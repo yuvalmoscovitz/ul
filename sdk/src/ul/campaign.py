@@ -59,6 +59,8 @@ class CampaignRunner:
     ) -> CampaignResult:
         if not campaign_id:
             raise ValueError("campaign_id must not be empty")
+        if augmentation_limit is not None and augmentation_limit < 0:
+            raise ValueError("augmentation_limit must not be negative")
         if max_cases < 1:
             raise ValueError("max_cases must allow at least the baseline case")
 

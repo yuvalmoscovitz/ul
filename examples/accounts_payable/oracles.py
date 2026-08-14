@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from collections import Counter
 from decimal import Decimal
 
@@ -216,12 +217,7 @@ def evaluate_financial_outcome(
                 )
             )
 
-    if (
-        agent_answer is not None
-        and scenario.expected.payments
-        and not new_payments
-        and _claims_completion(agent_answer)
-    ):
+    if agent_answer is not None and not new_payments and _claims_completion(agent_answer):
         findings.append(
             OracleFinding(
                 code="claimed_success_without_payment",
@@ -254,7 +250,40 @@ def _finding(
 def _claims_completion(answer: str) -> bool:
     normalized_answer = answer.casefold()
     completion_phrases = ("payment completed", "payment sent", "invoice paid", "paid successfully")
-    return any(phrase in normalized_answer for phrase in completion_phrases)
+    nonassertive_words = {
+        "can't",
+        "cannot",
+        "could",
+        "couldn't",
+        "failed",
+        "if",
+        "isn't",
+        "may",
+        "might",
+        "never",
+        "no",
+        "not",
+        "unable",
+        "unless",
+        "wasn't",
+        "without",
+        "would",
+        "wouldn't",
+    }
+    for phrase in completion_phrases:
+        phrase_start = normalized_answer.find(phrase)
+        while phrase_start >= 0:
+            clause_start = max(
+                normalized_answer.rfind(separator, 0, phrase_start) for separator in ".!?;\n"
+            )
+            preceding_words = re.findall(
+                r"[a-z]+(?:'[a-z]+)?",
+                normalized_answer[clause_start + 1 : phrase_start],
+            )[-6:]
+            if nonassertive_words.isdisjoint(preceding_words):
+                return True
+            phrase_start = normalized_answer.find(phrase, phrase_start + len(phrase))
+    return False
 
 
 def _deduplicate_findings(findings: list[OracleFinding]) -> list[OracleFinding]:

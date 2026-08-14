@@ -111,6 +111,26 @@ async def test_campaign_has_a_hard_case_limit() -> None:
     assert runner.archive is archive
 
 
+async def test_campaign_rejects_negative_augmentation_limit_before_execution() -> None:
+    execution_count = 0
+
+    class CountingExecutor:
+        async def execute(self, scenario: MaterializedScenario) -> ExecutionResult:
+            nonlocal execution_count
+            execution_count += 1
+            return ExecutionResult(
+                scenario_id=scenario.scenario_id,
+                status=ExecutionStatus.SUCCEEDED,
+            )
+
+    runner = CampaignRunner(FakeMaterializer(), CountingExecutor(), FakeOracle())
+
+    with pytest.raises(ValueError, match="augmentation_limit must not be negative"):
+        await runner.run("campaign-1", seed_scenario(), augmentation_limit=-1)
+
+    assert execution_count == 0
+
+
 async def test_campaign_records_mismatched_executor_results() -> None:
     class WrongExecutor:
         async def execute(self, scenario: MaterializedScenario) -> ExecutionResult:

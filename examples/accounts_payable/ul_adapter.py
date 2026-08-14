@@ -63,7 +63,6 @@ PAYMENT_ACTION_ID = "execute-approved-payments"
 SUPPORTED_AUGMENTATION_IDS = {
     "conversation.ambiguity",
     "conversation.later_correction",
-    "policy.boundary_shift",
     "tool.timeout_before_commit",
     "tool.timeout_after_commit",
 }
@@ -605,7 +604,7 @@ def _materialize_expectations(
         if expected.invoice_id in invoice_ids
     ]
     requires_clarification = seed.expected.requires_clarification
-    if lineage_ids & {"conversation.later_correction", "policy.boundary_shift"}:
+    if "conversation.later_correction" in lineage_ids:
         amount = _action_amount(scenario)
         if expected_payments:
             expected = expected_payments[0]
