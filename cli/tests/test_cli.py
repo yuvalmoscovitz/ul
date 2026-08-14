@@ -19,7 +19,7 @@ def test_live_demo_requires_an_explicit_scenario() -> None:
     result = runner.invoke(app, ["demo", "accounts-payable", "--live"])
 
     assert result.exit_code != 0
-    assert "explicit --scenario" in result.output
+    assert "Live runs require at least one explicit" in result.output
 
 
 def test_live_demo_allows_only_one_unique_scenario() -> None:
@@ -37,7 +37,7 @@ def test_live_demo_allows_only_one_unique_scenario() -> None:
     )
 
     assert result.exit_code != 0
-    assert "exactly one unique --scenario" in result.output
+    assert "Live runs require exactly one unique" in result.output
 
 
 def test_live_demo_rejects_more_than_two_cases_before_execution() -> None:
