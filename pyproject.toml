@@ -1,0 +1,49 @@
+[project]
+name = "ul"
+version = "0.1.0"
+description = "Discover consequential failures in high-risk AI agents"
+requires-python = ">=3.12"
+dependencies = [
+    "httpx>=0.27,<1",
+    "pydantic>=2.9,<3",
+    "pydantic-settings>=2.5,<3",
+    "rich>=13.8,<14",
+    "typer>=0.12,<1",
+]
+
+[project.scripts]
+ul = "ul_cli.main:app"
+
+[build-system]
+requires = ["hatchling==1.31.0"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["core/src/ul_core", "sdk/src/ul", "cli/src/ul_cli", "examples"]
+exclude = ["examples/**/tests"]
+
+[dependency-groups]
+dev = [
+    "pyright>=1.1.380,<2",
+    "pytest>=8.3,<9",
+    "pytest-asyncio>=0.24,<1",
+    "ruff>=0.6,<1",
+    "hatchling==1.31.0",
+]
+
+[tool.pytest.ini_options]
+addopts = "-ra"
+testpaths = ["core/tests", "sdk/tests", "cli/tests", "examples/accounts_payable/tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
+
+[tool.pyright]
+pythonVersion = "3.12"
+typeCheckingMode = "strict"
+include = ["core/src", "sdk/src", "cli/src", "examples/accounts_payable"]
+extraPaths = ["core/src", "sdk/src", "cli/src"]
