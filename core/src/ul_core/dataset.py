@@ -29,6 +29,11 @@ class InteractionRecord(UserInputRecord):
         return self
 
 
+class RenderedUserInput(_StrictULModel):
+    text: str = Field(min_length=1)
+    metadata: dict[str, JsonValue] = Field(default_factory=dict)
+
+
 class EvidenceReference(_StrictULModel):
     source: Literal["input", "output"]
     json_pointer: str

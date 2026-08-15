@@ -1,23 +1,162 @@
 from __future__ import annotations
 
+import hashlib
 import json
+import re
 from collections.abc import Iterable
-from itertools import islice
-from typing import Any, Literal
+from itertools import islice, pairwise
+from typing import Any, Literal, Self
 
-from pydantic import Field
+from pydantic import Field, JsonValue, model_validator
 from ul_core.contracts import SemanticDeconstructor, SemanticRenderer
-from ul_core.dataset import InteractionRecord, SemanticFrame, UserInputRecord
+from ul_core.dataset import (
+    InteractionRecord,
+    RenderedUserInput,
+    SemanticFrame,
+    UserInputRecord,
+)
 from ul_core.models import ULModel
+
+OperatorId = Literal[
+    "surface.rephrase",
+    "surface.typing_noise",
+    "surface.fragmented_syntax",
+    "surface.disfluency_repeat",
+    "style.terse",
+    "style.verbose",
+    "tone.frustrated",
+]
+AllowedChange = Literal["surface_form_only", "declared_communication_form"]
+
+
+class DatasetAugmentationOperator(ULModel):
+    id: OperatorId
+    version: Literal["1.0.0"] = "1.0.0"
+    instruction: str = Field(min_length=1)
+    allowed_change: AllowedChange
+    target_communication_kind: str | None = Field(default=None, min_length=1)
+    target_marker_required: bool = False
+    human_review_required: bool = False
+
+    @model_validator(mode="after")
+    def validate_change_contract(self) -> Self:
+        requires_target = self.allowed_change == "declared_communication_form"
+        if requires_target != (self.target_communication_kind is not None):
+            raise ValueError("target communication kind must match the allowed change")
+        if self.target_marker_required and self.target_communication_kind is None:
+            raise ValueError("required target marker needs a communication kind")
+        return self
+
+
+_BUILTIN_OPERATORS = (
+    DatasetAugmentationOperator(
+        id="surface.rephrase",
+        instruction=(
+            "Noticeably rephrase the user input as a natural everyday message; never return the "
+            "exact input or a benchmark-polished sentence. Do not change any meaning, request "
+            "order, or communication behavior. Keep semantic noun phrases and wording directly "
+            "around values intact; change only the request verb or harmless surrounding wording. "
+            "Preserve its language, every request, fact, value, constraint, identifier, and "
+            "relationship. Do not add context."
+        ),
+        allowed_change="surface_form_only",
+    ),
+    DatasetAugmentationOperator(
+        id="surface.typing_noise",
+        instruction=(
+            "Keep the wording almost identical but make exactly one ordinary word contain a "
+            "plausible human typo. For example only, 'book 2 seats for AB-12' could become 'book "
+            "2 seets for AB-12'. Never copy the example. Do not corrupt names, identifiers, "
+            "amounts, dates, addresses, negation, or any other meaning, and do not change request "
+            "order or other communication behavior."
+        ),
+        allowed_change="declared_communication_form",
+        target_communication_kind="typing_noise",
+    ),
+    DatasetAugmentationOperator(
+        id="surface.fragmented_syntax",
+        instruction=(
+            "Rewrite the user input in natural chat shorthand or sentence fragments, like a real "
+            "person typing quickly rather than a polished benchmark example. For example only, "
+            "'please book the red item for tomorrow' could become 'pls book red item. tomorrow'. "
+            "Never copy the example. Keep it unambiguous and preserve every request, fact, value, "
+            "constraint, identifier, relationship, and request order. Do not add context."
+        ),
+        allowed_change="declared_communication_form",
+        target_communication_kind="fragmented_syntax",
+        target_marker_required=True,
+    ),
+    DatasetAugmentationOperator(
+        id="surface.disfluency_repeat",
+        instruction=(
+            "Keep the message natural and unpolished, and repeat exactly one ordinary word "
+            "immediately as a small hesitation. For example only, 'please book it' could become "
+            "'please please book it'. Never copy the example. Do not introduce a correction or "
+            "alternative. Preserve every request, fact, value, constraint, identifier, "
+            "relationship, and request order. Do not add context."
+        ),
+        allowed_change="declared_communication_form",
+        target_communication_kind="repetition",
+    ),
+    DatasetAugmentationOperator(
+        id="style.terse",
+        instruction=(
+            "Rewrite the user input as a visibly shorter, terse but natural message from a busy "
+            "person, not a polished benchmark sentence. Preserve every request, fact, value, "
+            "constraint, identifier, relationship, and request order. Do not make it ambiguous or "
+            "add context."
+        ),
+        allowed_change="declared_communication_form",
+        target_communication_kind="terse",
+    ),
+    DatasetAugmentationOperator(
+        id="style.verbose",
+        instruction=(
+            "Rewrite the user input as a natural, visibly wordier everyday message, roughly one "
+            "and a half to two times as many words. Expand only through harmless restatement, "
+            "never new facts, motivations, requests, constraints, or context. Preserve every "
+            "value, identifier, relationship, and request order, and mention each value and "
+            "identifier exactly once. Use only casual filler and pronouns referring back to the "
+            "same request; do not add statements about what the user needs or why. For example "
+            "only, 'book 2 seats' could become 'hey could you just book 2 seats, just put them in "
+            "there for me'. Never copy the example or make the result more formal."
+        ),
+        allowed_change="declared_communication_form",
+        target_communication_kind="verbose",
+    ),
+    DatasetAugmentationOperator(
+        id="tone.frustrated",
+        instruction=(
+            "Add one short, clearly visible expression of mild natural frustration while keeping "
+            "the request otherwise almost identical. For example only, 'add 2 items' could become "
+            "'ugh just add 2 items'. Never copy the example. Preserve every request, fact, value, "
+            "constraint, identifier, relationship, and request order. Never invent urgency, "
+            "authority, prior history, threats, deadlines, consequences, or any other facts. Do "
+            "not add insults or abuse."
+        ),
+        allowed_change="declared_communication_form",
+        target_communication_kind="frustrated",
+        target_marker_required=True,
+        human_review_required=True,
+    ),
+)
+_BUILTIN_OPERATORS_BY_ID = {operator.id: operator for operator in _BUILTIN_OPERATORS}
+
+
+def builtin_dataset_augmentation_operators() -> tuple[DatasetAugmentationOperator, ...]:
+    return _BUILTIN_OPERATORS
 
 
 class DatasetAugmentationCandidate(ULModel):
     source_interaction_id: str = Field(min_length=1)
-    operator_id: Literal["surface.rephrase"] = "surface.rephrase"
+    operator_id: OperatorId = "surface.rephrase"
     operator_version: Literal["1.0.0"] = "1.0.0"
+    allowed_change: AllowedChange = "surface_form_only"
+    human_review_required: bool = False
     augmented_input: str = Field(min_length=1)
+    renderer_metadata: dict[str, JsonValue] = Field(default_factory=dict)
     expected_input_frame: SemanticFrame
-    reparsed_input_frame: SemanticFrame
+    reparsed_input_frame: SemanticFrame | None
     passed: bool
     failure_reasons: tuple[str, ...] = ()
 
@@ -29,6 +168,7 @@ class DatasetAugmentationResult(ULModel):
 
 class DatasetAugmentationEngine:
     maximum_records = 100
+    maximum_candidates = 100
 
     def __init__(
         self,
@@ -43,7 +183,9 @@ class DatasetAugmentationEngine:
         records: Iterable[InteractionRecord],
         *,
         max_records: int = 25,
+        operator_ids: Iterable[str] = ("surface.rephrase",),
     ) -> DatasetAugmentationResult:
+        selected_operators = _select_operators(operator_ids)
         if not 1 <= max_records <= self.maximum_records:
             raise ValueError(f"max_records must be between 1 and {self.maximum_records}")
         source_records = tuple(islice(records, max_records + 1))
@@ -52,6 +194,9 @@ class DatasetAugmentationEngine:
         record_ids = tuple(record.id for record in source_records)
         if len(record_ids) != len(set(record_ids)):
             raise ValueError("interaction record identifiers must be unique")
+        candidate_count = len(source_records) * len(selected_operators)
+        if candidate_count > self.maximum_candidates:
+            raise ValueError(f"candidate count exceeds maximum of {self.maximum_candidates}")
         source_frames: list[SemanticFrame] = []
         candidates: list[DatasetAugmentationCandidate] = []
         for record in source_records:
@@ -67,35 +212,74 @@ class DatasetAugmentationEngine:
                 or _has_ambiguous_nodes(expected_input_frame)
             ):
                 continue
-            augmented_input = await self._renderer.render(
-                record.raw_input,
-                "Rephrase the user input naturally without changing any meaning, request order, "
-                "or communication behavior.",
-            )
-            candidate_record = UserInputRecord(
-                id=f"{record.id}:surface.rephrase",
-                raw_input=augmented_input,
-            )
-            reparsed_frame = await self._deconstructor.deconstruct(
-                candidate_record, expected_input_frame
-            )
-            failure_reasons = list(
-                _semantic_difference_reasons(expected_input_frame, reparsed_frame)
-            )
-            if _has_unresolved_nodes(reparsed_frame):
-                failure_reasons.append("reparsed frame contains unresolved semantic elements")
-            if augmented_input == record.raw_input:
-                failure_reasons.append("renderer did not change the source input")
-            candidates.append(
-                DatasetAugmentationCandidate(
-                    source_interaction_id=record.id,
-                    augmented_input=augmented_input,
-                    expected_input_frame=expected_input_frame,
-                    reparsed_input_frame=reparsed_frame,
-                    passed=not failure_reasons,
-                    failure_reasons=tuple(failure_reasons),
+            generated_inputs: set[str] = set()
+            for operator in selected_operators:
+                if operator.id == "surface.typing_noise":
+                    rendered_input = _add_typing_noise(record, expected_input_frame, operator)
+                elif operator.id == "surface.disfluency_repeat":
+                    rendered_input = _add_word_repetition(record, expected_input_frame, operator)
+                else:
+                    rendered_input = await self._renderer.render(
+                        record.raw_input, operator.instruction
+                    )
+                augmented_input = rendered_input.text
+                candidate_record = UserInputRecord(
+                    id=f"{record.id}:{operator.id}",
+                    raw_input=augmented_input,
                 )
-            )
+                try:
+                    reparsed_frame = await self._deconstructor.deconstruct(
+                        candidate_record, expected_input_frame
+                    )
+                except ValueError:
+                    reparsed_frame = None
+                    failure_reasons = ["candidate semantic deconstruction failed validation"]
+                else:
+                    if reparsed_frame.interaction_id != candidate_record.id:
+                        failure_reasons = ["reparsed frame must reference its candidate input"]
+                    elif operator.allowed_change == "surface_form_only":
+                        failure_reasons = list(
+                            _semantic_difference_reasons(expected_input_frame, reparsed_frame)
+                        )
+                    else:
+                        failure_reasons = list(
+                            _declared_communication_form_difference_reasons(
+                                expected_input_frame,
+                                reparsed_frame,
+                                operator.target_communication_kind,
+                                operator.target_marker_required,
+                            )
+                        )
+                    if _has_unresolved_nodes(reparsed_frame):
+                        failure_reasons.append(
+                            "reparsed frame contains unresolved semantic elements"
+                        )
+                failure_reasons.extend(
+                    _surface_footprint_reasons(operator.id, record.raw_input, augmented_input)
+                )
+                if augmented_input == record.raw_input:
+                    failure_reasons.append("renderer did not change the source input")
+                generated_input_key = _text_key(augmented_input)
+                if generated_input_key in generated_inputs:
+                    failure_reasons.append(
+                        "renderer produced an input already generated for this source"
+                    )
+                generated_inputs.add(generated_input_key)
+                candidates.append(
+                    DatasetAugmentationCandidate(
+                        source_interaction_id=record.id,
+                        operator_id=operator.id,
+                        operator_version=operator.version,
+                        allowed_change=operator.allowed_change,
+                        human_review_required=operator.human_review_required,
+                        augmented_input=augmented_input,
+                        renderer_metadata=rendered_input.metadata,
+                        expected_input_frame=expected_input_frame,
+                        reparsed_input_frame=reparsed_frame,
+                        passed=not failure_reasons,
+                        failure_reasons=tuple(failure_reasons),
+                    )
+                )
         return DatasetAugmentationResult(
             source_frames=tuple(source_frames), candidates=tuple(candidates)
         )
@@ -164,6 +348,168 @@ def _semantic_difference_reasons(
         )
         if expected_part != reparsed_part
     )
+
+
+def _declared_communication_form_difference_reasons(
+    expected: SemanticFrame,
+    reparsed: SemanticFrame,
+    target_communication_kind: str | None,
+    target_marker_required: bool,
+) -> tuple[str, ...]:
+    target_acts = tuple(
+        act for act in reparsed.communication_acts if act.kind == target_communication_kind
+    )
+    if not target_acts:
+        if target_marker_required:
+            return (
+                f"reparsed frame does not contain required communication kind "
+                f"{target_communication_kind}",
+            )
+        return _semantic_difference_reasons(expected, reparsed)
+    candidate_differences: list[tuple[str, ...]] = []
+    for target_act in target_acts:
+        if target_act.factor_ids or target_act.attributes:
+            candidate_differences.append(
+                ("declared communication marker contains unsupported semantics",)
+            )
+            continue
+        if any(
+            target_act.id in (*relation.source_ids, *relation.target_ids)
+            for relation in reparsed.relations
+        ):
+            candidate_differences.append(
+                ("declared communication marker has unsupported relations",)
+            )
+            continue
+        filtered_frame = reparsed.model_copy(
+            update={
+                "communication_acts": tuple(
+                    act for act in reparsed.communication_acts if act.id != target_act.id
+                ),
+            }
+        )
+        differences = _semantic_difference_reasons(expected, filtered_frame)
+        if not differences:
+            return ()
+        candidate_differences.append(differences)
+    return min(candidate_differences, key=len)
+
+
+def _surface_footprint_reasons(
+    operator_id: OperatorId,
+    source_input: str,
+    augmented_input: str,
+) -> tuple[str, ...]:
+    source_word_count = len(re.findall(r"\w+", source_input, flags=re.UNICODE))
+    augmented_words = re.findall(r"\w+", augmented_input, flags=re.UNICODE)
+    augmented_word_count = len(augmented_words)
+    if operator_id == "surface.rephrase" and _word_key(source_input) == _word_key(augmented_input):
+        return ("rendered input only changes case, spacing, or punctuation",)
+    if operator_id == "style.terse" and augmented_word_count * 10 > source_word_count * 9:
+        return ("rendered input is not visibly shorter than the source",)
+    if operator_id == "style.verbose" and not (
+        source_word_count * 15 <= augmented_word_count * 10
+        and augmented_word_count <= source_word_count * 2
+    ):
+        return ("rendered input is not between 1.5 and 2 times the source length",)
+    if operator_id == "surface.disfluency_repeat":
+        source_repetition_count = sum(
+            first.casefold() == second.casefold()
+            for first, second in pairwise(re.findall(r"\w+", source_input, flags=re.UNICODE))
+        )
+        augmented_repetition_count = sum(
+            first.casefold() == second.casefold() for first, second in pairwise(augmented_words)
+        )
+        if augmented_repetition_count != source_repetition_count + 1:
+            return ("rendered input must contain exactly one immediate word repetition",)
+    return ()
+
+
+def _add_typing_noise(
+    record: InteractionRecord,
+    frame: SemanticFrame,
+    operator: DatasetAugmentationOperator,
+) -> RenderedUserInput:
+    seed = int.from_bytes(
+        hashlib.sha256(f"{record.id}\0{operator.id}\0{operator.version}".encode()).digest()[:4],
+        "big",
+    )
+    protected_words = _protected_factor_words(frame)
+    eligible_words: list[tuple[int, int, tuple[int, ...]]] = []
+    for match in re.finditer(r"[A-Za-z]+", record.raw_input):
+        if len(match.group()) < 4 or match.group().casefold() in protected_words:
+            continue
+        swap_positions = tuple(
+            index
+            for index in range(1, len(match.group()) - 1)
+            if match.group()[index] != match.group()[index + 1]
+        )
+        if swap_positions:
+            eligible_words.append((match.start(), match.end(), swap_positions))
+    if not eligible_words:
+        rendered_text = record.raw_input
+    else:
+        start, end, swap_positions = eligible_words[seed % len(eligible_words)]
+        characters = list(record.raw_input[start:end])
+        swap_index = swap_positions[seed % len(swap_positions)]
+        characters[swap_index], characters[swap_index + 1] = (
+            characters[swap_index + 1],
+            characters[swap_index],
+        )
+        rendered_text = f"{record.raw_input[:start]}{''.join(characters)}{record.raw_input[end:]}"
+    return RenderedUserInput(
+        text=rendered_text,
+        metadata={
+            "renderer": "deterministic",
+            "algorithm": "protected_adjacent_transposition",
+            "seed": seed,
+        },
+    )
+
+
+def _add_word_repetition(
+    record: InteractionRecord,
+    frame: SemanticFrame,
+    operator: DatasetAugmentationOperator,
+) -> RenderedUserInput:
+    seed = int.from_bytes(
+        hashlib.sha256(f"{record.id}\0{operator.id}\0{operator.version}".encode()).digest()[:4],
+        "big",
+    )
+    protected_words = _protected_factor_words(frame)
+    eligible_words = tuple(
+        match
+        for match in re.finditer(r"[A-Za-z]+", record.raw_input)
+        if len(match.group()) >= 3 and match.group().casefold() not in protected_words
+    )
+    if not eligible_words:
+        rendered_text = record.raw_input
+    else:
+        match = eligible_words[seed % len(eligible_words)]
+        repeated_word = match.group()
+        if repeated_word[:1].isupper() and repeated_word[1:].islower():
+            repeated_word = repeated_word.lower()
+        rendered_text = (
+            f"{record.raw_input[: match.end()]} {repeated_word}{record.raw_input[match.end() :]}"
+        )
+    return RenderedUserInput(
+        text=rendered_text,
+        metadata={
+            "renderer": "deterministic",
+            "algorithm": "protected_immediate_word_repetition",
+            "seed": seed,
+        },
+    )
+
+
+def _protected_factor_words(frame: SemanticFrame) -> set[str]:
+    return {
+        word.casefold()
+        for factor in frame.factors
+        for evidence in factor.evidence
+        if evidence.source == "input" and evidence.text_quote is not None
+        for word in re.findall(r"[A-Za-z]+", evidence.text_quote)
+    }
 
 
 def _has_ambiguous_nodes(frame: SemanticFrame) -> bool:
@@ -250,6 +596,32 @@ def _canonical_semantics(frame: SemanticFrame) -> tuple[object, ...]:
         relation_semantics,
         tuple(communication_semantics[act.id] for act in frame.communication_acts),
     )
+
+
+def _select_operators(
+    operator_ids: Iterable[str],
+) -> tuple[DatasetAugmentationOperator, ...]:
+    selected_ids = tuple(islice(operator_ids, len(_BUILTIN_OPERATORS) + 1))
+    if not selected_ids:
+        raise ValueError("operator_ids must contain at least one operator")
+    if any(not operator_id for operator_id in selected_ids):
+        raise ValueError("operator identifiers must not be empty")
+    if len(selected_ids) != len(set(selected_ids)):
+        raise ValueError("operator identifiers must be unique")
+    if len(selected_ids) > len(_BUILTIN_OPERATORS):
+        raise ValueError("operator count exceeds the built-in library")
+    unknown_ids = set(selected_ids) - _BUILTIN_OPERATORS_BY_ID.keys()
+    if unknown_ids:
+        raise ValueError(f"unknown operator identifiers: {sorted(unknown_ids)}")
+    return tuple(_BUILTIN_OPERATORS_BY_ID[operator_id] for operator_id in selected_ids)
+
+
+def _text_key(text: str) -> str:
+    return " ".join(text.split()).casefold()
+
+
+def _word_key(text: str) -> tuple[str, ...]:
+    return tuple(word.casefold() for word in re.findall(r"\w+", text, flags=re.UNICODE))
 
 
 def _json_key(value: Any) -> str:

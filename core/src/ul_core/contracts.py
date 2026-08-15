@@ -3,7 +3,12 @@ from __future__ import annotations
 from collections.abc import Awaitable
 from typing import Protocol, runtime_checkable
 
-from ul_core.dataset import InteractionRecord, SemanticFrame, UserInputRecord
+from ul_core.dataset import (
+    InteractionRecord,
+    RenderedUserInput,
+    SemanticFrame,
+    UserInputRecord,
+)
 from ul_core.models import ExecutionResult, MaterializedScenario, OracleFinding, Scenario
 
 
@@ -22,7 +27,7 @@ class SemanticRenderer(Protocol):
         self,
         raw_input: str,
         instruction: str,
-    ) -> Awaitable[str]: ...
+    ) -> Awaitable[RenderedUserInput]: ...
 
 
 @runtime_checkable
