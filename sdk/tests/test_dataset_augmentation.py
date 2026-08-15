@@ -682,6 +682,82 @@ async def test_word_repetition_is_deterministic_and_protects_factors() -> None:
     assert candidate.renderer_metadata["algorithm"] == ("protected_immediate_word_repetition")
 
 
+async def test_factor_evidence_does_not_protect_unrelated_words_in_its_span() -> None:
+    record = InteractionRecord(
+        id="source",
+        raw_input="Pay AC-100.",
+        raw_observed_output={"action": "payment_committed"},
+    )
+    identifier = SemanticFactor(
+        id="identifier",
+        evidence=(
+            EvidenceReference(source="input", json_pointer="/raw_input", text_quote="AC-100"),
+        ),
+        confidence=1,
+        status="observed",
+        kind="identifier",
+        role="invoice_identifier",
+        value="AC-100",
+    )
+    inferred_object = SemanticFactor(
+        id="object",
+        evidence=(
+            EvidenceReference(
+                source="input",
+                json_pointer="/raw_input",
+                text_quote="Pay AC-100",
+            ),
+        ),
+        confidence=1,
+        status="observed",
+        kind="entity",
+        role="object",
+        value="invoice",
+    )
+    request = RequestUnit(
+        id="request",
+        evidence=(EvidenceReference(source="input", json_pointer="/raw_input", text_quote="Pay"),),
+        confidence=1,
+        status="observed",
+        mode="act",
+        predicate="pay",
+        factor_ids=(identifier.id, inferred_object.id),
+    )
+    original_frame = SemanticFrame(
+        interaction_id=record.id,
+        request_units=(request,),
+        factors=(identifier, inferred_object),
+        outcomes=(
+            ObservedOutcome(
+                id="outcome",
+                evidence=(
+                    EvidenceReference(
+                        source="output",
+                        json_pointer="/raw_observed_output/action",
+                        text_quote="payment_committed",
+                    ),
+                ),
+                confidence=1,
+                status="observed",
+                request_unit_ids=(request.id,),
+                position=0,
+                kind="action",
+                predicate="payment_committed",
+            ),
+        ),
+        extractor_version="test",
+    )
+    candidate_frame = original_frame.model_copy(update={"outcomes": ()})
+    model = DeterministicSemanticModel({record.id: original_frame}, candidate_frame)
+
+    result = await DatasetAugmentationEngine(model, model).augment(
+        (record,), operator_ids=("surface.disfluency_repeat",)
+    )
+
+    assert result.candidates[0].passed
+    assert result.candidates[0].augmented_input == "Pay pay AC-100."
+
+
 @pytest.mark.parametrize(
     ("operator_id", "rendered_output"),
     [

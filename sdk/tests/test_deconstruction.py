@@ -208,6 +208,15 @@ async def test_deconstruct_sends_one_bounded_strict_structured_request() -> None
         assert [message["role"] for message in body["messages"]] == ["system", "user"]
         assert "fragmented_syntax" in body["messages"][0]["content"]
         assert "frustrated" in body["messages"][0]["content"]
+        assert "action for a visible executed action or effect" in body["messages"][0]["content"]
+        assert "answer for a textual answer" in body["messages"][0]["content"]
+        assert "set its status to observed" in body["messages"][0]["content"]
+        assert "A field is also grounded" in body["messages"][0]["content"]
+        assert "complete action object is also valid" in body["messages"][0]["content"]
+        assert "Other container pointers are invalid" in body["messages"][0]["content"]
+        assert "must list the request unit IDs that it fulfills" in body["messages"][0]["content"]
+        assert "ground each relation" in body["messages"][0]["content"]
+        assert "Never serialize an object" in body["messages"][0]["content"]
         supplied_record = json.loads(body["messages"][1]["content"])
         assert supplied_record == {
             "raw_input": interaction().raw_input,
@@ -323,6 +332,26 @@ async def test_deconstruct_supports_input_only_candidate_validation() -> None:
         ],
         "outcomes": [],
     }
+    reference_frame = semantic_frame()
+    reference_frame = reference_frame.model_copy(
+        update={
+            "outcomes": (
+                *reference_frame.outcomes,
+                reference_frame.outcomes[0].model_copy(
+                    update={
+                        "id": "outcome-2",
+                        "position": 1,
+                        "predicate": "send_receipt",
+                        "fields": {
+                            "invoice_id": "INV-104",
+                            "recipient": "ops@example.test",
+                        },
+                        "propositions": ("Receipt sent",),
+                    }
+                ),
+            )
+        }
+    )
 
     def handler(request: httpx.Request) -> httpx.Response:
         body = json.loads(request.content)
@@ -335,12 +364,39 @@ async def test_deconstruct_supports_input_only_candidate_validation() -> None:
             "factor_types": [{"kind": "entity", "role": "invoice_reference"}],
             "relation_kinds": [],
             "communication_kinds": [],
+            "outcome_kinds": ["action"],
+            "outcome_predicates": ["pay_invoice", "send_receipt"],
+            "outcome_field_names": ["invoice_id", "recipient"],
         }
+        reference_vocabulary = cast(dict[str, object], supplied_record["reference_vocabulary"])
+        outcome_vocabulary = {
+            key: value for key, value in reference_vocabulary.items() if key.startswith("outcome_")
+        }
+        assert all(
+            isinstance(value, list)
+            and all(isinstance(item, str) for item in cast(list[object], value))
+            for value in outcome_vocabulary.values()
+        )
+        serialized_outcome_vocabulary = json.dumps(outcome_vocabulary)
+        for forbidden_reference_detail in (
+            "INV-104",
+            "ops@example.test",
+            "Receipt sent",
+            "outcome-1",
+            "outcome-2",
+            "request-1",
+            "position",
+            "request_unit_ids",
+            "fields",
+            "propositions",
+            "count",
+        ):
+            assert forbidden_reference_detail not in serialized_outcome_vocabulary
         return completion(json.dumps(input_only_frame))
 
     client = mock_client(handler)
     async with OpenRouterSemanticDeconstructor(settings(), client=client) as deconstructor:
-        frame = await deconstructor.deconstruct(input_only_record, semantic_frame())
+        frame = await deconstructor.deconstruct(input_only_record, reference_frame)
 
     assert frame.outcomes == ()
     await client.aclose()

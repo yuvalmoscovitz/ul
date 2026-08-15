@@ -7,6 +7,7 @@ from ul_core.dataset import (
     CommunicationAct,
     EvidenceReference,
     InteractionRecord,
+    ObservedAgentOutput,
     ObservedOutcome,
     RenderedUserInput,
     RequestUnit,
@@ -34,6 +35,18 @@ def test_rendered_user_input_preserves_replay_metadata() -> None:
     )
 
     assert RenderedUserInput.model_validate_json(rendered.model_dump_json()) == rendered
+
+
+def test_observed_agent_output_preserves_replay_metadata() -> None:
+    observation = ObservedAgentOutput(
+        raw_output={"actions": [{"kind": "transfer", "amount": 100}]},
+        metadata={"endpoint_version": "test-v2", "latency_ms": 12},
+    )
+
+    assert ObservedAgentOutput.model_validate_json(observation.model_dump_json()) == observation
+
+    with pytest.raises(ValidationError, match="require an output"):
+        ObservedAgentOutput(raw_output=None)
 
 
 def test_mixed_action_and_answer_frame_round_trips() -> None:

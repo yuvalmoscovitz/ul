@@ -136,14 +136,14 @@ class OpenRouterSemanticDeconstructor:
 
     async def deconstruct(
         self,
-        interaction: InteractionRecord | UserInputRecord,
+        record: InteractionRecord | UserInputRecord,
         reference_frame: SemanticFrame | None = None,
     ) -> SemanticFrame:
         observed_output = (
-            interaction.raw_observed_output if isinstance(interaction, InteractionRecord) else None
+            record.raw_observed_output if isinstance(record, InteractionRecord) else None
         )
         request_payload: dict[str, JsonValue] = {
-            "raw_input": interaction.raw_input,
+            "raw_input": record.raw_input,
             "raw_observed_output": observed_output,
         }
         if reference_frame is not None:
@@ -168,7 +168,9 @@ class OpenRouterSemanticDeconstructor:
                 "agent mechanics. When raw_observed_output is null, this is input-only "
                 "candidate validation: leave outcomes empty and invent no output facts. "
                 "When raw_observed_output is present, represent every distinct visible answer or "
-                "action as an ordered outcome. Use "
+                "action as an ordered outcome and set its status to observed. Use stable outcome "
+                "kinds: action for a visible executed action or effect, and answer for a textual "
+                "answer. Use "
                 "stable snake_case names: request modes act, ask, or inform; specific semantic "
                 "factor roles; and prefer reusable factor kinds such as entity, identifier, "
                 "number, money, date_time, duration, location, boolean, text, or enum. Introduce "
@@ -186,10 +188,22 @@ class OpenRouterSemanticDeconstructor:
                 "Do not label a communication act unless the text directly evidences it. "
                 "Provide evidence for every extracted request unit, factor, relation, "
                 "communication act, and outcome. Evidence JSON pointers address this wrapper: "
+                "For each action outcome, use an output evidence pointer to the primitive value "
+                "supporting its predicate. For every primitive outcome field value that also "
+                "appears in the input, put its output evidence pointer on the outcome. A field is "
+                "also grounded when it is a sibling of the evidenced predicate in the same "
+                "structured output object. A pointer to the complete action object is also valid "
+                "when it has an action key equal to the predicate and exact sibling field values. "
+                "Other container pointers are invalid. Every action outcome "
+                "must list the request unit IDs that it fulfills; if the action cannot be linked, "
+                "mark it unresolved. "
+                "Relations are not exempt: ground each relation in direct input or output "
+                "evidence, and omit any relation that cannot be grounded. "
                 "input evidence begins /raw_input and output evidence begins "
                 "/raw_observed_output. Always return text_quote. When a pointer selects text, "
                 "quote an exact non-empty substring supporting the element; otherwise set it to "
-                "null. Never shorten an evidence quote with ellipses or paraphrase it. Mark "
+                "null. Never serialize an object, array, number, or boolean into text_quote. "
+                "Never shorten an evidence quote with ellipses or paraphrase it. Mark "
                 "uncertain "
                 "interpretations unresolved. If reference_vocabulary is present, use it only to "
                 "name independently extracted concepts consistently. It contains no expected "
@@ -202,14 +216,14 @@ class OpenRouterSemanticDeconstructor:
         raw_frame.update(
             {
                 "schema_version": "1.0.0",
-                "interaction_id": interaction.id,
+                "interaction_id": record.id,
                 "extractor_version": self._extractor_version,
                 "metadata": self._generation_metadata(response),
             }
         )
         frame = SemanticFrame.model_validate_json(json.dumps(raw_frame))
-        frame = self._expand_unambiguous_evidence_quotes(interaction, frame)
-        self._validate_evidence(interaction, frame)
+        frame = self._expand_unambiguous_evidence_quotes(record, frame)
+        self._validate_evidence(record, frame)
         return frame
 
     async def render(
@@ -371,6 +385,11 @@ class OpenRouterSemanticDeconstructor:
                 "communication_kinds": sorted(
                     {communication_act.kind for communication_act in frame.communication_acts}
                 ),
+                "outcome_kinds": sorted({outcome.kind for outcome in frame.outcomes}),
+                "outcome_predicates": sorted({outcome.predicate for outcome in frame.outcomes}),
+                "outcome_field_names": sorted(
+                    {field_name for outcome in frame.outcomes for field_name in outcome.fields}
+                ),
             },
         )
 
@@ -456,7 +475,7 @@ class OpenRouterSemanticDeconstructor:
         }
         for element in elements:
             if not element.evidence:
-                raise ValueError("semantic elements must include source evidence")
+                raise ValueError(f"semantic element {element.id} requires source evidence")
             for evidence in element.evidence:
                 if evidence.source == "output" and observed_output is None:
                     raise ValueError("input-only frames must not contain output evidence")

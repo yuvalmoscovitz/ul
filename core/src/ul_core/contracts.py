@@ -5,11 +5,18 @@ from typing import Protocol, runtime_checkable
 
 from ul_core.dataset import (
     InteractionRecord,
+    ObservedAgentOutput,
     RenderedUserInput,
     SemanticFrame,
     UserInputRecord,
 )
-from ul_core.models import ExecutionResult, MaterializedScenario, OracleFinding, Scenario
+from ul_core.models import (
+    ExecutionResult,
+    MaterializedScenario,
+    OracleFinding,
+    SafetyEnvelope,
+    Scenario,
+)
 
 
 @runtime_checkable
@@ -28,6 +35,14 @@ class SemanticRenderer(Protocol):
         raw_input: str,
         instruction: str,
     ) -> Awaitable[RenderedUserInput]: ...
+
+
+@runtime_checkable
+class DatasetTargetExecutor(Protocol):
+    @property
+    def safety_envelope(self) -> SafetyEnvelope: ...
+
+    def execute(self, raw_input: str) -> Awaitable[ObservedAgentOutput]: ...
 
 
 @runtime_checkable
