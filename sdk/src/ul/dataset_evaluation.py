@@ -322,7 +322,7 @@ def _value_appears_in_input(value: JsonValue, source_input: str) -> bool:
             normalized_value = Decimal(numeric_text.replace(",", ""))
         except InvalidOperation:
             return False
-        bounded_number_pattern = rf"(?<![\w.]){_NUMBER_PATTERN}(?![\w.])"
+        bounded_number_pattern = rf"(?<![\w.]){_NUMBER_PATTERN}(?!\w|\.\d)"
         for match in re.finditer(bounded_number_pattern, source_input, re.IGNORECASE):
             try:
                 candidate_value = Decimal(match.group().replace(",", ""))

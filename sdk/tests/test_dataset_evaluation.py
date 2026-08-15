@@ -731,7 +731,7 @@ async def test_numeric_formatting_keeps_amount_grounded(
     semantic_pipeline.source_frame = _frame("source", (source_outcome,))
     source = InteractionRecord(
         id="source",
-        raw_input="Transfer $100.50 to Alice.",
+        raw_input="Transfer to Alice for $100.50.",
         raw_observed_output=_raw_output_for_actions((source_outcome,)),
     )
 
