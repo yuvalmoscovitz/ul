@@ -6,6 +6,7 @@ import math
 import re
 from collections import defaultdict
 from collections.abc import Iterable
+from decimal import Decimal
 from typing import Literal, Self
 
 from pydantic import ConfigDict, Field, JsonValue, model_validator
@@ -60,9 +61,12 @@ class DatasetEvaluationCase(_StrictULModel):
         if self.observed_frame is not None and self.target_output is None:
             raise ValueError("an observed frame requires target output")
         if not self.candidate.passed and (
-            self.target_output is not None or self.observed_frame is not None
+            self.target_output is not None
+            or self.observed_frame is not None
+            or self.findings
+            or self.inconclusive_reasons
         ):
-            raise ValueError("rejected candidates cannot have an observed execution")
+            raise ValueError("rejected candidates cannot have evaluation results")
         if self.candidate.passed and self.target_output is None:
             raise ValueError("accepted candidates require target output")
         if self.candidate.passed and self.observed_frame is None and not self.inconclusive_reasons:
@@ -301,6 +305,18 @@ def _input_grounded_action_values(frame: SemanticFrame, source_input: str) -> se
 def _value_appears_in_input(value: JsonValue, source_input: str) -> bool:
     if value is None or isinstance(value, (dict, list)):
         return False
+    if isinstance(value, str) and not value.strip():
+        return False
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        normalized_value = Decimal(str(value))
+        number_pattern = (
+            r"(?<![\w.])[-+]?(?:\d{1,3}(?:,\d{3})+|\d+)"
+            r"(?:\.\d+)?(?:e[-+]?\d+)?(?![\w.])"
+        )
+        return any(
+            Decimal(match.group().replace(",", "")) == normalized_value
+            for match in re.finditer(number_pattern, source_input, re.IGNORECASE)
+        )
     value_text = str(value).casefold()
     return re.search(rf"(?<!\w){re.escape(value_text)}(?!\w)", source_input.casefold()) is not None
 

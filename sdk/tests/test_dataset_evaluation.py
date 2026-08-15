@@ -588,6 +588,12 @@ async def test_case_model_rejects_inconsistent_execution_and_verdicts() -> None:
             candidate=rejected_candidate,
             verdict="no_divergence",
         )
+    with pytest.raises(ValidationError, match="rejected candidates"):
+        DatasetEvaluationCase(
+            candidate=rejected_candidate,
+            verdict="augmentation_rejected",
+            inconclusive_reasons=("not evaluated",),
+        )
     with pytest.raises(ValidationError, match="case verdict"):
         DatasetEvaluationCase(
             candidate=accepted_case.candidate,
@@ -669,6 +675,48 @@ async def test_runner_rejects_inconclusive_source_actions_before_execution(
         await runner.run(_source())
 
     assert target.raw_inputs == []
+
+
+async def test_runner_rejects_empty_source_action_values_before_execution() -> None:
+    source_outcome = _outcome("empty_recipient", 0, fields={"recipient": ""})
+    runner, semantic_pipeline, target = _runner((_source_outcomes()[0],))
+    semantic_pipeline.source_frame = _frame("source", (source_outcome,))
+    source = InteractionRecord(
+        id="source",
+        raw_input="Transfer to Alice.",
+        raw_observed_output=_raw_output_for_actions((source_outcome,)),
+    )
+
+    with pytest.raises(ValueError, match="source action outcomes are inconclusive"):
+        await runner.run(source)
+
+    assert target.raw_inputs == []
+
+
+async def test_numeric_formatting_keeps_amount_grounded() -> None:
+    source_outcome = _outcome(
+        "source_transfer",
+        0,
+        fields={"amount": 100.5, "recipient": "Alice"},
+    )
+    observed_outcome = _outcome(
+        "observed_transfer",
+        0,
+        fields={"amount": 999, "recipient": "Alice"},
+    )
+    runner, semantic_pipeline, _ = _runner((observed_outcome,))
+    semantic_pipeline.source_frame = _frame("source", (source_outcome,))
+    source = InteractionRecord(
+        id="source",
+        raw_input="Transfer $100.50 to Alice.",
+        raw_observed_output=_raw_output_for_actions((source_outcome,)),
+    )
+
+    result = await runner.run(source)
+
+    assert result.cases[0].verdict == "divergence_needs_review"
+    assert result.cases[0].findings[0].category == "changed_grounded_effect_argument"
+    assert result.cases[0].findings[0].grounded_field_names == ("amount",)
 
 
 async def test_prompt_injected_ambiguous_observation_is_inconclusive() -> None:
