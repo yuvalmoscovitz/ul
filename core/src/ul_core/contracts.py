@@ -3,7 +3,26 @@ from __future__ import annotations
 from collections.abc import Awaitable
 from typing import Protocol, runtime_checkable
 
+from ul_core.dataset import InteractionRecord, SemanticFrame, UserInputRecord
 from ul_core.models import ExecutionResult, MaterializedScenario, OracleFinding, Scenario
+
+
+@runtime_checkable
+class SemanticDeconstructor(Protocol):
+    def deconstruct(
+        self,
+        record: InteractionRecord | UserInputRecord,
+        reference_frame: SemanticFrame | None = None,
+    ) -> Awaitable[SemanticFrame]: ...
+
+
+@runtime_checkable
+class SemanticRenderer(Protocol):
+    def render(
+        self,
+        raw_input: str,
+        instruction: str,
+    ) -> Awaitable[str]: ...
 
 
 @runtime_checkable
