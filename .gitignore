@@ -1,6 +1,9 @@
 # macOS Finder metadata
 .DS_Store
 
+# Temporary artifacts
+/tmp/
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]

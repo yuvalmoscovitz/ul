@@ -1,8 +1,14 @@
 from ul import (
+    DatasetAugmentationEngine,
     ExecutionResult,
     ExecutionStatus,
+    InteractionRecord,
+    OpenRouterDatasetSettings,
+    OpenRouterSemanticDeconstructor,
     Scenario,
     ScenarioProvenance,
+    SemanticFrame,
+    UserInputRecord,
     builtin_augmentation_registry,
 )
 
@@ -37,3 +43,18 @@ def test_sdk_execution_result_preserves_json_safe_provider_evidence() -> None:
 
     assert restored == execution
     assert restored.metadata["generation_id"] == "generation-1"
+
+
+def test_sdk_exposes_dataset_augmentation_api() -> None:
+    record = InteractionRecord(
+        id="observed-interaction",
+        raw_input="Book a visit tomorrow.",
+        raw_observed_output={"action": "visit_booked"},
+    )
+
+    assert record.raw_observed_output == {"action": "visit_booked"}
+    assert DatasetAugmentationEngine is not None
+    assert OpenRouterSemanticDeconstructor is not None
+    assert OpenRouterDatasetSettings is not None
+    assert SemanticFrame.__name__ == "SemanticFrame"
+    assert UserInputRecord.__name__ == "UserInputRecord"
