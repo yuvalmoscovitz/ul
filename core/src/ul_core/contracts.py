@@ -10,7 +10,13 @@ from ul_core.dataset import (
     SemanticFrame,
     UserInputRecord,
 )
-from ul_core.models import ExecutionResult, MaterializedScenario, OracleFinding, Scenario
+from ul_core.models import (
+    ExecutionResult,
+    MaterializedScenario,
+    OracleFinding,
+    SafetyEnvelope,
+    Scenario,
+)
 
 
 @runtime_checkable
@@ -33,6 +39,9 @@ class SemanticRenderer(Protocol):
 
 @runtime_checkable
 class DatasetTargetExecutor(Protocol):
+    @property
+    def safety_envelope(self) -> SafetyEnvelope: ...
+
     def execute(self, raw_input: str) -> Awaitable[ObservedAgentOutput]: ...
 
 

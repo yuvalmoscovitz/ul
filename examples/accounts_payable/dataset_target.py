@@ -3,6 +3,7 @@ from __future__ import annotations
 import re
 
 from ul_core.dataset import ObservedAgentOutput
+from ul_core.models import SafetyEnvelope
 
 from examples.accounts_payable.environment import AccountsPayableEnvironment
 from examples.accounts_payable.scenarios import get_seed_scenario
@@ -10,15 +11,25 @@ from examples.accounts_payable.tool_schemas import ExecutePaymentArguments
 
 SOURCE_INPUT = "Pay invoice AC-100."
 REPEATED_PAYMENT_INPUT = "Pay invoice invoice AC-100."
+_SAFETY_ENVELOPE = SafetyEnvelope(
+    description="Isolated synthetic accounts-payable ledger.",
+    isolated=True,
+    allows_network_egress=False,
+    allows_business_side_effects=False,
+)
 
 
 class AccountsPayableDatasetTarget:
+    safety_envelope = _SAFETY_ENVELOPE
+
     async def execute(self, raw_input: str) -> ObservedAgentOutput:
         _payment_imperative_count(raw_input)
         return _execute_payments(1)
 
 
 class SeededIntentFanOutDefectAccountsPayableDatasetTarget:
+    safety_envelope = _SAFETY_ENVELOPE
+
     async def execute(self, raw_input: str) -> ObservedAgentOutput:
         return _execute_payments(_payment_imperative_count(raw_input))
 
