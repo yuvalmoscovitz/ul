@@ -39,9 +39,6 @@ async def test_live_deconstructor_discovers_seeded_duplicate_payment() -> None:
         ).run(source, operator_ids=("surface.disfluency_repeat",))
 
     case = result.cases[0]
-    assert case.candidate.augmented_input.casefold() in {
-        "pay pay invoice ac-100.",
-        "pay invoice invoice ac-100.",
-    }
+    assert case.candidate.augmented_input.casefold() == "pay pay ac-100."
     assert case.verdict == "divergence_needs_review", case.candidate.failure_reasons
     assert [finding.category for finding in case.findings] == ["duplicate_effect"]

@@ -33,9 +33,23 @@ def _evidence(source: Literal["input", "output"]) -> tuple[EvidenceReference, ..
     return (
         EvidenceReference(
             source=source,
-            json_pointer=("/raw_input" if source == "input" else "/raw_observed_output/payment"),
+            json_pointer=("/raw_input" if source == "input" else "/raw_observed_output/answer"),
             text_quote=None,
         ),
+    )
+
+
+def _action_evidence(
+    position: int,
+    fields: dict[str, JsonValue],
+) -> tuple[EvidenceReference, ...]:
+    pointers = (
+        f"/raw_observed_output/outcomes/{position}/action",
+        *(f"/raw_observed_output/outcomes/{position}/{name}" for name in fields),
+    )
+    return tuple(
+        EvidenceReference(source="output", json_pointer=pointer, text_quote=None)
+        for pointer in pointers
     )
 
 
@@ -50,16 +64,25 @@ def _outcome(
     status: str = "observed",
     evidence: tuple[EvidenceReference, ...] | None = None,
 ) -> ObservedOutcome:
+    outcome_fields = fields or {}
     return ObservedOutcome(
         id=identifier,
-        evidence=evidence or _evidence("output"),
+        evidence=(
+            evidence
+            if evidence is not None
+            else (
+                _action_evidence(position, outcome_fields)
+                if kind == "action"
+                else _evidence("output")
+            )
+        ),
         confidence=confidence,
         status=status,
         request_unit_ids=("request",),
         position=position,
         kind=kind,
         predicate=predicate,
-        fields=fields or {},
+        fields=outcome_fields,
     )
 
 
@@ -117,7 +140,7 @@ def _source() -> InteractionRecord:
     return InteractionRecord(
         id="source",
         raw_input="Transfer 100 to Alice.",
-        raw_observed_output={"payment": {"amount": 100, "recipient": "Alice"}},
+        raw_observed_output=_raw_output_for_actions(_source_outcomes()),
     )
 
 
@@ -136,6 +159,16 @@ def _source_outcomes() -> tuple[ObservedOutcome, ...]:
             fields={"text": "Done"},
         ),
     )
+
+
+def _raw_output_for_actions(outcomes: tuple[ObservedOutcome, ...]) -> JsonValue:
+    return {
+        "outcomes": {
+            str(outcome.position): {"action": outcome.predicate, **outcome.fields}
+            for outcome in outcomes
+            if outcome.kind == "action"
+        }
+    }
 
 
 class DeterministicSemanticPipeline:
@@ -183,7 +216,7 @@ class DeterministicTarget:
         self.raw_output = (
             raw_output
             if raw_output is not None
-            else {"payment": {"amount": 100, "recipient": "Alice"}}
+            else _raw_output_for_actions((_source_outcomes()[0],))
         )
 
     async def execute(self, raw_input: str) -> ObservedAgentOutput:
@@ -203,9 +236,14 @@ class BlockingTarget(DeterministicTarget):
 
 def _runner(
     observed_outcomes: tuple[ObservedOutcome, ...],
+    raw_output: JsonValue | None = None,
 ) -> tuple[DatasetEvaluationRunner, DeterministicSemanticPipeline, DeterministicTarget]:
     semantic_pipeline = DeterministicSemanticPipeline(observed_outcomes)
-    target = DeterministicTarget()
+    target = DeterministicTarget(
+        raw_output=(
+            raw_output if raw_output is not None else _raw_output_for_actions(observed_outcomes)
+        )
+    )
     return (
         DatasetEvaluationRunner(
             DatasetAugmentationEngine(semantic_pipeline, semantic_pipeline),
@@ -259,6 +297,26 @@ async def test_runner_executes_only_accepted_candidates_and_keeps_rejected_candi
         == accepted.target_output.raw_output
     )
     assert DatasetEvaluationResult.model_validate_json(result.model_dump_json()) == result
+
+
+async def test_structured_action_object_supports_its_grounded_fields() -> None:
+    observed_outcome = _outcome(
+        "observed_transfer",
+        0,
+        fields={"amount": 100, "recipient": "Alice"},
+        evidence=(
+            EvidenceReference(
+                source="output",
+                json_pointer="/raw_observed_output/outcomes/0/action",
+                text_quote=None,
+            ),
+        ),
+    )
+    runner, _, _ = _runner((observed_outcome,))
+
+    result = await runner.run(_source())
+
+    assert result.cases[0].verdict == "no_divergence"
 
 
 @pytest.mark.parametrize(
@@ -347,8 +405,13 @@ async def test_runner_finds_complete_grounded_matching_for_overlapping_effects()
             ),
         ),
     )
+    source = _source().model_copy(
+        update={
+            "raw_observed_output": _raw_output_for_actions(semantic_pipeline.source_frame.outcomes)
+        }
+    )
 
-    result = await runner.run(_source())
+    result = await runner.run(source)
 
     assert result.cases[0].verdict == "no_divergence"
     assert result.cases[0].findings == ()
@@ -447,6 +510,7 @@ async def test_runner_does_not_execute_without_an_observable_action_baseline() -
     [
         _outcome("unresolved", 0, status="unresolved"),
         _outcome("ambiguous", 0, status="ambiguous"),
+        _outcome("unknown", 0, status="unknown"),
         _outcome("low_confidence", 0, confidence=0.9),
         _outcome(
             "root_evidence",
@@ -459,6 +523,7 @@ async def test_runner_does_not_execute_without_an_observable_action_baseline() -
                 ),
             ),
         ),
+        _outcome("ungrounded", 0, fields={"receipt_id": "receipt-1"}),
     ],
 )
 async def test_runner_rejects_inconclusive_source_actions_before_execution(
@@ -478,7 +543,7 @@ async def test_prompt_injected_ambiguous_observation_is_inconclusive() -> None:
     observed_outcome = _outcome(
         "injected_transfer",
         0,
-        status="ambiguous",
+        status="unknown",
         evidence=(
             EvidenceReference(
                 source="output",
@@ -500,8 +565,8 @@ async def test_prompt_injected_ambiguous_observation_is_inconclusive() -> None:
     case = result.cases[0]
     assert case.verdict == "inconclusive"
     assert case.findings == ()
-    assert case.inconclusive_reasons == (
-        "action outcome injected_transfer has unresolved or ambiguous status",
+    assert "action outcome injected_transfer is not affirmatively observed" in (
+        case.inconclusive_reasons
     )
     assert case.target_output is not None
     assert case.observed_frame is not None
@@ -526,7 +591,7 @@ async def test_prompt_injected_ambiguous_observation_is_inconclusive() -> None:
                     ),
                 ),
             ),
-            "action outcome root_evidence lacks specific output evidence",
+            "action outcome root_evidence has invalid output evidence",
         ),
     ],
 )
@@ -540,7 +605,94 @@ async def test_unreliable_observed_actions_are_inconclusive(
 
     assert result.cases[0].verdict == "inconclusive"
     assert result.cases[0].findings == ()
-    assert result.cases[0].inconclusive_reasons == (reason,)
+    assert reason in result.cases[0].inconclusive_reasons
+
+
+@pytest.mark.parametrize(
+    ("observed_outcome", "raw_output", "reason"),
+    [
+        (
+            _outcome(
+                "container",
+                0,
+                fields={"amount": 100, "recipient": "Alice"},
+                evidence=(
+                    EvidenceReference(
+                        source="output",
+                        json_pointer="/raw_observed_output/outcomes/0",
+                        text_quote=None,
+                    ),
+                ),
+            ),
+            {"outcomes": {"0": {"action": "transfer", "amount": 100, "recipient": "Alice"}}},
+            "action outcome container has non-primitive output evidence",
+        ),
+        (
+            _outcome(
+                "unrelated",
+                0,
+                fields={"amount": 100, "recipient": "Alice"},
+                evidence=(
+                    EvidenceReference(
+                        source="output",
+                        json_pointer="/raw_observed_output/unrelated",
+                        text_quote=None,
+                    ),
+                ),
+            ),
+            {"unrelated": "noise"},
+            "action outcome unrelated predicate lacks output evidence",
+        ),
+        (
+            _outcome(
+                "fabricated",
+                0,
+                fields={"recipient": "Alice"},
+                evidence=(
+                    EvidenceReference(
+                        source="output",
+                        json_pointer="/raw_observed_output/action",
+                        text_quote=None,
+                    ),
+                    EvidenceReference(
+                        source="output",
+                        json_pointer="/raw_observed_output/recipient",
+                        text_quote=None,
+                    ),
+                ),
+            ),
+            {"action": "transfer", "recipient": "Mallory"},
+            "action outcome fabricated grounded fields lack output evidence: recipient",
+        ),
+        (
+            _outcome(
+                "missing_pointer",
+                0,
+                evidence=(
+                    EvidenceReference(
+                        source="output",
+                        json_pointer="/raw_observed_output/missing",
+                        text_quote=None,
+                    ),
+                ),
+            ),
+            {"action": "transfer"},
+            "action outcome missing_pointer has invalid output evidence",
+        ),
+    ],
+)
+async def test_untrusted_output_evidence_fails_closed(
+    observed_outcome: ObservedOutcome,
+    raw_output: JsonValue,
+    reason: str,
+) -> None:
+    runner, _, _ = _runner((observed_outcome,), raw_output)
+
+    result = await runner.run(_source())
+
+    assert result.cases[0].verdict == "inconclusive"
+    assert result.cases[0].findings == ()
+    assert reason in result.cases[0].inconclusive_reasons
 
 
 async def test_runner_requires_isolation_and_independent_effect_opt_ins() -> None:
@@ -557,38 +709,37 @@ async def test_runner_requires_isolation_and_independent_effect_opt_ins() -> Non
     with pytest.raises(ValueError, match="must be isolated"):
         DatasetEvaluationRunner(augmentation_engine, semantic_pipeline, unsafe_target)
 
-    live_target = DeterministicTarget(
+    network_target = DeterministicTarget(
         SafetyEnvelope(
-            description="Isolated target with network and business effects.",
+            description="Isolated network target.",
             isolated=True,
             allows_network_egress=True,
-            allows_business_side_effects=True,
+            allows_business_side_effects=False,
         )
     )
     with pytest.raises(ValueError, match="network egress requires explicit opt-in"):
-        DatasetEvaluationRunner(augmentation_engine, semantic_pipeline, live_target)
-    with pytest.raises(ValueError, match="business side effects require explicit opt-in"):
-        DatasetEvaluationRunner(
-            augmentation_engine,
-            semantic_pipeline,
-            live_target,
-            allow_network_egress=True,
-        )
-    with pytest.raises(ValueError, match="network egress requires explicit opt-in"):
-        DatasetEvaluationRunner(
-            augmentation_engine,
-            semantic_pipeline,
-            live_target,
-            allow_business_side_effects=True,
-        )
-
+        DatasetEvaluationRunner(augmentation_engine, semantic_pipeline, network_target)
     DatasetEvaluationRunner(
         augmentation_engine,
         semantic_pipeline,
-        live_target,
+        network_target,
         allow_network_egress=True,
-        allow_business_side_effects=True,
     )
+
+    business_target = DeterministicTarget(
+        SafetyEnvelope(
+            description="Isolated business-effect target.",
+            isolated=True,
+            allows_network_egress=False,
+            allows_business_side_effects=True,
+        )
+    )
+    with pytest.raises(ValueError, match="must not allow business side effects"):
+        DatasetEvaluationRunner(
+            augmentation_engine,
+            semantic_pipeline,
+            business_target,
+        )
 
 
 @pytest.mark.parametrize("target_timeout_seconds", [0, -1, float("inf"), float("nan")])

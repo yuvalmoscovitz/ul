@@ -104,7 +104,6 @@ class DatasetEvaluationRunner:
         *,
         target_timeout_seconds: float = 30,
         allow_network_egress: bool = False,
-        allow_business_side_effects: bool = False,
     ) -> None:
         if not math.isfinite(target_timeout_seconds) or target_timeout_seconds <= 0:
             raise ValueError("target_timeout_seconds must be positive and finite")
@@ -113,8 +112,8 @@ class DatasetEvaluationRunner:
             raise ValueError("dataset target must be isolated")
         if safety_envelope.allows_network_egress and not allow_network_egress:
             raise ValueError("dataset target network egress requires explicit opt-in")
-        if safety_envelope.allows_business_side_effects and not allow_business_side_effects:
-            raise ValueError("dataset target business side effects require explicit opt-in")
+        if safety_envelope.allows_business_side_effects:
+            raise ValueError("dataset targets must not allow business side effects")
         self._augmentation_engine = augmentation_engine
         self._deconstructor = deconstructor
         self._target = target
@@ -130,7 +129,11 @@ class DatasetEvaluationRunner:
         source_frame = augmentation.source_frames[0]
         if not any(outcome.kind == "action" for outcome in source_frame.outcomes):
             raise ValueError("source frame requires at least one observable action outcome")
-        source_action_issues = _action_outcome_reliability_issues(source_frame)
+        source_action_issues = _action_outcome_reliability_issues(
+            source_frame,
+            source.raw_observed_output,
+            require_input_grounded_fields=True,
+        )
         if source_action_issues:
             raise ValueError(f"source action outcomes are inconclusive: {source_action_issues[0]}")
         cases: list[DatasetEvaluationCase] = []
@@ -153,7 +156,11 @@ class DatasetEvaluationRunner:
             observed_frame = await self._deconstructor.deconstruct(candidate_record, source_frame)
             if observed_frame.interaction_id != candidate_record.id:
                 raise ValueError("observed frame must reference its candidate interaction")
-            inconclusive_reasons = _action_outcome_reliability_issues(observed_frame)
+            inconclusive_reasons = _action_outcome_reliability_issues(
+                observed_frame,
+                target_output.raw_output,
+                reference_frame=source_frame,
+            )
             if inconclusive_reasons:
                 cases.append(
                     DatasetEvaluationCase(
@@ -178,23 +185,116 @@ class DatasetEvaluationRunner:
         return DatasetEvaluationResult(source=source, augmentation=augmentation, cases=tuple(cases))
 
 
-def _action_outcome_reliability_issues(frame: SemanticFrame) -> tuple[str, ...]:
+def _action_outcome_reliability_issues(
+    frame: SemanticFrame,
+    raw_observed_output: JsonValue,
+    *,
+    reference_frame: SemanticFrame | None = None,
+    require_input_grounded_fields: bool = False,
+) -> tuple[str, ...]:
     issues: list[str] = []
+    input_factor_values = {
+        _json_key(factor.value)
+        for factor in (reference_frame or frame).factors
+        if any(evidence.source == "input" for evidence in factor.evidence)
+    }
     for outcome in frame.outcomes:
         if outcome.kind != "action":
             continue
-        normalized_status = outcome.status.casefold()
-        if "unresolved" in normalized_status or "ambiguous" in normalized_status:
-            issues.append(f"action outcome {outcome.id} has unresolved or ambiguous status")
+        if outcome.status.casefold() != "observed":
+            issues.append(f"action outcome {outcome.id} is not affirmatively observed")
         if outcome.confidence < 1:
             issues.append(f"action outcome {outcome.id} has confidence below 1")
-        if not any(
-            evidence.source == "output"
-            and evidence.json_pointer.startswith("/raw_observed_output/")
-            for evidence in outcome.evidence
+        evidence_values: set[str] = set()
+        for evidence in outcome.evidence:
+            if evidence.source != "output":
+                continue
+            try:
+                evidence_value = _resolve_output_pointer(
+                    raw_observed_output,
+                    evidence.json_pointer,
+                )
+            except ValueError:
+                issues.append(f"action outcome {outcome.id} has invalid output evidence")
+                continue
+            if isinstance(evidence_value, (dict, list)):
+                issues.append(f"action outcome {outcome.id} has non-primitive output evidence")
+                continue
+            evidence_values.add(_json_key(evidence_value))
+        if _json_key(outcome.predicate) not in evidence_values:
+            issues.append(f"action outcome {outcome.id} predicate lacks output evidence")
+        unsupported_grounded_fields = tuple(
+            sorted(
+                name
+                for name, value in outcome.fields.items()
+                if _json_key(value) in input_factor_values
+                and _json_key(value) not in evidence_values
+                and not _predicate_object_supports_output_field(
+                    outcome,
+                    name,
+                    value,
+                    raw_observed_output,
+                )
+            )
+        )
+        if unsupported_grounded_fields:
+            issues.append(
+                f"action outcome {outcome.id} grounded fields lack output evidence: "
+                f"{', '.join(unsupported_grounded_fields)}"
+            )
+        if require_input_grounded_fields and not any(
+            _json_key(value) in input_factor_values for value in outcome.fields.values()
         ):
-            issues.append(f"action outcome {outcome.id} lacks specific output evidence")
+            issues.append(f"action outcome {outcome.id} has no input-grounded fields")
     return tuple(issues)
+
+
+def _predicate_object_supports_output_field(
+    outcome: ObservedOutcome,
+    field_name: str,
+    field_value: JsonValue,
+    raw_observed_output: JsonValue,
+) -> bool:
+    for evidence in outcome.evidence:
+        if evidence.source != "output":
+            continue
+        try:
+            predicate_value = _resolve_output_pointer(
+                raw_observed_output,
+                evidence.json_pointer,
+            )
+            parent_value = _resolve_output_pointer(
+                raw_observed_output,
+                evidence.json_pointer.rsplit("/", 1)[0],
+            )
+        except ValueError:
+            continue
+        if (
+            _json_key(predicate_value) == _json_key(outcome.predicate)
+            and isinstance(parent_value, dict)
+            and field_name in parent_value
+            and _json_key(parent_value[field_name]) == _json_key(field_value)
+        ):
+            return True
+    return False
+
+
+def _resolve_output_pointer(raw_observed_output: JsonValue, pointer: str) -> JsonValue:
+    prefix = "/raw_observed_output/"
+    if not pointer.startswith(prefix):
+        raise ValueError("action evidence must point below raw_observed_output")
+    current: object = raw_observed_output
+    for encoded_token in pointer[len(prefix) :].split("/"):
+        token = encoded_token.replace("~1", "/").replace("~0", "~")
+        if isinstance(current, dict) and token in current:
+            current = current[token]
+            continue
+        valid_array_index = token == "0" or (token.isdecimal() and not token.startswith("0"))
+        if isinstance(current, list) and valid_array_index and int(token) < len(current):
+            current = current[int(token)]
+            continue
+        raise ValueError("action evidence pointer does not resolve")
+    return current
 
 
 def _compare_action_outcomes(

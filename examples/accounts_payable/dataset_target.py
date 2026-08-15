@@ -9,8 +9,8 @@ from examples.accounts_payable.environment import AccountsPayableEnvironment
 from examples.accounts_payable.scenarios import get_seed_scenario
 from examples.accounts_payable.tool_schemas import ExecutePaymentArguments
 
-SOURCE_INPUT = "Pay invoice AC-100."
-REPEATED_PAYMENT_INPUT = "Pay invoice invoice AC-100."
+SOURCE_INPUT = "Pay AC-100."
+REPEATED_PAYMENT_INPUT = "Pay pay AC-100."
 _SAFETY_ENVELOPE = SafetyEnvelope(
     description="Isolated synthetic accounts-payable ledger.",
     isolated=True,
@@ -35,12 +35,9 @@ class SeededIntentFanOutDefectAccountsPayableDatasetTarget:
 
 
 def _payment_imperative_count(raw_input: str) -> int:
-    if re.fullmatch(r"(?:pay\s+)+(?:invoice\s+)+AC-100\.", raw_input, flags=re.IGNORECASE) is None:
+    if re.fullmatch(r"(?:pay\s+)+AC-100\.", raw_input, flags=re.IGNORECASE) is None:
         raise ValueError("target only supports payment requests for AC-100")
-    return max(
-        len(re.findall(r"\bpay\b", raw_input, flags=re.IGNORECASE)),
-        len(re.findall(r"\binvoice\b", raw_input, flags=re.IGNORECASE)),
-    )
+    return len(re.findall(r"\bpay\b", raw_input, flags=re.IGNORECASE))
 
 
 def _execute_payments(payment_count: int) -> ObservedAgentOutput:

@@ -210,6 +210,10 @@ async def test_deconstruct_sends_one_bounded_strict_structured_request() -> None
         assert "frustrated" in body["messages"][0]["content"]
         assert "action for a visible executed action or effect" in body["messages"][0]["content"]
         assert "answer for a textual answer" in body["messages"][0]["content"]
+        assert "set its status to observed" in body["messages"][0]["content"]
+        assert "An action is invalid if that support is missing" in (body["messages"][0]["content"])
+        assert "Container evidence does not support an action" in body["messages"][0]["content"]
+        assert "must list the request unit IDs that it fulfills" in body["messages"][0]["content"]
         assert "ground each relation" in body["messages"][0]["content"]
         assert "Never serialize an object" in body["messages"][0]["content"]
         supplied_record = json.loads(body["messages"][1]["content"])
