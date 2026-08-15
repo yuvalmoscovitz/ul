@@ -319,6 +319,26 @@ async def test_structured_action_object_supports_its_grounded_fields() -> None:
     assert result.cases[0].verdict == "no_divergence"
 
 
+async def test_complete_structured_action_object_is_valid_evidence() -> None:
+    observed_outcome = _outcome(
+        "observed_transfer",
+        0,
+        fields={"amount": 100, "recipient": "Alice"},
+        evidence=(
+            EvidenceReference(
+                source="output",
+                json_pointer="/raw_observed_output/outcomes/0",
+                text_quote=None,
+            ),
+        ),
+    )
+    runner, _, _ = _runner((observed_outcome,))
+
+    result = await runner.run(_source())
+
+    assert result.cases[0].verdict == "no_divergence"
+
+
 @pytest.mark.parametrize(
     ("observed_outcomes", "category"),
     [
@@ -624,8 +644,8 @@ async def test_unreliable_observed_actions_are_inconclusive(
                     ),
                 ),
             ),
-            {"outcomes": {"0": {"action": "transfer", "amount": 100, "recipient": "Alice"}}},
-            "action outcome container has non-primitive output evidence",
+            {"outcomes": {"0": {"details": {"amount": 100, "recipient": "Alice"}}}},
+            "action outcome container has non-action object evidence",
         ),
         (
             _outcome(
@@ -663,6 +683,22 @@ async def test_unreliable_observed_actions_are_inconclusive(
             ),
             {"action": "transfer", "recipient": "Mallory"},
             "action outcome fabricated grounded fields lack output evidence: recipient",
+        ),
+        (
+            _outcome(
+                "fabricated_container",
+                0,
+                fields={"recipient": "Alice"},
+                evidence=(
+                    EvidenceReference(
+                        source="output",
+                        json_pointer="/raw_observed_output/outcome",
+                        text_quote=None,
+                    ),
+                ),
+            ),
+            {"outcome": {"action": "transfer", "recipient": "Mallory"}},
+            ("action outcome fabricated_container grounded fields lack output evidence: recipient"),
         ),
         (
             _outcome(

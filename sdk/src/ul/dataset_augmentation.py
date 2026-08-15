@@ -503,13 +503,18 @@ def _add_word_repetition(
 
 
 def _protected_factor_words(frame: SemanticFrame) -> set[str]:
-    return {
-        word.casefold()
-        for factor in frame.factors
-        for evidence in factor.evidence
-        if evidence.source == "input" and evidence.text_quote is not None
-        for word in re.findall(r"[A-Za-z]+", evidence.text_quote)
-    }
+    protected_words: set[str] = set()
+    for factor in frame.factors:
+        if not isinstance(factor.value, str):
+            continue
+        value_words = {word.casefold() for word in re.findall(r"[A-Za-z]+", factor.value)}
+        for evidence in factor.evidence:
+            if evidence.source == "input" and evidence.text_quote is not None:
+                evidence_words = {
+                    word.casefold() for word in re.findall(r"[A-Za-z]+", evidence.text_quote)
+                }
+                protected_words.update(value_words & evidence_words)
+    return protected_words
 
 
 def _has_ambiguous_nodes(frame: SemanticFrame) -> bool:

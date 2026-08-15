@@ -206,6 +206,7 @@ def _action_outcome_reliability_issues(
         if outcome.confidence < 1:
             issues.append(f"action outcome {outcome.id} has confidence below 1")
         evidence_values: set[str] = set()
+        structured_action_objects: list[dict[str, JsonValue]] = []
         for evidence in outcome.evidence:
             if evidence.source != "output":
                 continue
@@ -217,11 +218,18 @@ def _action_outcome_reliability_issues(
             except ValueError:
                 issues.append(f"action outcome {outcome.id} has invalid output evidence")
                 continue
-            if isinstance(evidence_value, (dict, list)):
+            if isinstance(evidence_value, dict):
+                action_value = evidence_value.get("action")
+                if _json_key(action_value) == _json_key(outcome.predicate):
+                    structured_action_objects.append(evidence_value)
+                    continue
+                issues.append(f"action outcome {outcome.id} has non-action object evidence")
+                continue
+            if isinstance(evidence_value, list):
                 issues.append(f"action outcome {outcome.id} has non-primitive output evidence")
                 continue
             evidence_values.add(_json_key(evidence_value))
-        if _json_key(outcome.predicate) not in evidence_values:
+        if not structured_action_objects and _json_key(outcome.predicate) not in evidence_values:
             issues.append(f"action outcome {outcome.id} predicate lacks output evidence")
         unsupported_grounded_fields = tuple(
             sorted(
@@ -229,6 +237,10 @@ def _action_outcome_reliability_issues(
                 for name, value in outcome.fields.items()
                 if _json_key(value) in input_factor_values
                 and _json_key(value) not in evidence_values
+                and not any(
+                    name in action_object and _json_key(action_object[name]) == _json_key(value)
+                    for action_object in structured_action_objects
+                )
                 and not _predicate_object_supports_output_field(
                     outcome,
                     name,
