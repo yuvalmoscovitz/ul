@@ -8,6 +8,7 @@ from ul_core.dataset import (
     EvidenceReference,
     InteractionRecord,
     ObservedOutcome,
+    RenderedUserInput,
     RequestUnit,
     SemanticFactor,
     SemanticFrame,
@@ -24,6 +25,15 @@ class FrameElementFields(TypedDict):
 
 def frame_element_fields(identifier: str, *, status: str = "explicit") -> FrameElementFields:
     return {"id": identifier, "confidence": 0.9, "status": status}
+
+
+def test_rendered_user_input_preserves_replay_metadata() -> None:
+    rendered = RenderedUserInput(
+        text="transfer 100$ to alice",
+        metadata={"model": "x-ai/grok", "seed": 7},
+    )
+
+    assert RenderedUserInput.model_validate_json(rendered.model_dump_json()) == rendered
 
 
 def test_mixed_action_and_answer_frame_round_trips() -> None:

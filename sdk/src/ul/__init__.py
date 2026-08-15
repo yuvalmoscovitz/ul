@@ -2,7 +2,7 @@
 
 from ul_core.augmentation import builtin_augmentation_registry
 from ul_core.coverage import CoverageArchive
-from ul_core.dataset import InteractionRecord, SemanticFrame, UserInputRecord
+from ul_core.dataset import InteractionRecord, RenderedUserInput, SemanticFrame, UserInputRecord
 from ul_core.models import (
     Action,
     ActionEffect,
@@ -19,7 +19,12 @@ from ul_core.models import (
 )
 
 from ul.campaign import CampaignRunner
-from ul.dataset_augmentation import DatasetAugmentationEngine, DatasetAugmentationResult
+from ul.dataset_augmentation import (
+    DatasetAugmentationEngine,
+    DatasetAugmentationOperator,
+    DatasetAugmentationResult,
+    builtin_dataset_augmentation_operators,
+)
 from ul.deconstruction import OpenRouterDatasetSettings, OpenRouterSemanticDeconstructor
 
 __all__ = [
@@ -29,6 +34,7 @@ __all__ = [
     "CampaignRunner",
     "CoverageArchive",
     "DatasetAugmentationEngine",
+    "DatasetAugmentationOperator",
     "DatasetAugmentationResult",
     "ExecutionMode",
     "ExecutionResult",
@@ -39,10 +45,12 @@ __all__ = [
     "OpenRouterDatasetSettings",
     "OpenRouterSemanticDeconstructor",
     "OracleFinding",
+    "RenderedUserInput",
     "SafetyEnvelope",
     "Scenario",
     "ScenarioProvenance",
     "SemanticFrame",
     "UserInputRecord",
     "builtin_augmentation_registry",
+    "builtin_dataset_augmentation_operators",
 ]

@@ -1,15 +1,18 @@
 from ul import (
     DatasetAugmentationEngine,
+    DatasetAugmentationOperator,
     ExecutionResult,
     ExecutionStatus,
     InteractionRecord,
     OpenRouterDatasetSettings,
     OpenRouterSemanticDeconstructor,
+    RenderedUserInput,
     Scenario,
     ScenarioProvenance,
     SemanticFrame,
     UserInputRecord,
     builtin_augmentation_registry,
+    builtin_dataset_augmentation_operators,
 )
 
 
@@ -54,7 +57,10 @@ def test_sdk_exposes_dataset_augmentation_api() -> None:
 
     assert record.raw_observed_output == {"action": "visit_booked"}
     assert DatasetAugmentationEngine is not None
+    assert DatasetAugmentationOperator.__name__ == "DatasetAugmentationOperator"
+    assert len(builtin_dataset_augmentation_operators()) == 7
     assert OpenRouterSemanticDeconstructor is not None
     assert OpenRouterDatasetSettings is not None
+    assert RenderedUserInput(text="hey").text == "hey"
     assert SemanticFrame.__name__ == "SemanticFrame"
     assert UserInputRecord.__name__ == "UserInputRecord"
