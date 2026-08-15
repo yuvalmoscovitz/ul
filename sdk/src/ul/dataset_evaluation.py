@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import math
+import re
 from collections import defaultdict
 from collections.abc import Iterable
 from typing import Literal, Self
@@ -56,13 +57,18 @@ class DatasetEvaluationCase(_StrictULModel):
 
     @model_validator(mode="after")
     def validate_execution_state(self) -> Self:
-        if (self.target_output is None) != (self.observed_frame is None):
-            raise ValueError("target output and observed frame must be provided together")
-        execution_present = self.target_output is not None and self.observed_frame is not None
-        if self.candidate.passed != execution_present:
-            raise ValueError("only accepted candidates may have an observed execution")
-        if not execution_present and (self.findings or self.inconclusive_reasons):
-            raise ValueError("unexecuted candidates cannot have evaluation results")
+        if self.observed_frame is not None and self.target_output is None:
+            raise ValueError("an observed frame requires target output")
+        if not self.candidate.passed and (
+            self.target_output is not None or self.observed_frame is not None
+        ):
+            raise ValueError("rejected candidates cannot have an observed execution")
+        if self.candidate.passed and self.target_output is None:
+            raise ValueError("accepted candidates require target output")
+        if self.candidate.passed and self.observed_frame is None and not self.inconclusive_reasons:
+            raise ValueError("missing observed frames require an inconclusive reason")
+        if self.observed_frame is None and self.findings:
+            raise ValueError("findings require an observed frame")
         if self.findings and self.inconclusive_reasons:
             raise ValueError("inconclusive cases cannot have findings")
         expected_verdict: CaseVerdict
@@ -132,6 +138,7 @@ class DatasetEvaluationRunner:
         source_action_issues = _action_outcome_reliability_issues(
             source_frame,
             source.raw_observed_output,
+            source.raw_input,
             require_input_grounded_fields=True,
         )
         if source_action_issues:
@@ -153,12 +160,29 @@ class DatasetEvaluationRunner:
                 raw_input=candidate.augmented_input,
                 raw_observed_output=target_output.raw_output,
             )
-            observed_frame = await self._deconstructor.deconstruct(candidate_record, source_frame)
+            try:
+                observed_frame = await self._deconstructor.deconstruct(
+                    candidate_record,
+                    source_frame,
+                )
+            except ValueError:
+                cases.append(
+                    DatasetEvaluationCase(
+                        candidate=candidate,
+                        verdict="inconclusive",
+                        target_output=target_output,
+                        inconclusive_reasons=(
+                            "target output could not be semantically deconstructed",
+                        ),
+                    )
+                )
+                continue
             if observed_frame.interaction_id != candidate_record.id:
                 raise ValueError("observed frame must reference its candidate interaction")
             inconclusive_reasons = _action_outcome_reliability_issues(
                 observed_frame,
                 target_output.raw_output,
+                source.raw_input,
                 reference_frame=source_frame,
             )
             if inconclusive_reasons:
@@ -172,7 +196,11 @@ class DatasetEvaluationRunner:
                     )
                 )
                 continue
-            findings = _compare_action_outcomes(source_frame, observed_frame)
+            findings = _compare_action_outcomes(
+                source_frame,
+                observed_frame,
+                source.raw_input,
+            )
             cases.append(
                 DatasetEvaluationCase(
                     candidate=candidate,
@@ -188,16 +216,16 @@ class DatasetEvaluationRunner:
 def _action_outcome_reliability_issues(
     frame: SemanticFrame,
     raw_observed_output: JsonValue,
+    source_input: str,
     *,
     reference_frame: SemanticFrame | None = None,
     require_input_grounded_fields: bool = False,
 ) -> tuple[str, ...]:
     issues: list[str] = []
-    input_factor_values = {
-        _json_key(factor.value)
-        for factor in (reference_frame or frame).factors
-        if any(evidence.source == "input" for evidence in factor.evidence)
-    }
+    input_grounded_values = _input_grounded_action_values(
+        reference_frame or frame,
+        source_input,
+    )
     for outcome in frame.outcomes:
         if outcome.kind != "action":
             continue
@@ -205,8 +233,7 @@ def _action_outcome_reliability_issues(
             issues.append(f"action outcome {outcome.id} is not affirmatively observed")
         if outcome.confidence < 1:
             issues.append(f"action outcome {outcome.id} has confidence below 1")
-        evidence_values: set[str] = set()
-        structured_action_objects: list[dict[str, JsonValue]] = []
+        evidenced_action_objects: list[dict[str, JsonValue]] = []
         for evidence in outcome.evidence:
             if evidence.source != "output":
                 continue
@@ -221,77 +248,66 @@ def _action_outcome_reliability_issues(
             if isinstance(evidence_value, dict):
                 action_value = evidence_value.get("action")
                 if _json_key(action_value) == _json_key(outcome.predicate):
-                    structured_action_objects.append(evidence_value)
+                    evidenced_action_objects.append(evidence_value)
                     continue
                 issues.append(f"action outcome {outcome.id} has non-action object evidence")
                 continue
             if isinstance(evidence_value, list):
                 issues.append(f"action outcome {outcome.id} has non-primitive output evidence")
                 continue
-            evidence_values.add(_json_key(evidence_value))
-        if not structured_action_objects and _json_key(outcome.predicate) not in evidence_values:
-            issues.append(f"action outcome {outcome.id} predicate lacks output evidence")
-        unsupported_grounded_fields = tuple(
-            sorted(
-                name
-                for name, value in outcome.fields.items()
-                if _json_key(value) in input_factor_values
-                and _json_key(value) not in evidence_values
-                and not any(
-                    name in action_object and _json_key(action_object[name]) == _json_key(value)
-                    for action_object in structured_action_objects
-                )
-                and not _predicate_object_supports_output_field(
-                    outcome,
-                    name,
-                    value,
-                    raw_observed_output,
-                )
+            if _json_key(evidence_value) == _json_key(outcome.predicate):
+                try:
+                    parent_value = _resolve_output_pointer(
+                        raw_observed_output,
+                        evidence.json_pointer.rsplit("/", 1)[0],
+                    )
+                except ValueError:
+                    continue
+                if isinstance(parent_value, dict):
+                    evidenced_action_objects.append(parent_value)
+        grounded_fields = {
+            name: value
+            for name, value in outcome.fields.items()
+            if _json_key(value) in input_grounded_values
+        }
+        if not evidenced_action_objects:
+            issues.append(f"action outcome {outcome.id} predicate lacks coherent action evidence")
+        elif grounded_fields and not any(
+            all(
+                name in action_object and _json_key(action_object[name]) == _json_key(value)
+                for name, value in grounded_fields.items()
             )
-        )
-        if unsupported_grounded_fields:
-            issues.append(
-                f"action outcome {outcome.id} grounded fields lack output evidence: "
-                f"{', '.join(unsupported_grounded_fields)}"
-            )
-        if require_input_grounded_fields and not any(
-            _json_key(value) in input_factor_values for value in outcome.fields.values()
+            for action_object in evidenced_action_objects
         ):
+            issues.append(
+                f"action outcome {outcome.id} grounded fields lack one coherent action record: "
+                f"{', '.join(sorted(grounded_fields))}"
+            )
+        if require_input_grounded_fields and not grounded_fields:
             issues.append(f"action outcome {outcome.id} has no input-grounded fields")
     return tuple(issues)
 
 
-def _predicate_object_supports_output_field(
-    outcome: ObservedOutcome,
-    field_name: str,
-    field_value: JsonValue,
-    raw_observed_output: JsonValue,
-) -> bool:
-    for evidence in outcome.evidence:
-        if evidence.source != "output":
-            continue
-        try:
-            predicate_value = _resolve_output_pointer(
-                raw_observed_output,
-                evidence.json_pointer,
-            )
-            parent_value = _resolve_output_pointer(
-                raw_observed_output,
-                evidence.json_pointer.rsplit("/", 1)[0],
-            )
-        except ValueError:
-            continue
-        if (
-            _json_key(predicate_value) == _json_key(outcome.predicate)
-            and isinstance(parent_value, dict)
-            and field_name in parent_value
-            and _json_key(parent_value[field_name]) == _json_key(field_value)
-        ):
-            return True
-    return False
+def _input_grounded_action_values(frame: SemanticFrame, source_input: str) -> set[str]:
+    return {
+        _json_key(value)
+        for outcome in frame.outcomes
+        if outcome.kind == "action"
+        for value in outcome.fields.values()
+        if _value_appears_in_input(value, source_input)
+    }
+
+
+def _value_appears_in_input(value: JsonValue, source_input: str) -> bool:
+    if value is None or isinstance(value, (dict, list)):
+        return False
+    value_text = str(value).casefold()
+    return re.search(rf"(?<!\w){re.escape(value_text)}(?!\w)", source_input.casefold()) is not None
 
 
 def _resolve_output_pointer(raw_observed_output: JsonValue, pointer: str) -> JsonValue:
+    if pointer == "/raw_observed_output":
+        return raw_observed_output
     prefix = "/raw_observed_output/"
     if not pointer.startswith(prefix):
         raise ValueError("action evidence must point below raw_observed_output")
@@ -312,14 +328,11 @@ def _resolve_output_pointer(raw_observed_output: JsonValue, pointer: str) -> Jso
 def _compare_action_outcomes(
     expected_frame: SemanticFrame,
     observed_frame: SemanticFrame,
+    source_input: str,
 ) -> tuple[DatasetEvaluationFinding, ...]:
     expected_by_key = _action_outcomes_by_key(expected_frame)
     observed_by_key = _action_outcomes_by_key(observed_frame)
-    input_factor_values = {
-        _json_key(factor.value)
-        for factor in expected_frame.factors
-        if any(evidence.source == "input" for evidence in factor.evidence)
-    }
+    input_grounded_values = _input_grounded_action_values(expected_frame, source_input)
     findings: list[DatasetEvaluationFinding] = []
     for key in sorted(expected_by_key.keys() | observed_by_key.keys()):
         expected = expected_by_key.get(key, ())
@@ -338,7 +351,7 @@ def _compare_action_outcomes(
             continue
 
         unmatched_expected, unmatched_observed = _remove_grounded_matches(
-            expected, observed, input_factor_values
+            expected, observed, input_grounded_values
         )
         changed_count = min(len(unmatched_expected), len(unmatched_observed))
         for expected_effect, observed_effect in zip(
@@ -347,7 +360,7 @@ def _compare_action_outcomes(
             strict=True,
         ):
             grounded_field_names = _changed_grounded_field_names(
-                expected_effect, observed_effect, input_factor_values
+                expected_effect, observed_effect, input_grounded_values
             )
             findings.append(
                 DatasetEvaluationFinding(
@@ -380,7 +393,7 @@ def _compare_action_outcomes(
             effect
             for effect in remaining_observed
             if any(
-                _grounded_effect_matches(expected_effect, effect, input_factor_values)
+                _grounded_effect_matches(expected_effect, effect, input_grounded_values)
                 for expected_effect in expected
             )
         )
@@ -424,7 +437,7 @@ def _action_outcomes_by_key(
 def _remove_grounded_matches(
     expected: tuple[ObservedOutcome, ...],
     observed: tuple[ObservedOutcome, ...],
-    input_factor_values: set[str],
+    input_grounded_values: set[str],
 ) -> tuple[tuple[ObservedOutcome, ...], tuple[ObservedOutcome, ...]]:
     compatible_observed_indexes: list[tuple[int, ...]] = []
     for expected_effect in expected:
@@ -435,7 +448,7 @@ def _remove_grounded_matches(
                 if _grounded_effect_matches(
                     expected_effect,
                     observed_effect,
-                    input_factor_values,
+                    input_grounded_values,
                 )
             )
         )
@@ -471,12 +484,12 @@ def _remove_grounded_matches(
 def _grounded_effect_matches(
     expected: ObservedOutcome,
     observed: ObservedOutcome,
-    input_factor_values: set[str],
+    input_grounded_values: set[str],
 ) -> bool:
     expected_grounded_fields = {
         name: value
         for name, value in expected.fields.items()
-        if _json_key(value) in input_factor_values
+        if _json_key(value) in input_grounded_values
     }
     return all(
         name in observed.fields and _json_key(observed.fields[name]) == _json_key(value)
@@ -487,13 +500,13 @@ def _grounded_effect_matches(
 def _changed_grounded_field_names(
     expected: ObservedOutcome,
     observed: ObservedOutcome,
-    input_factor_values: set[str],
+    input_grounded_values: set[str],
 ) -> tuple[str, ...]:
     return tuple(
         sorted(
             name
             for name, value in expected.fields.items()
-            if _json_key(value) in input_factor_values
+            if _json_key(value) in input_grounded_values
             and (
                 name not in observed.fields or _json_key(observed.fields[name]) != _json_key(value)
             )
