@@ -6,7 +6,7 @@ import math
 import re
 from collections import defaultdict
 from collections.abc import Iterable
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from typing import Literal, Self
 
 from pydantic import ConfigDict, Field, JsonValue, model_validator
@@ -26,6 +26,7 @@ FindingCategory = Literal[
     "missing_effect",
     "changed_grounded_effect_argument",
 ]
+_NUMBER_PATTERN = r"[-+]?(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?(?:e[-+]?\d+)?"
 CaseVerdict = Literal[
     "augmentation_rejected",
     "inconclusive",
@@ -307,16 +308,29 @@ def _value_appears_in_input(value: JsonValue, source_input: str) -> bool:
         return False
     if isinstance(value, str) and not value.strip():
         return False
+    numeric_text: str | None = None
     if isinstance(value, (int, float)) and not isinstance(value, bool):
-        normalized_value = Decimal(str(value))
-        number_pattern = (
-            r"(?<![\w.])[-+]?(?:\d{1,3}(?:,\d{3})+|\d+)"
-            r"(?:\.\d+)?(?:e[-+]?\d+)?(?![\w.])"
-        )
-        return any(
-            Decimal(match.group().replace(",", "")) == normalized_value
-            for match in re.finditer(number_pattern, source_input, re.IGNORECASE)
-        )
+        numeric_text = str(value)
+    elif (
+        isinstance(value, str)
+        and re.fullmatch(_NUMBER_PATTERN, value.strip(), re.IGNORECASE)
+        and any(marker in value.casefold() for marker in (".", ",", "e"))
+    ):
+        numeric_text = value.strip()
+    if numeric_text is not None:
+        try:
+            normalized_value = Decimal(numeric_text.replace(",", ""))
+        except InvalidOperation:
+            return False
+        bounded_number_pattern = rf"(?<![\w.]){_NUMBER_PATTERN}(?![\w.])"
+        for match in re.finditer(bounded_number_pattern, source_input, re.IGNORECASE):
+            try:
+                candidate_value = Decimal(match.group().replace(",", ""))
+            except InvalidOperation:
+                continue
+            if candidate_value == normalized_value:
+                return True
+        return False
     value_text = str(value).casefold()
     return re.search(rf"(?<!\w){re.escape(value_text)}(?!\w)", source_input.casefold()) is not None
 

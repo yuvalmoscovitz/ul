@@ -693,16 +693,39 @@ async def test_runner_rejects_empty_source_action_values_before_execution() -> N
     assert target.raw_inputs == []
 
 
-async def test_numeric_formatting_keeps_amount_grounded() -> None:
+async def test_runner_rejects_malformed_numeric_source_input_before_execution() -> None:
+    source_outcome = _outcome("numeric_value", 0, fields={"amount": 50})
+    runner, semantic_pipeline, target = _runner((_source_outcomes()[0],))
+    semantic_pipeline.source_frame = _frame("source", (source_outcome,))
+    source = InteractionRecord(
+        id="source",
+        raw_input="Transfer 1e999999999999999999999 to Alice.",
+        raw_observed_output=_raw_output_for_actions((source_outcome,)),
+    )
+
+    with pytest.raises(ValueError, match="source action outcomes are inconclusive"):
+        await runner.run(source)
+
+    assert target.raw_inputs == []
+
+
+@pytest.mark.parametrize(
+    ("source_amount", "observed_amount"),
+    [(100.5, 999), ("100.5", "999")],
+)
+async def test_numeric_formatting_keeps_amount_grounded(
+    source_amount: JsonValue,
+    observed_amount: JsonValue,
+) -> None:
     source_outcome = _outcome(
         "source_transfer",
         0,
-        fields={"amount": 100.5, "recipient": "Alice"},
+        fields={"amount": source_amount, "recipient": "Alice"},
     )
     observed_outcome = _outcome(
         "observed_transfer",
         0,
-        fields={"amount": 999, "recipient": "Alice"},
+        fields={"amount": observed_amount, "recipient": "Alice"},
     )
     runner, semantic_pipeline, _ = _runner((observed_outcome,))
     semantic_pipeline.source_frame = _frame("source", (source_outcome,))
