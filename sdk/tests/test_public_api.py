@@ -1,9 +1,13 @@
 from ul import (
     DatasetAugmentationEngine,
     DatasetAugmentationOperator,
+    DatasetEvaluationFinding,
+    DatasetEvaluationRunner,
+    DatasetTargetExecutor,
     ExecutionResult,
     ExecutionStatus,
     InteractionRecord,
+    ObservedAgentOutput,
     OpenRouterDatasetSettings,
     OpenRouterSemanticDeconstructor,
     RenderedUserInput,
@@ -58,9 +62,15 @@ def test_sdk_exposes_dataset_augmentation_api() -> None:
     assert record.raw_observed_output == {"action": "visit_booked"}
     assert DatasetAugmentationEngine is not None
     assert DatasetAugmentationOperator.__name__ == "DatasetAugmentationOperator"
+    assert DatasetEvaluationFinding.__name__ == "DatasetEvaluationFinding"
+    assert DatasetEvaluationRunner.__name__ == "DatasetEvaluationRunner"
+    assert DatasetTargetExecutor.__name__ == "DatasetTargetExecutor"
     assert len(builtin_dataset_augmentation_operators()) == 7
     assert OpenRouterSemanticDeconstructor is not None
     assert OpenRouterDatasetSettings is not None
+    assert ObservedAgentOutput(raw_output={"action": "visit_booked"}).raw_output == {
+        "action": "visit_booked"
+    }
     assert RenderedUserInput(text="hey").text == "hey"
     assert SemanticFrame.__name__ == "SemanticFrame"
     assert UserInputRecord.__name__ == "UserInputRecord"

@@ -5,6 +5,7 @@ from typing import Protocol, runtime_checkable
 
 from ul_core.dataset import (
     InteractionRecord,
+    ObservedAgentOutput,
     RenderedUserInput,
     SemanticFrame,
     UserInputRecord,
@@ -28,6 +29,11 @@ class SemanticRenderer(Protocol):
         raw_input: str,
         instruction: str,
     ) -> Awaitable[RenderedUserInput]: ...
+
+
+@runtime_checkable
+class DatasetTargetExecutor(Protocol):
+    def execute(self, raw_input: str) -> Awaitable[ObservedAgentOutput]: ...
 
 
 @runtime_checkable

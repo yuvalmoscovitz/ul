@@ -34,6 +34,17 @@ class RenderedUserInput(_StrictULModel):
     metadata: dict[str, JsonValue] = Field(default_factory=dict)
 
 
+class ObservedAgentOutput(_StrictULModel):
+    raw_output: JsonValue
+    metadata: dict[str, JsonValue] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def validate_output(self) -> Self:
+        if self.raw_output is None:
+            raise ValueError("agent observations require an output")
+        return self
+
+
 class EvidenceReference(_StrictULModel):
     source: Literal["input", "output"]
     json_pointer: str
