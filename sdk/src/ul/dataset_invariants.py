@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Literal, Self, cast
 
 from pydantic import ConfigDict, Field, JsonValue, ValidationError, field_validator, model_validator
+from ul_core.dataset import ObservedAgentOutput
 from ul_core.models import ULModel
 
 from ul.dataset_evaluation import DatasetEvaluationResult, DatasetEvaluationTrial
@@ -320,6 +321,15 @@ def evaluate_dataset_invariants(
     )
 
 
+def evaluate_dataset_invariant_rules(
+    rules: tuple[JsonValuesEqualInvariant, ...],
+    outputs: tuple[ObservedAgentOutput | None, ...],
+) -> tuple[DatasetInvariantRuleEvaluation, ...]:
+    if not outputs:
+        raise ValueError("invariant evaluation requires at least one target output")
+    return tuple(_evaluate_rule_from_outputs(rule, outputs) for rule in rules)
+
+
 def _evaluate_arm(
     suite: DatasetInvariantSuite,
     trials: tuple[DatasetEvaluationTrial, ...],
@@ -338,7 +348,17 @@ def _evaluate_rule(
     rule: JsonValuesEqualInvariant,
     trials: tuple[DatasetEvaluationTrial, ...],
 ) -> DatasetInvariantRuleEvaluation:
-    trial_results = tuple(_evaluate_trial(rule, trial) for trial in trials)
+    return _evaluate_rule_from_outputs(rule, tuple(trial.target_output for trial in trials))
+
+
+def _evaluate_rule_from_outputs(
+    rule: JsonValuesEqualInvariant,
+    outputs: tuple[ObservedAgentOutput | None, ...],
+) -> DatasetInvariantRuleEvaluation:
+    trial_results = tuple(
+        _evaluate_output(rule, output, repetition)
+        for repetition, output in enumerate(outputs, start=1)
+    )
     statuses = {trial.status for trial in trial_results}
     if "violated" in statuses:
         status: InvariantStatus = "violated"
@@ -361,31 +381,32 @@ def _evaluate_rule(
     )
 
 
-def _evaluate_trial(
+def _evaluate_output(
     rule: JsonValuesEqualInvariant,
-    trial: DatasetEvaluationTrial,
+    target_output: ObservedAgentOutput | None,
+    repetition: int,
 ) -> DatasetInvariantTrialEvaluation:
-    if trial.target_output is None:
-        return _trial_result(rule, trial.repetition, "not_evaluable", "target_output_missing")
+    if target_output is None:
+        return _trial_result(rule, repetition, "not_evaluable", "target_output_missing")
     left_found, left_value = _resolve_json_pointer(
-        trial.target_output.raw_output,
+        target_output.raw_output,
         rule.left_pointer,
     )
     if not left_found:
-        return _trial_result(rule, trial.repetition, "not_evaluable", "left_pointer_missing")
+        return _trial_result(rule, repetition, "not_evaluable", "left_pointer_missing")
     if not _is_json_scalar(left_value):
-        return _trial_result(rule, trial.repetition, "not_evaluable", "left_value_not_scalar")
+        return _trial_result(rule, repetition, "not_evaluable", "left_value_not_scalar")
     if isinstance(left_value, float):
         return _trial_result(
             rule,
-            trial.repetition,
+            repetition,
             "not_evaluable",
             "left_non_integer_number_not_supported",
         )
     if not _resolved_value_fits(left_value):
         return _trial_result(
             rule,
-            trial.repetition,
+            repetition,
             "not_evaluable",
             "left_value_exceeds_limit",
         )
@@ -393,13 +414,13 @@ def _evaluate_trial(
         "left": cast(JsonValue, left_value)
     }
     right_found, right_value = _resolve_json_pointer(
-        trial.target_output.raw_output,
+        target_output.raw_output,
         rule.right_pointer,
     )
     if not right_found:
         return _trial_result(
             rule,
-            trial.repetition,
+            repetition,
             "not_evaluable",
             "right_pointer_missing",
             resolved_values,
@@ -407,7 +428,7 @@ def _evaluate_trial(
     if not _is_json_scalar(right_value):
         return _trial_result(
             rule,
-            trial.repetition,
+            repetition,
             "not_evaluable",
             "right_value_not_scalar",
             resolved_values,
@@ -415,7 +436,7 @@ def _evaluate_trial(
     if isinstance(right_value, float):
         return _trial_result(
             rule,
-            trial.repetition,
+            repetition,
             "not_evaluable",
             "right_non_integer_number_not_supported",
             resolved_values,
@@ -423,7 +444,7 @@ def _evaluate_trial(
     if not _resolved_value_fits(right_value):
         return _trial_result(
             rule,
-            trial.repetition,
+            repetition,
             "not_evaluable",
             "right_value_exceeds_limit",
             resolved_values,
@@ -433,14 +454,14 @@ def _evaluate_trial(
     if not comparable:
         return _trial_result(
             rule,
-            trial.repetition,
+            repetition,
             "not_evaluable",
             "operand_types_differ",
             resolved_values,
         )
     return _trial_result(
         rule,
-        trial.repetition,
+        repetition,
         "satisfied" if equal else "violated",
         "values_equal" if equal else "values_differ",
         resolved_values,

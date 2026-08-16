@@ -20,6 +20,7 @@ from examples.accounts_payable.ul_adapter import (
     to_ul_scenario,
 )
 from ul_cli.dataset import app as dataset_app
+from ul_cli.dataset_regression import app as regression_app
 
 app = typer.Typer(
     name="ul",
@@ -30,6 +31,7 @@ augmentations_app = typer.Typer(help="Inspect UL's built-in augmentation library
 demo_app = typer.Typer(help="Run an isolated proving-ground agent.")
 app.add_typer(augmentations_app, name="augmentations")
 app.add_typer(dataset_app, name="dataset")
+app.add_typer(regression_app, name="regression")
 app.add_typer(demo_app, name="demo")
 
 console = Console()

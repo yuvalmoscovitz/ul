@@ -12,6 +12,8 @@ from ul import (
     DatasetInvariantRuleEvaluation,
     DatasetInvariantSuite,
     DatasetInvariantTrialEvaluation,
+    DatasetRegressionCase,
+    DatasetRegressionResult,
     DatasetTargetExecutor,
     ExecutionResult,
     ExecutionStatus,
@@ -32,9 +34,13 @@ from ul import (
     UserInputRecord,
     builtin_augmentation_registry,
     builtin_dataset_augmentation_operators,
+    create_dataset_regression_case,
+    dataset_regression_target_config_sha256,
     evaluate_dataset_invariants,
     load_dataset_invariant_suite,
+    load_dataset_regression_case,
     load_json_http_dataset_target_config,
+    replay_dataset_regression,
 )
 
 
@@ -91,13 +97,21 @@ def test_sdk_exposes_dataset_augmentation_api() -> None:
     assert DatasetInvariantRuleEvaluation.__name__ == "DatasetInvariantRuleEvaluation"
     assert DatasetInvariantSuite.__name__ == "DatasetInvariantSuite"
     assert DatasetInvariantTrialEvaluation.__name__ == "DatasetInvariantTrialEvaluation"
+    assert DatasetRegressionCase.__name__ == "DatasetRegressionCase"
+    assert DatasetRegressionResult.__name__ == "DatasetRegressionResult"
     assert DatasetTargetExecutor.__name__ == "DatasetTargetExecutor"
     assert JsonHttpDatasetTarget.__name__ == "JsonHttpDatasetTarget"
     assert JsonHttpDatasetTargetConfig.__name__ == "JsonHttpDatasetTargetConfig"
     assert JsonValuesEqualInvariant.__name__ == "JsonValuesEqualInvariant"
     assert load_json_http_dataset_target_config.__name__ == ("load_json_http_dataset_target_config")
     assert evaluate_dataset_invariants.__name__ == "evaluate_dataset_invariants"
+    assert create_dataset_regression_case.__name__ == "create_dataset_regression_case"
+    assert dataset_regression_target_config_sha256.__name__ == (
+        "dataset_regression_target_config_sha256"
+    )
     assert load_dataset_invariant_suite.__name__ == "load_dataset_invariant_suite"
+    assert load_dataset_regression_case.__name__ == "load_dataset_regression_case"
+    assert replay_dataset_regression.__name__ == "replay_dataset_regression"
     assert len(builtin_dataset_augmentation_operators()) == 8
     assert OpenRouterSemanticDeconstructor is not None
     assert OpenRouterDatasetSettings is not None

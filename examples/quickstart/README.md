@@ -90,6 +90,42 @@ unchanged. UL creates it with mode `0600` on Unix; on Windows it inherits the pa
 access controls, so use a directory restricted to the review team. The report keeps UL's machine
 observation separate from the reviewer's contextual judgment.
 
+The bundled runner stops its ephemeral server and deletes its temporary target configuration
+when it exits, so its evidence is intentionally not replayable afterward. In a customer workflow,
+keep a persistent sandbox configuration and use it to preserve a confirmed finding as an exact
+regression case:
+
+```bash
+uv run ul regression save PATH_TO_EVIDENCE.jsonl FINDING_ID \
+  --rule committed-invoice-matches-request \
+  --target-config PATH_TO_TARGET.json \
+  --output regressions/quickstart-wrong-invoice.json \
+  --confirm-versioned-input
+
+uv run ul regression replay regressions/quickstart-wrong-invoice.json \
+  --target-config PATH_TO_TARGET.json \
+  --allow-target-network \
+  --confirm-isolated-sandbox \
+  --confirm-fresh-state \
+  --allow-insecure-http \
+  --max-target-calls 3 \
+  --output tmp/quickstart-replay.json
+```
+
+Saving requires the explicit confirmation because the case contains the exact raw variation and
+literal target-template values, which may be sensitive. UL does not redact them automatically
+because that could alter the reproduced behavior. The embedded target configuration is declared
+by the customer when the case is created, not verified as the discovery target, and may contain
+sensitive literal template values.
+It is never executed; replay requires a separately trusted configuration with the same digest.
+Complete replay evidence contains raw target outputs and may also be sensitive.
+
+Replay performs the saved three trials directly against the target with no generation,
+equivalence, or other semantic-model calls. The seeded defective target violates the rule and
+therefore exits `1`. A target that returns matching requested and committed invoice references in
+all three trials exits `0`. That outcome shows only that this saved customer rule held for this
+case; it is not proof that the implementation is correct or that every related failure is fixed.
+
 ## Limitations
 
 The example is intentionally small and deterministic on the target side. Variation generation,

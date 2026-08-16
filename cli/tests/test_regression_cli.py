@@ -1,0 +1,572 @@
+from __future__ import annotations
+
+import json
+import os
+import stat
+import threading
+from collections.abc import Generator
+from contextlib import contextmanager
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from typing import Any, cast
+
+import pytest
+from typer.testing import CliRunner
+from ul_cli.main import app
+
+runner = CliRunner()
+FINDING_ID = f"ulf_v1_{'a' * 64}"
+RULE_ID = "committed-invoice-matches-request"
+SECOND_RULE_ID = "committed-amount-matches-request"
+TEST_SECRET = "regression-test-secret-must-not-leak"
+
+
+def _effect(invoice_reference: str) -> dict[str, Any]:
+    return {
+        "id": f"payment-{invoice_reference}",
+        "evidence": [],
+        "confidence": 1.0,
+        "status": "completed",
+        "request_unit_ids": [],
+        "position": 0,
+        "kind": "action",
+        "predicate": "payment_committed",
+        "fields": {"invoice_reference": invoice_reference},
+        "propositions": [],
+    }
+
+
+def _observations(effect: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "requested_repetitions": 3,
+        "stability": "stable",
+        "observed_repetitions": 3,
+        "inconclusive_repetitions": 0,
+        "outcome_group_count": 1,
+        "outcome_groups": [
+            {
+                "repetitions": [1, 2, 3],
+                "count": 3,
+                "representative_effects": [effect],
+            }
+        ],
+        "trials": [
+            {"repetition": repetition, "status": "observed", "inconclusive_reasons": []}
+            for repetition in (1, 2, 3)
+        ],
+    }
+
+
+def _rule(status: str, committed: str, requested: str) -> dict[str, Any]:
+    return {
+        "rule_type": "json_values_equal",
+        "rule_id": RULE_ID,
+        "rule_version": "1.0.0",
+        "description": "The committed invoice must equal the requested invoice.",
+        "severity": "high",
+        "status": status,
+        "reason_code": (
+            "all_trials_satisfied" if status == "satisfied" else "one_or_more_trials_violated"
+        ),
+        "trials": [
+            {
+                "repetition": repetition,
+                "status": status,
+                "reason_code": "values_equal" if status == "satisfied" else "values_differ",
+                "left_pointer": "/invoice_reference",
+                "right_pointer": "/requested_invoice_reference",
+                "resolved_values": {"left": committed, "right": requested},
+            }
+            for repetition in (1, 2, 3)
+        ],
+    }
+
+
+def _amount_rule(status: str) -> dict[str, Any]:
+    rule = _rule(status, "12500" if status == "satisfied" else "12600", "12500")
+    rule["rule_id"] = SECOND_RULE_ID
+    rule["description"] = "The committed amount must equal the requested amount."
+    for trial in cast(list[dict[str, Any]], rule["trials"]):
+        trial["left_pointer"] = "/amount"
+        trial["right_pointer"] = "/requested_amount"
+    return rule
+
+
+def _evidence_record() -> dict[str, Any]:
+    original_effect = _effect("AC-100")
+    changed_effect = _effect("AC-101")
+    return {
+        "schema_version": "1.4.0",
+        "interaction_id": "quickstart-payment",
+        "original_input": "Pay AC-100.",
+        "execution_plan": {
+            "repetitions": 3,
+            "max_target_calls": 6,
+            "dataset_planned_target_calls": 6,
+        },
+        "limitations": "UL reports observations for human review.",
+        "current_baseline": {
+            "status": "ORIGINAL REPLAY STABLE (3/3 OBSERVED)",
+            "observations": _observations(original_effect),
+            "inconclusive_reasons": [],
+        },
+        "cases": [
+            {
+                "operator_id": "surface.disfluency_repeat",
+                "operator_version": "1.0.0",
+                "augmented_input": "Pay pay AC-100.",
+                "status": "REPEATABLE DIFFERENCE — REVIEW",
+                "variation_accepted": True,
+                "variation_rejection_reasons": [],
+                "observations": _observations(changed_effect),
+                "findings": [
+                    {
+                        "finding_id": FINDING_ID,
+                        "category": "changed_grounded_effect_argument",
+                        "grounded_field_names": ["invoice_reference"],
+                        "severity": "unrated",
+                        "review_status": "needs_review",
+                        "summary": "The variation changed the committed invoice.",
+                        "reference_effects": [original_effect],
+                        "observed_effects": [changed_effect],
+                    }
+                ],
+                "inconclusive_reasons": [],
+            }
+        ],
+        "invariant_evaluation": {
+            "interaction_id": "quickstart-payment",
+            "suite_sha256": "b" * 64,
+            "observation_source": "target_output",
+            "observation_authority": "committed_state_snapshot",
+            "baseline": {
+                "arm": "baseline",
+                "operator_id": None,
+                "rules": [
+                    _rule("satisfied", "AC-100", "AC-100"),
+                    _amount_rule("satisfied"),
+                ],
+            },
+            "variations": [
+                {
+                    "arm": "variation",
+                    "operator_id": "surface.disfluency_repeat",
+                    "rules": [
+                        _rule("violated", "AC-101", "AC-100"),
+                        _amount_rule("violated"),
+                    ],
+                }
+            ],
+        },
+        "technical_details": {"fixture": "saved-regression-e2e"},
+    }
+
+
+def _write_evidence(path: Path) -> None:
+    path.write_text(
+        json.dumps(_evidence_record(), ensure_ascii=False, separators=(",", ":")) + "\n",
+        encoding="utf-8",
+    )
+
+
+class _ReplayServer(ThreadingHTTPServer):
+    fixed: bool
+    requests: list[dict[str, Any]]
+    authorization_headers: list[str | None]
+
+
+class _ReplayHandler(BaseHTTPRequestHandler):
+    def do_POST(self) -> None:
+        replay_server = cast(_ReplayServer, self.server)
+        content_length = int(self.headers.get("Content-Length", "0"))
+        payload = json.loads(self.rfile.read(content_length))
+        replay_server.requests.append(cast(dict[str, Any], payload))
+        replay_server.authorization_headers.append(self.headers.get("X-Test-Token"))
+        invoice_reference = "AC-100" if replay_server.fixed else "AC-101"
+        response = json.dumps(
+            {
+                "result": {
+                    "action": "payment_committed",
+                    "payment_id": "pay-0001",
+                    "invoice_reference": invoice_reference,
+                    "requested_invoice_reference": "AC-100",
+                    "amount": "12500" if replay_server.fixed else "12600",
+                    "requested_amount": "12500",
+                }
+            }
+        ).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(response)))
+        self.end_headers()
+        self.wfile.write(response)
+
+    def log_message(self, format: str, *args: object) -> None:
+        return
+
+
+@contextmanager
+def _running_server() -> Generator[tuple[_ReplayServer, str]]:
+    server = _ReplayServer(("127.0.0.1", 0), _ReplayHandler)
+    server.fixed = False
+    server.requests = []
+    server.authorization_headers = []
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    host, port = cast(tuple[str, int], server.server_address)
+    try:
+        yield server, f"http://{host}:{port}/execute"
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+    assert not thread.is_alive()
+
+
+def _write_target_config(path: Path, endpoint: str) -> None:
+    path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "url": endpoint,
+                "headers_from_env": {"X-Test-Token": "UL_REGRESSION_TEST_SECRET"},
+                "request_json_template": {
+                    "request": {"message": "{{input}}"},
+                    "settings": {"mode": "sandbox"},
+                },
+                "response_json_pointer": "/result",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
+def _confirm_finding(evidence: Path) -> None:
+    report = runner.invoke(app, ["dataset", "report", str(evidence)])
+    assert report.exit_code == 0, report.output
+    assert "needs_review=1" in report.output
+    review = runner.invoke(
+        app,
+        [
+            "dataset",
+            "review",
+            str(evidence),
+            FINDING_ID,
+            "--status",
+            "confirmed",
+            "--severity",
+            "high",
+            "--reviewer",
+            "payments-risk",
+            "--reason",
+            "The sandbox committed payment for a different invoice.",
+        ],
+    )
+    assert review.exit_code == 0, review.output
+    reviewed_report = runner.invoke(app, ["dataset", "report", str(evidence)])
+    assert reviewed_report.exit_code == 0, reviewed_report.output
+    assert "confirmed=1" in reviewed_report.output
+
+
+def _save_arguments(evidence: Path, target_config: Path, case_path: Path) -> list[str]:
+    return [
+        "regression",
+        "save",
+        str(evidence),
+        FINDING_ID,
+        "--rule",
+        RULE_ID,
+        "--target-config",
+        str(target_config),
+        "--output",
+        str(case_path),
+        "--confirm-versioned-input",
+    ]
+
+
+def _replay_arguments(case_path: Path, target_config: Path, result_path: Path) -> list[str]:
+    return [
+        "regression",
+        "replay",
+        str(case_path),
+        "--target-config",
+        str(target_config),
+        "--allow-target-network",
+        "--confirm-isolated-sandbox",
+        "--confirm-fresh-state",
+        "--allow-insecure-http",
+        "--max-target-calls",
+        "3",
+        "--output",
+        str(result_path),
+    ]
+
+
+def test_confirmed_finding_save_and_replay_real_loopback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    evidence = tmp_path / "evidence.jsonl"
+    case_path = tmp_path / "wrong-invoice.regression.json"
+    defective_result_path = tmp_path / "defective-replay.json"
+    fixed_result_path = tmp_path / "fixed-replay.json"
+    _write_evidence(evidence)
+    monkeypatch.setenv("UL_REGRESSION_TEST_SECRET", TEST_SECRET)
+    monkeypatch.delenv("OPEN_ROUTER_API_KEY", raising=False)
+
+    with _running_server() as (server, endpoint):
+        target_config = tmp_path / "target.json"
+        _write_target_config(target_config, endpoint)
+        _confirm_finding(evidence)
+
+        saved = runner.invoke(app, _save_arguments(evidence, target_config, case_path))
+        assert saved.exit_code == 0, saved.output
+        assert "Saved regression case ulrc_v1_" in saved.output
+        assert "--max-target-calls 3" in saved.output
+        assert "--allow-insecure-http" in saved.output
+        assert "not verified as the discovery target" in saved.output
+        assert case_path.exists()
+        assert TEST_SECRET not in saved.output
+        assert TEST_SECRET not in case_path.read_text(encoding="utf-8")
+
+        defective = runner.invoke(
+            app, _replay_arguments(case_path, target_config, defective_result_path)
+        )
+        assert defective.exit_code == 1, defective.output
+        assert ": failed" in defective.output
+        assert len(server.requests) == 3
+        assert all(
+            request
+            == {
+                "request": {"message": "Pay pay AC-100."},
+                "settings": {"mode": "sandbox"},
+            }
+            for request in server.requests
+        )
+        assert server.authorization_headers == [TEST_SECRET] * 3
+
+        server.fixed = True
+        fixed = runner.invoke(app, _replay_arguments(case_path, target_config, fixed_result_path))
+        assert fixed.exit_code == 0, fixed.output
+        assert ": passed" in fixed.output
+        assert len(server.requests) == 6
+        assert server.requests[:3] == server.requests[3:]
+
+    for artifact in (case_path, defective_result_path, fixed_result_path):
+        serialized = artifact.read_text(encoding="utf-8")
+        assert TEST_SECRET not in serialized
+        if os.name != "nt":
+            assert stat.S_IMODE(artifact.stat().st_mode) == 0o600
+    defective_result = json.loads(defective_result_path.read_text(encoding="utf-8"))
+    fixed_result = json.loads(fixed_result_path.read_text(encoding="utf-8"))
+    assert defective_result["status"] == "failed"
+    assert fixed_result["status"] == "passed"
+    assert len(defective_result["executions"]) == len(fixed_result["executions"]) == 3
+
+
+def test_save_requires_explicit_sensitive_input_confirmation_and_confirmed_review(
+    tmp_path: Path,
+) -> None:
+    evidence = tmp_path / "evidence.jsonl"
+    target_config = tmp_path / "target.json"
+    case_path = tmp_path / "case.json"
+    _write_evidence(evidence)
+    _write_target_config(target_config, "https://sandbox.example.test/execute")
+
+    no_review = runner.invoke(app, _save_arguments(evidence, target_config, case_path))
+    assert no_review.exit_code == 2
+    assert not case_path.exists()
+
+    _confirm_finding(evidence)
+    arguments_without_confirmation = _save_arguments(evidence, target_config, case_path)[:-1]
+    no_confirmation = runner.invoke(app, arguments_without_confirmation)
+    assert no_confirmation.exit_code == 2
+    assert "exact" in no_confirmation.output.casefold()
+    assert "sensitive" in no_confirmation.output.casefold()
+    assert not case_path.exists()
+
+
+def test_save_rejects_stale_review_lineage_and_never_overwrites(tmp_path: Path) -> None:
+    evidence = tmp_path / "evidence.jsonl"
+    target_config = tmp_path / "target.json"
+    case_path = tmp_path / "case.json"
+    _write_evidence(evidence)
+    _write_target_config(target_config, "https://sandbox.example.test/execute")
+    _confirm_finding(evidence)
+    changed_evidence = _evidence_record()
+    changed_evidence["technical_details"] = {"fixture": "changed-after-review"}
+    evidence.write_text(json.dumps(changed_evidence) + "\n", encoding="utf-8")
+
+    stale = runner.invoke(app, _save_arguments(evidence, target_config, case_path))
+    assert stale.exit_code == 2
+    assert "review" in stale.output.casefold()
+    assert not case_path.exists()
+
+    collision_evidence = tmp_path / "collision-evidence.jsonl"
+    collision_case = tmp_path / "collision-case.json"
+    _write_evidence(collision_evidence)
+    _confirm_finding(collision_evidence)
+    collision_case.write_text("keep", encoding="utf-8")
+    collision = runner.invoke(
+        app, _save_arguments(collision_evidence, target_config, collision_case)
+    )
+    assert collision.exit_code == 2
+    assert collision_case.read_text(encoding="utf-8") == "keep"
+
+
+def test_save_canonicalizes_selected_rule_order(tmp_path: Path) -> None:
+    evidence = tmp_path / "evidence.jsonl"
+    target_config = tmp_path / "target.json"
+    first_case = tmp_path / "first.json"
+    second_case = tmp_path / "second.json"
+    _write_evidence(evidence)
+    _write_target_config(target_config, "https://sandbox.example.test/execute")
+    _confirm_finding(evidence)
+
+    first_arguments = _save_arguments(evidence, target_config, first_case)
+    first_arguments[6:6] = ["--rule", SECOND_RULE_ID]
+    second_arguments = _save_arguments(evidence, target_config, second_case)
+    second_arguments[4:4] = ["--rule", SECOND_RULE_ID]
+    first = runner.invoke(app, first_arguments)
+    second = runner.invoke(app, second_arguments)
+
+    assert first.exit_code == second.exit_code == 0
+    assert first_case.read_bytes() == second_case.read_bytes()
+
+
+def test_save_prints_insecure_http_for_case_insensitive_scheme(tmp_path: Path) -> None:
+    evidence = tmp_path / "evidence.jsonl"
+    target_config = tmp_path / "target.json"
+    case_path = tmp_path / "case.json"
+    _write_evidence(evidence)
+    _write_target_config(target_config, "HTTP://127.0.0.1:8765/execute")
+    _confirm_finding(evidence)
+
+    saved = runner.invoke(app, _save_arguments(evidence, target_config, case_path))
+
+    assert saved.exit_code == 0, saved.output
+    assert "--allow-insecure-http" in saved.output
+
+
+def test_replay_rejects_untrusted_or_tampered_inputs_before_target_call(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    evidence = tmp_path / "evidence.jsonl"
+    case_path = tmp_path / "case.json"
+    _write_evidence(evidence)
+    monkeypatch.setenv("UL_REGRESSION_TEST_SECRET", TEST_SECRET)
+
+    with _running_server() as (server, endpoint):
+        target_config = tmp_path / "target.json"
+        wrong_target_config = tmp_path / "wrong-target.json"
+        result_path = tmp_path / "result.json"
+        _write_target_config(target_config, endpoint)
+        _write_target_config(wrong_target_config, f"{endpoint}/different")
+        _confirm_finding(evidence)
+        saved = runner.invoke(app, _save_arguments(evidence, target_config, case_path))
+        assert saved.exit_code == 0, saved.output
+
+        mismatch = runner.invoke(
+            app, _replay_arguments(case_path, wrong_target_config, result_path)
+        )
+        assert mismatch.exit_code == 2
+        assert "digest" in mismatch.output.casefold() or "sha" in mismatch.output.casefold()
+        assert server.requests == []
+        assert not result_path.exists()
+
+        case = json.loads(case_path.read_text(encoding="utf-8"))
+        cast(dict[str, Any], case["variation"])["variation_input"] = "Transfer everything."
+        case_path.write_text(json.dumps(case), encoding="utf-8")
+        tampered = runner.invoke(app, _replay_arguments(case_path, target_config, result_path))
+        assert tampered.exit_code == 2
+        assert server.requests == []
+        assert not result_path.exists()
+
+
+def test_replay_enforces_target_call_budget_before_secret_resolution_or_output(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    evidence = tmp_path / "evidence.jsonl"
+    case_path = tmp_path / "case.json"
+    target_config = tmp_path / "target.json"
+    result_path = tmp_path / "result.json"
+    _write_evidence(evidence)
+    _write_target_config(target_config, "https://sandbox.example.test/execute")
+    _confirm_finding(evidence)
+    saved = runner.invoke(app, _save_arguments(evidence, target_config, case_path))
+    assert saved.exit_code == 0, saved.output
+    monkeypatch.delenv("UL_REGRESSION_TEST_SECRET", raising=False)
+    arguments = _replay_arguments(case_path, target_config, result_path)
+    budget_index = arguments.index("--max-target-calls") + 1
+    arguments[budget_index] = "2"
+
+    replay = runner.invoke(app, arguments)
+
+    assert replay.exit_code == 2
+    assert "3" in replay.output and "2" in replay.output
+    assert "target" in replay.output.casefold() and "call" in replay.output.casefold()
+    assert TEST_SECRET not in replay.output
+    assert not result_path.exists()
+
+
+@pytest.mark.parametrize(
+    "missing_option",
+    ["--allow-target-network", "--confirm-isolated-sandbox", "--confirm-fresh-state"],
+)
+def test_replay_requires_every_target_safety_confirmation(
+    tmp_path: Path, missing_option: str
+) -> None:
+    evidence = tmp_path / "evidence.jsonl"
+    case_path = tmp_path / "case.json"
+    target_config = tmp_path / "target.json"
+    result_path = tmp_path / "result.json"
+    _write_evidence(evidence)
+    _write_target_config(target_config, "http://127.0.0.1:9/execute")
+    _confirm_finding(evidence)
+    saved = runner.invoke(app, _save_arguments(evidence, target_config, case_path))
+    assert saved.exit_code == 0, saved.output
+    arguments = _replay_arguments(case_path, target_config, result_path)
+    arguments.remove(missing_option)
+
+    replay = runner.invoke(app, arguments)
+
+    assert replay.exit_code == 2
+    assert not result_path.exists()
+
+
+@pytest.mark.parametrize("contents", ["not json", "{}", "[]"])
+def test_save_and_replay_reject_malformed_files_without_tracebacks_or_outputs(
+    tmp_path: Path, contents: str
+) -> None:
+    evidence = tmp_path / "evidence.jsonl"
+    target_config = tmp_path / "target.json"
+    case_path = tmp_path / "case.json"
+    result_path = tmp_path / "result.json"
+    evidence.write_text(contents, encoding="utf-8")
+    _write_target_config(target_config, "https://sandbox.example.test/execute")
+
+    saved = runner.invoke(app, _save_arguments(evidence, target_config, case_path))
+    replayed = runner.invoke(app, _replay_arguments(evidence, target_config, result_path))
+
+    assert saved.exit_code == 2
+    assert replayed.exit_code == 2
+    assert "traceback" not in (saved.output + replayed.output).casefold()
+    assert not case_path.exists()
+    assert not result_path.exists()
+
+
+def test_replay_escapes_terminal_controls_from_untrusted_case_errors(tmp_path: Path) -> None:
+    case_path = tmp_path / "case.json"
+    target_config = tmp_path / "target.json"
+    result_path = tmp_path / "result.json"
+    case_path.write_text(
+        json.dumps({"schema_version": "1.0.0", "\u001b[31mPWN": True}),
+        encoding="utf-8",
+    )
+    _write_target_config(target_config, "https://sandbox.example.test/execute")
+
+    replayed = runner.invoke(app, _replay_arguments(case_path, target_config, result_path))
+
+    assert replayed.exit_code == 2
+    assert "\x1b" not in replayed.output
+    assert "\\u001b[31mPWN" in replayed.output
+    assert not result_path.exists()

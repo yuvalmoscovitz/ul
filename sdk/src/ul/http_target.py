@@ -5,6 +5,8 @@ import json
 import math
 import os
 import re
+import stat
+import sys
 from collections.abc import Mapping
 from pathlib import Path
 from types import TracebackType
@@ -82,8 +84,7 @@ class JsonHttpDatasetTargetConfig(BaseModel):
 
 def load_json_http_dataset_target_config(path: str | Path) -> JsonHttpDatasetTargetConfig:
     try:
-        with Path(path).open("rb") as config_file:
-            encoded_config = config_file.read(_MAXIMUM_CONFIG_BYTES + 1)
+        encoded_config = _read_bounded_regular_file(Path(path), maximum_bytes=_MAXIMUM_CONFIG_BYTES)
     except OSError:
         raise RuntimeError("HTTP target config could not be read") from None
     if len(encoded_config) > _MAXIMUM_CONFIG_BYTES:
@@ -254,6 +255,7 @@ class JsonHttpDatasetTarget:
                 object_pairs_hook=_reject_duplicate_object_keys,
                 parse_constant=_reject_nonstandard_json_constant,
             )
+            _reject_deep_json(raw_output)
         except (UnicodeDecodeError, json.JSONDecodeError, RecursionError, ValueError):
             raise RuntimeError("HTTP dataset target returned invalid JSON") from None
         if raw_output is None:
@@ -408,6 +410,37 @@ def _reject_deep_json(value: object) -> None:
             values_to_visit.extend(
                 (item, depth + 1) for item in cast(dict[object, object], current).values()
             )
+
+
+def _read_bounded_regular_file(path: Path, *, maximum_bytes: int) -> bytes:
+    no_follow_flag = getattr(os, "O_NOFOLLOW", 0)
+    requires_identity_check = no_follow_flag == 0
+    if requires_identity_check and stat.S_ISLNK(os.lstat(path).st_mode):
+        raise OSError("path is a symbolic link")
+    binary_flag = os.O_BINARY if sys.platform == "win32" else 0
+    nonblocking_flag = getattr(os, "O_NONBLOCK", 0)
+    descriptor = os.open(path, os.O_RDONLY | no_follow_flag | nonblocking_flag | binary_flag)
+    try:
+        descriptor_status = os.fstat(descriptor)
+        if not stat.S_ISREG(descriptor_status.st_mode):
+            raise OSError("path is not a regular file")
+        if requires_identity_check:
+            path_status = os.lstat(path)
+            if stat.S_ISLNK(path_status.st_mode) or not os.path.samestat(
+                descriptor_status, path_status
+            ):
+                raise OSError("path changed while it was opened")
+        chunks: list[bytes] = []
+        remaining_bytes = maximum_bytes + 1
+        while remaining_bytes:
+            chunk = os.read(descriptor, min(remaining_bytes, 65_536))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining_bytes -= len(chunk)
+        return b"".join(chunks)
+    finally:
+        os.close(descriptor)
 
 
 def _validated_request_json_template(template: object) -> JsonValue:
