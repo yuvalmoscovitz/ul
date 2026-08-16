@@ -298,8 +298,9 @@ def test_preflight_enforces_record_and_target_call_bounds(
     )
 
     assert too_many_calls.exit_code != 0
-    assert "would make up to 102 target calls" in too_many_calls.output
-    assert "--max-target-calls 100" in too_many_calls.output
+    normalized_output = " ".join(_ANSI_ESCAPE_PATTERN.sub("", too_many_calls.output).split())
+    assert "would make up to 102 target calls" in normalized_output
+    assert "--max-target-calls 100" in normalized_output
 
 
 def test_repetition_budget_is_explicit_and_checked_before_external_setup(
