@@ -12,6 +12,7 @@ from ul import (
     ExecutionStatus,
     InteractionRecord,
     JsonHttpDatasetTarget,
+    JsonHttpDatasetTargetConfig,
     ObservedAgentOutput,
     OpenRouterDatasetSettings,
     OpenRouterSemanticDeconstructor,
@@ -25,6 +26,7 @@ from ul import (
     UserInputRecord,
     builtin_augmentation_registry,
     builtin_dataset_augmentation_operators,
+    load_json_http_dataset_target_config,
 )
 
 
@@ -78,6 +80,8 @@ def test_sdk_exposes_dataset_augmentation_api() -> None:
     assert DatasetEvaluationTrialSet.__name__ == "DatasetEvaluationTrialSet"
     assert DatasetTargetExecutor.__name__ == "DatasetTargetExecutor"
     assert JsonHttpDatasetTarget.__name__ == "JsonHttpDatasetTarget"
+    assert JsonHttpDatasetTargetConfig.__name__ == "JsonHttpDatasetTargetConfig"
+    assert load_json_http_dataset_target_config.__name__ == ("load_json_http_dataset_target_config")
     assert len(builtin_dataset_augmentation_operators()) == 8
     assert OpenRouterSemanticDeconstructor is not None
     assert OpenRouterDatasetSettings is not None

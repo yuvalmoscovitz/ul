@@ -26,6 +26,8 @@ from ul import (
 )
 from ul.http_target import (
     JsonHttpDatasetTarget,
+    JsonHttpDatasetTargetConfig,
+    load_json_http_dataset_target_config,
     validate_json_http_dataset_target_configuration,
 )
 
@@ -61,6 +63,61 @@ class _DatasetInputError(ValueError):
     pass
 
 
+@app.command("init")
+def initialize_dataset_target(
+    target_config: Annotated[
+        Path,
+        typer.Argument(
+            dir_okay=False,
+            help="New JSON file describing the target request and response shape.",
+        ),
+    ],
+    url: Annotated[
+        str,
+        typer.Option(help="Sandbox HTTP(S) endpoint that UL will evaluate."),
+    ],
+) -> None:
+    """Create a private starter configuration for a JSON HTTP target.
+
+    The generated template contains one complete {{input}} JSON value. A response
+    JSON Pointer such as /choices/0/message/content selects the observable result.
+    """
+    try:
+        config = JsonHttpDatasetTargetConfig(
+            version=1,
+            url=url,
+            headers_from_env={},
+            request_json_template={"input": "{{input}}"},
+            response_json_pointer="",
+        )
+        output_stream = _create_private_output(target_config)
+    except (OSError, ValidationError, ValueError) as error:
+        if isinstance(error, FileExistsError):
+            message = "target config already exists; UL will not overwrite it"
+        elif isinstance(error, OSError):
+            message = f"cannot create target config ({error.__class__.__name__})"
+        elif isinstance(error, ValidationError):
+            message = "target config is invalid"
+        else:
+            message = str(error)
+        raise typer.BadParameter(message, param_hint="TARGET_CONFIG") from None
+
+    with output_stream:
+        json.dump(config.model_dump(mode="json"), output_stream, indent=2)
+        output_stream.write("\n")
+
+    console.print(f"Created private target config: {target_config}")
+    console.print(
+        "Next: adjust request_json_template and response_json_pointer, add any "
+        "headers_from_env, then run 'ul dataset evaluate DATASET --target-config "
+        f"{target_config} --dry-run'."
+    )
+    console.print(
+        "Keep exactly one complete {{input}} value. headers_from_env maps HTTP header names "
+        "to environment-variable names; secret values stay outside this file."
+    )
+
+
 @app.command("operators")
 def list_dataset_operators() -> None:
     """List realistic-user transformations available for dataset evaluation."""
@@ -88,6 +145,15 @@ def evaluate_dataset(
         str | None,
         typer.Option(
             help="Simple sandbox endpoint: POST one JSON string field and return non-null JSON."
+        ),
+    ] = None,
+    target_config: Annotated[
+        Path | None,
+        typer.Option(
+            exists=True,
+            dir_okay=False,
+            readable=True,
+            help="JSON target configuration created by 'ul dataset init'.",
         ),
     ] = None,
     output: Annotated[
@@ -120,9 +186,9 @@ def evaluate_dataset(
         ),
     ] = _DEFAULT_MAXIMUM_TARGET_CALLS,
     request_field: Annotated[
-        str,
+        str | None,
         typer.Option(help="JSON request field that receives the augmented input."),
-    ] = "input",
+    ] = None,
     header_env: Annotated[
         list[str] | None,
         typer.Option(
@@ -163,6 +229,12 @@ def evaluate_dataset(
     try:
         records = _load_interaction_records(data)
         selected_operators = _validate_operator_ids(operator)
+        _validate_target_mode_options(
+            target_url=target_url,
+            target_config=target_config,
+            request_field=request_field,
+            header_env=header_env,
+        )
         header_environment_variables = _parse_header_environment_variables(header_env)
     except _DatasetInputError as error:
         raise typer.BadParameter(str(error)) from None
@@ -176,8 +248,11 @@ def evaluate_dataset(
             "--repetitions, or explicitly raise the call budget"
         )
     if not dry_run:
-        if target_url is None:
-            raise typer.BadParameter("execution requires --target-url", param_hint="--target-url")
+        if target_url is None and target_config is None:
+            raise typer.BadParameter(
+                "execution requires --target-url or --target-config",
+                param_hint="--target-url",
+            )
         if not allow_target_network:
             raise typer.BadParameter(
                 "execution requires --allow-target-network",
@@ -203,13 +278,28 @@ def evaluate_dataset(
     try:
         settings = OpenRouterDatasetSettings()
         _validate_model_input_bounds(selected_records, settings.max_input_chars)
+        loaded_target_config = (
+            load_json_http_dataset_target_config(target_config)
+            if target_config is not None
+            else None
+        )
         if target_url is not None:
             validate_json_http_dataset_target_configuration(
                 target_url,
                 sandbox_confirmed=confirm_isolated_sandbox or dry_run,
                 fresh_state_confirmed=confirm_fresh_state or dry_run,
-                request_field=request_field,
+                request_field=request_field or "input",
                 header_environment_variables=header_environment_variables,
+                allow_insecure_http=allow_insecure_http,
+            )
+        if loaded_target_config is not None:
+            validate_json_http_dataset_target_configuration(
+                loaded_target_config.url,
+                sandbox_confirmed=confirm_isolated_sandbox or dry_run,
+                fresh_state_confirmed=confirm_fresh_state or dry_run,
+                header_environment_variables=loaded_target_config.headers_from_env,
+                request_json_template=loaded_target_config.request_json_template,
+                response_json_pointer=loaded_target_config.response_json_pointer,
                 allow_insecure_http=allow_insecure_http,
             )
     except (ValidationError, ValueError, RuntimeError) as error:
@@ -219,13 +309,21 @@ def evaluate_dataset(
             record_count=len(records),
             selected_count=len(selected_records),
             operator_ids=selected_operators,
-            target_configured=target_url is not None,
+            target_configured=target_url is not None or target_config is not None,
+            target_endpoint=(
+                loaded_target_config.url if loaded_target_config is not None else target_url
+            ),
+            target_header_environment_variables=(
+                loaded_target_config.headers_from_env
+                if loaded_target_config is not None
+                else header_environment_variables
+            ),
             repetitions=repetitions,
             max_target_calls=max_target_calls,
         )
         return
 
-    assert target_url is not None
+    assert target_url is not None or loaded_target_config is not None
     assert output is not None
     if not settings.live_calls:
         raise typer.BadParameter("set UL_DATASET_LIVE_CALLS=true to allow semantic model calls")
@@ -237,14 +335,23 @@ def evaluate_dataset(
         raise typer.BadParameter("set OPEN_ROUTER_API_KEY to run an evaluation")
 
     try:
-        target = JsonHttpDatasetTarget(
-            target_url,
-            sandbox_confirmed=True,
-            fresh_state_confirmed=True,
-            request_field=request_field,
-            header_environment_variables=header_environment_variables,
-            allow_insecure_http=allow_insecure_http,
-        )
+        if loaded_target_config is not None:
+            target = JsonHttpDatasetTarget.from_config(
+                loaded_target_config,
+                sandbox_confirmed=True,
+                fresh_state_confirmed=True,
+                allow_insecure_http=allow_insecure_http,
+            )
+        else:
+            assert target_url is not None
+            target = JsonHttpDatasetTarget(
+                target_url,
+                sandbox_confirmed=True,
+                fresh_state_confirmed=True,
+                request_field=request_field or "input",
+                header_environment_variables=header_environment_variables,
+                allow_insecure_http=allow_insecure_http,
+            )
     except ValueError as error:
         raise typer.BadParameter(str(error), param_hint="--target-url") from None
 
@@ -435,12 +542,36 @@ def _parse_header_environment_variables(
     return parsed_headers
 
 
+def _validate_target_mode_options(
+    *,
+    target_url: str | None,
+    target_config: Path | None,
+    request_field: str | None,
+    header_env: list[str] | None,
+) -> None:
+    if target_config is None:
+        return
+    conflicting_options: list[str] = []
+    if target_url is not None:
+        conflicting_options.append("--target-url")
+    if request_field is not None:
+        conflicting_options.append("--request-field")
+    if header_env:
+        conflicting_options.append("--header-env")
+    if conflicting_options:
+        raise _DatasetInputError(
+            f"--target-config cannot be combined with {', '.join(conflicting_options)}"
+        )
+
+
 def _print_dataset_plan(
     *,
     record_count: int,
     selected_count: int,
     operator_ids: tuple[str, ...],
     target_configured: bool,
+    target_endpoint: str | None,
+    target_header_environment_variables: dict[str, str],
     repetitions: int,
     max_target_calls: int,
 ) -> None:
@@ -458,6 +589,18 @@ def _print_dataset_plan(
         f"(authorized maximum: {max_target_calls})"
     )
     console.print(f"Target: {'configured' if target_configured else 'not configured'}")
+    if target_endpoint is not None:
+        console.print(f"Target endpoint: {target_endpoint}")
+        if target_header_environment_variables:
+            mappings = ", ".join(
+                f"{header_name}={environment_variable}"
+                for header_name, environment_variable in sorted(
+                    target_header_environment_variables.items()
+                )
+            )
+            console.print(f"Target header environment mappings: {mappings}")
+        else:
+            console.print("Target header environment mappings: none")
     console.print(
         "Semantic models receive historical inputs and outputs, generated variations, "
         "live control responses, and variation responses on execution."
