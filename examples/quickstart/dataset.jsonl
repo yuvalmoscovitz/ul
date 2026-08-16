@@ -1,1 +1,1 @@
-{"id":"quickstart-ap-1","input":"Pay AC-100.","output":{"action":"payment_committed","payment_id":"pay-0001","invoice_reference":"AC-100","amount":"12500","currency":"USD","source_bank_account_id":"bank-main","idempotency_key":"invoice:AC-100:1"}}
+{"id":"quickstart-ap-1","input":"Pay AC-100.","output":{"action":"payment_committed","payment_id":"pay-0001","invoice_reference":"AC-100","requested_invoice_reference":"AC-100","amount":"12500","currency":"USD","source_bank_account_id":"bank-main","idempotency_key":"invoice:AC-100:1"}}

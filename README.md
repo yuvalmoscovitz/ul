@@ -30,6 +30,11 @@ a `REPEATABLE DIFFERENCE — REVIEW`: the agent pays invoice `AC-100` for the or
 pays `AC-101` for a naturally repeated-word variation. Generation and checking use models, so
 the exact variation and result can differ between runs.
 
+The quickstart also applies one deterministic customer rule to the raw structured target output:
+the committed invoice reference must equal the requested invoice reference. The original trials
+satisfy that rule and the defective variation violates it. The rule uses no model calls and stays
+separate from UL's behavioral-difference finding.
+
 The quickstart permits up to 6 calls to the local target and up to 10 semantic-model calls. The
 quickstart explicitly requests `x-ai/grok-4.6` for semantic deconstruction, rendering, and
 equivalence checking to improve consistency. This model may cost more, and OpenRouter or the
@@ -44,12 +49,13 @@ uv run python -m examples.quickstart.run --dry-run
 Dry-run makes no target or model calls. It prints the dataset plan, destination, external-data
 notice, and maximum call counts first.
 
-The full evidence is written locally as JSONL. The quickstart exits `0` when it confirms its
-expected stable 3/3 `changed action value` finding; any unconfirmed or interrupted run exits
-nonzero.
-For the underlying `ul dataset evaluate` command, exit `0` means no review finding, `1` means an
-observed difference needs review, and `2` means the evaluation could not finish. Exit `1` is not
-a correctness judgment.
+The full evidence is written locally as JSONL. The quickstart exits `0` when it confirms both its
+expected stable 3/3 `changed action value` finding and the customer-rule violation; any
+unconfirmed or interrupted run exits nonzero.
+For the underlying `ul dataset evaluate` command, exit `0` means no review finding or declared-rule
+violation, `1` means an observed difference needs review or a declared rule was violated, and `2`
+means the evaluation could not finish or a declared rule was not evaluable. Exit `1` is not a
+general correctness judgment.
 
 Review findings without making more model or target calls:
 
@@ -87,3 +93,32 @@ uv run ul dataset evaluate your-data.jsonl --target-config target.json --dry-run
 The target must be an isolated sandbox that starts every request from the same clean state.
 Use `headers_from_env` in the target file for credentials so secret values remain outside the
 configuration. Dry-run validates the dataset and target mapping without making external calls.
+
+To add customer-defined deterministic checks, provide a strict invariant file:
+
+```json
+{
+  "schema_version": "1.0.0",
+  "observation_source": "target_output",
+  "observation_authority": "committed_state_snapshot",
+  "rules": [
+    {
+      "type": "json_values_equal",
+      "id": "committed-amount-matches-corrected-amount",
+      "version": "1.0.0",
+      "description": "The committed amount must equal the corrected amount.",
+      "severity": "high",
+      "left_pointer": "/committed_amount",
+      "right_pointer": "/corrected_amount"
+    }
+  ]
+}
+```
+
+Pass it with `--invariants invariants.json`. UL evaluates the rule locally for every executed
+original and variation trial. Results are `satisfied`, `violated`, or `not_evaluable`; missing or
+non-scalar values never silently satisfy a rule. A satisfied declared rule does not establish
+that the agent is correct or safe beyond that rule. Non-integer JSON numbers and selected values
+larger than 4 KiB are `not_evaluable` in this first rule type. Represent exact decimal values as
+strings or integer minor units rather than binary JSON floats. `observation_authority` is the
+customer's statement about what the target output represents; UL does not independently verify it.

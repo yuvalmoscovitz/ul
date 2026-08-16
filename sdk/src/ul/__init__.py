@@ -44,6 +44,16 @@ from ul.dataset_evaluation import (
     DatasetEvaluationTrial,
     DatasetEvaluationTrialSet,
 )
+from ul.dataset_invariants import (
+    DatasetInvariantArmEvaluation,
+    DatasetInvariantEvaluation,
+    DatasetInvariantRuleEvaluation,
+    DatasetInvariantSuite,
+    DatasetInvariantTrialEvaluation,
+    JsonValuesEqualInvariant,
+    evaluate_dataset_invariants,
+    load_dataset_invariant_suite,
+)
 from ul.deconstruction import OpenRouterDatasetSettings, OpenRouterSemanticDeconstructor
 from ul.http_target import (
     JsonHttpDatasetTarget,
@@ -68,6 +78,11 @@ __all__ = [
     "DatasetEvaluationRunner",
     "DatasetEvaluationTrial",
     "DatasetEvaluationTrialSet",
+    "DatasetInvariantArmEvaluation",
+    "DatasetInvariantEvaluation",
+    "DatasetInvariantRuleEvaluation",
+    "DatasetInvariantSuite",
+    "DatasetInvariantTrialEvaluation",
     "DatasetTargetExecutor",
     "ExecutionMode",
     "ExecutionResult",
@@ -76,6 +91,7 @@ __all__ = [
     "InteractionRecord",
     "JsonHttpDatasetTarget",
     "JsonHttpDatasetTargetConfig",
+    "JsonValuesEqualInvariant",
     "MaterializedScenario",
     "ObservedAgentOutput",
     "OpenRouterDatasetSettings",
@@ -92,5 +108,7 @@ __all__ = [
     "UserInputRecord",
     "builtin_augmentation_registry",
     "builtin_dataset_augmentation_operators",
+    "evaluate_dataset_invariants",
+    "load_dataset_invariant_suite",
     "load_json_http_dataset_target_config",
 ]

@@ -1,0 +1,16 @@
+{
+  "schema_version": "1.0.0",
+  "observation_source": "target_output",
+  "observation_authority": "committed_state_snapshot",
+  "rules": [
+    {
+      "type": "json_values_equal",
+      "id": "committed-invoice-matches-request",
+      "version": "1.0.0",
+      "description": "The committed invoice reference must match the requested invoice reference.",
+      "severity": "high",
+      "left_pointer": "/invoice_reference",
+      "right_pointer": "/requested_invoice_reference"
+    }
+  ]
+}

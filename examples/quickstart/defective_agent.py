@@ -29,6 +29,7 @@ def _payment_action(invoice_reference: str) -> dict[str, str]:
         "action": "payment_committed",
         "payment_id": "pay-0001",
         "invoice_reference": invoice_reference,
+        "requested_invoice_reference": "AC-100",
         "amount": "12500",
         "currency": "USD",
         "source_bank_account_id": "bank-main",

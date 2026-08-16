@@ -17,6 +17,7 @@ from examples.quickstart.defective_agent import create_server
 _QUICKSTART_DIRECTORY = Path(__file__).resolve().parent
 _PROJECT_DIRECTORY = _QUICKSTART_DIRECTORY.parents[1]
 _DATASET_PATH = _QUICKSTART_DIRECTORY / "dataset.jsonl"
+_INVARIANTS_PATH = _QUICKSTART_DIRECTORY / "invariants.json"
 _TARGET_TEMPLATE_PATH = _QUICKSTART_DIRECTORY / "target.json"
 _REQUIRED_LIVE_ENVIRONMENT = (
     "OPEN_ROUTER_API_KEY",
@@ -99,9 +100,45 @@ def _evidence_confirms_repeatable_wrong_invoice(evidence_path: Path) -> bool:
             and len(finding_items) == 1
             and type(finding_items[0]) is dict
             and _finding_is_wrong_invoice_change(cast(dict[str, object], finding_items[0]))
+            and _invariant_confirms_wrong_invoice(evidence.get("invariant_evaluation"))
         )
     except (OSError, UnicodeDecodeError, json.JSONDecodeError, RecursionError):
         return False
+
+
+def _invariant_confirms_wrong_invoice(invariant_evaluation: object) -> bool:
+    if type(invariant_evaluation) is not dict:
+        return False
+    invariant_mapping = cast(dict[str, object], invariant_evaluation)
+    baseline = invariant_mapping.get("baseline")
+    variations = invariant_mapping.get("variations")
+    if type(baseline) is not dict or type(variations) is not list:
+        return False
+    baseline_rules = cast(dict[str, object], baseline).get("rules")
+    variation_items = cast(list[object], variations)
+    if (
+        type(baseline_rules) is not list
+        or len(cast(list[object], baseline_rules)) != 1
+        or len(variation_items) != 1
+        or type(variation_items[0]) is not dict
+    ):
+        return False
+    variation = cast(dict[str, object], variation_items[0])
+    variation_rules = variation.get("rules")
+    if type(variation_rules) is not list or len(cast(list[object], variation_rules)) != 1:
+        return False
+    baseline_rule = cast(list[object], baseline_rules)[0]
+    variation_rule = cast(list[object], variation_rules)[0]
+    return (
+        type(baseline_rule) is dict
+        and type(variation_rule) is dict
+        and cast(dict[str, object], baseline_rule).get("rule_id")
+        == "committed-invoice-matches-request"
+        and cast(dict[str, object], baseline_rule).get("status") == "satisfied"
+        and cast(dict[str, object], variation_rule).get("rule_id")
+        == "committed-invoice-matches-request"
+        and cast(dict[str, object], variation_rule).get("status") == "violated"
+    )
 
 
 def _finding_is_wrong_invoice_change(finding: dict[str, object]) -> bool:
@@ -194,6 +231,8 @@ def main(
             str(_DATASET_PATH),
             "--target-config",
             str(target_config_path),
+            "--invariants",
+            str(_INVARIANTS_PATH),
             "--operator",
             "surface.disfluency_repeat",
             "--limit",
@@ -241,7 +280,9 @@ def main(
     if completed_process.returncode == 1 and _evidence_confirms_repeatable_wrong_invoice(
         evidence_path
     ):
-        typer.echo("Confirmed: UL found a stable 3/3 wrong-invoice action.")
+        typer.echo(
+            "Confirmed: UL found a stable 3/3 wrong-invoice action and the customer rule failed."
+        )
         typer.echo(f"Evidence: {evidence_path}")
         return
 
