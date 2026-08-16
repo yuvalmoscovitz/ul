@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import stat
 from pathlib import Path
 from types import SimpleNamespace
@@ -14,6 +15,7 @@ from ul_cli import dataset as main
 from ul_cli.main import app as root_app
 
 runner = CliRunner()
+_ANSI_ESCAPE_PATTERN = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 
 
 def _write_dataset(path: Path, records: list[dict[str, Any]]) -> None:
@@ -147,7 +149,8 @@ def test_preflight_reports_safe_line_numbered_errors_without_external_calls(
     result = runner.invoke(root_app, ["dataset", "evaluate", str(dataset)])
 
     assert result.exit_code != 0
-    assert expected_error in result.output
+    normalized_output = " ".join(_ANSI_ESCAPE_PATTERN.sub("", result.output).split())
+    assert expected_error in normalized_output
     assert "Transfer 100" not in result.output
 
 
