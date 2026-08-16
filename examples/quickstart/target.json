@@ -1,0 +1,14 @@
+{
+  "version": 1,
+  "url": "http://127.0.0.1:8765/execute",
+  "headers_from_env": {},
+  "request_json_template": {
+    "request": {
+      "message": "{{input}}"
+    },
+    "settings": {
+      "mode": "sandbox"
+    }
+  },
+  "response_json_pointer": "/result"
+}

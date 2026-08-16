@@ -1,0 +1,435 @@
+from __future__ import annotations
+
+import json
+import os
+import stat
+import subprocess
+import sys
+import threading
+import zipfile
+from collections.abc import Callable, Generator
+from contextlib import contextmanager
+from http.server import ThreadingHTTPServer
+from pathlib import Path
+from typing import Any, cast
+
+import httpx
+import pytest
+import typer
+
+from examples.quickstart import run as quickstart
+from examples.quickstart.defective_agent import create_server
+
+_PROJECT_ROOT = Path(__file__).parents[3]
+_QUICKSTART_DIRECTORY = Path(__file__).parents[1]
+_VALID_REQUEST = {
+    "request": {"message": "Pay AC-100."},
+    "settings": {"mode": "sandbox"},
+}
+
+
+@contextmanager
+def _running_server() -> Generator[tuple[str, ThreadingHTTPServer]]:
+    server = create_server()
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    host, port = cast(tuple[str, int], server.server_address)
+    try:
+        yield f"http://{host}:{port}", server
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+    assert not thread.is_alive()
+
+
+def _post(base_url: str, payload: object, **kwargs: Any) -> httpx.Response:
+    return httpx.post(f"{base_url}/execute", json=payload, timeout=2, trust_env=False, **kwargs)
+
+
+def _actions(response: httpx.Response) -> list[dict[str, object]]:
+    assert response.status_code == 200, response.text
+    response_payload = cast(dict[str, Any], response.json())
+    assert set(response_payload) == {"result"}
+    result = response_payload["result"]
+    assert isinstance(result, dict)
+    return [cast(dict[str, object], result)]
+
+
+def test_server_reproduces_the_seeded_wrong_invoice() -> None:
+    with _running_server() as (base_url, _server):
+        original_actions = _actions(_post(base_url, _VALID_REQUEST))
+        wrong_invoice_actions = _actions(
+            _post(
+                base_url,
+                {
+                    "request": {"message": "Pay pay AC-100."},
+                    "settings": {"mode": "sandbox"},
+                },
+            )
+        )
+
+    assert original_actions == [
+        {
+            "action": "payment_committed",
+            "payment_id": "pay-0001",
+            "invoice_reference": "AC-100",
+            "amount": "12500",
+            "currency": "USD",
+            "source_bank_account_id": "bank-main",
+            "idempotency_key": "invoice:AC-100:1",
+        }
+    ]
+    assert wrong_invoice_actions == [
+        {
+            **original_actions[0],
+            "invoice_reference": "AC-101",
+            "idempotency_key": "invoice:AC-101:1",
+        }
+    ]
+
+
+def test_server_starts_every_request_from_identical_fresh_state() -> None:
+    with _running_server() as (base_url, _server):
+        responses = [_actions(_post(base_url, _VALID_REQUEST)) for _ in range(3)]
+        wrong_invoice_responses = [
+            _actions(
+                _post(
+                    base_url,
+                    {
+                        "request": {"message": "Pay pay AC-100."},
+                        "settings": {"mode": "sandbox"},
+                    },
+                )
+            )
+            for _ in range(3)
+        ]
+
+    assert responses[0] == responses[1] == responses[2]
+    assert wrong_invoice_responses[0] == wrong_invoice_responses[1] == wrong_invoice_responses[2]
+
+
+@pytest.mark.parametrize(
+    ("body", "content_type", "path"),
+    [
+        (b"{}", "text/plain", "/execute"),
+        (b"not json", "application/json", "/execute"),
+        (
+            json.dumps({"request": {"message": "Pay AC-100."}}).encode(),
+            "application/json",
+            "/execute",
+        ),
+        (
+            json.dumps({**_VALID_REQUEST, "extra": True}).encode(),
+            "application/json",
+            "/execute",
+        ),
+        (json.dumps(_VALID_REQUEST).encode(), "application/json", "/wrong"),
+    ],
+)
+def test_server_rejects_wrong_path_content_or_shape(
+    body: bytes, content_type: str, path: str
+) -> None:
+    with _running_server() as (base_url, _server):
+        response = httpx.post(
+            f"{base_url}{path}",
+            content=body,
+            headers={"Content-Type": content_type},
+            timeout=2,
+            trust_env=False,
+        )
+
+    assert 400 <= response.status_code < 500
+
+
+def test_server_rejects_oversized_and_invalid_values() -> None:
+    with _running_server() as (base_url, _server):
+        oversized = _post(
+            base_url,
+            {
+                "request": {"message": "x" * 100_001},
+                "settings": {"mode": "sandbox"},
+            },
+        )
+        wrong_mode = _post(
+            base_url,
+            {
+                "request": {"message": "Pay AC-100."},
+                "settings": {"mode": "production"},
+            },
+        )
+
+    assert 400 <= oversized.status_code < 500
+    assert 400 <= wrong_mode.status_code < 500
+
+
+def test_quickstart_target_contains_no_authentication_mapping() -> None:
+    target = json.loads((_QUICKSTART_DIRECTORY / "target.json").read_text(encoding="utf-8"))
+
+    assert target["headers_from_env"] == {}
+    assert target["request_json_template"] == {
+        "request": {"message": "{{input}}"},
+        "settings": {"mode": "sandbox"},
+    }
+    assert target["response_json_pointer"] == "/result"
+
+
+def _confirmed_evidence() -> dict[str, Any]:
+    stable_observations = {
+        "requested_repetitions": 3,
+        "stability": "stable",
+        "observed_repetitions": 3,
+        "inconclusive_repetitions": 0,
+        "outcome_group_count": 1,
+    }
+    return {
+        "current_baseline": {"observations": stable_observations},
+        "cases": [
+            {
+                "operator_id": "surface.disfluency_repeat",
+                "variation_accepted": True,
+                "status": "REPEATABLE DIFFERENCE — REVIEW",
+                "observations": stable_observations,
+                "findings": [
+                    {
+                        "category": "changed_grounded_effect_argument",
+                        "reference_effects": [
+                            {
+                                "predicate": "payment_committed",
+                                "fields": {"invoice_reference": "AC-100"},
+                            }
+                        ],
+                        "observed_effects": [
+                            {
+                                "predicate": "payment_committed",
+                                "fields": {"invoice_reference": "AC-101"},
+                            }
+                        ],
+                    }
+                ],
+            }
+        ],
+    }
+
+
+def test_runner_uses_safe_argv_minimal_environment_private_artifacts_and_cleans_server(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(quickstart, "_PROJECT_DIRECTORY", tmp_path)
+    monkeypatch.setenv("OPEN_ROUTER_API_KEY", "test-only-secret")
+    monkeypatch.setenv("UL_DATASET_LIVE_CALLS", "true")
+    monkeypatch.setenv("UL_DATASET_ALLOW_EXTERNAL_DATA_PROCESSING", "true")
+    monkeypatch.setenv("UL_DATASET_MODEL", "untrusted/model-override")
+    monkeypatch.setenv("UL_DATASET_RENDER_MODEL", "untrusted/render-override")
+    monkeypatch.setenv("UL_DATASET_EQUIVALENCE_MODEL", "untrusted/checker-override")
+    monkeypatch.setenv("UNRELATED_SECRET", "must-not-be-forwarded")
+    observed_endpoint = ""
+    evidence_path: Path | None = None
+
+    def run_cli(
+        command: list[str],
+        *,
+        cwd: Path,
+        env: dict[str, str],
+        check: bool,
+        shell: bool,
+    ) -> subprocess.CompletedProcess[str]:
+        nonlocal observed_endpoint, evidence_path
+        assert command[:4] == [sys.executable, "-m", "ul_cli.main", "dataset"]
+        assert all(isinstance(argument, str) for argument in command)
+        assert cwd == _QUICKSTART_DIRECTORY
+        assert check is False
+        assert shell is False
+        assert env == {
+            "OPEN_ROUTER_API_KEY": "test-only-secret",
+            "UL_DATASET_LIVE_CALLS": "true",
+            "UL_DATASET_ALLOW_EXTERNAL_DATA_PROCESSING": "true",
+            "UL_DATASET_MODEL": "x-ai/grok-4.6",
+            "UL_DATASET_RENDER_MODEL": "x-ai/grok-4.6",
+            "UL_DATASET_EQUIVALENCE_MODEL": "x-ai/grok-4.6",
+        }
+        target_config_path = Path(command[command.index("--target-config") + 1])
+        evidence_path = Path(command[command.index("--output") + 1])
+        assert stat.S_IMODE(target_config_path.stat().st_mode) == 0o600
+        assert stat.S_IMODE(target_config_path.parent.stat().st_mode) == 0o700
+        target = json.loads(target_config_path.read_text(encoding="utf-8"))
+        assert "test-only-secret" not in json.dumps(target)
+        assert "test-only-secret" not in command
+        observed_endpoint = target["url"]
+        assert _actions(_post(observed_endpoint.rsplit("/", 1)[0], _VALID_REQUEST))
+        descriptor = os.open(evidence_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as evidence_file:
+            json.dump(_confirmed_evidence(), evidence_file)
+            evidence_file.write("\n")
+        return subprocess.CompletedProcess(command, 1)
+
+    monkeypatch.setattr(quickstart.subprocess, "run", run_cli)
+
+    quickstart.main()
+
+    assert evidence_path is not None
+    assert evidence_path.exists()
+    assert stat.S_IMODE(evidence_path.stat().st_mode) == 0o600
+    assert not (evidence_path.parent / "target.json").exists()
+    with pytest.raises(httpx.ConnectError):
+        _post(observed_endpoint.rsplit("/", 1)[0], _VALID_REQUEST)
+
+
+def test_runner_accepts_only_the_exact_stable_wrong_invoice_finding(tmp_path: Path) -> None:
+    confirms_repeatable_wrong_invoice = cast(
+        Callable[[Path], bool],
+        getattr(quickstart, "_evidence_confirms_" + "repeatable_wrong_invoice"),
+    )
+    evidence_path = tmp_path / "evidence.jsonl"
+    evidence = _confirmed_evidence()
+    evidence_path.write_text(json.dumps(evidence) + "\n", encoding="utf-8")
+    assert confirms_repeatable_wrong_invoice(evidence_path)
+
+    case = evidence["cases"][0]
+    assert isinstance(case, dict)
+    changes: tuple[tuple[str, object], ...] = (
+        ("status", "NO OBSERVED DIFFERENCE"),
+        ("variation_accepted", False),
+        ("operator_id", "surface.rephrase"),
+        ("findings", []),
+        (
+            "findings",
+            [
+                {"category": "changed_grounded_effect_argument"},
+                {"category": "unexpected_effect"},
+            ],
+        ),
+    )
+    for key, value in changes:
+        changed_evidence = json.loads(json.dumps(evidence))
+        changed_evidence["cases"][0][key] = value
+        evidence_path.write_text(json.dumps(changed_evidence) + "\n", encoding="utf-8")
+        assert not confirms_repeatable_wrong_invoice(evidence_path)
+
+    for effect_group, invoice_reference in (
+        ("reference_effects", "AC-999"),
+        ("observed_effects", "AC-100"),
+    ):
+        changed_evidence = json.loads(json.dumps(evidence))
+        changed_evidence["cases"][0]["findings"][0][effect_group][0]["fields"][
+            "invoice_reference"
+        ] = invoice_reference
+        evidence_path.write_text(json.dumps(changed_evidence) + "\n", encoding="utf-8")
+        assert not confirms_repeatable_wrong_invoice(evidence_path)
+
+    evidence_path.write_text("not json\n", encoding="utf-8")
+    assert not confirms_repeatable_wrong_invoice(evidence_path)
+
+
+def test_runner_propagates_nonconfirmation_and_execution_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(quickstart, "_PROJECT_DIRECTORY", tmp_path)
+    monkeypatch.setenv("OPEN_ROUTER_API_KEY", "test-only-secret")
+    monkeypatch.setenv("UL_DATASET_LIVE_CALLS", "true")
+    monkeypatch.setenv("UL_DATASET_ALLOW_EXTERNAL_DATA_PROCESSING", "true")
+
+    def no_finding(command: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        evidence_path = Path(command[command.index("--output") + 1])
+        evidence_path.write_text("{}\n", encoding="utf-8")
+        return subprocess.CompletedProcess(command, 0)
+
+    monkeypatch.setattr(quickstart.subprocess, "run", no_finding)
+    with pytest.raises(typer.Exit) as nonconfirmation:
+        quickstart.main()
+    assert nonconfirmation.value.exit_code == 1
+
+    def execution_error(command: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(command, 2)
+
+    monkeypatch.setattr(quickstart.subprocess, "run", execution_error)
+    with pytest.raises(typer.Exit) as error:
+        quickstart.main()
+    assert error.value.exit_code == 2
+
+
+def test_dry_run_does_not_construct_the_target_server(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(quickstart, "_PROJECT_DIRECTORY", tmp_path)
+
+    def unexpected_server() -> object:
+        raise AssertionError("dry-run constructed the target server")
+
+    monkeypatch.setattr(quickstart, "create_server", unexpected_server)
+    quickstart.main(dry_run=True)
+
+
+def test_dry_run_is_a_real_subprocess_and_needs_no_api_key(tmp_path: Path) -> None:
+    environment = {
+        "PATH": os.environ["PATH"],
+        "PYTHONPATH": os.pathsep.join(
+            [
+                str(_PROJECT_ROOT / "core/src"),
+                str(_PROJECT_ROOT / "sdk/src"),
+                str(_PROJECT_ROOT / "cli/src"),
+            ]
+        ),
+        "HOME": str(tmp_path),
+    }
+
+    completed = subprocess.run(
+        [sys.executable, "-m", "examples.quickstart.run", "--dry-run"],
+        cwd=_PROJECT_ROOT,
+        env=environment,
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+        shell=False,
+    )
+
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    assert "No model or target requests sent." in completed.stdout
+    assert "OPEN_ROUTER_API_KEY" not in environment
+
+
+def test_built_wheel_contains_the_complete_quickstart(tmp_path: Path) -> None:
+    completed = subprocess.run(
+        [sys.executable, "-m", "hatchling", "build", "-t", "wheel", "-d", str(tmp_path)],
+        cwd=_PROJECT_ROOT,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+        shell=False,
+    )
+
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    wheel_path = next(tmp_path.glob("*.whl"))
+    with zipfile.ZipFile(wheel_path) as wheel:
+        names = set(wheel.namelist())
+    assert {
+        "examples/quickstart/__init__.py",
+        "examples/quickstart/README.md",
+        "examples/quickstart/dataset.jsonl",
+        "examples/quickstart/defective_agent.py",
+        "examples/quickstart/run.py",
+        "examples/quickstart/target.json",
+    } <= names
+    assert not any(name.startswith("examples/quickstart/tests/") for name in names)
+
+
+@pytest.mark.skipif(
+    os.environ.get("UL_QUICKSTART_LIVE_E2E") != "true",
+    reason="set UL_QUICKSTART_LIVE_E2E=true and OPEN_ROUTER_API_KEY to run the paid live demo",
+)
+def test_exact_documented_quickstart_command_finds_stable_wrong_invoice() -> None:
+    completed = subprocess.run(
+        [sys.executable, "-m", "examples.quickstart.run"],
+        cwd=_PROJECT_ROOT,
+        env=os.environ.copy(),
+        capture_output=True,
+        text=True,
+        timeout=180,
+        check=False,
+        shell=False,
+    )
+
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    assert "stable 3/3 wrong-invoice action" in completed.stdout.casefold()

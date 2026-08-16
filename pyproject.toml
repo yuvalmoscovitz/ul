@@ -2,6 +2,7 @@
 name = "ul"
 version = "0.1.0"
 description = "Discover consequential failures in high-risk AI agents"
+readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "httpx>=0.27,<1",
@@ -33,7 +34,13 @@ dev = [
 
 [tool.pytest.ini_options]
 addopts = "-ra"
-testpaths = ["core/tests", "sdk/tests", "cli/tests", "examples/accounts_payable/tests"]
+testpaths = [
+    "core/tests",
+    "sdk/tests",
+    "cli/tests",
+    "examples/accounts_payable/tests",
+    "examples/quickstart/tests",
+]
 
 [tool.ruff]
 line-length = 100
@@ -45,5 +52,11 @@ select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
 [tool.pyright]
 pythonVersion = "3.12"
 typeCheckingMode = "strict"
-include = ["core/src", "sdk/src", "cli/src", "examples/accounts_payable"]
+include = [
+    "core/src",
+    "sdk/src",
+    "cli/src",
+    "examples/accounts_payable",
+    "examples/quickstart",
+]
 extraPaths = ["core/src", "sdk/src", "cli/src"]
