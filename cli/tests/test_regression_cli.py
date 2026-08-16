@@ -564,9 +564,13 @@ def test_replay_escapes_terminal_controls_from_untrusted_case_errors(tmp_path: P
     )
     _write_target_config(target_config, "https://sandbox.example.test/execute")
 
-    replayed = runner.invoke(app, _replay_arguments(case_path, target_config, result_path))
+    replayed = runner.invoke(
+        app,
+        _replay_arguments(case_path, target_config, result_path),
+        color=True,
+    )
 
     assert replayed.exit_code == 2
-    assert "\x1b" not in replayed.output
+    assert "\x1b[31mPWN" not in replayed.output
     assert "\\u001b[31mPWN" in replayed.output
     assert not result_path.exists()
