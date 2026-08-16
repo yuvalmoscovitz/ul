@@ -202,7 +202,14 @@ class DeterministicSemanticPipeline:
             return _frame(record.id, outcomes)
         return _frame(record.id, ())
 
-    async def render(self, raw_input: str, instruction: str) -> RenderedUserInput:
+    async def render(
+        self,
+        raw_input: str,
+        instruction: str,
+        *,
+        allow_temporary_value: bool = False,
+    ) -> RenderedUserInput:
+        del allow_temporary_value
         if "frustration" in instruction:
             return RenderedUserInput(text=raw_input)
         return RenderedUserInput(

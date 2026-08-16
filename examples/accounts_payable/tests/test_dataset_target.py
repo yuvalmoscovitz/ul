@@ -5,9 +5,12 @@ from ul_core.contracts import DatasetTargetExecutor
 from ul_core.dataset import ObservedAgentOutput
 
 from examples.accounts_payable.dataset_target import (
+    AMOUNT_SOURCE_INPUT,
     REPEATED_PAYMENT_INPUT,
+    SELF_CORRECTED_PAYMENT_INPUT,
     SOURCE_INPUT,
     AccountsPayableDatasetTarget,
+    SeededFirstValueWinsDefectAccountsPayableDatasetTarget,
     SeededIntentFanOutDefectAccountsPayableDatasetTarget,
 )
 
@@ -67,3 +70,38 @@ async def test_seeded_target_state_is_fresh_for_each_call() -> None:
         "pay-0001",
         "pay-0002",
     ]
+
+
+@pytest.mark.asyncio
+async def test_correct_target_uses_the_repaired_final_amount() -> None:
+    target = AccountsPayableDatasetTarget()
+
+    source_output = await target.execute(AMOUNT_SOURCE_INPUT)
+    candidate_output = await target.execute(SELF_CORRECTED_PAYMENT_INPUT)
+
+    assert _committed_payment_actions(source_output)[0]["amount"] == "12500"
+    assert _committed_payment_actions(candidate_output)[0]["amount"] == "12500"
+
+
+@pytest.mark.asyncio
+async def test_seeded_first_value_wins_defect_uses_the_provisional_amount() -> None:
+    target = SeededFirstValueWinsDefectAccountsPayableDatasetTarget()
+
+    source_output = await target.execute(AMOUNT_SOURCE_INPUT)
+    candidate_output = await target.execute(SELF_CORRECTED_PAYMENT_INPUT)
+
+    assert _committed_payment_actions(source_output)[0]["amount"] == "12500"
+    assert _committed_payment_actions(candidate_output)[0]["amount"] == "13500"
+
+
+@pytest.mark.asyncio
+async def test_self_correction_targets_start_from_fresh_state_for_each_call() -> None:
+    correct_target = AccountsPayableDatasetTarget()
+    defective_target = SeededFirstValueWinsDefectAccountsPayableDatasetTarget()
+
+    first_correct_output = await correct_target.execute(SELF_CORRECTED_PAYMENT_INPUT)
+    second_correct_output = await correct_target.execute(SELF_CORRECTED_PAYMENT_INPUT)
+    assert first_correct_output == second_correct_output
+    assert await defective_target.execute(
+        SELF_CORRECTED_PAYMENT_INPUT
+    ) == await defective_target.execute(SELF_CORRECTED_PAYMENT_INPUT)

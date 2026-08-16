@@ -35,6 +35,8 @@ class SemanticRenderer(Protocol):
         self,
         raw_input: str,
         instruction: str,
+        *,
+        allow_temporary_value: bool = False,
     ) -> Awaitable[RenderedUserInput]: ...
 
 

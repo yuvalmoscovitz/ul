@@ -479,6 +479,78 @@ def test_help_explains_dataset_target_and_operator_contract() -> None:
     assert operators.exit_code == 0, operators.output
     assert "surface.disfluency_repeat" in operators.output
     assert "tone.frustrated" in operators.output
+    assert "intent.self_correction" in operators.output
+
+
+def test_operator_list_is_fixed_and_self_correction_keeps_existing_call_accounting(
+    tmp_path: Path,
+) -> None:
+    operators = runner.invoke(root_app, ["dataset", "operators"])
+
+    assert operators.exit_code == 0, operators.output
+    listed_operator_ids = tuple(
+        line.removeprefix("- ").split(" ", 1)[0]
+        for line in operators.output.splitlines()
+        if line.startswith("- ")
+    )
+    assert listed_operator_ids == (
+        "surface.rephrase",
+        "surface.typing_noise",
+        "surface.fragmented_syntax",
+        "surface.disfluency_repeat",
+        "style.terse",
+        "style.verbose",
+        "tone.frustrated",
+        "intent.self_correction",
+    )
+
+    dataset = tmp_path / "interactions.jsonl"
+    _write_dataset(dataset, [_record()])
+    dry_run = runner.invoke(
+        root_app,
+        [
+            "dataset",
+            "evaluate",
+            str(dataset),
+            "--operator",
+            "intent.self_correction",
+            "--dry-run",
+        ],
+    )
+
+    assert dry_run.exit_code == 0, dry_run.output
+    assert "Operators: intent.self_correction" in dry_run.output
+    assert "Potential semantic model calls: up to 6" in dry_run.output
+    assert "Potential target calls: up to 2" in dry_run.output
+
+
+@pytest.mark.parametrize(
+    "operators",
+    [
+        ("intent.self_correction", "intent.self_correction"),
+        ("intent.self-correction",),
+    ],
+)
+def test_cli_rejects_duplicate_or_unknown_self_correction_operator_before_calls(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    operators: tuple[str, ...],
+) -> None:
+    dataset = tmp_path / "interactions.jsonl"
+    _write_dataset(dataset, [_record()])
+
+    def unexpected_settings() -> None:
+        raise AssertionError("invalid operator selection reached model setup")
+
+    monkeypatch.setattr(main, "OpenRouterDatasetSettings", unexpected_settings)
+    arguments = ["dataset", "evaluate", str(dataset)]
+    for operator_id in operators:
+        arguments.extend(("--operator", operator_id))
+
+    result = runner.invoke(root_app, arguments)
+
+    assert result.exit_code != 0
+    assert "operator" in result.output.casefold()
 
 
 def test_customer_evidence_keeps_summary_and_nested_technical_details() -> None:

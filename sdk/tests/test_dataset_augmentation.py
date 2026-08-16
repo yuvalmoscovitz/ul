@@ -150,6 +150,7 @@ class DeterministicSemanticModel:
         self.deconstructed_records: list[InteractionRecord | UserInputRecord] = []
         self.rendered_inputs: list[str] = []
         self.rendered_instructions: list[str] = []
+        self.temporary_value_permissions: list[bool] = []
 
     async def deconstruct(
         self,
@@ -172,9 +173,12 @@ class DeterministicSemanticModel:
         self,
         raw_input: str,
         instruction: str,
+        *,
+        allow_temporary_value: bool = False,
     ) -> RenderedUserInput:
         self.rendered_inputs.append(raw_input)
         self.rendered_instructions.append(instruction)
+        self.temporary_value_permissions.append(allow_temporary_value)
         return RenderedUserInput(
             text=self.rendered_output,
             metadata={"model": "test/model", "seed": 42},
@@ -393,6 +397,65 @@ def behavior_candidate_frame(
     return frame.model_copy(update={"communication_acts": (*frame.communication_acts, target_act)})
 
 
+def self_correction_source_frame(record: InteractionRecord) -> SemanticFrame:
+    frame = source_frame(record)
+    amount = frame.factors[0].model_copy(
+        update={
+            "evidence": (
+                EvidenceReference(source="input", json_pointer="/raw_input", text_quote="100"),
+            )
+        }
+    )
+    return frame.model_copy(update={"factors": (amount, frame.factors[1])})
+
+
+def self_correction_candidate_frame(record: InteractionRecord) -> SemanticFrame:
+    frame = source_frame(record, identifier_prefix="candidate").model_copy(update={"outcomes": ()})
+    final_amount = frame.factors[0].model_copy(
+        update={
+            "evidence": (
+                EvidenceReference(source="input", json_pointer="/raw_input", text_quote="100"),
+            )
+        }
+    )
+    provisional_amount = SemanticFactor(
+        id="candidate:provisional-amount",
+        evidence=(EvidenceReference(source="input", json_pointer="/raw_input", text_quote="110"),),
+        confidence=1,
+        status="superseded",
+        kind="money",
+        role="amount",
+        value=110,
+    )
+    correction_evidence = (
+        EvidenceReference(source="input", json_pointer="/raw_input", text_quote="110, sorry 100"),
+    )
+    correction_act = CommunicationAct(
+        id="candidate:self-correction",
+        evidence=correction_evidence,
+        confidence=1,
+        status="explicit",
+        kind="self_correction",
+        factor_ids=(provisional_amount.id, final_amount.id),
+    )
+    correction_relation = SemanticRelation(
+        id="candidate:superseded-by",
+        evidence=correction_evidence,
+        confidence=1,
+        status="explicit",
+        kind="superseded_by",
+        source_ids=(provisional_amount.id,),
+        target_ids=(final_amount.id,),
+    )
+    return frame.model_copy(
+        update={
+            "factors": (final_amount, frame.factors[1], provisional_amount),
+            "relations": (*frame.relations, correction_relation),
+            "communication_acts": (*frame.communication_acts, correction_act),
+        }
+    )
+
+
 async def test_builtin_operator_library_is_fixed_versioned_and_reviewable() -> None:
     operators = builtin_dataset_augmentation_operators()
 
@@ -404,12 +467,16 @@ async def test_builtin_operator_library_is_fixed_versioned_and_reviewable() -> N
         "style.terse",
         "style.verbose",
         "tone.frustrated",
+        "intent.self_correction",
     )
     assert {operator.version for operator in operators} == {"1.0.0"}
     assert [operator.id for operator in operators if operator.human_review_required] == [
-        "tone.frustrated"
+        "tone.frustrated",
+        "intent.self_correction",
     ]
-    frustrated_instruction = operators[-1].instruction
+    frustrated_instruction = next(
+        operator.instruction for operator in operators if operator.id == "tone.frustrated"
+    )
     assert all(
         forbidden_invention in frustrated_instruction
         for forbidden_invention in (
@@ -437,6 +504,288 @@ async def test_operator_change_contract_rejects_impossible_target_states() -> No
             instruction="Make it terse.",
             allowed_change="declared_communication_form",
         )
+    with pytest.raises(ValueError, match="target communication kind"):
+        DatasetAugmentationOperator(
+            id="intent.self_correction",
+            instruction="Add a correction.",
+            allowed_change="structured_self_correction",
+        )
+
+
+async def test_self_correction_accepts_one_structured_superseded_value() -> None:
+    record = source_record()
+    original_frame = self_correction_source_frame(record)
+    candidate_frame = self_correction_candidate_frame(record)
+    rendered_output = "Transfer 110, sorry 100 to Alice, then tell me the balance."
+    model = DeterministicSemanticModel(
+        {record.id: original_frame}, candidate_frame, rendered_output
+    )
+
+    result = await DatasetAugmentationEngine(model, model).augment(
+        (record,), operator_ids=("intent.self_correction",)
+    )
+
+    candidate = result.candidates[0]
+    assert candidate.passed
+    assert candidate.allowed_change == "structured_self_correction"
+    assert candidate.augmented_input == rendered_output
+    assert candidate.semantic_equivalence_assessment is None
+    assert model.temporary_value_permissions == [True]
+    assert 'exact source text "100"' in model.rendered_instructions[0]
+    assert 'exact temporary text "110"' in model.rendered_instructions[0]
+
+
+@pytest.mark.parametrize(
+    "malformation",
+    [
+        "missing_act",
+        "duplicate_act",
+        "missing_relation",
+        "wrong_relation",
+        "provisional_in_request",
+        "same_value",
+        "misparsed_provisional_value",
+        "different_kind",
+        "changed_final_value",
+        "extra_provisional_reference",
+        "attributes",
+        "wrong_status",
+        "incomplete_evidence",
+        "semantic_drift",
+    ],
+)
+async def test_self_correction_rejects_malformed_semantic_structures(
+    malformation: str,
+) -> None:
+    record = source_record()
+    original_frame = self_correction_source_frame(record)
+    candidate_frame = self_correction_candidate_frame(record)
+    correction_act = candidate_frame.communication_acts[-1]
+    correction_relation = candidate_frame.relations[-1]
+    provisional_factor = candidate_frame.factors[-1]
+    final_factor = candidate_frame.factors[0]
+    if malformation == "missing_act":
+        candidate_frame = candidate_frame.model_copy(
+            update={"communication_acts": candidate_frame.communication_acts[:-1]}
+        )
+    elif malformation == "duplicate_act":
+        duplicate_act = correction_act.model_copy(update={"id": "candidate:second-correction"})
+        candidate_frame = candidate_frame.model_copy(
+            update={"communication_acts": (*candidate_frame.communication_acts, duplicate_act)}
+        )
+    elif malformation == "missing_relation":
+        candidate_frame = candidate_frame.model_copy(
+            update={"relations": candidate_frame.relations[:-1]}
+        )
+    elif malformation == "wrong_relation":
+        reversed_relation = correction_relation.model_copy(
+            update={
+                "source_ids": correction_relation.target_ids,
+                "target_ids": correction_relation.source_ids,
+            }
+        )
+        candidate_frame = candidate_frame.model_copy(
+            update={"relations": (*candidate_frame.relations[:-1], reversed_relation)}
+        )
+    elif malformation == "provisional_in_request":
+        changed_request = candidate_frame.request_units[0].model_copy(
+            update={
+                "factor_ids": (
+                    *candidate_frame.request_units[0].factor_ids,
+                    provisional_factor.id,
+                )
+            }
+        )
+        candidate_frame = candidate_frame.model_copy(
+            update={"request_units": (changed_request, candidate_frame.request_units[1])}
+        )
+    elif malformation == "same_value":
+        changed_provisional = provisional_factor.model_copy(update={"value": final_factor.value})
+        candidate_frame = candidate_frame.model_copy(
+            update={"factors": (*candidate_frame.factors[:-1], changed_provisional)}
+        )
+    elif malformation == "misparsed_provisional_value":
+        changed_provisional = provisional_factor.model_copy(update={"value": 11})
+        candidate_frame = candidate_frame.model_copy(
+            update={"factors": (*candidate_frame.factors[:-1], changed_provisional)}
+        )
+    elif malformation == "different_kind":
+        changed_provisional = provisional_factor.model_copy(update={"kind": "number"})
+        candidate_frame = candidate_frame.model_copy(
+            update={"factors": (*candidate_frame.factors[:-1], changed_provisional)}
+        )
+    elif malformation == "changed_final_value":
+        changed_final = final_factor.model_copy(update={"value": 90})
+        candidate_frame = candidate_frame.model_copy(
+            update={"factors": (changed_final, *candidate_frame.factors[1:])}
+        )
+    elif malformation == "extra_provisional_reference":
+        extra_act = CommunicationAct(
+            id="candidate:extra-act",
+            evidence=evidence("input"),
+            confidence=1,
+            status="explicit",
+            kind="emphasis",
+            factor_ids=(provisional_factor.id,),
+        )
+        candidate_frame = candidate_frame.model_copy(
+            update={"communication_acts": (*candidate_frame.communication_acts, extra_act)}
+        )
+    elif malformation == "attributes":
+        changed_act = correction_act.model_copy(update={"attributes": {"cue": "sorry"}})
+        candidate_frame = candidate_frame.model_copy(
+            update={
+                "communication_acts": (
+                    *candidate_frame.communication_acts[:-1],
+                    changed_act,
+                )
+            }
+        )
+    elif malformation == "wrong_status":
+        changed_provisional = provisional_factor.model_copy(update={"status": "explicit"})
+        candidate_frame = candidate_frame.model_copy(
+            update={"factors": (*candidate_frame.factors[:-1], changed_provisional)}
+        )
+    elif malformation == "incomplete_evidence":
+        changed_relation = correction_relation.model_copy(
+            update={
+                "evidence": (
+                    EvidenceReference(
+                        source="input", json_pointer="/raw_input", text_quote="sorry"
+                    ),
+                )
+            }
+        )
+        candidate_frame = candidate_frame.model_copy(
+            update={"relations": (*candidate_frame.relations[:-1], changed_relation)}
+        )
+    else:
+        changed_request = candidate_frame.request_units[1].model_copy(
+            update={"predicate": "report_credit_limit"}
+        )
+        candidate_frame = candidate_frame.model_copy(
+            update={"request_units": (candidate_frame.request_units[0], changed_request)}
+        )
+    model = DeterministicSemanticModel(
+        {record.id: original_frame},
+        candidate_frame,
+        "Transfer 110, sorry 100 to Alice, then tell me the balance.",
+    )
+
+    result = await DatasetAugmentationEngine(model, model).augment(
+        (record,), operator_ids=("intent.self_correction",)
+    )
+
+    assert not result.candidates[0].passed
+    assert result.candidates[0].failure_reasons
+
+
+@pytest.mark.parametrize(
+    "rendered_output",
+    [
+        "Transfer 100, sorry 110 to Alice, then tell me the balance.",
+        "Transfer 110, sorry 100 and 100 to Alice, then tell me the balance.",
+        "Transfer sorry 110, 100 to Alice, then tell me the balance.",
+    ],
+)
+async def test_self_correction_rejects_invalid_textual_footprint(
+    rendered_output: str,
+) -> None:
+    record = source_record()
+    original_frame = self_correction_source_frame(record)
+    candidate_frame = self_correction_candidate_frame(record)
+    model = DeterministicSemanticModel(
+        {record.id: original_frame}, candidate_frame, rendered_output
+    )
+
+    result = await DatasetAugmentationEngine(model, model).augment(
+        (record,), operator_ids=("intent.self_correction",)
+    )
+
+    assert not result.candidates[0].passed
+
+
+async def test_self_correction_never_uses_generic_equivalence_fallback() -> None:
+    record = source_record()
+    original_frame = self_correction_source_frame(record)
+    malformed_frame = self_correction_candidate_frame(record).model_copy(
+        update={"relations": self_correction_candidate_frame(record).relations[:-1]}
+    )
+    model = DeterministicSemanticModel(
+        {record.id: original_frame},
+        malformed_frame,
+        "Transfer 110, sorry 100 to Alice, then tell me the balance.",
+    )
+    assessment = SemanticEquivalenceAssessment(
+        verdict="equivalent",
+        explanation="The final request is the same.",
+        verifier_version="test/1",
+    )
+    verifier = DeterministicEquivalenceVerifier(assessment)
+
+    result = await DatasetAugmentationEngine(model, model, verifier).augment(
+        (record,), operator_ids=("intent.self_correction",)
+    )
+
+    assert not result.candidates[0].passed
+    assert verifier.calls == []
+
+
+@pytest.mark.parametrize(
+    "ineligible_reason",
+    ["no_quote", "not_action_grounded", "unsupported_kind", "boolean", "existing"],
+)
+async def test_self_correction_skips_ineligible_sources(ineligible_reason: str) -> None:
+    record = source_record()
+    original_frame = self_correction_source_frame(record)
+    if ineligible_reason == "no_quote":
+        amount = original_frame.factors[0].model_copy(update={"evidence": evidence("input")})
+        original_frame = original_frame.model_copy(
+            update={"factors": (amount, original_frame.factors[1])}
+        )
+    elif ineligible_reason == "not_action_grounded":
+        transfer_outcome = original_frame.outcomes[0].model_copy(update={"kind": "answer"})
+        original_frame = original_frame.model_copy(
+            update={"outcomes": (transfer_outcome, original_frame.outcomes[1])}
+        )
+    elif ineligible_reason == "unsupported_kind":
+        amount = original_frame.factors[0].model_copy(update={"kind": "identifier"})
+        original_frame = original_frame.model_copy(
+            update={"factors": (amount, original_frame.factors[1])}
+        )
+    elif ineligible_reason == "boolean":
+        amount = original_frame.factors[0].model_copy(
+            update={"kind": "number", "role": "approved", "value": True}
+        )
+        transfer_outcome = original_frame.outcomes[0].model_copy(
+            update={"fields": {"approved": True, "recipient": "Alice"}}
+        )
+        original_frame = original_frame.model_copy(
+            update={
+                "factors": (amount, original_frame.factors[1]),
+                "outcomes": (transfer_outcome, original_frame.outcomes[1]),
+            }
+        )
+    else:
+        existing_act = CommunicationAct(
+            id="source:self-correction",
+            evidence=evidence("input"),
+            confidence=1,
+            status="explicit",
+            kind="self_correction",
+            factor_ids=(original_frame.factors[0].id,),
+        )
+        original_frame = original_frame.model_copy(
+            update={"communication_acts": (*original_frame.communication_acts, existing_act)}
+        )
+    model = DeterministicSemanticModel({record.id: original_frame})
+
+    result = await DatasetAugmentationEngine(model, model).augment(
+        (record,), operator_ids=("intent.self_correction",)
+    )
+
+    assert result.candidates == ()
+    assert model.rendered_inputs == []
 
 
 @pytest.mark.parametrize(
