@@ -16,6 +16,8 @@ from ul_core.dataset import (
     ObservedOutcome,
     RenderedUserInput,
     RequestUnit,
+    SemanticDelta,
+    SemanticEquivalenceAssessment,
     SemanticFactor,
     SemanticFrame,
     SemanticRelation,
@@ -177,6 +179,20 @@ class DeterministicSemanticModel:
             text=self.rendered_output,
             metadata={"model": "test/model", "seed": 42},
         )
+
+
+class DeterministicEquivalenceVerifier:
+    def __init__(self, assessment: SemanticEquivalenceAssessment | None) -> None:
+        self.assessment = assessment
+        self.calls: list[tuple[str, str]] = []
+
+    async def verify(
+        self, source_input: str, candidate_input: str
+    ) -> SemanticEquivalenceAssessment:
+        self.calls.append((source_input, candidate_input))
+        if self.assessment is None:
+            raise ValueError("invalid model evidence")
+        return self.assessment
 
 
 async def test_engine_rephrases_and_independently_validates_full_semantics() -> None:
@@ -930,3 +946,85 @@ async def test_engine_propagates_source_deconstruction_validation_failure() -> N
         await DatasetAugmentationEngine(model, model).augment((record,))
 
     assert model.rendered_inputs == []
+
+
+@pytest.mark.parametrize(
+    ("verdict", "expected_passed", "expected_reason"),
+    [
+        ("equivalent", True, None),
+        (
+            "different",
+            False,
+            "semantic equivalence check found a material change",
+        ),
+        (
+            "uncertain",
+            False,
+            "semantic equivalence check was uncertain",
+        ),
+    ],
+)
+async def test_engine_uses_equivalence_only_after_strict_frame_mismatch(
+    verdict: Literal["equivalent", "different", "uncertain"],
+    expected_passed: bool,
+    expected_reason: str | None,
+) -> None:
+    record = source_record()
+    original_frame = source_frame(record)
+    candidate_frame = source_frame(record, identifier_prefix="candidate").model_copy(
+        update={
+            "factors": (
+                *source_frame(record, identifier_prefix="candidate").factors[:-1],
+                source_frame(record, identifier_prefix="candidate")
+                .factors[-1]
+                .model_copy(update={"kind": "number"}),
+            ),
+            "outcomes": (),
+        }
+    )
+    model = DeterministicSemanticModel({record.id: original_frame}, candidate_frame)
+    deltas = (
+        (
+            SemanticDelta(
+                category="value",
+                operation="changed",
+                description="A value changed.",
+                source_quote="100",
+                candidate_quote="100",
+            ),
+        )
+        if verdict == "different"
+        else ()
+    )
+    assessment = SemanticEquivalenceAssessment(
+        verdict=verdict,
+        explanation="Direct comparison result.",
+        deltas=deltas,
+        verifier_version="test/1",
+    )
+    verifier = DeterministicEquivalenceVerifier(assessment)
+
+    result = await DatasetAugmentationEngine(model, model, verifier).augment((record,))
+
+    candidate = result.candidates[0]
+    assert candidate.passed is expected_passed
+    assert candidate.semantic_equivalence_assessment == assessment
+    assert verifier.calls == [(record.raw_input, candidate.augmented_input)]
+    if expected_reason is not None:
+        assert expected_reason in candidate.failure_reasons
+
+
+async def test_engine_fails_closed_when_equivalence_evidence_is_invalid() -> None:
+    record = source_record()
+    original_frame = source_frame(record)
+    candidate_frame = source_frame(record, identifier_prefix="candidate").model_copy(
+        update={"relations": (), "outcomes": ()}
+    )
+    model = DeterministicSemanticModel({record.id: original_frame}, candidate_frame)
+
+    result = await DatasetAugmentationEngine(
+        model, model, DeterministicEquivalenceVerifier(None)
+    ).augment((record,))
+
+    assert not result.candidates[0].passed
+    assert result.candidates[0].failure_reasons == ("semantic equivalence validation failed",)

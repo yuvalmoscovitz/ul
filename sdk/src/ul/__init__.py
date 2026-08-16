@@ -1,12 +1,14 @@
 """Public Python SDK for UL."""
 
 from ul_core.augmentation import builtin_augmentation_registry
-from ul_core.contracts import DatasetTargetExecutor
+from ul_core.contracts import DatasetTargetExecutor, SemanticEquivalenceVerifier
 from ul_core.coverage import CoverageArchive
 from ul_core.dataset import (
     InteractionRecord,
     ObservedAgentOutput,
     RenderedUserInput,
+    SemanticDelta,
+    SemanticEquivalenceAssessment,
     SemanticFrame,
     UserInputRecord,
 )
@@ -39,6 +41,7 @@ from ul.dataset_evaluation import (
     DatasetEvaluationRunner,
 )
 from ul.deconstruction import OpenRouterDatasetSettings, OpenRouterSemanticDeconstructor
+from ul.http_target import JsonHttpDatasetTarget
 
 __all__ = [
     "Action",
@@ -59,6 +62,7 @@ __all__ = [
     "ExecutionStatus",
     "FindingSeverity",
     "InteractionRecord",
+    "JsonHttpDatasetTarget",
     "MaterializedScenario",
     "ObservedAgentOutput",
     "OpenRouterDatasetSettings",
@@ -68,6 +72,9 @@ __all__ = [
     "SafetyEnvelope",
     "Scenario",
     "ScenarioProvenance",
+    "SemanticDelta",
+    "SemanticEquivalenceAssessment",
+    "SemanticEquivalenceVerifier",
     "SemanticFrame",
     "UserInputRecord",
     "builtin_augmentation_registry",

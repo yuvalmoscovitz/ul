@@ -19,6 +19,7 @@ from examples.accounts_payable.ul_adapter import (
     accounts_payable_augmentation_registry,
     to_ul_scenario,
 )
+from ul_cli.dataset import app as dataset_app
 
 app = typer.Typer(
     name="ul",
@@ -28,6 +29,7 @@ app = typer.Typer(
 augmentations_app = typer.Typer(help="Inspect UL's built-in augmentation library.")
 demo_app = typer.Typer(help="Run an isolated proving-ground agent.")
 app.add_typer(augmentations_app, name="augmentations")
+app.add_typer(dataset_app, name="dataset")
 app.add_typer(demo_app, name="demo")
 
 console = Console()

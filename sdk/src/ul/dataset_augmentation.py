@@ -8,10 +8,15 @@ from itertools import islice, pairwise
 from typing import Any, Literal, Self
 
 from pydantic import Field, JsonValue, model_validator
-from ul_core.contracts import SemanticDeconstructor, SemanticRenderer
+from ul_core.contracts import (
+    SemanticDeconstructor,
+    SemanticEquivalenceVerifier,
+    SemanticRenderer,
+)
 from ul_core.dataset import (
     InteractionRecord,
     RenderedUserInput,
+    SemanticEquivalenceAssessment,
     SemanticFrame,
     UserInputRecord,
 )
@@ -157,6 +162,7 @@ class DatasetAugmentationCandidate(ULModel):
     renderer_metadata: dict[str, JsonValue] = Field(default_factory=dict)
     expected_input_frame: SemanticFrame
     reparsed_input_frame: SemanticFrame | None
+    semantic_equivalence_assessment: SemanticEquivalenceAssessment | None = None
     passed: bool
     failure_reasons: tuple[str, ...] = ()
 
@@ -174,9 +180,11 @@ class DatasetAugmentationEngine:
         self,
         deconstructor: SemanticDeconstructor,
         renderer: SemanticRenderer,
+        equivalence_verifier: SemanticEquivalenceVerifier | None = None,
     ) -> None:
         self._deconstructor = deconstructor
         self._renderer = renderer
+        self._equivalence_verifier = equivalence_verifier
 
     async def augment(
         self,
@@ -233,8 +241,10 @@ class DatasetAugmentationEngine:
                     )
                 except ValueError:
                     reparsed_frame = None
+                    equivalence_assessment = None
                     failure_reasons = ["candidate semantic deconstruction failed validation"]
                 else:
+                    equivalence_assessment = None
                     if reparsed_frame.interaction_id != candidate_record.id:
                         failure_reasons = ["reparsed frame must reference its candidate input"]
                     elif operator.allowed_change == "surface_form_only":
@@ -254,6 +264,30 @@ class DatasetAugmentationEngine:
                         failure_reasons.append(
                             "reparsed frame contains unresolved semantic elements"
                         )
+                    if (
+                        self._equivalence_verifier is not None
+                        and failure_reasons
+                        and all(
+                            reason.endswith("differ from the expected frame")
+                            for reason in failure_reasons
+                        )
+                    ):
+                        try:
+                            equivalence_assessment = await self._equivalence_verifier.verify(
+                                record.raw_input,
+                                augmented_input,
+                            )
+                        except ValueError:
+                            failure_reasons = ["semantic equivalence validation failed"]
+                        else:
+                            if equivalence_assessment.verdict == "equivalent":
+                                failure_reasons = []
+                            elif equivalence_assessment.verdict == "different":
+                                failure_reasons = [
+                                    "semantic equivalence check found a material change"
+                                ]
+                            else:
+                                failure_reasons = ["semantic equivalence check was uncertain"]
                 failure_reasons.extend(
                     _surface_footprint_reasons(operator.id, record.raw_input, augmented_input)
                 )
@@ -276,6 +310,7 @@ class DatasetAugmentationEngine:
                         renderer_metadata=rendered_input.metadata,
                         expected_input_frame=expected_input_frame,
                         reparsed_input_frame=reparsed_frame,
+                        semantic_equivalence_assessment=equivalence_assessment,
                         passed=not failure_reasons,
                         failure_reasons=tuple(failure_reasons),
                     )
