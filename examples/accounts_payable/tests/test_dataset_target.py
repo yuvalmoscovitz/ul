@@ -11,6 +11,7 @@ from examples.accounts_payable.dataset_target import (
     SOURCE_INPUT,
     AccountsPayableDatasetTarget,
     SeededFirstValueWinsDefectAccountsPayableDatasetTarget,
+    SeededFlakyIntentFanOutDefectAccountsPayableDatasetTarget,
     SeededIntentFanOutDefectAccountsPayableDatasetTarget,
 )
 
@@ -70,6 +71,25 @@ async def test_seeded_target_state_is_fresh_for_each_call() -> None:
         "pay-0001",
         "pay-0002",
     ]
+
+
+@pytest.mark.asyncio
+async def test_seeded_flaky_target_varies_only_repeated_imperatives_with_fresh_state() -> None:
+    target = SeededFlakyIntentFanOutDefectAccountsPayableDatasetTarget(seed=4)
+
+    source_outputs = [await target.execute(SOURCE_INPUT) for _ in range(3)]
+    candidate_outputs = [await target.execute(REPEATED_PAYMENT_INPUT) for _ in range(3)]
+
+    assert [len(_committed_payment_actions(output)) for output in source_outputs] == [1, 1, 1]
+    assert [len(_committed_payment_actions(output)) for output in candidate_outputs] == [1, 2, 1]
+    assert [
+        action["payment_id"]
+        for output in candidate_outputs
+        for action in _committed_payment_actions(output)[:1]
+    ] == ["pay-0001", "pay-0001", "pay-0001"]
+    assert [
+        action["payment_id"] for action in _committed_payment_actions(candidate_outputs[1])
+    ] == ["pay-0001", "pay-0002"]
 
 
 @pytest.mark.asyncio

@@ -14,9 +14,11 @@ from rich.console import Console
 from rich.table import Table
 from ul import (
     DatasetAugmentationEngine,
+    DatasetEvaluationCase,
     DatasetEvaluationFinding,
     DatasetEvaluationResult,
     DatasetEvaluationRunner,
+    DatasetEvaluationTrialSet,
     InteractionRecord,
     OpenRouterDatasetSettings,
     OpenRouterSemanticDeconstructor,
@@ -27,12 +29,12 @@ from ul.http_target import (
     validate_json_http_dataset_target_configuration,
 )
 
-app = typer.Typer(help="Evaluate successful agent interactions.")
+app = typer.Typer(help="Explore behavioral differences in observed agent interactions.")
 console = Console()
 
 _MAXIMUM_DATASET_BYTES = 10_000_000
 _MAXIMUM_DATASET_RECORDS = 100
-_MAXIMUM_TARGET_CALLS = 100
+_DEFAULT_MAXIMUM_TARGET_CALLS = 100
 _HEADER_NAME_PATTERN = re.compile(r"[!#$%&'*+.^_`|~0-9A-Za-z-]+")
 _ENVIRONMENT_NAME_PATTERN = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 _DATASET_OPERATOR_IDS = tuple(operator.id for operator in builtin_dataset_augmentation_operators())
@@ -42,17 +44,17 @@ _CUSTOMER_STATUSES = {
     "no_divergence": "NO OBSERVED DIFFERENCE",
     "divergence_needs_review": "DIFFERENCE — REVIEW",
 }
-_BASELINE_STATUSES = {
-    "inconclusive": "COULDN'T DETERMINE",
-    "no_divergence": "LIVE CONTROL MATCHES STORED RUN",
-    "divergence_needs_review": "LIVE CONTROL DIFFERS — REVIEW",
-}
 _FINDING_LABELS = {
     "duplicate_effect": "duplicate action",
     "unexpected_effect": "unexpected action",
     "missing_effect": "missing action",
     "changed_grounded_effect_argument": "changed action value",
 }
+_BEHAVIORAL_LIMITATIONS = (
+    "UL compares observed action behavior only. It does not determine whether the original or "
+    "variation is correct, prove that the variation caused a difference, or estimate a "
+    "production failure rate."
+)
 
 
 class _DatasetInputError(ValueError):
@@ -102,7 +104,21 @@ def evaluate_dataset(
     limit: Annotated[
         int,
         typer.Option(min=1, max=_MAXIMUM_DATASET_RECORDS, help="Interactions to evaluate."),
-    ] = 25,
+    ] = 10,
+    repetitions: Annotated[
+        int,
+        typer.Option(
+            min=1,
+            help="Fresh-state target executions per original input and accepted variation.",
+        ),
+    ] = 3,
+    max_target_calls: Annotated[
+        int,
+        typer.Option(
+            min=1,
+            help="Maximum target requests authorized for this evaluation.",
+        ),
+    ] = _DEFAULT_MAXIMUM_TARGET_CALLS,
     request_field: Annotated[
         str,
         typer.Option(help="JSON request field that receives the augmented input."),
@@ -135,7 +151,7 @@ def evaluate_dataset(
         typer.Option(help="Validate and show the execution plan without external calls."),
     ] = False,
 ) -> None:
-    """Evaluate successful interactions against an isolated black-box agent.
+    """Explore behavioral differences against an isolated black-box agent.
 
     Execution requires UL_DATASET_LIVE_CALLS=true,
     UL_DATASET_ALLOW_EXTERNAL_DATA_PROCESSING=true, and OPEN_ROUTER_API_KEY.
@@ -152,11 +168,12 @@ def evaluate_dataset(
         raise typer.BadParameter(str(error)) from None
 
     selected_records = records[:limit]
-    potential_target_calls = len(selected_records) * (1 + len(selected_operators))
-    if potential_target_calls > _MAXIMUM_TARGET_CALLS:
+    potential_target_calls = len(selected_records) * repetitions * (1 + len(selected_operators))
+    if potential_target_calls > max_target_calls:
         raise typer.BadParameter(
-            f"selection would make {potential_target_calls} target calls; maximum is "
-            f"{_MAXIMUM_TARGET_CALLS}"
+            f"selection would make up to {potential_target_calls} target calls, exceeding "
+            f"--max-target-calls {max_target_calls}; reduce --limit, --operator, or "
+            "--repetitions, or explicitly raise the call budget"
         )
     if not dry_run:
         if target_url is None:
@@ -203,6 +220,8 @@ def evaluate_dataset(
             selected_count=len(selected_records),
             operator_ids=selected_operators,
             target_configured=target_url is not None,
+            repetitions=repetitions,
+            max_target_calls=max_target_calls,
         )
         return
 
@@ -248,6 +267,9 @@ def evaluate_dataset(
                     settings,
                     target,
                     output_stream,
+                    repetitions=repetitions,
+                    max_target_calls=max_target_calls,
+                    planned_target_calls=potential_target_calls,
                 )
             )
             for result in results:
@@ -419,21 +441,35 @@ def _print_dataset_plan(
     selected_count: int,
     operator_ids: tuple[str, ...],
     target_configured: bool,
+    repetitions: int,
+    max_target_calls: int,
 ) -> None:
-    potential_target_calls = selected_count * (1 + len(operator_ids))
-    potential_model_calls = selected_count * (2 + 4 * len(operator_ids))
+    potential_target_calls = selected_count * repetitions * (1 + len(operator_ids))
+    potential_model_calls = selected_count * (
+        1 + 3 * len(operator_ids) + repetitions * (1 + len(operator_ids))
+    )
     console.print(f"Dataset valid: {record_count} interaction(s)")
     console.print(f"Selected interactions: {selected_count}")
     console.print(f"Operators: {', '.join(operator_ids)}")
+    console.print(f"Repetitions: {repetitions} per original and accepted variation")
     console.print(f"Potential semantic model calls: up to {potential_model_calls}")
-    console.print(f"Potential target calls: up to {potential_target_calls}")
+    console.print(
+        f"Potential target calls: up to {potential_target_calls} "
+        f"(authorized maximum: {max_target_calls})"
+    )
     console.print(f"Target: {'configured' if target_configured else 'not configured'}")
     console.print(
         "Semantic models receive historical inputs and outputs, generated variations, "
         "live control responses, and variation responses on execution."
     )
     console.print(
-        "The target receives each selected original input once, then each accepted variation."
+        "Every target request must start from the same clean state. The target receives each "
+        "selected original input and each accepted variation for every repetition."
+    )
+    console.print(
+        "Target requests and semantic model calls may be billed separately. Repetitions only "
+        "show observed behavioral consistency: they do not determine correctness, identify "
+        "causality, or estimate a production failure rate."
     )
     console.print("No model or target requests sent.")
 
@@ -450,6 +486,10 @@ async def _evaluate_interaction_records(
     settings: OpenRouterDatasetSettings,
     target: JsonHttpDatasetTarget,
     output_stream: TextIO,
+    *,
+    repetitions: int,
+    max_target_calls: int,
+    planned_target_calls: int,
 ) -> tuple[DatasetEvaluationResult, ...]:
     results: list[DatasetEvaluationResult] = []
     async with OpenRouterSemanticDeconstructor(settings) as deconstructor, target:
@@ -460,9 +500,22 @@ async def _evaluate_interaction_records(
             allow_network_egress=True,
         )
         for record in records:
-            result = await runner.run(record, operator_ids=operator_ids)
+            result = await runner.run(
+                record,
+                operator_ids=operator_ids,
+                repetitions=repetitions,
+            )
             output_stream.write(
-                json.dumps(_customer_evidence_record(result), ensure_ascii=False) + "\n"
+                json.dumps(
+                    _customer_evidence_record(
+                        result,
+                        repetitions=repetitions,
+                        max_target_calls=max_target_calls,
+                        planned_target_calls=planned_target_calls,
+                    ),
+                    ensure_ascii=False,
+                )
+                + "\n"
             )
             output_stream.flush()
             results.append(result)
@@ -477,6 +530,8 @@ def _print_dataset_results(
     table.add_column("Case", style="cyan")
     table.add_column("Augmentation")
     table.add_column("Status")
+    table.add_column("Stability")
+    table.add_column("Trials / outcome groups")
     table.add_column("Finding")
     case_number = 0
     for result in results:
@@ -484,16 +539,19 @@ def _print_dataset_results(
         table.add_row(
             str(case_number),
             "original replay",
-            _BASELINE_STATUSES[result.baseline.verdict],
-            ", ".join(_FINDING_LABELS[finding.category] for finding in result.baseline.findings)
-            or "—",
+            _baseline_customer_status(result),
+            result.baseline.trial_set.stability,
+            _trial_set_summary(result.baseline.trial_set),
+            "—",
         )
         for case in result.cases:
             case_number += 1
             table.add_row(
                 str(case_number),
                 case.candidate.operator_id,
-                _CUSTOMER_STATUSES[case.verdict],
+                _case_customer_status(result, case),
+                case.trial_set.stability if case.trial_set is not None else "—",
+                _trial_set_summary(case.trial_set),
                 ", ".join(_FINDING_LABELS[finding.category] for finding in case.findings) or "—",
             )
     console.print(table)
@@ -501,13 +559,16 @@ def _print_dataset_results(
 
 
 def _result_needs_review(result: DatasetEvaluationResult) -> bool:
-    return result.baseline.verdict == "divergence_needs_review" or any(
-        case.verdict == "divergence_needs_review" for case in result.cases
-    )
+    return any(case.verdict == "divergence_needs_review" for case in result.cases)
 
 
-def _customer_evidence_record(result: DatasetEvaluationResult) -> dict[str, JsonValue]:
-    baseline_findings = _customer_findings(result.baseline.findings)
+def _customer_evidence_record(
+    result: DatasetEvaluationResult,
+    *,
+    repetitions: int,
+    max_target_calls: int,
+    planned_target_calls: int,
+) -> dict[str, JsonValue]:
     cases: list[JsonValue] = []
     for case in result.cases:
         cases.append(
@@ -515,25 +576,109 @@ def _customer_evidence_record(result: DatasetEvaluationResult) -> dict[str, Json
                 "operator_id": case.candidate.operator_id,
                 "operator_version": case.candidate.operator_version,
                 "augmented_input": case.candidate.augmented_input,
-                "status": _CUSTOMER_STATUSES[case.verdict],
+                "status": _case_customer_status(result, case),
                 "variation_accepted": case.candidate.passed,
                 "variation_rejection_reasons": list(case.candidate.failure_reasons),
+                "observations": _customer_trial_set(case.trial_set),
                 "findings": _customer_findings(case.findings),
                 "inconclusive_reasons": list(case.inconclusive_reasons),
             }
         )
     return {
-        "schema_version": "1.1.0",
+        "schema_version": "1.2.0",
         "interaction_id": result.source.id,
         "original_input": result.source.raw_input,
+        "execution_plan": {
+            "repetitions": repetitions,
+            "max_target_calls": max_target_calls,
+            "dataset_planned_target_calls": planned_target_calls,
+        },
+        "limitations": _BEHAVIORAL_LIMITATIONS,
         "current_baseline": {
-            "status": _BASELINE_STATUSES[result.baseline.verdict],
-            "findings": baseline_findings,
+            "status": _baseline_customer_status(result),
+            "observations": _customer_trial_set(result.baseline.trial_set),
             "inconclusive_reasons": list(result.baseline.inconclusive_reasons),
         },
         "cases": cases,
         "technical_details": cast(JsonValue, result.model_dump(mode="json")),
     }
+
+
+def _baseline_customer_status(result: DatasetEvaluationResult) -> str:
+    trial_set = result.baseline.trial_set
+    stability = trial_set.stability
+    if stability == "unstable":
+        return "UNSTABLE ORIGINAL — INCONCLUSIVE"
+    if stability == "inconclusive":
+        return "COULDN'T DETERMINE"
+    repetitions = trial_set.requested_repetitions
+    return f"ORIGINAL REPLAY STABLE ({repetitions}/{repetitions} OBSERVED)"
+
+
+def _case_customer_status(result: DatasetEvaluationResult, case: DatasetEvaluationCase) -> str:
+    if case.verdict == "augmentation_rejected":
+        return _CUSTOMER_STATUSES["augmentation_rejected"]
+    trial_set = case.trial_set
+    if trial_set is not None and trial_set.stability == "inconclusive":
+        return "COULDN'T DETERMINE"
+    if result.baseline.trial_set.stability == "inconclusive":
+        return "COULDN'T DETERMINE"
+    if (
+        result.baseline.trial_set.stability == "unstable"
+        and trial_set is not None
+        and trial_set.stability == "unstable"
+    ):
+        return "UNSTABLE ORIGINAL AND VARIATION — INCONCLUSIVE"
+    if result.baseline.trial_set.stability == "unstable":
+        return "UNSTABLE ORIGINAL — INCONCLUSIVE"
+    if trial_set is not None and trial_set.stability == "unstable":
+        return "UNSTABLE VARIATION — REVIEW"
+    if case.verdict == "divergence_needs_review":
+        if trial_set is not None and trial_set.requested_repetitions > 1:
+            return "REPEATABLE DIFFERENCE — REVIEW"
+        return "POTENTIAL DIFFERENCE — REVIEW"
+    return _CUSTOMER_STATUSES[case.verdict]
+
+
+def _trial_set_summary(trial_set: DatasetEvaluationTrialSet | None) -> str:
+    if trial_set is None:
+        return "—"
+    return f"{trial_set.requested_repetitions} / {len(trial_set.outcome_groups)}"
+
+
+def _customer_trial_set(trial_set: DatasetEvaluationTrialSet | None) -> JsonValue:
+    if trial_set is None:
+        return None
+    trials = [
+        {
+            "repetition": trial.repetition,
+            "status": "inconclusive" if trial.inconclusive_reasons else "observed",
+            "inconclusive_reasons": list(trial.inconclusive_reasons),
+        }
+        for trial in trial_set.trials
+    ]
+    outcome_groups = [
+        {
+            "repetitions": list(group.repetitions),
+            "count": len(group.repetitions),
+            "representative_effects": [
+                effect.model_dump(mode="json") for effect in group.representative_effects
+            ],
+        }
+        for group in trial_set.outcome_groups
+    ]
+    return cast(
+        JsonValue,
+        {
+            "requested_repetitions": trial_set.requested_repetitions,
+            "stability": trial_set.stability,
+            "observed_repetitions": sum(trial["status"] == "observed" for trial in trials),
+            "inconclusive_repetitions": sum(trial["status"] == "inconclusive" for trial in trials),
+            "outcome_group_count": len(outcome_groups),
+            "outcome_groups": outcome_groups,
+            "trials": trials,
+        },
+    )
 
 
 def _customer_findings(
@@ -543,7 +688,7 @@ def _customer_findings(
         {
             "category": finding.category,
             "summary": finding.message,
-            "expected_effects": [
+            "reference_effects": [
                 effect.model_dump(mode="json") for effect in finding.expected_effects
             ],
             "observed_effects": [

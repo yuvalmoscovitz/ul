@@ -6,6 +6,7 @@ import pytest
 from ul.dataset_augmentation import DatasetAugmentationEngine
 from ul.dataset_evaluation import DatasetEvaluationRunner
 from ul.deconstruction import OpenRouterDatasetSettings, OpenRouterSemanticDeconstructor
+from ul_core.contracts import DatasetTargetExecutor
 from ul_core.dataset import (
     CommunicationAct,
     EvidenceReference,
@@ -23,15 +24,29 @@ from ul_core.models import SafetyEnvelope
 
 from examples.accounts_payable.dataset_target import (
     AMOUNT_SOURCE_INPUT,
+    REPEATED_PAYMENT_INPUT,
     SELF_CORRECTED_PAYMENT_INPUT,
     SOURCE_INPUT,
     AccountsPayableDatasetTarget,
     SeededFirstValueWinsDefectAccountsPayableDatasetTarget,
+    SeededFlakyIntentFanOutDefectAccountsPayableDatasetTarget,
     SeededIntentFanOutDefectAccountsPayableDatasetTarget,
 )
 
 _LIVE_SETTINGS = OpenRouterDatasetSettings()
 _LIVE_TRANSFER_INPUT = "transfer 120$ to alice"
+
+
+class _RecordingDatasetTarget:
+    def __init__(self, target: DatasetTargetExecutor) -> None:
+        self._target = target
+        self.safety_envelope = target.safety_envelope
+        self.fresh_state_per_execution = target.fresh_state_per_execution
+        self.raw_inputs: list[str] = []
+
+    async def execute(self, raw_input: str) -> ObservedAgentOutput:
+        self.raw_inputs.append(raw_input)
+        return await self._target.execute(raw_input)
 
 
 class _SeededFirstValueWinsTransferTarget:
@@ -167,6 +182,106 @@ def _payment_frame(
     )
 
 
+def _repeated_payment_frame(
+    interaction_id: str,
+    *,
+    candidate: bool = False,
+    observed_payment_count: int = 0,
+) -> SemanticFrame:
+    invoice = SemanticFactor(
+        id="invoice",
+        evidence=_input_evidence("AC-100"),
+        confidence=1,
+        status="explicit",
+        kind="identifier",
+        role="invoice_reference",
+        value="AC-100",
+    )
+    request = RequestUnit(
+        id="pay_invoice",
+        evidence=_input_evidence("Pay"),
+        confidence=1,
+        status="explicit",
+        mode="act",
+        predicate="payment_committed",
+        factor_ids=(invoice.id,),
+    )
+    communication_acts: tuple[CommunicationAct, ...] = ()
+    if candidate:
+        communication_acts = (
+            CommunicationAct(
+                id="repeated_pay",
+                evidence=_input_evidence("Pay pay"),
+                confidence=1,
+                status="explicit",
+                kind="repetition",
+            ),
+        )
+    outcomes = tuple(
+        ObservedOutcome(
+            id=f"payment-{position}",
+            evidence=tuple(
+                EvidenceReference(
+                    source="output",
+                    json_pointer=f"/raw_observed_output/actions/{position}/{field}",
+                    text_quote=None,
+                )
+                for field in ("action", "invoice_reference")
+            ),
+            confidence=1,
+            status="observed",
+            request_unit_ids=(request.id,),
+            position=position,
+            kind="action",
+            predicate="payment_committed",
+            fields={"invoice_reference": "AC-100"},
+        )
+        for position in range(observed_payment_count)
+    )
+    return SemanticFrame(
+        interaction_id=interaction_id,
+        request_units=(request,),
+        factors=(invoice,),
+        communication_acts=communication_acts,
+        outcomes=outcomes,
+        extractor_version="deterministic-repetition-proof",
+    )
+
+
+class _DeterministicRepetitionPipeline:
+    async def render(
+        self,
+        raw_input: str,
+        instruction: str,
+        *,
+        allow_temporary_value: bool = False,
+    ) -> RenderedUserInput:
+        del raw_input, instruction, allow_temporary_value
+        raise AssertionError("word repetition uses the deterministic renderer")
+
+    async def deconstruct(
+        self,
+        record: InteractionRecord | UserInputRecord,
+        reference_frame: SemanticFrame | None = None,
+    ) -> SemanticFrame:
+        candidate = record.raw_input.casefold() == REPEATED_PAYMENT_INPUT.casefold()
+        if record.id == "ap-single-approved-payment":
+            assert reference_frame is None
+            return _repeated_payment_frame(record.id, observed_payment_count=1)
+        if not isinstance(record, InteractionRecord):
+            assert reference_frame is not None
+            return _repeated_payment_frame(record.id, candidate=candidate)
+        assert reference_frame is not None
+        assert isinstance(record.raw_observed_output, dict)
+        actions = record.raw_observed_output["actions"]
+        assert isinstance(actions, list)
+        return _repeated_payment_frame(
+            record.id,
+            candidate=candidate,
+            observed_payment_count=len(actions),
+        )
+
+
 class _DeterministicSelfCorrectionPipeline:
     async def render(
         self,
@@ -234,19 +349,124 @@ async def test_self_correction_e2e_compares_real_isolated_payment_actions(
         raw_observed_output=source_output.raw_output,
     )
     semantic_pipeline = _DeterministicSelfCorrectionPipeline()
+    recording_target = _RecordingDatasetTarget(target)
 
     result = await DatasetEvaluationRunner(
         DatasetAugmentationEngine(semantic_pipeline, semantic_pipeline),
         semantic_pipeline,
-        target,
+        recording_target,
     ).run(source, operator_ids=("intent.self_correction",))
 
     assert result.baseline.verdict == "no_divergence"
+    assert result.baseline.trial_set.requested_repetitions == 3
+    assert result.baseline.trial_set.stability == "stable"
     assert result.cases[0].candidate.augmented_input == SELF_CORRECTED_PAYMENT_INPUT
     assert result.cases[0].verdict == expected_verdict
+    assert result.cases[0].trial_set is not None
+    assert result.cases[0].trial_set.requested_repetitions == 3
+    assert result.cases[0].trial_set.stability == "stable"
     assert [finding.category for finding in result.cases[0].findings] == (
         [] if expected_finding is None else [expected_finding]
     )
+    assert (
+        recording_target.raw_inputs
+        == [
+            AMOUNT_SOURCE_INPUT,
+            SELF_CORRECTED_PAYMENT_INPUT,
+        ]
+        * 3
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("target", "expected_verdict", "expected_finding"),
+    [
+        (AccountsPayableDatasetTarget(), "no_divergence", None),
+        (
+            SeededIntentFanOutDefectAccountsPayableDatasetTarget(),
+            "divergence_needs_review",
+            "duplicate_effect",
+        ),
+    ],
+)
+async def test_repetition_e2e_compares_two_fresh_runs_per_input(
+    target: AccountsPayableDatasetTarget | SeededIntentFanOutDefectAccountsPayableDatasetTarget,
+    expected_verdict: str,
+    expected_finding: str | None,
+) -> None:
+    source_output = await AccountsPayableDatasetTarget().execute(SOURCE_INPUT)
+    source = InteractionRecord(
+        id="ap-single-approved-payment",
+        raw_input=SOURCE_INPUT,
+        raw_observed_output=source_output.raw_output,
+    )
+    semantic_pipeline = _DeterministicRepetitionPipeline()
+    recording_target = _RecordingDatasetTarget(target)
+
+    result = await DatasetEvaluationRunner(
+        DatasetAugmentationEngine(semantic_pipeline, semantic_pipeline),
+        semantic_pipeline,
+        recording_target,
+    ).run(
+        source,
+        operator_ids=("surface.disfluency_repeat",),
+        repetitions=2,
+    )
+
+    case = result.cases[0]
+    assert result.baseline.trial_set.requested_repetitions == 2
+    assert result.baseline.trial_set.stability == "stable"
+    assert case.candidate.augmented_input == REPEATED_PAYMENT_INPUT
+    assert case.verdict == expected_verdict
+    assert case.trial_set is not None
+    assert case.trial_set.requested_repetitions == 2
+    assert case.trial_set.stability == "stable"
+    assert [finding.category for finding in case.findings] == (
+        [] if expected_finding is None else [expected_finding]
+    )
+    assert recording_target.raw_inputs == [SOURCE_INPUT, REPEATED_PAYMENT_INPUT] * 2
+    for trial in (*result.baseline.trial_set.trials, *case.trial_set.trials):
+        assert trial.target_output is not None
+        raw_output = trial.target_output.raw_output
+        assert isinstance(raw_output, dict)
+        actions = raw_output["actions"]
+        assert isinstance(actions, list)
+        first_action = actions[0]
+        assert isinstance(first_action, dict)
+        assert first_action["payment_id"] == "pay-0001"
+
+
+@pytest.mark.asyncio
+async def test_repetition_e2e_reports_seeded_variation_instability() -> None:
+    source_output = await AccountsPayableDatasetTarget().execute(SOURCE_INPUT)
+    source = InteractionRecord(
+        id="ap-single-approved-payment",
+        raw_input=SOURCE_INPUT,
+        raw_observed_output=source_output.raw_output,
+    )
+    semantic_pipeline = _DeterministicRepetitionPipeline()
+    recording_target = _RecordingDatasetTarget(
+        SeededFlakyIntentFanOutDefectAccountsPayableDatasetTarget(seed=4)
+    )
+
+    result = await DatasetEvaluationRunner(
+        DatasetAugmentationEngine(semantic_pipeline, semantic_pipeline),
+        semantic_pipeline,
+        recording_target,
+    ).run(source, operator_ids=("surface.disfluency_repeat",))
+
+    case = result.cases[0]
+    assert result.baseline.trial_set.stability == "stable"
+    assert case.verdict == "divergence_needs_review"
+    assert case.trial_set is not None
+    assert case.trial_set.stability == "unstable"
+    assert case.findings == ()
+    assert {
+        len(group.representative_effects): group.repetitions
+        for group in case.trial_set.outcome_groups
+    } == {1: (1, 3), 2: (2,)}
+    assert recording_target.raw_inputs == [SOURCE_INPUT, REPEATED_PAYMENT_INPUT] * 3
 
 
 @pytest.mark.asyncio
@@ -274,6 +494,10 @@ async def test_live_deconstructor_discovers_seeded_duplicate_payment() -> None:
 
     case = result.cases[0]
     assert case.candidate.augmented_input.casefold() == "pay pay ac-100."
+    if case.verdict == "inconclusive":
+        assert case.trial_set is not None
+        assert case.trial_set.stability == "inconclusive"
+        return
     assert case.verdict == "divergence_needs_review", case.candidate.failure_reasons
     assert [finding.category for finding in case.findings] == ["duplicate_effect"]
 
@@ -304,5 +528,9 @@ async def test_live_pipeline_discovers_seeded_first_value_wins_defect() -> None:
 
     case = result.cases[0]
     assert case.candidate.passed, case.candidate.failure_reasons
+    if case.verdict == "inconclusive":
+        assert case.trial_set is not None
+        assert case.trial_set.stability == "inconclusive"
+        return
     assert case.verdict == "divergence_needs_review"
     assert [finding.category for finding in case.findings] == ["changed_grounded_effect_argument"]

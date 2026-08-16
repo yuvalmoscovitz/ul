@@ -38,8 +38,11 @@ from ul.dataset_evaluation import (
     DatasetEvaluationBaseline,
     DatasetEvaluationCase,
     DatasetEvaluationFinding,
+    DatasetEvaluationOutcomeGroup,
     DatasetEvaluationResult,
     DatasetEvaluationRunner,
+    DatasetEvaluationTrial,
+    DatasetEvaluationTrialSet,
 )
 from ul.deconstruction import OpenRouterDatasetSettings, OpenRouterSemanticDeconstructor
 from ul.http_target import JsonHttpDatasetTarget
@@ -56,8 +59,11 @@ __all__ = [
     "DatasetEvaluationBaseline",
     "DatasetEvaluationCase",
     "DatasetEvaluationFinding",
+    "DatasetEvaluationOutcomeGroup",
     "DatasetEvaluationResult",
     "DatasetEvaluationRunner",
+    "DatasetEvaluationTrial",
+    "DatasetEvaluationTrialSet",
     "DatasetTargetExecutor",
     "ExecutionMode",
     "ExecutionResult",
