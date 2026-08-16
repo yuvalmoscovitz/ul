@@ -33,6 +33,7 @@ CaseVerdict = Literal[
     "no_divergence",
     "divergence_needs_review",
 ]
+BaselineVerdict = Literal["inconclusive", "no_divergence", "divergence_needs_review"]
 
 
 class _StrictULModel(ULModel):
@@ -68,8 +69,8 @@ class DatasetEvaluationCase(_StrictULModel):
             or self.inconclusive_reasons
         ):
             raise ValueError("rejected candidates cannot have evaluation results")
-        if self.candidate.passed and self.target_output is None:
-            raise ValueError("accepted candidates require target output")
+        if self.candidate.passed and self.target_output is None and not self.inconclusive_reasons:
+            raise ValueError("accepted candidates require target output or an inconclusive reason")
         if self.candidate.passed and self.observed_frame is None and not self.inconclusive_reasons:
             raise ValueError("missing observed frames require an inconclusive reason")
         if self.observed_frame is None and self.findings:
@@ -90,9 +91,45 @@ class DatasetEvaluationCase(_StrictULModel):
         return self
 
 
+class DatasetEvaluationBaseline(_StrictULModel):
+    verdict: BaselineVerdict
+    target_output: ObservedAgentOutput | None = None
+    observed_frame: SemanticFrame | None = None
+    findings: tuple[DatasetEvaluationFinding, ...] = ()
+    inconclusive_reasons: tuple[str, ...] = ()
+
+    @model_validator(mode="after")
+    def validate_execution_state(self) -> Self:
+        if self.observed_frame is not None and self.target_output is None:
+            raise ValueError("a baseline observed frame requires target output")
+        if self.observed_frame is None and self.findings:
+            raise ValueError("baseline findings require an observed frame")
+        if self.findings and self.inconclusive_reasons:
+            raise ValueError("an inconclusive baseline cannot have findings")
+        if self.target_output is None and not self.inconclusive_reasons:
+            raise ValueError("a baseline without target output requires an inconclusive reason")
+        if (
+            self.observed_frame is None
+            and self.target_output is not None
+            and not self.inconclusive_reasons
+        ):
+            raise ValueError("a missing baseline frame requires an inconclusive reason")
+        expected_verdict: BaselineVerdict
+        if self.inconclusive_reasons:
+            expected_verdict = "inconclusive"
+        elif self.findings:
+            expected_verdict = "divergence_needs_review"
+        else:
+            expected_verdict = "no_divergence"
+        if self.verdict != expected_verdict:
+            raise ValueError("baseline verdict must match its evaluation results")
+        return self
+
+
 class DatasetEvaluationResult(_StrictULModel):
     source: InteractionRecord
     augmentation: DatasetAugmentationResult
+    baseline: DatasetEvaluationBaseline
     cases: tuple[DatasetEvaluationCase, ...]
 
     @model_validator(mode="after")
@@ -103,6 +140,22 @@ class DatasetEvaluationResult(_StrictULModel):
             raise ValueError("source frame must reference the source interaction")
         if tuple(case.candidate for case in self.cases) != self.augmentation.candidates:
             raise ValueError("evaluation cases must preserve every augmentation candidate")
+        if (
+            self.baseline.observed_frame is not None
+            and self.baseline.observed_frame.interaction_id != f"{self.source.id}:current_baseline"
+        ):
+            raise ValueError("baseline frame must reference the current baseline interaction")
+        if self.baseline.verdict == "inconclusive" and any(
+            case.candidate.passed
+            and (
+                case.verdict != "inconclusive"
+                or case.target_output is not None
+                or case.observed_frame is not None
+                or case.findings
+            )
+            for case in self.cases
+        ):
+            raise ValueError("accepted candidates cannot be evaluated without a valid baseline")
         return self
 
 
@@ -125,6 +178,8 @@ class DatasetEvaluationRunner:
             raise ValueError("dataset target network egress requires explicit opt-in")
         if safety_envelope.allows_business_side_effects:
             raise ValueError("dataset targets must not allow business side effects")
+        if not target.fresh_state_per_execution:
+            raise ValueError("dataset target must start from fresh state for every execution")
         self._augmentation_engine = augmentation_engine
         self._deconstructor = deconstructor
         self._target = target
@@ -148,6 +203,7 @@ class DatasetEvaluationRunner:
         )
         if source_action_issues:
             raise ValueError(f"source action outcomes are inconclusive: {source_action_issues[0]}")
+        baseline = await self._evaluate_baseline(source, source_frame)
         cases: list[DatasetEvaluationCase] = []
         for candidate in augmentation.candidates:
             if not candidate.passed:
@@ -158,8 +214,41 @@ class DatasetEvaluationRunner:
                     )
                 )
                 continue
-            async with asyncio.timeout(self._target_timeout_seconds):
-                target_output = await self._target.execute(candidate.augmented_input)
+            if baseline.verdict == "inconclusive":
+                cases.append(
+                    DatasetEvaluationCase(
+                        candidate=candidate,
+                        verdict="inconclusive",
+                        inconclusive_reasons=(
+                            f"current baseline is inconclusive: {baseline.inconclusive_reasons[0]}",
+                        ),
+                    )
+                )
+                continue
+            baseline_frame = baseline.observed_frame
+            if baseline_frame is None:
+                raise AssertionError("conclusive baseline requires an observed frame")
+            try:
+                async with asyncio.timeout(self._target_timeout_seconds):
+                    target_output = await self._target.execute(candidate.augmented_input)
+            except TimeoutError:
+                cases.append(
+                    DatasetEvaluationCase(
+                        candidate=candidate,
+                        verdict="inconclusive",
+                        inconclusive_reasons=("target execution timed out",),
+                    )
+                )
+                continue
+            except RuntimeError:
+                cases.append(
+                    DatasetEvaluationCase(
+                        candidate=candidate,
+                        verdict="inconclusive",
+                        inconclusive_reasons=("target execution failed",),
+                    )
+                )
+                continue
             candidate_record = InteractionRecord(
                 id=f"{source.id}:{candidate.operator_id}",
                 raw_input=candidate.augmented_input,
@@ -168,7 +257,7 @@ class DatasetEvaluationRunner:
             try:
                 observed_frame = await self._deconstructor.deconstruct(
                     candidate_record,
-                    source_frame,
+                    baseline_frame,
                 )
             except ValueError:
                 cases.append(
@@ -202,9 +291,10 @@ class DatasetEvaluationRunner:
                 )
                 continue
             findings = _compare_action_outcomes(
-                source_frame,
+                baseline_frame,
                 observed_frame,
                 source.raw_input,
+                grounding_frame=source_frame,
             )
             cases.append(
                 DatasetEvaluationCase(
@@ -215,7 +305,76 @@ class DatasetEvaluationRunner:
                     findings=findings,
                 )
             )
-        return DatasetEvaluationResult(source=source, augmentation=augmentation, cases=tuple(cases))
+        return DatasetEvaluationResult(
+            source=source,
+            augmentation=augmentation,
+            baseline=baseline,
+            cases=tuple(cases),
+        )
+
+    async def _evaluate_baseline(
+        self,
+        source: InteractionRecord,
+        source_frame: SemanticFrame,
+    ) -> DatasetEvaluationBaseline:
+        try:
+            async with asyncio.timeout(self._target_timeout_seconds):
+                target_output = await self._target.execute(source.raw_input)
+        except TimeoutError:
+            return DatasetEvaluationBaseline(
+                verdict="inconclusive",
+                inconclusive_reasons=("current baseline execution timed out",),
+            )
+        except RuntimeError:
+            return DatasetEvaluationBaseline(
+                verdict="inconclusive",
+                inconclusive_reasons=("current baseline execution failed",),
+            )
+        baseline_record = InteractionRecord(
+            id=f"{source.id}:current_baseline",
+            raw_input=source.raw_input,
+            raw_observed_output=target_output.raw_output,
+        )
+        try:
+            observed_frame = await self._deconstructor.deconstruct(
+                baseline_record,
+                source_frame,
+            )
+        except ValueError:
+            return DatasetEvaluationBaseline(
+                verdict="inconclusive",
+                target_output=target_output,
+                inconclusive_reasons=(
+                    "current baseline output could not be semantically deconstructed",
+                ),
+            )
+        if observed_frame.interaction_id != baseline_record.id:
+            raise ValueError("baseline frame must reference its current baseline interaction")
+        inconclusive_reasons = _action_outcome_reliability_issues(
+            observed_frame,
+            target_output.raw_output,
+            source.raw_input,
+            reference_frame=source_frame,
+        )
+        if inconclusive_reasons:
+            return DatasetEvaluationBaseline(
+                verdict="inconclusive",
+                target_output=target_output,
+                observed_frame=observed_frame,
+                inconclusive_reasons=inconclusive_reasons,
+            )
+        findings = _compare_action_outcomes(
+            source_frame,
+            observed_frame,
+            source.raw_input,
+            subject="current baseline",
+        )
+        return DatasetEvaluationBaseline(
+            verdict=("divergence_needs_review" if findings else "no_divergence"),
+            target_output=target_output,
+            observed_frame=observed_frame,
+            findings=findings,
+        )
 
 
 def _action_outcome_reliability_issues(
@@ -227,13 +386,18 @@ def _action_outcome_reliability_issues(
     require_input_grounded_fields: bool = False,
 ) -> tuple[str, ...]:
     issues: list[str] = []
-    input_grounded_values = _input_grounded_action_values(
-        reference_frame or frame,
-        source_input,
+    input_grounded_field_names_by_outcome, association_issues = (
+        _input_grounded_action_field_names_by_outcome(
+            frame,
+            source_input,
+            reference_frame=reference_frame,
+        )
     )
+    issues.extend(association_issues)
     for outcome in frame.outcomes:
         if outcome.kind != "action":
             continue
+        input_grounded_field_names = input_grounded_field_names_by_outcome.get(outcome.id, set())
         if outcome.status.casefold() != "observed":
             issues.append(f"action outcome {outcome.id} is not affirmatively observed")
         if outcome.confidence < 1:
@@ -273,7 +437,7 @@ def _action_outcome_reliability_issues(
         grounded_fields = {
             name: value
             for name, value in outcome.fields.items()
-            if _json_key(value) in input_grounded_values
+            if name in input_grounded_field_names
         }
         if not evidenced_action_objects:
             issues.append(f"action outcome {outcome.id} predicate lacks coherent action evidence")
@@ -293,14 +457,104 @@ def _action_outcome_reliability_issues(
     return tuple(issues)
 
 
-def _input_grounded_action_values(frame: SemanticFrame, source_input: str) -> set[str]:
-    return {
-        _json_key(value)
-        for outcome in frame.outcomes
+def _input_grounded_action_field_names_by_outcome(
+    frame: SemanticFrame,
+    source_input: str,
+    *,
+    reference_frame: SemanticFrame | None = None,
+) -> tuple[dict[str, set[str]], tuple[str, ...]]:
+    grounding_frame = reference_frame or frame
+    grounded_names_by_reference_id = {
+        outcome.id: {
+            name
+            for name, value in outcome.fields.items()
+            if _value_appears_in_input(value, source_input)
+        }
+        for outcome in grounding_frame.outcomes
         if outcome.kind == "action"
-        for value in outcome.fields.values()
-        if _value_appears_in_input(value, source_input)
     }
+    if reference_frame is None or frame is reference_frame:
+        return grounded_names_by_reference_id, ()
+
+    reference_by_predicate = _action_outcomes_by_key(grounding_frame)
+    grounded_names_by_outcome: dict[str, set[str]] = {}
+    association_issues: list[str] = []
+    frame_by_predicate = _action_outcomes_by_key(frame)
+    for key, outcomes in frame_by_predicate.items():
+        reference_outcomes = reference_by_predicate.get(key, ())
+        if not reference_outcomes:
+            grounded_names_by_outcome.update(
+                (
+                    outcome.id,
+                    {
+                        name
+                        for name, value in outcome.fields.items()
+                        if _value_appears_in_input(value, source_input)
+                    },
+                )
+                for outcome in outcomes
+            )
+            continue
+        if len(reference_outcomes) == 1:
+            grounded_names_by_outcome.update(
+                (outcome.id, grounded_names_by_reference_id[reference_outcomes[0].id])
+                for outcome in outcomes
+            )
+            continue
+        remaining_outcomes = list(outcomes)
+        remaining_references = list(reference_outcomes)
+        while remaining_outcomes and remaining_references:
+            proposals: list[tuple[ObservedOutcome, ObservedOutcome]] = []
+            for outcome in remaining_outcomes:
+                scored_references = [
+                    (
+                        sum(
+                            name in outcome.fields
+                            and _observable_values_equal(
+                                outcome.fields[name], reference.fields[name]
+                            )
+                            for name in grounded_names_by_reference_id[reference.id]
+                        ),
+                        reference,
+                    )
+                    for reference in remaining_references
+                ]
+                highest_score = max(score for score, _ in scored_references)
+                best_references = [
+                    reference for score, reference in scored_references if score == highest_score
+                ]
+                if highest_score > 0 and len(best_references) == 1:
+                    proposals.append((outcome, best_references[0]))
+            uniquely_proposed_references = {
+                reference.id
+                for _, reference in proposals
+                if sum(candidate.id == reference.id for _, candidate in proposals) == 1
+            }
+            accepted_proposals = [
+                (outcome, reference)
+                for outcome, reference in proposals
+                if reference.id in uniquely_proposed_references
+            ]
+            if not accepted_proposals:
+                break
+            for outcome, reference in accepted_proposals:
+                grounded_names_by_outcome[outcome.id] = grounded_names_by_reference_id[reference.id]
+            accepted_outcome_ids = {outcome.id for outcome, _ in accepted_proposals}
+            accepted_reference_ids = {reference.id for _, reference in accepted_proposals}
+            remaining_outcomes = [
+                outcome for outcome in remaining_outcomes if outcome.id not in accepted_outcome_ids
+            ]
+            remaining_references = [
+                reference
+                for reference in remaining_references
+                if reference.id not in accepted_reference_ids
+            ]
+        for outcome in remaining_outcomes:
+            association_issues.append(
+                f"action outcome {outcome.id} cannot be safely associated with an "
+                "input-grounded source action"
+            )
+    return grounded_names_by_outcome, tuple(association_issues)
 
 
 def _value_appears_in_input(value: JsonValue, source_input: str) -> bool:
@@ -359,10 +613,21 @@ def _compare_action_outcomes(
     expected_frame: SemanticFrame,
     observed_frame: SemanticFrame,
     source_input: str,
+    *,
+    subject: str = "augmented input",
+    grounding_frame: SemanticFrame | None = None,
 ) -> tuple[DatasetEvaluationFinding, ...]:
     expected_by_key = _action_outcomes_by_key(expected_frame)
     observed_by_key = _action_outcomes_by_key(observed_frame)
-    input_grounded_values = _input_grounded_action_values(expected_frame, source_input)
+    input_grounded_field_names_by_outcome, association_issues = (
+        _input_grounded_action_field_names_by_outcome(
+            expected_frame,
+            source_input,
+            reference_frame=grounding_frame,
+        )
+    )
+    if association_issues:
+        raise AssertionError("expected action grounding must be unambiguous")
     findings: list[DatasetEvaluationFinding] = []
     for key in sorted(expected_by_key.keys() | observed_by_key.keys()):
         expected = expected_by_key.get(key, ())
@@ -372,7 +637,7 @@ def _compare_action_outcomes(
                 DatasetEvaluationFinding(
                     category="unexpected_effect",
                     message=(
-                        f"Needs review: the augmented input produced an unexpected {key[1]} "
+                        f"Needs review: the {subject} produced an unexpected {key[1]} "
                         "action effect."
                     ),
                     observed_effects=observed,
@@ -381,7 +646,9 @@ def _compare_action_outcomes(
             continue
 
         unmatched_expected, unmatched_observed = _remove_grounded_matches(
-            expected, observed, input_grounded_values
+            expected,
+            observed,
+            input_grounded_field_names_by_outcome,
         )
         changed_count = min(len(unmatched_expected), len(unmatched_observed))
         for expected_effect, observed_effect in zip(
@@ -390,13 +657,15 @@ def _compare_action_outcomes(
             strict=True,
         ):
             grounded_field_names = _changed_grounded_field_names(
-                expected_effect, observed_effect, input_grounded_values
+                expected_effect,
+                observed_effect,
+                input_grounded_field_names_by_outcome[expected_effect.id],
             )
             findings.append(
                 DatasetEvaluationFinding(
                     category="changed_grounded_effect_argument",
                     message=(
-                        f"Needs review: the augmented input changed a grounded argument of the "
+                        f"Needs review: the {subject} changed a grounded argument of the "
                         f"{key[1]} action effect."
                     ),
                     expected_effects=(expected_effect,),
@@ -411,7 +680,7 @@ def _compare_action_outcomes(
                 DatasetEvaluationFinding(
                     category="missing_effect",
                     message=(
-                        f"Needs review: the augmented input produced {len(observed)} {key[1]} "
+                        f"Needs review: the {subject} produced {len(observed)} {key[1]} "
                         f"action effects instead of {len(expected)}."
                     ),
                     expected_effects=expected,
@@ -423,7 +692,11 @@ def _compare_action_outcomes(
             effect
             for effect in remaining_observed
             if any(
-                _grounded_effect_matches(expected_effect, effect, input_grounded_values)
+                _grounded_effect_matches(
+                    expected_effect,
+                    effect,
+                    input_grounded_field_names_by_outcome[expected_effect.id],
+                )
                 for expected_effect in expected
             )
         )
@@ -431,9 +704,7 @@ def _compare_action_outcomes(
             findings.append(
                 DatasetEvaluationFinding(
                     category="duplicate_effect",
-                    message=(
-                        f"Needs review: the augmented input repeated a {key[1]} action effect."
-                    ),
+                    message=(f"Needs review: the {subject} repeated a {key[1]} action effect."),
                     expected_effects=expected,
                     observed_effects=duplicate,
                 )
@@ -444,7 +715,7 @@ def _compare_action_outcomes(
                 DatasetEvaluationFinding(
                     category="unexpected_effect",
                     message=(
-                        f"Needs review: the augmented input produced an unexpected {key[1]} "
+                        f"Needs review: the {subject} produced an unexpected {key[1]} "
                         "action effect."
                     ),
                     expected_effects=expected,
@@ -467,7 +738,7 @@ def _action_outcomes_by_key(
 def _remove_grounded_matches(
     expected: tuple[ObservedOutcome, ...],
     observed: tuple[ObservedOutcome, ...],
-    input_grounded_values: set[str],
+    input_grounded_field_names_by_outcome: dict[str, set[str]],
 ) -> tuple[tuple[ObservedOutcome, ...], tuple[ObservedOutcome, ...]]:
     compatible_observed_indexes: list[tuple[int, ...]] = []
     for expected_effect in expected:
@@ -478,7 +749,7 @@ def _remove_grounded_matches(
                 if _grounded_effect_matches(
                     expected_effect,
                     observed_effect,
-                    input_grounded_values,
+                    input_grounded_field_names_by_outcome[expected_effect.id],
                 )
             )
         )
@@ -514,12 +785,10 @@ def _remove_grounded_matches(
 def _grounded_effect_matches(
     expected: ObservedOutcome,
     observed: ObservedOutcome,
-    input_grounded_values: set[str],
+    input_grounded_field_names: set[str],
 ) -> bool:
     expected_grounded_fields = {
-        name: value
-        for name, value in expected.fields.items()
-        if _json_key(value) in input_grounded_values
+        name: value for name, value in expected.fields.items() if name in input_grounded_field_names
     }
     return all(
         name in observed.fields and _json_key(observed.fields[name]) == _json_key(value)
@@ -530,13 +799,13 @@ def _grounded_effect_matches(
 def _changed_grounded_field_names(
     expected: ObservedOutcome,
     observed: ObservedOutcome,
-    input_grounded_values: set[str],
+    input_grounded_field_names: set[str],
 ) -> tuple[str, ...]:
     return tuple(
         sorted(
             name
             for name, value in expected.fields.items()
-            if _json_key(value) in input_grounded_values
+            if name in input_grounded_field_names
             and (
                 name not in observed.fields or _json_key(observed.fields[name]) != _json_key(value)
             )

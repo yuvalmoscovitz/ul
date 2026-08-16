@@ -62,12 +62,13 @@ def test_dry_run_validates_and_makes_no_external_calls(
     assert result.exit_code == 0, result.output
     assert "Dataset valid: 2 interaction(s)" in result.output
     assert "Selected interactions: 1" in result.output
-    assert "Potential semantic model calls: up to 5" in result.output
-    assert "Potential target calls: up to 1" in result.output
+    assert "Potential semantic model calls: up to 6" in result.output
+    assert "Potential target calls: up to 2" in result.output
     assert "Semantic models receive historical inputs and outputs" in result.output
     assert "generated variations" in result.output
-    assert "sandbox target responses" in result.output
-    assert "target receives only accepted augmented inputs" in result.output
+    assert "live control responses" in result.output
+    assert "target receives each selected original input once" in result.output
+    assert "then each accepted variation" in " ".join(result.output.split())
     assert "No model or target requests sent." in result.output
     assert "Transfer 100" not in result.output
 
@@ -220,7 +221,29 @@ def test_preflight_enforces_record_and_target_call_bounds(
     assert too_many_records.exit_code != 0
     assert "line 101: dataset exceeds 100 records" in too_many_records.output
 
-    _write_dataset(dataset, [_record(f"interaction-{index}") for index in range(100)])
+    monkeypatch.setattr(
+        main,
+        "OpenRouterDatasetSettings",
+        lambda: SimpleNamespace(max_input_chars=50_000),
+    )
+    _write_dataset(dataset, [_record(f"interaction-{index}") for index in range(51)])
+    maximum_calls = runner.invoke(
+        root_app,
+        [
+            "dataset",
+            "evaluate",
+            str(dataset),
+            "--limit",
+            "50",
+            "--operator",
+            "surface.rephrase",
+            "--dry-run",
+        ],
+    )
+
+    assert maximum_calls.exit_code == 0, maximum_calls.output
+    assert "Potential target calls: up to 100" in maximum_calls.output
+
     too_many_calls = runner.invoke(
         root_app,
         [
@@ -228,17 +251,15 @@ def test_preflight_enforces_record_and_target_call_bounds(
             "evaluate",
             str(dataset),
             "--limit",
-            "100",
+            "51",
             "--operator",
             "surface.rephrase",
-            "--operator",
-            "surface.disfluency_repeat",
             "--dry-run",
         ],
     )
 
     assert too_many_calls.exit_code != 0
-    assert "would make 200 target calls; maximum is 100" in too_many_calls.output
+    assert "would make 102 target calls; maximum is 100" in too_many_calls.output
 
 
 @pytest.mark.parametrize(
@@ -260,6 +281,16 @@ def test_preflight_enforces_record_and_target_call_bounds(
                 "https://sandbox.example.test",
                 "--allow-target-network",
                 "--confirm-isolated-sandbox",
+            ],
+            "--confirm-fresh-state",
+        ),
+        (
+            [
+                "--target-url",
+                "https://sandbox.example.test",
+                "--allow-target-network",
+                "--confirm-isolated-sandbox",
+                "--confirm-fresh-state",
             ],
             "execution requires --output",
         ),
@@ -302,6 +333,7 @@ def test_execution_refuses_to_overwrite_output_before_model_setup(
             "https://sandbox.example.test",
             "--allow-target-network",
             "--confirm-isolated-sandbox",
+            "--confirm-fresh-state",
             "--output",
             str(output),
         ],
@@ -347,6 +379,7 @@ def test_execution_rejects_missing_header_secret_before_model_or_output(
             "Authorization=MISSING_SANDBOX_TOKEN",
             "--allow-target-network",
             "--confirm-isolated-sandbox",
+            "--confirm-fresh-state",
             "--output",
             str(output),
         ],
@@ -368,6 +401,7 @@ def test_execution_creates_private_explicit_output(
         def __init__(self, endpoint: str, **options: object) -> None:
             assert endpoint == "http://127.0.0.1:8765/execute"
             assert options["sandbox_confirmed"] is True
+            assert options["fresh_state_confirmed"] is True
             assert options["request_field"] == "query"
 
     async def fake_evaluate(
@@ -411,6 +445,7 @@ def test_execution_creates_private_explicit_output(
             "--allow-insecure-http",
             "--allow-target-network",
             "--confirm-isolated-sandbox",
+            "--confirm-fresh-state",
             "--output",
             str(output),
         ],
@@ -436,6 +471,7 @@ def test_help_explains_dataset_target_and_operator_contract() -> None:
     assert "POST" in result.output
     assert "non-null JSON" in normalized_help
     assert "UL_DATASET_LIVE_CALLS" in result.output
+    assert "same clean state" in normalized_help
     assert "operator. Run 'ul" in normalized_help
     assert "operators' for" in normalized_help
 
@@ -472,6 +508,11 @@ def test_customer_evidence_keeps_summary_and_nested_technical_details() -> None:
         DatasetEvaluationResult,
         SimpleNamespace(
             source=SimpleNamespace(id="case-1", raw_input="transfer 100 to Alice"),
+            baseline=SimpleNamespace(
+                verdict="no_divergence",
+                findings=(),
+                inconclusive_reasons=(),
+            ),
             cases=(case,),
             model_dump=lambda **kwargs: {"full": "technical evidence"},
         ),
@@ -479,10 +520,60 @@ def test_customer_evidence_keeps_summary_and_nested_technical_details() -> None:
 
     evidence = main._customer_evidence_record(result)
 
+    assert main._result_needs_review(result) is True
     assert evidence["interaction_id"] == "case-1"
     assert evidence["original_input"] == "transfer 100 to Alice"
-    assert evidence["cases"][0]["status"] == "SUSPECTED FAILURE"
+    assert evidence["schema_version"] == "1.1.0"
+    assert evidence["current_baseline"]["status"] == "LIVE CONTROL MATCHES STORED RUN"
+    assert evidence["cases"][0]["status"] == "DIFFERENCE — REVIEW"
     assert evidence["cases"][0]["findings"][0]["expected_effects"] == [
         {"kind": "action", "predicate": "transfer"}
     ]
     assert evidence["technical_details"] == {"full": "technical evidence"}
+
+
+def test_live_control_drift_is_shown_and_requires_review(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    finding = SimpleNamespace(
+        category="changed_grounded_effect_argument",
+        message="The live control changed an action value.",
+        expected_effects=(),
+        observed_effects=(),
+    )
+    result = cast(
+        DatasetEvaluationResult,
+        SimpleNamespace(
+            source=SimpleNamespace(id="case-1", raw_input="transfer 100 to Alice"),
+            baseline=SimpleNamespace(
+                verdict="divergence_needs_review",
+                findings=(finding,),
+                inconclusive_reasons=(),
+            ),
+            cases=(),
+        ),
+    )
+    printed_rows: list[tuple[str, ...]] = []
+
+    class CapturingTable:
+        def add_column(self, *args: object, **kwargs: object) -> None:
+            pass
+
+        def add_row(self, *values: str) -> None:
+            printed_rows.append(values)
+
+    monkeypatch.setattr(main, "Table", lambda **kwargs: CapturingTable())
+    monkeypatch.setattr(main.console, "print", lambda *args, **kwargs: None)
+
+    main._print_dataset_results((result,), tmp_path / "evidence.jsonl")
+
+    assert main._result_needs_review(result) is True
+    assert printed_rows == [
+        (
+            "1",
+            "original replay",
+            "LIVE CONTROL DIFFERS — REVIEW",
+            "changed action value",
+        )
+    ]

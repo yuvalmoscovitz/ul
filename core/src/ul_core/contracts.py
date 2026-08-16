@@ -52,6 +52,9 @@ class DatasetTargetExecutor(Protocol):
     @property
     def safety_envelope(self) -> SafetyEnvelope: ...
 
+    @property
+    def fresh_state_per_execution(self) -> bool: ...
+
     def execute(self, raw_input: str) -> Awaitable[ObservedAgentOutput]: ...
 
 

@@ -35,6 +35,7 @@ from ul.dataset_augmentation import (
     builtin_dataset_augmentation_operators,
 )
 from ul.dataset_evaluation import (
+    DatasetEvaluationBaseline,
     DatasetEvaluationCase,
     DatasetEvaluationFinding,
     DatasetEvaluationResult,
@@ -52,6 +53,7 @@ __all__ = [
     "DatasetAugmentationEngine",
     "DatasetAugmentationOperator",
     "DatasetAugmentationResult",
+    "DatasetEvaluationBaseline",
     "DatasetEvaluationCase",
     "DatasetEvaluationFinding",
     "DatasetEvaluationResult",
