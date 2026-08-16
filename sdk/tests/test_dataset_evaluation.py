@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import asyncio
-from typing import Literal
+from collections.abc import Iterable
+from typing import Literal, cast
 
 import pytest
 from pydantic import JsonValue, ValidationError
@@ -10,9 +11,12 @@ from ul.dataset_evaluation import (
     DatasetEvaluationBaseline,
     DatasetEvaluationCase,
     DatasetEvaluationFinding,
+    DatasetEvaluationOutcomeGroup,
     DatasetEvaluationResult,
-    DatasetEvaluationRunner,
+    DatasetEvaluationTrial,
+    DatasetEvaluationTrialSet,
 )
+from ul.dataset_evaluation import DatasetEvaluationRunner as _DatasetEvaluationRunner
 from ul_core.dataset import (
     CommunicationAct,
     EvidenceReference,
@@ -28,6 +32,21 @@ from ul_core.dataset import (
 from ul_core.models import SafetyEnvelope
 
 pytestmark = pytest.mark.asyncio
+
+
+class DatasetEvaluationRunner(_DatasetEvaluationRunner):
+    async def run(
+        self,
+        source: InteractionRecord,
+        *,
+        operator_ids: Iterable[str] = ("surface.rephrase",),
+        repetitions: int = 1,
+    ) -> DatasetEvaluationResult:
+        return await super().run(
+            source,
+            operator_ids=operator_ids,
+            repetitions=repetitions,
+        )
 
 
 def _evidence(source: Literal["input", "output"]) -> tuple[EvidenceReference, ...]:
@@ -196,7 +215,7 @@ class DeterministicSemanticPipeline:
             self.observed_records.append(record)
             outcomes = (
                 self.baseline_outcomes or self.source_frame.outcomes
-                if record.id.endswith(":current_baseline")
+                if ":current_baseline:" in record.id
                 else self.observed_outcomes
             )
             return _frame(record.id, outcomes)
@@ -281,6 +300,55 @@ class FailingTarget(DeterministicTarget):
         return await super().execute(raw_input)
 
 
+class SequenceTarget(DeterministicTarget):
+    def __init__(
+        self,
+        raw_outputs: list[JsonValue],
+        *,
+        failing_executions: set[int] | None = None,
+    ) -> None:
+        super().__init__()
+        self.raw_outputs = raw_outputs
+        self.failing_executions = failing_executions or set()
+
+    async def execute(self, raw_input: str) -> ObservedAgentOutput:
+        execution = len(self.raw_inputs) + 1
+        self.raw_inputs.append(raw_input)
+        if execution in self.failing_executions:
+            raise RuntimeError("untrusted sequence failure")
+        successful_execution = execution - sum(
+            failed_execution <= execution for failed_execution in self.failing_executions
+        )
+        return ObservedAgentOutput(raw_output=self.raw_outputs[successful_execution - 1])
+
+
+class OutputDrivenSemanticPipeline(DeterministicSemanticPipeline):
+    async def deconstruct(
+        self,
+        record: InteractionRecord | UserInputRecord,
+        reference_frame: SemanticFrame | None = None,
+    ) -> SemanticFrame:
+        if not isinstance(record, InteractionRecord) or record.id == "source":
+            return await super().deconstruct(record, reference_frame)
+        self.references.append(reference_frame)
+        self.observed_records.append(record)
+        raw_output = record.raw_observed_output
+        assert isinstance(raw_output, dict)
+        raw_actions = raw_output["outcomes"]
+        assert isinstance(raw_actions, dict)
+        outcomes = tuple(
+            _outcome(
+                f"{record.id}:{position}",
+                int(position),
+                predicate=str(action["action"]),
+                fields={name: value for name, value in action.items() if name != "action"},
+            )
+            for position, action in raw_actions.items()
+            if isinstance(action, dict)
+        )
+        return _frame(record.id, outcomes)
+
+
 def _runner(
     observed_outcomes: tuple[ObservedOutcome, ...],
     raw_output: JsonValue | None = None,
@@ -291,6 +359,24 @@ def _runner(
             raw_output if raw_output is not None else _raw_output_for_actions(observed_outcomes)
         )
     )
+    return (
+        DatasetEvaluationRunner(
+            DatasetAugmentationEngine(semantic_pipeline, semantic_pipeline),
+            semantic_pipeline,
+            target,
+        ),
+        semantic_pipeline,
+        target,
+    )
+
+
+def _sequence_runner(
+    raw_outputs: list[JsonValue],
+    *,
+    failing_executions: set[int] | None = None,
+) -> tuple[DatasetEvaluationRunner, OutputDrivenSemanticPipeline, SequenceTarget]:
+    semantic_pipeline = OutputDrivenSemanticPipeline((_source_outcomes()[0],))
+    target = SequenceTarget(raw_outputs, failing_executions=failing_executions)
     return (
         DatasetEvaluationRunner(
             DatasetAugmentationEngine(semantic_pipeline, semantic_pipeline),
@@ -339,7 +425,7 @@ async def test_runner_executes_only_accepted_candidates_and_keeps_rejected_candi
     assert last_reference is not None
     assert last_reference.outcomes == _source_outcomes()
     assert result.baseline.verdict == "no_divergence"
-    assert semantic_pipeline.observed_records[0].id == "source:current_baseline"
+    assert semantic_pipeline.observed_records[0].id == "source:current_baseline:round-1"
     assert semantic_pipeline.observed_records[1].raw_input == target.raw_inputs[1]
     assert (
         semantic_pipeline.observed_records[1].raw_observed_output
@@ -371,9 +457,8 @@ async def test_current_baseline_drift_is_not_blame_on_augmentation() -> None:
 
     result = await runner.run(_source())
 
-    assert result.baseline.verdict == "divergence_needs_review"
-    assert result.baseline.findings[0].category == "changed_grounded_effect_argument"
-    assert "current baseline" in result.baseline.findings[0].message
+    assert result.baseline.verdict == "no_divergence"
+    assert result.baseline.findings == ()
     assert result.cases[0].verdict == "no_divergence"
 
 
@@ -404,7 +489,7 @@ async def test_candidate_is_compared_with_changed_current_baseline() -> None:
 
     result = await runner.run(_source())
 
-    assert result.baseline.verdict == "divergence_needs_review"
+    assert result.baseline.verdict == "no_divergence"
     assert result.cases[0].verdict == "divergence_needs_review"
     assert result.cases[0].findings[0].grounded_field_names == ("amount",)
 
@@ -445,8 +530,8 @@ async def test_candidate_change_to_new_baseline_action_is_detected() -> None:
 
     result = await runner.run(_source())
 
-    assert result.baseline.verdict == "divergence_needs_review"
-    assert result.baseline.findings[0].category == "unexpected_effect"
+    assert result.baseline.verdict == "no_divergence"
+    assert result.baseline.findings == ()
     assert result.cases[0].verdict == "divergence_needs_review"
     assert result.cases[0].findings[0].category == "changed_grounded_effect_argument"
     assert result.cases[0].findings[0].grounded_field_names == ("recipient",)
@@ -541,7 +626,7 @@ async def test_one_current_baseline_is_shared_by_all_accepted_candidates() -> No
     assert target.raw_inputs[0] == "Transfer 100 to Alice."
     assert len(target.raw_inputs) == 3
     assert [record.id for record in semantic_pipeline.observed_records].count(
-        "source:current_baseline"
+        "source:current_baseline:round-1"
     ) == 1
 
 
@@ -562,8 +647,9 @@ async def test_invalid_observed_output_frame_is_retained_as_inconclusive() -> No
     assert case.target_output is None
     assert case.observed_frame is None
     assert case.inconclusive_reasons == (
-        "current baseline is inconclusive: current baseline output could not be semantically "
-        "deconstructed",
+        "paired original repetition was inconclusive; variation not executed",
+        "original repetition 1 is inconclusive: current baseline output could not be "
+        "semantically deconstructed",
     )
     assert target.raw_inputs == ["Transfer 100 to Alice."]
 
@@ -820,8 +906,7 @@ async def test_case_model_rejects_inconsistent_execution_and_verdicts() -> None:
         DatasetEvaluationCase(
             candidate=rejected_candidate,
             verdict="no_divergence",
-            target_output=ObservedAgentOutput(raw_output={"payment": "completed"}),
-            observed_frame=result.augmentation.source_frames[0],
+            trial_set=accepted_case.trial_set,
         )
     with pytest.raises(ValidationError, match="case verdict"):
         DatasetEvaluationCase(
@@ -838,19 +923,22 @@ async def test_case_model_rejects_inconsistent_execution_and_verdicts() -> None:
         DatasetEvaluationCase(
             candidate=accepted_case.candidate,
             verdict="divergence_needs_review",
-            target_output=accepted_case.target_output,
-            observed_frame=accepted_case.observed_frame,
+            trial_set=accepted_case.trial_set,
         )
-    with pytest.raises(ValidationError, match="missing observed frames"):
+    with pytest.raises(ValidationError, match="require trials"):
         DatasetEvaluationCase(
             candidate=accepted_case.candidate,
             verdict="no_divergence",
-            target_output=ObservedAgentOutput(raw_output={"payment": "completed"}),
+        )
+    with pytest.raises(ValidationError, match="require trials"):
+        DatasetEvaluationCase(
+            candidate=accepted_case.candidate,
+            verdict="inconclusive",
+            inconclusive_reasons=("not evaluated",),
         )
     with pytest.raises(ValidationError, match="requires target output"):
-        DatasetEvaluationCase(
-            candidate=accepted_case.candidate,
-            verdict="no_divergence",
+        DatasetEvaluationTrial(
+            repetition=1,
             observed_frame=result.augmentation.source_frames[0],
         )
     with pytest.raises(ValidationError, match="unrated"):
@@ -862,15 +950,38 @@ async def test_case_model_rejects_inconsistent_execution_and_verdicts() -> None:
             }
         )
 
-    with pytest.raises(ValidationError, match="baseline verdict"):
-        DatasetEvaluationBaseline(
+    inconclusive_trial_set = DatasetEvaluationTrialSet(
+        requested_repetitions=1,
+        stability="inconclusive",
+        trials=(
+            DatasetEvaluationTrial(
+                repetition=1,
+                inconclusive_reasons=("target execution failed",),
+            ),
+        ),
+    )
+    with pytest.raises(ValidationError, match="inconclusive reason"):
+        DatasetEvaluationCase(
+            candidate=accepted_case.candidate,
             verdict="no_divergence",
-            inconclusive_reasons=("target unavailable",),
+            trial_set=inconclusive_trial_set,
         )
-    with pytest.raises(ValidationError, match="baseline findings require"):
-        DatasetEvaluationBaseline(
+
+    stable_output = _raw_output_for_actions((_source_outcomes()[0],))
+    changed_output = _raw_output_for_actions(
+        (_outcome("changed", 0, fields={"amount": 120, "recipient": "Alice"}),)
+    )
+    unstable_runner, _, _ = _sequence_runner(
+        [stable_output, stable_output, stable_output, changed_output]
+    )
+    unstable_result = await unstable_runner.run(_source(), repetitions=2)
+    unstable_trial_set = unstable_result.cases[0].trial_set
+    assert unstable_trial_set is not None
+    with pytest.raises(ValidationError, match="stable observed trials"):
+        DatasetEvaluationCase(
+            candidate=unstable_result.cases[0].candidate,
             verdict="divergence_needs_review",
-            target_output=ObservedAgentOutput(raw_output={"action": "transfer"}),
+            trial_set=unstable_trial_set,
             findings=(
                 DatasetEvaluationFinding(
                     category="missing_effect",
@@ -878,22 +989,323 @@ async def test_case_model_rejects_inconsistent_execution_and_verdicts() -> None:
                 ),
             ),
         )
+
+    with pytest.raises(ValidationError, match="baseline verdict"):
+        DatasetEvaluationBaseline(
+            verdict="no_divergence",
+            trial_set=result.baseline.trial_set,
+            inconclusive_reasons=("target unavailable",),
+        )
     wrong_baseline_frame = result.baseline.observed_frame
     assert wrong_baseline_frame is not None
-    with pytest.raises(ValidationError, match="current baseline interaction"):
+    with pytest.raises(ValidationError, match="original repetition"):
         invalid_result = result.model_dump()
-        invalid_result["baseline"]["observed_frame"]["interaction_id"] = "wrong"
+        invalid_result["baseline"]["trial_set"]["trials"][0]["observed_frame"]["interaction_id"] = (
+            "wrong"
+        )
         DatasetEvaluationResult.model_validate(invalid_result)
-    with pytest.raises(ValidationError, match="without a valid baseline"):
-        invalid_result = result.model_dump()
-        invalid_result["baseline"] = {
-            "verdict": "inconclusive",
-            "target_output": None,
-            "observed_frame": None,
-            "findings": (),
-            "inconclusive_reasons": ("target unavailable",),
+    assert accepted_case.trial_set is not None
+    mismatched_case = accepted_case.model_copy(
+        update={
+            "trial_set": accepted_case.trial_set.model_copy(update={"requested_repetitions": 2})
         }
-        DatasetEvaluationResult.model_validate(invalid_result)
+    )
+    with pytest.raises(ValidationError, match="repetition counts must match"):
+        DatasetEvaluationResult(
+            source=result.source,
+            augmentation=result.augmentation,
+            baseline=result.baseline,
+            cases=(mismatched_case, result.cases[1]),
+        )
+
+
+async def test_repetitions_are_interleaved_and_group_equivalent_observations() -> None:
+    raw_outputs = [
+        _raw_output_for_actions(
+            (
+                _outcome(
+                    f"run-{index}",
+                    0,
+                    fields={
+                        "amount": 100,
+                        "recipient": "Alice",
+                        "receipt_id": f"receipt-{index}",
+                    },
+                ),
+            )
+        )
+        for index in range(6)
+    ]
+    runner, semantic_pipeline, target = _sequence_runner(raw_outputs)
+
+    result = await _DatasetEvaluationRunner.run(runner, _source())
+
+    assert (
+        target.raw_inputs
+        == [
+            "Transfer 100 to Alice.",
+            "Please transfer 100 to Alice.",
+        ]
+        * 3
+    )
+    assert [record.id for record in semantic_pipeline.observed_records] == [
+        "source:current_baseline:round-1",
+        "source:surface.rephrase:round-1",
+        "source:current_baseline:round-2",
+        "source:surface.rephrase:round-2",
+        "source:current_baseline:round-3",
+        "source:surface.rephrase:round-3",
+    ]
+    assert result.baseline.trial_set.stability == "stable"
+    assert result.baseline.trial_set.outcome_groups[0].repetitions == (1, 2, 3)
+    assert result.cases[0].trial_set is not None
+    assert result.cases[0].trial_set.stability == "stable"
+    assert result.cases[0].trial_set.outcome_groups[0].repetitions == (1, 2, 3)
+    assert result.cases[0].verdict == "no_divergence"
+
+
+async def test_stable_repeated_difference_keeps_findings() -> None:
+    original = _raw_output_for_actions((_source_outcomes()[0],))
+    variation = _raw_output_for_actions(
+        (_outcome("changed", 0, fields={"amount": 120, "recipient": "Alice"}),)
+    )
+    runner, _, _ = _sequence_runner([original, variation, original, variation, original, variation])
+
+    result = await runner.run(_source(), repetitions=3)
+
+    case = result.cases[0]
+    assert result.baseline.trial_set.stability == "stable"
+    assert case.trial_set is not None
+    assert case.trial_set.stability == "stable"
+    assert case.verdict == "divergence_needs_review"
+    assert [finding.category for finding in case.findings] == ["changed_grounded_effect_argument"]
+
+
+async def test_stored_output_is_grounding_not_a_live_review_oracle() -> None:
+    live_outcome = _outcome(
+        "live",
+        0,
+        fields={"amount": 120, "recipient": "Alice"},
+    )
+    live_output = _raw_output_for_actions((live_outcome,))
+    runner, _, _ = _sequence_runner([live_output] * 6)
+
+    result = await runner.run(_source(), repetitions=3)
+
+    assert result.source.raw_observed_output != live_output
+    assert result.baseline.verdict == "no_divergence"
+    assert result.baseline.trial_set.stability == "stable"
+    assert result.baseline.findings == ()
+    case = result.cases[0]
+    assert case.trial_set is not None
+    assert case.trial_set.stability == "stable"
+    assert case.verdict == "no_divergence"
+    assert case.findings == ()
+
+
+async def test_numeric_representations_group_and_compare_as_the_same_observation() -> None:
+    def output(amount: JsonValue) -> JsonValue:
+        return _raw_output_for_actions(
+            (_outcome("transfer", 0, fields={"amount": amount, "recipient": "Alice"}),)
+        )
+
+    runner, _, _ = _sequence_runner(
+        [output(100), output("100.0"), output("100"), output(100), output("100.0"), output("100")]
+    )
+
+    result = await runner.run(_source(), repetitions=3)
+
+    assert result.baseline.trial_set.stability == "stable"
+    case = result.cases[0]
+    assert case.trial_set is not None
+    assert case.trial_set.stability == "stable"
+    assert case.verdict == "no_divergence"
+
+
+async def test_numeric_identifier_representations_remain_distinct() -> None:
+    source_outcome = _outcome(
+        "source",
+        0,
+        fields={"account_id": "100", "amount": 100, "recipient": "Alice"},
+    )
+    string_identifier_output = _raw_output_for_actions((source_outcome,))
+    numeric_identifier_output = _raw_output_for_actions(
+        (
+            _outcome(
+                "candidate",
+                0,
+                fields={"account_id": 100, "amount": "100.0", "recipient": "Alice"},
+            ),
+        )
+    )
+    runner, semantic_pipeline, _ = _sequence_runner(
+        [string_identifier_output, numeric_identifier_output] * 2
+    )
+    semantic_pipeline.source_frame = _frame("source", (source_outcome,))
+    source = InteractionRecord(
+        id="source",
+        raw_input="Transfer 100 from account 100 to Alice.",
+        raw_observed_output=string_identifier_output,
+    )
+
+    result = await runner.run(
+        source,
+        operator_ids=("surface.disfluency_repeat",),
+        repetitions=2,
+    )
+
+    case = result.cases[0]
+    assert case.trial_set is not None
+    assert case.trial_set.stability == "stable"
+    assert case.verdict == "divergence_needs_review"
+    assert case.findings[0].grounded_field_names == ("account_id",)
+
+
+async def test_stable_original_and_unstable_variation_needs_review() -> None:
+    stable = _raw_output_for_actions((_source_outcomes()[0],))
+    changed = _raw_output_for_actions(
+        (_outcome("changed", 0, fields={"amount": 120, "recipient": "Alice"}),)
+    )
+    runner, _, _ = _sequence_runner([stable, stable, stable, changed, stable, stable])
+
+    result = await runner.run(_source(), repetitions=3)
+
+    case = result.cases[0]
+    assert result.baseline.trial_set.stability == "stable"
+    assert case.trial_set is not None
+    assert case.trial_set.stability == "unstable"
+    assert tuple(group.repetitions for group in case.trial_set.outcome_groups) == ((1, 3), (2,))
+    assert case.verdict == "divergence_needs_review"
+    assert case.findings == ()
+
+
+async def test_outcome_grouping_preserves_action_multiplicity() -> None:
+    one_action = _raw_output_for_actions((_source_outcomes()[0],))
+    duplicate_actions = _raw_output_for_actions(
+        (
+            _outcome("first", 0, fields={"amount": 100, "recipient": "Alice"}),
+            _outcome("second", 1, fields={"amount": 100, "recipient": "Alice"}),
+        )
+    )
+    runner, _, _ = _sequence_runner([one_action, one_action, one_action, duplicate_actions])
+
+    result = await runner.run(_source(), repetitions=2)
+
+    case = result.cases[0]
+    assert case.trial_set is not None
+    assert case.trial_set.stability == "unstable"
+    assert tuple(group.repetitions for group in case.trial_set.outcome_groups) == ((1,), (2,))
+    assert case.verdict == "divergence_needs_review"
+
+
+async def test_unstable_original_makes_stable_variation_inconclusive() -> None:
+    stable = _raw_output_for_actions((_source_outcomes()[0],))
+    changed = _raw_output_for_actions(
+        (_outcome("changed", 0, fields={"amount": 120, "recipient": "Alice"}),)
+    )
+    runner, _, target = _sequence_runner([stable, stable, changed, stable, stable, stable])
+
+    result = await runner.run(_source(), repetitions=3)
+
+    assert len(target.raw_inputs) == 6
+    assert result.baseline.trial_set.stability == "unstable"
+    assert result.baseline.verdict == "inconclusive"
+    case = result.cases[0]
+    assert case.trial_set is not None
+    assert case.trial_set.stability == "stable"
+    assert case.verdict == "inconclusive"
+    assert case.findings == ()
+
+
+async def test_both_unstable_preserves_both_inconclusive_reasons() -> None:
+    stable = _raw_output_for_actions((_source_outcomes()[0],))
+    changed = _raw_output_for_actions(
+        (_outcome("changed", 0, fields={"amount": 120, "recipient": "Alice"}),)
+    )
+    duplicate = _raw_output_for_actions(
+        (
+            _outcome("first", 0, fields={"amount": 100, "recipient": "Alice"}),
+            _outcome("second", 1, fields={"amount": 100, "recipient": "Alice"}),
+        )
+    )
+    runner, _, _ = _sequence_runner([stable, stable, changed, duplicate, stable, stable])
+
+    result = await runner.run(_source(), repetitions=3)
+
+    case = result.cases[0]
+    assert result.baseline.trial_set.stability == "unstable"
+    assert case.trial_set is not None
+    assert case.trial_set.stability == "unstable"
+    assert case.verdict == "inconclusive"
+    assert case.inconclusive_reasons == (
+        "original repetitions produced multiple outcomes",
+        "variation repetitions produced multiple outcomes",
+    )
+
+
+async def test_inconclusive_original_round_skips_only_its_paired_variation() -> None:
+    stable = _raw_output_for_actions((_source_outcomes()[0],))
+    runner, _, target = _sequence_runner(
+        [stable, stable, stable, stable],
+        failing_executions={3},
+    )
+
+    result = await runner.run(_source(), repetitions=3)
+
+    assert target.raw_inputs == [
+        "Transfer 100 to Alice.",
+        "Please transfer 100 to Alice.",
+        "Transfer 100 to Alice.",
+        "Transfer 100 to Alice.",
+        "Please transfer 100 to Alice.",
+    ]
+    assert result.baseline.trial_set.stability == "inconclusive"
+    case = result.cases[0]
+    assert case.trial_set is not None
+    assert case.trial_set.stability == "inconclusive"
+    assert case.trial_set.trials[1].target_output is None
+    assert "not executed" in case.trial_set.trials[1].inconclusive_reasons[0]
+    assert case.verdict == "inconclusive"
+
+
+@pytest.mark.parametrize("repetitions", [0, True, 1.5])
+async def test_runner_rejects_non_positive_or_non_integer_repetitions(
+    repetitions: object,
+) -> None:
+    runner, _, target = _runner((_source_outcomes()[0],))
+
+    with pytest.raises(ValueError, match="positive integer"):
+        await _DatasetEvaluationRunner.run(
+            runner,
+            _source(),
+            repetitions=cast(int, repetitions),
+        )
+
+    assert target.raw_inputs == []
+
+
+async def test_trial_set_model_rejects_inconsistent_group_partition() -> None:
+    observed_trial = DatasetEvaluationTrial(
+        repetition=1,
+        target_output=ObservedAgentOutput(raw_output={"action": "transfer"}),
+        observed_frame=_frame(
+            "source:current_baseline:round-1",
+            (_source_outcomes()[0],),
+        ),
+    )
+
+    with pytest.raises(ValidationError, match="partition"):
+        DatasetEvaluationTrialSet(
+            requested_repetitions=1,
+            stability="stable",
+            trials=(observed_trial,),
+            outcome_groups=(
+                DatasetEvaluationOutcomeGroup(
+                    repetitions=(2,),
+                    representative_effects=(_source_outcomes()[0],),
+                ),
+            ),
+        )
 
 
 async def test_runner_does_not_execute_without_an_observable_action_baseline() -> None:

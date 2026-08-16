@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 from decimal import Decimal
+from random import Random
 
 from ul_core.dataset import ObservedAgentOutput
 from ul_core.models import SafetyEnvelope
@@ -42,6 +43,19 @@ class SeededIntentFanOutDefectAccountsPayableDatasetTarget:
         return _execute_payments(
             (_expected_payment_amount(),) * _payment_imperative_count(raw_input)
         )
+
+
+class SeededFlakyIntentFanOutDefectAccountsPayableDatasetTarget:
+    safety_envelope = _SAFETY_ENVELOPE
+    fresh_state_per_execution = True
+
+    def __init__(self, seed: int = 4) -> None:
+        self._random = Random(seed)
+
+    async def execute(self, raw_input: str) -> ObservedAgentOutput:
+        imperative_count = _payment_imperative_count(raw_input)
+        payment_count = 1 if imperative_count == 1 else 1 + self._random.randrange(imperative_count)
+        return _execute_payments((_expected_payment_amount(),) * payment_count)
 
 
 class SeededFirstValueWinsDefectAccountsPayableDatasetTarget:

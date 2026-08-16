@@ -33,6 +33,40 @@ def _record(identifier: str = "interaction-1") -> dict[str, Any]:
     }
 
 
+def _trial_set(
+    *,
+    requested_repetitions: int = 3,
+    stability: str = "stable",
+    outcome_group_repetitions: tuple[tuple[int, ...], ...] | None = None,
+    representative_effect: object | None = None,
+) -> SimpleNamespace:
+    if outcome_group_repetitions is None:
+        outcome_group_repetitions = (tuple(range(1, requested_repetitions + 1)),)
+    grouped_repetitions = {
+        repetition for group in outcome_group_repetitions for repetition in group
+    }
+    trials = tuple(
+        SimpleNamespace(
+            repetition=repetition,
+            inconclusive_reasons=(
+                () if repetition in grouped_repetitions else ("target execution failed",)
+            ),
+        )
+        for repetition in range(1, requested_repetitions + 1)
+    )
+    effects = () if representative_effect is None else (representative_effect,)
+    outcome_groups = tuple(
+        SimpleNamespace(repetitions=repetitions, representative_effects=effects)
+        for repetitions in outcome_group_repetitions
+    )
+    return SimpleNamespace(
+        requested_repetitions=requested_repetitions,
+        stability=stability,
+        trials=trials,
+        outcome_groups=outcome_groups,
+    )
+
+
 def test_dry_run_validates_and_makes_no_external_calls(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -62,13 +96,18 @@ def test_dry_run_validates_and_makes_no_external_calls(
     assert result.exit_code == 0, result.output
     assert "Dataset valid: 2 interaction(s)" in result.output
     assert "Selected interactions: 1" in result.output
-    assert "Potential semantic model calls: up to 6" in result.output
-    assert "Potential target calls: up to 2" in result.output
+    assert "Repetitions: 3 per original and accepted variation" in result.output
+    assert "Potential semantic model calls: up to 10" in result.output
+    assert "Potential target calls: up to 6" in result.output
+    assert "authorized maximum: 100" in result.output
     assert "Semantic models receive historical inputs and outputs" in result.output
     assert "generated variations" in result.output
     assert "live control responses" in result.output
-    assert "target receives each selected original input once" in result.output
-    assert "then each accepted variation" in " ".join(result.output.split())
+    assert "Every target request must start from the same clean state" in result.output
+    assert "each accepted variation for every repetition" in " ".join(result.output.split())
+    assert "do not determine correctness" in result.output
+    assert "identify causality" in result.output
+    assert "estimate a production failure rate" in result.output
     assert "No model or target requests sent." in result.output
     assert "Transfer 100" not in result.output
 
@@ -226,7 +265,7 @@ def test_preflight_enforces_record_and_target_call_bounds(
         "OpenRouterDatasetSettings",
         lambda: SimpleNamespace(max_input_chars=50_000),
     )
-    _write_dataset(dataset, [_record(f"interaction-{index}") for index in range(51)])
+    _write_dataset(dataset, [_record(f"interaction-{index}") for index in range(17)])
     maximum_calls = runner.invoke(
         root_app,
         [
@@ -234,7 +273,7 @@ def test_preflight_enforces_record_and_target_call_bounds(
             "evaluate",
             str(dataset),
             "--limit",
-            "50",
+            "16",
             "--operator",
             "surface.rephrase",
             "--dry-run",
@@ -242,7 +281,7 @@ def test_preflight_enforces_record_and_target_call_bounds(
     )
 
     assert maximum_calls.exit_code == 0, maximum_calls.output
-    assert "Potential target calls: up to 100" in maximum_calls.output
+    assert "Potential target calls: up to 96" in maximum_calls.output
 
     too_many_calls = runner.invoke(
         root_app,
@@ -251,7 +290,7 @@ def test_preflight_enforces_record_and_target_call_bounds(
             "evaluate",
             str(dataset),
             "--limit",
-            "51",
+            "17",
             "--operator",
             "surface.rephrase",
             "--dry-run",
@@ -259,7 +298,97 @@ def test_preflight_enforces_record_and_target_call_bounds(
     )
 
     assert too_many_calls.exit_code != 0
-    assert "would make 102 target calls; maximum is 100" in too_many_calls.output
+    assert "would make up to 102 target calls" in too_many_calls.output
+    assert "--max-target-calls 100" in too_many_calls.output
+
+
+def test_repetition_budget_is_explicit_and_checked_before_external_setup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    dataset = tmp_path / "interactions.jsonl"
+    _write_dataset(dataset, [_record()])
+
+    def unexpected_settings() -> None:
+        raise AssertionError("over-budget repetition plan reached model setup")
+
+    monkeypatch.setattr(main, "OpenRouterDatasetSettings", unexpected_settings)
+    huge_plan = runner.invoke(
+        root_app,
+        [
+            "dataset",
+            "evaluate",
+            str(dataset),
+            "--repetitions",
+            "1000000000",
+            "--dry-run",
+        ],
+    )
+
+    assert huge_plan.exit_code != 0
+    normalized_output = " ".join(_ANSI_ESCAPE_PATTERN.sub("", huge_plan.output).split())
+    assert "would make up to" in normalized_output
+    assert "--max-target-calls" in normalized_output
+    assert "call budget" in normalized_output
+
+    monkeypatch.setattr(
+        main,
+        "OpenRouterDatasetSettings",
+        lambda: SimpleNamespace(max_input_chars=50_000),
+    )
+    exact_budget = runner.invoke(
+        root_app,
+        [
+            "dataset",
+            "evaluate",
+            str(dataset),
+            "--repetitions",
+            "51",
+            "--max-target-calls",
+            "102",
+            "--dry-run",
+        ],
+    )
+
+    assert exact_budget.exit_code == 0, exact_budget.output
+    assert "Potential target calls: up to 102 (authorized maximum: 102)" in " ".join(
+        exact_budget.output.split()
+    )
+
+
+@pytest.mark.parametrize(
+    "options",
+    (
+        ("--repetitions", "0"),
+        ("--repetitions", "-1"),
+        ("--max-target-calls", "0"),
+        ("--max-target-calls", "-1"),
+    ),
+)
+def test_repetition_and_call_budget_must_be_positive(
+    tmp_path: Path,
+    options: tuple[str, str],
+) -> None:
+    dataset = tmp_path / "interactions.jsonl"
+    _write_dataset(dataset, [_record()])
+
+    result = runner.invoke(
+        root_app,
+        ["dataset", "evaluate", str(dataset), *options, "--dry-run"],
+    )
+
+    assert result.exit_code != 0
+
+
+def test_default_limit_and_repetitions_fit_the_default_call_budget(tmp_path: Path) -> None:
+    dataset = tmp_path / "interactions.jsonl"
+    _write_dataset(dataset, [_record(f"interaction-{index}") for index in range(11)])
+
+    result = runner.invoke(root_app, ["dataset", "evaluate", str(dataset), "--dry-run"])
+
+    assert result.exit_code == 0, result.output
+    assert "Selected interactions: 10" in result.output
+    assert "Potential target calls: up to 60" in result.output
 
 
 @pytest.mark.parametrize(
@@ -410,10 +539,17 @@ def test_execution_creates_private_explicit_output(
         settings: object,
         target: object,
         output_stream: Any,
+        *,
+        repetitions: int,
+        max_target_calls: int,
+        planned_target_calls: int,
     ) -> tuple[object, ...]:
         del settings, target
         captured_records.extend(record.id for record in records)
         assert operator_ids == ("surface.disfluency_repeat",)
+        assert repetitions == 3
+        assert max_target_calls == 100
+        assert planned_target_calls == 6
         output_stream.write('{"saved":true}\n')
         output_stream.flush()
         return ()
@@ -466,12 +602,16 @@ def test_help_explains_dataset_target_and_operator_contract() -> None:
     assert '"id"' in result.output
     assert '"input"' in result.output
     assert '"output"' in result.output
-    normalized_help = " ".join(result.output.split())
+    normalized_help = " ".join(_ANSI_ESCAPE_PATTERN.sub("", result.output).split())
     assert "Simple sandbox" in normalized_help
     assert "POST" in result.output
     assert "non-null JSON" in normalized_help
     assert "UL_DATASET_LIVE_CALLS" in result.output
     assert "same clean state" in normalized_help
+    assert "Fresh-state" in normalized_help
+    assert "target executions" in normalized_help
+    assert "Maximum target" in normalized_help
+    assert "requests" in normalized_help
     assert "operator. Run 'ul" in normalized_help
     assert "operators' for" in normalized_help
 
@@ -520,8 +660,8 @@ def test_operator_list_is_fixed_and_self_correction_keeps_existing_call_accounti
 
     assert dry_run.exit_code == 0, dry_run.output
     assert "Operators: intent.self_correction" in dry_run.output
-    assert "Potential semantic model calls: up to 6" in dry_run.output
-    assert "Potential target calls: up to 2" in dry_run.output
+    assert "Potential semantic model calls: up to 10" in dry_run.output
+    assert "Potential target calls: up to 6" in dry_run.output
 
 
 @pytest.mark.parametrize(
@@ -573,6 +713,7 @@ def test_customer_evidence_keeps_summary_and_nested_technical_details() -> None:
     case = SimpleNamespace(
         candidate=candidate,
         verdict="divergence_needs_review",
+        trial_set=_trial_set(representative_effect=expected_effect),
         findings=(finding,),
         inconclusive_reasons=(),
     )
@@ -582,7 +723,7 @@ def test_customer_evidence_keeps_summary_and_nested_technical_details() -> None:
             source=SimpleNamespace(id="case-1", raw_input="transfer 100 to Alice"),
             baseline=SimpleNamespace(
                 verdict="no_divergence",
-                findings=(),
+                trial_set=_trial_set(representative_effect=expected_effect),
                 inconclusive_reasons=(),
             ),
             cases=(case,),
@@ -590,21 +731,44 @@ def test_customer_evidence_keeps_summary_and_nested_technical_details() -> None:
         ),
     )
 
-    evidence = main._customer_evidence_record(result)
+    evidence = main._customer_evidence_record(
+        result,
+        repetitions=3,
+        max_target_calls=100,
+        planned_target_calls=6,
+    )
 
     assert main._result_needs_review(result) is True
     assert evidence["interaction_id"] == "case-1"
     assert evidence["original_input"] == "transfer 100 to Alice"
-    assert evidence["schema_version"] == "1.1.0"
-    assert evidence["current_baseline"]["status"] == "LIVE CONTROL MATCHES STORED RUN"
-    assert evidence["cases"][0]["status"] == "DIFFERENCE — REVIEW"
-    assert evidence["cases"][0]["findings"][0]["expected_effects"] == [
+    assert evidence["schema_version"] == "1.2.0"
+    assert evidence["current_baseline"]["status"] == "ORIGINAL REPLAY STABLE (3/3 OBSERVED)"
+    assert "findings" not in evidence["current_baseline"]
+    assert evidence["current_baseline"]["observations"]["outcome_group_count"] == 1
+    assert evidence["current_baseline"]["observations"]["outcome_groups"][0]["repetitions"] == [
+        1,
+        2,
+        3,
+    ]
+    assert evidence["current_baseline"]["observations"]["outcome_groups"][0]["count"] == 3
+    assert evidence["current_baseline"]["observations"]["observed_repetitions"] == 3
+    assert evidence["current_baseline"]["observations"]["inconclusive_repetitions"] == 0
+    assert evidence["cases"][0]["status"] == "REPEATABLE DIFFERENCE — REVIEW"
+    assert evidence["cases"][0]["findings"][0]["reference_effects"] == [
         {"kind": "action", "predicate": "transfer"}
     ]
+    assert evidence["execution_plan"] == {
+        "repetitions": 3,
+        "max_target_calls": 100,
+        "dataset_planned_target_calls": 6,
+    }
+    assert "does not determine" in evidence["limitations"]
+    assert "caused" in evidence["limitations"]
+    assert "production failure rate" in evidence["limitations"]
     assert evidence["technical_details"] == {"full": "technical evidence"}
 
 
-def test_live_control_drift_is_shown_and_requires_review(
+def test_stored_output_drift_does_not_require_review_or_appear_in_original_replay(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -614,16 +778,31 @@ def test_live_control_drift_is_shown_and_requires_review(
         expected_effects=(),
         observed_effects=(),
     )
+    candidate = SimpleNamespace(
+        operator_id="surface.rephrase",
+        operator_version="1.0.0",
+        augmented_input="Please transfer 100 to Alice.",
+        passed=True,
+        failure_reasons=(),
+    )
+    case = SimpleNamespace(
+        candidate=candidate,
+        verdict="no_divergence",
+        trial_set=_trial_set(),
+        findings=(),
+        inconclusive_reasons=(),
+    )
     result = cast(
         DatasetEvaluationResult,
         SimpleNamespace(
             source=SimpleNamespace(id="case-1", raw_input="transfer 100 to Alice"),
             baseline=SimpleNamespace(
-                verdict="divergence_needs_review",
+                verdict="no_divergence",
+                trial_set=_trial_set(),
                 findings=(finding,),
                 inconclusive_reasons=(),
             ),
-            cases=(),
+            cases=(case,),
         ),
     )
     printed_rows: list[tuple[str, ...]] = []
@@ -640,12 +819,90 @@ def test_live_control_drift_is_shown_and_requires_review(
 
     main._print_dataset_results((result,), tmp_path / "evidence.jsonl")
 
-    assert main._result_needs_review(result) is True
+    assert main._result_needs_review(result) is False
     assert printed_rows == [
         (
             "1",
             "original replay",
-            "LIVE CONTROL DIFFERS — REVIEW",
-            "changed action value",
-        )
+            "ORIGINAL REPLAY STABLE (3/3 OBSERVED)",
+            "stable",
+            "3 / 1",
+            "—",
+        ),
+        (
+            "2",
+            "surface.rephrase",
+            "NO OBSERVED DIFFERENCE",
+            "stable",
+            "3 / 1",
+            "—",
+        ),
     ]
+
+
+def test_customer_statuses_distinguish_potential_repeatable_and_unstable_results() -> None:
+    baseline = SimpleNamespace(
+        verdict="no_divergence",
+        trial_set=_trial_set(),
+        inconclusive_reasons=(),
+    )
+    result = cast(DatasetEvaluationResult, SimpleNamespace(baseline=baseline))
+
+    one_trial_difference = SimpleNamespace(
+        verdict="divergence_needs_review",
+        trial_set=_trial_set(requested_repetitions=1),
+    )
+    repeated_difference = SimpleNamespace(
+        verdict="divergence_needs_review",
+        trial_set=_trial_set(requested_repetitions=3),
+    )
+    unstable_variation = SimpleNamespace(
+        verdict="divergence_needs_review",
+        trial_set=_trial_set(
+            stability="unstable",
+            outcome_group_repetitions=((1, 2), (3,)),
+        ),
+    )
+
+    assert main._case_customer_status(result, one_trial_difference) == (
+        "POTENTIAL DIFFERENCE — REVIEW"
+    )
+    assert main._case_customer_status(result, repeated_difference) == (
+        "REPEATABLE DIFFERENCE — REVIEW"
+    )
+    assert main._case_customer_status(result, unstable_variation) == ("UNSTABLE VARIATION — REVIEW")
+
+    unstable_original_result = cast(
+        DatasetEvaluationResult,
+        SimpleNamespace(
+            baseline=SimpleNamespace(
+                verdict="inconclusive",
+                trial_set=_trial_set(
+                    stability="unstable",
+                    outcome_group_repetitions=((1, 2), (3,)),
+                ),
+                inconclusive_reasons=("original repetitions produced multiple outcomes",),
+            )
+        ),
+    )
+    assert (
+        main._baseline_customer_status(unstable_original_result)
+        == "UNSTABLE ORIGINAL — INCONCLUSIVE"
+    )
+    assert main._case_customer_status(unstable_original_result, repeated_difference) == (
+        "UNSTABLE ORIGINAL — INCONCLUSIVE"
+    )
+
+    assert main._case_customer_status(unstable_original_result, unstable_variation) == (
+        "UNSTABLE ORIGINAL AND VARIATION — INCONCLUSIVE"
+    )
+    incomplete_variation = SimpleNamespace(
+        verdict="inconclusive",
+        trial_set=_trial_set(
+            stability="inconclusive",
+            outcome_group_repetitions=((1, 2),),
+        ),
+    )
+    assert main._case_customer_status(unstable_original_result, incomplete_variation) == (
+        "COULDN'T DETERMINE"
+    )

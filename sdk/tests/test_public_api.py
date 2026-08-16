@@ -3,7 +3,10 @@ from ul import (
     DatasetAugmentationOperator,
     DatasetEvaluationBaseline,
     DatasetEvaluationFinding,
+    DatasetEvaluationOutcomeGroup,
     DatasetEvaluationRunner,
+    DatasetEvaluationTrial,
+    DatasetEvaluationTrialSet,
     DatasetTargetExecutor,
     ExecutionResult,
     ExecutionStatus,
@@ -69,7 +72,10 @@ def test_sdk_exposes_dataset_augmentation_api() -> None:
     assert DatasetAugmentationOperator.__name__ == "DatasetAugmentationOperator"
     assert DatasetEvaluationBaseline.__name__ == "DatasetEvaluationBaseline"
     assert DatasetEvaluationFinding.__name__ == "DatasetEvaluationFinding"
+    assert DatasetEvaluationOutcomeGroup.__name__ == "DatasetEvaluationOutcomeGroup"
     assert DatasetEvaluationRunner.__name__ == "DatasetEvaluationRunner"
+    assert DatasetEvaluationTrial.__name__ == "DatasetEvaluationTrial"
+    assert DatasetEvaluationTrialSet.__name__ == "DatasetEvaluationTrialSet"
     assert DatasetTargetExecutor.__name__ == "DatasetTargetExecutor"
     assert JsonHttpDatasetTarget.__name__ == "JsonHttpDatasetTarget"
     assert len(builtin_dataset_augmentation_operators()) == 8
