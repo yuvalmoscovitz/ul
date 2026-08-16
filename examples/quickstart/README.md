@@ -66,6 +66,23 @@ uv run ul dataset evaluate examples/quickstart/dataset.jsonl \
 The runner handles the server lifecycle and uses a new private output path, so it is the
 recommended route. UL never overwrites an existing evidence file.
 
+The successful runner prints the evidence path. Use it to inspect and record a human judgment:
+
+```bash
+uv run ul dataset report PATH_TO_EVIDENCE.jsonl
+uv run ul dataset review PATH_TO_EVIDENCE.jsonl FINDING_ID \
+  --status confirmed \
+  --severity high \
+  --reviewer "quickstart-reviewer" \
+  --reason "The observed payment used a different invoice reference."
+uv run ul dataset report PATH_TO_EVIDENCE.jsonl
+```
+
+The review command appends to a separate sidecar and leaves the original evidence byte-for-byte
+unchanged. UL creates it with mode `0600` on Unix; on Windows it inherits the parent directory's
+access controls, so use a directory restricted to the review team. The report keeps UL's machine
+observation separate from the reviewer's contextual judgment.
+
 ## Limitations
 
 The example is intentionally small and deterministic on the target side. Variation generation,

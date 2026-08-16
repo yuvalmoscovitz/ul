@@ -821,6 +821,7 @@ def test_execution_creates_private_explicit_output(
     assert output.read_text(encoding="utf-8") == '{"saved":true}\n'
     assert stat.S_IMODE(output.stat().st_mode) == 0o600
     assert "Complete evidence" in result.output
+    assert "Next: ul dataset report" in result.output
     assert "Transfer 100" not in result.output
 
 
@@ -1051,13 +1052,24 @@ def test_cli_rejects_duplicate_or_unknown_self_correction_operator_before_calls(
 
 def test_customer_evidence_keeps_summary_and_nested_technical_details() -> None:
     expected_effect = SimpleNamespace(
-        model_dump=lambda **kwargs: {"kind": "action", "predicate": "transfer"}
+        id="effect-1",
+        evidence=(),
+        confidence=0.9,
+        status="completed",
+        request_unit_ids=("request-1",),
+        position=0,
+        kind="action",
+        predicate="transfer",
+        fields={"amount": 100},
+        propositions=(),
+        model_dump=lambda **kwargs: {"kind": "action", "predicate": "transfer"},
     )
     finding = SimpleNamespace(
         category="duplicate_effect",
         message="A duplicate action needs review.",
         expected_effects=(expected_effect,),
         observed_effects=(expected_effect, expected_effect),
+        grounded_field_names=("amount",),
     )
     candidate = SimpleNamespace(
         operator_id="surface.disfluency_repeat",
@@ -1097,7 +1109,7 @@ def test_customer_evidence_keeps_summary_and_nested_technical_details() -> None:
     assert main._result_needs_review(result) is True
     assert evidence["interaction_id"] == "case-1"
     assert evidence["original_input"] == "transfer 100 to Alice"
-    assert evidence["schema_version"] == "1.2.0"
+    assert evidence["schema_version"] == "1.3.0"
     assert evidence["current_baseline"]["status"] == "ORIGINAL REPLAY STABLE (3/3 OBSERVED)"
     assert "findings" not in evidence["current_baseline"]
     assert evidence["current_baseline"]["observations"]["outcome_group_count"] == 1
@@ -1113,6 +1125,12 @@ def test_customer_evidence_keeps_summary_and_nested_technical_details() -> None:
     assert evidence["cases"][0]["findings"][0]["reference_effects"] == [
         {"kind": "action", "predicate": "transfer"}
     ]
+    assert evidence["cases"][0]["findings"][0]["finding_id"] == (
+        "ulf_v1_963abb59403f4bb8ec4e9bb81c8eb38ddc693dc5a28153569723a484baac4625"
+    )
+    assert evidence["cases"][0]["findings"][0]["grounded_field_names"] == ["amount"]
+    assert evidence["cases"][0]["findings"][0]["severity"] == "unrated"
+    assert evidence["cases"][0]["findings"][0]["review_status"] == "needs_review"
     assert evidence["execution_plan"] == {
         "repetitions": 3,
         "max_target_calls": 100,
@@ -1122,6 +1140,259 @@ def test_customer_evidence_keeps_summary_and_nested_technical_details() -> None:
     assert "caused" in evidence["limitations"]
     assert "production failure rate" in evidence["limitations"]
     assert evidence["technical_details"] == {"full": "technical evidence"}
+
+
+def test_finding_id_ignores_volatile_evidence_and_semantic_ordering() -> None:
+    first_effect = SimpleNamespace(
+        id="generated-effect-1",
+        evidence=(SimpleNamespace(json_pointer="/actions/0"),),
+        confidence=0.72,
+        status="failed",
+        request_unit_ids=("generated-request-1",),
+        position=0,
+        kind="action",
+        predicate="transfer",
+        fields={"recipient": "Alice", "details": {"currency": "USD", "amount": 100}},
+        propositions=("authorized", "settled"),
+    )
+    same_effect_with_volatile_changes = SimpleNamespace(
+        id="generated-effect-99",
+        evidence=(SimpleNamespace(json_pointer="/tool_calls/4"),),
+        confidence=0.99,
+        status="completed",
+        request_unit_ids=("generated-request-42",),
+        position=8,
+        kind="action",
+        predicate="transfer",
+        fields={"details": {"amount": 100, "currency": "USD"}, "recipient": "Alice"},
+        propositions=("settled", "authorized"),
+    )
+    second_effect = SimpleNamespace(
+        id="generated-effect-2",
+        evidence=(),
+        confidence=0.8,
+        status="completed",
+        request_unit_ids=(),
+        position=1,
+        kind="action",
+        predicate="notify",
+        fields={"recipient": "Alice"},
+        propositions=(),
+    )
+    reordered_second_effect = SimpleNamespace(**vars(second_effect))
+    finding = cast(
+        Any,
+        SimpleNamespace(
+            category="changed_grounded_effect_argument",
+            grounded_field_names=("recipient", "amount"),
+            expected_effects=(first_effect, second_effect),
+            observed_effects=(second_effect, first_effect),
+        ),
+    )
+    semantically_identical_finding = cast(
+        Any,
+        SimpleNamespace(
+            category="changed_grounded_effect_argument",
+            grounded_field_names=("amount", "recipient"),
+            expected_effects=(reordered_second_effect, same_effect_with_volatile_changes),
+            observed_effects=(same_effect_with_volatile_changes, reordered_second_effect),
+        ),
+    )
+
+    finding_id = main._finding_id(
+        interaction_id="case-1",
+        original_input="Transfer 100 to Alice.",
+        operator_id="surface.rephrase",
+        operator_version="1.0.0",
+        augmented_input="Please transfer 100 to Alice.",
+        finding=finding,
+    )
+    identical_finding_id = main._finding_id(
+        interaction_id="case-1",
+        original_input="Transfer 100 to Alice.",
+        operator_id="surface.rephrase",
+        operator_version="1.0.0",
+        augmented_input="Please transfer 100 to Alice.",
+        finding=semantically_identical_finding,
+    )
+
+    assert finding_id == identical_finding_id
+    assert re.fullmatch(r"ulf_v1_[0-9a-f]{64}", finding_id)
+
+
+def test_finding_id_changes_for_meaningful_variation_or_behavior() -> None:
+    reference_effect = SimpleNamespace(
+        status="completed",
+        kind="action",
+        predicate="transfer",
+        fields={"amount": 100, "recipient": "Alice"},
+        propositions=(),
+    )
+    changed_effect = SimpleNamespace(
+        status="completed",
+        kind="action",
+        predicate="transfer",
+        fields={"amount": 200, "recipient": "Alice"},
+        propositions=(),
+    )
+    finding = cast(
+        Any,
+        SimpleNamespace(
+            category="changed_grounded_effect_argument",
+            grounded_field_names=("amount",),
+            expected_effects=(reference_effect,),
+            observed_effects=(changed_effect,),
+        ),
+    )
+
+    finding_id = main._finding_id(
+        interaction_id="case-1",
+        original_input="Transfer 100 to Alice.",
+        operator_id="surface.rephrase",
+        operator_version="1.0.0",
+        augmented_input="Please transfer 100 to Alice.",
+        finding=finding,
+    )
+    changed_variation_id = main._finding_id(
+        interaction_id="case-1",
+        original_input="Transfer 100 to Alice.",
+        operator_id="surface.rephrase",
+        operator_version="1.0.0",
+        augmented_input="Could you transfer 100 to Alice?",
+        finding=finding,
+    )
+    changed_behavior = cast(
+        Any,
+        SimpleNamespace(
+            category="changed_grounded_effect_argument",
+            grounded_field_names=("amount",),
+            expected_effects=(reference_effect,),
+            observed_effects=(
+                SimpleNamespace(
+                    status="completed",
+                    kind="action",
+                    predicate="transfer",
+                    fields={"amount": 300, "recipient": "Alice"},
+                    propositions=(),
+                ),
+            ),
+        ),
+    )
+    changed_behavior_id = main._finding_id(
+        interaction_id="case-1",
+        original_input="Transfer 100 to Alice.",
+        operator_id="surface.rephrase",
+        operator_version="1.0.0",
+        augmented_input="Please transfer 100 to Alice.",
+        finding=changed_behavior,
+    )
+
+    assert finding_id != changed_variation_id
+    assert finding_id != changed_behavior_id
+
+
+def test_duplicate_semantic_findings_get_stable_unique_reportable_ids(tmp_path: Path) -> None:
+    def effect(identifier: str, amount: int, position: int) -> SimpleNamespace:
+        payload = {
+            "id": identifier,
+            "evidence": [],
+            "confidence": 0.9,
+            "status": "observed",
+            "request_unit_ids": [],
+            "position": position,
+            "kind": "action",
+            "predicate": "transfer",
+            "fields": {"amount": amount, "recipient": "Alice"},
+            "propositions": [],
+        }
+        return SimpleNamespace(
+            **{**payload, "propositions": ()},
+            model_dump=lambda **kwargs: payload,
+        )
+
+    first_reference = effect("reference-1", 100, 0)
+    second_reference = effect("reference-2", 100, 1)
+    first_observed = effect("observed-1", 200, 0)
+    second_observed = effect("observed-2", 200, 1)
+    first_finding = SimpleNamespace(
+        category="changed_grounded_effect_argument",
+        message="The variation changed a grounded transfer amount.",
+        expected_effects=(first_reference,),
+        observed_effects=(first_observed,),
+        grounded_field_names=("amount",),
+    )
+    second_finding = SimpleNamespace(
+        category="changed_grounded_effect_argument",
+        message="The variation changed a grounded transfer amount.",
+        expected_effects=(second_reference,),
+        observed_effects=(second_observed,),
+        grounded_field_names=("amount",),
+    )
+    finding_context = {
+        "interaction_id": "case-1",
+        "original_input": "Transfer 100 to Alice.",
+        "operator_id": "surface.rephrase",
+        "operator_version": "1.0.0",
+        "augmented_input": "Please transfer 100 to Alice.",
+    }
+
+    customer_findings = main._customer_findings(
+        cast(Any, (first_finding, second_finding)),
+        **finding_context,
+    )
+    reordered_customer_findings = main._customer_findings(
+        cast(Any, (second_finding, first_finding)),
+        **finding_context,
+    )
+    finding_ids = {cast(dict[str, Any], finding)["finding_id"] for finding in customer_findings}
+    reordered_finding_ids = {
+        cast(dict[str, Any], finding)["finding_id"] for finding in reordered_customer_findings
+    }
+
+    assert len(finding_ids) == 2
+    assert finding_ids == reordered_finding_ids
+    assert all(re.fullmatch(r"ulf_v1_[0-9a-f]{64}", finding_id) for finding_id in finding_ids)
+
+    candidate = SimpleNamespace(
+        operator_id="surface.rephrase",
+        operator_version="1.0.0",
+        augmented_input="Please transfer 100 to Alice.",
+        passed=True,
+        failure_reasons=(),
+    )
+    case = SimpleNamespace(
+        candidate=candidate,
+        verdict="divergence_needs_review",
+        trial_set=_trial_set(representative_effect=first_observed),
+        findings=(first_finding, second_finding),
+        inconclusive_reasons=(),
+    )
+    result = cast(
+        DatasetEvaluationResult,
+        SimpleNamespace(
+            source=SimpleNamespace(id="case-1", raw_input="Transfer 100 to Alice."),
+            baseline=SimpleNamespace(
+                verdict="no_divergence",
+                trial_set=_trial_set(representative_effect=first_reference),
+                inconclusive_reasons=(),
+            ),
+            cases=(case,),
+            model_dump=lambda **kwargs: {"fixture": "duplicate semantic findings"},
+        ),
+    )
+    evidence = main._customer_evidence_record(
+        result,
+        repetitions=3,
+        max_target_calls=6,
+        planned_target_calls=6,
+    )
+    evidence_path = tmp_path / "evidence.jsonl"
+    evidence_path.write_text(json.dumps(evidence) + "\n", encoding="utf-8")
+
+    report = runner.invoke(root_app, ["dataset", "report", str(evidence_path)])
+
+    assert report.exit_code == 0, report.output
+    assert "Dataset finding report: 2 finding(s)" in report.output
 
 
 def test_stored_output_drift_does_not_require_review_or_appear_in_original_replay(
