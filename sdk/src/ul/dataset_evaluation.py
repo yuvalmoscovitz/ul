@@ -279,7 +279,7 @@ def _action_outcome_reliability_issues(
             issues.append(f"action outcome {outcome.id} predicate lacks coherent action evidence")
         elif grounded_fields and not any(
             all(
-                name in action_object and _json_key(action_object[name]) == _json_key(value)
+                name in action_object and _observable_values_equal(action_object[name], value)
                 for name, value in grounded_fields.items()
             )
             for action_object in evidenced_action_objects
@@ -546,3 +546,27 @@ def _changed_grounded_field_names(
 
 def _json_key(value: JsonValue) -> str:
     return json.dumps(value, sort_keys=True, separators=(",", ":"))
+
+
+def _observable_values_equal(left: JsonValue, right: JsonValue) -> bool:
+    if _json_key(left) == _json_key(right):
+        return True
+    if isinstance(left, bool) or isinstance(right, bool):
+        return False
+    number: int | float
+    numeric_text: str
+    if isinstance(left, (int, float)) and isinstance(right, str):
+        number, numeric_text = left, right
+    elif isinstance(right, (int, float)) and isinstance(left, str):
+        number, numeric_text = right, left
+    else:
+        return False
+    if (
+        re.fullmatch(r"-?(?:0|[1-9]\d*)(?:\.\d+)?(?:e[-+]?\d+)?", numeric_text, re.IGNORECASE)
+        is None
+    ):
+        return False
+    try:
+        return Decimal(str(number)) == Decimal(numeric_text)
+    except InvalidOperation:
+        return False

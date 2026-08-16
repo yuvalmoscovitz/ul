@@ -8,6 +8,7 @@ from ul_core.contracts import (
     DatasetTargetExecutor,
     OracleEvaluator,
     ScenarioMaterializer,
+    SemanticEquivalenceVerifier,
     TargetExecutor,
 )
 from ul_core.coverage import (
@@ -15,7 +16,11 @@ from ul_core.coverage import (
     DeterministicAugmentationSelector,
     extract_semantic_coverage,
 )
-from ul_core.dataset import ObservedAgentOutput
+from ul_core.dataset import (
+    ObservedAgentOutput,
+    SemanticDelta,
+    SemanticEquivalenceAssessment,
+)
 from ul_core.models import (
     AugmentationApplication,
     CampaignCaseResult,
@@ -45,6 +50,9 @@ __all__ = [
     "OracleRelation",
     "Scenario",
     "ScenarioMaterializer",
+    "SemanticDelta",
+    "SemanticEquivalenceAssessment",
+    "SemanticEquivalenceVerifier",
     "TargetExecutor",
     "builtin_augmentation_registry",
     "extract_semantic_coverage",

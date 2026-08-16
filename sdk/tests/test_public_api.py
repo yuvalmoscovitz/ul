@@ -14,6 +14,9 @@ from ul import (
     RenderedUserInput,
     Scenario,
     ScenarioProvenance,
+    SemanticDelta,
+    SemanticEquivalenceAssessment,
+    SemanticEquivalenceVerifier,
     SemanticFrame,
     UserInputRecord,
     builtin_augmentation_registry,
@@ -75,4 +78,7 @@ def test_sdk_exposes_dataset_augmentation_api() -> None:
     }
     assert RenderedUserInput(text="hey").text == "hey"
     assert SemanticFrame.__name__ == "SemanticFrame"
+    assert SemanticDelta.__name__ == "SemanticDelta"
+    assert SemanticEquivalenceAssessment.__name__ == "SemanticEquivalenceAssessment"
+    assert SemanticEquivalenceVerifier.__name__ == "SemanticEquivalenceVerifier"
     assert UserInputRecord.__name__ == "UserInputRecord"

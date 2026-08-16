@@ -62,7 +62,7 @@ def test_dry_run_validates_and_makes_no_external_calls(
     assert result.exit_code == 0, result.output
     assert "Dataset valid: 2 interaction(s)" in result.output
     assert "Selected interactions: 1" in result.output
-    assert "Potential semantic model calls: up to 4" in result.output
+    assert "Potential semantic model calls: up to 5" in result.output
     assert "Potential target calls: up to 1" in result.output
     assert "Semantic models receive historical inputs and outputs" in result.output
     assert "generated variations" in result.output

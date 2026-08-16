@@ -405,7 +405,7 @@ def _print_dataset_plan(
     target_configured: bool,
 ) -> None:
     potential_target_calls = selected_count * len(operator_ids)
-    potential_model_calls = selected_count * (1 + 3 * len(operator_ids))
+    potential_model_calls = selected_count * (1 + 4 * len(operator_ids))
     console.print(f"Dataset valid: {record_count} interaction(s)")
     console.print(f"Selected interactions: {selected_count}")
     console.print(f"Operators: {', '.join(operator_ids)}")
@@ -436,7 +436,7 @@ async def _evaluate_interaction_records(
     results: list[DatasetEvaluationResult] = []
     async with OpenRouterSemanticDeconstructor(settings) as deconstructor, target:
         runner = DatasetEvaluationRunner(
-            DatasetAugmentationEngine(deconstructor, deconstructor),
+            DatasetAugmentationEngine(deconstructor, deconstructor, deconstructor),
             deconstructor,
             target,
             allow_network_egress=True,

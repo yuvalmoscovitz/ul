@@ -161,3 +161,44 @@ class SemanticFrame(_StrictULModel):
             raise ValueError(
                 f"unknown reference on semantic element {owner_id}: {sorted(unknown_ids)}"
             )
+
+
+class SemanticDelta(_StrictULModel):
+    category: Literal[
+        "request",
+        "entity",
+        "value",
+        "constraint",
+        "negation",
+        "request_order",
+        "relationship",
+        "cardinality",
+        "communication",
+    ]
+    operation: Literal["added", "removed", "changed", "reordered"]
+    source_quote: str | None = Field(default=None, min_length=1)
+    candidate_quote: str | None = Field(default=None, min_length=1)
+    description: str = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def validate_evidence(self) -> Self:
+        if self.source_quote is None and self.candidate_quote is None:
+            raise ValueError("semantic deltas require source or candidate evidence")
+        return self
+
+
+class SemanticEquivalenceAssessment(_StrictULModel):
+    schema_version: Literal["1.0.0"] = "1.0.0"
+    verdict: Literal["equivalent", "different", "uncertain"]
+    explanation: str = Field(min_length=1)
+    deltas: tuple[SemanticDelta, ...] = ()
+    verifier_version: str = Field(min_length=1)
+    metadata: dict[str, JsonValue] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def validate_verdict(self) -> Self:
+        if self.verdict == "equivalent" and self.deltas:
+            raise ValueError("equivalent assessments cannot contain deltas")
+        if self.verdict == "different" and not self.deltas:
+            raise ValueError("different assessments require at least one delta")
+        return self

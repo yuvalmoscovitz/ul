@@ -7,6 +7,7 @@ from ul_core.dataset import (
     InteractionRecord,
     ObservedAgentOutput,
     RenderedUserInput,
+    SemanticEquivalenceAssessment,
     SemanticFrame,
     UserInputRecord,
 )
@@ -35,6 +36,15 @@ class SemanticRenderer(Protocol):
         raw_input: str,
         instruction: str,
     ) -> Awaitable[RenderedUserInput]: ...
+
+
+@runtime_checkable
+class SemanticEquivalenceVerifier(Protocol):
+    def verify(
+        self,
+        source_input: str,
+        candidate_input: str,
+    ) -> Awaitable[SemanticEquivalenceAssessment]: ...
 
 
 @runtime_checkable
