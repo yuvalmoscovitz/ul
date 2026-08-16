@@ -39,6 +39,7 @@ from ul.dataset_evaluation import (
     DatasetEvaluationRunner,
 )
 from ul.deconstruction import OpenRouterDatasetSettings, OpenRouterSemanticDeconstructor
+from ul.http_target import JsonHttpDatasetTarget
 
 __all__ = [
     "Action",
@@ -59,6 +60,7 @@ __all__ = [
     "ExecutionStatus",
     "FindingSeverity",
     "InteractionRecord",
+    "JsonHttpDatasetTarget",
     "MaterializedScenario",
     "ObservedAgentOutput",
     "OpenRouterDatasetSettings",
