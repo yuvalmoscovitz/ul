@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 import re
 import stat
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
@@ -31,6 +33,89 @@ def _record(identifier: str = "interaction-1") -> dict[str, Any]:
         "input": "Transfer 100 to Alice.",
         "output": {"actions": [{"action": "transfer", "amount": 100, "recipient": "Alice"}]},
     }
+
+
+def _write_target_config(
+    path: Path,
+    *,
+    url: str = "https://sandbox.example.test/execute",
+    headers_from_env: dict[str, str] | None = None,
+    request_json_template: object | None = None,
+    response_json_pointer: str = "",
+) -> None:
+    path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "url": url,
+                "headers_from_env": headers_from_env or {},
+                "request_json_template": request_json_template
+                if request_json_template is not None
+                else {"input": "{{input}}"},
+                "response_json_pointer": response_json_pointer,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
+def test_init_creates_private_strict_starter_config(tmp_path: Path) -> None:
+    target_config = tmp_path / "target.json"
+
+    result = runner.invoke(
+        root_app,
+        [
+            "dataset",
+            "init",
+            str(target_config),
+            "--url",
+            "https://sandbox.example.test/execute",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert json.loads(target_config.read_text(encoding="utf-8")) == {
+        "version": 1,
+        "url": "https://sandbox.example.test/execute",
+        "headers_from_env": {},
+        "request_json_template": {"input": "{{input}}"},
+        "response_json_pointer": "",
+    }
+    assert stat.S_IMODE(target_config.stat().st_mode) == 0o600
+    assert "request_json_template" in result.output
+    assert "response_json_pointer" in result.output
+    assert "headers_from_env" in result.output
+    assert "--dry-run" in result.output
+
+
+def test_init_refuses_invalid_url_and_existing_file(tmp_path: Path) -> None:
+    invalid_config = tmp_path / "invalid.json"
+    invalid_url = runner.invoke(
+        root_app,
+        ["dataset", "init", str(invalid_config), "--url", "file:///etc/passwd"],
+    )
+
+    assert invalid_url.exit_code != 0
+    assert not invalid_config.exists()
+
+    existing_config = tmp_path / "target.json"
+    existing_config.write_text("keep me", encoding="utf-8")
+    collision = runner.invoke(
+        root_app,
+        [
+            "dataset",
+            "init",
+            str(existing_config),
+            "--url",
+            "https://sandbox.example.test/execute",
+        ],
+    )
+
+    assert collision.exit_code != 0
+    normalized_output = " ".join(_ANSI_ESCAPE_PATTERN.sub("", collision.output).split())
+    assert "will not" in normalized_output
+    assert "overwrite it" in normalized_output
+    assert existing_config.read_text(encoding="utf-8") == "keep me"
 
 
 def _trial_set(
@@ -76,7 +161,11 @@ def test_dry_run_validates_and_makes_no_external_calls(
     def unexpected_deconstructor(*args: object, **kwargs: object) -> None:
         raise AssertionError("dry-run constructed a semantic model client")
 
+    def unexpected_target(*args: object, **kwargs: object) -> None:
+        raise AssertionError("dry-run constructed a target client")
+
     monkeypatch.setattr(main, "OpenRouterSemanticDeconstructor", unexpected_deconstructor)
+    monkeypatch.setattr(main.JsonHttpDatasetTarget, "from_config", unexpected_target)
     result = runner.invoke(
         root_app,
         [
@@ -110,6 +199,145 @@ def test_dry_run_validates_and_makes_no_external_calls(
     assert "estimate a production failure rate" in result.output
     assert "No model or target requests sent." in result.output
     assert "Transfer 100" not in result.output
+
+
+def test_target_config_dry_run_validates_environment_and_makes_no_calls(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    dataset = tmp_path / "interactions.jsonl"
+    target_config = tmp_path / "target.json"
+    _write_dataset(dataset, [_record()])
+    _write_target_config(
+        target_config,
+        headers_from_env={"Authorization": "SANDBOX_TOKEN"},
+        request_json_template={"request": {"message": "{{input}}"}},
+        response_json_pointer="/result",
+    )
+    monkeypatch.setenv("SANDBOX_TOKEN", "Bearer test-token")
+
+    def unexpected_deconstructor(*args: object, **kwargs: object) -> None:
+        raise AssertionError("dry-run constructed a semantic model client")
+
+    monkeypatch.setattr(main, "OpenRouterSemanticDeconstructor", unexpected_deconstructor)
+    result = runner.invoke(
+        root_app,
+        [
+            "dataset",
+            "evaluate",
+            str(dataset),
+            "--target-config",
+            str(target_config),
+            "--dry-run",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "Target: configured" in result.output
+    assert "https://sandbox.example.test/execute" in result.output
+    assert "Authorization=SANDBOX_TOKEN" in result.output
+    assert "Bearer test-token" not in result.output
+    assert "No model or target requests sent" in result.output
+
+    monkeypatch.delenv("SANDBOX_TOKEN")
+    missing_environment = runner.invoke(
+        root_app,
+        [
+            "dataset",
+            "evaluate",
+            str(dataset),
+            "--target-config",
+            str(target_config),
+            "--dry-run",
+        ],
+    )
+
+    assert missing_environment.exit_code != 0
+    assert "environment variable is not set" in missing_environment.output
+    assert "No model or target requests sent" not in missing_environment.output
+
+
+@pytest.mark.parametrize(
+    "conflicting_options",
+    [
+        ["--target-url", "https://sandbox.example.test/execute"],
+        ["--request-field", "message"],
+        ["--header-env", "Authorization=SANDBOX_TOKEN"],
+    ],
+)
+def test_target_config_rejects_legacy_target_options(
+    tmp_path: Path,
+    conflicting_options: list[str],
+) -> None:
+    dataset = tmp_path / "interactions.jsonl"
+    target_config = tmp_path / "target.json"
+    _write_dataset(dataset, [_record()])
+    _write_target_config(target_config)
+
+    result = runner.invoke(
+        root_app,
+        [
+            "dataset",
+            "evaluate",
+            str(dataset),
+            "--target-config",
+            str(target_config),
+            *conflicting_options,
+            "--dry-run",
+        ],
+    )
+
+    assert result.exit_code != 0
+    normalized_output = " ".join(_ANSI_ESCAPE_PATTERN.sub("", result.output).split())
+    assert "--target-config cannot be combined" in normalized_output
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {
+            "version": 1,
+            "url": "https://sandbox.example.test/execute",
+            "headers_from_env": {},
+            "request_json_template": {"input": "{{input}}"},
+            "response_json_pointer": "",
+            "unknown": True,
+        },
+        {
+            "version": 1,
+            "url": "https://sandbox.example.test/execute",
+            "headers_from_env": {},
+            "request_json_template": {"input": "missing marker"},
+            "response_json_pointer": "",
+        },
+        {
+            "version": 1,
+            "url": "https://sandbox.example.test/execute",
+            "headers_from_env": {},
+            "request_json_template": {"input": "{{input}}"},
+            "response_json_pointer": "not-a-pointer",
+        },
+    ],
+)
+def test_dry_run_rejects_invalid_target_config(tmp_path: Path, payload: dict[str, Any]) -> None:
+    dataset = tmp_path / "interactions.jsonl"
+    target_config = tmp_path / "target.json"
+    _write_dataset(dataset, [_record()])
+    target_config.write_text(json.dumps(payload), encoding="utf-8")
+
+    result = runner.invoke(
+        root_app,
+        [
+            "dataset",
+            "evaluate",
+            str(dataset),
+            "--target-config",
+            str(target_config),
+            "--dry-run",
+        ],
+    )
+
+    assert result.exit_code != 0
+    assert "No model or target requests sent" not in result.output
 
 
 @pytest.mark.parametrize(
@@ -596,6 +824,120 @@ def test_execution_creates_private_explicit_output(
     assert "Transfer 100" not in result.output
 
 
+def test_target_config_runs_nested_request_and_response_against_loopback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    received_requests: list[object] = []
+
+    class TargetHandler(BaseHTTPRequestHandler):
+        def do_POST(self) -> None:
+            content_length = int(self.headers["Content-Length"])
+            received_requests.append(json.loads(self.rfile.read(content_length)))
+            response = json.dumps(
+                {
+                    "envelope": {
+                        "agent": {
+                            "actions": [{"action": "transfer", "amount": 100, "recipient": "Alice"}]
+                        }
+                    }
+                }
+            ).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(response)))
+            self.end_headers()
+            self.wfile.write(response)
+
+        def log_message(self, format: str, *args: object) -> None:
+            pass
+
+    try:
+        server = ThreadingHTTPServer(("127.0.0.1", 0), TargetHandler)
+    except PermissionError:
+        pytest.skip("the test sandbox does not allow binding a loopback server")
+    server_thread = threading.Thread(target=server.serve_forever)
+    server_thread.start()
+    try:
+        dataset = tmp_path / "interactions.jsonl"
+        target_config = tmp_path / "target.json"
+        output = tmp_path / "results.jsonl"
+        _write_dataset(dataset, [_record()])
+        _write_target_config(
+            target_config,
+            url=f"http://127.0.0.1:{server.server_port}/execute",
+            request_json_template={
+                "payload": {
+                    "messages": [{"role": "user", "content": "{{input}}"}],
+                }
+            },
+            response_json_pointer="/envelope/agent",
+        )
+        observed_outputs: list[object] = []
+
+        async def evaluate_once(
+            records: tuple[Any, ...],
+            operator_ids: tuple[str, ...],
+            settings: object,
+            target: Any,
+            output_stream: Any,
+            *,
+            repetitions: int,
+            max_target_calls: int,
+            planned_target_calls: int,
+        ) -> tuple[object, ...]:
+            del operator_ids, settings, repetitions, max_target_calls, planned_target_calls
+            async with target:
+                observed_outputs.append((await target.execute(records[0].raw_input)).raw_output)
+            output_stream.write('{"saved":true}\n')
+            return ()
+
+        monkeypatch.setattr(
+            main,
+            "OpenRouterDatasetSettings",
+            lambda: SimpleNamespace(
+                live_calls=True,
+                allow_external_data_processing=True,
+                api_key=SecretStr("test-key"),
+                max_input_chars=50_000,
+            ),
+        )
+        monkeypatch.setattr(main, "_evaluate_interaction_records", evaluate_once)
+
+        result = runner.invoke(
+            root_app,
+            [
+                "dataset",
+                "evaluate",
+                str(dataset),
+                "--target-config",
+                str(target_config),
+                "--allow-insecure-http",
+                "--allow-target-network",
+                "--confirm-isolated-sandbox",
+                "--confirm-fresh-state",
+                "--output",
+                str(output),
+            ],
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+        server_thread.join()
+
+    assert result.exit_code == 0, result.output
+    assert received_requests == [
+        {
+            "payload": {
+                "messages": [{"role": "user", "content": "Transfer 100 to Alice."}],
+            }
+        }
+    ]
+    assert observed_outputs == [
+        {"actions": [{"action": "transfer", "amount": 100, "recipient": "Alice"}]}
+    ]
+    assert output.read_text(encoding="utf-8") == '{"saved":true}\n'
+
+
 def test_help_explains_dataset_target_and_operator_contract() -> None:
     result = runner.invoke(root_app, ["dataset", "evaluate", "--help"])
 
@@ -615,6 +957,19 @@ def test_help_explains_dataset_target_and_operator_contract() -> None:
     assert "requests" in normalized_help
     assert "operator. Run 'ul" in normalized_help
     assert "operators' for" in normalized_help
+    assert "--target-config" in normalized_help
+    assert "configuration" in normalized_help
+    help_text = " ".join(normalized_help.replace("│", "").split())
+    assert "created by 'ul dataset init'" in help_text
+
+    init_help = runner.invoke(root_app, ["dataset", "init", "--help"])
+    assert init_help.exit_code == 0, init_help.output
+    normalized_init_help = " ".join(_ANSI_ESCAPE_PATTERN.sub("", init_help.output).split())
+    assert "target_config" in normalized_init_help
+    assert "--url" in normalized_init_help
+    assert "private starter" in normalized_init_help
+    assert "{{input}}" in normalized_init_help
+    assert "/choices/0/message/content" in normalized_init_help
 
     operators = runner.invoke(root_app, ["dataset", "operators"])
     assert operators.exit_code == 0, operators.output

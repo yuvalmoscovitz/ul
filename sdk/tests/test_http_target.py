@@ -6,12 +6,16 @@ import threading
 from collections.abc import AsyncIterator, Generator
 from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from typing import Any
 
 import httpx
 import pytest
+import ul.http_target as http_target_module
 from ul.http_target import (
     JsonHttpDatasetTarget,
+    JsonHttpDatasetTargetConfig,
+    load_json_http_dataset_target_config,
     validate_json_http_dataset_target_configuration,
 )
 
@@ -111,12 +115,343 @@ async def test_posts_input_to_real_json_endpoint_and_preserves_response(
     assert target.safety_envelope.allows_business_side_effects is False
 
 
+async def test_posts_nested_template_and_selects_nested_response_from_real_endpoint() -> None:
+    with _loopback_server() as endpoint:
+        async with JsonHttpDatasetTarget(
+            endpoint,
+            sandbox_confirmed=True,
+            fresh_state_confirmed=True,
+            request_json_template={
+                "messages": [{"role": "user", "content": "{{input}}"}],
+                "settings": {"mode": "sandbox"},
+            },
+            response_json_pointer="/actions/0",
+            allow_insecure_http=True,
+        ) as target:
+            output = await target.execute("transfer 100 to Alice")
+
+    assert _JsonTargetHandler.request_body == {
+        "messages": [{"role": "user", "content": "transfer 100 to Alice"}],
+        "settings": {"mode": "sandbox"},
+    }
+    assert output.raw_output == {
+        "action": "transfer",
+        "amount": 100,
+        "recipient": "Alice",
+    }
+
+
+async def test_loads_strict_config_and_constructs_target_without_network(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_path = tmp_path / "target.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "url": "https://example.com/run",
+                "headers_from_env": {"Authorization": "TEST_AGENT_TOKEN"},
+                "request_json_template": {"request": {"text": "{{input}}"}},
+                "response_json_pointer": "/result/output",
+            }
+        )
+    )
+    monkeypatch.setenv("TEST_AGENT_TOKEN", "Bearer token")
+    observed_request: httpx.Request | None = None
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal observed_request
+        observed_request = request
+        return _raw_response(
+            b'{"result":{"output":{"answer":"ok"}}}',
+            content_type="application/json",
+        )
+
+    config = load_json_http_dataset_target_config(config_path)
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        target = JsonHttpDatasetTarget.from_config(
+            config,
+            sandbox_confirmed=True,
+            fresh_state_confirmed=True,
+            client=client,
+        )
+        output = await target.execute("hello")
+
+    assert isinstance(config, JsonHttpDatasetTargetConfig)
+    assert observed_request is not None
+    assert json.loads(observed_request.content) == {"request": {"text": "hello"}}
+    assert observed_request.headers["authorization"] == "Bearer token"
+    assert output.raw_output == {"answer": "ok"}
+
+
+@pytest.mark.parametrize("unsafe_value", ("value\x00suffix", "value\x01suffix", "value\x7fsuffix"))
+async def test_rejects_header_control_bytes_before_network(
+    monkeypatch: pytest.MonkeyPatch,
+    unsafe_value: str,
+) -> None:
+    request_count = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal request_count
+        request_count += 1
+        return _raw_response(b'{"answer":"ok"}', content_type="application/json")
+
+    monkeypatch.setattr(
+        http_target_module.os,
+        "environ",
+        {"TEST_UNSAFE_HEADER": unsafe_value},
+    )
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        with pytest.raises(RuntimeError, match="environment variable is invalid"):
+            JsonHttpDatasetTarget(
+                "https://example.com/run",
+                sandbox_confirmed=True,
+                fresh_state_confirmed=True,
+                header_environment_variables={"Authorization": "TEST_UNSAFE_HEADER"},
+                client=client,
+            )
+
+    assert request_count == 0
+
+
+async def test_rejects_oversized_header_values_before_network(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("TEST_LARGE_HEADER", "x" * 8_193)
+    with pytest.raises(RuntimeError, match="environment variable is too large"):
+        JsonHttpDatasetTarget(
+            "https://example.com/run",
+            sandbox_confirmed=True,
+            fresh_state_confirmed=True,
+            header_environment_variables={"Authorization": "TEST_LARGE_HEADER"},
+        )
+
+
+async def test_rejects_too_many_configured_headers() -> None:
+    with pytest.raises(ValueError, match="too many headers"):
+        JsonHttpDatasetTargetConfig(
+            version=1,
+            url="https://example.com/run",
+            request_json_template={"input": "{{input}}"},
+            headers_from_env={f"X-Test-{index}": f"TEST_HEADER_{index}" for index in range(33)},
+        )
+
+
+@pytest.mark.parametrize(
+    "encoded_config",
+    (
+        b'{"version":1,"version":1,"url":"https://example.com","request_json_template":{"x":"{{input}}"}}',
+        b'{"version":NaN,"url":"https://example.com","request_json_template":{"x":"{{input}}"}}',
+        b"[" * 200 + b"0" + b"]" * 200,
+    ),
+)
+async def test_config_loader_rejects_adversarial_json(
+    tmp_path: Path,
+    encoded_config: bytes,
+) -> None:
+    config_path = tmp_path / "target.json"
+    config_path.write_bytes(encoded_config)
+
+    with pytest.raises(ValueError, match="invalid JSON"):
+        load_json_http_dataset_target_config(config_path)
+
+
+async def test_config_loader_enforces_size_limit(tmp_path: Path) -> None:
+    config_path = tmp_path / "target.json"
+    config_path.write_bytes(b" " * 1_000_001)
+
+    with pytest.raises(ValueError, match="size limit"):
+        load_json_http_dataset_target_config(config_path)
+
+
+@pytest.mark.parametrize(
+    "config",
+    (
+        {
+            "version": True,
+            "url": "https://example.com",
+            "request_json_template": {"x": "{{input}}"},
+        },
+        {
+            "version": 1,
+            "url": "https://example.com",
+            "request_json_template": {"x": "{{input}}"},
+            "unknown": "value",
+        },
+        {
+            "version": 1,
+            "url": "https://example.com",
+            "request_json_template": {"x": "no marker"},
+        },
+        {
+            "version": 1,
+            "url": "https://example.com",
+            "request_json_template": ["{{input}}", {"x": "{{input}}"}],
+        },
+        {
+            "version": 1,
+            "url": "https://example.com",
+            "request_json_template": "{{input}}",
+        },
+        {
+            "version": 1,
+            "url": "https://example.com",
+            "request_json_template": {"x": "{{input}}"},
+            "response_json_pointer": "/bad~2escape",
+        },
+    ),
+)
+async def test_config_loader_rejects_invalid_schema(
+    tmp_path: Path,
+    config: dict[str, Any],
+) -> None:
+    config_path = tmp_path / "target.json"
+    config_path.write_text(json.dumps(config))
+
+    with pytest.raises(ValueError, match="config is invalid"):
+        load_json_http_dataset_target_config(config_path)
+
+
+async def test_config_loader_reports_safe_field_reason_without_echoing_values(
+    tmp_path: Path,
+) -> None:
+    config_path = tmp_path / "target.json"
+    private_url = "https://private-user:private-password@example.com"
+    config_path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "url": private_url,
+                "request_json_template": {"input": "{{input}}"},
+                "response_json_pointer": "result.output",
+            }
+        )
+    )
+
+    with pytest.raises(ValueError) as captured_error:
+        load_json_http_dataset_target_config(config_path)
+
+    message = str(captured_error.value)
+    assert "url:" in message
+    assert "response_json_pointer:" in message
+    assert "must not contain credentials" in message
+    assert "RFC 6901" in message
+    assert "private-user" not in message
+    assert "private-password" not in message
+
+
+async def test_template_is_replaced_structurally_without_mutation() -> None:
+    template: Any = [{"body": "{{input}}"}, {"literal": "prefix {{input}}"}]
+    observed_bodies: list[Any] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        observed_bodies.append(json.loads(request.content))
+        return _raw_response(b'{"answer":"ok"}', content_type="application/json")
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        target = JsonHttpDatasetTarget(
+            "https://example.com/run",
+            sandbox_confirmed=True,
+            fresh_state_confirmed=True,
+            request_json_template=template,
+            client=client,
+        )
+        await target.execute('first "quoted" input')
+        await target.execute("second input")
+
+    assert template == [{"body": "{{input}}"}, {"literal": "prefix {{input}}"}]
+    assert observed_bodies == [
+        [{"body": 'first "quoted" input'}, {"literal": "prefix {{input}}"}],
+        [{"body": "second input"}, {"literal": "prefix {{input}}"}],
+    ]
+
+
+async def test_rejects_oversized_rendered_request_before_network() -> None:
+    request_count = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal request_count
+        request_count += 1
+        return _raw_response(b'{"answer":"ok"}', content_type="application/json")
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        target = JsonHttpDatasetTarget(
+            "https://example.com/run",
+            sandbox_confirmed=True,
+            fresh_state_confirmed=True,
+            request_json_template={"request": "{{input}}"},
+            max_request_bytes=20,
+            client=client,
+        )
+        with pytest.raises(RuntimeError, match="request exceeds the size limit"):
+            await target.execute("a request that is too large")
+
+    assert request_count == 0
+
+
+@pytest.mark.parametrize(
+    ("pointer", "expected"),
+    (
+        ("", {"a/b": {"~key": [{"": "selected"}]}}),
+        ("/a~1b/~0key/0/", "selected"),
+    ),
+)
+async def test_resolves_rfc_6901_root_objects_arrays_and_escapes(
+    pointer: str,
+    expected: Any,
+) -> None:
+    response_document = {"a/b": {"~key": [{"": "selected"}]}}
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(
+            lambda request: _raw_response(
+                json.dumps(response_document).encode(), content_type="application/json"
+            )
+        )
+    ) as client:
+        target = JsonHttpDatasetTarget(
+            "https://example.com/run",
+            sandbox_confirmed=True,
+            fresh_state_confirmed=True,
+            response_json_pointer=pointer,
+            client=client,
+        )
+        output = await target.execute("hello")
+
+    assert output.raw_output == expected
+
+
+@pytest.mark.parametrize("pointer", ("/missing", "/items/-", "/items/01", "/nothing"))
+async def test_rejects_unresolvable_or_null_response_pointer_without_private_data(
+    pointer: str,
+) -> None:
+    response = _raw_response(
+        b'{"items":["private response"],"nothing":null}',
+        content_type="application/json",
+    )
+    async with httpx.AsyncClient(transport=httpx.MockTransport(lambda request: response)) as client:
+        target = JsonHttpDatasetTarget(
+            "https://example.com/run",
+            sandbox_confirmed=True,
+            fresh_state_confirmed=True,
+            response_json_pointer=pointer,
+            client=client,
+        )
+        with pytest.raises(RuntimeError, match="JSON pointer") as error:
+            await target.execute("private input")
+
+    assert "private" not in str(error.value)
+
+
 @pytest.mark.parametrize(
     ("endpoint", "allow_insecure_http", "message"),
     [
         ("https://user:password@example.com/run", False, "credentials"),
         ("https://example.com/run?token=secret", False, "query or fragment"),
         ("https://example.com/run#result", False, "query or fragment"),
+        ("https://example.com/a\nb", False, "non-empty HTTP"),
+        ("https://example.com/a\tb", False, "non-empty HTTP"),
+        ("https://example.com/a\x1bb", False, "non-empty HTTP"),
         ("file:///tmp/agent", False, "valid HTTP"),
         ("http://example.com/run", False, "insecure transport opt-in"),
     ],
