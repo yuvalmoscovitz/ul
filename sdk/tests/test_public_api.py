@@ -72,7 +72,7 @@ def test_sdk_exposes_dataset_augmentation_api() -> None:
     assert DatasetEvaluationRunner.__name__ == "DatasetEvaluationRunner"
     assert DatasetTargetExecutor.__name__ == "DatasetTargetExecutor"
     assert JsonHttpDatasetTarget.__name__ == "JsonHttpDatasetTarget"
-    assert len(builtin_dataset_augmentation_operators()) == 7
+    assert len(builtin_dataset_augmentation_operators()) == 8
     assert OpenRouterSemanticDeconstructor is not None
     assert OpenRouterDatasetSettings is not None
     assert ObservedAgentOutput(raw_output={"action": "visit_booked"}).raw_output == {

@@ -4,6 +4,7 @@ import hashlib
 import json
 import re
 from collections.abc import Iterable
+from decimal import Decimal
 from itertools import islice, pairwise
 from typing import Any, Literal, Self
 
@@ -17,6 +18,7 @@ from ul_core.dataset import (
     InteractionRecord,
     RenderedUserInput,
     SemanticEquivalenceAssessment,
+    SemanticFactor,
     SemanticFrame,
     UserInputRecord,
 )
@@ -30,8 +32,13 @@ OperatorId = Literal[
     "style.terse",
     "style.verbose",
     "tone.frustrated",
+    "intent.self_correction",
 ]
-AllowedChange = Literal["surface_form_only", "declared_communication_form"]
+AllowedChange = Literal[
+    "surface_form_only",
+    "declared_communication_form",
+    "structured_self_correction",
+]
 
 
 class DatasetAugmentationOperator(ULModel):
@@ -45,7 +52,10 @@ class DatasetAugmentationOperator(ULModel):
 
     @model_validator(mode="after")
     def validate_change_contract(self) -> Self:
-        requires_target = self.allowed_change == "declared_communication_form"
+        requires_target = self.allowed_change in {
+            "declared_communication_form",
+            "structured_self_correction",
+        }
         if requires_target != (self.target_communication_kind is not None):
             raise ValueError("target communication kind must match the allowed change")
         if self.target_marker_required and self.target_communication_kind is None:
@@ -144,6 +154,22 @@ _BUILTIN_OPERATORS = (
         target_marker_required=True,
         human_review_required=True,
     ),
+    DatasetAugmentationOperator(
+        id="intent.self_correction",
+        instruction=(
+            "Add one natural inline false start for the specified argument: first write one "
+            "plausible temporary value, then immediately and explicitly correct it to the exact "
+            "original value. Write like a real person typing normally, not a polished benchmark "
+            "template. For example only, 'transfer 120$ to alice' could become 'transfer 100$, "
+            "sorry 120$ to alice'. Never copy the example. The original value must be the final "
+            "active value. Preserve every other request, fact, value, constraint, identifier, "
+            "relationship, and request order. Add no other context or correction."
+        ),
+        allowed_change="structured_self_correction",
+        target_communication_kind="self_correction",
+        target_marker_required=True,
+        human_review_required=True,
+    ),
 )
 _BUILTIN_OPERATORS_BY_ID = {operator.id: operator for operator in _BUILTIN_OPERATORS}
 
@@ -222,10 +248,38 @@ class DatasetAugmentationEngine:
                 continue
             generated_inputs: set[str] = set()
             for operator in selected_operators:
+                selected_correction_factor: SemanticFactor | None = None
+                planned_provisional_quote: str | None = None
+                if operator.allowed_change == "structured_self_correction":
+                    selected_correction_factor = _select_self_correction_factor(
+                        record, source_frame
+                    )
+                    if selected_correction_factor is None:
+                        continue
+                    planned_provisional_quote = _planned_provisional_quote(
+                        selected_correction_factor, record.raw_input
+                    )
+                    if planned_provisional_quote is None:
+                        continue
                 if operator.id == "surface.typing_noise":
                     rendered_input = _add_typing_noise(record, expected_input_frame, operator)
                 elif operator.id == "surface.disfluency_repeat":
                     rendered_input = _add_word_repetition(record, expected_input_frame, operator)
+                elif operator.allowed_change == "structured_self_correction":
+                    if selected_correction_factor is None:
+                        raise AssertionError("self-correction requires a selected factor")
+                    correction_quote = _unique_input_quote(selected_correction_factor)
+                    if correction_quote is None:
+                        raise AssertionError("selected correction factor requires a unique quote")
+                    rendered_input = await self._renderer.render(
+                        record.raw_input,
+                        f"{operator.instruction} The specified argument is the exact source text "
+                        f"{json.dumps(correction_quote, ensure_ascii=False)}. Use the exact "
+                        "temporary text "
+                        f"{json.dumps(planned_provisional_quote, ensure_ascii=False)} "
+                        "before it.",
+                        allow_temporary_value=True,
+                    )
                 else:
                     rendered_input = await self._renderer.render(
                         record.raw_input, operator.instruction
@@ -251,6 +305,21 @@ class DatasetAugmentationEngine:
                         failure_reasons = list(
                             _semantic_difference_reasons(expected_input_frame, reparsed_frame)
                         )
+                    elif operator.allowed_change == "structured_self_correction":
+                        if selected_correction_factor is None:
+                            raise AssertionError("self-correction requires a selected factor")
+                        if planned_provisional_quote is None:
+                            raise AssertionError("self-correction requires a provisional value")
+                        failure_reasons = list(
+                            _structured_self_correction_difference_reasons(
+                                expected_input_frame,
+                                reparsed_frame,
+                                selected_correction_factor,
+                                planned_provisional_quote,
+                                record.raw_input,
+                                augmented_input,
+                            )
+                        )
                     else:
                         failure_reasons = list(
                             _declared_communication_form_difference_reasons(
@@ -266,6 +335,7 @@ class DatasetAugmentationEngine:
                         )
                     if (
                         self._equivalence_verifier is not None
+                        and operator.allowed_change != "structured_self_correction"
                         and failure_reasons
                         and all(
                             reason.endswith("differ from the expected frame")
@@ -428,6 +498,259 @@ def _declared_communication_form_difference_reasons(
             return ()
         candidate_differences.append(differences)
     return min(candidate_differences, key=len)
+
+
+_SELF_CORRECTION_FACTOR_KINDS = ("money", "number", "date_time", "duration")
+
+
+def _select_self_correction_factor(
+    record: InteractionRecord, frame: SemanticFrame
+) -> SemanticFactor | None:
+    if any(act.kind == "self_correction" for act in frame.communication_acts) or any(
+        relation.kind == "superseded_by" for relation in frame.relations
+    ):
+        return None
+    action_outcomes_by_request_id = {
+        request_id: tuple(
+            outcome
+            for outcome in frame.outcomes
+            if outcome.kind == "action"
+            and outcome.status == "observed"
+            and request_id in outcome.request_unit_ids
+        )
+        for request_id in (request.id for request in frame.request_units)
+    }
+    action_requests_by_factor_id = {
+        factor.id: tuple(
+            request
+            for request in frame.request_units
+            if request.mode == "act"
+            and action_outcomes_by_request_id[request.id]
+            and factor.id in request.factor_ids
+        )
+        for factor in frame.factors
+    }
+    eligible_factors = tuple(
+        factor
+        for factor in frame.factors
+        if len(action_requests_by_factor_id[factor.id]) == 1
+        and factor.kind in _SELF_CORRECTION_FACTOR_KINDS
+        and factor.status in {"explicit", "observed"}
+        and _is_self_correction_value(factor.value)
+        and any(
+            _json_key(outcome.fields.get(factor.role)) == _json_key(factor.value)
+            for outcome in action_outcomes_by_request_id[
+                action_requests_by_factor_id[factor.id][0].id
+            ]
+        )
+        and (quote := _unique_input_quote(factor)) is not None
+        and record.raw_input.count(quote) == 1
+    )
+    if not eligible_factors:
+        return None
+    factor_kind_priority = {
+        kind: priority for priority, kind in enumerate(_SELF_CORRECTION_FACTOR_KINDS)
+    }
+    return min(
+        eligible_factors,
+        key=lambda factor: (factor_kind_priority[factor.kind], frame.factors.index(factor)),
+    )
+
+
+def _is_self_correction_value(value: JsonValue) -> bool:
+    return isinstance(value, (str, int, float)) and not isinstance(value, bool)
+
+
+def _unique_input_quote(factor: SemanticFactor) -> str | None:
+    quotes = tuple(
+        dict.fromkeys(
+            evidence.text_quote
+            for evidence in factor.evidence
+            if evidence.source == "input" and evidence.text_quote is not None
+        )
+    )
+    if len(quotes) != 1:
+        return None
+    return quotes[0]
+
+
+def _planned_provisional_quote(factor: SemanticFactor, source_input: str) -> str | None:
+    source_quote = _unique_input_quote(factor)
+    if source_quote is None:
+        return None
+    match = re.search(r"(?<![\w.])(?P<number>\d+(?:\.\d+)?)(?![\w.])", source_quote)
+    if match is None:
+        return None
+    source_number_text = match.group("number")
+    if len(source_number_text) > 64:
+        return None
+    source_number = Decimal(source_number_text)
+    if source_number != source_number.to_integral_value():
+        provisional_number = source_number + 1
+    else:
+        integer_value = int(source_number)
+        if integer_value < 10:
+            provisional_number = Decimal(integer_value + 2)
+        elif integer_value < 100:
+            provisional_number = Decimal(integer_value - 1)
+        else:
+            provisional_number = Decimal(integer_value + 10 ** (len(str(integer_value)) - 2))
+    provisional_text = (
+        str(int(provisional_number))
+        if provisional_number == provisional_number.to_integral_value()
+        else format(provisional_number, "f").rstrip("0").rstrip(".")
+    )
+    provisional_quote = (
+        f"{source_quote[: match.start()]}{provisional_text}{source_quote[match.end() :]}"
+    )
+    if provisional_quote in source_input or source_quote in provisional_quote:
+        return None
+    return provisional_quote
+
+
+def _structured_self_correction_difference_reasons(
+    expected: SemanticFrame,
+    reparsed: SemanticFrame,
+    selected_source_factor: SemanticFactor,
+    planned_provisional_quote: str,
+    source_input: str,
+    augmented_input: str,
+) -> tuple[str, ...]:
+    correction_acts = tuple(
+        act for act in reparsed.communication_acts if act.kind == "self_correction"
+    )
+    correction_relations = tuple(
+        relation for relation in reparsed.relations if relation.kind == "superseded_by"
+    )
+    if len(correction_acts) != 1:
+        return ("reparsed frame must contain exactly one self-correction act",)
+    if len(correction_relations) != 1:
+        return ("reparsed frame must contain exactly one superseded-by relation",)
+    correction_act = correction_acts[0]
+    correction_relation = correction_relations[0]
+    if correction_act.attributes:
+        return ("self-correction act cannot contain attributes",)
+    if len(correction_act.factor_ids) != 2:
+        return ("self-correction act must reference provisional and final factors",)
+    provisional_factor_id, final_factor_id = correction_act.factor_ids
+    if correction_relation.source_ids != (
+        provisional_factor_id,
+    ) or correction_relation.target_ids != (final_factor_id,):
+        return ("superseded-by relation must connect provisional to final factor",)
+    factors_by_id = {factor.id: factor for factor in reparsed.factors}
+    provisional_factor = factors_by_id.get(provisional_factor_id)
+    final_factor = factors_by_id.get(final_factor_id)
+    if provisional_factor is None or final_factor is None:
+        return ("self-correction references an unknown factor",)
+    if provisional_factor.status != "superseded":
+        return ("provisional factor must be marked superseded",)
+    if any(provisional_factor_id in request.factor_ids for request in reparsed.request_units):
+        return ("request units must reference only the final correction factor",)
+    if provisional_factor.kind != final_factor.kind or provisional_factor.role != final_factor.role:
+        return ("provisional and final factors must have the same kind and role",)
+    if _json_key(provisional_factor.value) == _json_key(final_factor.value):
+        return ("provisional and final factors must have different values",)
+    provisional_quote = _unique_input_quote(provisional_factor)
+    final_quote = _unique_input_quote(final_factor)
+    selected_source_quote = _unique_input_quote(selected_source_factor)
+    if provisional_quote is None or final_quote is None or selected_source_quote is None:
+        return ("provisional and final factors require one direct input quote",)
+    if provisional_quote != planned_provisional_quote:
+        return ("provisional correction must match the planned temporary value",)
+    if not all(
+        _factor_value_is_supported_by_quote(factor, quote)
+        for factor, quote in (
+            (provisional_factor, provisional_quote),
+            (final_factor, final_quote),
+            (selected_source_factor, selected_source_quote),
+        )
+    ):
+        return ("correction factor values must be supported by their exact text",)
+    if final_quote != selected_source_quote:
+        return ("final correction must retain the exact selected source text",)
+    if (final_factor.kind, final_factor.role) != (
+        selected_source_factor.kind,
+        selected_source_factor.role,
+    ):
+        return ("final correction factor must preserve the selected source kind and role",)
+    if _json_key(final_factor.value) != _json_key(selected_source_factor.value):
+        return ("final correction factor must preserve the selected source value",)
+    expected_factor_semantics = {
+        (factor.kind, factor.role, _json_key(factor.value)) for factor in expected.factors
+    }
+    provisional_semantics = (
+        provisional_factor.kind,
+        provisional_factor.role,
+        _json_key(provisional_factor.value),
+    )
+    if provisional_semantics in expected_factor_semantics:
+        return ("provisional value cannot be an active source value",)
+    if any(
+        provisional_factor_id in (*relation.source_ids, *relation.target_ids)
+        for relation in reparsed.relations
+        if relation.id != correction_relation.id
+    ) or any(
+        provisional_factor_id in act.factor_ids
+        for act in reparsed.communication_acts
+        if act.id != correction_act.id
+    ):
+        return ("provisional factor can only appear in correction artifacts",)
+    artifact_elements = (provisional_factor, correction_act, correction_relation)
+    if any(not _has_input_evidence(element) for element in artifact_elements):
+        return ("self-correction artifacts require direct input evidence",)
+    if provisional_quote in source_input:
+        return ("provisional value must be new to the augmented input",)
+    if augmented_input.count(provisional_quote) != 1 or augmented_input.count(final_quote) != 1:
+        return ("provisional and final values must each appear exactly once",)
+    if augmented_input.index(provisional_quote) >= augmented_input.index(final_quote):
+        return ("provisional value must appear before the final value",)
+    between_values = augmented_input[
+        augmented_input.index(provisional_quote) + len(provisional_quote) : augmented_input.index(
+            final_quote
+        )
+    ]
+    if not any(character.isalpha() for character in between_values):
+        return ("correction language must appear between provisional and final values",)
+    if not all(
+        _element_evidence_spans_values(element, provisional_quote, final_quote)
+        for element in (correction_act, correction_relation)
+    ):
+        return ("correction act and relation evidence must span both values in order",)
+    stripped_frame = reparsed.model_copy(
+        update={
+            "factors": tuple(
+                factor for factor in reparsed.factors if factor.id != provisional_factor_id
+            ),
+            "relations": tuple(
+                relation for relation in reparsed.relations if relation.id != correction_relation.id
+            ),
+            "communication_acts": tuple(
+                act for act in reparsed.communication_acts if act.id != correction_act.id
+            ),
+        }
+    )
+    return _semantic_difference_reasons(expected, stripped_frame)
+
+
+def _element_evidence_spans_values(element: Any, provisional_quote: str, final_quote: str) -> bool:
+    return any(
+        evidence.source == "input"
+        and evidence.text_quote is not None
+        and provisional_quote in evidence.text_quote
+        and final_quote in evidence.text_quote
+        and evidence.text_quote.index(provisional_quote) < evidence.text_quote.index(final_quote)
+        for evidence in element.evidence
+    )
+
+
+def _factor_value_is_supported_by_quote(factor: SemanticFactor, quote: str) -> bool:
+    if not isinstance(factor.value, (str, int, float)) or isinstance(factor.value, bool):
+        return False
+    normalized_value = "".join(
+        character for character in str(factor.value).casefold() if character.isalnum()
+    )
+    normalized_quote = "".join(character for character in quote.casefold() if character.isalnum())
+    return bool(normalized_value) and normalized_value == normalized_quote
 
 
 def _surface_footprint_reasons(
