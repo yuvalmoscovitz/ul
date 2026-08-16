@@ -89,6 +89,7 @@ async def test_posts_input_to_real_json_endpoint_and_preserves_response(
         async with JsonHttpDatasetTarget(
             endpoint,
             sandbox_confirmed=True,
+            fresh_state_confirmed=True,
             request_field="query",
             header_environment_variables={
                 "Authorization": "TEST_AGENT_AUTHORIZATION",
@@ -104,6 +105,7 @@ async def test_posts_input_to_real_json_endpoint_and_preserves_response(
         "actions": [{"action": "transfer", "amount": 100, "recipient": "Alice"}]
     }
     assert output.metadata == {}
+    assert target.fresh_state_per_execution is True
     assert target.safety_envelope.isolated is True
     assert target.safety_envelope.allows_network_egress is True
     assert target.safety_envelope.allows_business_side_effects is False
@@ -128,19 +130,56 @@ async def test_rejects_unsafe_endpoints(
         JsonHttpDatasetTarget(
             endpoint,
             sandbox_confirmed=True,
+            fresh_state_confirmed=True,
             allow_insecure_http=allow_insecure_http,
         )
 
 
 async def test_requires_explicit_sandbox_confirmation() -> None:
     with pytest.raises(ValueError, match="explicit sandbox confirmation"):
-        JsonHttpDatasetTarget("https://example.com/run", sandbox_confirmed=False)
+        JsonHttpDatasetTarget(
+            "https://example.com/run",
+            sandbox_confirmed=False,
+            fresh_state_confirmed=True,
+        )
 
     invalid_confirmation: Any = "true"
     with pytest.raises(ValueError, match="explicit sandbox confirmation"):
         validate_json_http_dataset_target_configuration(
             "https://example.com/run",
             sandbox_confirmed=invalid_confirmation,
+            fresh_state_confirmed=True,
+        )
+
+
+async def test_requires_explicit_fresh_state_confirmation() -> None:
+    with pytest.raises(ValueError, match="explicit fresh-state confirmation"):
+        JsonHttpDatasetTarget(
+            "https://example.com/run",
+            sandbox_confirmed=True,
+            fresh_state_confirmed=False,
+        )
+
+    invalid_confirmation: Any = "true"
+    with pytest.raises(ValueError, match="explicit fresh-state confirmation"):
+        validate_json_http_dataset_target_configuration(
+            "https://example.com/run",
+            sandbox_confirmed=True,
+            fresh_state_confirmed=invalid_confirmation,
+        )
+
+
+async def test_fresh_state_confirmation_is_required() -> None:
+    with pytest.raises(TypeError, match="fresh_state_confirmed"):
+        JsonHttpDatasetTarget(  # type: ignore[call-arg]
+            "https://example.com/run",
+            sandbox_confirmed=True,
+        )
+
+    with pytest.raises(TypeError, match="fresh_state_confirmed"):
+        validate_json_http_dataset_target_configuration(  # type: ignore[call-arg]
+            "https://example.com/run",
+            sandbox_confirmed=True,
         )
 
 
@@ -152,6 +191,7 @@ async def test_public_configuration_validation_resolves_headers_without_network(
     headers = validate_json_http_dataset_target_configuration(
         "https://example.com/run",
         sandbox_confirmed=True,
+        fresh_state_confirmed=True,
         request_field="query",
         header_environment_variables={"Authorization": "TEST_AGENT_TOKEN"},
     )
@@ -174,6 +214,7 @@ async def test_target_stores_headers_resolved_during_configuration(
         target = JsonHttpDatasetTarget(
             "https://example.com/run",
             sandbox_confirmed=True,
+            fresh_state_confirmed=True,
             header_environment_variables={"Authorization": "TEST_AGENT_TOKEN"},
             client=client,
         )
@@ -192,6 +233,7 @@ async def test_rejects_non_simple_request_fields(request_field: str) -> None:
         JsonHttpDatasetTarget(
             "https://example.com/run",
             sandbox_confirmed=True,
+            fresh_state_confirmed=True,
             request_field=request_field,
         )
 
@@ -212,6 +254,7 @@ async def test_rejects_unsafe_header_configuration(headers: dict[str, str]) -> N
         JsonHttpDatasetTarget(
             "https://example.com/run",
             sandbox_confirmed=True,
+            fresh_state_confirmed=True,
             header_environment_variables=headers,
         )
 
@@ -237,6 +280,7 @@ async def test_invalid_header_environment_variable_fails_during_configuration(
             JsonHttpDatasetTarget(
                 "https://example.com/run",
                 sandbox_confirmed=True,
+                fresh_state_confirmed=True,
                 header_environment_variables={"Authorization": "TEST_AGENT_TOKEN"},
                 client=client,
             )
@@ -277,6 +321,7 @@ async def test_rejects_unsafe_or_invalid_responses(
         target = JsonHttpDatasetTarget(
             "https://example.com/run",
             sandbox_confirmed=True,
+            fresh_state_confirmed=True,
             client=client,
         )
         with pytest.raises(RuntimeError, match=message) as error:
@@ -291,6 +336,7 @@ async def test_enforces_streamed_response_size_limit() -> None:
         target = JsonHttpDatasetTarget(
             "https://example.com/run",
             sandbox_confirmed=True,
+            fresh_state_confirmed=True,
             max_response_bytes=10,
             client=client,
         )
@@ -322,6 +368,7 @@ async def test_rejects_content_encoding_before_reading_response() -> None:
         target = JsonHttpDatasetTarget(
             "https://example.com/run",
             sandbox_confirmed=True,
+            fresh_state_confirmed=True,
             client=client,
         )
         with pytest.raises(RuntimeError, match="content encoding"):
@@ -343,6 +390,7 @@ async def test_rejects_duplicate_json_keys_at_every_depth(response_body: bytes) 
         target = JsonHttpDatasetTarget(
             "https://example.com/run",
             sandbox_confirmed=True,
+            fresh_state_confirmed=True,
             client=client,
         )
         with pytest.raises(RuntimeError, match="invalid JSON") as error:
@@ -359,6 +407,7 @@ async def test_deeply_nested_json_fails_with_a_sanitized_error() -> None:
         target = JsonHttpDatasetTarget(
             "https://example.com/run",
             sandbox_confirmed=True,
+            fresh_state_confirmed=True,
             client=client,
         )
         with pytest.raises(RuntimeError, match="invalid JSON"):
@@ -381,6 +430,7 @@ async def test_total_timeout_stops_a_slow_drip_response() -> None:
         target = JsonHttpDatasetTarget(
             "https://example.com/run",
             sandbox_confirmed=True,
+            fresh_state_confirmed=True,
             timeout_seconds=0.05,
             client=client,
         )
@@ -406,6 +456,7 @@ async def test_caller_cancellation_is_not_converted_to_a_target_error() -> None:
         target = JsonHttpDatasetTarget(
             "https://example.com/run",
             sandbox_confirmed=True,
+            fresh_state_confirmed=True,
             timeout_seconds=10,
             client=client,
         )
@@ -424,6 +475,7 @@ async def test_transport_errors_do_not_expose_endpoint_or_input() -> None:
         target = JsonHttpDatasetTarget(
             "https://example.com/private-path",
             sandbox_confirmed=True,
+            fresh_state_confirmed=True,
             client=client,
         )
         with pytest.raises(RuntimeError, match="request failed") as error:
@@ -444,6 +496,7 @@ async def test_does_not_retry_failed_action_request() -> None:
         target = JsonHttpDatasetTarget(
             "https://example.com/run",
             sandbox_confirmed=True,
+            fresh_state_confirmed=True,
             client=client,
         )
         with pytest.raises(RuntimeError, match="non-success"):

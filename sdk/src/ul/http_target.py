@@ -40,6 +40,7 @@ class JsonHttpDatasetTarget:
         endpoint: str,
         *,
         sandbox_confirmed: bool,
+        fresh_state_confirmed: bool,
         request_field: str = "input",
         header_environment_variables: Mapping[str, str] | None = None,
         allow_insecure_http: bool = False,
@@ -50,6 +51,7 @@ class JsonHttpDatasetTarget:
         self._headers = validate_json_http_dataset_target_configuration(
             endpoint,
             sandbox_confirmed=sandbox_confirmed,
+            fresh_state_confirmed=fresh_state_confirmed,
             request_field=request_field,
             header_environment_variables=header_environment_variables,
             allow_insecure_http=allow_insecure_http,
@@ -63,11 +65,15 @@ class JsonHttpDatasetTarget:
         self._owns_client = client is None
         self._client = client or httpx.AsyncClient(follow_redirects=False, trust_env=False)
         self.safety_envelope = SafetyEnvelope(
-            description="Customer-confirmed isolated JSON HTTP sandbox.",
+            description="Customer-confirmed isolated, fresh-state JSON HTTP sandbox.",
             isolated=True,
             allows_network_egress=True,
             allows_business_side_effects=False,
         )
+
+    @property
+    def fresh_state_per_execution(self) -> bool:
+        return True
 
     async def __aenter__(self) -> JsonHttpDatasetTarget:
         return self
@@ -132,6 +138,7 @@ def validate_json_http_dataset_target_configuration(
     endpoint: str,
     *,
     sandbox_confirmed: bool,
+    fresh_state_confirmed: bool,
     request_field: str = "input",
     header_environment_variables: Mapping[str, str] | None = None,
     allow_insecure_http: bool = False,
@@ -140,6 +147,8 @@ def validate_json_http_dataset_target_configuration(
 ) -> dict[str, str]:
     if sandbox_confirmed is not True:
         raise ValueError("HTTP dataset targets require explicit sandbox confirmation")
+    if fresh_state_confirmed is not True:
+        raise ValueError("HTTP dataset targets require explicit fresh-state confirmation")
     _validate_endpoint(endpoint, allow_insecure_http)
     if _REQUEST_FIELD_PATTERN.fullmatch(request_field) is None:
         raise ValueError("request_field must be a simple JSON field name")

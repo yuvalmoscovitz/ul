@@ -24,6 +24,7 @@ async def test_source_and_candidate_each_commit_once_for_correct_target() -> Non
     target = AccountsPayableDatasetTarget()
 
     assert isinstance(target, DatasetTargetExecutor)
+    assert target.fresh_state_per_execution is True
     assert target.safety_envelope.isolated
     assert not target.safety_envelope.allows_network_egress
     assert not target.safety_envelope.allows_business_side_effects
@@ -40,6 +41,7 @@ async def test_seeded_intent_fan_out_defect_commits_repeated_imperatives_twice()
     target = SeededIntentFanOutDefectAccountsPayableDatasetTarget()
 
     assert isinstance(target, DatasetTargetExecutor)
+    assert target.fresh_state_per_execution is True
     assert target.safety_envelope.isolated
 
     source_output = await target.execute(SOURCE_INPUT)

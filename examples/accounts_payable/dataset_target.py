@@ -21,6 +21,7 @@ _SAFETY_ENVELOPE = SafetyEnvelope(
 
 class AccountsPayableDatasetTarget:
     safety_envelope = _SAFETY_ENVELOPE
+    fresh_state_per_execution = True
 
     async def execute(self, raw_input: str) -> ObservedAgentOutput:
         _payment_imperative_count(raw_input)
@@ -29,6 +30,7 @@ class AccountsPayableDatasetTarget:
 
 class SeededIntentFanOutDefectAccountsPayableDatasetTarget:
     safety_envelope = _SAFETY_ENVELOPE
+    fresh_state_per_execution = True
 
     async def execute(self, raw_input: str) -> ObservedAgentOutput:
         return _execute_payments(_payment_imperative_count(raw_input))

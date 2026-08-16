@@ -14,6 +14,7 @@ from rich.console import Console
 from rich.table import Table
 from ul import (
     DatasetAugmentationEngine,
+    DatasetEvaluationFinding,
     DatasetEvaluationResult,
     DatasetEvaluationRunner,
     InteractionRecord,
@@ -38,8 +39,13 @@ _DATASET_OPERATOR_IDS = tuple(operator.id for operator in builtin_dataset_augmen
 _CUSTOMER_STATUSES = {
     "augmentation_rejected": "VARIATION DISCARDED",
     "inconclusive": "COULDN'T DETERMINE",
-    "no_divergence": "NO DIFFERENCE",
-    "divergence_needs_review": "SUSPECTED FAILURE",
+    "no_divergence": "NO OBSERVED DIFFERENCE",
+    "divergence_needs_review": "DIFFERENCE — REVIEW",
+}
+_BASELINE_STATUSES = {
+    "inconclusive": "COULDN'T DETERMINE",
+    "no_divergence": "LIVE CONTROL MATCHES STORED RUN",
+    "divergence_needs_review": "LIVE CONTROL DIFFERS — REVIEW",
 }
 _FINDING_LABELS = {
     "duplicate_effect": "duplicate action",
@@ -116,6 +122,10 @@ def evaluate_dataset(
         bool,
         typer.Option(help="Confirm the target cannot cause real business effects."),
     ] = False,
+    confirm_fresh_state: Annotated[
+        bool,
+        typer.Option(help="Confirm every target request starts from the same clean state."),
+    ] = False,
     allow_insecure_http: Annotated[
         bool,
         typer.Option(help="Allow an HTTP target. Intended for local sandboxes."),
@@ -131,7 +141,8 @@ def evaluate_dataset(
     UL_DATASET_ALLOW_EXTERNAL_DATA_PROCESSING=true, and OPEN_ROUTER_API_KEY.
 
     Example: ul dataset evaluate interactions.jsonl --target-url https://sandbox/run
-    --allow-target-network --confirm-isolated-sandbox --output results.jsonl
+    --allow-target-network --confirm-isolated-sandbox --confirm-fresh-state
+    --output results.jsonl
     """
     try:
         records = _load_interaction_records(data)
@@ -141,7 +152,7 @@ def evaluate_dataset(
         raise typer.BadParameter(str(error)) from None
 
     selected_records = records[:limit]
-    potential_target_calls = len(selected_records) * len(selected_operators)
+    potential_target_calls = len(selected_records) * (1 + len(selected_operators))
     if potential_target_calls > _MAXIMUM_TARGET_CALLS:
         raise typer.BadParameter(
             f"selection would make {potential_target_calls} target calls; maximum is "
@@ -160,6 +171,11 @@ def evaluate_dataset(
                 "execution requires --confirm-isolated-sandbox",
                 param_hint="--confirm-isolated-sandbox",
             )
+        if not confirm_fresh_state:
+            raise typer.BadParameter(
+                "execution requires --confirm-fresh-state",
+                param_hint="--confirm-fresh-state",
+            )
         if output is None:
             raise typer.BadParameter("execution requires --output", param_hint="--output")
         if output.exists():
@@ -174,6 +190,7 @@ def evaluate_dataset(
             validate_json_http_dataset_target_configuration(
                 target_url,
                 sandbox_confirmed=confirm_isolated_sandbox or dry_run,
+                fresh_state_confirmed=confirm_fresh_state or dry_run,
                 request_field=request_field,
                 header_environment_variables=header_environment_variables,
                 allow_insecure_http=allow_insecure_http,
@@ -204,6 +221,7 @@ def evaluate_dataset(
         target = JsonHttpDatasetTarget(
             target_url,
             sandbox_confirmed=True,
+            fresh_state_confirmed=True,
             request_field=request_field,
             header_environment_variables=header_environment_variables,
             allow_insecure_http=allow_insecure_http,
@@ -233,9 +251,7 @@ def evaluate_dataset(
                 )
             )
             for result in results:
-                has_review_findings |= any(
-                    case.verdict == "divergence_needs_review" for case in result.cases
-                )
+                has_review_findings |= _result_needs_review(result)
     except (TimeoutError, RuntimeError, ValueError, httpx.HTTPError) as error:
         console.print(
             f"Evaluation stopped ({error.__class__.__name__}). "
@@ -404,8 +420,8 @@ def _print_dataset_plan(
     operator_ids: tuple[str, ...],
     target_configured: bool,
 ) -> None:
-    potential_target_calls = selected_count * len(operator_ids)
-    potential_model_calls = selected_count * (1 + 4 * len(operator_ids))
+    potential_target_calls = selected_count * (1 + len(operator_ids))
+    potential_model_calls = selected_count * (2 + 4 * len(operator_ids))
     console.print(f"Dataset valid: {record_count} interaction(s)")
     console.print(f"Selected interactions: {selected_count}")
     console.print(f"Operators: {', '.join(operator_ids)}")
@@ -414,9 +430,11 @@ def _print_dataset_plan(
     console.print(f"Target: {'configured' if target_configured else 'not configured'}")
     console.print(
         "Semantic models receive historical inputs and outputs, generated variations, "
-        "and sandbox target responses on execution."
+        "live control responses, and variation responses on execution."
     )
-    console.print("The target receives only accepted augmented inputs.")
+    console.print(
+        "The target receives each selected original input once, then each accepted variation."
+    )
     console.print("No model or target requests sent.")
 
 
@@ -462,6 +480,14 @@ def _print_dataset_results(
     table.add_column("Finding")
     case_number = 0
     for result in results:
+        case_number += 1
+        table.add_row(
+            str(case_number),
+            "original replay",
+            _BASELINE_STATUSES[result.baseline.verdict],
+            ", ".join(_FINDING_LABELS[finding.category] for finding in result.baseline.findings)
+            or "—",
+        )
         for case in result.cases:
             case_number += 1
             table.add_row(
@@ -474,23 +500,16 @@ def _print_dataset_results(
     console.print(f"Complete evidence: {output}")
 
 
+def _result_needs_review(result: DatasetEvaluationResult) -> bool:
+    return result.baseline.verdict == "divergence_needs_review" or any(
+        case.verdict == "divergence_needs_review" for case in result.cases
+    )
+
+
 def _customer_evidence_record(result: DatasetEvaluationResult) -> dict[str, JsonValue]:
+    baseline_findings = _customer_findings(result.baseline.findings)
     cases: list[JsonValue] = []
     for case in result.cases:
-        findings: list[JsonValue] = []
-        for finding in case.findings:
-            findings.append(
-                {
-                    "category": finding.category,
-                    "summary": finding.message,
-                    "expected_effects": [
-                        effect.model_dump(mode="json") for effect in finding.expected_effects
-                    ],
-                    "observed_effects": [
-                        effect.model_dump(mode="json") for effect in finding.observed_effects
-                    ],
-                }
-            )
         cases.append(
             {
                 "operator_id": case.candidate.operator_id,
@@ -499,14 +518,37 @@ def _customer_evidence_record(result: DatasetEvaluationResult) -> dict[str, Json
                 "status": _CUSTOMER_STATUSES[case.verdict],
                 "variation_accepted": case.candidate.passed,
                 "variation_rejection_reasons": list(case.candidate.failure_reasons),
-                "findings": findings,
+                "findings": _customer_findings(case.findings),
                 "inconclusive_reasons": list(case.inconclusive_reasons),
             }
         )
     return {
-        "schema_version": "1.0.0",
+        "schema_version": "1.1.0",
         "interaction_id": result.source.id,
         "original_input": result.source.raw_input,
+        "current_baseline": {
+            "status": _BASELINE_STATUSES[result.baseline.verdict],
+            "findings": baseline_findings,
+            "inconclusive_reasons": list(result.baseline.inconclusive_reasons),
+        },
         "cases": cases,
         "technical_details": cast(JsonValue, result.model_dump(mode="json")),
     }
+
+
+def _customer_findings(
+    findings: tuple[DatasetEvaluationFinding, ...],
+) -> list[JsonValue]:
+    return [
+        {
+            "category": finding.category,
+            "summary": finding.message,
+            "expected_effects": [
+                effect.model_dump(mode="json") for effect in finding.expected_effects
+            ],
+            "observed_effects": [
+                effect.model_dump(mode="json") for effect in finding.observed_effects
+            ],
+        }
+        for finding in findings
+    ]

@@ -1,6 +1,7 @@
 from ul import (
     DatasetAugmentationEngine,
     DatasetAugmentationOperator,
+    DatasetEvaluationBaseline,
     DatasetEvaluationFinding,
     DatasetEvaluationRunner,
     DatasetTargetExecutor,
@@ -66,6 +67,7 @@ def test_sdk_exposes_dataset_augmentation_api() -> None:
     assert record.raw_observed_output == {"action": "visit_booked"}
     assert DatasetAugmentationEngine is not None
     assert DatasetAugmentationOperator.__name__ == "DatasetAugmentationOperator"
+    assert DatasetEvaluationBaseline.__name__ == "DatasetEvaluationBaseline"
     assert DatasetEvaluationFinding.__name__ == "DatasetEvaluationFinding"
     assert DatasetEvaluationRunner.__name__ == "DatasetEvaluationRunner"
     assert DatasetTargetExecutor.__name__ == "DatasetTargetExecutor"

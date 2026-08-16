@@ -7,6 +7,7 @@ import pytest
 from pydantic import JsonValue, ValidationError
 from ul.dataset_augmentation import DatasetAugmentationEngine
 from ul.dataset_evaluation import (
+    DatasetEvaluationBaseline,
     DatasetEvaluationCase,
     DatasetEvaluationFinding,
     DatasetEvaluationResult,
@@ -172,9 +173,14 @@ def _raw_output_for_actions(outcomes: tuple[ObservedOutcome, ...]) -> JsonValue:
 
 
 class DeterministicSemanticPipeline:
-    def __init__(self, observed_outcomes: tuple[ObservedOutcome, ...]) -> None:
+    def __init__(
+        self,
+        observed_outcomes: tuple[ObservedOutcome, ...],
+        baseline_outcomes: tuple[ObservedOutcome, ...] | None = None,
+    ) -> None:
         self.source_frame = _frame("source", _source_outcomes())
         self.observed_outcomes = observed_outcomes
+        self.baseline_outcomes = baseline_outcomes
         self.references: list[SemanticFrame | None] = []
         self.observed_records: list[InteractionRecord] = []
 
@@ -188,7 +194,12 @@ class DeterministicSemanticPipeline:
             return self.source_frame
         if isinstance(record, InteractionRecord):
             self.observed_records.append(record)
-            return _frame(record.id, self.observed_outcomes)
+            outcomes = (
+                self.baseline_outcomes or self.source_frame.outcomes
+                if record.id.endswith(":current_baseline")
+                else self.observed_outcomes
+            )
+            return _frame(record.id, outcomes)
         return _frame(record.id, ())
 
     async def render(self, raw_input: str, instruction: str) -> RenderedUserInput:
@@ -216,7 +227,10 @@ class DeterministicTarget:
         self,
         safety_envelope: SafetyEnvelope | None = None,
         raw_output: JsonValue | None = None,
+        baseline_raw_output: JsonValue | None = None,
+        fresh_state_per_execution: bool = True,
     ) -> None:
+        self.fresh_state_per_execution = fresh_state_per_execution
         self.safety_envelope = safety_envelope or SafetyEnvelope(
             description="Isolated deterministic test target.",
             isolated=True,
@@ -229,11 +243,14 @@ class DeterministicTarget:
             if raw_output is not None
             else _raw_output_for_actions((_source_outcomes()[0],))
         )
+        self.baseline_raw_output = baseline_raw_output or _raw_output_for_actions(
+            (_source_outcomes()[0],)
+        )
 
     async def execute(self, raw_input: str) -> ObservedAgentOutput:
         self.raw_inputs.append(raw_input)
         return ObservedAgentOutput(
-            raw_output=self.raw_output,
+            raw_output=(self.baseline_raw_output if len(self.raw_inputs) == 1 else self.raw_output),
             metadata={"run_id": "run-1"},
         )
 
@@ -243,6 +260,18 @@ class BlockingTarget(DeterministicTarget):
         self.raw_inputs.append(raw_input)
         await asyncio.Event().wait()
         raise AssertionError("blocking target returned")
+
+
+class FailingTarget(DeterministicTarget):
+    def __init__(self, fail_on_execution: int) -> None:
+        super().__init__()
+        self.fail_on_execution = fail_on_execution
+
+    async def execute(self, raw_input: str) -> ObservedAgentOutput:
+        if len(self.raw_inputs) + 1 == self.fail_on_execution:
+            self.raw_inputs.append(raw_input)
+            raise RuntimeError("untrusted target failure detail")
+        return await super().execute(raw_input)
 
 
 def _runner(
@@ -297,17 +326,216 @@ async def test_runner_executes_only_accepted_candidates_and_keeps_rejected_candi
     assert rejected.target_output is None
     assert rejected.observed_frame is None
     assert rejected.findings == ()
-    assert target.raw_inputs == ["Please transfer 100 to Alice."]
+    assert target.raw_inputs == ["Transfer 100 to Alice.", "Please transfer 100 to Alice."]
     last_reference = semantic_pipeline.references[-1]
-    assert last_reference == semantic_pipeline.source_frame
+    assert last_reference == result.baseline.observed_frame
     assert last_reference is not None
     assert last_reference.outcomes == _source_outcomes()
-    assert semantic_pipeline.observed_records[0].raw_input == target.raw_inputs[0]
+    assert result.baseline.verdict == "no_divergence"
+    assert semantic_pipeline.observed_records[0].id == "source:current_baseline"
+    assert semantic_pipeline.observed_records[1].raw_input == target.raw_inputs[1]
     assert (
-        semantic_pipeline.observed_records[0].raw_observed_output
+        semantic_pipeline.observed_records[1].raw_observed_output
         == accepted.target_output.raw_output
     )
     assert DatasetEvaluationResult.model_validate_json(result.model_dump_json()) == result
+
+
+async def test_current_baseline_drift_is_not_blame_on_augmentation() -> None:
+    current_outcome = _outcome(
+        "current_transfer",
+        0,
+        fields={"amount": 120, "recipient": "Alice"},
+    )
+    semantic_pipeline = DeterministicSemanticPipeline(
+        (current_outcome,),
+        baseline_outcomes=(current_outcome,),
+    )
+    current_raw_output = _raw_output_for_actions((current_outcome,))
+    target = DeterministicTarget(
+        raw_output=current_raw_output,
+        baseline_raw_output=current_raw_output,
+    )
+    runner = DatasetEvaluationRunner(
+        DatasetAugmentationEngine(semantic_pipeline, semantic_pipeline),
+        semantic_pipeline,
+        target,
+    )
+
+    result = await runner.run(_source())
+
+    assert result.baseline.verdict == "divergence_needs_review"
+    assert result.baseline.findings[0].category == "changed_grounded_effect_argument"
+    assert "current baseline" in result.baseline.findings[0].message
+    assert result.cases[0].verdict == "no_divergence"
+
+
+async def test_candidate_is_compared_with_changed_current_baseline() -> None:
+    baseline_outcome = _outcome(
+        "baseline_transfer",
+        0,
+        fields={"amount": 120, "recipient": "Alice"},
+    )
+    candidate_outcome = _outcome(
+        "candidate_transfer",
+        0,
+        fields={"amount": 130, "recipient": "Alice"},
+    )
+    semantic_pipeline = DeterministicSemanticPipeline(
+        (candidate_outcome,),
+        baseline_outcomes=(baseline_outcome,),
+    )
+    target = DeterministicTarget(
+        raw_output=_raw_output_for_actions((candidate_outcome,)),
+        baseline_raw_output=_raw_output_for_actions((baseline_outcome,)),
+    )
+    runner = DatasetEvaluationRunner(
+        DatasetAugmentationEngine(semantic_pipeline, semantic_pipeline),
+        semantic_pipeline,
+        target,
+    )
+
+    result = await runner.run(_source())
+
+    assert result.baseline.verdict == "divergence_needs_review"
+    assert result.cases[0].verdict == "divergence_needs_review"
+    assert result.cases[0].findings[0].grounded_field_names == ("amount",)
+
+
+async def test_candidate_change_to_new_baseline_action_is_detected() -> None:
+    source_transfer = _source_outcomes()[0]
+    baseline_outcomes = (
+        source_transfer,
+        _outcome(
+            "baseline_email",
+            1,
+            predicate="send_email",
+            fields={"recipient": "Alice"},
+        ),
+    )
+    candidate_outcomes = (
+        source_transfer,
+        _outcome(
+            "candidate_email",
+            1,
+            predicate="send_email",
+            fields={"recipient": "Mallory"},
+        ),
+    )
+    semantic_pipeline = DeterministicSemanticPipeline(
+        candidate_outcomes,
+        baseline_outcomes=baseline_outcomes,
+    )
+    target = DeterministicTarget(
+        raw_output=_raw_output_for_actions(candidate_outcomes),
+        baseline_raw_output=_raw_output_for_actions(baseline_outcomes),
+    )
+    runner = DatasetEvaluationRunner(
+        DatasetAugmentationEngine(semantic_pipeline, semantic_pipeline),
+        semantic_pipeline,
+        target,
+    )
+
+    result = await runner.run(_source())
+
+    assert result.baseline.verdict == "divergence_needs_review"
+    assert result.baseline.findings[0].category == "unexpected_effect"
+    assert result.cases[0].verdict == "divergence_needs_review"
+    assert result.cases[0].findings[0].category == "changed_grounded_effect_argument"
+    assert result.cases[0].findings[0].grounded_field_names == ("recipient",)
+
+
+async def test_derived_field_is_not_grounded_by_another_action_with_the_same_field() -> None:
+    source_outcomes = (
+        _outcome("alice", 0, fields={"amount": 100, "recipient": "Alice"}),
+        _outcome("bob", 1, fields={"amount": 500, "recipient": "Bob"}),
+    )
+    live_outcomes = (
+        _outcome("live_alice", 0, fields={"amount": 100, "recipient": "Alice"}),
+        _outcome("live_bob", 1, fields={"amount": 600, "recipient": "Bob"}),
+    )
+    semantic_pipeline = DeterministicSemanticPipeline(
+        live_outcomes,
+        baseline_outcomes=live_outcomes,
+    )
+    semantic_pipeline.source_frame = _frame("source", source_outcomes)
+    target = DeterministicTarget(
+        raw_output=_raw_output_for_actions(live_outcomes),
+        baseline_raw_output=_raw_output_for_actions(live_outcomes),
+    )
+    runner = DatasetEvaluationRunner(
+        DatasetAugmentationEngine(semantic_pipeline, semantic_pipeline),
+        semantic_pipeline,
+        target,
+    )
+    source = InteractionRecord(
+        id="source",
+        raw_input="Transfer 100 to Alice and transfer my current balance to Bob.",
+        raw_observed_output=_raw_output_for_actions(source_outcomes),
+    )
+
+    result = await runner.run(source)
+
+    assert result.baseline.verdict == "no_divergence"
+    assert result.cases[0].verdict == "no_divergence"
+
+
+async def test_ambiguous_repeated_action_grounding_is_inconclusive() -> None:
+    source_outcomes = (
+        _outcome("first", 0, fields={"amount": 100, "recipient": "Alice"}),
+        _outcome("second", 1, fields={"amount": 200, "recipient": "Alice"}),
+    )
+    live_outcomes = (
+        _outcome("live_first", 0, fields={"amount": 120, "recipient": "Alice"}),
+        _outcome("live_second", 1, fields={"amount": 220, "recipient": "Alice"}),
+    )
+    semantic_pipeline = DeterministicSemanticPipeline(
+        live_outcomes,
+        baseline_outcomes=live_outcomes,
+    )
+    semantic_pipeline.source_frame = _frame("source", source_outcomes)
+    target = DeterministicTarget(
+        raw_output=_raw_output_for_actions(live_outcomes),
+        baseline_raw_output=_raw_output_for_actions(live_outcomes),
+    )
+    runner = DatasetEvaluationRunner(
+        DatasetAugmentationEngine(semantic_pipeline, semantic_pipeline),
+        semantic_pipeline,
+        target,
+    )
+    source = InteractionRecord(
+        id="source",
+        raw_input="Transfer 100 and 200 to Alice.",
+        raw_observed_output=_raw_output_for_actions(source_outcomes),
+    )
+
+    result = await runner.run(source)
+
+    assert result.baseline.verdict == "inconclusive"
+    assert result.baseline.inconclusive_reasons == (
+        "action outcome live_first cannot be safely associated with an input-grounded source "
+        "action",
+        "action outcome live_second cannot be safely associated with an input-grounded source "
+        "action",
+    )
+    assert result.cases[0].verdict == "inconclusive"
+    assert target.raw_inputs == [source.raw_input]
+
+
+async def test_one_current_baseline_is_shared_by_all_accepted_candidates() -> None:
+    runner, semantic_pipeline, target = _runner((_source_outcomes()[0],))
+
+    result = await runner.run(
+        _source(),
+        operator_ids=("surface.rephrase", "surface.typing_noise"),
+    )
+
+    assert all(case.candidate.passed for case in result.cases)
+    assert target.raw_inputs[0] == "Transfer 100 to Alice."
+    assert len(target.raw_inputs) == 3
+    assert [record.id for record in semantic_pipeline.observed_records].count(
+        "source:current_baseline"
+    ) == 1
 
 
 async def test_invalid_observed_output_frame_is_retained_as_inconclusive() -> None:
@@ -323,10 +551,14 @@ async def test_invalid_observed_output_frame_is_retained_as_inconclusive() -> No
 
     case = result.cases[0]
     assert case.verdict == "inconclusive"
-    assert case.target_output is not None
+    assert result.baseline.verdict == "inconclusive"
+    assert case.target_output is None
     assert case.observed_frame is None
-    assert case.inconclusive_reasons == ("target output could not be semantically deconstructed",)
-    assert target.raw_inputs == ["Please transfer 100 to Alice."]
+    assert case.inconclusive_reasons == (
+        "current baseline is inconclusive: current baseline output could not be semantically "
+        "deconstructed",
+    )
+    assert target.raw_inputs == ["Transfer 100 to Alice."]
 
 
 async def test_structured_action_object_supports_its_grounded_fields() -> None:
@@ -392,7 +624,7 @@ async def test_fields_from_different_actions_cannot_form_a_composite_effect(
             for pointer in evidence_pointers
         ),
     )
-    raw_output = {
+    raw_output: JsonValue = {
         "outcomes": {
             "0": {"action": "transfer", "amount": 100, "recipient": "Bob"},
             "1": {"action": "transfer", "amount": 200, "recipient": "Alice"},
@@ -525,7 +757,7 @@ async def test_runner_finds_complete_grounded_matching_for_overlapping_effects()
             fields={"amount": 100, "recipient": "Bob"},
         ),
     )
-    runner, semantic_pipeline, _ = _runner(observed_outcomes)
+    runner, semantic_pipeline, target = _runner(observed_outcomes)
     semantic_pipeline.source_frame = _frame(
         "source",
         (
@@ -542,6 +774,7 @@ async def test_runner_finds_complete_grounded_matching_for_overlapping_effects()
             "raw_observed_output": _raw_output_for_actions(semantic_pipeline.source_frame.outcomes)
         }
     )
+    target.baseline_raw_output = source.raw_observed_output
 
     result = await runner.run(source)
 
@@ -621,6 +854,39 @@ async def test_case_model_rejects_inconsistent_execution_and_verdicts() -> None:
                 "message": "Needs review: effect missing.",
             }
         )
+
+    with pytest.raises(ValidationError, match="baseline verdict"):
+        DatasetEvaluationBaseline(
+            verdict="no_divergence",
+            inconclusive_reasons=("target unavailable",),
+        )
+    with pytest.raises(ValidationError, match="baseline findings require"):
+        DatasetEvaluationBaseline(
+            verdict="divergence_needs_review",
+            target_output=ObservedAgentOutput(raw_output={"action": "transfer"}),
+            findings=(
+                DatasetEvaluationFinding(
+                    category="missing_effect",
+                    message="Needs review: effect missing.",
+                ),
+            ),
+        )
+    wrong_baseline_frame = result.baseline.observed_frame
+    assert wrong_baseline_frame is not None
+    with pytest.raises(ValidationError, match="current baseline interaction"):
+        invalid_result = result.model_dump()
+        invalid_result["baseline"]["observed_frame"]["interaction_id"] = "wrong"
+        DatasetEvaluationResult.model_validate(invalid_result)
+    with pytest.raises(ValidationError, match="without a valid baseline"):
+        invalid_result = result.model_dump()
+        invalid_result["baseline"] = {
+            "verdict": "inconclusive",
+            "target_output": None,
+            "observed_frame": None,
+            "findings": (),
+            "inconclusive_reasons": ("target unavailable",),
+        }
+        DatasetEvaluationResult.model_validate(invalid_result)
 
 
 async def test_runner_does_not_execute_without_an_observable_action_baseline() -> None:
@@ -727,13 +993,14 @@ async def test_numeric_formatting_keeps_amount_grounded(
         0,
         fields={"amount": observed_amount, "recipient": "Alice"},
     )
-    runner, semantic_pipeline, _ = _runner((observed_outcome,))
+    runner, semantic_pipeline, target = _runner((observed_outcome,))
     semantic_pipeline.source_frame = _frame("source", (source_outcome,))
     source = InteractionRecord(
         id="source",
         raw_input="Transfer to Alice for $100.50.",
         raw_observed_output=_raw_output_for_actions((source_outcome,)),
     )
+    target.baseline_raw_output = source.raw_observed_output
 
     result = await runner.run(source)
 
@@ -753,14 +1020,17 @@ async def test_numeric_string_outcome_matches_numeric_action_evidence() -> None:
         0,
         fields={"amount": "100", "recipient": "Alice"},
     )
-    raw_output = {"outcomes": {"0": {"action": "transfer", "amount": 100, "recipient": "Alice"}}}
-    runner, semantic_pipeline, _ = _runner((observed_outcome,), raw_output)
+    raw_output: JsonValue = {
+        "outcomes": {"0": {"action": "transfer", "amount": 100, "recipient": "Alice"}}
+    }
+    runner, semantic_pipeline, target = _runner((observed_outcome,), raw_output)
     semantic_pipeline.source_frame = _frame("source", (source_outcome,))
     source = InteractionRecord(
         id="source",
         raw_input="Transfer 100 to Alice.",
         raw_observed_output=raw_output,
     )
+    target.baseline_raw_output = source.raw_observed_output
 
     result = await runner.run(source)
 
@@ -989,6 +1259,14 @@ async def test_runner_requires_isolation_and_independent_effect_opt_ins() -> Non
             business_target,
         )
 
+    stale_state_target = DeterministicTarget(fresh_state_per_execution=False)
+    with pytest.raises(ValueError, match="fresh state for every execution"):
+        DatasetEvaluationRunner(
+            augmentation_engine,
+            semantic_pipeline,
+            stale_state_target,
+        )
+
 
 @pytest.mark.parametrize("target_timeout_seconds", [0, -1, float("inf"), float("nan")])
 async def test_runner_rejects_invalid_target_timeouts(target_timeout_seconds: float) -> None:
@@ -1013,7 +1291,33 @@ async def test_runner_times_out_target_execution() -> None:
         target_timeout_seconds=0.01,
     )
 
-    with pytest.raises(TimeoutError):
-        await runner.run(_source())
+    result = await runner.run(_source())
 
-    assert target.raw_inputs == ["Please transfer 100 to Alice."]
+    assert result.baseline.verdict == "inconclusive"
+    assert result.baseline.inconclusive_reasons == ("current baseline execution timed out",)
+    assert result.cases[0].verdict == "inconclusive"
+    assert result.cases[0].target_output is None
+    assert target.raw_inputs == ["Transfer 100 to Alice."]
+
+
+@pytest.mark.parametrize("fail_on_execution", [1, 2])
+async def test_runner_marks_target_runtime_failures_inconclusive(
+    fail_on_execution: int,
+) -> None:
+    semantic_pipeline = DeterministicSemanticPipeline((_source_outcomes()[0],))
+    target = FailingTarget(fail_on_execution)
+    runner = DatasetEvaluationRunner(
+        DatasetAugmentationEngine(semantic_pipeline, semantic_pipeline),
+        semantic_pipeline,
+        target,
+    )
+
+    result = await runner.run(_source())
+
+    if fail_on_execution == 1:
+        assert result.baseline.inconclusive_reasons == ("current baseline execution failed",)
+    else:
+        assert result.baseline.verdict == "no_divergence"
+    assert result.cases[0].verdict == "inconclusive"
+    assert result.cases[0].target_output is None
+    assert "untrusted target failure detail" not in result.model_dump_json()
