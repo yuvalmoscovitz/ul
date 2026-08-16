@@ -16,6 +16,7 @@ from uuid import uuid4
 import typer
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, ValidationError, model_validator
 from rich.console import Console
+from ul.dataset_invariants import DatasetInvariantEvaluation
 
 if sys.platform == "win32":
     import msvcrt
@@ -117,14 +118,26 @@ class _Case(_StrictModel):
 
 
 class _EvidenceRecord(_StrictModel):
-    schema_version: Literal["1.3.0"]
+    schema_version: Literal["1.3.0", "1.4.0"]
     interaction_id: str
     original_input: str
     execution_plan: _ExecutionPlan
     limitations: str
     current_baseline: _Baseline
     cases: list[_Case]
+    invariant_evaluation: DatasetInvariantEvaluation | None = None
     technical_details: JsonValue
+
+    @model_validator(mode="after")
+    def validate_invariant_evaluation(self) -> Self:
+        if self.schema_version == "1.3.0" and "invariant_evaluation" in self.model_fields_set:
+            raise ValueError("schema 1.3.0 does not include invariant evaluation")
+        if (
+            self.invariant_evaluation is not None
+            and self.invariant_evaluation.interaction_id != self.interaction_id
+        ):
+            raise ValueError("invariant evaluation must match the evidence interaction")
+        return self
 
 
 class ReviewRecord(_StrictModel):
@@ -226,6 +239,17 @@ def report_dataset_evidence(
             )
             _print_plain(f"Review reason: {latest_review.reason}")
         _print_plain(f"Evidence record SHA-256: {loaded_record.sha256}")
+
+    invariant_evaluations = [
+        loaded_record.evidence.invariant_evaluation
+        for loaded_record in evidence_records
+        if loaded_record.evidence.invariant_evaluation is not None
+    ]
+    if invariant_evaluations:
+        _print_plain("")
+        _print_plain("Customer invariant evaluation")
+        for invariant_evaluation in invariant_evaluations:
+            _print_invariant_evaluation(invariant_evaluation)
 
     _print_plain("")
     _print_plain(f"Complete technical evidence: {evidence}")
@@ -350,7 +374,7 @@ def _load_evidence(path: Path) -> list[_LoadedEvidenceRecord]:
                 )
             )
     except (ValidationError, ValueError):
-        raise _ReviewInputError("evidence is not valid UL schema 1.3.0 JSONL") from None
+        raise _ReviewInputError("evidence is not valid UL schema 1.3.0 or 1.4.0 JSONL") from None
     return records
 
 
@@ -564,6 +588,37 @@ def _effects_summary(effects: list[_Effect]) -> str:
         )
         for effect in effects
     )
+
+
+def _print_invariant_evaluation(evaluation: DatasetInvariantEvaluation) -> None:
+    _print_plain(
+        "Selected values remain in the private evidence file; terminal output shows pointers only."
+    )
+    _print_plain(f"Interaction: {evaluation.interaction_id}")
+    _print_plain(f"Declared observation authority: {evaluation.observation_authority}")
+    for arm in (evaluation.baseline, *evaluation.variations):
+        arm_name = "original" if arm.arm == "baseline" else f"variation ({arm.operator_id})"
+        for rule in arm.rules:
+            status_counts = {
+                status: sum(trial.status == status for trial in rule.trials)
+                for status in ("satisfied", "violated", "not_evaluable")
+            }
+            _print_plain(
+                f"Rule {rule.rule_id} ({rule.rule_version}); severity={rule.severity}; "
+                f"arm={arm_name}; status={rule.status}; reason={rule.reason_code}; trials="
+                + ", ".join(f"{status}={count}" for status, count in status_counts.items())
+            )
+            _print_plain(f"Description: {rule.description}")
+            if rule.status == "violated":
+                _print_plain(
+                    f"Customer rule violated against declared {evaluation.observation_authority}."
+                )
+            for trial in rule.trials:
+                _print_plain(
+                    f"Trial {trial.repetition}: {trial.status}; "
+                    f"left={trial.left_pointer}; right={trial.right_pointer}; "
+                    f"reason={trial.reason_code}"
+                )
 
 
 def _print_plain(message: str) -> None:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 import stat
@@ -13,6 +14,11 @@ import pytest
 from pydantic import SecretStr
 from typer.testing import CliRunner
 from ul import DatasetEvaluationResult
+from ul.dataset_invariants import (
+    DatasetInvariantArmEvaluation,
+    DatasetInvariantEvaluation,
+    DatasetInvariantRuleEvaluation,
+)
 from ul_cli import dataset as main
 from ul_cli.main import app as root_app
 
@@ -56,6 +62,92 @@ def _write_target_config(
             }
         ),
         encoding="utf-8",
+    )
+
+
+def _write_invariant_suite(path: Path) -> None:
+    path.write_text(
+        json.dumps(
+            {
+                "schema_version": "1.0.0",
+                "observation_source": "target_output",
+                "observation_authority": "committed_state_snapshot",
+                "rules": [
+                    {
+                        "type": "json_values_equal",
+                        "id": "amount-matches-corrected",
+                        "version": "1.0.0",
+                        "description": "Final amount equals the corrected amount.",
+                        "severity": "high",
+                        "left_pointer": "/final_amount",
+                        "right_pointer": "/corrected_amount",
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
+def _invariant_evaluation(
+    baseline_status: str = "satisfied",
+    variation_status: str | None = None,
+) -> DatasetInvariantEvaluation:
+    def arm_rule(status: str) -> DatasetInvariantRuleEvaluation:
+        if status == "satisfied":
+            trial_reason = "values_equal"
+            aggregate_reason = "all_trials_satisfied"
+            resolved_values = {"left": 100, "right": 100}
+        elif status == "violated":
+            trial_reason = "values_differ"
+            aggregate_reason = "one_or_more_trials_violated"
+            resolved_values = {"left": 200, "right": 100}
+        else:
+            trial_reason = "left_pointer_missing"
+            aggregate_reason = "one_or_more_trials_not_evaluable"
+            resolved_values = {}
+        return DatasetInvariantRuleEvaluation.model_validate(
+            {
+                "rule_type": "json_values_equal",
+                "rule_id": "amount-matches-corrected",
+                "rule_version": "1.0.0",
+                "description": "Final amount equals the corrected amount.",
+                "severity": "high",
+                "status": status,
+                "reason_code": aggregate_reason,
+                "trials": (
+                    {
+                        "repetition": 1,
+                        "status": status,
+                        "reason_code": trial_reason,
+                        "left_pointer": "/final_amount",
+                        "right_pointer": "/corrected_amount",
+                        "resolved_values": resolved_values,
+                    },
+                ),
+            }
+        )
+
+    variations = (
+        ()
+        if variation_status is None
+        else (
+            DatasetInvariantArmEvaluation(
+                arm="variation",
+                operator_id="surface.rephrase",
+                rules=(arm_rule(variation_status),),
+            ),
+        )
+    )
+    return DatasetInvariantEvaluation(
+        interaction_id="case-1",
+        suite_sha256="a" * 64,
+        observation_authority="committed_state_snapshot",
+        baseline=DatasetInvariantArmEvaluation(
+            arm="baseline",
+            rules=(arm_rule(baseline_status),),
+        ),
+        variations=variations,
     )
 
 
@@ -199,6 +291,141 @@ def test_dry_run_validates_and_makes_no_external_calls(
     assert "estimate a production failure rate" in result.output
     assert "No model or target requests sent." in result.output
     assert "Transfer 100" not in result.output
+
+
+def test_invariant_dry_run_reports_rules_authority_and_no_extra_calls(
+    tmp_path: Path,
+) -> None:
+    dataset = tmp_path / "interactions.jsonl"
+    invariant_suite = tmp_path / "invariants.json"
+    _write_dataset(dataset, [_record()])
+    _write_invariant_suite(invariant_suite)
+
+    result = runner.invoke(
+        root_app,
+        [
+            "dataset",
+            "evaluate",
+            str(dataset),
+            "--invariants",
+            str(invariant_suite),
+            "--dry-run",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "Customer invariants: 1 rule(s)" in result.output
+    assert "Declared observation authority: committed_state_snapshot" in result.output
+    assert "Additional model calls for customer invariants: 0" in result.output
+    assert "Additional target calls for customer invariants: 0" in result.output
+    assert "Potential semantic model calls: up to 10" in result.output
+    assert "Potential target calls: up to 6" in result.output
+
+
+def test_invalid_invariant_config_stops_before_settings_network_or_output(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    dataset = tmp_path / "interactions.jsonl"
+    invariant_suite = tmp_path / "invariants.json"
+    output = tmp_path / "evidence.jsonl"
+    _write_dataset(dataset, [_record()])
+    invariant_suite.write_text(
+        '{"schema_version":"1.0.0","observation_source":"target_output",'
+        '"observation_authority":"agent_response","rules":[]}',
+        encoding="utf-8",
+    )
+
+    def unexpected_settings() -> None:
+        raise AssertionError("invalid invariants reached settings")
+
+    monkeypatch.setattr(main, "OpenRouterDatasetSettings", unexpected_settings)
+    result = runner.invoke(
+        root_app,
+        [
+            "dataset",
+            "evaluate",
+            str(dataset),
+            "--invariants",
+            str(invariant_suite),
+            "--output",
+            str(output),
+        ],
+    )
+
+    assert result.exit_code != 0
+    assert "invariant suite is invalid" in result.output
+    assert not output.exists()
+
+
+def test_invariant_evaluation_reuses_results_without_extra_runner_calls(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    invariant_path = tmp_path / "invariants.json"
+    _write_invariant_suite(invariant_path)
+    suite = main.load_dataset_invariant_suite(invariant_path)
+    runner_calls = 0
+    invariant_calls = 0
+    stored_evaluations: list[DatasetInvariantEvaluation] = []
+
+    class AsyncContext:
+        async def __aenter__(self) -> object:
+            return self
+
+        async def __aexit__(self, *args: object) -> None:
+            pass
+
+    class FakeRunner:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            pass
+
+        async def run(self, *args: object, **kwargs: object) -> DatasetEvaluationResult:
+            nonlocal runner_calls
+            runner_calls += 1
+            return cast(DatasetEvaluationResult, SimpleNamespace())
+
+    evaluation = _invariant_evaluation("satisfied", "violated")
+
+    def evaluate_once(*args: object) -> DatasetInvariantEvaluation:
+        nonlocal invariant_calls
+        invariant_calls += 1
+        return evaluation
+
+    monkeypatch.setattr(main, "OpenRouterSemanticDeconstructor", lambda settings: AsyncContext())
+    monkeypatch.setattr(main, "DatasetAugmentationEngine", lambda *args: object())
+    monkeypatch.setattr(main, "DatasetEvaluationRunner", FakeRunner)
+    monkeypatch.setattr(main, "evaluate_dataset_invariants", evaluate_once)
+    monkeypatch.setattr(
+        main,
+        "_customer_evidence_record",
+        lambda result, **options: {
+            "schema_version": "1.4.0",
+            "invariant_evaluation": options["invariant_evaluation"].model_dump(mode="json"),
+        },
+    )
+    output = tmp_path / "evidence.jsonl"
+    with output.open("w", encoding="utf-8") as output_stream:
+        results = asyncio.run(
+            main._evaluate_interaction_records(
+                (cast(Any, SimpleNamespace()),),
+                ("surface.rephrase",),
+                cast(Any, SimpleNamespace()),
+                cast(Any, AsyncContext()),
+                output_stream,
+                repetitions=1,
+                max_target_calls=2,
+                planned_target_calls=2,
+                invariant_suite=suite,
+                invariant_evaluations=stored_evaluations,
+            )
+        )
+
+    assert len(results) == 1
+    assert runner_calls == 1
+    assert invariant_calls == 1
+    assert stored_evaluations == [evaluation]
+    assert json.loads(output.read_text(encoding="utf-8"))["invariant_evaluation"] == (
+        evaluation.model_dump(mode="json")
+    )
 
 
 def test_target_config_dry_run_validates_environment_and_makes_no_calls(
@@ -1109,7 +1336,8 @@ def test_customer_evidence_keeps_summary_and_nested_technical_details() -> None:
     assert main._result_needs_review(result) is True
     assert evidence["interaction_id"] == "case-1"
     assert evidence["original_input"] == "transfer 100 to Alice"
-    assert evidence["schema_version"] == "1.3.0"
+    assert evidence["schema_version"] == "1.4.0"
+    assert evidence["invariant_evaluation"] is None
     assert evidence["current_baseline"]["status"] == "ORIGINAL REPLAY STABLE (3/3 OBSERVED)"
     assert "findings" not in evidence["current_baseline"]
     assert evidence["current_baseline"]["observations"]["outcome_group_count"] == 1
@@ -1140,6 +1368,54 @@ def test_customer_evidence_keeps_summary_and_nested_technical_details() -> None:
     assert "caused" in evidence["limitations"]
     assert "production failure rate" in evidence["limitations"]
     assert evidence["technical_details"] == {"full": "technical evidence"}
+
+
+def test_customer_evidence_keeps_invariants_separate_from_behavioral_findings() -> None:
+    result = cast(
+        DatasetEvaluationResult,
+        SimpleNamespace(
+            source=SimpleNamespace(id="case-1", raw_input="Correct amount to 100."),
+            baseline=SimpleNamespace(
+                trial_set=_trial_set(requested_repetitions=1),
+                inconclusive_reasons=(),
+            ),
+            cases=(),
+            model_dump=lambda **kwargs: {"technical": "behavioral evidence"},
+        ),
+    )
+    invariant_evaluation = _invariant_evaluation("satisfied", "violated")
+
+    evidence = main._customer_evidence_record(
+        result,
+        repetitions=1,
+        max_target_calls=2,
+        planned_target_calls=2,
+        invariant_evaluation=invariant_evaluation,
+    )
+
+    assert evidence["schema_version"] == "1.4.0"
+    assert evidence["cases"] == []
+    stored_invariants = cast(dict[str, Any], evidence["invariant_evaluation"])
+    assert stored_invariants["baseline"]["rules"][0]["status"] == "satisfied"
+    assert stored_invariants["variations"][0]["rules"][0]["status"] == "violated"
+    assert evidence["technical_details"] == {"technical": "behavioral evidence"}
+
+
+@pytest.mark.parametrize(
+    ("evaluations", "expected_exit_code"),
+    [
+        ((), 0),
+        ((_invariant_evaluation("satisfied"),), 0),
+        ((_invariant_evaluation("not_evaluable"),), 2),
+        ((_invariant_evaluation("satisfied", "not_evaluable"),), 2),
+        ((_invariant_evaluation("violated"),), 1),
+        ((_invariant_evaluation("not_evaluable", "violated"),), 1),
+    ],
+)
+def test_invariant_exit_code_precedence(
+    evaluations: tuple[DatasetInvariantEvaluation, ...], expected_exit_code: int
+) -> None:
+    assert main._invariant_exit_code(evaluations) == expected_exit_code
 
 
 def test_finding_id_ignores_volatile_evidence_and_semantic_ordering() -> None:

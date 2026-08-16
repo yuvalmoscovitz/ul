@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 import re
+import unicodedata
 from pathlib import Path
 from typing import Annotated, TextIO, cast
 
@@ -24,6 +25,12 @@ from ul import (
     OpenRouterDatasetSettings,
     OpenRouterSemanticDeconstructor,
     builtin_dataset_augmentation_operators,
+)
+from ul.dataset_invariants import (
+    DatasetInvariantEvaluation,
+    DatasetInvariantSuite,
+    evaluate_dataset_invariants,
+    load_dataset_invariant_suite,
 )
 from ul.http_target import (
     JsonHttpDatasetTarget,
@@ -167,6 +174,15 @@ def evaluate_dataset(
         Path | None,
         typer.Option(help="New JSONL file for complete local evidence."),
     ] = None,
+    invariants: Annotated[
+        Path | None,
+        typer.Option(
+            exists=True,
+            dir_okay=False,
+            readable=True,
+            help="Strict declarative customer invariant configuration.",
+        ),
+    ] = None,
     operator: Annotated[
         list[str] | None,
         typer.Option(
@@ -243,7 +259,10 @@ def evaluate_dataset(
             header_env=header_env,
         )
         header_environment_variables = _parse_header_environment_variables(header_env)
-    except _DatasetInputError as error:
+        invariant_suite = (
+            load_dataset_invariant_suite(invariants) if invariants is not None else None
+        )
+    except (_DatasetInputError, ValidationError, ValueError, RuntimeError) as error:
         raise typer.BadParameter(str(error)) from None
 
     selected_records = records[:limit]
@@ -327,6 +346,7 @@ def evaluate_dataset(
             ),
             repetitions=repetitions,
             max_target_calls=max_target_calls,
+            invariant_suite=invariant_suite,
         )
         return
 
@@ -372,10 +392,24 @@ def evaluate_dataset(
         ) from None
 
     has_review_findings = False
+    invariant_evaluations: list[DatasetInvariantEvaluation] = []
     try:
         with output_stream:
-            results = asyncio.run(
-                _evaluate_interaction_records(
+            if invariant_suite is not None:
+                evaluation_coroutine = _evaluate_interaction_records(
+                    selected_records,
+                    selected_operators,
+                    settings,
+                    target,
+                    output_stream,
+                    repetitions=repetitions,
+                    max_target_calls=max_target_calls,
+                    planned_target_calls=potential_target_calls,
+                    invariant_suite=invariant_suite,
+                    invariant_evaluations=invariant_evaluations,
+                )
+            else:
+                evaluation_coroutine = _evaluate_interaction_records(
                     selected_records,
                     selected_operators,
                     settings,
@@ -385,7 +419,7 @@ def evaluate_dataset(
                     max_target_calls=max_target_calls,
                     planned_target_calls=potential_target_calls,
                 )
-            )
+            results = asyncio.run(evaluation_coroutine)
             for result in results:
                 has_review_findings |= _result_needs_review(result)
     except (TimeoutError, RuntimeError, ValueError, httpx.HTTPError) as error:
@@ -395,7 +429,12 @@ def evaluate_dataset(
         )
         raise typer.Exit(code=2) from None
 
-    _print_dataset_results(results, output)
+    _print_dataset_results(results, output, invariant_evaluations=tuple(invariant_evaluations))
+    invariant_exit_code = _invariant_exit_code(tuple(invariant_evaluations))
+    if invariant_exit_code == 1:
+        raise typer.Exit(code=1)
+    if invariant_exit_code == 2:
+        raise typer.Exit(code=2)
     if has_review_findings:
         raise typer.Exit(code=1)
 
@@ -581,6 +620,7 @@ def _print_dataset_plan(
     target_header_environment_variables: dict[str, str],
     repetitions: int,
     max_target_calls: int,
+    invariant_suite: DatasetInvariantSuite | None,
 ) -> None:
     potential_target_calls = selected_count * repetitions * (1 + len(operator_ids))
     potential_model_calls = selected_count * (
@@ -590,6 +630,13 @@ def _print_dataset_plan(
     console.print(f"Selected interactions: {selected_count}")
     console.print(f"Operators: {', '.join(operator_ids)}")
     console.print(f"Repetitions: {repetitions} per original and accepted variation")
+    if invariant_suite is None:
+        console.print("Customer invariants: none")
+    else:
+        console.print(f"Customer invariants: {len(invariant_suite.rules)} rule(s)")
+        console.print(f"Declared observation authority: {invariant_suite.observation_authority}")
+        console.print("Additional model calls for customer invariants: 0")
+        console.print("Additional target calls for customer invariants: 0")
     console.print(f"Potential semantic model calls: up to {potential_model_calls}")
     console.print(
         f"Potential target calls: up to {potential_target_calls} "
@@ -640,6 +687,8 @@ async def _evaluate_interaction_records(
     repetitions: int,
     max_target_calls: int,
     planned_target_calls: int,
+    invariant_suite: DatasetInvariantSuite | None = None,
+    invariant_evaluations: list[DatasetInvariantEvaluation] | None = None,
 ) -> tuple[DatasetEvaluationResult, ...]:
     results: list[DatasetEvaluationResult] = []
     async with OpenRouterSemanticDeconstructor(settings) as deconstructor, target:
@@ -655,6 +704,13 @@ async def _evaluate_interaction_records(
                 operator_ids=operator_ids,
                 repetitions=repetitions,
             )
+            invariant_evaluation = (
+                evaluate_dataset_invariants(result, invariant_suite)
+                if invariant_suite is not None
+                else None
+            )
+            if invariant_evaluation is not None and invariant_evaluations is not None:
+                invariant_evaluations.append(invariant_evaluation)
             output_stream.write(
                 json.dumps(
                     _customer_evidence_record(
@@ -662,6 +718,7 @@ async def _evaluate_interaction_records(
                         repetitions=repetitions,
                         max_target_calls=max_target_calls,
                         planned_target_calls=planned_target_calls,
+                        invariant_evaluation=invariant_evaluation,
                     ),
                     ensure_ascii=False,
                 )
@@ -675,6 +732,8 @@ async def _evaluate_interaction_records(
 def _print_dataset_results(
     results: tuple[DatasetEvaluationResult, ...],
     output: Path,
+    *,
+    invariant_evaluations: tuple[DatasetInvariantEvaluation, ...] = (),
 ) -> None:
     table = Table(title="Dataset evaluation")
     table.add_column("Case", style="cyan")
@@ -705,6 +764,8 @@ def _print_dataset_results(
                 ", ".join(_FINDING_LABELS[finding.category] for finding in case.findings) or "—",
             )
     console.print(table)
+    if invariant_evaluations:
+        _print_invariant_results(invariant_evaluations)
     console.print(f"Complete evidence: {output}")
     console.print(f"Next: ul dataset report {output}")
 
@@ -713,12 +774,77 @@ def _result_needs_review(result: DatasetEvaluationResult) -> bool:
     return any(case.verdict == "divergence_needs_review" for case in result.cases)
 
 
+def _invariant_exit_code(
+    evaluations: tuple[DatasetInvariantEvaluation, ...],
+) -> int:
+    rules = tuple(
+        rule
+        for evaluation in evaluations
+        for arm in (evaluation.baseline, *evaluation.variations)
+        for rule in arm.rules
+    )
+    if any(rule.status == "violated" for rule in rules):
+        return 1
+    if any(rule.status == "not_evaluable" for rule in rules):
+        return 2
+    return 0
+
+
+def _print_invariant_results(
+    evaluations: tuple[DatasetInvariantEvaluation, ...],
+) -> None:
+    _print_dataset_plain("")
+    _print_dataset_plain("Customer invariant evaluation")
+    _print_dataset_plain(
+        "Selected values remain in the private evidence file; terminal output shows pointers only."
+    )
+    for evaluation in evaluations:
+        _print_dataset_plain(f"Interaction: {evaluation.interaction_id}")
+        _print_dataset_plain(f"Declared observation authority: {evaluation.observation_authority}")
+        for arm in (evaluation.baseline, *evaluation.variations):
+            arm_name = "original" if arm.arm == "baseline" else f"variation ({arm.operator_id})"
+            for rule in arm.rules:
+                status_counts = {
+                    status: sum(trial.status == status for trial in rule.trials)
+                    for status in ("satisfied", "violated", "not_evaluable")
+                }
+                _print_dataset_plain(
+                    f"Rule {rule.rule_id} ({rule.rule_version}); severity={rule.severity}; "
+                    f"arm={arm_name}; status={rule.status}; reason={rule.reason_code}; trials="
+                    + ", ".join(f"{status}={count}" for status, count in status_counts.items())
+                )
+                _print_dataset_plain(f"Description: {rule.description}")
+                if rule.status == "violated":
+                    _print_dataset_plain(
+                        "Customer rule violated against declared "
+                        f"{evaluation.observation_authority}."
+                    )
+                for trial in rule.trials:
+                    _print_dataset_plain(
+                        f"Trial {trial.repetition}: {trial.status}; "
+                        f"left={trial.left_pointer}; right={trial.right_pointer}; "
+                        f"reason={trial.reason_code}"
+                    )
+
+
+def _print_dataset_plain(message: str) -> None:
+    safe_message = "".join(
+        character
+        if (ord(character) >= 32 and not 0x7F <= ord(character) <= 0x9F)
+        and unicodedata.category(character) not in {"Cf", "Cs"}
+        else f"\\u{ord(character):04x}"
+        for character in message
+    )
+    console.print(safe_message, markup=False, highlight=False)
+
+
 def _customer_evidence_record(
     result: DatasetEvaluationResult,
     *,
     repetitions: int,
     max_target_calls: int,
     planned_target_calls: int,
+    invariant_evaluation: DatasetInvariantEvaluation | None = None,
 ) -> dict[str, JsonValue]:
     cases: list[JsonValue] = []
     for case in result.cases:
@@ -743,7 +869,7 @@ def _customer_evidence_record(
             }
         )
     return {
-        "schema_version": "1.3.0",
+        "schema_version": "1.4.0",
         "interaction_id": result.source.id,
         "original_input": result.source.raw_input,
         "execution_plan": {
@@ -758,6 +884,12 @@ def _customer_evidence_record(
             "inconclusive_reasons": list(result.baseline.inconclusive_reasons),
         },
         "cases": cases,
+        "invariant_evaluation": cast(
+            JsonValue,
+            invariant_evaluation.model_dump(mode="json")
+            if invariant_evaluation is not None
+            else None,
+        ),
         "technical_details": cast(JsonValue, result.model_dump(mode="json")),
     }
 

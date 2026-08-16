@@ -107,6 +107,50 @@ def _evidence_record(*, finding_id: str = FINDING_ID) -> dict[str, Any]:
     }
 
 
+def _invariant_evaluation() -> dict[str, Any]:
+    def rule(status: str, left: int, right: int) -> dict[str, Any]:
+        return {
+            "rule_type": "json_values_equal",
+            "rule_id": "final-amount-matches-corrected",
+            "rule_version": "1.0.0",
+            "description": "Final amount equals the corrected amount.",
+            "severity": "critical",
+            "status": status,
+            "reason_code": (
+                "all_trials_satisfied" if status == "satisfied" else "one_or_more_trials_violated"
+            ),
+            "trials": [
+                {
+                    "repetition": 1,
+                    "status": status,
+                    "reason_code": "values_equal" if status == "satisfied" else "values_differ",
+                    "left_pointer": "/final_amount",
+                    "right_pointer": "/corrected_amount",
+                    "resolved_values": {"left": left, "right": right},
+                }
+            ],
+        }
+
+    return {
+        "interaction_id": "quickstart-payment",
+        "suite_sha256": "b" * 64,
+        "observation_source": "target_output",
+        "observation_authority": "committed_state_snapshot",
+        "baseline": {
+            "arm": "baseline",
+            "operator_id": None,
+            "rules": [rule("satisfied", 100, 100)],
+        },
+        "variations": [
+            {
+                "arm": "variation",
+                "operator_id": "surface.disfluency_repeat",
+                "rules": [rule("violated", 200, 100)],
+            }
+        ],
+    }
+
+
 def _write_evidence(path: Path, records: list[dict[str, Any]] | None = None) -> bytes:
     raw = b"".join(
         json.dumps(record, ensure_ascii=False, separators=(",", ":")).encode() + b"\n"
@@ -210,6 +254,33 @@ def test_report_review_report_journey_preserves_evidence_and_history(tmp_path: P
     assert "expected=1" in final_report.output
     assert "Latest review: expected, severity=unrated" in final_report.output
     assert "history: 2" in final_report.output
+
+
+def test_report_schema_1_4_shows_customer_invariants_separately(tmp_path: Path) -> None:
+    evidence = tmp_path / "evidence.jsonl"
+    record = _evidence_record()
+    record["schema_version"] = "1.4.0"
+    record["invariant_evaluation"] = _invariant_evaluation()
+    _write_evidence(evidence, [record])
+
+    report = runner.invoke(app, ["dataset", "report", str(evidence)])
+
+    assert report.exit_code == 0, report.output
+    normalized_output = " ".join(report.output.split())
+    assert "Dataset finding report: 1 finding(s)" in normalized_output
+    assert "Customer invariant evaluation" in normalized_output
+    assert "Declared observation authority: committed_state_snapshot" in normalized_output
+    assert "severity=critical; arm=original; status=satisfied" in normalized_output
+    assert (
+        "severity=critical; arm=variation (surface.disfluency_repeat); status=violated"
+        in normalized_output
+    )
+    assert "Description: Final amount equals the corrected amount." in normalized_output
+    assert "reason=one_or_more_trials_violated" in normalized_output
+    assert "satisfied=0, violated=1, not_evaluable=0" in normalized_output
+    assert "selected_values=" not in normalized_output
+    assert "Customer rule violated against declared committed_state_snapshot." in normalized_output
+    assert "agent wrong" not in normalized_output.casefold()
 
 
 @pytest.mark.parametrize(

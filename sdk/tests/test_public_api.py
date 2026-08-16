@@ -7,12 +7,18 @@ from ul import (
     DatasetEvaluationRunner,
     DatasetEvaluationTrial,
     DatasetEvaluationTrialSet,
+    DatasetInvariantArmEvaluation,
+    DatasetInvariantEvaluation,
+    DatasetInvariantRuleEvaluation,
+    DatasetInvariantSuite,
+    DatasetInvariantTrialEvaluation,
     DatasetTargetExecutor,
     ExecutionResult,
     ExecutionStatus,
     InteractionRecord,
     JsonHttpDatasetTarget,
     JsonHttpDatasetTargetConfig,
+    JsonValuesEqualInvariant,
     ObservedAgentOutput,
     OpenRouterDatasetSettings,
     OpenRouterSemanticDeconstructor,
@@ -26,6 +32,8 @@ from ul import (
     UserInputRecord,
     builtin_augmentation_registry,
     builtin_dataset_augmentation_operators,
+    evaluate_dataset_invariants,
+    load_dataset_invariant_suite,
     load_json_http_dataset_target_config,
 )
 
@@ -78,10 +86,18 @@ def test_sdk_exposes_dataset_augmentation_api() -> None:
     assert DatasetEvaluationRunner.__name__ == "DatasetEvaluationRunner"
     assert DatasetEvaluationTrial.__name__ == "DatasetEvaluationTrial"
     assert DatasetEvaluationTrialSet.__name__ == "DatasetEvaluationTrialSet"
+    assert DatasetInvariantArmEvaluation.__name__ == "DatasetInvariantArmEvaluation"
+    assert DatasetInvariantEvaluation.__name__ == "DatasetInvariantEvaluation"
+    assert DatasetInvariantRuleEvaluation.__name__ == "DatasetInvariantRuleEvaluation"
+    assert DatasetInvariantSuite.__name__ == "DatasetInvariantSuite"
+    assert DatasetInvariantTrialEvaluation.__name__ == "DatasetInvariantTrialEvaluation"
     assert DatasetTargetExecutor.__name__ == "DatasetTargetExecutor"
     assert JsonHttpDatasetTarget.__name__ == "JsonHttpDatasetTarget"
     assert JsonHttpDatasetTargetConfig.__name__ == "JsonHttpDatasetTargetConfig"
+    assert JsonValuesEqualInvariant.__name__ == "JsonValuesEqualInvariant"
     assert load_json_http_dataset_target_config.__name__ == ("load_json_http_dataset_target_config")
+    assert evaluate_dataset_invariants.__name__ == "evaluate_dataset_invariants"
+    assert load_dataset_invariant_suite.__name__ == "load_dataset_invariant_suite"
     assert len(builtin_dataset_augmentation_operators()) == 8
     assert OpenRouterSemanticDeconstructor is not None
     assert OpenRouterDatasetSettings is not None

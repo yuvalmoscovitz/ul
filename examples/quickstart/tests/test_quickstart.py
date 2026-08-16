@@ -16,6 +16,7 @@ from typing import Any, cast
 import httpx
 import pytest
 import typer
+from ul.dataset_invariants import load_dataset_invariant_suite
 
 from examples.quickstart import run as quickstart
 from examples.quickstart.defective_agent import create_server
@@ -74,6 +75,7 @@ def test_server_reproduces_the_seeded_wrong_invoice() -> None:
             "action": "payment_committed",
             "payment_id": "pay-0001",
             "invoice_reference": "AC-100",
+            "requested_invoice_reference": "AC-100",
             "amount": "12500",
             "currency": "USD",
             "source_bank_account_id": "bank-main",
@@ -174,6 +176,17 @@ def test_quickstart_target_contains_no_authentication_mapping() -> None:
     assert target["response_json_pointer"] == "/result"
 
 
+def test_quickstart_invariant_uses_declared_committed_state_fields() -> None:
+    suite = load_dataset_invariant_suite(_QUICKSTART_DIRECTORY / "invariants.json")
+
+    assert suite.observation_source == "target_output"
+    assert suite.observation_authority == "committed_state_snapshot"
+    assert len(suite.rules) == 1
+    assert suite.rules[0].id == "committed-invoice-matches-request"
+    assert suite.rules[0].left_pointer == "/invoice_reference"
+    assert suite.rules[0].right_pointer == "/requested_invoice_reference"
+
+
 def _confirmed_evidence() -> dict[str, Any]:
     stable_observations = {
         "requested_repetitions": 3,
@@ -181,6 +194,46 @@ def _confirmed_evidence() -> dict[str, Any]:
         "observed_repetitions": 3,
         "inconclusive_repetitions": 0,
         "outcome_group_count": 1,
+    }
+    invariant_trial = {
+        "repetition": 1,
+        "status": "satisfied",
+        "reason_code": "values_equal",
+        "left_pointer": "/invoice_reference",
+        "right_pointer": "/requested_invoice_reference",
+        "resolved_values": {"left": "AC-100", "right": "AC-100"},
+    }
+    baseline_rule = {
+        "rule_type": "json_values_equal",
+        "rule_id": "committed-invoice-matches-request",
+        "rule_version": "1.0.0",
+        "description": (
+            "The committed invoice reference must match the requested invoice reference."
+        ),
+        "severity": "high",
+        "status": "satisfied",
+        "reason_code": "all_trials_satisfied",
+        "trials": [
+            invariant_trial,
+            {**invariant_trial, "repetition": 2},
+            {**invariant_trial, "repetition": 3},
+        ],
+    }
+    violated_trial = {
+        **invariant_trial,
+        "status": "violated",
+        "reason_code": "values_differ",
+        "resolved_values": {"left": "AC-101", "right": "AC-100"},
+    }
+    variation_rule = {
+        **baseline_rule,
+        "status": "violated",
+        "reason_code": "one_or_more_trials_violated",
+        "trials": [
+            violated_trial,
+            {**violated_trial, "repetition": 2},
+            {**violated_trial, "repetition": 3},
+        ],
     }
     return {
         "current_baseline": {"observations": stable_observations},
@@ -209,6 +262,20 @@ def _confirmed_evidence() -> dict[str, Any]:
                 ],
             }
         ],
+        "invariant_evaluation": {
+            "interaction_id": "quickstart-ap-1",
+            "suite_sha256": "0" * 64,
+            "observation_source": "target_output",
+            "observation_authority": "committed_state_snapshot",
+            "baseline": {"arm": "baseline", "operator_id": None, "rules": [baseline_rule]},
+            "variations": [
+                {
+                    "arm": "variation",
+                    "operator_id": "surface.disfluency_repeat",
+                    "rules": [variation_rule],
+                }
+            ],
+        },
     }
 
 
@@ -249,6 +316,9 @@ def test_runner_uses_safe_argv_minimal_environment_private_artifacts_and_cleans_
             "UL_DATASET_EQUIVALENCE_MODEL": "x-ai/grok-4.6",
         }
         target_config_path = Path(command[command.index("--target-config") + 1])
+        assert Path(command[command.index("--invariants") + 1]) == (
+            _QUICKSTART_DIRECTORY / "invariants.json"
+        )
         evidence_path = Path(command[command.index("--output") + 1])
         assert stat.S_IMODE(target_config_path.stat().st_mode) == 0o600
         assert stat.S_IMODE(target_config_path.parent.stat().st_mode) == 0o700
@@ -314,6 +384,23 @@ def test_runner_accepts_only_the_exact_stable_wrong_invoice_finding(tmp_path: Pa
         changed_evidence["cases"][0]["findings"][0][effect_group][0]["fields"][
             "invoice_reference"
         ] = invoice_reference
+        evidence_path.write_text(json.dumps(changed_evidence) + "\n", encoding="utf-8")
+        assert not confirms_repeatable_wrong_invoice(evidence_path)
+
+    invariant_changes: tuple[tuple[str, str], ...] = (
+        ("baseline", "violated"),
+        ("variation", "satisfied"),
+        ("rule_id", "different-rule"),
+    )
+    for subject, value in invariant_changes:
+        changed_evidence = json.loads(json.dumps(evidence))
+        invariant_evaluation = changed_evidence["invariant_evaluation"]
+        if subject == "baseline":
+            invariant_evaluation["baseline"]["rules"][0]["status"] = value
+        elif subject == "variation":
+            invariant_evaluation["variations"][0]["rules"][0]["status"] = value
+        else:
+            invariant_evaluation["variations"][0]["rules"][0][subject] = value
         evidence_path.write_text(json.dumps(changed_evidence) + "\n", encoding="utf-8")
         assert not confirms_repeatable_wrong_invoice(evidence_path)
 
@@ -409,6 +496,7 @@ def test_built_wheel_contains_the_complete_quickstart(tmp_path: Path) -> None:
         "examples/quickstart/README.md",
         "examples/quickstart/dataset.jsonl",
         "examples/quickstart/defective_agent.py",
+        "examples/quickstart/invariants.json",
         "examples/quickstart/run.py",
         "examples/quickstart/target.json",
     } <= names
@@ -432,4 +520,7 @@ def test_exact_documented_quickstart_command_finds_stable_wrong_invoice() -> Non
     )
 
     assert completed.returncode == 0, completed.stdout + completed.stderr
-    assert "stable 3/3 wrong-invoice action" in completed.stdout.casefold()
+    assert (
+        "stable 3/3 wrong-invoice action and the customer rule failed"
+        in completed.stdout.casefold()
+    )
