@@ -78,6 +78,48 @@ supported), and `inconclusive` (the reviewer needs more context). These are huma
 UL correctness labels. Correcting a judgment requires `--supersedes REVIEW_ID`, preserving the
 earlier decision.
 
+After a finding has an active `confirmed` review, save its exact variation and one or more
+violated customer rules as a replayable regression case:
+
+```bash
+uv run ul regression save PATH_TO_EVIDENCE.jsonl FINDING_ID \
+  --rule committed-invoice-matches-request \
+  --target-config target.json \
+  --output regressions/wrong-invoice.json \
+  --confirm-versioned-input
+```
+
+`--confirm-versioned-input` is required because the case copies the exact raw input and literal
+target-template values, which can contain sensitive data. UL does not automatically redact them:
+changing the input or template could change the behavior being reproduced. Treat the case as
+sensitive, inspect it before committing, and apply your own data-governance policy.
+
+Replay the saved input and deterministic rules against a sandbox:
+
+```bash
+uv run ul regression replay regressions/wrong-invoice.json \
+  --target-config target.json \
+  --allow-target-network \
+  --confirm-isolated-sandbox \
+  --confirm-fresh-state \
+  --max-target-calls 3 \
+  --output tmp/wrong-invoice-replay.json
+```
+
+For a local HTTP sandbox, also pass `--allow-insecure-http`. Replay makes exactly the saved number
+of target calls, refuses to start when that exceeds `--max-target-calls`, and makes no
+semantic-model calls. It exits `0` when every selected rule is satisfied,
+`1` when any selected rule is violated, and `2` when a rule or target call is inconclusive. A
+passing replay means only that the saved customer expectations held in those trials; it does not
+prove the agent is correct or that a failure was fixed.
+
+The case contains a target configuration declared by the customer when the case is created. UL
+cannot verify that it was the discovery target; its digest only binds future replay to that
+declaration. UL never executes the embedded configuration. You must separately provide a trusted
+target configuration, and its digest must match before any request is sent. Literal request-template
+values and replay evidence can contain sensitive data. Keep cases and complete replay evidence as
+versioned artifacts only when that matches your access-control and retention policy.
+
 See [the quickstart details](examples/quickstart/README.md) for the expanded command and file
 layout.
 

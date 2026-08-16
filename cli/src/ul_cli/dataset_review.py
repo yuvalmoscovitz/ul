@@ -174,6 +174,36 @@ class _LoadedEvidenceRecord(BaseModel):
     sha256: str
 
 
+class ConfirmedDatasetFinding(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True, frozen=True)
+
+    evidence_record: _LoadedEvidenceRecord
+    case: _Case
+    review: ReviewRecord
+
+
+def load_confirmed_dataset_finding(
+    evidence_path: Path,
+    reviews_path: Path,
+    finding_id: str,
+) -> ConfirmedDatasetFinding:
+    evidence_records = _load_evidence(evidence_path)
+    findings = _index_findings(evidence_records)
+    selected = findings.get(finding_id)
+    if selected is None:
+        raise ValueError("finding ID was not found in the evidence")
+    review_records = _load_reviews(reviews_path)
+    _validate_review_history(review_records, findings)
+    active_review = _active_reviews(review_records).get(finding_id)
+    if active_review is None or active_review.status != "confirmed":
+        raise ValueError("finding must have an active confirmed review")
+    return ConfirmedDatasetFinding(
+        evidence_record=selected[0],
+        case=selected[1],
+        review=active_review,
+    )
+
+
 def report_dataset_evidence(
     evidence: Annotated[
         Path,

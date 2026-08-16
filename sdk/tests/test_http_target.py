@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import threading
 from collections.abc import AsyncIterator, Generator
 from contextlib import contextmanager
@@ -263,6 +264,44 @@ async def test_config_loader_enforces_size_limit(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="size limit"):
         load_json_http_dataset_target_config(config_path)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX filesystem special files")
+async def test_config_loader_rejects_symlink_and_fifo_without_blocking(tmp_path: Path) -> None:
+    regular_config = tmp_path / "regular.json"
+    regular_config.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "url": "https://example.test/run",
+                "request_json_template": {"input": "{{input}}"},
+            }
+        )
+    )
+    symlink_config = tmp_path / "symlink.json"
+    symlink_config.symlink_to(regular_config)
+    fifo_config = tmp_path / "fifo.json"
+    os.mkfifo(fifo_config)
+
+    with pytest.raises(RuntimeError, match="could not be read"):
+        load_json_http_dataset_target_config(symlink_config)
+    with pytest.raises(RuntimeError, match="could not be read"):
+        load_json_http_dataset_target_config(fifo_config)
+
+
+async def test_response_nesting_limit_returns_sanitized_target_error() -> None:
+    response_body = ("[" * 101 + "0" + "]" * 101).encode()
+    response = _raw_response(response_body, content_type="application/json")
+    async with httpx.AsyncClient(transport=httpx.MockTransport(lambda request: response)) as client:
+        target = JsonHttpDatasetTarget(
+            "https://example.com/run",
+            sandbox_confirmed=True,
+            fresh_state_confirmed=True,
+            client=client,
+        )
+
+        with pytest.raises(RuntimeError, match="invalid JSON"):
+            await target.execute("private input")
 
 
 @pytest.mark.parametrize(
