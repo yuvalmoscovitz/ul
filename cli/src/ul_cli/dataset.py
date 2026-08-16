@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 import re
@@ -30,9 +31,15 @@ from ul.http_target import (
     load_json_http_dataset_target_config,
     validate_json_http_dataset_target_configuration,
 )
+from ul_core.dataset import ObservedOutcome
+
+from ul_cli.dataset_review import report_dataset_evidence, review_dataset_finding
 
 app = typer.Typer(help="Explore behavioral differences in observed agent interactions.")
 console = Console()
+
+app.command("report")(report_dataset_evidence)
+app.command("review")(review_dataset_finding)
 
 _MAXIMUM_DATASET_BYTES = 10_000_000
 _MAXIMUM_DATASET_RECORDS = 100
@@ -699,6 +706,7 @@ def _print_dataset_results(
             )
     console.print(table)
     console.print(f"Complete evidence: {output}")
+    console.print(f"Next: ul dataset report {output}")
 
 
 def _result_needs_review(result: DatasetEvaluationResult) -> bool:
@@ -723,12 +731,19 @@ def _customer_evidence_record(
                 "variation_accepted": case.candidate.passed,
                 "variation_rejection_reasons": list(case.candidate.failure_reasons),
                 "observations": _customer_trial_set(case.trial_set),
-                "findings": _customer_findings(case.findings),
+                "findings": _customer_findings(
+                    case.findings,
+                    interaction_id=result.source.id,
+                    original_input=result.source.raw_input,
+                    operator_id=case.candidate.operator_id,
+                    operator_version=case.candidate.operator_version,
+                    augmented_input=case.candidate.augmented_input,
+                ),
                 "inconclusive_reasons": list(case.inconclusive_reasons),
             }
         )
     return {
-        "schema_version": "1.2.0",
+        "schema_version": "1.3.0",
         "interaction_id": result.source.id,
         "original_input": result.source.raw_input,
         "execution_plan": {
@@ -826,17 +841,123 @@ def _customer_trial_set(trial_set: DatasetEvaluationTrialSet | None) -> JsonValu
 
 def _customer_findings(
     findings: tuple[DatasetEvaluationFinding, ...],
+    *,
+    interaction_id: str,
+    original_input: str,
+    operator_id: str,
+    operator_version: str,
+    augmented_input: str,
 ) -> list[JsonValue]:
-    return [
-        {
-            "category": finding.category,
-            "summary": finding.message,
-            "reference_effects": [
-                effect.model_dump(mode="json") for effect in finding.expected_effects
-            ],
-            "observed_effects": [
-                effect.model_dump(mode="json") for effect in finding.observed_effects
-            ],
-        }
+    base_finding_ids = [
+        _finding_id(
+            interaction_id=interaction_id,
+            original_input=original_input,
+            operator_id=operator_id,
+            operator_version=operator_version,
+            augmented_input=augmented_input,
+            finding=finding,
+        )
         for finding in findings
     ]
+    finding_id_counts: dict[str, int] = {}
+    for finding_id in base_finding_ids:
+        finding_id_counts[finding_id] = finding_id_counts.get(finding_id, 0) + 1
+    finding_id_occurrences: dict[str, int] = {}
+    customer_findings: list[JsonValue] = []
+    for finding, base_finding_id in zip(findings, base_finding_ids, strict=True):
+        duplicate_ordinal = None
+        if finding_id_counts[base_finding_id] > 1:
+            duplicate_ordinal = finding_id_occurrences.get(base_finding_id, 0) + 1
+            finding_id_occurrences[base_finding_id] = duplicate_ordinal
+        finding_id = (
+            base_finding_id
+            if duplicate_ordinal is None
+            else _finding_id(
+                interaction_id=interaction_id,
+                original_input=original_input,
+                operator_id=operator_id,
+                operator_version=operator_version,
+                augmented_input=augmented_input,
+                finding=finding,
+                duplicate_ordinal=duplicate_ordinal,
+            )
+        )
+        customer_findings.append(
+            cast(
+                JsonValue,
+                {
+                    "finding_id": finding_id,
+                    "category": finding.category,
+                    "grounded_field_names": sorted(finding.grounded_field_names),
+                    "severity": "unrated",
+                    "review_status": "needs_review",
+                    "summary": finding.message,
+                    "reference_effects": [
+                        effect.model_dump(mode="json") for effect in finding.expected_effects
+                    ],
+                    "observed_effects": [
+                        effect.model_dump(mode="json") for effect in finding.observed_effects
+                    ],
+                },
+            )
+        )
+    return customer_findings
+
+
+def _finding_id(
+    *,
+    interaction_id: str,
+    original_input: str,
+    operator_id: str,
+    operator_version: str,
+    augmented_input: str,
+    finding: DatasetEvaluationFinding,
+    duplicate_ordinal: int | None = None,
+) -> str:
+    canonical_finding = cast(
+        dict[str, JsonValue],
+        {
+            "interaction_id": interaction_id,
+            "original_input": original_input,
+            "operator_id": operator_id,
+            "operator_version": operator_version,
+            "augmented_input": augmented_input,
+            "category": finding.category,
+            "grounded_field_names": sorted(finding.grounded_field_names),
+            "reference_action_semantics": _normalized_action_semantics(finding.expected_effects),
+            "observed_action_semantics": _normalized_action_semantics(finding.observed_effects),
+        },
+    )
+    if duplicate_ordinal is not None:
+        canonical_finding["duplicate_ordinal"] = duplicate_ordinal
+    canonical_json = json.dumps(
+        canonical_finding,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    return f"ulf_v1_{hashlib.sha256(canonical_json.encode('utf-8')).hexdigest()}"
+
+
+def _normalized_action_semantics(effects: tuple[ObservedOutcome, ...]) -> list[JsonValue]:
+    signatures = [
+        cast(
+            JsonValue,
+            {
+                "kind": effect.kind,
+                "predicate": effect.predicate,
+                "fields": effect.fields,
+                "propositions": sorted(effect.propositions),
+            },
+        )
+        for effect in effects
+    ]
+    return sorted(
+        signatures,
+        key=lambda signature: json.dumps(
+            signature,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ),
+    )

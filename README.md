@@ -51,6 +51,27 @@ For the underlying `ul dataset evaluate` command, exit `0` means no review findi
 observed difference needs review, and `2` means the evaluation could not finish. Exit `1` is not
 a correctness judgment.
 
+Review findings without making more model or target calls:
+
+```bash
+uv run ul dataset report PATH_TO_EVIDENCE.jsonl
+uv run ul dataset review PATH_TO_EVIDENCE.jsonl FINDING_ID \
+  --status confirmed \
+  --severity high \
+  --reviewer "payments-risk" \
+  --reason "The variation committed payment for the wrong invoice."
+uv run ul dataset report PATH_TO_EVIDENCE.jsonl
+```
+
+Reviews are appended to a separate `PATH_TO_EVIDENCE.reviews.jsonl` audit file; the evaluation
+evidence is never rewritten. UL creates the sidecar with mode `0600` on Unix. On Windows it
+inherits the parent directory's access controls, so store it in a directory restricted to the
+review team. Available judgments are `confirmed` (the reviewer sees a problem in this context),
+`expected` (a supported but acceptable difference), `unsupported` (the machine finding is not
+supported), and `inconclusive` (the reviewer needs more context). These are human judgments, not
+UL correctness labels. Correcting a judgment requires `--supersedes REVIEW_ID`, preserving the
+earlier decision.
+
 See [the quickstart details](examples/quickstart/README.md) for the expanded command and file
 layout.
 
