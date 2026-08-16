@@ -276,7 +276,8 @@ def test_execution_requires_explicit_target_confirmations_and_output(
     result = runner.invoke(root_app, ["dataset", "evaluate", str(dataset), *options])
 
     assert result.exit_code != 0
-    assert expected_error in result.output
+    normalized_output = " ".join(_ANSI_ESCAPE_PATTERN.sub("", result.output).split())
+    assert expected_error in normalized_output
 
 
 def test_execution_refuses_to_overwrite_output_before_model_setup(
