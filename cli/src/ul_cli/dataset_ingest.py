@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Annotated, TextIO, cast
 
 import typer
-from ul.otlp_ingest import parse_otlp_traces
+from ul.otlp_ingest import OtlpIngestResult, parse_otlp_traces
 
 app = typer.Typer(help="Import production traces as a UL dataset.")
 
@@ -39,7 +39,7 @@ def ingest_otlp_traces(
         typer.Option(
             min=1,
             max=_MAXIMUM_RECORDS,
-            help="Maximum interactions to extract.",
+            help=f"Maximum interactions to extract (default: {_MAXIMUM_RECORDS}).",
         ),
     ] = _MAXIMUM_RECORDS,
 ) -> None:
@@ -62,6 +62,11 @@ def ingest_otlp_traces(
             f"cannot read trace file ({error.__class__.__name__})",
             param_hint="TRACES",
         ) from None
+    if len(raw_bytes) > _MAXIMUM_FILE_BYTES:
+        raise typer.BadParameter(
+            f"trace file exceeds the {_MAXIMUM_FILE_BYTES // 1_000_000} MB limit",
+            param_hint="TRACES",
+        )
 
     try:
         data = json.loads(
@@ -84,7 +89,9 @@ def ingest_otlp_traces(
     if not result.records:
         skipped_summary = _skipped_summary(result)
         raise typer.BadParameter(
-            f"no usable LLM interactions found in trace file{skipped_summary}",
+            f"no usable LLM interactions found in trace file{skipped_summary}; "
+            "ensure your export includes GenAI semantic conventions "
+            "(gen_ai.operation.name or gen_ai.prompt attributes)",
             param_hint="TRACES",
         )
 
@@ -115,13 +122,14 @@ def ingest_otlp_traces(
         _print_safe(f"Skipped traces:{skipped_summary}")
     if result.truncated:
         _print_safe(f"Trace file contains more than {limit} interactions; use --limit to adjust.")
-    _print_safe(f"Next: ul dataset evaluate {output} --target-config target.json --dry-run")
+    _print_safe(
+        "Next: create a target config with "
+        "'ul dataset init target.json --url https://your-sandbox/run', "
+        f"then run 'ul dataset evaluate {output} --target-config target.json --dry-run'."
+    )
 
 
-def _skipped_summary(result: object) -> str:
-    from ul.otlp_ingest import OtlpIngestResult
-
-    assert isinstance(result, OtlpIngestResult)
+def _skipped_summary(result: OtlpIngestResult) -> str:
     parts: list[str] = []
     if result.skipped_no_gen_ai:
         parts.append(f"{result.skipped_no_gen_ai} without GenAI spans")

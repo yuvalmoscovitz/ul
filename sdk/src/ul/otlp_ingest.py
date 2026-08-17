@@ -107,8 +107,7 @@ def _pick_root_span(gen_ai_spans: list[dict[str, Any]]) -> dict[str, Any]:
     ]
 
     candidates = root_spans if root_spans else gen_ai_spans
-    candidates.sort(key=lambda s: _parse_nano(s.get("startTimeUnixNano")))
-    return candidates[0]
+    return sorted(candidates, key=lambda s: _parse_nano(s.get("startTimeUnixNano")))[0]
 
 
 def _is_gen_ai_span(span: dict[str, Any]) -> bool:

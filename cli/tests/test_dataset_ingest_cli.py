@@ -324,7 +324,8 @@ def test_ingest_output_is_valid_jsonl_for_evaluate(tmp_path: Path) -> None:
         _span("aabbccdd" * 4, "11223344" * 2),
     )
 
-    runner.invoke(app, _ingest_arguments(traces, output))
+    result = runner.invoke(app, _ingest_arguments(traces, output))
+    assert result.exit_code == 0, result.output
 
     lines = output.read_text(encoding="utf-8").splitlines()
     assert len(lines) == 1
@@ -347,6 +348,32 @@ def test_ingest_escapes_terminal_controls_from_error_messages(tmp_path: Path) ->
 
     assert result.exit_code == 2
     assert "\x1b[31m" not in result.output
+
+
+def test_ingest_rejects_oversized_file_with_clear_message(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    traces = tmp_path / "traces.json"
+    output = tmp_path / "dataset.jsonl"
+    _write_traces(traces, _span("aabbccdd" * 4, "11223344" * 2))
+    monkeypatch.setattr("ul_cli.dataset_ingest._MAXIMUM_FILE_BYTES", 10)
+
+    result = runner.invoke(app, _ingest_arguments(traces, output))
+
+    assert result.exit_code == 2
+    assert "limit" in result.output.casefold() or "mb" in result.output.casefold()
+    assert not output.exists()
+
+
+def test_ingest_no_usable_traces_error_includes_actionable_guidance(tmp_path: Path) -> None:
+    traces = tmp_path / "traces.json"
+    output = tmp_path / "dataset.jsonl"
+    traces.write_text(json.dumps({"resourceSpans": []}), encoding="utf-8")
+
+    result = runner.invoke(app, _ingest_arguments(traces, output))
+
+    assert result.exit_code == 2
+    assert "gen_ai" in result.output.casefold() or "semantic" in result.output.casefold()
 
 
 @pytest.mark.parametrize("trace_id_format", ["hex", "base64"])
