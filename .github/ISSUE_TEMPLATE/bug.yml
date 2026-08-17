@@ -1,0 +1,41 @@
+name: Bug report
+description: Report a reproducible problem in UL
+title: "[Bug] "
+body:
+  - type: markdown
+    attributes:
+      value: >-
+        Do not include secrets, production traces, or customer data. Report security
+        vulnerabilities [privately](https://github.com/yuvalmoscovitz/ul/security/advisories/new).
+  - type: textarea
+    id: summary
+    attributes:
+      label: What happened?
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Minimal reproduction
+      description: Use synthetic inputs and remove secrets and customer data.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+    validations:
+      required: true
+  - type: input
+    id: environment
+    attributes:
+      label: Environment
+      description: UL commit or version, Python version, OS, and install method.
+    validations:
+      required: true
