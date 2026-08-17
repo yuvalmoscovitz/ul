@@ -7,6 +7,8 @@ import math
 import os
 import stat
 import sys
+import unicodedata
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Literal, Self, cast
 
@@ -144,6 +146,71 @@ class DatasetRegressionResult(_StrictModel):
             expected_status = "passed"
         if self.status != expected_status:
             raise ValueError("regression status must match invariant results")
+        return self
+
+
+class DatasetRegressionRunCaseResult(_StrictModel):
+    label: str = Field(min_length=1, max_length=500)
+    result: DatasetRegressionResult
+
+    @field_validator("label")
+    @classmethod
+    def validate_label(cls, label: str) -> str:
+        return _validate_regression_run_label(label)
+
+
+class DatasetRegressionRunResult(_StrictModel):
+    schema_version: Literal["1.0.0"] = "1.0.0"
+    started_at: datetime
+    completed_at: datetime
+    target_config_sha256: str = Field(pattern=_SHA256_PATTERN)
+    requested_target_calls: int = Field(ge=1)
+    status: RegressionStatus
+    passed_case_count: int = Field(ge=0)
+    failed_case_count: int = Field(ge=0)
+    inconclusive_case_count: int = Field(ge=0)
+    cases: tuple[DatasetRegressionRunCaseResult, ...] = Field(min_length=1, max_length=100)
+
+    @model_validator(mode="after")
+    def validate_run(self) -> Self:
+        for timestamp in (self.started_at, self.completed_at):
+            if timestamp.tzinfo is None or timestamp.utcoffset() != UTC.utcoffset(None):
+                raise ValueError("regression run timestamps must use UTC")
+        if self.completed_at < self.started_at:
+            raise ValueError("regression run completion cannot precede its start")
+        case_ids = tuple(case.result.case_id for case in self.cases)
+        if len(case_ids) != len(set(case_ids)):
+            raise ValueError("regression run results must have unique case IDs")
+        labels = tuple(case.label for case in self.cases)
+        if len(labels) != len(set(labels)):
+            raise ValueError("regression run results must have unique labels")
+        if any(
+            case.result.target_config_sha256 != self.target_config_sha256 for case in self.cases
+        ):
+            raise ValueError("regression run results must use one target config digest")
+        if self.requested_target_calls != sum(
+            case.result.requested_repetitions for case in self.cases
+        ):
+            raise ValueError("requested target calls must match regression result repetitions")
+        expected_counts = {
+            status: sum(case.result.status == status for case in self.cases)
+            for status in ("passed", "failed", "inconclusive")
+        }
+        if (
+            self.passed_case_count != expected_counts["passed"]
+            or self.failed_case_count != expected_counts["failed"]
+            or self.inconclusive_case_count != expected_counts["inconclusive"]
+        ):
+            raise ValueError("regression run counts must match case results")
+        expected_status: RegressionStatus
+        if self.failed_case_count:
+            expected_status = "failed"
+        elif self.inconclusive_case_count:
+            expected_status = "inconclusive"
+        else:
+            expected_status = "passed"
+        if self.status != expected_status:
+            raise ValueError("regression run status must match case results")
         return self
 
 
@@ -314,6 +381,89 @@ async def replay_dataset_regression(
         executions=tuple(executions),
         rules=rules,
     )
+
+
+async def run_dataset_regressions(
+    cases: tuple[DatasetRegressionCase, ...],
+    target: DatasetTargetExecutor,
+    *,
+    case_labels: tuple[str, ...] | None = None,
+    target_timeout_seconds: float = 30,
+    allow_network_egress: bool = False,
+    max_target_calls: int = 100,
+) -> DatasetRegressionRunResult:
+    if not cases:
+        raise ValueError("regression run requires at least one case")
+    if len(cases) > 100:
+        raise ValueError("regression run supports at most 100 cases")
+    case_ids = tuple(case.case_id for case in cases)
+    if len(case_ids) != len(set(case_ids)):
+        raise ValueError("regression run case IDs must be unique")
+    labels = case_ids if case_labels is None else case_labels
+    if len(labels) != len(cases):
+        raise ValueError("regression run labels must match the cases")
+    for label in labels:
+        _validate_regression_run_label(label)
+    if len(labels) != len(set(labels)):
+        raise ValueError("regression run labels must be unique")
+    target_config_sha256 = cases[0].target.config_sha256
+    if any(case.target.config_sha256 != target_config_sha256 for case in cases):
+        raise ValueError("regression run cases must use one target config digest")
+    if type(max_target_calls) is not int or max_target_calls < 1:
+        raise ValueError("max_target_calls must be a positive integer")
+    requested_target_calls = sum(case.discovery_repetitions for case in cases)
+    if requested_target_calls > max_target_calls:
+        raise ValueError("regression run exceeds the authorized target call budget")
+
+    started_at = datetime.now(UTC)
+    result_list: list[DatasetRegressionResult] = []
+    for case in cases:
+        result_list.append(
+            await replay_dataset_regression(
+                case,
+                target,
+                target_timeout_seconds=target_timeout_seconds,
+                allow_network_egress=allow_network_egress,
+                max_target_calls=case.discovery_repetitions,
+            )
+        )
+    results = tuple(result_list)
+    completed_at = datetime.now(UTC)
+    passed_case_count = sum(result.status == "passed" for result in results)
+    failed_case_count = sum(result.status == "failed" for result in results)
+    inconclusive_case_count = sum(result.status == "inconclusive" for result in results)
+    status: RegressionStatus
+    if failed_case_count:
+        status = "failed"
+    elif inconclusive_case_count:
+        status = "inconclusive"
+    else:
+        status = "passed"
+    return DatasetRegressionRunResult(
+        started_at=started_at,
+        completed_at=completed_at,
+        target_config_sha256=target_config_sha256,
+        requested_target_calls=requested_target_calls,
+        status=status,
+        passed_case_count=passed_case_count,
+        failed_case_count=failed_case_count,
+        inconclusive_case_count=inconclusive_case_count,
+        cases=tuple(
+            DatasetRegressionRunCaseResult(label=label, result=result)
+            for label, result in zip(labels, results, strict=True)
+        ),
+    )
+
+
+def _validate_regression_run_label(label: object) -> str:
+    if (
+        not isinstance(label, str)
+        or not label
+        or len(label) > 500
+        or any(unicodedata.category(character) in {"Cc", "Cf", "Cs"} for character in label)
+    ):
+        raise ValueError("regression run labels must contain 1 to 500 characters without controls")
+    return label
 
 
 def _case_id(content: dict[str, JsonValue]) -> str:

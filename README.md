@@ -118,6 +118,80 @@ semantic-model calls. It exits `0` when every selected rule is satisfied,
 passing replay means only that the saved customer expectations held in those trials; it does not
 prove the agent is correct or that a failure was fixed.
 
+Replay a directory of saved cases against the current black-box target:
+
+```bash
+uv run ul regression run regressions/ \
+  --target-config target.json \
+  --allow-target-network \
+  --confirm-isolated-sandbox \
+  --confirm-fresh-state \
+  --max-target-calls 100 \
+  --output tmp/regression-run.json
+```
+
+The runner reads every immediate `.json` file in the directory in filename order, validates the
+complete suite and its total call budget before resolving target credentials, and then executes
+all cases sequentially. It exits `0` when every case passes, `1` when any known failure is
+observed, and `2` when no case fails but at least one is inconclusive. A failed case takes
+precedence over an inconclusive case so a known recurrence is never hidden; the JSON artifact
+retains every case result and its source filename. The artifact includes UTC start and completion
+times and the trusted target-configuration digest. It does not claim that a behavioral change was
+caused by a vendor deployment or model update.
+
+Use the same command for manual, CI, and scheduled monitoring. For example, a cron job can run it
+daily with a unique immutable output such as
+`tmp/regression-run-$(date -u +\%Y\%m\%dT\%H\%M\%SZ).json`. A GitHub Actions workflow can use both
+`workflow_dispatch` and `schedule` triggers:
+
+```yaml
+name: Scheduled UL regressions
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 3 * * *"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ul-regressions-production-sandbox
+  cancel-in-progress: false
+
+jobs:
+  monitor:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        with:
+          version: "0.12.4"
+          python-version: "3.12"
+      - run: uv sync --locked
+      - name: Run UL regressions
+        env:
+          TARGET_TOKEN: ${{ secrets.TARGET_TOKEN }}
+        run: uv run --frozen ul regression run regressions/ --target-config target.json --allow-target-network --confirm-isolated-sandbox --confirm-fresh-state --max-target-calls 100 --output tmp/regression-run-${{ github.run_id }}.json
+      - name: Upload UL evidence
+        if: ${{ !cancelled() && vars.UL_UPLOAD_RAW_EVIDENCE == 'true' }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ul-regression-${{ github.run_id }}
+          path: tmp/regression-run-${{ github.run_id }}.json
+          if-no-files-found: ignore
+          retention-days: 1
+```
+
+Review and update the pinned action commits under your dependency policy. Raw-evidence upload is
+disabled unless the repository variable `UL_UPLOAD_RAW_EVIDENCE` is set to `true`; enable it only
+when GitHub Actions artifact access and retention meet your data policy. Otherwise send the safe
+terminal summary to your alerting system and move raw evidence directly to approved encrypted
+storage. Scheduled monitoring still requires a target that is isolated, has no real business
+effects, and starts every request from equivalent fresh state. Regression run evidence contains
+raw target outputs and may be sensitive; store and retain it according to the same policy as
+single-case replay evidence.
+
 The case contains a target configuration declared by the customer when the case is created. UL
 cannot verify that it was the discovery target; its digest only binds future replay to that
 declaration. UL never executes the embedded configuration. You must separately provide a trusted

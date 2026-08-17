@@ -15,10 +15,12 @@ from pydantic import ValidationError
 from ul.dataset_invariants import JsonValuesEqualInvariant
 from ul.dataset_regression import (
     DatasetRegressionCase,
+    DatasetRegressionRunResult,
     create_dataset_regression_case,
     dataset_regression_target_config_sha256,
     load_dataset_regression_case,
     replay_dataset_regression,
+    run_dataset_regressions,
 )
 from ul.http_target import (
     JsonHttpDatasetTarget,
@@ -263,6 +265,206 @@ def replay_saved_dataset_regression(
         raise typer.Exit(code=1)
     if replay_result.status == "inconclusive":
         raise typer.Exit(code=2)
+
+
+@app.command("run")
+def run_saved_dataset_regressions(
+    cases_path: Annotated[
+        Path,
+        typer.Argument(
+            exists=True,
+            readable=True,
+            help="Saved regression case JSON file or directory of case JSON files.",
+        ),
+    ],
+    target_config: Annotated[
+        Path,
+        typer.Option(
+            exists=True,
+            dir_okay=False,
+            readable=True,
+            help="Separately trusted target config whose digest must match every case.",
+        ),
+    ],
+    output: Annotated[
+        Path,
+        typer.Option(help="New private JSON regression run evidence file."),
+    ],
+    allow_target_network: Annotated[
+        bool, typer.Option(help="Allow requests to the configured sandbox endpoint.")
+    ] = False,
+    confirm_isolated_sandbox: Annotated[
+        bool, typer.Option(help="Confirm the target cannot cause real business effects.")
+    ] = False,
+    confirm_fresh_state: Annotated[
+        bool, typer.Option(help="Confirm every target request starts from the same clean state.")
+    ] = False,
+    allow_insecure_http: Annotated[
+        bool, typer.Option(help="Allow an HTTP target. Intended for local sandboxes.")
+    ] = False,
+    max_target_calls: Annotated[
+        int,
+        typer.Option(min=1, help="Maximum total target requests authorized for this run."),
+    ] = 100,
+) -> None:
+    """Replay saved regressions against the current black-box target."""
+    try:
+        case_labels, regression_cases = _load_regression_cases(cases_path)
+        trusted_target_config = load_json_http_dataset_target_config(target_config)
+        trusted_target_config_sha256 = _target_config_sha256(trusted_target_config)
+        for regression_case in regression_cases:
+            if regression_case.target.config_sha256 != trusted_target_config_sha256:
+                raise ValueError(
+                    f"case {regression_case.case_id} target config digest does not match "
+                    "the trusted target config"
+                )
+        requested_target_calls = sum(
+            regression_case.discovery_repetitions for regression_case in regression_cases
+        )
+        if requested_target_calls > max_target_calls:
+            raise ValueError(
+                f"run requires {requested_target_calls} target calls, exceeding "
+                f"--max-target-calls {max_target_calls}; explicitly raise the call budget"
+            )
+    except (ValidationError, ValueError, RuntimeError) as error:
+        raise typer.BadParameter(_terminal_safe(str(error))) from None
+
+    if not allow_target_network:
+        raise typer.BadParameter(
+            "regression run requires --allow-target-network",
+            param_hint="--allow-target-network",
+        )
+    if not confirm_isolated_sandbox:
+        raise typer.BadParameter(
+            "regression run requires --confirm-isolated-sandbox",
+            param_hint="--confirm-isolated-sandbox",
+        )
+    if not confirm_fresh_state:
+        raise typer.BadParameter(
+            "regression run requires --confirm-fresh-state",
+            param_hint="--confirm-fresh-state",
+        )
+    if output.exists():
+        raise typer.BadParameter(
+            "output already exists; UL will not overwrite it", param_hint="--output"
+        )
+
+    try:
+        target = JsonHttpDatasetTarget.from_config(
+            trusted_target_config,
+            sandbox_confirmed=True,
+            fresh_state_confirmed=True,
+            allow_insecure_http=allow_insecure_http,
+        )
+    except (ValueError, RuntimeError) as error:
+        raise typer.BadParameter(_terminal_safe(str(error)), param_hint="--target-config") from None
+    try:
+        output_stream = _create_private_output(output)
+    except OSError as error:
+        asyncio.run(target.aclose())
+        raise typer.BadParameter(
+            f"cannot create regression run output ({error.__class__.__name__})",
+            param_hint="--output",
+        ) from None
+
+    with output_stream:
+        run_result = asyncio.run(
+            _run_regressions_and_close(
+                regression_cases,
+                target,
+                case_labels=case_labels,
+                max_target_calls=max_target_calls,
+            )
+        )
+        json.dump(
+            run_result.model_dump(mode="json"),
+            output_stream,
+            ensure_ascii=False,
+            indent=2,
+        )
+        output_stream.write("\n")
+        output_stream.flush()
+        os.fsync(output_stream.fileno())
+
+    _print_safe(f"Regression run: {run_result.status}")
+    _print_safe(
+        "Cases: "
+        f"passed={run_result.passed_case_count}, "
+        f"failed={run_result.failed_case_count}, "
+        f"inconclusive={run_result.inconclusive_case_count}"
+    )
+    _print_safe(f"Target calls requested: {run_result.requested_target_calls}")
+    for case_result in run_result.cases:
+        violated_rules = tuple(
+            f"{rule.rule_id} ({rule.severity})"
+            for rule in case_result.result.rules
+            if rule.status == "violated"
+        )
+        violation_summary = (
+            "; violated rules: " + ", ".join(violated_rules) if violated_rules else ""
+        )
+        _print_safe(
+            f"{case_result.label}: {case_result.result.status}{violation_summary}; "
+            f"case={case_result.result.case_id}"
+        )
+    _print_safe(f"Complete regression run evidence: {output}")
+    if run_result.status == "failed":
+        raise typer.Exit(code=1)
+    if run_result.status == "inconclusive":
+        raise typer.Exit(code=2)
+
+
+async def _run_regressions_and_close(
+    regression_cases: tuple[DatasetRegressionCase, ...],
+    target: JsonHttpDatasetTarget,
+    *,
+    case_labels: tuple[str, ...],
+    max_target_calls: int,
+) -> DatasetRegressionRunResult:
+    try:
+        return await run_dataset_regressions(
+            regression_cases,
+            target,
+            case_labels=case_labels,
+            allow_network_egress=True,
+            max_target_calls=max_target_calls,
+        )
+    finally:
+        await target.aclose()
+
+
+def _load_regression_cases(
+    path: Path,
+) -> tuple[tuple[str, ...], tuple[DatasetRegressionCase, ...]]:
+    if path.is_symlink():
+        raise ValueError("regression case input must not be a symbolic link")
+    if path.is_file():
+        case_paths = (path,)
+    elif path.is_dir():
+        try:
+            case_paths = tuple(
+                sorted(
+                    (
+                        candidate
+                        for candidate in path.iterdir()
+                        if candidate.name.casefold().endswith(".json")
+                    ),
+                    key=lambda candidate: candidate.name,
+                )
+            )
+        except OSError:
+            raise RuntimeError("regression case directory could not be read") from None
+        if not case_paths:
+            raise ValueError("regression case directory contains no JSON files")
+    else:
+        raise ValueError("regression case input must be a regular file or directory")
+    if len(case_paths) > 100:
+        raise ValueError("regression run supports at most 100 cases")
+    regression_cases = tuple(load_dataset_regression_case(case_path) for case_path in case_paths)
+    case_ids = tuple(regression_case.case_id for regression_case in regression_cases)
+    if len(case_ids) != len(set(case_ids)):
+        raise ValueError("regression run case IDs must be unique")
+    return tuple(case_path.name for case_path in case_paths), regression_cases
 
 
 def _build_regression_case(

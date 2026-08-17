@@ -13,6 +13,7 @@ from ul.dataset_regression import (
     create_dataset_regression_case,
     load_dataset_regression_case,
     replay_dataset_regression,
+    run_dataset_regressions,
 )
 from ul.http_target import JsonHttpDatasetTargetConfig
 from ul_core.dataset import ObservedAgentOutput
@@ -35,7 +36,11 @@ def _rule(*, rule_id: str = "invoice-matches-request") -> JsonValuesEqualInvaria
     )
 
 
-def _case(*, repetitions: int = 3) -> DatasetRegressionCase:
+def _case(
+    *,
+    repetitions: int = 3,
+    variation_input: str = "Pay invoice AC-101 instead of AC-100.",
+) -> DatasetRegressionCase:
     return create_dataset_regression_case(
         finding_id=FINDING_ID,
         evidence_sha256="3" * 64,
@@ -44,7 +49,7 @@ def _case(*, repetitions: int = 3) -> DatasetRegressionCase:
         operator_id="context.pasted_block",
         operator_version="1.0.0",
         original_input="Pay invoice AC-100.",
-        variation_input="Pay invoice AC-101 instead of AC-100.",
+        variation_input=variation_input,
         target_config=JsonHttpDatasetTargetConfig(
             version=1,
             url="http://127.0.0.1:8765/execute",
@@ -196,6 +201,110 @@ def test_replay_rejects_case_over_sdk_target_call_budget_before_execution() -> N
         asyncio.run(replay_dataset_regression(_case(), target, max_target_calls=2))
 
     assert target.inputs == []
+
+
+def test_run_executes_cases_in_order_and_aggregates_statuses() -> None:
+    passing_case = _case(repetitions=2)
+    failing_case = _case(
+        repetitions=2,
+        variation_input="Pay invoice AC-102 instead of AC-100.",
+    )
+    target = _Target(
+        [
+            _output("AC-101", "AC-101"),
+            _output("AC-101", "AC-101"),
+            _output("AC-100", "AC-102"),
+            RuntimeError("provider detail"),
+        ]
+    )
+
+    result = asyncio.run(
+        run_dataset_regressions(
+            (passing_case, failing_case),
+            target,
+            case_labels=("invoice-correction.json", "invoice-substitution.json"),
+        )
+    )
+
+    assert result.status == "failed"
+    assert result.passed_case_count == 1
+    assert result.failed_case_count == 1
+    assert result.inconclusive_case_count == 0
+    assert result.requested_target_calls == 4
+    assert [case_result.label for case_result in result.cases] == [
+        "invoice-correction.json",
+        "invoice-substitution.json",
+    ]
+    assert [case_result.result.case_id for case_result in result.cases] == [
+        passing_case.case_id,
+        failing_case.case_id,
+    ]
+    assert target.inputs == [
+        passing_case.variation.variation_input,
+        passing_case.variation.variation_input,
+        failing_case.variation.variation_input,
+        failing_case.variation.variation_input,
+    ]
+    assert "provider detail" not in result.model_dump_json()
+
+
+def test_run_returns_inconclusive_when_no_case_fails() -> None:
+    passing_case = _case(repetitions=1)
+    inconclusive_case = _case(
+        repetitions=1,
+        variation_input="Pay invoice AC-102 instead of AC-100.",
+    )
+    target = _Target([_output("AC-101", "AC-101"), RuntimeError("unavailable")])
+
+    result = asyncio.run(run_dataset_regressions((passing_case, inconclusive_case), target))
+
+    assert result.status == "inconclusive"
+    assert result.passed_case_count == 1
+    assert result.inconclusive_case_count == 1
+
+
+def test_run_enforces_total_budget_and_unique_cases_before_execution() -> None:
+    first_case = _case(repetitions=2)
+    second_case = _case(
+        repetitions=3,
+        variation_input="Pay invoice AC-102 instead of AC-100.",
+    )
+    target = _Target([_output("AC-101", "AC-101")] * 5)
+
+    with pytest.raises(ValueError, match="authorized target call budget"):
+        asyncio.run(
+            run_dataset_regressions(
+                (first_case, second_case),
+                target,
+                max_target_calls=4,
+            )
+        )
+    assert target.inputs == []
+
+    with pytest.raises(ValueError, match="case IDs must be unique"):
+        asyncio.run(run_dataset_regressions((first_case, first_case), target))
+    assert target.inputs == []
+
+    with pytest.raises(ValueError, match="labels must match"):
+        asyncio.run(
+            run_dataset_regressions(
+                (first_case, second_case),
+                target,
+                case_labels=("only-one.json",),
+            )
+        )
+    assert target.inputs == []
+
+    for invalid_label in ("", "\udcff"):
+        with pytest.raises(ValueError, match="1 to 500 characters"):
+            asyncio.run(
+                run_dataset_regressions(
+                    (first_case, second_case),
+                    target,
+                    case_labels=(invalid_label, "second.json"),
+                )
+            )
+        assert target.inputs == []
 
 
 def test_loader_rejects_duplicate_deep_and_oversized_input(tmp_path: Path) -> None:
