@@ -199,7 +199,7 @@ def _normalize_id_field(value: object) -> str | None:
         if all(c == "0" for c in normalized):
             return None
         return normalized
-    except Exception:
+    except ValueError:
         return None
 
 
