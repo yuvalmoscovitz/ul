@@ -171,6 +171,7 @@ def _write_evidence(path: Path) -> None:
 
 class _ReplayServer(ThreadingHTTPServer):
     fixed: bool
+    unavailable: bool
     requests: list[dict[str, Any]]
     authorization_headers: list[str | None]
 
@@ -182,6 +183,11 @@ class _ReplayHandler(BaseHTTPRequestHandler):
         payload = json.loads(self.rfile.read(content_length))
         replay_server.requests.append(cast(dict[str, Any], payload))
         replay_server.authorization_headers.append(self.headers.get("X-Test-Token"))
+        if replay_server.unavailable:
+            self.send_response(500)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
         invoice_reference = "AC-100" if replay_server.fixed else "AC-101"
         response = json.dumps(
             {
@@ -209,6 +215,7 @@ class _ReplayHandler(BaseHTTPRequestHandler):
 def _running_server() -> Generator[tuple[_ReplayServer, str]]:
     server = _ReplayServer(("127.0.0.1", 0), _ReplayHandler)
     server.fixed = False
+    server.unavailable = False
     server.requests = []
     server.authorization_headers = []
     thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -302,6 +309,30 @@ def _replay_arguments(case_path: Path, target_config: Path, result_path: Path) -
     ]
 
 
+def _run_arguments(
+    cases_path: Path,
+    target_config: Path,
+    result_path: Path,
+    *,
+    max_target_calls: int = 100,
+) -> list[str]:
+    return [
+        "regression",
+        "run",
+        str(cases_path),
+        "--target-config",
+        str(target_config),
+        "--allow-target-network",
+        "--confirm-isolated-sandbox",
+        "--confirm-fresh-state",
+        "--allow-insecure-http",
+        "--max-target-calls",
+        str(max_target_calls),
+        "--output",
+        str(result_path),
+    ]
+
+
 def test_confirmed_finding_save_and_replay_real_loopback(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -361,6 +392,144 @@ def test_confirmed_finding_save_and_replay_real_loopback(
     assert defective_result["status"] == "failed"
     assert fixed_result["status"] == "passed"
     assert len(defective_result["executions"]) == len(fixed_result["executions"]) == 3
+
+
+def test_regression_run_monitors_saved_cases_against_current_black_box_target(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    evidence = tmp_path / "evidence.jsonl"
+    cases_directory = tmp_path / "regressions"
+    cases_directory.mkdir()
+    invoice_case_path = cases_directory / "z-invoice.json"
+    amount_case_path = cases_directory / "a-amount.json"
+    defective_result_path = tmp_path / "defective-run.json"
+    fixed_result_path = tmp_path / "fixed-run.json"
+    inconclusive_result_path = tmp_path / "inconclusive-run.json"
+    _write_evidence(evidence)
+    monkeypatch.setenv("UL_REGRESSION_TEST_SECRET", TEST_SECRET)
+
+    with _running_server() as (server, endpoint):
+        target_config = tmp_path / "target.json"
+        _write_target_config(target_config, endpoint)
+        _confirm_finding(evidence)
+        invoice_saved = runner.invoke(
+            app,
+            _save_arguments(evidence, target_config, invoice_case_path),
+        )
+        amount_arguments = _save_arguments(evidence, target_config, amount_case_path)
+        amount_arguments[amount_arguments.index(RULE_ID)] = SECOND_RULE_ID
+        amount_saved = runner.invoke(app, amount_arguments)
+        assert invoice_saved.exit_code == amount_saved.exit_code == 0
+
+        expected_case_ids = [
+            json.loads(amount_case_path.read_text(encoding="utf-8"))["case_id"],
+            json.loads(invoice_case_path.read_text(encoding="utf-8"))["case_id"],
+        ]
+        defective = runner.invoke(
+            app,
+            _run_arguments(
+                cases_directory,
+                target_config,
+                defective_result_path,
+                max_target_calls=6,
+            ),
+        )
+        assert defective.exit_code == 1, defective.output
+        assert "passed=0, failed=2, inconclusive=0" in defective.output
+        assert len(server.requests) == 6
+        defective_result = json.loads(defective_result_path.read_text(encoding="utf-8"))
+        assert defective_result["status"] == "failed"
+        assert [case["label"] for case in defective_result["cases"]] == [
+            "a-amount.json",
+            "z-invoice.json",
+        ]
+        assert [case["result"]["case_id"] for case in defective_result["cases"]] == (
+            expected_case_ids
+        )
+        assert "a-amount.json: failed" in defective.output
+        assert f"{SECOND_RULE_ID} (high)" in defective.output
+
+        server.fixed = True
+        fixed = runner.invoke(
+            app,
+            _run_arguments(
+                cases_directory,
+                target_config,
+                fixed_result_path,
+                max_target_calls=6,
+            ),
+        )
+        assert fixed.exit_code == 0, fixed.output
+        assert "passed=2, failed=0, inconclusive=0" in fixed.output
+        assert len(server.requests) == 12
+
+        server.unavailable = True
+        inconclusive = runner.invoke(
+            app,
+            _run_arguments(
+                invoice_case_path,
+                target_config,
+                inconclusive_result_path,
+                max_target_calls=3,
+            ),
+        )
+        assert inconclusive.exit_code == 2, inconclusive.output
+        assert "passed=0, failed=0, inconclusive=1" in inconclusive.output
+        assert len(server.requests) == 15
+
+    for artifact in (
+        defective_result_path,
+        fixed_result_path,
+        inconclusive_result_path,
+    ):
+        serialized = artifact.read_text(encoding="utf-8")
+        assert TEST_SECRET not in serialized
+        if os.name != "nt":
+            assert stat.S_IMODE(artifact.stat().st_mode) == 0o600
+    assert TEST_SECRET not in defective.output + fixed.output + inconclusive.output
+
+
+def test_regression_run_preflights_total_budget_before_secrets_output_or_network(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    evidence = tmp_path / "evidence.jsonl"
+    cases_directory = tmp_path / "regressions"
+    cases_directory.mkdir()
+    first_case_path = cases_directory / "first.json"
+    second_case_path = cases_directory / "second.json"
+    result_path = tmp_path / "run.json"
+    _write_evidence(evidence)
+
+    with _running_server() as (server, endpoint):
+        target_config = tmp_path / "target.json"
+        _write_target_config(target_config, endpoint)
+        _confirm_finding(evidence)
+        monkeypatch.setenv("UL_REGRESSION_TEST_SECRET", TEST_SECRET)
+        first_saved = runner.invoke(
+            app,
+            _save_arguments(evidence, target_config, first_case_path),
+        )
+        second_arguments = _save_arguments(evidence, target_config, second_case_path)
+        second_arguments[second_arguments.index(RULE_ID)] = SECOND_RULE_ID
+        second_saved = runner.invoke(app, second_arguments)
+        assert first_saved.exit_code == second_saved.exit_code == 0
+        monkeypatch.delenv("UL_REGRESSION_TEST_SECRET")
+
+        run = runner.invoke(
+            app,
+            _run_arguments(
+                cases_directory,
+                target_config,
+                result_path,
+                max_target_calls=5,
+            ),
+        )
+
+    assert run.exit_code == 2
+    assert "6" in run.output and "5" in run.output
+    assert server.requests == []
+    assert TEST_SECRET not in run.output
+    assert not result_path.exists()
 
 
 def test_save_requires_explicit_sensitive_input_confirmation_and_confirmed_review(

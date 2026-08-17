@@ -61,12 +61,15 @@ from ul.dataset_regression import (
     DatasetRegressionInvariantSuite,
     DatasetRegressionLineage,
     DatasetRegressionResult,
+    DatasetRegressionRunCaseResult,
+    DatasetRegressionRunResult,
     DatasetRegressionTargetSnapshot,
     DatasetRegressionVariation,
     create_dataset_regression_case,
     dataset_regression_target_config_sha256,
     load_dataset_regression_case,
     replay_dataset_regression,
+    run_dataset_regressions,
 )
 from ul.deconstruction import OpenRouterDatasetSettings, OpenRouterSemanticDeconstructor
 from ul.http_target import (
@@ -103,6 +106,8 @@ __all__ = [
     "DatasetRegressionInvariantSuite",
     "DatasetRegressionLineage",
     "DatasetRegressionResult",
+    "DatasetRegressionRunCaseResult",
+    "DatasetRegressionRunResult",
     "DatasetRegressionTargetSnapshot",
     "DatasetRegressionVariation",
     "DatasetTargetExecutor",
@@ -141,4 +146,5 @@ __all__ = [
     "load_json_http_dataset_target_config",
     "parse_otlp_traces",
     "replay_dataset_regression",
+    "run_dataset_regressions",
 ]
