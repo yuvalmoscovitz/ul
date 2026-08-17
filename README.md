@@ -1,5 +1,10 @@
 # UL
 
+[![CI](https://github.com/yuvalmoscovitz/ul/actions/workflows/ci.yml/badge.svg)](https://github.com/yuvalmoscovitz/ul/actions/workflows/ci.yml)
+
+UL is early-stage; APIs and evidence schemas may change. [Contributing](CONTRIBUTING.md) ·
+[Security](SECURITY.md) · [MIT License](LICENSE)
+
 UL actively tests black-box AI agents for behavioral differences that could matter in
 high-risk workflows. It starts with a real interaction, makes a realistic variation, and
 replays both against the same isolated agent several times.
