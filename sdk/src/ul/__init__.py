@@ -74,6 +74,7 @@ from ul.http_target import (
     JsonHttpDatasetTargetConfig,
     load_json_http_dataset_target_config,
 )
+from ul.otlp_ingest import OtlpIngestResult, OtlpInteractionRecord, parse_otlp_traces
 
 __all__ = [
     "Action",
@@ -118,6 +119,8 @@ __all__ = [
     "OpenRouterDatasetSettings",
     "OpenRouterSemanticDeconstructor",
     "OracleFinding",
+    "OtlpIngestResult",
+    "OtlpInteractionRecord",
     "RenderedUserInput",
     "SafetyEnvelope",
     "Scenario",
@@ -136,5 +139,6 @@ __all__ = [
     "load_dataset_invariant_suite",
     "load_dataset_regression_case",
     "load_json_http_dataset_target_config",
+    "parse_otlp_traces",
     "replay_dataset_regression",
 ]

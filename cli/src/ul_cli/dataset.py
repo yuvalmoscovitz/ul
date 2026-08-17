@@ -40,11 +40,13 @@ from ul.http_target import (
 )
 from ul_core.dataset import ObservedOutcome
 
+from ul_cli.dataset_ingest import app as ingest_app
 from ul_cli.dataset_review import report_dataset_evidence, review_dataset_finding
 
 app = typer.Typer(help="Explore behavioral differences in observed agent interactions.")
 console = Console()
 
+app.add_typer(ingest_app, name="ingest")
 app.command("report")(report_dataset_evidence)
 app.command("review")(review_dataset_finding)
 
