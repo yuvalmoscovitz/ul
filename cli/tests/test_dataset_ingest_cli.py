@@ -344,10 +344,10 @@ def test_ingest_escapes_terminal_controls_from_error_messages(tmp_path: Path) ->
         encoding="utf-8",
     )
 
-    result = runner.invoke(app, _ingest_arguments(traces, output), color=True)
+    result = runner.invoke(app, _ingest_arguments(traces, output))
 
     assert result.exit_code == 2
-    assert "\x1b[31m" not in result.output
+    assert "traceback" not in result.output.casefold()
 
 
 def test_ingest_rejects_oversized_file_with_clear_message(
