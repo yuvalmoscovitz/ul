@@ -26,6 +26,7 @@ from ul import (
     InteractionRecord,
     JsonHttpDatasetTargetConfig,
     ObservedAgentOutput,
+    OpenAICompatibleDatasetSettings,
     SemanticFrame,
 )
 from ul.dataset_augmentation import DatasetAugmentationCandidate
@@ -72,6 +73,12 @@ def _settings(**overrides: object) -> SimpleNamespace:
         "max_render_tokens": 512,
         "max_response_bytes": 1_000_000,
         "timeout_seconds": 60.0,
+        "semantic_provider_id": "openrouter",
+        "semantic_endpoint_sha256": (
+            "76ef4ad6f0c8a4ae66efb13875c107cee40c78997a212353d379acfbb2f45591"
+        ),
+        "api_key_required": True,
+        "api_key_environment_variable": "OPEN_ROUTER_API_KEY",
     }
     values.update(overrides)
     return SimpleNamespace(**values)
@@ -401,7 +408,7 @@ def test_dry_run_validates_and_makes_no_external_calls(
     def unexpected_target(*args: object, **kwargs: object) -> None:
         raise AssertionError("dry-run constructed a target client")
 
-    monkeypatch.setattr(main, "OpenRouterSemanticDeconstructor", unexpected_deconstructor)
+    monkeypatch.setattr(main, "create_semantic_model_deconstructor", unexpected_deconstructor)
     monkeypatch.setattr(main.JsonHttpDatasetTarget, "from_config", unexpected_target)
     result = runner.invoke(
         root_app,
@@ -436,6 +443,99 @@ def test_dry_run_validates_and_makes_no_external_calls(
     assert "estimate a production failure rate" in result.output
     assert "No model or target requests sent." in result.output
     assert "Transfer 100" not in result.output
+
+
+def test_openai_compatible_dry_run_reports_provider_without_making_calls(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    dataset = tmp_path / "interactions.jsonl"
+    _write_dataset(dataset, [_record()])
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("UL_DATASET_SEMANTIC_PROVIDER", "openai-compatible")
+    monkeypatch.setenv("UL_DATASET_OPENAI_BASE_URL", "http://localhost:8000/v1")
+    monkeypatch.setenv("UL_DATASET_MODEL", "local-semantic-model")
+
+    def unexpected_deconstructor(*args: object, **kwargs: object) -> None:
+        raise AssertionError("dry-run constructed a semantic model client")
+
+    monkeypatch.setattr(main, "create_semantic_model_deconstructor", unexpected_deconstructor)
+    result = runner.invoke(root_app, ["dataset", "evaluate", str(dataset), "--dry-run"])
+
+    assert result.exit_code == 0, result.output
+    assert "Semantic provider: openai-compatible (endpoint sha256: cbff7260a780)" in result.output
+    assert "http://localhost:8000/v1" not in result.output
+    assert "No model or target requests sent." in result.output
+
+
+def test_openai_compatible_cli_hides_rejected_base_url_secrets(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    dataset = tmp_path / "interactions.jsonl"
+    _write_dataset(dataset, [_record()])
+    credential_sentinel = "credential-sentinel"
+    query_sentinel = "query-sentinel"
+    rejected_url = (
+        f"https://user:{credential_sentinel}@models.example.test/v1?token={query_sentinel}"
+    )
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("UL_DATASET_SEMANTIC_PROVIDER", "openai-compatible")
+    monkeypatch.setenv("UL_DATASET_OPENAI_BASE_URL", rejected_url)
+    monkeypatch.setenv("UL_DATASET_MODEL", "customer/model")
+
+    result = runner.invoke(root_app, ["dataset", "evaluate", str(dataset), "--dry-run"])
+
+    normalized_output = " ".join(_ANSI_ESCAPE_PATTERN.sub("", result.output).split())
+    assert result.exit_code != 0
+    assert "UL_DATASET_OPENAI_BASE_URL must be an HTTPS API root" in normalized_output
+    assert credential_sentinel not in normalized_output
+    assert query_sentinel not in normalized_output
+    assert rejected_url not in normalized_output
+
+
+def test_openai_compatible_execution_allows_an_unauthenticated_endpoint(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    dataset = tmp_path / "interactions.jsonl"
+    output = tmp_path / "results.jsonl"
+    _write_dataset(dataset, [_record()])
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("UL_DATASET_SEMANTIC_PROVIDER", "openai-compatible")
+    monkeypatch.setenv("UL_DATASET_OPENAI_BASE_URL", "https://models.example.test/v1")
+    monkeypatch.setenv("UL_DATASET_MODEL", "customer/model")
+    monkeypatch.setenv("UL_LIVE", "true")
+    monkeypatch.delenv("UL_DATASET_OPENAI_API_KEY", raising=False)
+
+    class FakeTarget:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            pass
+
+    async def fake_evaluate(*args: object, **kwargs: object) -> tuple[object, ...]:
+        return ()
+
+    monkeypatch.setattr(main, "JsonHttpDatasetTarget", FakeTarget)
+    monkeypatch.setattr(main, "_evaluate_interaction_records", fake_evaluate)
+
+    result = runner.invoke(
+        root_app,
+        [
+            "dataset",
+            "evaluate",
+            str(dataset),
+            "--target-url",
+            "https://sandbox.example.test/execute",
+            "--allow-target-network",
+            "--confirm-isolated-sandbox",
+            "--confirm-fresh-state",
+            "--output",
+            str(output),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert output.exists()
 
 
 def test_invariant_dry_run_reports_rules_authority_and_no_extra_calls(
@@ -540,7 +640,7 @@ def test_invalid_invariant_config_stops_before_settings_network_or_output(
     def unexpected_settings() -> None:
         raise AssertionError("invalid invariants reached settings")
 
-    monkeypatch.setattr(main, "OpenRouterDatasetSettings", unexpected_settings)
+    monkeypatch.setattr(main, "load_dataset_semantic_settings", unexpected_settings)
     result = runner.invoke(
         root_app,
         [
@@ -592,7 +692,9 @@ def test_invariant_evaluation_reuses_results_without_extra_runner_calls(
         invariant_calls += 1
         return evaluation
 
-    monkeypatch.setattr(main, "OpenRouterSemanticDeconstructor", lambda settings: AsyncContext())
+    monkeypatch.setattr(
+        main, "create_semantic_model_deconstructor", lambda settings: AsyncContext()
+    )
     monkeypatch.setattr(main, "DatasetAugmentationEngine", lambda *args: object())
     monkeypatch.setattr(main, "DatasetEvaluationRunner", FakeRunner)
     monkeypatch.setattr(main, "evaluate_dataset_invariants", evaluate_once)
@@ -647,7 +749,7 @@ def test_target_config_dry_run_validates_environment_and_makes_no_calls(
     def unexpected_deconstructor(*args: object, **kwargs: object) -> None:
         raise AssertionError("dry-run constructed a semantic model client")
 
-    monkeypatch.setattr(main, "OpenRouterSemanticDeconstructor", unexpected_deconstructor)
+    monkeypatch.setattr(main, "create_semantic_model_deconstructor", unexpected_deconstructor)
     result = runner.invoke(
         root_app,
         [
@@ -842,7 +944,7 @@ def test_preflight_reports_safe_line_numbered_errors_without_external_calls(
     def unexpected_settings() -> None:
         raise AssertionError("invalid data reached model setup")
 
-    monkeypatch.setattr(main, "OpenRouterDatasetSettings", unexpected_settings)
+    monkeypatch.setattr(main, "load_dataset_semantic_settings", unexpected_settings)
     result = runner.invoke(root_app, ["dataset", "evaluate", str(dataset)])
 
     assert result.exit_code != 0
@@ -860,7 +962,7 @@ def test_preflight_rejects_duplicate_ids_before_external_calls(
     def unexpected_settings() -> None:
         raise AssertionError("duplicate data reached model setup")
 
-    monkeypatch.setattr(main, "OpenRouterDatasetSettings", unexpected_settings)
+    monkeypatch.setattr(main, "load_dataset_semantic_settings", unexpected_settings)
     result = runner.invoke(root_app, ["dataset", "evaluate", str(dataset)])
 
     assert result.exit_code != 0
@@ -889,7 +991,7 @@ def test_preflight_rejects_selected_model_input_over_limit(
     _write_dataset(dataset, [_record(), _record("interaction-2")])
     monkeypatch.setattr(
         main,
-        "OpenRouterDatasetSettings",
+        "load_dataset_semantic_settings",
         lambda: _settings(max_input_chars=50),
     )
 
@@ -908,7 +1010,7 @@ def test_preflight_enforces_record_and_target_call_bounds(
     def unexpected_settings() -> None:
         raise AssertionError("oversized data reached model setup")
 
-    monkeypatch.setattr(main, "OpenRouterDatasetSettings", unexpected_settings)
+    monkeypatch.setattr(main, "load_dataset_semantic_settings", unexpected_settings)
     too_many_records = runner.invoke(
         root_app,
         ["dataset", "evaluate", str(dataset), "--dry-run"],
@@ -919,8 +1021,8 @@ def test_preflight_enforces_record_and_target_call_bounds(
 
     monkeypatch.setattr(
         main,
-        "OpenRouterDatasetSettings",
-        lambda: SimpleNamespace(max_input_chars=50_000),
+        "load_dataset_semantic_settings",
+        lambda: _settings(),
     )
     _write_dataset(dataset, [_record(f"interaction-{index}") for index in range(17)])
     maximum_calls = runner.invoke(
@@ -970,7 +1072,7 @@ def test_repetition_budget_is_explicit_and_checked_before_external_setup(
     def unexpected_settings() -> None:
         raise AssertionError("over-budget repetition plan reached model setup")
 
-    monkeypatch.setattr(main, "OpenRouterDatasetSettings", unexpected_settings)
+    monkeypatch.setattr(main, "load_dataset_semantic_settings", unexpected_settings)
     huge_plan = runner.invoke(
         root_app,
         [
@@ -991,8 +1093,8 @@ def test_repetition_budget_is_explicit_and_checked_before_external_setup(
 
     monkeypatch.setattr(
         main,
-        "OpenRouterDatasetSettings",
-        lambda: SimpleNamespace(max_input_chars=50_000),
+        "load_dataset_semantic_settings",
+        lambda: _settings(),
     )
     exact_budget = runner.invoke(
         root_app,
@@ -1109,7 +1211,7 @@ def test_execution_refuses_to_overwrite_output_before_model_setup(
     def unexpected_settings() -> None:
         raise AssertionError("output collision reached model setup")
 
-    monkeypatch.setattr(main, "OpenRouterDatasetSettings", unexpected_settings)
+    monkeypatch.setattr(main, "load_dataset_semantic_settings", unexpected_settings)
     result = runner.invoke(
         root_app,
         [
@@ -1141,14 +1243,14 @@ def test_execution_rejects_missing_header_secret_before_model_or_output(
     monkeypatch.delenv("MISSING_SANDBOX_TOKEN", raising=False)
     monkeypatch.setattr(
         main,
-        "OpenRouterDatasetSettings",
+        "load_dataset_semantic_settings",
         _settings,
     )
 
     def unexpected_deconstructor(*args: object, **kwargs: object) -> None:
         raise AssertionError("missing target auth reached semantic model setup")
 
-    monkeypatch.setattr(main, "OpenRouterSemanticDeconstructor", unexpected_deconstructor)
+    monkeypatch.setattr(main, "create_semantic_model_deconstructor", unexpected_deconstructor)
     result = runner.invoke(
         root_app,
         [
@@ -1210,7 +1312,7 @@ def test_execution_creates_private_explicit_output(
 
     monkeypatch.setattr(
         main,
-        "OpenRouterDatasetSettings",
+        "load_dataset_semantic_settings",
         _settings,
     )
     monkeypatch.setattr(main, "JsonHttpDatasetTarget", FakeTarget)
@@ -1322,7 +1424,7 @@ def test_target_config_runs_nested_request_and_response_against_loopback(
 
         monkeypatch.setattr(
             main,
-            "OpenRouterDatasetSettings",
+            "load_dataset_semantic_settings",
             _settings,
         )
         monkeypatch.setattr(main, "_evaluate_interaction_records", evaluate_once)
@@ -1444,6 +1546,39 @@ def test_operator_list_is_fixed_and_self_correction_keeps_existing_call_accounti
     assert "Potential target calls: up to 6" in dry_run.output
 
 
+def test_run_context_records_canonical_provider_identity() -> None:
+    record = _evaluation_result("interaction-1").source
+    openrouter_context = cast(Any, _run_context((record,)))
+
+    custom_settings = OpenAICompatibleDatasetSettings(
+        live_calls=True,
+        allow_external_data_processing=True,
+        api_key=SecretStr("test-key"),
+        provider_id="customer-gateway",
+        base_url="https://models.example.test/v1",
+        model="customer/model",
+    )
+    custom_context = main._dataset_evidence_run_context(
+        selected_records=(record,),
+        selected_operator_ids=("surface.rephrase",),
+        repetitions=1,
+        invariant_suite=None,
+        target_config=JsonHttpDatasetTargetConfig(
+            version=1,
+            url="https://sandbox.example.test/execute",
+            headers_from_env={},
+            request_json_template={"input": "{{input}}"},
+            response_json_pointer="",
+        ),
+        settings=custom_settings,
+    )
+
+    assert custom_context.semantic_settings.provider == "customer-gateway"
+    assert len(custom_context.semantic_settings.endpoint_sha256) == 64
+    assert "https://models.example.test/v1" not in custom_context.model_dump_json()
+    assert custom_context.context_sha256 != openrouter_context.context_sha256
+
+
 def test_resume_skips_already_processed_interaction_ids(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1509,7 +1644,7 @@ def test_resume_skips_already_processed_interaction_ids(
 
     monkeypatch.setattr(
         main,
-        "OpenRouterDatasetSettings",
+        "load_dataset_semantic_settings",
         _settings,
     )
     monkeypatch.setattr(main, "JsonHttpDatasetTarget", FakeTarget)
@@ -1569,7 +1704,7 @@ def test_resume_exits_early_when_all_records_already_processed(
         + "\n",
         encoding="utf-8",
     )
-    monkeypatch.setattr(main, "OpenRouterDatasetSettings", _settings)
+    monkeypatch.setattr(main, "load_dataset_semantic_settings", _settings)
 
     result = runner.invoke(
         root_app,
@@ -1615,7 +1750,7 @@ def test_all_complete_resume_preserves_prior_review_finding_exit_code(
         + "\n",
         encoding="utf-8",
     )
-    monkeypatch.setattr(main, "OpenRouterDatasetSettings", _settings)
+    monkeypatch.setattr(main, "load_dataset_semantic_settings", _settings)
 
     result = runner.invoke(
         root_app,
@@ -1692,7 +1827,7 @@ def test_all_complete_resume_preserves_prior_invariant_exit_code(
         + "\n",
         encoding="utf-8",
     )
-    monkeypatch.setattr(main, "OpenRouterDatasetSettings", _settings)
+    monkeypatch.setattr(main, "load_dataset_semantic_settings", _settings)
 
     result = runner.invoke(
         root_app,
@@ -1996,7 +2131,7 @@ def test_resume_dry_run_accepts_read_only_evidence(
         encoding="utf-8",
     )
     evidence.chmod(0o400)
-    monkeypatch.setattr(main, "OpenRouterDatasetSettings", _settings)
+    monkeypatch.setattr(main, "load_dataset_semantic_settings", _settings)
 
     result = runner.invoke(
         root_app,
@@ -2073,7 +2208,7 @@ def test_cli_rejects_duplicate_or_unknown_self_correction_operator_before_calls(
     def unexpected_settings() -> None:
         raise AssertionError("invalid operator selection reached model setup")
 
-    monkeypatch.setattr(main, "OpenRouterDatasetSettings", unexpected_settings)
+    monkeypatch.setattr(main, "load_dataset_semantic_settings", unexpected_settings)
     arguments = ["dataset", "evaluate", str(dataset)]
     for operator_id in operators:
         arguments.extend(("--operator", operator_id))

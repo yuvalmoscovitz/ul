@@ -388,6 +388,35 @@ def test_live_environment_respects_granular_false_override(
         subprocess_environment(dry_run=False)
 
 
+def test_live_environment_supports_keyless_loopback_openai_provider(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("UL_DATASET_SEMANTIC_PROVIDER", "openai-compatible")
+    monkeypatch.setenv("UL_DATASET_OPENAI_BASE_URL", "http://127.0.0.1:8000/v1")
+    monkeypatch.setenv("UL_DATASET_OPENAI_PROVIDER_ID", "local-vllm")
+    monkeypatch.setenv("UL_DATASET_MODEL", "local-model")
+    monkeypatch.setenv("UL_LIVE", "true")
+    monkeypatch.delenv("UL_DATASET_OPENAI_API_KEY", raising=False)
+
+    subprocess_environment = cast(
+        Callable[..., dict[str, str]], quickstart.__dict__["_subprocess_environment"]
+    )
+    environment = subprocess_environment(dry_run=False)
+
+    assert environment == {
+        "UL_DATASET_SEMANTIC_PROVIDER": "openai-compatible",
+        "UL_DATASET_OPENAI_PROVIDER_ID": "local-vllm",
+        "UL_DATASET_OPENAI_BASE_URL": "http://127.0.0.1:8000/v1",
+        "UL_DATASET_MODEL": "local-model",
+        "UL_DATASET_RENDER_MODEL": "local-model",
+        "UL_DATASET_EQUIVALENCE_MODEL": "local-model",
+        "UL_DATASET_LIVE_CALLS": "true",
+        "UL_DATASET_ALLOW_EXTERNAL_DATA_PROCESSING": "true",
+    }
+
+
 def test_runner_accepts_only_the_exact_stable_wrong_invoice_finding(tmp_path: Path) -> None:
     confirms_repeatable_wrong_invoice = cast(
         Callable[[Path], bool],

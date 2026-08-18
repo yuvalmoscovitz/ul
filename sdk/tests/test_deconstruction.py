@@ -12,12 +12,19 @@ from ul.dataset_augmentation import (
     DatasetAugmentationEngine,
     builtin_dataset_augmentation_operators,
 )
-from ul.deconstruction import OpenRouterDatasetSettings, OpenRouterSemanticDeconstructor
+from ul.deconstruction import (
+    OpenAICompatibleDatasetSettings,
+    OpenRouterDatasetSettings,
+    SemanticModelDeconstructor,
+    create_semantic_model_deconstructor,
+    load_dataset_semantic_settings,
+)
 from ul_core.dataset import InteractionRecord, SemanticFrame, UserInputRecord
 from ul_core.prompts import prompt_provenance
 
 pytestmark = pytest.mark.asyncio
 _TEST_API_KEY = SecretStr("test-openrouter-key")
+_TEST_CUSTOMER_API_KEY = SecretStr("test-customer-key")
 
 
 def settings(
@@ -40,6 +47,27 @@ def settings(
         max_render_tokens=max_render_tokens,
         max_response_bytes=max_response_bytes,
         timeout_seconds=timeout_seconds,
+    )
+
+
+def openai_compatible_settings(
+    *,
+    live_calls: bool = True,
+    allow_external_data_processing: bool = True,
+    api_key: SecretStr | None = _TEST_CUSTOMER_API_KEY,
+    provider_id: str = "customer-model-gateway",
+    base_url: str = "https://models.example.test/openai/v1/",
+    model: str = "customer/semantic-model",
+) -> OpenAICompatibleDatasetSettings:
+    return OpenAICompatibleDatasetSettings(
+        live_calls=live_calls,
+        allow_external_data_processing=allow_external_data_processing,
+        api_key=api_key,
+        provider_id=provider_id,
+        base_url=base_url,
+        model=model,
+        max_output_tokens=321,
+        timeout_seconds=12,
     )
 
 
@@ -190,6 +218,7 @@ async def test_deconstruct_sends_one_bounded_strict_structured_request() -> None
         request_count += 1
         assert request.url == "https://openrouter.ai/api/v1/chat/completions"
         assert request.headers["authorization"] == "Bearer test-openrouter-key"
+        assert request.headers["accept-encoding"] == "identity"
         body = json.loads(request.content)
         assert body["model"] == "google/gemini-2.5-flash"
         assert body["reasoning"] == {"effort": "minimal"}
@@ -233,28 +262,266 @@ async def test_deconstruct_sends_one_bounded_strict_structured_request() -> None
         return completion(json.dumps(frame_payload()))
 
     client = mock_client(handler)
-    async with OpenRouterSemanticDeconstructor(settings(), client=client) as deconstructor:
+    async with create_semantic_model_deconstructor(settings(), client=client) as deconstructor:
         frame = await deconstructor.deconstruct(interaction())
 
     assert request_count == 1
     assert not client.is_closed
     assert frame.interaction_id == "interaction-1"
     assert frame.schema_version == "1.0.0"
-    assert frame.extractor_version == "openrouter-semantic-deconstructor/1.0.0"
+    assert frame.extractor_version == "semantic-deconstructor/2.0.0"
     assert frame.metadata == {
-        "openrouter_generation_id": "generation-1",
-        "openrouter_model": "provider/resolved-model",
-        "openrouter_provider": "provider-name",
-        "openrouter_usage": {
+        "semantic_provider": "openrouter",
+        "semantic_protocol": "openai-chat-completions",
+        "semantic_endpoint_sha256": (
+            "76ef4ad6f0c8a4ae66efb13875c107cee40c78997a212353d379acfbb2f45591"
+        ),
+        "semantic_generation_id": "generation-1",
+        "semantic_model": "provider/resolved-model",
+        "semantic_upstream_provider": "provider-name",
+        "semantic_usage": {
             "prompt_tokens": 100,
             "completion_tokens": 25,
             "total_tokens": 125,
             "cost": 0.00042,
         },
-        "openrouter_cost": 0.00042,
         "prompts": prompt_provenance("semantic.deconstruct"),
     }
     await client.aclose()
+
+
+async def test_openai_compatible_deconstruction_uses_generic_chat_contract() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url == "https://models.example.test/openai/v1/chat/completions"
+        assert request.headers["authorization"] == "Bearer test-customer-key"
+        body = json.loads(request.content)
+        assert body["model"] == "customer/semantic-model"
+        assert body["max_tokens"] == 321
+        assert body["response_format"]["type"] == "json_schema"
+        assert "reasoning" not in body
+        assert "provider" not in body
+        return completion(json.dumps(frame_payload()))
+
+    client = mock_client(handler)
+    async with create_semantic_model_deconstructor(
+        openai_compatible_settings(),
+        client=client,
+    ) as deconstructor:
+        frame = await deconstructor.deconstruct(interaction())
+
+    assert frame.extractor_version == "semantic-deconstructor/2.0.0"
+    assert frame.metadata["semantic_provider"] == "customer-model-gateway"
+    assert frame.metadata["semantic_protocol"] == "openai-chat-completions"
+    assert frame.metadata["semantic_endpoint_sha256"] == (
+        "4f2a52208889d0545fdef28326edd0698cce9666979858460960c88162503d74"
+    )
+    assert frame.metadata["semantic_generation_id"] == "generation-1"
+    assert frame.metadata["semantic_model"] == "provider/resolved-model"
+    assert "openrouter_generation_id" not in frame.metadata
+    await client.aclose()
+
+
+async def test_provider_provenance_is_bounded_and_usage_is_allowlisted() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "id": "generation-1",
+                "model": "resolved-model",
+                "provider": "customer-runtime",
+                "choices": [
+                    {
+                        "message": {
+                            "content": json.dumps(frame_payload()),
+                        }
+                    }
+                ],
+                "usage": {
+                    "prompt_tokens": 10,
+                    "completion_tokens": 5,
+                    "total_tokens": 15,
+                    "cost": 0.01,
+                    "untrusted_note": "must-not-enter-evidence",
+                    "nested": {"secret": "must-not-enter-evidence"},
+                },
+            },
+        )
+
+    client = mock_client(handler)
+    async with create_semantic_model_deconstructor(
+        openai_compatible_settings(), client=client
+    ) as deconstructor:
+        frame = await deconstructor.deconstruct(interaction())
+
+    assert frame.metadata["semantic_usage"] == {
+        "prompt_tokens": 10,
+        "completion_tokens": 5,
+        "total_tokens": 15,
+        "cost": 0.01,
+    }
+    assert "must-not-enter-evidence" not in json.dumps(frame.metadata)
+    await client.aclose()
+
+
+async def test_provider_accepts_null_usage() -> None:
+    response_body = {
+        "id": "generation-1",
+        "model": "resolved-model",
+        "choices": [{"message": {"content": json.dumps(frame_payload())}}],
+        "usage": None,
+    }
+    client = mock_client(lambda request: httpx.Response(200, json=response_body))
+
+    async with create_semantic_model_deconstructor(
+        openai_compatible_settings(), client=client
+    ) as deconstructor:
+        frame = await deconstructor.deconstruct(interaction())
+
+    assert frame.metadata["semantic_usage"] == {}
+    await client.aclose()
+
+
+async def test_provider_rejects_encoded_response() -> None:
+    client = mock_client(
+        lambda request: httpx.Response(
+            200,
+            headers={"Content-Encoding": "gzip"},
+            stream=httpx.ByteStream(b"endpoint-controlled-body"),
+        )
+    )
+
+    async with create_semantic_model_deconstructor(
+        openai_compatible_settings(), client=client
+    ) as deconstructor:
+        with pytest.raises(ValueError, match="Content-Encoding is not allowed") as error:
+            await deconstructor.deconstruct(interaction())
+
+    assert "endpoint-controlled-body" not in str(error.value)
+    await client.aclose()
+
+
+async def test_provider_cannot_persist_a_reflected_endpoint_url() -> None:
+    endpoint_url = "https://models.example.test/openai/v1"
+    response_body = {
+        "id": "generation-1",
+        "model": "resolved-model",
+        "provider": endpoint_url,
+        "choices": [{"message": {"content": json.dumps(frame_payload())}}],
+    }
+    client = mock_client(lambda request: httpx.Response(200, json=response_body))
+
+    async with create_semantic_model_deconstructor(
+        openai_compatible_settings(), client=client
+    ) as deconstructor:
+        with pytest.raises(ValueError, match="configured endpoint URL") as error:
+            await deconstructor.deconstruct(interaction())
+
+    assert endpoint_url not in str(error.value)
+    await client.aclose()
+
+
+@pytest.mark.parametrize(
+    ("field_name", "field_value"),
+    [
+        ("id", "x" * 501),
+        ("model", "x" * 201),
+        ("provider", "x" * 201),
+    ],
+)
+async def test_provider_provenance_strings_are_bounded(
+    field_name: str,
+    field_value: str,
+) -> None:
+    response_body: dict[str, object] = {
+        "id": "generation-1",
+        "model": "resolved-model",
+        "provider": "customer-runtime",
+        "choices": [{"message": {"content": json.dumps(frame_payload())}}],
+    }
+    response_body[field_name] = field_value
+    client = mock_client(lambda request: httpx.Response(200, json=response_body))
+
+    async with create_semantic_model_deconstructor(
+        openai_compatible_settings(), client=client
+    ) as deconstructor:
+        with pytest.raises(ValidationError) as error:
+            await deconstructor.deconstruct(interaction())
+
+    assert field_value not in str(error.value)
+    await client.aclose()
+
+
+@pytest.mark.parametrize(
+    "usage",
+    [
+        {"prompt_tokens": -1},
+        {"total_tokens": 1_000_000_000_001},
+        {"completion_tokens": "5"},
+        {"cost": "0.01"},
+    ],
+)
+async def test_provider_usage_values_are_size_and_type_bounded(
+    usage: dict[str, object],
+) -> None:
+    client = mock_client(
+        lambda request: httpx.Response(
+            200,
+            json={
+                "id": "generation-1",
+                "model": "resolved-model",
+                "choices": [{"message": {"content": json.dumps(frame_payload())}}],
+                "usage": usage,
+            },
+        )
+    )
+
+    async with create_semantic_model_deconstructor(
+        openai_compatible_settings(), client=client
+    ) as deconstructor:
+        with pytest.raises(ValidationError):
+            await deconstructor.deconstruct(interaction())
+    await client.aclose()
+
+
+@pytest.mark.parametrize("reflected_field", ["id", "model", "provider", "content"])
+async def test_provider_cannot_persist_a_reflected_api_key(reflected_field: str) -> None:
+    secret = _TEST_CUSTOMER_API_KEY.get_secret_value()
+    response_body: dict[str, object] = {
+        "id": "generation-1",
+        "model": "resolved-model",
+        "provider": "customer-runtime",
+        "choices": [{"message": {"content": json.dumps(frame_payload())}}],
+    }
+    if reflected_field == "content":
+        response_body["choices"] = [{"message": {"content": secret}}]
+    else:
+        response_body[reflected_field] = secret
+    client = mock_client(lambda request: httpx.Response(200, json=response_body))
+
+    async with create_semantic_model_deconstructor(
+        openai_compatible_settings(), client=client
+    ) as deconstructor:
+        with pytest.raises(ValueError, match="contains the configured credential") as error:
+            await deconstructor.deconstruct(interaction())
+
+    assert secret not in str(error.value)
+    await client.aclose()
+
+
+async def test_semantic_provider_redirect_is_rejected() -> None:
+    redirect_client = mock_client(
+        lambda request: httpx.Response(
+            307,
+            headers={"Location": "https://attacker.example.test/steal"},
+        )
+    )
+    async with create_semantic_model_deconstructor(
+        openai_compatible_settings(),
+        client=redirect_client,
+    ) as deconstructor:
+        with pytest.raises(ValueError, match="redirects are not allowed"):
+            await deconstructor.deconstruct(interaction())
+    await redirect_client.aclose()
 
 
 async def test_render_keeps_caller_instruction_out_of_the_system_prompt() -> None:
@@ -294,7 +561,7 @@ async def test_render_keeps_caller_instruction_out_of_the_system_prompt() -> Non
         return completion(json.dumps({"rendered_input": "Please pay INV-104."}))
 
     client = mock_client(handler)
-    async with OpenRouterSemanticDeconstructor(settings(), client=client) as deconstructor:
+    async with create_semantic_model_deconstructor(settings(), client=client) as deconstructor:
         rendered = await deconstructor.render(
             raw_input,
             instruction,
@@ -302,16 +569,20 @@ async def test_render_keeps_caller_instruction_out_of_the_system_prompt() -> Non
 
     assert rendered.text == "Please pay INV-104."
     assert rendered.metadata == {
-        "openrouter_generation_id": "generation-1",
-        "openrouter_model": "provider/resolved-model",
-        "openrouter_provider": "provider-name",
-        "openrouter_usage": {
+        "semantic_provider": "openrouter",
+        "semantic_protocol": "openai-chat-completions",
+        "semantic_endpoint_sha256": (
+            "76ef4ad6f0c8a4ae66efb13875c107cee40c78997a212353d379acfbb2f45591"
+        ),
+        "semantic_generation_id": "generation-1",
+        "semantic_model": "provider/resolved-model",
+        "semantic_upstream_provider": "provider-name",
+        "semantic_usage": {
             "prompt_tokens": 100,
             "completion_tokens": 25,
             "total_tokens": 125,
             "cost": 0.00042,
         },
-        "openrouter_cost": 0.00042,
         "requested_model": "x-ai/grok-4.3",
         "prompts": prompt_provenance(
             "semantic.render",
@@ -356,7 +627,7 @@ async def test_render_trusted_self_correction_mode_is_caller_controlled() -> Non
         return completion(json.dumps({"rendered_input": "transfer 100$, sorry 120$ to alice"}))
 
     client = mock_client(handler)
-    async with OpenRouterSemanticDeconstructor(settings(), client=client) as deconstructor:
+    async with create_semantic_model_deconstructor(settings(), client=client) as deconstructor:
         rendered = await deconstructor.render(
             raw_input,
             instruction,
@@ -460,7 +731,7 @@ async def test_self_correction_evidence_is_grounded_to_the_exact_visible_repair(
         )
     )
 
-    grounded = OpenRouterSemanticDeconstructor._ground_self_correction_evidence(
+    grounded = SemanticModelDeconstructor._ground_self_correction_evidence(
         UserInputRecord(id="candidate", raw_input=candidate_input),
         frame,
     )
@@ -495,15 +766,15 @@ async def test_verify_equivalence_compares_raw_inputs_with_a_stronger_model() ->
         )
 
     client = mock_client(handler)
-    async with OpenRouterSemanticDeconstructor(settings(), client=client) as deconstructor:
+    async with create_semantic_model_deconstructor(settings(), client=client) as deconstructor:
         assessment = await deconstructor.verify(
             "Pay invoice AC-100 for $125 USD.",
             "Can you pay invoice AC-100 for $125 USD?",
         )
 
     assert assessment.verdict == "equivalent"
-    assert assessment.verifier_version == "openrouter-semantic-equivalence-verifier/1.0.0"
-    assert assessment.metadata["openrouter_generation_id"] == "generation-1"
+    assert assessment.verifier_version == "semantic-equivalence-verifier/2.0.0"
+    assert assessment.metadata["semantic_generation_id"] == "generation-1"
     await client.aclose()
 
 
@@ -530,7 +801,7 @@ async def test_verify_equivalence_rejects_invalid_delta_quotes(source_quote: str
         )
 
     client = mock_client(handler)
-    async with OpenRouterSemanticDeconstructor(settings(), client=client) as deconstructor:
+    async with create_semantic_model_deconstructor(settings(), client=client) as deconstructor:
         with pytest.raises(ValueError, match="source evidence is invalid"):
             await deconstructor.verify("Pay $125.", "Pay $150.")
     await client.aclose()
@@ -620,7 +891,7 @@ async def test_deconstruct_supports_input_only_candidate_validation() -> None:
         return completion(json.dumps(input_only_frame))
 
     client = mock_client(handler)
-    async with OpenRouterSemanticDeconstructor(settings(), client=client) as deconstructor:
+    async with create_semantic_model_deconstructor(settings(), client=client) as deconstructor:
         frame = await deconstructor.deconstruct(input_only_record, reference_frame)
 
     assert frame.outcomes == ()
@@ -647,7 +918,7 @@ async def test_deconstruct_rejects_evidence_pointer_that_does_not_resolve() -> N
         return completion(json.dumps({**frame_payload(), **frame_change}))
 
     client = mock_client(handler)
-    async with OpenRouterSemanticDeconstructor(settings(), client=client) as deconstructor:
+    async with create_semantic_model_deconstructor(settings(), client=client) as deconstructor:
         with pytest.raises(ValueError, match="evidence"):
             await deconstructor.deconstruct(interaction())
     await client.aclose()
@@ -663,7 +934,7 @@ async def test_deconstruct_rejects_ungrounded_semantic_elements() -> None:
         return completion(json.dumps(ungrounded_frame))
 
     client = mock_client(handler)
-    async with OpenRouterSemanticDeconstructor(settings(), client=client) as deconstructor:
+    async with create_semantic_model_deconstructor(settings(), client=client) as deconstructor:
         with pytest.raises(ValueError, match="source evidence"):
             await deconstructor.deconstruct(interaction())
     await client.aclose()
@@ -685,7 +956,7 @@ async def test_deconstruct_rejects_text_quote_not_found_in_source() -> None:
         return completion(json.dumps({**frame_payload(), "factors": [wrapped_factor]}))
 
     client = mock_client(handler)
-    async with OpenRouterSemanticDeconstructor(settings(), client=client) as deconstructor:
+    async with create_semantic_model_deconstructor(settings(), client=client) as deconstructor:
         with pytest.raises(ValueError, match="text_quote"):
             await deconstructor.deconstruct(interaction())
     await client.aclose()
@@ -708,7 +979,7 @@ async def test_deconstruct_expands_one_unambiguous_ellipsized_quote() -> None:
         return completion(json.dumps({**frame_payload(), "request_units": [ellipsized_request]}))
 
     client = mock_client(handler)
-    async with OpenRouterSemanticDeconstructor(settings(), client=client) as deconstructor:
+    async with create_semantic_model_deconstructor(settings(), client=client) as deconstructor:
         frame = await deconstructor.deconstruct(interaction())
 
     assert frame.request_units[0].evidence[0].text_quote == "Pay invoice INV-104"
@@ -738,7 +1009,7 @@ async def test_deconstruct_rejects_non_factor_communication_references() -> None
         )
 
     client = mock_client(handler)
-    async with OpenRouterSemanticDeconstructor(settings(), client=client) as deconstructor:
+    async with create_semantic_model_deconstructor(settings(), client=client) as deconstructor:
         with pytest.raises(ValidationError, match="unknown reference"):
             await deconstructor.deconstruct(interaction())
     await client.aclose()
@@ -782,7 +1053,7 @@ async def test_input_only_validation_rejects_output_evidence() -> None:
         return completion(json.dumps(output_evidence_frame))
 
     client = mock_client(handler)
-    async with OpenRouterSemanticDeconstructor(settings(), client=client) as deconstructor:
+    async with create_semantic_model_deconstructor(settings(), client=client) as deconstructor:
         with pytest.raises(ValueError, match="output evidence"):
             await deconstructor.deconstruct(input_only_record)
     await client.aclose()
@@ -793,7 +1064,7 @@ async def test_observed_output_requires_a_grounded_outcome() -> None:
         return completion(json.dumps({**frame_payload(), "outcomes": []}))
 
     client = mock_client(handler)
-    async with OpenRouterSemanticDeconstructor(settings(), client=client) as deconstructor:
+    async with create_semantic_model_deconstructor(settings(), client=client) as deconstructor:
         with pytest.raises(ValueError, match="grounded outcome"):
             await deconstructor.deconstruct(interaction())
     await client.aclose()
@@ -827,7 +1098,7 @@ async def test_every_observed_outcome_requires_output_evidence() -> None:
         )
 
     client = mock_client(handler)
-    async with OpenRouterSemanticDeconstructor(settings(), client=client) as deconstructor:
+    async with create_semantic_model_deconstructor(settings(), client=client) as deconstructor:
         with pytest.raises(ValueError, match="every observed outcome"):
             await deconstructor.deconstruct(interaction())
     await client.aclose()
@@ -857,7 +1128,7 @@ async def test_calls_require_explicit_live_opt_in_and_api_key(
         return completion(json.dumps(frame_payload()))
 
     client = mock_client(handler)
-    async with OpenRouterSemanticDeconstructor(
+    async with create_semantic_model_deconstructor(
         configured_settings,
         client=client,
     ) as deconstructor:
@@ -884,7 +1155,7 @@ async def test_request_content_and_rendered_output_are_bounded() -> None:
         raw_observed_output="done",
     )
     first_client = mock_client(handler)
-    async with OpenRouterSemanticDeconstructor(
+    async with create_semantic_model_deconstructor(
         small_settings,
         client=first_client,
     ) as deconstructor:
@@ -895,7 +1166,7 @@ async def test_request_content_and_rendered_output_are_bounded() -> None:
 
     render_settings = settings(max_input_chars=2_000)
     second_client = mock_client(handler)
-    async with OpenRouterSemanticDeconstructor(
+    async with create_semantic_model_deconstructor(
         render_settings,
         client=second_client,
     ) as deconstructor:
@@ -909,7 +1180,7 @@ async def test_provider_response_bytes_are_bounded() -> None:
         return completion(json.dumps({"rendered_input": "x" * 2_000}))
 
     client = mock_client(handler)
-    async with OpenRouterSemanticDeconstructor(
+    async with create_semantic_model_deconstructor(
         settings(max_response_bytes=1_024), client=client
     ) as deconstructor:
         with pytest.raises(ValueError, match="max_response_bytes"):
@@ -928,7 +1199,7 @@ async def test_complete_request_has_a_wall_clock_deadline() -> None:
         return httpx.Response(200, stream=SlowResponseStream())
 
     client = mock_client(handler)
-    async with OpenRouterSemanticDeconstructor(
+    async with create_semantic_model_deconstructor(
         settings(timeout_seconds=0.01), client=client
     ) as deconstructor:
         with pytest.raises(TimeoutError):
@@ -941,7 +1212,7 @@ async def test_invalid_provider_response_is_rejected() -> None:
         return completion(json.dumps({"rendered_input": "valid", "unexpected": True}))
 
     client = mock_client(handler)
-    async with OpenRouterSemanticDeconstructor(settings(), client=client) as deconstructor:
+    async with create_semantic_model_deconstructor(settings(), client=client) as deconstructor:
         with pytest.raises(ValidationError):
             await deconstructor.render("Pay INV-104", "Rephrase.")
     await client.aclose()
@@ -957,7 +1228,7 @@ async def test_cancellation_is_not_swallowed_and_client_closes() -> None:
         return completion(json.dumps(frame_payload()))
 
     client = mock_client(handler)
-    async with OpenRouterSemanticDeconstructor(settings(), client=client) as deconstructor:
+    async with create_semantic_model_deconstructor(settings(), client=client) as deconstructor:
         task = asyncio.create_task(deconstructor.deconstruct(interaction()))
         await started.wait()
         task.cancel()
@@ -971,19 +1242,167 @@ async def test_cancellation_is_not_swallowed_and_client_closes() -> None:
 async def test_owned_client_closes_on_context_exit(monkeypatch: pytest.MonkeyPatch) -> None:
     original_client_class = httpx.AsyncClient
     created_clients: list[httpx.AsyncClient] = []
+    client_options: list[dict[str, Any]] = []
 
     def recording_client(*args: Any, **kwargs: Any) -> httpx.AsyncClient:
+        client_options.append(kwargs)
         client = original_client_class(*args, **kwargs)
         created_clients.append(client)
         return client
 
     monkeypatch.setattr("ul.deconstruction.httpx.AsyncClient", recording_client)
-    deconstructor = OpenRouterSemanticDeconstructor(settings())
+    deconstructor = create_semantic_model_deconstructor(settings())
 
     async with deconstructor:
         assert not created_clients[0].is_closed
 
     assert created_clients[0].is_closed
+    async with create_semantic_model_deconstructor(openai_compatible_settings()):
+        assert not created_clients[1].is_closed
+
+    assert created_clients[1].is_closed
+    assert client_options == [
+        {
+            "timeout": 12,
+            "follow_redirects": False,
+            "trust_env": True,
+        },
+        {
+            "timeout": 12,
+            "follow_redirects": False,
+            "trust_env": False,
+        },
+    ]
+
+
+@pytest.mark.parametrize(
+    "base_url",
+    [
+        "http://models.example.test/v1",
+        "ftp://localhost:8000/v1",
+        "https://user:password@models.example.test/v1",
+        "https://models.example.test/v1?tenant=secret",
+        "https://models.example.test/v1#fragment",
+        "https://models.example.test:invalid/v1",
+        "https://models.example.test/v1/chat/completions",
+    ],
+)
+async def test_openai_compatible_settings_reject_unsafe_base_urls(base_url: str) -> None:
+    with pytest.raises(ValidationError):
+        openai_compatible_settings(base_url=base_url)
+
+
+async def test_openai_compatible_settings_hide_rejected_url_credentials_and_queries() -> None:
+    credential_sentinel = "credential-sentinel"
+    query_sentinel = "query-sentinel"
+    rejected_url = (
+        f"https://user:{credential_sentinel}@models.example.test/v1?token={query_sentinel}"
+    )
+
+    with pytest.raises(ValidationError) as error:
+        openai_compatible_settings(base_url=rejected_url)
+
+    rendered_error = str(error.value)
+    assert credential_sentinel not in rendered_error
+    assert query_sentinel not in rendered_error
+    assert rejected_url not in rendered_error
+
+
+async def test_openai_compatible_settings_allow_loopback_http_and_inherit_models() -> None:
+    configured_settings = openai_compatible_settings(
+        base_url="http://127.0.0.1:8000/v1/",
+        model="local-model",
+    )
+
+    assert configured_settings.base_url == "http://127.0.0.1:8000/v1"
+    assert configured_settings.model == "local-model"
+    assert configured_settings.render_model == "local-model"
+    assert configured_settings.equivalence_model == "local-model"
+
+    with pytest.raises(ValidationError):
+        OpenAICompatibleDatasetSettings(base_url="https://models.example.test/v1")
+    with pytest.raises(ValidationError):
+        OpenAICompatibleDatasetSettings(model="customer/model")
+    with pytest.raises(ValidationError, match="reserved openrouter ID"):
+        openai_compatible_settings(provider_id="openrouter")
+
+
+async def test_openai_compatible_calls_can_omit_the_scoped_api_key() -> None:
+    configured_settings = openai_compatible_settings(api_key=None)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert "authorization" not in request.headers
+        return completion(json.dumps(frame_payload()))
+
+    client = mock_client(handler)
+
+    async with create_semantic_model_deconstructor(
+        configured_settings,
+        client=client,
+    ) as deconstructor:
+        frame = await deconstructor.deconstruct(interaction())
+
+    assert frame.interaction_id == "interaction-1"
+    await client.aclose()
+
+
+async def test_openai_compatible_selection_loads_scoped_environment(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("UL_DATASET_SEMANTIC_PROVIDER", "openai-compatible")
+    monkeypatch.setenv("UL_DATASET_OPENAI_BASE_URL", "https://models.example.test/v1")
+    monkeypatch.setenv("UL_DATASET_OPENAI_API_KEY", "customer-secret")
+    monkeypatch.setenv("OPENAI_API_KEY", "ambient-key-must-not-be-used")
+    monkeypatch.setenv("UL_DATASET_MODEL", "customer/model")
+
+    configured_settings = load_dataset_semantic_settings()
+
+    assert isinstance(configured_settings, OpenAICompatibleDatasetSettings)
+    assert configured_settings.api_key is not None
+    assert configured_settings.api_key.get_secret_value() == "customer-secret"
+    assert configured_settings.render_model == "customer/model"
+    assert "customer-secret" not in repr(configured_settings)
+
+
+@pytest.mark.parametrize(
+    ("environment_name", "invalid_value", "expected_message"),
+    [
+        (
+            "UL_DATASET_OPENAI_PROVIDER_ID",
+            "INVALID_PROVIDER",
+            "UL_DATASET_OPENAI_PROVIDER_ID must be 1-100 lowercase",
+        ),
+        (
+            "UL_DATASET_MODEL",
+            " ",
+            "UL_DATASET_MODEL must be 1-200 non-whitespace characters",
+        ),
+        (
+            "UL_DATASET_MAX_RESPONSE_BYTES",
+            "1",
+            "UL_DATASET_MAX_RESPONSE_BYTES must be between 1024 and 5000000",
+        ),
+    ],
+)
+async def test_semantic_settings_loader_reports_safe_field_specific_diagnostics(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    environment_name: str,
+    invalid_value: str,
+    expected_message: str,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("UL_DATASET_SEMANTIC_PROVIDER", "openai-compatible")
+    monkeypatch.setenv("UL_DATASET_OPENAI_BASE_URL", "https://models.example.test/v1")
+    monkeypatch.setenv("UL_DATASET_MODEL", "customer/model")
+    monkeypatch.setenv(environment_name, invalid_value)
+
+    with pytest.raises(ValueError) as error:
+        load_dataset_semantic_settings()
+
+    assert expected_message in str(error.value)
 
 
 async def test_settings_load_dotenv_and_hide_secrets(
@@ -1124,7 +1543,7 @@ async def test_live_deconstruction_with_synthetic_interaction() -> None:
     )
     synthetic_interaction = synthetic_live_interaction()
 
-    async with OpenRouterSemanticDeconstructor(configured_settings) as deconstructor:
+    async with create_semantic_model_deconstructor(configured_settings) as deconstructor:
         frame = await deconstructor.deconstruct(synthetic_interaction)
 
     assert frame.interaction_id == synthetic_interaction.id
@@ -1143,7 +1562,7 @@ async def test_live_augmentation_generates_or_safely_rejects_each_candidate() ->
     )
 
     operators = builtin_dataset_augmentation_operators()
-    async with OpenRouterSemanticDeconstructor(configured_settings) as semantic_model:
+    async with create_semantic_model_deconstructor(configured_settings) as semantic_model:
         result = await DatasetAugmentationEngine(
             semantic_model, semantic_model, semantic_model
         ).augment(
@@ -1207,7 +1626,7 @@ async def test_live_equivalence_qualification_across_ten_domains() -> None:
         ("Create one shipment to Munich.", "Create two shipments to Munich."),
     )
 
-    async with OpenRouterSemanticDeconstructor(configured_settings) as checker:
+    async with create_semantic_model_deconstructor(configured_settings) as checker:
         for source_input, candidate_input in equivalent_pairs:
             assessment = await checker.verify(source_input, candidate_input)
             assert assessment.verdict == "equivalent"

@@ -23,10 +23,11 @@ from ul import (
     DatasetEvaluationResult,
     DatasetEvaluationRunner,
     DatasetEvaluationTrialSet,
+    DatasetSemanticSettings,
     InteractionRecord,
-    OpenRouterDatasetSettings,
-    OpenRouterSemanticDeconstructor,
     builtin_dataset_augmentation_operators,
+    create_semantic_model_deconstructor,
+    load_dataset_semantic_settings,
 )
 from ul.dataset_invariants import (
     DatasetInvariantArrayUniqueTrialEvaluation,
@@ -78,6 +79,8 @@ _ENVIRONMENT_NAME_PATTERN = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 _DATASET_OPERATORS = builtin_dataset_augmentation_operators()
 _DATASET_OPERATOR_IDS = tuple(operator.id for operator in _DATASET_OPERATORS)
 _DATASET_OPERATORS_BY_ID = {operator.id: operator for operator in _DATASET_OPERATORS}
+
+
 _CUSTOMER_STATUSES = {
     "augmentation_rejected": "VARIATION DISCARDED",
     "inconclusive": "COULDN'T DETERMINE",
@@ -280,7 +283,8 @@ def evaluate_dataset(
 
     UL_LIVE=true enables billed semantic-model calls and external processing together.
     UL_DATASET_LIVE_CALLS and UL_DATASET_ALLOW_EXTERNAL_DATA_PROCESSING remain separate,
-    higher-precedence controls. Execution also requires OPEN_ROUTER_API_KEY.
+    higher-precedence controls. OpenRouter remains the default; set
+    UL_DATASET_SEMANTIC_PROVIDER=openai-compatible for a customer-controlled endpoint.
 
     Example: ul dataset evaluate interactions.jsonl --target-url https://sandbox/run
     --allow-target-network --confirm-isolated-sandbox --confirm-fresh-state
@@ -346,7 +350,7 @@ def evaluate_dataset(
                     "output already exists; UL will not overwrite it",
                     param_hint="--output",
                 )
-        settings = OpenRouterDatasetSettings()
+        settings = load_dataset_semantic_settings()
         _validate_model_input_bounds(selected_records, settings.max_input_chars)
         loaded_target_config = (
             load_json_http_dataset_target_config(target_config)
@@ -445,6 +449,8 @@ def evaluate_dataset(
             max_target_calls=max_target_calls,
             invariant_suite=invariant_suite,
             output=output,
+            semantic_provider_id=settings.semantic_provider_id,
+            semantic_endpoint_sha256=settings.semantic_endpoint_sha256,
         )
         return
 
@@ -501,8 +507,12 @@ def evaluate_dataset(
             "set UL_LIVE=true (or UL_DATASET_ALLOW_EXTERNAL_DATA_PROCESSING=true) "
             "to allow semantic model calls"
         )
-    if settings.api_key is None or not settings.api_key.get_secret_value().strip():
-        raise typer.BadParameter("set OPEN_ROUTER_API_KEY to run an evaluation")
+    if settings.api_key_required and (
+        settings.api_key is None or not settings.api_key.get_secret_value().strip()
+    ):
+        raise typer.BadParameter(
+            f"set {settings.api_key_environment_variable} to run an evaluation"
+        )
 
     try:
         if loaded_target_config is not None:
@@ -813,7 +823,7 @@ def _dataset_evidence_run_context(
     repetitions: int,
     invariant_suite: DatasetInvariantSuite | None,
     target_config: JsonHttpDatasetTargetConfig,
-    settings: OpenRouterDatasetSettings,
+    settings: DatasetSemanticSettings,
 ) -> DatasetEvidenceRunContext:
     return create_dataset_evidence_run_context(
         selected_records=selected_records,
@@ -825,6 +835,8 @@ def _dataset_evidence_run_context(
         invariant_suite_sha256=(invariant_suite.sha256 if invariant_suite is not None else None),
         target_config=target_config,
         semantic_settings=DatasetEvidenceSemanticSettings(
+            provider=settings.semantic_provider_id,
+            endpoint_sha256=settings.semantic_endpoint_sha256,
             model=settings.model,
             render_model=settings.render_model,
             equivalence_model=settings.equivalence_model,
@@ -850,6 +862,8 @@ def _print_dataset_plan(
     max_target_calls: int,
     invariant_suite: DatasetInvariantSuite | None,
     output: Path | None,
+    semantic_provider_id: str,
+    semantic_endpoint_sha256: str,
 ) -> None:
     potential_target_calls = selected_count * repetitions * (1 + len(operator_ids))
     potential_model_calls = selected_count * (
@@ -873,6 +887,10 @@ def _print_dataset_plan(
         console.print("Additional model calls for customer invariants: 0")
         console.print("Additional target calls for customer invariants: 0")
     console.print(f"Potential semantic model calls: up to {potential_model_calls}")
+    console.print(
+        f"Semantic provider: {semantic_provider_id} "
+        f"(endpoint sha256: {semantic_endpoint_sha256[:12]})"
+    )
     console.print(
         f"Potential target calls: up to {potential_target_calls} "
         f"(authorized maximum: {max_target_calls})"
@@ -1019,7 +1037,7 @@ def _read_resume_descriptor(
 async def _evaluate_interaction_records(
     records: tuple[InteractionRecord, ...],
     operator_ids: tuple[str, ...],
-    settings: OpenRouterDatasetSettings,
+    settings: DatasetSemanticSettings,
     target: JsonHttpDatasetTarget,
     output_stream: TextIO,
     *,
@@ -1031,7 +1049,7 @@ async def _evaluate_interaction_records(
     invariant_evaluations: list[DatasetInvariantEvaluation] | None = None,
 ) -> tuple[DatasetEvaluationResult, ...]:
     results: list[DatasetEvaluationResult] = []
-    async with OpenRouterSemanticDeconstructor(settings) as deconstructor, target:
+    async with create_semantic_model_deconstructor(settings) as deconstructor, target:
         runner = DatasetEvaluationRunner(
             DatasetAugmentationEngine(deconstructor, deconstructor, deconstructor),
             deconstructor,
