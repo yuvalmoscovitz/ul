@@ -1,19 +1,3 @@
-"""End-to-end regression pipeline over 5 interactions.
-
-Pipeline:
-  1. Start the defective agent  (same one as quickstart)
-  2. ul dataset evaluate dataset.jsonl  →  evidence.jsonl
-  3. ul dataset review  →  evidence.reviews.jsonl  (confirm each finding)
-  4. ul regression save  →  regressions/*.json  (one case per finding)
-  5. ul regression run   →  run-result.json   (batch replay)
-
-Usage:
-  export OPEN_ROUTER_API_KEY=...
-  export UL_DATASET_LIVE_CALLS=true
-  export UL_DATASET_ALLOW_EXTERNAL_DATA_PROCESSING=true
-  uv run python -m examples.e2e_regression.run
-"""
-
 from __future__ import annotations
 
 import json
@@ -49,7 +33,6 @@ _MODEL_ENVIRONMENT = {
     "UL_DATASET_EQUIVALENCE_MODEL": "x-ai/grok-4.6",
 }
 
-# 5 customer tenants, each with one recorded payment interaction for AC-100.
 _TENANTS = [
     "acme-corp",
     "globex-inc",
@@ -153,7 +136,6 @@ def main(
         typer.Option(help="Validate dataset and plan without model or target calls."),
     ] = False,
 ) -> None:
-    """Full 5-tenant regression pipeline: evaluate → review → save → batch run."""
     try:
         env = _subprocess_environment(dry_run=dry_run)
     except ValueError as error:
@@ -170,13 +152,11 @@ def main(
     regressions_dir.mkdir()
     run_result_path = artifact_dir / "run-result.json"
 
-    # ── Step 1: Write 5-entry dataset ───────────────────────────────────────
     with _create_private_file(dataset_path) as f:
         for entry in _make_dataset():
             f.write(json.dumps(entry, ensure_ascii=False, separators=(",", ":")) + "\n")
     typer.echo(f"[1/5] Dataset: {len(_TENANTS)} interactions ({', '.join(_TENANTS)})")
 
-    # ── Write target config (with placeholder URL for dry-run) ──────────────
     target_url = "http://127.0.0.1:9999/execute" if dry_run else None
 
     if dry_run:
@@ -202,7 +182,6 @@ def main(
         typer.echo("Dry-run complete. No model or target calls sent.")
         return
 
-    # ── Step 2: Start defective agent ────────────────────────────────────────
     server: ThreadingHTTPServer = create_server()
     host, port = cast(tuple[str, int], server.server_address)
     server_thread = Thread(target=server.serve_forever, name="e2e-agent", daemon=True)
@@ -213,8 +192,6 @@ def main(
     typer.echo(f"[2/5] Defective agent started on {host}:{port}")
 
     try:
-        # ── Step 3: Evaluate ─────────────────────────────────────────────────
-        # 5 tenants × 2 baseline reps + 5 variations × 2 reps = 20 target calls
         typer.echo("[3/5] Evaluating 5 interactions (up to 20 target calls) …")
         rc = _ul(
             "dataset", "evaluate", str(dataset_path),
@@ -241,7 +218,6 @@ def main(
             raise typer.Exit(code=1)
         typer.echo(f"      {len(finding_ids)} finding(s) detected")
 
-        # ── Step 4: Review + save each finding ───────────────────────────────
         typer.echo(f"[4/5] Reviewing and saving {len(finding_ids)} regression case(s) …")
         for i, fid in enumerate(finding_ids, start=1):
             rc = _ul(
@@ -270,7 +246,6 @@ def main(
                 raise typer.Exit(code=rc)
             typer.echo(f"      case-{i:02d}.json  ← {fid[:28]}…")
 
-        # ── Step 5: Batch regression run ─────────────────────────────────────
         saved = len(list(regressions_dir.glob("*.json")))
         typer.echo(f"[5/5] ul regression run — {saved} cases, up to {saved * 2} target calls …")
         rc = _ul(
