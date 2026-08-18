@@ -17,6 +17,7 @@ from pydantic import JsonValue, ValidationError
 from ul.http_target import (
     JsonHttpDatasetTarget,
     JsonHttpDatasetTargetConfig,
+    json_http_target_calls_per_conversation,
     json_http_target_calls_per_execution,
     load_json_http_dataset_target_config,
     validate_json_http_dataset_target_configuration,
@@ -179,6 +180,34 @@ async def test_json_null_is_a_valid_configured_clean_state() -> None:
     assert _LifecycleHandler.events[-1] == "/reset"
 
 
+async def test_executes_multi_turn_conversation_in_one_lifecycle_with_turn_snapshots() -> None:
+    with _loopback_server() as base_url:
+        config = _lifecycle_config(base_url)
+        async with JsonHttpDatasetTarget.from_config(
+            config,
+            sandbox_confirmed=True,
+            allow_insecure_http=True,
+            max_target_calls=7,
+        ) as target:
+            outputs = await target.execute_conversation(("first", "correction"))
+
+    assert _LifecycleHandler.events == [
+        "/reset",
+        "/setup",
+        "/execute",
+        "/snapshot",
+        "/execute",
+        "/snapshot",
+        "/reset",
+    ]
+    assert [output.raw_output["input"] for output in outputs] == ["first", "correction"]
+    assert [output.metadata["committed_state_snapshot"] for output in outputs] == [
+        {"committed_amount": 150},
+        {"committed_amount": 200},
+    ]
+    assert json_http_target_calls_per_conversation(config, 2) == 7
+
+
 def _successful_handler() -> tuple[Any, list[str]]:
     observed_paths: list[str] = []
     reset_generation = 0
@@ -265,6 +294,51 @@ async def test_late_commit_transport_failure_permanently_blocks_target() -> None
     assert observed_paths == ["/reset", "/setup", "/execute", "/reset"]
 
 
+async def test_second_turn_delivery_failure_cleans_up_and_fails_closed() -> None:
+    observed_paths: list[str] = []
+    reset_generation = 0
+    execute_calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal execute_calls, reset_generation
+        observed_paths.append(request.url.path)
+        if request.url.path == "/reset":
+            reset_generation += 1
+            return _raw_response(
+                json.dumps({"generation": reset_generation, "clean": True}).encode()
+            )
+        if request.url.path == "/setup":
+            return _raw_response(b"")
+        if request.url.path == "/execute":
+            execute_calls += 1
+            if execute_calls == 2:
+                raise httpx.ReadTimeout("response lost", request=request)
+            return _raw_response(b'{"agent_response":{"ok":true}}')
+        return _raw_response(b'{"state":{"committed":true}}')
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        target = JsonHttpDatasetTarget.from_config(
+            _lifecycle_config(), sandbox_confirmed=True, max_target_calls=14, client=client
+        )
+        with pytest.raises(DatasetTargetLifecycleError) as captured:
+            await target.execute_conversation(("first", "correction"))
+        with pytest.raises(DatasetTargetLifecycleError) as blocked:
+            await target.execute("later")
+
+    assert captured.value.failed_phase == "execute_turn:2"
+    assert captured.value.cleanup_reset_failed is False
+    assert captured.value.target_state_uncertain is True
+    assert blocked.value.failed_phase == "blocked_state_uncertain"
+    assert observed_paths == [
+        "/reset",
+        "/setup",
+        "/execute",
+        "/snapshot",
+        "/execute",
+        "/reset",
+    ]
+
+
 async def test_cancellation_during_cleanup_blocks_later_execution() -> None:
     cleanup_started = asyncio.Event()
     never_complete = asyncio.Event()
@@ -300,6 +374,54 @@ async def test_cancellation_during_cleanup_blocks_later_execution() -> None:
 
     assert blocked.value.failed_phase == "blocked_state_uncertain"
     assert observed_paths == ["/reset", "/setup", "/execute", "/snapshot", "/reset"]
+
+
+async def test_cancellation_during_second_turn_attempts_cleanup_and_blocks_target() -> None:
+    second_turn_started = asyncio.Event()
+    never_complete = asyncio.Event()
+    observed_paths: list[str] = []
+    reset_generation = 0
+    execute_calls = 0
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal execute_calls, reset_generation
+        observed_paths.append(request.url.path)
+        if request.url.path == "/reset":
+            reset_generation += 1
+            return _raw_response(
+                json.dumps({"generation": reset_generation, "clean": True}).encode()
+            )
+        if request.url.path == "/setup":
+            return _raw_response(b"")
+        if request.url.path == "/execute":
+            execute_calls += 1
+            if execute_calls == 2:
+                second_turn_started.set()
+                await never_complete.wait()
+            return _raw_response(b'{"agent_response":{"ok":true}}')
+        return _raw_response(b'{"state":{"committed":true}}')
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        target = JsonHttpDatasetTarget.from_config(
+            _lifecycle_config(), sandbox_confirmed=True, max_target_calls=14, client=client
+        )
+        execution = asyncio.create_task(target.execute_conversation(("first", "correction")))
+        await second_turn_started.wait()
+        execution.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await execution
+        with pytest.raises(DatasetTargetLifecycleError) as blocked:
+            await target.execute("later")
+
+    assert blocked.value.failed_phase == "blocked_state_uncertain"
+    assert observed_paths == [
+        "/reset",
+        "/setup",
+        "/execute",
+        "/snapshot",
+        "/execute",
+        "/reset",
+    ]
 
 
 async def test_records_failed_reset_generation_before_clean_assertion() -> None:

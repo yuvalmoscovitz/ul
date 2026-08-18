@@ -1,7 +1,11 @@
 """Public Python SDK for UL."""
 
 from ul_core.augmentation import builtin_augmentation_registry
-from ul_core.contracts import DatasetTargetExecutor, SemanticEquivalenceVerifier
+from ul_core.contracts import (
+    DatasetTargetExecutor,
+    MultiTurnDatasetTargetExecutor,
+    SemanticEquivalenceVerifier,
+)
 from ul_core.coverage import CoverageArchive
 from ul_core.dataset import (
     InteractionRecord,
@@ -91,6 +95,21 @@ from ul.deconstruction import (
     create_semantic_model_deconstructor,
     load_dataset_semantic_settings,
 )
+from ul.event_stress import (
+    CorrectionAfterFirstResponseCase,
+    CorrectionDivergence,
+    CorrectionStressPlan,
+    CorrectionStressResult,
+    CorrectionStressTrial,
+    CorrectionTurnObservation,
+    MultiTurnRegressionCase,
+    create_multi_turn_regression_case,
+    load_correction_after_first_response_case,
+    load_multi_turn_regression_case,
+    plan_correction_stress_test,
+    replay_multi_turn_regression,
+    run_correction_stress_test,
+)
 from ul.http_target import (
     JsonHttpDatasetTarget,
     JsonHttpDatasetTargetConfig,
@@ -106,6 +125,12 @@ __all__ = [
     "ActionEffect",
     "CampaignResult",
     "CampaignRunner",
+    "CorrectionAfterFirstResponseCase",
+    "CorrectionDivergence",
+    "CorrectionStressPlan",
+    "CorrectionStressResult",
+    "CorrectionStressTrial",
+    "CorrectionTurnObservation",
     "CoverageArchive",
     "DatasetAugmentationEngine",
     "DatasetAugmentationOperator",
@@ -156,6 +181,8 @@ __all__ = [
     "JsonValueInAllowedSetInvariant",
     "JsonValuesEqualInvariant",
     "MaterializedScenario",
+    "MultiTurnDatasetTargetExecutor",
+    "MultiTurnRegressionCase",
     "ObservedAgentOutput",
     "OpenAICompatibleDatasetSettings",
     "OpenRouterDatasetSettings",
@@ -178,15 +205,21 @@ __all__ = [
     "builtin_augmentation_registry",
     "builtin_dataset_augmentation_operators",
     "create_dataset_regression_case",
+    "create_multi_turn_regression_case",
     "create_semantic_model_deconstructor",
     "dataset_regression_target_config_sha256",
     "evaluate_dataset_invariant_rules",
     "evaluate_dataset_invariants",
+    "load_correction_after_first_response_case",
     "load_dataset_invariant_suite",
     "load_dataset_regression_case",
     "load_dataset_semantic_settings",
     "load_json_http_dataset_target_config",
+    "load_multi_turn_regression_case",
     "parse_otlp_traces",
+    "plan_correction_stress_test",
     "replay_dataset_regression",
+    "replay_multi_turn_regression",
+    "run_correction_stress_test",
     "run_dataset_regressions",
 ]

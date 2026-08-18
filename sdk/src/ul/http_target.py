@@ -281,10 +281,23 @@ class JsonHttpDatasetTarget:
             await self._client.aclose()
 
     async def execute(self, raw_input: str) -> ObservedAgentOutput:
-        async with self._lifecycle_lock:
-            return await self._execute_stateful(raw_input)
+        outputs = await self.execute_conversation((raw_input,))
+        return outputs[0]
 
-    async def _execute_stateful(self, raw_input: str) -> ObservedAgentOutput:
+    def target_calls_for_conversation(self, turn_count: int) -> int:
+        return json_http_target_calls_per_conversation(self._config, turn_count)
+
+    async def execute_conversation(
+        self, raw_inputs: tuple[str, ...]
+    ) -> tuple[ObservedAgentOutput, ...]:
+        if not raw_inputs:
+            raise ValueError("a target conversation requires at least one turn")
+        async with self._lifecycle_lock:
+            return await self._execute_stateful(raw_inputs)
+
+    async def _execute_stateful(
+        self, raw_inputs: tuple[str, ...]
+    ) -> tuple[ObservedAgentOutput, ...]:
         config = self._config
         if self._lifecycle_state_uncertain:
             raise DatasetTargetLifecycleError(
@@ -293,7 +306,7 @@ class JsonHttpDatasetTarget:
                 cleanup_reset_failed=True,
                 target_state_uncertain=True,
             )
-        self._reserve_target_calls(json_http_target_calls_per_execution(config))
+        self._reserve_target_calls(json_http_target_calls_per_conversation(config, len(raw_inputs)))
         self._lifecycle_state_uncertain = True
         completed_phase_names: list[str] = []
         completed_phases: list[JsonValue] = []
@@ -302,8 +315,7 @@ class JsonHttpDatasetTarget:
         cleanup_reset_failed = False
         delivery_uncertain = False
         current_phase = "reset"
-        execute_response: JsonValue | None = None
-        committed_state_snapshot: JsonValue | None = None
+        turn_observations: list[tuple[JsonValue, JsonValue]] = []
         try:
             lifecycle_started = True
             await self._reset(config.reset)
@@ -318,35 +330,41 @@ class JsonHttpDatasetTarget:
                 )
                 completed_phase_names.append("setup")
                 completed_phases.append({"phase": "setup", "status": "succeeded"})
-            current_phase = "execute_turn"
-            execute_response = await self._post_for_json(
-                config.execute_turn.url,
-                _replace_input_placeholder(config.execute_turn.request_json_template, raw_input),
-                config.execute_turn.response_json_pointer,
-                consume_budget=False,
-            )
-            completed_phase_names.append("execute_turn")
-            completed_phases.append({"phase": "execute_turn", "status": "succeeded"})
-            current_phase = "snapshot"
-            committed_state_snapshot = await self._post_for_json(
-                config.snapshot.url,
-                config.snapshot.request_json,
-                config.snapshot.response_json_pointer,
-                consume_budget=False,
-            )
-            completed_phase_names.append("snapshot")
-            completed_phases.append({"phase": "snapshot", "status": "succeeded"})
+            for turn_index, raw_input in enumerate(raw_inputs, start=1):
+                current_phase = _conversation_phase_name(
+                    "execute_turn", turn_index, len(raw_inputs)
+                )
+                execute_response = await self._post_for_json(
+                    config.execute_turn.url,
+                    _replace_input_placeholder(
+                        config.execute_turn.request_json_template, raw_input
+                    ),
+                    config.execute_turn.response_json_pointer,
+                    consume_budget=False,
+                )
+                completed_phase_names.append(current_phase)
+                completed_phases.append({"phase": current_phase, "status": "succeeded"})
+                current_phase = _conversation_phase_name("snapshot", turn_index, len(raw_inputs))
+                committed_state_snapshot = await self._post_for_json(
+                    config.snapshot.url,
+                    config.snapshot.request_json,
+                    config.snapshot.response_json_pointer,
+                    consume_budget=False,
+                )
+                completed_phase_names.append(current_phase)
+                completed_phases.append({"phase": current_phase, "status": "succeeded"})
+                turn_observations.append((execute_response, committed_state_snapshot))
         except _TargetDeliveryUncertainError:
             failed_phase = current_phase
-            delivery_uncertain = current_phase in {"setup", "execute_turn", "snapshot"}
+            delivery_uncertain = current_phase == "setup" or current_phase.startswith(
+                ("execute_turn", "snapshot")
+            )
         except asyncio.CancelledError:
-            if current_phase in {"setup", "execute_turn", "snapshot"}:
+            if current_phase == "setup" or current_phase.startswith(("execute_turn", "snapshot")):
                 delivery_uncertain = True
             raise
         except RuntimeError:
-            failed_phase = _next_lifecycle_phase(
-                tuple(completed_phase_names), config.setup is not None
-            )
+            failed_phase = current_phase
         finally:
             if lifecycle_started:
                 try:
@@ -364,18 +382,24 @@ class JsonHttpDatasetTarget:
                 cleanup_reset_failed=cleanup_reset_failed,
                 target_state_uncertain=self._lifecycle_state_uncertain,
             ) from None
-        if execute_response is None or committed_state_snapshot is None:
+        if len(turn_observations) != len(raw_inputs):
             raise AssertionError(
-                "successful lifecycle requires execution and snapshot observations"
+                "successful lifecycle requires every turn and snapshot observation"
             )
         try:
-            return ObservedAgentOutput(
-                raw_output=execute_response,
-                metadata={
-                    "target_protocol_version": 2,
-                    "lifecycle_calls": completed_phases,
-                    "committed_state_snapshot": committed_state_snapshot,
-                },
+            return tuple(
+                ObservedAgentOutput(
+                    raw_output=execute_response,
+                    metadata={
+                        "target_protocol_version": 2,
+                        "turn_index": turn_index,
+                        "lifecycle_calls": completed_phases,
+                        "committed_state_snapshot": committed_state_snapshot,
+                    },
+                )
+                for turn_index, (execute_response, committed_state_snapshot) in enumerate(
+                    turn_observations, start=1
+                )
             )
         except (RecursionError, ValidationError):
             raise RuntimeError("HTTP dataset target returned invalid JSON") from None
@@ -544,7 +568,20 @@ def validate_json_http_dataset_target_configuration(
 def json_http_target_calls_per_execution(
     config: JsonHttpDatasetTargetConfig,
 ) -> int:
-    return 5 if config.setup is not None else 4
+    return json_http_target_calls_per_conversation(config, 1)
+
+
+def json_http_target_calls_per_conversation(
+    config: JsonHttpDatasetTargetConfig,
+    turn_count: int,
+) -> int:
+    if type(turn_count) is not int or turn_count < 1:
+        raise ValueError("turn_count must be a positive integer")
+    return 2 + (1 if config.setup is not None else 0) + (2 * turn_count)
+
+
+def _conversation_phase_name(phase: str, turn_index: int, turn_count: int) -> str:
+    return phase if turn_count == 1 else f"{phase}:{turn_index}"
 
 
 def json_http_target_config_urls(
@@ -556,14 +593,6 @@ def json_http_target_config_urls(
         config.execute_turn.url,
         config.snapshot.url,
     )
-
-
-def _next_lifecycle_phase(
-    completed_phases: tuple[str, ...],
-    setup_configured: bool,
-) -> str:
-    phases = ("reset", *(("setup",) if setup_configured else ()), "execute_turn", "snapshot")
-    return phases[len(completed_phases)]
 
 
 def _endpoint_origin(endpoint: str) -> tuple[str, str, int]:
