@@ -262,9 +262,12 @@ def create_dataset_evidence_run_context(
         for operator_id, version in operators
     )
     target_config_sha256 = dataset_regression_target_config_sha256(target_config)
+    pipeline_version: Literal["1.0.0", "1.1.0"] = (
+        "1.0.0" if isinstance(target_config, JsonHttpDatasetTargetConfig) else "1.1.0"
+    )
     content = {
         "schema_version": "1.0.0",
-        "pipeline_version": _DATASET_EVALUATION_PIPELINE_VERSION,
+        "pipeline_version": pipeline_version,
         "selected_dataset_sha256": selected_dataset_sha256,
         "operators": [operator.model_dump(mode="json") for operator in operator_snapshots],
         "repetitions": repetitions,
@@ -274,6 +277,7 @@ def create_dataset_evidence_run_context(
         "semantic_settings": semantic_settings.model_dump(mode="json"),
     }
     return DatasetEvidenceRunContext(
+        pipeline_version=pipeline_version,
         selected_dataset_sha256=selected_dataset_sha256,
         operators=operator_snapshots,
         repetitions=repetitions,

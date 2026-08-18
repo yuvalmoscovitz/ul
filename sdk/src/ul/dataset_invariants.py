@@ -683,7 +683,7 @@ def evaluate_dataset_invariants(
     result: DatasetEvaluationResult,
     suite: DatasetInvariantSuite,
     *,
-    allow_legacy_committed_state_fallback: bool = False,
+    allow_legacy_committed_state_fallback: bool = True,
 ) -> DatasetInvariantEvaluation:
     array_work_budget = _ArrayInvariantWorkBudget(_MAXIMUM_ARRAY_INVARIANT_WORK_UNITS)
     baseline = _evaluate_arm(
@@ -719,7 +719,7 @@ def evaluate_dataset_invariant_rules(
     outputs: tuple[ObservedAgentOutput | None, ...],
     *,
     observation_authority: ObservationAuthority = "agent_response",
-    allow_legacy_committed_state_fallback: bool = False,
+    allow_legacy_committed_state_fallback: bool = True,
 ) -> tuple[DatasetInvariantRuleResult, ...]:
     if not outputs:
         raise ValueError("invariant evaluation requires at least one target output")

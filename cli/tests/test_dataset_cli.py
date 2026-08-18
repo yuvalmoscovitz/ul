@@ -25,6 +25,7 @@ from ul import (
     DatasetEvaluationTrialSet,
     InteractionRecord,
     JsonHttpDatasetTargetConfig,
+    JsonHttpStatefulDatasetTargetConfig,
     ObservedAgentOutput,
     SemanticFrame,
 )
@@ -181,6 +182,37 @@ def _run_context(
         ),
         settings=cast(Any, _settings()),
     )
+
+
+def test_run_context_pipeline_version_tracks_target_protocol() -> None:
+    record = _evaluation_result("interaction-1").source
+    version_one_context = _run_context((record,))
+    version_two_context = main._dataset_evidence_run_context(
+        selected_records=(record,),
+        selected_operator_ids=("surface.rephrase",),
+        repetitions=1,
+        invariant_suite=None,
+        target_config=JsonHttpStatefulDatasetTargetConfig.model_validate(
+            {
+                "version": 2,
+                "reset": {
+                    "url": "https://sandbox.example.test/reset",
+                    "generation_json_pointer": "/generation",
+                    "clean_state_json_pointer": "/clean",
+                    "clean_state_value": True,
+                },
+                "execute_turn": {
+                    "url": "https://sandbox.example.test/execute",
+                    "request_json_template": {"input": "{{input}}"},
+                },
+                "snapshot": {"url": "https://sandbox.example.test/snapshot"},
+            }
+        ),
+        settings=cast(Any, _settings()),
+    )
+
+    assert version_one_context.pipeline_version == "1.0.0"
+    assert version_two_context.pipeline_version == "1.1.0"
 
 
 def _write_target_config(

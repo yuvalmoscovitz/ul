@@ -366,6 +366,7 @@ def test_committed_state_authority_does_not_fall_back_to_execute_response() -> N
         (rule,),
         (ObservedAgentOutput(raw_output={"amount": 150}),),
         observation_authority="committed_state_snapshot",
+        allow_legacy_committed_state_fallback=False,
     )[0]
 
     assert result.status == "not_evaluable"
@@ -391,10 +392,20 @@ def test_legacy_v1_committed_state_authority_can_use_execute_response() -> None:
             ),
         ),
         observation_authority="committed_state_snapshot",
-        allow_legacy_committed_state_fallback=True,
     )[0]
 
     assert result.status == "satisfied"
+
+
+def test_public_evaluation_defaults_to_legacy_committed_state_fallback() -> None:
+    suite = _suite().model_copy(update={"observation_authority": "committed_state_snapshot"})
+
+    result = evaluate_dataset_invariants(
+        _evaluation_result([_output("AC-100", "AC-100")]),
+        suite,
+    )
+
+    assert result.baseline.rules[0].status == "satisfied"
 
 
 def test_allowed_set_is_strict_ordered_and_rejects_duplicate_configuration() -> None:
