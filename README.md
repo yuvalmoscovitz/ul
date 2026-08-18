@@ -277,7 +277,8 @@ responsible for making reset deterministic and complete.
 Each physical lifecycle request counts toward `--max-target-calls`. A configuration with setup
 uses five calls per repetition; without setup it uses four. Version 2 therefore does not require
 `--confirm-fresh-state`. Version 1 remains supported and still requires that confirmation because
-it has no explicit reset operation.
+it has no explicit reset operation. Version 1 invariant suites must use `agent_response`;
+`committed_state_snapshot` is evaluable only when a version 2 snapshot call succeeds.
 
 To add customer-defined deterministic checks, provide a strict invariant file:
 
@@ -306,7 +307,8 @@ non-scalar values never silently satisfy a rule. A satisfied declared rule does 
 that the agent is correct or safe beyond that rule. Non-integer JSON numbers and selected values
 larger than 4 KiB are `not_evaluable` in this first rule type. Represent exact decimal values as
 strings or integer minor units rather than binary JSON floats. `observation_authority` is the
-customer's statement about what the target output represents; UL does not independently verify it.
+customer's choice of the agent-response or committed-snapshot channel. UL keeps those channels
+separate and never substitutes an agent response for a missing committed-state snapshot.
 
 Invariant schema `1.1.0` also supports literal values, allowed sets, and array uniqueness by a
 customer-declared composite key:

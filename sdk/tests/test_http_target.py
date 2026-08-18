@@ -114,7 +114,6 @@ async def test_posts_input_to_real_json_endpoint_and_preserves_response(
         "actions": [{"action": "transfer", "amount": 100, "recipient": "Alice"}]
     }
     assert output.metadata == {}
-    assert target.protocol_version == 1
     assert target.fresh_state_per_execution is True
     assert target.safety_envelope.isolated is True
     assert target.safety_envelope.allows_network_egress is True

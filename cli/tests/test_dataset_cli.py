@@ -184,7 +184,7 @@ def _run_context(
     )
 
 
-def test_run_context_pipeline_version_tracks_target_protocol() -> None:
+def test_run_context_uses_current_pipeline_for_all_target_protocols() -> None:
     record = _evaluation_result("interaction-1").source
     version_one_context = _run_context((record,))
     version_two_context = main._dataset_evidence_run_context(
@@ -211,7 +211,7 @@ def test_run_context_pipeline_version_tracks_target_protocol() -> None:
         settings=cast(Any, _settings()),
     )
 
-    assert version_one_context.pipeline_version == "1.0.0"
+    assert version_one_context.pipeline_version == "1.1.0"
     assert version_two_context.pipeline_version == "1.1.0"
 
 
@@ -1780,7 +1780,6 @@ def test_all_complete_resume_preserves_prior_invariant_exit_code(
     invariant_evaluation = main.evaluate_dataset_invariants(
         evaluation_result,
         invariant_suite,
-        allow_legacy_committed_state_fallback=True,
     )
     assert invariant_evaluation.baseline.rules[0].status == invariant_status
     run_context = _run_context(
@@ -1946,7 +1945,6 @@ def test_resume_accepts_extended_invariant_evidence_schema() -> None:
     invariant_evaluation = main.evaluate_dataset_invariants(
         evaluation_result,
         suite,
-        allow_legacy_committed_state_fallback=True,
     )
     run_context = _run_context((evaluation_result.source,), invariant_suite=suite)
     raw_evidence = (

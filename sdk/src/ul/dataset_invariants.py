@@ -682,15 +682,12 @@ def load_dataset_invariant_suite(path: str | Path) -> DatasetInvariantSuite:
 def evaluate_dataset_invariants(
     result: DatasetEvaluationResult,
     suite: DatasetInvariantSuite,
-    *,
-    allow_legacy_committed_state_fallback: bool = True,
 ) -> DatasetInvariantEvaluation:
     array_work_budget = _ArrayInvariantWorkBudget(_MAXIMUM_ARRAY_INVARIANT_WORK_UNITS)
     baseline = _evaluate_arm(
         suite,
         result.baseline.trial_set.trials,
         arm="baseline",
-        allow_legacy_committed_state_fallback=allow_legacy_committed_state_fallback,
         array_work_budget=array_work_budget,
     )
     variations = tuple(
@@ -699,7 +696,6 @@ def evaluate_dataset_invariants(
             case.trial_set.trials,
             arm="variation",
             operator_id=case.candidate.operator_id,
-            allow_legacy_committed_state_fallback=allow_legacy_committed_state_fallback,
             array_work_budget=array_work_budget,
         )
         for case in result.cases
@@ -719,16 +715,11 @@ def evaluate_dataset_invariant_rules(
     outputs: tuple[ObservedAgentOutput | None, ...],
     *,
     observation_authority: ObservationAuthority = "agent_response",
-    allow_legacy_committed_state_fallback: bool = True,
 ) -> tuple[DatasetInvariantRuleResult, ...]:
     if not outputs:
         raise ValueError("invariant evaluation requires at least one target output")
     array_work_budget = _ArrayInvariantWorkBudget(_MAXIMUM_ARRAY_INVARIANT_WORK_UNITS)
-    selected_outputs = _outputs_for_observation_authority(
-        outputs,
-        observation_authority,
-        allow_legacy_committed_state_fallback=allow_legacy_committed_state_fallback,
-    )
+    selected_outputs = _outputs_for_observation_authority(outputs, observation_authority)
     return tuple(
         _evaluate_rule_from_outputs(
             rule,
@@ -746,7 +737,6 @@ def _evaluate_arm(
     arm: Literal["baseline", "variation"],
     array_work_budget: _ArrayInvariantWorkBudget,
     operator_id: str | None = None,
-    allow_legacy_committed_state_fallback: bool = False,
 ) -> DatasetInvariantArmEvaluation:
     return DatasetInvariantArmEvaluation(
         arm=arm,
@@ -756,7 +746,6 @@ def _evaluate_arm(
                 rule,
                 trials,
                 observation_authority=suite.observation_authority,
-                allow_legacy_committed_state_fallback=allow_legacy_committed_state_fallback,
                 array_work_budget=array_work_budget,
             )
             for rule in suite.rules
@@ -769,7 +758,6 @@ def _evaluate_rule(
     trials: tuple[DatasetEvaluationTrial, ...],
     *,
     observation_authority: ObservationAuthority,
-    allow_legacy_committed_state_fallback: bool,
     array_work_budget: _ArrayInvariantWorkBudget,
 ) -> DatasetInvariantRuleResult:
     return _evaluate_rule_from_outputs(
@@ -777,7 +765,6 @@ def _evaluate_rule(
         _outputs_for_observation_authority(
             tuple(trial.target_output for trial in trials),
             observation_authority,
-            allow_legacy_committed_state_fallback=allow_legacy_committed_state_fallback,
         ),
         array_work_budget=array_work_budget,
     )
@@ -786,21 +773,13 @@ def _evaluate_rule(
 def _outputs_for_observation_authority(
     outputs: tuple[ObservedAgentOutput | None, ...],
     observation_authority: ObservationAuthority,
-    *,
-    allow_legacy_committed_state_fallback: bool = False,
 ) -> tuple[ObservedAgentOutput | None, ...]:
     if observation_authority != "committed_state_snapshot":
         return outputs
     return tuple(
         None
-        if output is None
-        or (
-            "committed_state_snapshot" not in output.metadata
-            and not allow_legacy_committed_state_fallback
-        )
+        if output is None or "committed_state_snapshot" not in output.metadata
         else ObservedAgentOutput(raw_output=output.metadata["committed_state_snapshot"])
-        if "committed_state_snapshot" in output.metadata
-        else output
         for output in outputs
     )
 

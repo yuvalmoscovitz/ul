@@ -366,38 +366,13 @@ def test_committed_state_authority_does_not_fall_back_to_execute_response() -> N
         (rule,),
         (ObservedAgentOutput(raw_output={"amount": 150}),),
         observation_authority="committed_state_snapshot",
-        allow_legacy_committed_state_fallback=False,
     )[0]
 
     assert result.status == "not_evaluable"
     assert result.trials[0].reason_code == "target_output_missing"
 
 
-def test_legacy_v1_committed_state_authority_can_use_execute_response() -> None:
-    rule = JsonValueEqualsLiteralInvariant(
-        type="json_value_equals_literal",
-        id="amount-is-committed",
-        version="1.0.0",
-        description="The committed amount must be 150.",
-        severity="high",
-        value_pointer="/amount",
-        literal=150,
-    )
-
-    result = evaluate_dataset_invariant_rules(
-        (rule,),
-        (
-            ObservedAgentOutput(
-                raw_output={"amount": 150},
-            ),
-        ),
-        observation_authority="committed_state_snapshot",
-    )[0]
-
-    assert result.status == "satisfied"
-
-
-def test_public_evaluation_defaults_to_legacy_committed_state_fallback() -> None:
+def test_public_evaluation_requires_a_committed_state_snapshot() -> None:
     suite = _suite().model_copy(update={"observation_authority": "committed_state_snapshot"})
 
     result = evaluate_dataset_invariants(
@@ -405,7 +380,7 @@ def test_public_evaluation_defaults_to_legacy_committed_state_fallback() -> None
         suite,
     )
 
-    assert result.baseline.rules[0].status == "satisfied"
+    assert result.baseline.rules[0].status == "not_evaluable"
 
 
 def test_allowed_set_is_strict_ordered_and_rejects_duplicate_configuration() -> None:

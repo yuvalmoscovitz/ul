@@ -38,7 +38,7 @@ from ul.dataset_invariants import (
     evaluate_dataset_invariants,
 )
 from ul.dataset_regression import dataset_regression_target_config_sha256
-from ul.http_target import JsonHttpDatasetTargetConfig, JsonHttpDatasetTargetConfiguration
+from ul.http_target import JsonHttpDatasetTargetConfiguration
 
 if sys.platform == "win32":
     import msvcrt
@@ -159,7 +159,7 @@ class DatasetEvidenceSemanticSettings(_StrictModel):
 
 class DatasetEvidenceRunContext(_StrictModel):
     schema_version: Literal["1.0.0"] = "1.0.0"
-    pipeline_version: Literal["1.0.0", "1.1.0"] = _DATASET_EVALUATION_PIPELINE_VERSION
+    pipeline_version: Literal["1.1.0"] = _DATASET_EVALUATION_PIPELINE_VERSION
     selected_dataset_sha256: str = Field(pattern=_SHA256_PATTERN)
     operators: tuple[DatasetEvidenceOperator, ...] = Field(min_length=1)
     repetitions: int = Field(ge=1)
@@ -262,12 +262,9 @@ def create_dataset_evidence_run_context(
         for operator_id, version in operators
     )
     target_config_sha256 = dataset_regression_target_config_sha256(target_config)
-    pipeline_version: Literal["1.0.0", "1.1.0"] = (
-        "1.0.0" if isinstance(target_config, JsonHttpDatasetTargetConfig) else "1.1.0"
-    )
     content = {
         "schema_version": "1.0.0",
-        "pipeline_version": pipeline_version,
+        "pipeline_version": _DATASET_EVALUATION_PIPELINE_VERSION,
         "selected_dataset_sha256": selected_dataset_sha256,
         "operators": [operator.model_dump(mode="json") for operator in operator_snapshots],
         "repetitions": repetitions,
@@ -277,7 +274,6 @@ def create_dataset_evidence_run_context(
         "semantic_settings": semantic_settings.model_dump(mode="json"),
     }
     return DatasetEvidenceRunContext(
-        pipeline_version=pipeline_version,
         selected_dataset_sha256=selected_dataset_sha256,
         operators=operator_snapshots,
         repetitions=repetitions,
@@ -358,13 +354,7 @@ def validate_dataset_resume_evidence(
         ):
             raise ValueError("resume evidence technical repetitions are incompatible")
         expected_invariant_evaluation = (
-            evaluate_dataset_invariants(
-                technical_result,
-                invariant_suite,
-                allow_legacy_committed_state_fallback=isinstance(
-                    expected_context.target_config, JsonHttpDatasetTargetConfig
-                ),
-            )
+            evaluate_dataset_invariants(technical_result, invariant_suite)
             if invariant_suite is not None
             else None
         )
@@ -1126,14 +1116,7 @@ def _validate_invariant_technical_details(
         ):
             raise _ReviewInputError("invariant technical details do not match the evidence case")
     try:
-        recomputed_evaluation = evaluate_dataset_invariants(
-            technical_details,
-            suite,
-            allow_legacy_committed_state_fallback=(
-                evidence.run_context is None
-                or isinstance(evidence.run_context.target_config, JsonHttpDatasetTargetConfig)
-            ),
-        )
+        recomputed_evaluation = evaluate_dataset_invariants(technical_details, suite)
     except (ValidationError, ValueError):
         raise _ReviewInputError("invariant technical details cannot be safely recomputed") from None
     if recomputed_evaluation != evaluation:

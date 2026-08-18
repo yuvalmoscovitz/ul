@@ -244,7 +244,16 @@ def test_extended_rules_round_trip_and_replay(
     result = asyncio.run(
         replay_dataset_regression(
             loaded,
-            _Target([ObservedAgentOutput.model_validate({"raw_output": raw_output})]),
+            _Target(
+                [
+                    ObservedAgentOutput.model_validate(
+                        {
+                            "raw_output": {"message": "completed"},
+                            "metadata": {"committed_state_snapshot": raw_output},
+                        }
+                    )
+                ]
+            ),
         )
     )
 

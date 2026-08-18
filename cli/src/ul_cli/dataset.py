@@ -1100,13 +1100,7 @@ async def _evaluate_interaction_records(
                 repetitions=repetitions,
             )
             invariant_evaluation = (
-                evaluate_dataset_invariants(
-                    result,
-                    invariant_suite,
-                    allow_legacy_committed_state_fallback=(
-                        getattr(target, "protocol_version", 1) == 1
-                    ),
-                )
+                evaluate_dataset_invariants(result, invariant_suite)
                 if invariant_suite is not None
                 else None
             )

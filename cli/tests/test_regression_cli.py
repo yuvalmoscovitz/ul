@@ -155,7 +155,7 @@ def _evidence_record() -> dict[str, Any]:
     suite = DatasetInvariantSuite(
         schema_version="1.0.0",
         observation_source="target_output",
-        observation_authority="committed_state_snapshot",
+        observation_authority="agent_response",
         rules=(
             JsonValuesEqualInvariant(
                 type="json_values_equal",
@@ -220,7 +220,7 @@ def _evidence_record() -> dict[str, Any]:
             "interaction_id": "quickstart-payment",
             "suite_sha256": suite.sha256,
             "observation_source": "target_output",
-            "observation_authority": "committed_state_snapshot",
+            "observation_authority": "agent_response",
             "baseline": {
                 "arm": "baseline",
                 "operator_id": None,

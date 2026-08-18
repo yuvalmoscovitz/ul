@@ -27,7 +27,6 @@ from ul.dataset_invariants import (
     evaluate_dataset_invariant_rules,
 )
 from ul.http_target import (
-    JsonHttpDatasetTargetConfig,
     JsonHttpDatasetTargetConfiguration,
     json_http_target_calls_per_execution,
 )
@@ -423,9 +422,6 @@ async def replay_dataset_regression(
         case.invariant_suite.rules,
         tuple(execution.target_output for execution in executions),
         observation_authority=case.invariant_suite.observation_authority,
-        allow_legacy_committed_state_fallback=isinstance(
-            case.target.config, JsonHttpDatasetTargetConfig
-        ),
     )
     rule_statuses = {rule.status for rule in rules}
     status: RegressionStatus

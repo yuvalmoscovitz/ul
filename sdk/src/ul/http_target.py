@@ -364,10 +364,6 @@ class JsonHttpDatasetTarget:
     def fresh_state_per_execution(self) -> bool:
         return True
 
-    @property
-    def protocol_version(self) -> Literal[1, 2]:
-        return 2 if self._lifecycle_config is not None else 1
-
     async def __aenter__(self) -> JsonHttpDatasetTarget:
         return self
 
