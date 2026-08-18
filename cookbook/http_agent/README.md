@@ -28,7 +28,7 @@ mapping to `raw_output` and `metadata`. Keep the committed state snapshot in met
 provides one—UL treats that field as authoritative state evidence.
 
 The rest of the file is protective plumbing: URL validation, authentication, timeout, response
-size limit, redirect blocking, and UL's safety declaration.
+size limit, redirect blocking, cookie clearing between trials, and UL's safety declaration.
 
 ## Run it
 

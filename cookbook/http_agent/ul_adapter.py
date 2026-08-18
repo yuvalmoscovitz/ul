@@ -41,6 +41,7 @@ class ExistingHttpAgentTarget:
         )
 
     async def execute(self, raw_input: str) -> ObservedAgentOutput:
+        self._client.cookies.clear()
         try:
             async with self._client.stream(
                 "POST", self._endpoint, json={"input": raw_input}

@@ -144,3 +144,28 @@ async def test_adapter_rejects_encoded_response(monkeypatch: pytest.MonkeyPatch)
             await target.execute("hello")
     finally:
         await target.aclose()
+
+
+@pytest.mark.asyncio
+async def test_adapter_does_not_reuse_response_cookies(monkeypatch: pytest.MonkeyPatch) -> None:
+    requests = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal requests
+        requests += 1
+        assert "Cookie" not in request.headers
+        return httpx.Response(
+            200,
+            headers={"Set-Cookie": "session=previous-trial; Secure"},
+            stream=_AsyncBytes(b'{"result":"ok"}'),
+        )
+
+    _install_transport(monkeypatch, handler)
+    target = ul_adapter.ExistingHttpAgentTarget("https://agent.example.test/run", None)
+    try:
+        await target.execute("first")
+        await target.execute("second")
+    finally:
+        await target.aclose()
+
+    assert requests == 2
