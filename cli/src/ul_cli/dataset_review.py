@@ -630,7 +630,7 @@ def _load_evidence(path: Path) -> list[_LoadedEvidenceRecord]:
             )
     except (ValidationError, ValueError):
         raise _ReviewInputError(
-            "evidence is not valid UL schema 1.3.0, 1.4.0, or 1.5.0 JSONL"
+            "evidence is not valid UL schema 1.3.0, 1.4.0, 1.5.0, or 1.6.0 JSONL"
         ) from None
     return records
 

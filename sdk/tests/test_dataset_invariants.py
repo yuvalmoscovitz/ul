@@ -6,9 +6,11 @@ from types import SimpleNamespace
 from typing import Literal, cast
 
 import pytest
+import ul.dataset_invariants as dataset_invariants
 from pydantic import ValidationError
 from ul import (
     DatasetInvariantArmEvaluation,
+    DatasetInvariantArrayUniqueTrialEvaluation,
     DatasetInvariantEvaluation,
     DatasetInvariantRuleEvaluation,
     DatasetInvariantSuite,
@@ -22,7 +24,7 @@ from ul import (
     load_dataset_invariant_suite,
 )
 from ul.dataset_evaluation import DatasetEvaluationResult
-from ul.dataset_invariants import _resolve_json_pointer
+from ul.dataset_invariants import EqualityTrialReasonCode, TrialReasonCode, _resolve_json_pointer
 from ul_core.dataset import ObservedAgentOutput
 
 _MISSING = object()
@@ -514,6 +516,53 @@ def test_extended_rule_configuration_and_array_work_are_bounded() -> None:
     )
 
 
+def test_array_evidence_rejects_evaluated_results_above_item_limit() -> None:
+    with pytest.raises(ValidationError, match="exceeds the item limit"):
+        DatasetInvariantArrayUniqueTrialEvaluation(
+            repetition=1,
+            status="satisfied",
+            reason_code="array_items_unique",
+            array_pointer="/items",
+            key_pointers=("/id",),
+            item_count=10_001,
+        )
+
+
+def test_array_invariant_work_budget_is_shared_across_rules(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(dataset_invariants, "_MAXIMUM_ARRAY_INVARIANT_WORK_UNITS", 5)
+    rules = tuple(
+        JsonArrayItemsUniqueByInvariant(
+            type="json_array_items_unique_by",
+            id=f"unique-items-{index}",
+            version="1.0.0",
+            description="Item identifiers must be unique.",
+            severity="high",
+            array_pointer="/items",
+            key_pointers=("/id",),
+        )
+        for index in range(2)
+    )
+
+    results = evaluate_dataset_invariant_rules(
+        rules,
+        (_observed({"items": [{"id": "one"}, {"id": "two"}]}),),
+    )
+
+    assert results[0].status == "satisfied"
+    exhausted_trial = results[1].trials[0]
+    assert (exhausted_trial.status, exhausted_trial.reason_code) == (
+        "not_evaluable",
+        "evaluation_work_limit_exceeded",
+    )
+    assert (exhausted_trial.failed_item_index, exhausted_trial.failed_key_pointer) == (0, "/id")
+
+
+def test_legacy_trial_reason_code_import_remains_compatible() -> None:
+    assert TrialReasonCode is EqualityTrialReasonCode
+
+
 @pytest.mark.parametrize(
     ("pointer", "expected"),
     [
@@ -534,6 +583,7 @@ def test_json_pointer_resolves_root_escapes_and_ascii_array_indices(
         None,
     )
     assert _resolve_json_pointer(document, "/missing") == (False, None)
+    assert _resolve_json_pointer(document, "/a~1b/~0key/" + "9" * 5_000) == (False, None)
 
 
 @pytest.mark.parametrize(

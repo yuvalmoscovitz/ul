@@ -21,6 +21,7 @@ _MAXIMUM_RESOLVED_VALUE_BYTES = 4_096
 _MAXIMUM_ALLOWED_VALUES = 100
 _MAXIMUM_ARRAY_ITEMS = 10_000
 _MAXIMUM_KEY_POINTERS = 10
+_MAXIMUM_ARRAY_INVARIANT_WORK_UNITS = 250_000
 _IDENTIFIER_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$"
 _VERSION_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9._+-]{0,49}$"
 _JSON_POINTER_PATTERN = r"^(?:/(?:[^~/]|~[01])*)*$"
@@ -47,6 +48,7 @@ EqualityTrialReasonCode = Literal[
     "right_value_exceeds_limit",
     "operand_types_differ",
 ]
+TrialReasonCode = EqualityTrialReasonCode
 ValueEqualsTrialReasonCode = Literal[
     "value_equals_literal",
     "value_differs_from_literal",
@@ -72,6 +74,7 @@ ArrayUniqueTrialReasonCode = Literal[
     "array_pointer_missing",
     "array_value_not_array",
     "array_exceeds_limit",
+    "evaluation_work_limit_exceeded",
     "key_pointer_missing",
     "key_value_not_scalar",
     "key_non_integer_number_not_supported",
@@ -93,6 +96,17 @@ ScalarResolution = Literal[
 
 class _StrictModel(ULModel):
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+
+class _ArrayInvariantWorkBudget:
+    def __init__(self, maximum_units: int) -> None:
+        self.remaining_units = maximum_units
+
+    def consume(self, units: int) -> bool:
+        if units > self.remaining_units:
+            return False
+        self.remaining_units -= units
+        return True
 
 
 class _InvariantRule(_StrictModel):
@@ -383,6 +397,7 @@ class DatasetInvariantArrayUniqueTrialEvaluation(_StrictModel):
             "array_pointer_missing": "not_evaluable",
             "array_value_not_array": "not_evaluable",
             "array_exceeds_limit": "not_evaluable",
+            "evaluation_work_limit_exceeded": "not_evaluable",
             "key_pointer_missing": "not_evaluable",
             "key_value_not_scalar": "not_evaluable",
             "key_non_integer_number_not_supported": "not_evaluable",
@@ -390,6 +405,12 @@ class DatasetInvariantArrayUniqueTrialEvaluation(_StrictModel):
         }
         if self.status != expected_status_by_reason[self.reason_code]:
             raise ValueError("trial invariant status must match its reason")
+        if (
+            self.reason_code != "array_exceeds_limit"
+            and self.item_count is not None
+            and self.item_count > _MAXIMUM_ARRAY_ITEMS
+        ):
+            raise ValueError("evaluated array invariant evidence exceeds the item limit")
         if self.reason_code in {
             "target_output_missing",
             "array_pointer_missing",
@@ -662,13 +683,20 @@ def evaluate_dataset_invariants(
     result: DatasetEvaluationResult,
     suite: DatasetInvariantSuite,
 ) -> DatasetInvariantEvaluation:
-    baseline = _evaluate_arm(suite, result.baseline.trial_set.trials, arm="baseline")
+    array_work_budget = _ArrayInvariantWorkBudget(_MAXIMUM_ARRAY_INVARIANT_WORK_UNITS)
+    baseline = _evaluate_arm(
+        suite,
+        result.baseline.trial_set.trials,
+        arm="baseline",
+        array_work_budget=array_work_budget,
+    )
     variations = tuple(
         _evaluate_arm(
             suite,
             case.trial_set.trials,
             arm="variation",
             operator_id=case.candidate.operator_id,
+            array_work_budget=array_work_budget,
         )
         for case in result.cases
         if case.candidate.passed and case.trial_set is not None
@@ -688,7 +716,11 @@ def evaluate_dataset_invariant_rules(
 ) -> tuple[DatasetInvariantRuleResult, ...]:
     if not outputs:
         raise ValueError("invariant evaluation requires at least one target output")
-    return tuple(_evaluate_rule_from_outputs(rule, outputs) for rule in rules)
+    array_work_budget = _ArrayInvariantWorkBudget(_MAXIMUM_ARRAY_INVARIANT_WORK_UNITS)
+    return tuple(
+        _evaluate_rule_from_outputs(rule, outputs, array_work_budget=array_work_budget)
+        for rule in rules
+    )
 
 
 def _evaluate_arm(
@@ -696,32 +728,44 @@ def _evaluate_arm(
     trials: tuple[DatasetEvaluationTrial, ...],
     *,
     arm: Literal["baseline", "variation"],
+    array_work_budget: _ArrayInvariantWorkBudget,
     operator_id: str | None = None,
 ) -> DatasetInvariantArmEvaluation:
     return DatasetInvariantArmEvaluation(
         arm=arm,
         operator_id=operator_id,
-        rules=tuple(_evaluate_rule(rule, trials) for rule in suite.rules),
+        rules=tuple(
+            _evaluate_rule(rule, trials, array_work_budget=array_work_budget)
+            for rule in suite.rules
+        ),
     )
 
 
 def _evaluate_rule(
     rule: DatasetInvariantRule,
     trials: tuple[DatasetEvaluationTrial, ...],
+    *,
+    array_work_budget: _ArrayInvariantWorkBudget,
 ) -> DatasetInvariantRuleResult:
-    return _evaluate_rule_from_outputs(rule, tuple(trial.target_output for trial in trials))
+    return _evaluate_rule_from_outputs(
+        rule,
+        tuple(trial.target_output for trial in trials),
+        array_work_budget=array_work_budget,
+    )
 
 
 def _evaluate_rule_from_outputs(
     rule: DatasetInvariantRule,
     outputs: tuple[ObservedAgentOutput | None, ...],
+    *,
+    array_work_budget: _ArrayInvariantWorkBudget,
 ) -> DatasetInvariantRuleResult:
     if isinstance(rule, JsonValueEqualsLiteralInvariant):
         return _evaluate_value_equals_rule(rule, outputs)
     if isinstance(rule, JsonValueInAllowedSetInvariant):
         return _evaluate_value_in_set_rule(rule, outputs)
     if isinstance(rule, JsonArrayItemsUniqueByInvariant):
-        return _evaluate_array_unique_rule(rule, outputs)
+        return _evaluate_array_unique_rule(rule, outputs, array_work_budget=array_work_budget)
     trial_results = tuple(
         _evaluate_equal_output(rule, output, repetition)
         for repetition, output in enumerate(outputs, start=1)
@@ -955,9 +999,16 @@ def _evaluate_value_in_set_output(
 def _evaluate_array_unique_rule(
     rule: JsonArrayItemsUniqueByInvariant,
     outputs: tuple[ObservedAgentOutput | None, ...],
+    *,
+    array_work_budget: _ArrayInvariantWorkBudget,
 ) -> DatasetInvariantArrayUniqueRuleEvaluation:
     trials = tuple(
-        _evaluate_array_unique_output(rule, output, repetition)
+        _evaluate_array_unique_output(
+            rule,
+            output,
+            repetition,
+            array_work_budget=array_work_budget,
+        )
         for repetition, output in enumerate(outputs, start=1)
     )
     status, reason_code = _aggregate_trial_statuses(trials)
@@ -979,6 +1030,8 @@ def _evaluate_array_unique_output(
     rule: JsonArrayItemsUniqueByInvariant,
     target_output: ObservedAgentOutput | None,
     repetition: int,
+    *,
+    array_work_budget: _ArrayInvariantWorkBudget,
 ) -> DatasetInvariantArrayUniqueTrialEvaluation:
     if target_output is None:
         return DatasetInvariantArrayUniqueTrialEvaluation(
@@ -1019,10 +1072,19 @@ def _evaluate_array_unique_output(
     first_index_by_key: dict[tuple[tuple[str, str], ...], int] = {}
     first_duplicate: tuple[int, int] | None = None
     first_error: tuple[ArrayUniqueTrialReasonCode, int, str] | None = None
+    key_pointer_tokens = tuple(
+        (key_pointer, _json_pointer_tokens(key_pointer)) for key_pointer in rule.key_pointers
+    )
+    work_limit_reached = False
     for index, item in enumerate(array_items):
         key_parts: list[tuple[str, str]] = []
-        for key_pointer in rule.key_pointers:
-            resolution, key_value = _resolve_supported_scalar(item, key_pointer)
+        for key_pointer, pointer_tokens in key_pointer_tokens:
+            work_units = sum(max(1, len(token)) for token in pointer_tokens) or 1
+            if not array_work_budget.consume(work_units):
+                first_error = ("evaluation_work_limit_exceeded", index, key_pointer)
+                work_limit_reached = True
+                break
+            resolution, key_value = _resolve_supported_scalar_tokens(item, pointer_tokens)
             if resolution != "resolved":
                 if first_error is None:
                     reason_by_resolution: dict[ScalarResolution, ArrayUniqueTrialReasonCode] = {
@@ -1042,6 +1104,8 @@ def _evaluate_array_unique_output(
                 first_duplicate = (previous_index, index)
             else:
                 first_index_by_key[composite_key] = index
+        if work_limit_reached:
+            break
     if first_duplicate is not None:
         return DatasetInvariantArrayUniqueTrialEvaluation(
             repetition=repetition,
@@ -1141,7 +1205,14 @@ def _aggregate_trial_statuses(
 
 
 def _resolve_supported_scalar(document: JsonValue, pointer: str) -> tuple[ScalarResolution, object]:
-    found, value = _resolve_json_pointer(document, pointer)
+    return _resolve_supported_scalar_tokens(document, _json_pointer_tokens(pointer))
+
+
+def _resolve_supported_scalar_tokens(
+    document: JsonValue,
+    pointer_tokens: tuple[str, ...],
+) -> tuple[ScalarResolution, object]:
+    found, value = _resolve_json_pointer_tokens(document, pointer_tokens)
     if not found:
         return "missing", None
     if not _is_json_scalar(value):
@@ -1154,22 +1225,51 @@ def _resolve_supported_scalar(document: JsonValue, pointer: str) -> tuple[Scalar
 
 
 def _resolve_json_pointer(document: JsonValue, pointer: str) -> tuple[bool, object]:
-    current: object = document
+    return _resolve_json_pointer_tokens(document, _json_pointer_tokens(pointer))
+
+
+def _json_pointer_tokens(pointer: str) -> tuple[str, ...]:
     if pointer == "":
-        return True, current
-    for encoded_token in pointer[1:].split("/"):
-        token = encoded_token.replace("~1", "/").replace("~0", "~")
-        if isinstance(current, dict) and token in current:
-            current = current[token]
-            continue
-        valid_array_index = token == "0" or (
-            token.isascii() and token.isdecimal() and not token.startswith("0")
-        )
-        if isinstance(current, list) and valid_array_index and int(token) < len(current):
-            current = current[int(token)]
-            continue
+        return ()
+    return tuple(
+        encoded_token.replace("~1", "/").replace("~0", "~")
+        for encoded_token in pointer[1:].split("/")
+    )
+
+
+def _resolve_json_pointer_tokens(
+    document: JsonValue,
+    pointer_tokens: tuple[str, ...],
+) -> tuple[bool, object]:
+    current: object = document
+    for token in pointer_tokens:
+        if isinstance(current, dict):
+            current_object = cast(dict[str, object], current)
+            if token in current_object:
+                current = current_object[token]
+                continue
+        if isinstance(current, list):
+            current_array = cast(list[object], current)
+            array_index = _bounded_array_index(token, len(current_array))
+            if array_index is not None:
+                current = current_array[array_index]
+                continue
         return False, None
     return True, current
+
+
+def _bounded_array_index(token: str, array_length: int) -> int | None:
+    valid_syntax = token == "0" or (
+        token.isascii() and token.isdecimal() and not token.startswith("0")
+    )
+    if not valid_syntax or array_length == 0:
+        return None
+    maximum_index_text = str(array_length - 1)
+    if len(token) > len(maximum_index_text) or (
+        len(token) == len(maximum_index_text) and token > maximum_index_text
+    ):
+        return None
+    return int(token)
 
 
 def _is_json_scalar(value: object) -> bool:

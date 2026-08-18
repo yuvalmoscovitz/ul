@@ -309,3 +309,6 @@ uniqueness rule checks 1–10 relative JSON pointers for each array item and rep
 pointer locations, and duplicate indices to the terminal; selected values remain in private evidence.
 An empty or single-item array satisfies uniqueness but does not prove an action occurred. The rule
 applies only within one declared target-output snapshot, not across independent customer requests.
+UL also applies a fixed work budget across array rules and trials for each interaction. If their
+combined item and pointer-processing work exceeds that budget, affected trials are `not_evaluable`
+rather than silently passing or consuming unbounded CPU time.
