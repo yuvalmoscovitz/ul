@@ -239,6 +239,67 @@ def test_trace_native_rejects_unknown_mapping_fields_without_echoing_values(
     assert "do-not-echo" not in result.output
 
 
+def test_file_exporter_json_lines_batches_merge_deterministically(tmp_path: Path) -> None:
+    traces = tmp_path / "traces.jsonl"
+    output = tmp_path / "dataset.jsonl"
+    mapping = tmp_path / "mapping.json"
+    _write_mapping(mapping)
+    later_trace = _otlp_export(_span("eeff0011" * 4, "22334455" * 2, input_text="Second trace"))
+    earlier_trace = _otlp_export(_span("aabbccdd" * 4, "11223344" * 2, input_text="First trace"))
+    traces.write_text(
+        json.dumps(later_trace) + "\n" + json.dumps(earlier_trace) + "\n",
+        encoding="utf-8",
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "dataset",
+            "ingest",
+            "otlp",
+            str(traces),
+            "--mapping",
+            str(mapping),
+            "--output",
+            str(output),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    records = [json.loads(line) for line in output.read_text(encoding="utf-8").splitlines()]
+    assert [record["id"] for record in records] == ["aabbccdd" * 4, "eeff0011" * 4]
+
+
+def test_file_exporter_json_array_is_accepted(tmp_path: Path) -> None:
+    traces = tmp_path / "traces.json"
+    output = tmp_path / "dataset.jsonl"
+    traces.write_text(
+        json.dumps([_otlp_export(_span("aabbccdd" * 4, "11223344" * 2, input_text="Array trace"))]),
+        encoding="utf-8",
+    )
+
+    result = runner.invoke(app, _ingest_arguments(traces, output))
+
+    assert result.exit_code == 0, result.output
+    assert json.loads(output.read_text(encoding="utf-8"))["input"] == "Array trace"
+
+
+def test_file_exporter_json_lines_error_identifies_line_without_values(tmp_path: Path) -> None:
+    traces = tmp_path / "traces.jsonl"
+    output = tmp_path / "dataset.jsonl"
+    traces.write_text(
+        json.dumps(_otlp_export(_span("aabbccdd" * 4, "11223344" * 2)))
+        + '\n{"secret":"do-not-echo"\n',
+        encoding="utf-8",
+    )
+
+    result = runner.invoke(app, _ingest_arguments(traces, output))
+
+    assert result.exit_code == 2
+    assert "line 2" in result.output
+    assert "do-not-echo" not in result.output
+
+
 def test_ingest_extracts_records_from_event_based_spans(tmp_path: Path) -> None:
     traces = tmp_path / "traces.json"
     output = tmp_path / "dataset.jsonl"

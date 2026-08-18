@@ -15,6 +15,7 @@ _MAXIMUM_TOOL_CALLS_PER_TRACE = 512
 _MAXIMUM_ERRORS_PER_TRACE = 512
 _MAXIMUM_CONTENT_CHARACTERS = 100_000
 _MAXIMUM_METADATA_CHARACTERS = 512
+_MAXIMUM_RECORD_BYTES = 1_000_000
 
 
 class OtlpAttributeMapping(BaseModel):
@@ -62,6 +63,7 @@ class OtlpIngestResult:
     skipped_no_input: int
     skipped_no_output: int
     skipped_limit: int
+    skipped_incompatible_histories: int
     truncated: bool
 
 
@@ -73,6 +75,10 @@ class _ExportedSpan:
     scope_version: str | None
 
 
+class _IncompatibleHistoriesError(ValueError):
+    pass
+
+
 def parse_otlp_traces(
     data: object,
     *,
@@ -81,51 +87,67 @@ def parse_otlp_traces(
 ) -> OtlpIngestResult:
     if type(limit) is not int or limit < 1:
         raise ValueError("limit must be a positive integer")
-    if not isinstance(data, dict):
-        raise ValueError("OTLP export must be a JSON object")
-
-    raw_resource_spans = cast(dict[str, Any], data).get("resourceSpans")
-    if not isinstance(raw_resource_spans, list):
-        raise ValueError("OTLP export must contain a resourceSpans array")
+    trace_batches: list[dict[str, Any]]
+    if isinstance(data, dict):
+        trace_batches = [cast(dict[str, Any], data)]
+    elif isinstance(data, list):
+        trace_batches = []
+        for item in cast(list[Any], data):
+            if not isinstance(item, dict):
+                raise ValueError("each OTLP trace batch must be a JSON object")
+            trace_batches.append(cast(dict[str, Any], item))
+    else:
+        raise ValueError("OTLP export must be a JSON object, array, or JSON Lines stream")
 
     spans_by_trace: dict[str, list[_ExportedSpan]] = {}
-    for resource_span in cast(list[Any], raw_resource_spans):
-        if not isinstance(resource_span, dict):
-            continue
-        typed_resource_span = cast(dict[str, Any], resource_span)
-        resource = typed_resource_span.get("resource")
-        resource_attributes = (
-            _span_attributes(cast(dict[str, Any], resource)) if isinstance(resource, dict) else {}
-        )
-        for scope_span in cast(list[Any], typed_resource_span.get("scopeSpans") or []):
-            if not isinstance(scope_span, dict):
+    for trace_batch in trace_batches:
+        raw_resource_spans = trace_batch.get("resourceSpans")
+        if not isinstance(raw_resource_spans, list):
+            raise ValueError("each OTLP trace batch must contain a resourceSpans array")
+        for resource_span in cast(list[Any], raw_resource_spans):
+            if not isinstance(resource_span, dict):
                 continue
-            typed_scope_span = cast(dict[str, Any], scope_span)
-            scope = typed_scope_span.get("scope")
-            typed_scope = cast(dict[str, Any], scope) if isinstance(scope, dict) else {}
-            scope_name = _nonempty_string(typed_scope.get("name"))
-            scope_version = _nonempty_string(typed_scope.get("version"))
-            for span in cast(list[Any], typed_scope_span.get("spans") or []):
-                if not isinstance(span, dict):
+            typed_resource_span = cast(dict[str, Any], resource_span)
+            resource = typed_resource_span.get("resource")
+            resource_attributes = (
+                _span_attributes(cast(dict[str, Any], resource))
+                if isinstance(resource, dict)
+                else {}
+            )
+            for scope_span in cast(list[Any], typed_resource_span.get("scopeSpans") or []):
+                if not isinstance(scope_span, dict):
                     continue
-                typed_span = cast(dict[str, Any], span)
-                trace_id = _normalize_id_field(typed_span.get("traceId"))
-                if trace_id is None:
-                    continue
-                spans_by_trace.setdefault(trace_id, []).append(
-                    _ExportedSpan(
-                        span=typed_span,
-                        resource_attributes=resource_attributes,
-                        scope_name=scope_name,
-                        scope_version=scope_version,
-                    )
+                typed_scope_span = cast(dict[str, Any], scope_span)
+                scope = typed_scope_span.get("scope")
+                typed_scope = cast(dict[str, Any], scope) if isinstance(scope, dict) else {}
+                scope_name = _bounded_optional_text(
+                    _nonempty_string(typed_scope.get("name")), _MAXIMUM_METADATA_CHARACTERS
                 )
+                scope_version = _bounded_optional_text(
+                    _nonempty_string(typed_scope.get("version")), _MAXIMUM_METADATA_CHARACTERS
+                )
+                for span in cast(list[Any], typed_scope_span.get("spans") or []):
+                    if not isinstance(span, dict):
+                        continue
+                    typed_span = cast(dict[str, Any], span)
+                    trace_id = _normalize_id_field(typed_span.get("traceId"), expected_bytes=16)
+                    if trace_id is None:
+                        continue
+                    spans_by_trace.setdefault(trace_id, []).append(
+                        _ExportedSpan(
+                            span=typed_span,
+                            resource_attributes=resource_attributes,
+                            scope_name=scope_name,
+                            scope_version=scope_version,
+                        )
+                    )
 
     records: list[OtlpInteractionRecord] = []
     skipped_no_gen_ai = 0
     skipped_no_input = 0
     skipped_no_output = 0
     skipped_limit = 0
+    skipped_incompatible_histories = 0
     truncated = False
 
     for trace_id in sorted(spans_by_trace):
@@ -148,17 +170,27 @@ def parse_otlp_traces(
             if output_text is None:
                 skipped_no_output += 1
                 continue
+            if _record_size_bytes(trace_id, input_text, output_text) > _MAXIMUM_RECORD_BYTES:
+                skipped_limit += 1
+                continue
             records.append(OtlpInteractionRecord(trace_id, input_text, output_text))
             continue
 
         if len(exported_spans) > _MAXIMUM_SPANS_PER_TRACE:
             skipped_limit += 1
             continue
-        scenario = _build_trace_scenario(trace_id, exported_spans, mapping)
+        try:
+            scenario = _build_trace_scenario(trace_id, exported_spans, mapping)
+        except _IncompatibleHistoriesError:
+            skipped_incompatible_histories += 1
+            continue
         if scenario is None:
             skipped_no_input += 1
             continue
         input_text, scenario_output = scenario
+        if _record_size_bytes(trace_id, input_text, scenario_output) > _MAXIMUM_RECORD_BYTES:
+            skipped_limit += 1
+            continue
         records.append(OtlpInteractionRecord(trace_id, input_text, scenario_output))
 
     return OtlpIngestResult(
@@ -167,7 +199,18 @@ def parse_otlp_traces(
         skipped_no_input=skipped_no_input,
         skipped_no_output=skipped_no_output,
         skipped_limit=skipped_limit,
+        skipped_incompatible_histories=skipped_incompatible_histories,
         truncated=truncated,
+    )
+
+
+def _record_size_bytes(interaction_id: str, input_text: str, output: JsonValue) -> int:
+    return len(
+        json.dumps(
+            {"id": interaction_id, "input": input_text, "output": output},
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
     )
 
 
@@ -176,15 +219,17 @@ def _build_trace_scenario(
     exported_spans: list[_ExportedSpan],
     mapping: OtlpMappingConfig,
 ) -> tuple[str, dict[str, JsonValue]] | None:
+    unique_spans = {_exported_span_identity(item): item for item in exported_spans}
     ordered_spans = sorted(
-        exported_spans,
+        unique_spans.values(),
         key=lambda item: (
             _parse_nano(item.span.get("startTimeUnixNano")),
             _normalize_id_field(item.span.get("spanId")) or "",
+            _exported_span_identity(item),
         ),
     )
     canonical_spans: list[dict[str, JsonValue]] = []
-    all_messages: list[dict[str, JsonValue]] = []
+    span_histories: list[list[dict[str, JsonValue]]] = []
     resource_attributes: dict[str, JsonValue] = {}
     tool_call_count = 0
     error_count = 0
@@ -195,9 +240,12 @@ def _build_trace_scenario(
         if not resource_attributes:
             resource_attributes = exported_span.resource_attributes
         messages = _extract_span_messages(span, attributes, mapping)
-        if len(all_messages) + len(messages) > _MAXIMUM_MESSAGES_PER_TRACE:
+        if sum(len(history) for history in span_histories) + len(messages) > (
+            _MAXIMUM_MESSAGES_PER_TRACE
+        ):
             return None
-        all_messages.extend(messages)
+        if messages:
+            span_histories.append(messages)
         tool_calls = _extract_tool_calls(attributes, mapping)
         errors = _extract_errors(span, attributes, mapping)
         tool_call_count += len(tool_calls)
@@ -208,8 +256,8 @@ def _build_trace_scenario(
         ):
             return None
         canonical_span: dict[str, JsonValue] = {
-            "span_id": _normalize_id_field(span.get("spanId")) or "unknown",
-            "parent_span_id": _normalize_id_field(span.get("parentSpanId")),
+            "span_id": _normalize_id_field(span.get("spanId"), expected_bytes=8) or "unknown",
+            "parent_span_id": _normalize_id_field(span.get("parentSpanId"), expected_bytes=8),
             "name": _bounded_text(_nonempty_string(span.get("name")) or "unnamed", 512),
             "start_time_unix_nano": _parse_nano(span.get("startTimeUnixNano")),
             "end_time_unix_nano": _parse_nano(span.get("endTimeUnixNano")),
@@ -239,7 +287,8 @@ def _build_trace_scenario(
             )
         canonical_spans.append(_compact_object(canonical_span))
 
-    input_text = _first_message_text(all_messages, "user")
+    canonical_messages = _merge_compatible_histories(span_histories)
+    input_text = _first_message_text(canonical_messages, "user")
     if input_text is None:
         return None
     session_id = _bounded_metadata_value(
@@ -267,13 +316,17 @@ def _build_trace_scenario(
                 "reference": source_reference,
                 "resource": _compact_object(
                     {
-                        "service_name": resource_attributes.get("service.name"),
-                        "service_version": resource_attributes.get("service.version"),
+                        "service_name": _bounded_metadata_value(
+                            resource_attributes.get("service.name")
+                        ),
+                        "service_version": _bounded_metadata_value(
+                            resource_attributes.get("service.version")
+                        ),
                     }
                 ),
             }
         ),
-        "messages": cast(JsonValue, all_messages),
+        "messages": cast(JsonValue, canonical_messages),
         "spans": cast(JsonValue, canonical_spans),
     }
     return input_text, output
@@ -512,6 +565,54 @@ def _first_message_text(messages: list[dict[str, JsonValue]], role: str) -> str 
     return None
 
 
+def _merge_compatible_histories(
+    histories: list[list[dict[str, JsonValue]]],
+) -> list[dict[str, JsonValue]]:
+    conversation: list[dict[str, JsonValue]] = []
+    for history in histories:
+        if not conversation:
+            conversation = list(history)
+            continue
+        conversation_identities = [_message_identity(message) for message in conversation]
+        history_identities = [_message_identity(message) for message in history]
+        common_prefix_length = 0
+        for existing, candidate in zip(conversation_identities, history_identities, strict=False):
+            if existing != candidate:
+                break
+            common_prefix_length += 1
+        if common_prefix_length == min(len(conversation), len(history)):
+            if len(history) > len(conversation):
+                conversation = list(history)
+            continue
+
+        overlap_length = 0
+        for candidate_length in range(
+            min(len(conversation), len(history)),
+            0,
+            -1,
+        ):
+            if conversation_identities[-candidate_length:] == history_identities[:candidate_length]:
+                overlap_length = candidate_length
+                break
+        if overlap_length:
+            conversation.extend(history[overlap_length:])
+            continue
+        if common_prefix_length or set(conversation_identities) & set(history_identities):
+            raise _IncompatibleHistoriesError("trace contains incompatible message histories")
+        conversation.extend(history)
+    return conversation
+
+
+def _message_identity(message: dict[str, JsonValue]) -> str:
+    semantic_message = {key: value for key, value in message.items() if key != "direction"}
+    return json.dumps(
+        semantic_message,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
 def _first_mapped_value(
     spans: list[_ExportedSpan], keys: tuple[str, ...], *, include_resource: bool
 ) -> JsonValue:
@@ -554,8 +655,12 @@ def _mapped_json(
             if len(value) > maximum_characters:
                 return _bounded_text(value, maximum_characters)
             try:
-                parsed = json.loads(value)
-            except (json.JSONDecodeError, RecursionError):
+                parsed = json.loads(
+                    value,
+                    parse_constant=_reject_nested_json_constant,
+                    parse_float=_parse_nested_finite_float,
+                )
+            except (json.JSONDecodeError, RecursionError, ValueError):
                 return value
             return _bounded_json(cast(JsonValue, parsed), maximum_characters)
         return _bounded_json(value, maximum_characters)
@@ -587,10 +692,25 @@ def _bounded_json(value: JsonValue, maximum_characters: int) -> JsonValue:
     return {"truncated": True, "original_characters": len(encoded)}
 
 
+def _reject_nested_json_constant(value: str) -> None:
+    raise ValueError(f"nonstandard JSON constant: {value}")
+
+
+def _parse_nested_finite_float(value: str) -> float:
+    parsed = float(value)
+    if not math.isfinite(parsed):
+        raise ValueError("non-finite JSON number")
+    return parsed
+
+
 def _bounded_text(value: str, maximum_characters: int) -> str:
     if len(value) <= maximum_characters:
         return value
-    return value[:maximum_characters] + "…"
+    return value[: maximum_characters - 1] + "…"
+
+
+def _bounded_optional_text(value: str | None, maximum_characters: int) -> str | None:
+    return _bounded_text(value, maximum_characters) if value is not None else None
 
 
 def _compact_object(value: dict[str, JsonValue]) -> dict[str, JsonValue]:
@@ -610,8 +730,23 @@ def _pick_root_span(gen_ai_spans: list[_ExportedSpan]) -> _ExportedSpan:
         key=lambda item: (
             _parse_nano(item.span.get("startTimeUnixNano")),
             _normalize_id_field(item.span.get("spanId")) or "",
+            _exported_span_identity(item),
         ),
     )[0]
+
+
+def _exported_span_identity(item: _ExportedSpan) -> str:
+    return json.dumps(
+        {
+            "span": item.span,
+            "resource_attributes": item.resource_attributes,
+            "scope_name": item.scope_name,
+            "scope_version": item.scope_version,
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
 
 
 def _is_gen_ai_span(span: dict[str, Any]) -> bool:
@@ -707,17 +842,21 @@ def _unwrap_otlp_value(value: object, *, depth: int = 0) -> JsonValue:
     return None
 
 
-def _normalize_id_field(value: object) -> str | None:
+def _normalize_id_field(value: object, *, expected_bytes: int | None = None) -> str | None:
     if not isinstance(value, str) or not value:
         return None
     if all(character in "0123456789abcdefABCDEF" for character in value):
         normalized = value.lower()
+        if expected_bytes is not None and len(normalized) != expected_bytes * 2:
+            return None
         return None if all(character == "0" for character in normalized) else normalized
     try:
         decoded = base64.b64decode(value, validate=True)
     except (ValueError, TypeError):
         return None
     normalized = decoded.hex()
+    if expected_bytes is not None and len(decoded) != expected_bytes:
+        return None
     if not normalized or all(character == "0" for character in normalized):
         return None
     return normalized

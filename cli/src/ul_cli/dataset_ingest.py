@@ -20,6 +20,10 @@ _MAXIMUM_RECORDS = 100
 _MAXIMUM_JSON_DEPTH = 100
 
 
+class _OtlpJsonInputError(ValueError):
+    pass
+
+
 @app.command("otlp")
 def ingest_otlp_traces(
     traces: Annotated[
@@ -87,17 +91,17 @@ def ingest_otlp_traces(
         )
 
     try:
-        data = json.loads(
-            raw_bytes.decode("utf-8"),
-            object_pairs_hook=_reject_duplicate_keys,
-            parse_constant=_reject_nonstandard_constant,
-            parse_float=_parse_finite_float,
-        )
+        data = _parse_otlp_json(raw_bytes.decode("utf-8"))
         _reject_deep_json(data)
     except UnicodeDecodeError:
         raise typer.BadParameter("trace file must be UTF-8", param_hint="TRACES") from None
+    except _OtlpJsonInputError as error:
+        raise typer.BadParameter(_terminal_safe(str(error)), param_hint="TRACES") from None
     except (json.JSONDecodeError, RecursionError, ValueError):
-        raise typer.BadParameter("trace file contains invalid JSON", param_hint="TRACES") from None
+        raise typer.BadParameter(
+            "trace file must be one OTLP JSON object, an array of objects, or JSON Lines",
+            param_hint="TRACES",
+        ) from None
 
     mapping_config: OtlpMappingConfig | None = None
     if mapping is not None:
@@ -201,7 +205,37 @@ def _skipped_summary(result: OtlpIngestResult) -> str:
         parts.append(f"{result.skipped_no_output} without extractable output")
     if result.skipped_limit:
         parts.append(f"{result.skipped_limit} over trace evidence limits")
+    if result.skipped_incompatible_histories:
+        parts.append(f"{result.skipped_incompatible_histories} with incompatible message histories")
     return (" " + ", ".join(parts)) if parts else ""
+
+
+def _parse_otlp_json(text: str) -> object:
+    try:
+        return _load_json_value(text)
+    except json.JSONDecodeError as whole_document_error:
+        batches: list[object] = []
+        for line_number, line in enumerate(text.splitlines(), start=1):
+            if not line.strip():
+                continue
+            try:
+                batches.append(_load_json_value(line))
+            except (json.JSONDecodeError, ValueError):
+                raise _OtlpJsonInputError(
+                    f"invalid OTLP JSON Lines record at line {line_number}"
+                ) from None
+        if not batches:
+            raise whole_document_error
+        return batches
+
+
+def _load_json_value(text: str) -> object:
+    return json.loads(
+        text,
+        object_pairs_hook=_reject_duplicate_keys,
+        parse_constant=_reject_nonstandard_constant,
+        parse_float=_parse_finite_float,
+    )
 
 
 def _read_bounded_file(path: Path, *, maximum_bytes: int) -> bytes:

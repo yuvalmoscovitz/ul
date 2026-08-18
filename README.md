@@ -277,8 +277,8 @@ layout.
 
 ## Import agent traces
 
-Turn an OTLP JSON file export into trace-native UL scenarios with the built-in OpenTelemetry GenAI
-and OpenInference mapping:
+Turn an OTLP JSON or OTLP File Exporter JSON Lines export into trace-native UL scenarios with the
+built-in OpenTelemetry GenAI and OpenInference mapping:
 
 ```bash
 uv run ul dataset ingest otlp traces.json \
@@ -292,7 +292,9 @@ uv run ul dataset ingest otlp traces.json \
 Dry-run reports only counts and mapping gaps; it never prints trace values. Each imported output
 contains ordered messages, parent-child span topology, tool calls and results, errors and retries,
 mapped state snapshots and deltas, session identity, agent version, and source references. Unknown
-attributes are dropped. The output is created with mode `0600` on Unix.
+attributes are dropped. Cumulative per-span histories are retained on their spans but collapsed into
+one compatible top-level conversation; traces with conflicting histories are skipped and reported.
+Each output record is capped at 1 MB, and the output is created with mode `0600` on Unix.
 
 [`examples/otlp_mapping.json`](examples/otlp_mapping.json) explicitly enables raw message, tool,
 error, and state content. Those values can contain credentials, personal data, or business data.
