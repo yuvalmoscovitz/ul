@@ -1254,7 +1254,7 @@ def test_execution_requires_config_network_confirmation_sandbox_and_output(
     _write_target_config(target_config)
 
     option_stages = [
-        ([], "execution requires --target-config"),
+        ([], "--target-factory"),
         (["--target-config", str(target_config)], "--allow-target-network"),
         (
             ["--target-config", str(target_config), "--allow-target-network"],
@@ -1275,6 +1275,139 @@ def test_execution_requires_config_network_confirmation_sandbox_and_output(
         assert result.exit_code != 0
         normalized_output = " ".join(_ANSI_ESCAPE_PATTERN.sub("", result.output).split())
         assert expected_error in normalized_output
+
+
+def test_target_config_and_python_factory_are_mutually_exclusive(tmp_path: Path) -> None:
+    dataset = tmp_path / "interactions.jsonl"
+    target_config = tmp_path / "target.json"
+    _write_dataset(dataset, [_record()])
+    _write_target_config(target_config)
+
+    result = runner.invoke(
+        root_app,
+        [
+            "dataset",
+            "evaluate",
+            str(dataset),
+            "--target-config",
+            str(target_config),
+            "--target-factory",
+            "examples.python_target_factory:create_target",
+            "--dry-run",
+        ],
+    )
+
+    assert result.exit_code != 0
+    assert "mutually exclusive" in result.output
+
+
+def test_python_target_factory_executes_without_http_lifecycle(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    dataset = tmp_path / "interactions.jsonl"
+    output = tmp_path / "results.jsonl"
+    module_path = tmp_path / "customer_target.py"
+    _write_dataset(dataset, [_record()])
+    module_path.write_text(
+        """
+from ul import ObservedAgentOutput, SafetyEnvelope
+
+class Target:
+    safety_envelope = SafetyEnvelope(
+        description="Disposable customer harness",
+        isolated=True,
+        allows_network_egress=False,
+        allows_business_side_effects=False,
+    )
+    fresh_state_per_execution = True
+
+    async def execute(self, raw_input):
+        return ObservedAgentOutput(raw_output={"received": raw_input})
+
+def create_target():
+    return Target()
+""",
+        encoding="utf-8",
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    observed_outputs: list[object] = []
+
+    async def evaluate_once(
+        records: tuple[Any, ...],
+        operator_ids: tuple[str, ...],
+        settings: object,
+        target: Any,
+        output_stream: Any,
+        *,
+        repetitions: int,
+        max_target_calls: int,
+        planned_target_calls: int,
+        run_context: object,
+        redaction_engine: object,
+    ) -> tuple[object, ...]:
+        del operator_ids, settings, repetitions, max_target_calls, planned_target_calls
+        assert redaction_engine is None
+        context = cast(Any, run_context)
+        assert context.target.kind == "python_factory"
+        assert context.target.factory == "customer_target:create_target"
+        async with target:
+            observed_outputs.append((await target.execute(records[0].raw_input)).raw_output)
+        output_stream.write('{"saved":true}\n')
+        return ()
+
+    monkeypatch.setattr(main, "load_dataset_semantic_settings", _settings)
+    monkeypatch.setattr(main, "_evaluate_interaction_records", evaluate_once)
+
+    result = runner.invoke(
+        root_app,
+        [
+            "dataset",
+            "evaluate",
+            str(dataset),
+            "--target-factory",
+            "customer_target:create_target",
+            "--confirm-isolated-sandbox",
+            "--output",
+            str(output),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert observed_outputs == [{"received": "Transfer 100 to Alice."}]
+    assert output.read_text(encoding="utf-8") == '{"saved":true}\n'
+    assert stat.S_IMODE(output.stat().st_mode) == 0o600
+
+
+def test_python_target_factory_dry_run_does_not_import_customer_code(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    dataset = tmp_path / "interactions.jsonl"
+    marker = tmp_path / "imported"
+    module_path = tmp_path / "customer_target.py"
+    _write_dataset(dataset, [_record()])
+    module_path.write_text(
+        f"from pathlib import Path\nPath({str(marker)!r}).touch()\n",
+        encoding="utf-8",
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+
+    result = runner.invoke(
+        root_app,
+        [
+            "dataset",
+            "evaluate",
+            str(dataset),
+            "--target-factory",
+            "customer_target:create_target",
+            "--dry-run",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "Target factory: customer_target:create_target" in result.output
+    assert "fresh isolated state for every execution" in result.output
+    assert "configured reset contract" not in result.output
+    assert not marker.exists()
 
 
 def test_execution_refuses_to_overwrite_output_before_model_setup(

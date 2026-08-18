@@ -120,6 +120,25 @@ Execution appends only after the compatibility check succeeds. Evidence without 
 metadata, changed inputs, or changed evaluation semantics is rejected; call-budget and credential
 changes remain allowed because they authorize execution rather than change its meaning.
 
+### Trusted Python targets
+
+An existing Python agent harness can implement `DatasetTargetExecutor` and expose a synchronous,
+zero-argument factory instead of operating UL's HTTP lifecycle endpoints:
+
+```bash
+uv run ul dataset evaluate interactions.jsonl \
+  --target-factory examples.python_target_factory:create_target \
+  --confirm-isolated-sandbox \
+  --output results.jsonl
+```
+
+The returned target declares its safety envelope and must provide fresh isolated state for every
+`execute` call. UL counts each call against `--max-target-calls`; pass
+`--allow-target-network` only when the declared envelope permits network egress. The module and
+factory are imported into UL's process and are therefore trusted customer code. Imports and the
+factory may run startup code, so use only reviewed modules from the active Python environment.
+The factory reference is recorded in evidence and must remain identical when resuming.
+
 Review findings without making more model or target calls:
 
 ```bash

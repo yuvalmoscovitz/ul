@@ -26,12 +26,15 @@ from ul import (
     DatasetTargetLifecycleFailure,
     InteractionRecord,
     LocalPseudonymStore,
+    PythonDatasetTarget,
     RedactedSemanticPipeline,
     RedactionEngine,
     builtin_dataset_augmentation_operators,
     create_semantic_model_deconstructor,
     load_dataset_semantic_settings,
+    load_python_dataset_target,
     load_redaction_policy,
+    validate_python_target_factory_reference,
 )
 from ul.dataset_invariants import (
     DatasetInvariantArrayUniqueTrialEvaluation,
@@ -219,6 +222,15 @@ def evaluate_dataset(
             help="JSON target configuration created by 'ul dataset init'.",
         ),
     ] = None,
+    target_factory: Annotated[
+        str | None,
+        typer.Option(
+            help=(
+                "Trusted local Python factory in package.module:create_target form. "
+                "Mutually exclusive with --target-config."
+            ),
+        ),
+    ] = None,
     output: Annotated[
         Path | None,
         typer.Option(help="New JSONL file for complete local evidence."),
@@ -259,7 +271,7 @@ def evaluate_dataset(
     ] = _DEFAULT_MAXIMUM_TARGET_CALLS,
     allow_target_network: Annotated[
         bool,
-        typer.Option(help="Allow requests to the configured sandbox endpoint."),
+        typer.Option(help="Allow network egress when the selected target declares it."),
     ] = False,
     confirm_isolated_sandbox: Annotated[
         bool,
@@ -306,7 +318,8 @@ def evaluate_dataset(
     higher-precedence controls. OpenRouter remains the default; set
     UL_DATASET_SEMANTIC_PROVIDER=openai-compatible for a customer-controlled endpoint.
 
-    Target configurations run an explicit reset/setup/execute/snapshot lifecycle.
+    HTTP target configurations run an explicit reset/setup/execute/snapshot lifecycle.
+    A trusted Python factory can instead return UL's DatasetTargetExecutor protocol.
 
     Example: ul dataset evaluate interactions.jsonl --target-config target.json
     --allow-target-network --confirm-isolated-sandbox
@@ -321,6 +334,10 @@ def evaluate_dataset(
         if output is None:
             output = resume
     try:
+        if target_config is not None and target_factory is not None:
+            raise ValueError("--target-config and --target-factory are mutually exclusive")
+        if target_factory is not None:
+            validate_python_target_factory_reference(target_factory)
         records = _load_interaction_records(data)
         selected_operators = _validate_operator_ids(operator)
         invariant_suite = (
@@ -337,12 +354,12 @@ def evaluate_dataset(
             selected_records = _protect_interaction_records(selected_records, redaction_engine)
         all_selected_records = selected_records
         if not dry_run and resume is None:
-            if target_config is None:
+            if target_config is None and target_factory is None:
                 raise typer.BadParameter(
-                    "execution requires --target-config",
+                    "execution requires --target-config or --target-factory",
                     param_hint="--target-config",
                 )
-            if not allow_target_network:
+            if target_config is not None and not allow_target_network:
                 raise typer.BadParameter(
                     "execution requires --allow-target-network",
                     param_hint="--allow-target-network",
@@ -364,8 +381,8 @@ def evaluate_dataset(
                 allow_insecure_http=allow_insecure_http,
             )
         normalized_target_config = loaded_target_config
-        if resume is not None and normalized_target_config is None:
-            raise ValueError("--resume requires --target-config")
+        if resume is not None and normalized_target_config is None and target_factory is None:
+            raise ValueError("--resume requires --target-config or --target-factory")
         target_calls_per_execution = (
             json_http_target_calls_per_execution(normalized_target_config)
             if normalized_target_config is not None
@@ -400,13 +417,14 @@ def evaluate_dataset(
                 repetitions=repetitions,
                 invariant_suite=invariant_suite,
                 target_config=normalized_target_config,
+                target_factory=target_factory,
                 settings=settings,
                 redaction_policy_sha256=(
                     redaction_engine.policy.digest if redaction_engine is not None else None
                 ),
                 redaction_coverage=redaction_coverage,
             )
-            if normalized_target_config is not None
+            if normalized_target_config is not None or target_factory is not None
             else None
         )
     except (_DatasetInputError, ValidationError, ValueError, RuntimeError) as error:
@@ -454,7 +472,7 @@ def evaluate_dataset(
             selected_count=len(selected_records),
             skipped_count=skipped_count,
             operator_ids=selected_operators,
-            target_configured=target_config is not None,
+            target_configured=target_config is not None or target_factory is not None,
             target_endpoint=(
                 json_http_target_config_urls(loaded_target_config)[0]
                 if loaded_target_config is not None
@@ -463,6 +481,7 @@ def evaluate_dataset(
             target_header_environment_variables=(
                 loaded_target_config.headers_from_env if loaded_target_config is not None else {}
             ),
+            target_factory=target_factory,
             repetitions=repetitions,
             max_target_calls=max_target_calls,
             target_calls_per_execution=target_calls_per_execution,
@@ -491,15 +510,10 @@ def evaluate_dataset(
             raise typer.Exit(code=1)
         raise typer.Exit(code=0)
 
-    if target_config is None:
+    if target_config is None and target_factory is None:
         raise typer.BadParameter(
-            "execution requires --target-config",
-            param_hint="--target-config",
-        )
-    if not allow_target_network:
-        raise typer.BadParameter(
-            "execution requires --allow-target-network",
-            param_hint="--allow-target-network",
+            "execution requires --target-config or --target-factory",
+            param_hint="--target-config/--target-factory",
         )
     if not confirm_isolated_sandbox:
         raise typer.BadParameter(
@@ -514,7 +528,6 @@ def evaluate_dataset(
             param_hint="--output",
         )
 
-    assert loaded_target_config is not None
     assert run_context is not None
     if not settings.live_calls:
         raise typer.BadParameter(
@@ -533,14 +546,40 @@ def evaluate_dataset(
         )
 
     try:
-        target = JsonHttpDatasetTarget.from_config(
-            loaded_target_config,
-            sandbox_confirmed=True,
-            allow_insecure_http=allow_insecure_http,
-            max_target_calls=max_target_calls,
-        )
+        if loaded_target_config is not None:
+            if not allow_target_network:
+                raise ValueError("HTTP targets require --allow-target-network")
+            target: JsonHttpDatasetTarget | PythonDatasetTarget = JsonHttpDatasetTarget.from_config(
+                loaded_target_config,
+                sandbox_confirmed=True,
+                allow_insecure_http=allow_insecure_http,
+                max_target_calls=max_target_calls,
+            )
+        else:
+            assert target_factory is not None
+            target = load_python_dataset_target(
+                target_factory,
+                max_target_calls=max_target_calls,
+            )
+            if not target.safety_envelope.isolated:
+                asyncio.run(target.aclose())
+                raise ValueError("Python dataset target must be isolated")
+            if target.safety_envelope.allows_business_side_effects:
+                asyncio.run(target.aclose())
+                raise ValueError("Python dataset target must not allow business side effects")
+            if not target.fresh_state_per_execution:
+                asyncio.run(target.aclose())
+                raise ValueError("Python dataset target must start fresh for every execution")
+            if target.safety_envelope.allows_network_egress and not allow_target_network:
+                asyncio.run(target.aclose())
+                raise ValueError("Python target network egress requires --allow-target-network")
     except ValueError as error:
-        raise typer.BadParameter(str(error), param_hint="--target-config") from None
+        raise typer.BadParameter(
+            str(error),
+            param_hint="--target-config" if target_config is not None else "--target-factory",
+        ) from None
+    except RuntimeError as error:
+        raise typer.BadParameter(str(error), param_hint="--target-factory") from None
 
     try:
         if resume is None:
@@ -846,7 +885,8 @@ def _dataset_evidence_run_context(
     selected_operator_ids: tuple[str, ...],
     repetitions: int,
     invariant_suite: DatasetInvariantSuite | None,
-    target_config: JsonHttpDatasetTargetConfig,
+    target_config: JsonHttpDatasetTargetConfig | None,
+    target_factory: str | None = None,
     settings: DatasetSemanticSettings,
     redaction_policy_sha256: str | None = None,
     redaction_coverage: tuple[DatasetEvidenceRedactionCoverage, ...] = (),
@@ -860,6 +900,7 @@ def _dataset_evidence_run_context(
         repetitions=repetitions,
         invariant_suite_sha256=(invariant_suite.sha256 if invariant_suite is not None else None),
         target_config=target_config,
+        target_factory=target_factory,
         semantic_settings=DatasetEvidenceSemanticSettings(
             provider=settings.semantic_provider_id,
             endpoint_sha256=settings.semantic_endpoint_sha256,
@@ -886,6 +927,7 @@ def _print_dataset_plan(
     target_configured: bool,
     target_endpoint: str | None,
     target_header_environment_variables: dict[str, str],
+    target_factory: str | None,
     repetitions: int,
     max_target_calls: int,
     target_calls_per_execution: int,
@@ -956,14 +998,21 @@ def _print_dataset_plan(
             console.print(f"Target header environment mappings: {mappings}")
         else:
             console.print("Target header environment mappings: none")
+    if target_factory is not None:
+        console.print(f"Target factory: {target_factory} (trusted local Python code)")
     console.print(
         "Semantic models receive historical inputs and outputs, generated variations, "
         "live control responses, and variation responses on execution."
     )
-    console.print(
-        "Every execution invokes and validates the configured reset contract. Optional setup "
-        "uses one static fixture from the target config for the entire run."
-    )
+    if target_factory is None:
+        console.print(
+            "Every execution invokes and validates the configured reset contract. Optional "
+            "setup uses one static fixture from the target config for the entire run."
+        )
+    else:
+        console.print(
+            "The trusted Python target must provide fresh isolated state for every execution."
+        )
     console.print(
         "Target requests and semantic model calls may be billed separately. Repetitions only "
         "show observed behavioral consistency: they do not determine correctness, identify "
@@ -1084,7 +1133,7 @@ async def _evaluate_interaction_records(
     records: tuple[InteractionRecord, ...],
     operator_ids: tuple[str, ...],
     settings: DatasetSemanticSettings,
-    target: JsonHttpDatasetTarget,
+    target: JsonHttpDatasetTarget | PythonDatasetTarget,
     output_stream: TextIO,
     *,
     repetitions: int,
@@ -1094,6 +1143,7 @@ async def _evaluate_interaction_records(
     invariant_suite: DatasetInvariantSuite | None = None,
     invariant_evaluations: list[DatasetInvariantEvaluation] | None = None,
     redaction_engine: RedactionEngine | None = None,
+    allow_network_egress: bool = True,
 ) -> tuple[DatasetEvaluationResult, ...]:
     results: list[DatasetEvaluationResult] = []
     async with create_semantic_model_deconstructor(settings) as deconstructor, target:
@@ -1115,7 +1165,7 @@ async def _evaluate_interaction_records(
             ),
             semantic_pipeline,
             evaluation_target,
-            allow_network_egress=True,
+            allow_network_egress=allow_network_egress,
         )
         for record in records:
             result = await runner.run(

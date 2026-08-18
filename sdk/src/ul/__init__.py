@@ -119,6 +119,11 @@ from ul.http_target import (
     load_json_http_dataset_target_config,
 )
 from ul.otlp_ingest import OtlpIngestResult, OtlpInteractionRecord, parse_otlp_traces
+from ul.python_target import (
+    PythonDatasetTarget,
+    load_python_dataset_target,
+    validate_python_target_factory_reference,
+)
 from ul.redaction import (
     LocalPseudonymStore,
     RedactedSemanticPipeline,
@@ -204,6 +209,7 @@ __all__ = [
     "OtlpInteractionRecord",
     "PromptManager",
     "PromptTemplateInfo",
+    "PythonDatasetTarget",
     "RedactedSemanticPipeline",
     "RedactionBoundaryError",
     "RedactionCoverage",
@@ -237,6 +243,7 @@ __all__ = [
     "load_dataset_semantic_settings",
     "load_json_http_dataset_target_config",
     "load_multi_turn_regression_case",
+    "load_python_dataset_target",
     "load_redaction_policy",
     "parse_otlp_traces",
     "plan_correction_stress_test",
@@ -244,4 +251,5 @@ __all__ = [
     "replay_multi_turn_regression",
     "run_correction_stress_test",
     "run_dataset_regressions",
+    "validate_python_target_factory_reference",
 ]
