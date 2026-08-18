@@ -250,6 +250,29 @@ The target must be an isolated sandbox that starts every request from the same c
 Use `headers_from_env` in the target file for credentials so secret values remain outside the
 configuration. Dry-run validates the dataset and target mapping without making external calls.
 
+For an agent whose state must be actively prepared and inspected, use a version 2 lifecycle
+configuration such as [`examples/stateful_target.json`](examples/stateful_target.json). For every
+original or variation repetition, UL sends these same-origin POST requests in order:
+
+```text
+reset → optional setup → execute_turn → snapshot → cleanup reset
+```
+
+`execute_turn` returns the agent response used for semantic comparison. `snapshot` separately
+returns committed state used by invariants whose `observation_authority` is
+`committed_state_snapshot`. A failed reset, setup, execution, snapshot, or cleanup reset makes the
+repetition inconclusive. UL disables redirects, ignores proxy environment variables, applies the
+same environment-backed headers to every operation, and rejects lifecycle URLs that do not share
+one origin. Setup and reset may return an empty successful response; execute and snapshot must
+return bounded JSON. UL verifies successful HTTP acknowledgement and ordering, but cannot prove
+that the sandbox actually erased or seeded its internal state. The sandbox implementation remains
+responsible for making reset deterministic and complete.
+
+Each physical lifecycle request counts toward `--max-target-calls`. A configuration with setup
+uses five calls per repetition; without setup it uses four. Version 2 therefore does not require
+`--confirm-fresh-state`. Version 1 remains supported and still requires that confirmation because
+it has no explicit reset operation.
+
 To add customer-defined deterministic checks, provide a strict invariant file:
 
 ```json

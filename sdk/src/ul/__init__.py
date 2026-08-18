@@ -85,6 +85,11 @@ from ul.deconstruction import OpenRouterDatasetSettings, OpenRouterSemanticDecon
 from ul.http_target import (
     JsonHttpDatasetTarget,
     JsonHttpDatasetTargetConfig,
+    JsonHttpDatasetTargetConfiguration,
+    JsonHttpLifecycleCallConfig,
+    JsonHttpLifecycleExecuteTurnConfig,
+    JsonHttpLifecycleObservationConfig,
+    JsonHttpStatefulDatasetTargetConfig,
     load_json_http_dataset_target_config,
 )
 from ul.otlp_ingest import OtlpIngestResult, OtlpInteractionRecord, parse_otlp_traces
@@ -135,6 +140,11 @@ __all__ = [
     "JsonArrayItemsUniqueByInvariant",
     "JsonHttpDatasetTarget",
     "JsonHttpDatasetTargetConfig",
+    "JsonHttpDatasetTargetConfiguration",
+    "JsonHttpLifecycleCallConfig",
+    "JsonHttpLifecycleExecuteTurnConfig",
+    "JsonHttpLifecycleObservationConfig",
+    "JsonHttpStatefulDatasetTargetConfig",
     "JsonValueEqualsLiteralInvariant",
     "JsonValueInAllowedSetInvariant",
     "JsonValuesEqualInvariant",

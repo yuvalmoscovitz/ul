@@ -22,7 +22,7 @@ from ul.dataset_regression import (
     replay_dataset_regression,
     run_dataset_regressions,
 )
-from ul.http_target import JsonHttpDatasetTargetConfig
+from ul.http_target import JsonHttpDatasetTargetConfig, JsonHttpStatefulDatasetTargetConfig
 from ul_core.dataset import ObservedAgentOutput
 from ul_core.models import SafetyEnvelope
 
@@ -62,6 +62,35 @@ def _case(
             url="http://127.0.0.1:8765/execute",
             headers_from_env={"Authorization": "TARGET_TOKEN"},
             request_json_template={"input": "{{input}}"},
+        ),
+        source_suite_sha256=SUITE_SHA256,
+        observation_authority="committed_state_snapshot",
+        selected_rules=(_rule(),),
+        discovery_repetitions=repetitions,
+    )
+
+
+def _stateful_case(*, repetitions: int = 3) -> DatasetRegressionCase:
+    return create_dataset_regression_case(
+        finding_id=FINDING_ID,
+        evidence_sha256="3" * 64,
+        review_id=REVIEW_ID,
+        interaction_id="invoice-correction",
+        operator_id="context.pasted_block",
+        operator_version="1.0.0",
+        original_input="Pay invoice AC-100.",
+        variation_input="Pay invoice AC-101 instead of AC-100.",
+        target_config=JsonHttpStatefulDatasetTargetConfig.model_validate(
+            {
+                "version": 2,
+                "reset": {"url": "https://sandbox.example.test/reset"},
+                "setup": {"url": "https://sandbox.example.test/setup"},
+                "execute_turn": {
+                    "url": "https://sandbox.example.test/execute",
+                    "request_json_template": {"input": "{{input}}"},
+                },
+                "snapshot": {"url": "https://sandbox.example.test/snapshot"},
+            }
         ),
         source_suite_sha256=SUITE_SHA256,
         observation_authority="committed_state_snapshot",
@@ -296,6 +325,20 @@ def test_replay_rejects_case_over_sdk_target_call_budget_before_execution() -> N
         asyncio.run(replay_dataset_regression(_case(), target, max_target_calls=2))
 
     assert target.inputs == []
+
+
+def test_stateful_replay_budget_counts_physical_lifecycle_calls() -> None:
+    case = _stateful_case()
+    target = _Target([_output("AC-101", "AC-101")] * 3)
+
+    with pytest.raises(ValueError, match="authorized target call budget"):
+        asyncio.run(replay_dataset_regression(case, target, max_target_calls=14))
+    assert target.inputs == []
+
+    result = asyncio.run(replay_dataset_regression(case, target, max_target_calls=15))
+
+    assert result.target_calls_per_execution == 5
+    assert result.requested_repetitions * result.target_calls_per_execution == 15
 
 
 def test_run_executes_cases_in_order_and_aggregates_statuses() -> None:

@@ -207,6 +207,32 @@ def _write_target_config(
     )
 
 
+def _write_stateful_target_config(path: Path) -> None:
+    path.write_text(
+        json.dumps(
+            {
+                "version": 2,
+                "headers_from_env": {},
+                "reset": {"url": "https://sandbox.example.test/reset"},
+                "setup": {
+                    "url": "https://sandbox.example.test/setup",
+                    "request_json": {"seed": "standard"},
+                },
+                "execute_turn": {
+                    "url": "https://sandbox.example.test/execute",
+                    "request_json_template": {"input": "{{input}}"},
+                    "response_json_pointer": "/response",
+                },
+                "snapshot": {
+                    "url": "https://sandbox.example.test/snapshot",
+                    "response_json_pointer": "/state",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
 def _write_invariant_suite(path: Path) -> None:
     path.write_text(
         json.dumps(
@@ -429,13 +455,44 @@ def test_dry_run_validates_and_makes_no_external_calls(
     assert "Semantic models receive historical inputs and outputs" in result.output
     assert "generated variations" in result.output
     assert "live control responses" in result.output
-    assert "Every target request must start from the same clean state" in result.output
-    assert "each accepted variation for every repetition" in " ".join(result.output.split())
+    assert "Every execution must start from the same clean state" in result.output
     assert "do not determine correctness" in result.output
     assert "identify causality" in result.output
     assert "estimate a production failure rate" in result.output
     assert "No model or target requests sent." in result.output
     assert "Transfer 100" not in result.output
+
+
+def test_stateful_target_dry_run_counts_physical_lifecycle_calls(
+    tmp_path: Path,
+) -> None:
+    dataset = tmp_path / "interactions.jsonl"
+    target_config = tmp_path / "target.json"
+    _write_dataset(dataset, [_record()])
+    _write_stateful_target_config(target_config)
+
+    result = runner.invoke(
+        root_app,
+        [
+            "dataset",
+            "evaluate",
+            str(dataset),
+            "--target-config",
+            str(target_config),
+            "--repetitions",
+            "2",
+            "--max-target-calls",
+            "20",
+            "--dry-run",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "Potential target calls: up to 20 (authorized maximum: 20)" in " ".join(
+        result.output.split()
+    )
+    assert "Lifecycle calls per execution: 5" in result.output
+    assert "Version 2 targets enforce this with lifecycle calls" in " ".join(result.output.split())
 
 
 def test_invariant_dry_run_reports_rules_authority_and_no_extra_calls(

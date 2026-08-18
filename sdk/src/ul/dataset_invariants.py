@@ -713,12 +713,19 @@ def evaluate_dataset_invariants(
 def evaluate_dataset_invariant_rules(
     rules: tuple[DatasetInvariantRule, ...],
     outputs: tuple[ObservedAgentOutput | None, ...],
+    *,
+    observation_authority: ObservationAuthority = "agent_response",
 ) -> tuple[DatasetInvariantRuleResult, ...]:
     if not outputs:
         raise ValueError("invariant evaluation requires at least one target output")
     array_work_budget = _ArrayInvariantWorkBudget(_MAXIMUM_ARRAY_INVARIANT_WORK_UNITS)
+    selected_outputs = _outputs_for_observation_authority(outputs, observation_authority)
     return tuple(
-        _evaluate_rule_from_outputs(rule, outputs, array_work_budget=array_work_budget)
+        _evaluate_rule_from_outputs(
+            rule,
+            selected_outputs,
+            array_work_budget=array_work_budget,
+        )
         for rule in rules
     )
 
@@ -735,7 +742,12 @@ def _evaluate_arm(
         arm=arm,
         operator_id=operator_id,
         rules=tuple(
-            _evaluate_rule(rule, trials, array_work_budget=array_work_budget)
+            _evaluate_rule(
+                rule,
+                trials,
+                observation_authority=suite.observation_authority,
+                array_work_budget=array_work_budget,
+            )
             for rule in suite.rules
         ),
     )
@@ -745,12 +757,32 @@ def _evaluate_rule(
     rule: DatasetInvariantRule,
     trials: tuple[DatasetEvaluationTrial, ...],
     *,
+    observation_authority: ObservationAuthority,
     array_work_budget: _ArrayInvariantWorkBudget,
 ) -> DatasetInvariantRuleResult:
     return _evaluate_rule_from_outputs(
         rule,
-        tuple(trial.target_output for trial in trials),
+        _outputs_for_observation_authority(
+            tuple(trial.target_output for trial in trials),
+            observation_authority,
+        ),
         array_work_budget=array_work_budget,
+    )
+
+
+def _outputs_for_observation_authority(
+    outputs: tuple[ObservedAgentOutput | None, ...],
+    observation_authority: ObservationAuthority,
+) -> tuple[ObservedAgentOutput | None, ...]:
+    if observation_authority != "committed_state_snapshot":
+        return outputs
+    return tuple(
+        None
+        if output is None
+        else ObservedAgentOutput(
+            raw_output=output.metadata.get("committed_state_snapshot", output.raw_output)
+        )
+        for output in outputs
     )
 
 

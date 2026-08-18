@@ -8,14 +8,17 @@ from collections.abc import AsyncIterator, Generator
 from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar
 
 import httpx
 import pytest
 import ul.http_target as http_target_module
+from pydantic import ValidationError
 from ul.http_target import (
     JsonHttpDatasetTarget,
     JsonHttpDatasetTargetConfig,
+    JsonHttpStatefulDatasetTargetConfig,
+    json_http_target_calls_per_execution,
     load_json_http_dataset_target_config,
     validate_json_http_dataset_target_configuration,
 )
@@ -140,6 +143,169 @@ async def test_posts_nested_template_and_selects_nested_response_from_real_endpo
         "amount": 100,
         "recipient": "Alice",
     }
+
+
+def _stateful_config(base_url: str) -> JsonHttpStatefulDatasetTargetConfig:
+    return JsonHttpStatefulDatasetTargetConfig.model_validate(
+        {
+            "version": 2,
+            "headers_from_env": {},
+            "reset": {"url": f"{base_url}/reset"},
+            "setup": {
+                "url": f"{base_url}/setup",
+                "request_json": {"starting_amount": 100},
+            },
+            "execute_turn": {
+                "url": f"{base_url}/execute",
+                "request_json_template": {"input": "{{input}}"},
+                "response_json_pointer": "/agent_response",
+            },
+            "snapshot": {
+                "url": f"{base_url}/snapshot",
+                "response_json_pointer": "/state",
+            },
+        }
+    )
+
+
+class _StatefulTargetHandler(BaseHTTPRequestHandler):
+    events: ClassVar[list[str]] = []
+    amount = 0
+
+    def do_POST(self) -> None:
+        content_length = int(self.headers.get("content-length", "0"))
+        request = json.loads(self.rfile.read(content_length))
+        type(self).events.append(self.path)
+        if self.path == "/reset":
+            type(self).amount = 0
+            self.send_response(204)
+            self.end_headers()
+            return
+        if self.path == "/setup":
+            type(self).amount = request["starting_amount"]
+            response = {}
+        elif self.path == "/execute":
+            type(self).amount += 50
+            response = {"agent_response": {"message": "completed", "input": request["input"]}}
+        elif self.path == "/snapshot":
+            response = {"state": {"committed_amount": type(self).amount}}
+        else:
+            self.send_response(404)
+            self.end_headers()
+            return
+        body = json.dumps(response).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, format: str, *args: object) -> None:
+        pass
+
+
+@contextmanager
+def _stateful_loopback_server() -> Generator[str]:
+    _StatefulTargetHandler.events = []
+    _StatefulTargetHandler.amount = 0
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _StatefulTargetHandler)
+    server_thread = threading.Thread(target=server.serve_forever)
+    server_thread.start()
+    try:
+        yield f"http://127.0.0.1:{server.server_port}"
+    finally:
+        server.shutdown()
+        server.server_close()
+        server_thread.join()
+
+
+async def test_stateful_target_runs_isolated_lifecycle_and_keeps_snapshot_separate() -> None:
+    with _stateful_loopback_server() as base_url:
+        config = _stateful_config(base_url)
+        async with JsonHttpDatasetTarget.from_config(
+            config,
+            sandbox_confirmed=True,
+            fresh_state_confirmed=False,
+            allow_insecure_http=True,
+            max_target_calls=5,
+        ) as target:
+            output = await target.execute("increase the amount")
+
+    assert _StatefulTargetHandler.events == [
+        "/reset",
+        "/setup",
+        "/execute",
+        "/snapshot",
+        "/reset",
+    ]
+    assert _StatefulTargetHandler.amount == 0
+    assert output.raw_output == {"message": "completed", "input": "increase the amount"}
+    assert output.metadata["committed_state_snapshot"] == {"committed_amount": 150}
+    assert output.metadata["target_protocol_version"] == 2
+    assert json_http_target_calls_per_execution(config) == 5
+
+
+async def test_stateful_target_cleanup_failure_fails_execution_closed() -> None:
+    reset_calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal reset_calls
+        if request.url.path == "/reset":
+            reset_calls += 1
+            return (
+                _raw_response(b"", content_type="application/json")
+                if reset_calls == 1
+                else httpx.Response(500)
+            )
+        if request.url.path == "/setup":
+            return _raw_response(b"", content_type="application/json")
+        if request.url.path == "/execute":
+            return _raw_response(b'{"agent_response":{"ok":true}}', content_type="application/json")
+        return _raw_response(b'{"state":{"committed":true}}', content_type="application/json")
+
+    config = _stateful_config("https://sandbox.example.test")
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        target = JsonHttpDatasetTarget.from_config(
+            config,
+            sandbox_confirmed=True,
+            fresh_state_confirmed=False,
+            max_target_calls=5,
+            client=client,
+        )
+        with pytest.raises(RuntimeError, match="lifecycle failed"):
+            await target.execute("do work")
+    assert reset_calls == 2
+
+
+async def test_stateful_target_budget_counts_every_physical_request() -> None:
+    observed_paths: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        observed_paths.append(request.url.path)
+        if request.url.path in {"/reset", "/setup"}:
+            return _raw_response(b"", content_type="application/json")
+        if request.url.path == "/execute":
+            return _raw_response(b'{"agent_response":{"ok":true}}', content_type="application/json")
+        return _raw_response(b'{"state":{"committed":true}}', content_type="application/json")
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        target = JsonHttpDatasetTarget.from_config(
+            _stateful_config("https://sandbox.example.test"),
+            sandbox_confirmed=True,
+            fresh_state_confirmed=False,
+            max_target_calls=4,
+            client=client,
+        )
+        with pytest.raises(RuntimeError, match="lifecycle failed"):
+            await target.execute("do work")
+    assert observed_paths == ["/reset", "/setup", "/execute", "/snapshot"]
+
+
+async def test_stateful_config_rejects_cross_origin_credentials_scope() -> None:
+    config = _stateful_config("https://sandbox.example.test").model_dump(mode="json")
+    config["snapshot"]["url"] = "https://other.example.test/snapshot"  # type: ignore[index]
+    with pytest.raises(ValidationError, match="same origin"):
+        JsonHttpStatefulDatasetTargetConfig.model_validate(config)
 
 
 async def test_loads_strict_config_and_constructs_target_without_network(

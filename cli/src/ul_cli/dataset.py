@@ -41,8 +41,13 @@ from ul.dataset_invariants import (
 from ul.http_target import (
     JsonHttpDatasetTarget,
     JsonHttpDatasetTargetConfig,
+    JsonHttpDatasetTargetConfiguration,
+    JsonHttpStatefulDatasetTargetConfig,
+    json_http_target_calls_per_execution,
+    json_http_target_config_urls,
     load_json_http_dataset_target_config,
     validate_json_http_dataset_target_configuration,
+    validate_json_http_stateful_dataset_target_configuration,
 )
 from ul_core.dataset import ObservedOutcome
 
@@ -253,7 +258,7 @@ def evaluate_dataset(
     ] = False,
     confirm_fresh_state: Annotated[
         bool,
-        typer.Option(help="Confirm every target request starts from the same clean state."),
+        typer.Option(help="Confirm same clean state for v1 target requests."),
     ] = False,
     allow_insecure_http: Annotated[
         bool,
@@ -282,6 +287,9 @@ def evaluate_dataset(
     UL_DATASET_LIVE_CALLS and UL_DATASET_ALLOW_EXTERNAL_DATA_PROCESSING remain separate,
     higher-precedence controls. Execution also requires OPEN_ROUTER_API_KEY.
 
+    Version 1 targets require the same clean state for every request. Version 2 target
+    configurations run an explicit lifecycle instead.
+
     Example: ul dataset evaluate interactions.jsonl --target-url https://sandbox/run
     --allow-target-network --confirm-isolated-sandbox --confirm-fresh-state
     --output results.jsonl
@@ -308,16 +316,6 @@ def evaluate_dataset(
             load_dataset_invariant_suite(invariants) if invariants is not None else None
         )
         selected_records = records[:limit]
-        if resume is None:
-            initial_target_calls = (
-                len(selected_records) * repetitions * (1 + len(selected_operators))
-            )
-            if initial_target_calls > max_target_calls:
-                raise typer.BadParameter(
-                    f"selection would make up to {initial_target_calls} target calls, exceeding "
-                    f"--max-target-calls {max_target_calls}; reduce --limit, --operator, or "
-                    "--repetitions, or explicitly raise the call budget"
-                )
         if not dry_run and resume is None:
             if target_url is None and target_config is None:
                 raise typer.BadParameter(
@@ -334,20 +332,11 @@ def evaluate_dataset(
                     "execution requires --confirm-isolated-sandbox",
                     param_hint="--confirm-isolated-sandbox",
                 )
-            if not confirm_fresh_state:
+            if target_url is not None and not confirm_fresh_state:
                 raise typer.BadParameter(
                     "execution requires --confirm-fresh-state",
                     param_hint="--confirm-fresh-state",
                 )
-            if output is None:
-                raise typer.BadParameter("execution requires --output", param_hint="--output")
-            if output.exists():
-                raise typer.BadParameter(
-                    "output already exists; UL will not overwrite it",
-                    param_hint="--output",
-                )
-        settings = OpenRouterDatasetSettings()
-        _validate_model_input_bounds(selected_records, settings.max_input_chars)
         loaded_target_config = (
             load_json_http_dataset_target_config(target_config)
             if target_config is not None
@@ -363,15 +352,22 @@ def evaluate_dataset(
                 allow_insecure_http=allow_insecure_http,
             )
         if loaded_target_config is not None:
-            validate_json_http_dataset_target_configuration(
-                loaded_target_config.url,
-                sandbox_confirmed=confirm_isolated_sandbox or dry_run or resume is not None,
-                fresh_state_confirmed=confirm_fresh_state or dry_run or resume is not None,
-                header_environment_variables=loaded_target_config.headers_from_env,
-                request_json_template=loaded_target_config.request_json_template,
-                response_json_pointer=loaded_target_config.response_json_pointer,
-                allow_insecure_http=allow_insecure_http,
-            )
+            if isinstance(loaded_target_config, JsonHttpStatefulDatasetTargetConfig):
+                validate_json_http_stateful_dataset_target_configuration(
+                    loaded_target_config,
+                    sandbox_confirmed=confirm_isolated_sandbox or dry_run or resume is not None,
+                    allow_insecure_http=allow_insecure_http,
+                )
+            else:
+                validate_json_http_dataset_target_configuration(
+                    loaded_target_config.url,
+                    sandbox_confirmed=confirm_isolated_sandbox or dry_run or resume is not None,
+                    fresh_state_confirmed=confirm_fresh_state or dry_run or resume is not None,
+                    header_environment_variables=loaded_target_config.headers_from_env,
+                    request_json_template=loaded_target_config.request_json_template,
+                    response_json_pointer=loaded_target_config.response_json_pointer,
+                    allow_insecure_http=allow_insecure_http,
+                )
         normalized_target_config = _normalized_target_config(
             target_url=target_url,
             loaded_target_config=loaded_target_config,
@@ -380,6 +376,41 @@ def evaluate_dataset(
         )
         if resume is not None and normalized_target_config is None:
             raise ValueError("--resume requires --target-url or --target-config")
+        target_calls_per_execution = (
+            json_http_target_calls_per_execution(normalized_target_config)
+            if normalized_target_config is not None
+            else 1
+        )
+        initial_target_calls = (
+            len(selected_records)
+            * repetitions
+            * (1 + len(selected_operators))
+            * target_calls_per_execution
+        )
+        if resume is None and initial_target_calls > max_target_calls:
+            raise ValueError(
+                f"selection would make up to {initial_target_calls} target calls, exceeding "
+                f"--max-target-calls {max_target_calls}; reduce --limit, --operator, or "
+                "--repetitions, or explicitly raise the call budget"
+            )
+        if not dry_run and resume is None:
+            if (
+                not isinstance(loaded_target_config, JsonHttpStatefulDatasetTargetConfig)
+                and not confirm_fresh_state
+            ):
+                raise typer.BadParameter(
+                    "execution requires --confirm-fresh-state",
+                    param_hint="--confirm-fresh-state",
+                )
+            if output is None:
+                raise typer.BadParameter("execution requires --output", param_hint="--output")
+            if output.exists():
+                raise typer.BadParameter(
+                    "output already exists; UL will not overwrite it",
+                    param_hint="--output",
+                )
+        settings = OpenRouterDatasetSettings()
+        _validate_model_input_bounds(selected_records, settings.max_input_chars)
         run_context = (
             _dataset_evidence_run_context(
                 selected_records=selected_records,
@@ -418,7 +449,12 @@ def evaluate_dataset(
         )
         skipped_count = len(resume_evidence.processed_ids)
 
-    potential_target_calls = len(selected_records) * repetitions * (1 + len(selected_operators))
+    potential_target_calls = (
+        len(selected_records)
+        * repetitions
+        * (1 + len(selected_operators))
+        * target_calls_per_execution
+    )
     if potential_target_calls > max_target_calls:
         raise typer.BadParameter(
             f"remaining selection would make up to {potential_target_calls} target calls, "
@@ -434,7 +470,9 @@ def evaluate_dataset(
             operator_ids=selected_operators,
             target_configured=target_url is not None or target_config is not None,
             target_endpoint=(
-                loaded_target_config.url if loaded_target_config is not None else target_url
+                json_http_target_config_urls(loaded_target_config)[0]
+                if loaded_target_config is not None
+                else target_url
             ),
             target_header_environment_variables=(
                 loaded_target_config.headers_from_env
@@ -443,6 +481,7 @@ def evaluate_dataset(
             ),
             repetitions=repetitions,
             max_target_calls=max_target_calls,
+            target_calls_per_execution=target_calls_per_execution,
             invariant_suite=invariant_suite,
             output=output,
         )
@@ -477,7 +516,10 @@ def evaluate_dataset(
             "execution requires --confirm-isolated-sandbox",
             param_hint="--confirm-isolated-sandbox",
         )
-    if not confirm_fresh_state:
+    if (
+        not isinstance(loaded_target_config, JsonHttpStatefulDatasetTargetConfig)
+        and not confirm_fresh_state
+    ):
         raise typer.BadParameter(
             "execution requires --confirm-fresh-state",
             param_hint="--confirm-fresh-state",
@@ -511,6 +553,7 @@ def evaluate_dataset(
                 sandbox_confirmed=True,
                 fresh_state_confirmed=True,
                 allow_insecure_http=allow_insecure_http,
+                max_target_calls=max_target_calls,
             )
         else:
             assert target_url is not None
@@ -521,6 +564,7 @@ def evaluate_dataset(
                 request_field=request_field or "input",
                 header_environment_variables=header_environment_variables,
                 allow_insecure_http=allow_insecure_http,
+                max_target_calls=max_target_calls,
             )
     except ValueError as error:
         raise typer.BadParameter(str(error), param_hint="--target-url") from None
@@ -564,6 +608,7 @@ def evaluate_dataset(
                         (len(selected_records) + skipped_count)
                         * repetitions
                         * (1 + len(selected_operators))
+                        * target_calls_per_execution
                     ),
                     run_context=run_context,
                     invariant_suite=invariant_suite,
@@ -582,6 +627,7 @@ def evaluate_dataset(
                         (len(selected_records) + skipped_count)
                         * repetitions
                         * (1 + len(selected_operators))
+                        * target_calls_per_execution
                     ),
                     run_context=run_context,
                 )
@@ -789,10 +835,10 @@ def _validate_target_mode_options(
 def _normalized_target_config(
     *,
     target_url: str | None,
-    loaded_target_config: JsonHttpDatasetTargetConfig | None,
+    loaded_target_config: JsonHttpDatasetTargetConfiguration | None,
     request_field: str | None,
     header_environment_variables: dict[str, str],
-) -> JsonHttpDatasetTargetConfig | None:
+) -> JsonHttpDatasetTargetConfiguration | None:
     if loaded_target_config is not None:
         return loaded_target_config
     if target_url is None:
@@ -812,7 +858,7 @@ def _dataset_evidence_run_context(
     selected_operator_ids: tuple[str, ...],
     repetitions: int,
     invariant_suite: DatasetInvariantSuite | None,
-    target_config: JsonHttpDatasetTargetConfig,
+    target_config: JsonHttpDatasetTargetConfiguration,
     settings: OpenRouterDatasetSettings,
 ) -> DatasetEvidenceRunContext:
     return create_dataset_evidence_run_context(
@@ -848,10 +894,13 @@ def _print_dataset_plan(
     target_header_environment_variables: dict[str, str],
     repetitions: int,
     max_target_calls: int,
+    target_calls_per_execution: int,
     invariant_suite: DatasetInvariantSuite | None,
     output: Path | None,
 ) -> None:
-    potential_target_calls = selected_count * repetitions * (1 + len(operator_ids))
+    potential_target_calls = (
+        selected_count * repetitions * (1 + len(operator_ids)) * target_calls_per_execution
+    )
     potential_model_calls = selected_count * (
         1 + 3 * len(operator_ids) + repetitions * (1 + len(operator_ids))
     )
@@ -877,6 +926,11 @@ def _print_dataset_plan(
         f"Potential target calls: up to {potential_target_calls} "
         f"(authorized maximum: {max_target_calls})"
     )
+    if target_calls_per_execution > 1:
+        console.print(
+            f"Lifecycle calls per execution: {target_calls_per_execution} "
+            "(reset, optional setup, execute_turn, snapshot, cleanup reset)"
+        )
     console.print(f"Target: {'configured' if target_configured else 'not configured'}")
     if output is not None:
         console.print(f"Evidence destination: {output}")
@@ -897,8 +951,8 @@ def _print_dataset_plan(
         "live control responses, and variation responses on execution."
     )
     console.print(
-        "Every target request must start from the same clean state. The target receives each "
-        "selected original input and each accepted variation for every repetition."
+        "Every execution must start from the same clean state. Version 2 targets enforce this "
+        "with lifecycle calls; version 1 targets rely on customer confirmation."
     )
     console.print(
         "Target requests and semantic model calls may be billed separately. Repetitions only "

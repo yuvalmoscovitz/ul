@@ -38,7 +38,7 @@ from ul.dataset_invariants import (
     evaluate_dataset_invariants,
 )
 from ul.dataset_regression import dataset_regression_target_config_sha256
-from ul.http_target import JsonHttpDatasetTargetConfig
+from ul.http_target import JsonHttpDatasetTargetConfiguration
 
 if sys.platform == "win32":
     import msvcrt
@@ -155,7 +155,7 @@ class DatasetEvidenceRunContext(_StrictModel):
     operators: tuple[DatasetEvidenceOperator, ...] = Field(min_length=1)
     repetitions: int = Field(ge=1)
     invariant_suite_sha256: str | None = Field(default=None, pattern=_SHA256_PATTERN)
-    target_config: JsonHttpDatasetTargetConfig
+    target_config: JsonHttpDatasetTargetConfiguration
     target_config_sha256: str = Field(pattern=_SHA256_PATTERN)
     semantic_settings: DatasetEvidenceSemanticSettings
     context_sha256: str = Field(pattern=_SHA256_PATTERN)
@@ -242,7 +242,7 @@ def create_dataset_evidence_run_context(
     operators: tuple[tuple[str, str], ...],
     repetitions: int,
     invariant_suite_sha256: str | None,
-    target_config: JsonHttpDatasetTargetConfig,
+    target_config: JsonHttpDatasetTargetConfiguration,
     semantic_settings: DatasetEvidenceSemanticSettings,
 ) -> DatasetEvidenceRunContext:
     selected_dataset_sha256 = _canonical_json_sha256(
