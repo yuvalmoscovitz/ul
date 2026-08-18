@@ -278,16 +278,13 @@ def evaluate_dataset(
 
     selected_records = records[:limit]
 
-    # Handle --resume: determine effective output path and skip processed IDs.
     skipped_count = 0
     if resume is not None:
-        # Validate --output consistency when both are given.
         if output is not None and output.resolve() != resume.resolve():
             raise typer.BadParameter(
                 "--output must point to the same file as --resume, or be omitted",
                 param_hint="--output",
             )
-        # Derive output from resume if not specified.
         if output is None:
             output = resume
         processed_ids = _read_processed_ids(resume)
@@ -331,7 +328,6 @@ def evaluate_dataset(
                 param_hint="--output",
             )
 
-    # Early exit when resuming and all records are already processed.
     if not dry_run and not selected_records and skipped_count > 0:
         console.print(
             f"All {skipped_count} selected interaction(s) already present in {resume}. "
