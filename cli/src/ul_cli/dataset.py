@@ -727,7 +727,8 @@ def _create_private_output(path: Path) -> TextIO:
 
 
 def _open_append_output(path: Path) -> TextIO:
-    descriptor = os.open(path, os.O_WRONLY | os.O_APPEND)
+    no_follow_flag = getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(path, os.O_WRONLY | os.O_APPEND | no_follow_flag)
     return os.fdopen(descriptor, "a", encoding="utf-8")
 
 
@@ -738,11 +739,13 @@ def _read_processed_ids(path: Path) -> set[str]:
             continue
         try:
             record = json.loads(line)
-            interaction_id = record.get("interaction_id")
-            if isinstance(interaction_id, str):
-                ids.add(interaction_id)
-        except (json.JSONDecodeError, ValueError):
-            pass
+        except (json.JSONDecodeError, ValueError) as exc:
+            raise RuntimeError(
+                f"--resume file contains a corrupt line: {exc}"
+            ) from exc
+        interaction_id = record.get("interaction_id")
+        if isinstance(interaction_id, str):
+            ids.add(interaction_id)
     return ids
 
 

@@ -8,7 +8,7 @@ from types import TracebackType
 from typing import Any, Self, cast
 
 import httpx
-from pydantic import AliasChoices, BaseModel, ConfigDict, Field, JsonValue, SecretStr
+from pydantic import BaseModel, ConfigDict, Field, JsonValue, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from ul_core.dataset import (
     EvidenceReference,
@@ -29,15 +29,24 @@ class OpenRouterDatasetSettings(BaseSettings):
         populate_by_name=True,
     )
 
-    live_calls: bool = Field(
-        default=False,
-        validation_alias=AliasChoices("UL_DATASET_LIVE_CALLS", "UL_LIVE"),
-    )
+    live_calls: bool = Field(default=False, validation_alias="UL_DATASET_LIVE_CALLS")
     allow_external_data_processing: bool = Field(
         default=False,
-        validation_alias=AliasChoices("UL_DATASET_ALLOW_EXTERNAL_DATA_PROCESSING", "UL_LIVE"),
+        validation_alias="UL_DATASET_ALLOW_EXTERNAL_DATA_PROCESSING",
     )
     api_key: SecretStr | None = Field(default=None, validation_alias="OPEN_ROUTER_API_KEY")
+
+    @model_validator(mode="before")
+    @classmethod
+    def apply_ul_live_shorthand(cls, data: Any) -> Any:
+        if not isinstance(data, dict):
+            return data
+        if str(data.get("UL_LIVE", "")).casefold() != "true":
+            return data
+        data = dict(data)
+        data.setdefault("UL_DATASET_LIVE_CALLS", "true")
+        data.setdefault("UL_DATASET_ALLOW_EXTERNAL_DATA_PROCESSING", "true")
+        return data
     model: str = Field(
         default="google/gemini-2.5-flash",
         min_length=1,
