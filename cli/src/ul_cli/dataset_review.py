@@ -19,8 +19,12 @@ from pydantic import BaseModel, ConfigDict, Field, JsonValue, ValidationError, m
 from rich.console import Console
 from ul import DatasetEvaluationResult, InteractionRecord
 from ul.dataset_invariants import (
+    DatasetInvariantArrayUniqueTrialEvaluation,
     DatasetInvariantEvaluation,
     DatasetInvariantSuite,
+    DatasetInvariantTrialEvaluation,
+    DatasetInvariantValueEqualsTrialEvaluation,
+    DatasetInvariantValueInSetTrialEvaluation,
     evaluate_dataset_invariants,
 )
 from ul.dataset_regression import dataset_regression_target_config_sha256
@@ -167,7 +171,7 @@ class _Case(_StrictModel):
 
 
 class _EvidenceRecord(_StrictModel):
-    schema_version: Literal["1.3.0", "1.4.0", "1.5.0"]
+    schema_version: Literal["1.3.0", "1.4.0", "1.5.0", "1.6.0"]
     interaction_id: str
     original_input: str
     execution_plan: _ExecutionPlan
@@ -182,10 +186,20 @@ class _EvidenceRecord(_StrictModel):
     def validate_invariant_evaluation(self) -> Self:
         if self.schema_version == "1.3.0" and "invariant_evaluation" in self.model_fields_set:
             raise ValueError("schema 1.3.0 does not include invariant evaluation")
-        if self.schema_version == "1.5.0" and self.run_context is None:
-            raise ValueError("schema 1.5.0 requires run context")
-        if self.schema_version != "1.5.0" and "run_context" in self.model_fields_set:
+        if self.schema_version in {"1.5.0", "1.6.0"} and self.run_context is None:
+            raise ValueError(f"schema {self.schema_version} requires run context")
+        if self.schema_version not in {"1.5.0", "1.6.0"} and "run_context" in self.model_fields_set:
             raise ValueError("legacy evidence does not include run context")
+        uses_extended_invariants = self.invariant_evaluation is not None and any(
+            rule.rule_type != "json_values_equal"
+            for arm in (
+                self.invariant_evaluation.baseline,
+                *self.invariant_evaluation.variations,
+            )
+            for rule in arm.rules
+        )
+        if uses_extended_invariants != (self.schema_version == "1.6.0"):
+            raise ValueError("extended invariant results require evidence schema 1.6.0")
         if (
             self.invariant_evaluation is not None
             and self.invariant_evaluation.interaction_id != self.interaction_id
@@ -269,9 +283,10 @@ def validate_dataset_resume_evidence(
             evidence = _EvidenceRecord.model_validate_json(raw_line)
         except (ValidationError, ValueError):
             raise ValueError("resume evidence is not valid UL JSONL") from None
-        if evidence.schema_version != "1.5.0" or evidence.run_context is None:
+        if evidence.schema_version not in {"1.5.0", "1.6.0"} or evidence.run_context is None:
             raise ValueError(
-                "resume requires evidence created with schema 1.5.0 run compatibility metadata"
+                "resume requires evidence created with schema 1.5.0 or 1.6.0 run "
+                "compatibility metadata"
             )
         if evidence.run_context != expected_context:
             raise ValueError("resume evidence is incompatible with the current evaluation plan")
@@ -858,9 +873,35 @@ def _print_invariant_evaluation(evaluation: DatasetInvariantEvaluation) -> None:
             for trial in rule.trials:
                 _print_plain(
                     f"Trial {trial.repetition}: {trial.status}; "
-                    f"left={trial.left_pointer}; right={trial.right_pointer}; "
+                    f"{_invariant_trial_location(trial)}; "
                     f"reason={trial.reason_code}"
                 )
+
+
+def _invariant_trial_location(
+    trial: DatasetInvariantTrialEvaluation
+    | DatasetInvariantValueEqualsTrialEvaluation
+    | DatasetInvariantValueInSetTrialEvaluation
+    | DatasetInvariantArrayUniqueTrialEvaluation,
+) -> str:
+    if isinstance(trial, DatasetInvariantTrialEvaluation):
+        return f"left={trial.left_pointer}; right={trial.right_pointer}"
+    if isinstance(
+        trial,
+        (DatasetInvariantValueEqualsTrialEvaluation, DatasetInvariantValueInSetTrialEvaluation),
+    ):
+        return f"value={trial.value_pointer}"
+    location = (
+        f"array={trial.array_pointer}; keys={','.join(trial.key_pointers)}; "
+        f"items={trial.item_count}"
+    )
+    if trial.duplicate_indices:
+        location += f"; duplicate_indices={trial.duplicate_indices}"
+    if trial.failed_item_index is not None:
+        location += (
+            f"; failed_item={trial.failed_item_index}; failed_key={trial.failed_key_pointer}"
+        )
+    return location
 
 
 def _print_plain(message: str) -> None:

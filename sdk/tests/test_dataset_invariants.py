@@ -13,7 +13,11 @@ from ul import (
     DatasetInvariantRuleEvaluation,
     DatasetInvariantSuite,
     DatasetInvariantTrialEvaluation,
+    JsonArrayItemsUniqueByInvariant,
+    JsonValueEqualsLiteralInvariant,
+    JsonValueInAllowedSetInvariant,
     JsonValuesEqualInvariant,
+    evaluate_dataset_invariant_rules,
     evaluate_dataset_invariants,
     load_dataset_invariant_suite,
 )
@@ -45,6 +49,10 @@ def _suite(*rules: JsonValuesEqualInvariant) -> DatasetInvariantSuite:
         observation_authority="agent_response",
         rules=rules or (_rule(),),
     )
+
+
+def _observed(raw_output: object) -> ObservedAgentOutput:
+    return ObservedAgentOutput.model_construct(raw_output=raw_output, metadata={})
 
 
 def _trial(repetition: int, raw_output: object = _MISSING) -> SimpleNamespace:
@@ -213,6 +221,297 @@ def test_loader_enforces_size_and_sanitizes_schema_errors(tmp_path: Path) -> Non
         load_dataset_invariant_suite(invalid)
     assert secret not in str(raised.value)
     assert "rules.0.severity" in str(raised.value)
+
+
+def test_extended_rules_require_suite_schema_1_1_and_round_trip(tmp_path: Path) -> None:
+    literal_rule = JsonValueEqualsLiteralInvariant(
+        type="json_value_equals_literal",
+        id="approval-is-current",
+        version="1.0.0",
+        description="The approval version must be current.",
+        severity="critical",
+        value_pointer="/approval/version",
+        literal=7,
+    )
+    with pytest.raises(ValidationError, match=r"schema 1\.0\.0 supports only"):
+        DatasetInvariantSuite(
+            schema_version="1.0.0",
+            observation_source="target_output",
+            observation_authority="committed_state_snapshot",
+            rules=(literal_rule,),
+        )
+
+    suite = DatasetInvariantSuite(
+        schema_version="1.1.0",
+        observation_source="target_output",
+        observation_authority="committed_state_snapshot",
+        rules=(literal_rule,),
+    )
+    path = tmp_path / "extended.json"
+    path.write_text(suite.model_dump_json(), encoding="utf-8")
+
+    assert load_dataset_invariant_suite(path) == suite
+
+
+@pytest.mark.parametrize(
+    ("actual", "literal", "expected_status", "expected_reason"),
+    [
+        ("approved", "approved", "satisfied", "value_equals_literal"),
+        ("expired", "approved", "violated", "value_differs_from_literal"),
+        (1, "1", "violated", "value_differs_from_literal"),
+        (True, 1, "violated", "value_differs_from_literal"),
+        (None, None, "satisfied", "value_equals_literal"),
+    ],
+)
+def test_literal_rule_uses_exact_typed_scalar_equality(
+    actual: object,
+    literal: object,
+    expected_status: str,
+    expected_reason: str,
+) -> None:
+    rule = JsonValueEqualsLiteralInvariant.model_validate(
+        {
+            "type": "json_value_equals_literal",
+            "id": "approval-is-current",
+            "version": "1.0.0",
+            "description": "The approval must be current.",
+            "severity": "critical",
+            "value_pointer": "/approval",
+            "literal": literal,
+        }
+    )
+
+    result = evaluate_dataset_invariant_rules((rule,), (_observed({"approval": actual}),))[0]
+
+    assert (result.status, result.trials[0].reason_code) == (
+        expected_status,
+        expected_reason,
+    )
+    assert result.trials[0].resolved_values == {"actual": actual}
+
+
+def test_literal_rule_does_not_silently_accept_missing_or_unsupported_values() -> None:
+    rule = JsonValueEqualsLiteralInvariant(
+        type="json_value_equals_literal",
+        id="amount-is-final",
+        version="1.0.0",
+        description="The final amount must be 12500 minor units.",
+        severity="high",
+        value_pointer="/amount",
+        literal=12500,
+    )
+    results = [
+        evaluate_dataset_invariant_rules((rule,), (output,))[0].trials[0]
+        for output in (
+            None,
+            _observed({}),
+            _observed({"amount": {"minor": 12500}}),
+            _observed({"amount": 12500.0}),
+        )
+    ]
+
+    assert [result.reason_code for result in results] == [
+        "target_output_missing",
+        "value_pointer_missing",
+        "value_not_scalar",
+        "value_non_integer_number_not_supported",
+    ]
+    assert all(result.status == "not_evaluable" for result in results)
+
+
+def test_allowed_set_is_strict_ordered_and_rejects_duplicate_configuration() -> None:
+    rule = JsonValueInAllowedSetInvariant(
+        type="json_value_in_allowed_set",
+        id="action-is-allowed",
+        version="1.0.0",
+        description="The committed action must be allowed.",
+        severity="critical",
+        value_pointer="/action",
+        allowed_values=("approved", "rejected", None),
+    )
+    outputs = (
+        _observed({"action": "approved"}),
+        _observed({"action": "paid"}),
+        _observed({"action": None}),
+    )
+
+    result = evaluate_dataset_invariant_rules((rule,), outputs)[0]
+
+    assert [trial.reason_code for trial in result.trials] == [
+        "value_in_allowed_set",
+        "value_not_in_allowed_set",
+        "value_in_allowed_set",
+    ]
+    assert result.status == "violated"
+    assert result.allowed_values == ("approved", "rejected", None)
+
+    with pytest.raises(ValidationError, match="allowed values must be unique"):
+        JsonValueInAllowedSetInvariant(
+            type="json_value_in_allowed_set",
+            id="duplicate-set",
+            version="1.0.0",
+            description="Duplicates are invalid.",
+            severity="low",
+            value_pointer="/value",
+            allowed_values=(True, True),
+        )
+    typed = JsonValueInAllowedSetInvariant(
+        type="json_value_in_allowed_set",
+        id="typed-set",
+        version="1.0.0",
+        description="Boolean true is not integer one.",
+        severity="low",
+        value_pointer="/value",
+        allowed_values=(True,),
+    )
+    assert evaluate_dataset_invariant_rules((typed,), (_observed({"value": 1}),))[0].status == (
+        "violated"
+    )
+
+
+def test_array_items_unique_by_composite_key_finds_duplicate_payment() -> None:
+    rule = JsonArrayItemsUniqueByInvariant(
+        type="json_array_items_unique_by",
+        id="never-pay-twice",
+        version="1.0.0",
+        description="An invoice must not be paid twice from one account.",
+        severity="critical",
+        array_pointer="/payments",
+        key_pointers=("/invoice", "/account"),
+    )
+    payments = [
+        {"payment_id": "pay-1", "invoice": "AC-100", "account": "main"},
+        {"payment_id": "pay-2", "invoice": "AC-101", "account": "main"},
+        {"payment_id": "pay-3", "invoice": "AC-100", "account": "main"},
+    ]
+
+    trial = evaluate_dataset_invariant_rules((rule,), (_observed({"payments": payments}),))[
+        0
+    ].trials[0]
+
+    assert trial.status == "violated"
+    assert trial.reason_code == "duplicate_array_items"
+    assert trial.item_count == 3
+    assert trial.duplicate_indices == (0, 2)
+    assert "AC-100" not in trial.model_dump_json()
+
+
+def test_array_uniqueness_violation_wins_over_malformed_item_regardless_of_order() -> None:
+    rule = JsonArrayItemsUniqueByInvariant(
+        type="json_array_items_unique_by",
+        id="unique-actions",
+        version="1.0.0",
+        description="Actions must have unique identities.",
+        severity="high",
+        array_pointer="/actions",
+        key_pointers=("/kind", "/entity"),
+    )
+    duplicate = [
+        {"kind": "pay", "entity": "AC-100"},
+        {"kind": "pay"},
+        {"kind": "pay", "entity": "AC-100"},
+    ]
+
+    for actions in (duplicate, list(reversed(duplicate))):
+        trial = evaluate_dataset_invariant_rules(
+            (rule,),
+            (_observed({"actions": actions}),),
+        )[0].trials[0]
+        assert (trial.status, trial.reason_code) == ("violated", "duplicate_array_items")
+
+    unevaluable = evaluate_dataset_invariant_rules(
+        (rule,),
+        (_observed({"actions": duplicate[:2]}),),
+    )[0].trials[0]
+    assert (unevaluable.status, unevaluable.reason_code) == (
+        "not_evaluable",
+        "key_pointer_missing",
+    )
+    assert (unevaluable.failed_item_index, unevaluable.failed_key_pointer) == (1, "/entity")
+
+
+def test_array_uniqueness_supports_scalar_items_with_root_key_pointer() -> None:
+    rule = JsonArrayItemsUniqueByInvariant(
+        type="json_array_items_unique_by",
+        id="unique-identifiers",
+        version="1.0.0",
+        description="Identifiers must be unique.",
+        severity="medium",
+        array_pointer="/ids",
+        key_pointers=("",),
+    )
+
+    satisfied = evaluate_dataset_invariant_rules(
+        (rule,),
+        (_observed({"ids": [1, "1", True, None]}),),
+    )[0]
+    violated = evaluate_dataset_invariant_rules(
+        (rule,),
+        (_observed({"ids": [1, "1", 1]}),),
+    )[0]
+
+    assert satisfied.status == "satisfied"
+    assert violated.status == "violated"
+
+
+def test_extended_rule_configuration_and_array_work_are_bounded() -> None:
+    literal_values = (1.5, {"nested": "value"}, ["value"], "x" * 4_097)
+    for literal in literal_values:
+        with pytest.raises(ValidationError):
+            JsonValueEqualsLiteralInvariant.model_validate(
+                {
+                    "type": "json_value_equals_literal",
+                    "id": "invalid-literal",
+                    "version": "1.0.0",
+                    "description": "Invalid literal.",
+                    "severity": "low",
+                    "value_pointer": "/value",
+                    "literal": literal,
+                }
+            )
+
+    for allowed_values in ((), tuple(range(101)), (1.5,)):
+        with pytest.raises(ValidationError):
+            JsonValueInAllowedSetInvariant.model_validate(
+                {
+                    "type": "json_value_in_allowed_set",
+                    "id": "invalid-set",
+                    "version": "1.0.0",
+                    "description": "Invalid allowed set.",
+                    "severity": "low",
+                    "value_pointer": "/value",
+                    "allowed_values": allowed_values,
+                }
+            )
+
+    with pytest.raises(ValidationError, match="key pointers must be unique"):
+        JsonArrayItemsUniqueByInvariant(
+            type="json_array_items_unique_by",
+            id="duplicate-keys",
+            version="1.0.0",
+            description="Duplicate keys are invalid.",
+            severity="low",
+            array_pointer="/items",
+            key_pointers=("/id", "/id"),
+        )
+    rule = JsonArrayItemsUniqueByInvariant(
+        type="json_array_items_unique_by",
+        id="bounded-array",
+        version="1.0.0",
+        description="Array work must be bounded.",
+        severity="low",
+        array_pointer="/items",
+        key_pointers=("",),
+    )
+    trial = evaluate_dataset_invariant_rules(
+        (rule,),
+        (_observed({"items": list(range(10_001))}),),
+    )[0].trials[0]
+    assert (trial.status, trial.reason_code, trial.item_count) == (
+        "not_evaluable",
+        "array_exceeds_limit",
+        10_001,
+    )
 
 
 @pytest.mark.parametrize(

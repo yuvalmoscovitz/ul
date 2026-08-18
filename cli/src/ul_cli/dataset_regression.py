@@ -12,7 +12,17 @@ from typing import Annotated, TextIO
 
 import typer
 from pydantic import ValidationError
-from ul.dataset_invariants import JsonValuesEqualInvariant
+from ul.dataset_invariants import (
+    DatasetInvariantRule,
+    DatasetInvariantRuleEvaluation,
+    DatasetInvariantRuleResult,
+    DatasetInvariantValueEqualsRuleEvaluation,
+    DatasetInvariantValueInSetRuleEvaluation,
+    JsonArrayItemsUniqueByInvariant,
+    JsonValueEqualsLiteralInvariant,
+    JsonValueInAllowedSetInvariant,
+    JsonValuesEqualInvariant,
+)
 from ul.dataset_regression import (
     DatasetRegressionCase,
     DatasetRegressionRunResult,
@@ -73,8 +83,9 @@ def save_dataset_regression(
         typer.Option(
             "--confirm-versioned-input",
             help=(
-                "Confirm the exact raw input and literal target-template values, which may be "
-                "sensitive and are not auto-redacted, are appropriate to store and version."
+                "Confirm the exact raw input, literal target-template values, and selected "
+                "customer-rule definitions, which may be sensitive and are not auto-redacted, "
+                "are appropriate to store and version."
             ),
         ),
     ] = False,
@@ -83,8 +94,8 @@ def save_dataset_regression(
     if not confirm_versioned_input:
         raise typer.BadParameter(
             "saving requires confirmation that the exact raw input and literal target-template "
-            "values may be sensitive, are not auto-redacted, and are appropriate to store and "
-            "version",
+            "values plus selected customer-rule definitions may be sensitive, are not "
+            "auto-redacted, and are appropriate to store and version",
             param_hint="--confirm-versioned-input",
         )
     if not rules:
@@ -128,8 +139,9 @@ def save_dataset_regression(
     _print_safe(f"Saved regression case {case.case_id}: {output}")
     _print_safe(
         "The case stores the exact raw input, which may be sensitive and is not auto-redacted, "
-        "plus selected rules and the declared observation authority. Header authentication "
-        "remains environment-backed, but literal request-template values may also be sensitive. "
+        "plus selected customer-rule definitions and the declared observation authority. Rule "
+        "literals, allowed sets, and literal request-template values are copied unredacted. "
+        "Header authentication remains environment-backed. "
         "The embedded target config is customer-declared at case creation, is not verified as "
         "the discovery target, and is never executed by replay."
     )
@@ -493,7 +505,7 @@ def _build_regression_case(
     missing_rule_ids = selected_rule_ids - baseline_rules.keys()
     if missing_rule_ids:
         raise ValueError(f"rule {sorted(missing_rule_ids)[0]!r} was not evaluated for both arms")
-    selected_rules: list[JsonValuesEqualInvariant] = []
+    selected_rules: list[DatasetInvariantRule] = []
     for baseline_rule in evaluation.baseline.rules:
         rule_id = baseline_rule.rule_id
         if rule_id not in selected_rule_ids:
@@ -505,24 +517,11 @@ def _build_regression_case(
             raise ValueError(
                 f"rule {rule_id!r} must be satisfied on the original and violated on the variation"
             )
-        baseline_trial = baseline_rule.trials[0]
-        variation_trial = variation_rule.trials[0]
-        if (
-            baseline_trial.left_pointer != variation_trial.left_pointer
-            or baseline_trial.right_pointer != variation_trial.right_pointer
-        ):
-            raise ValueError(f"rule {rule_id!r} uses inconsistent JSON pointers")
-        selected_rules.append(
-            JsonValuesEqualInvariant(
-                type="json_values_equal",
-                id=baseline_rule.rule_id,
-                version=baseline_rule.rule_version,
-                description=baseline_rule.description,
-                severity=baseline_rule.severity,
-                left_pointer=baseline_trial.left_pointer,
-                right_pointer=baseline_trial.right_pointer,
-            )
-        )
+        baseline_definition = _invariant_rule_definition(baseline_rule)
+        variation_definition = _invariant_rule_definition(variation_rule)
+        if baseline_definition != variation_definition:
+            raise ValueError(f"rule {rule_id!r} uses inconsistent definitions")
+        selected_rules.append(baseline_definition)
 
     trusted_target_config = load_json_http_dataset_target_config(target_config_path)
     return create_dataset_regression_case(
@@ -539,6 +538,49 @@ def _build_regression_case(
         observation_authority=evaluation.observation_authority,
         selected_rules=tuple(selected_rules),
         discovery_repetitions=loaded_record.evidence.execution_plan.repetitions,
+    )
+
+
+def _invariant_rule_definition(rule: DatasetInvariantRuleResult) -> DatasetInvariantRule:
+    if isinstance(rule, DatasetInvariantRuleEvaluation):
+        first_trial = rule.trials[0]
+        return JsonValuesEqualInvariant(
+            type="json_values_equal",
+            id=rule.rule_id,
+            version=rule.rule_version,
+            description=rule.description,
+            severity=rule.severity,
+            left_pointer=first_trial.left_pointer,
+            right_pointer=first_trial.right_pointer,
+        )
+    if isinstance(rule, DatasetInvariantValueEqualsRuleEvaluation):
+        return JsonValueEqualsLiteralInvariant(
+            type="json_value_equals_literal",
+            id=rule.rule_id,
+            version=rule.rule_version,
+            description=rule.description,
+            severity=rule.severity,
+            value_pointer=rule.value_pointer,
+            literal=rule.literal,
+        )
+    if isinstance(rule, DatasetInvariantValueInSetRuleEvaluation):
+        return JsonValueInAllowedSetInvariant(
+            type="json_value_in_allowed_set",
+            id=rule.rule_id,
+            version=rule.rule_version,
+            description=rule.description,
+            severity=rule.severity,
+            value_pointer=rule.value_pointer,
+            allowed_values=rule.allowed_values,
+        )
+    return JsonArrayItemsUniqueByInvariant(
+        type="json_array_items_unique_by",
+        id=rule.rule_id,
+        version=rule.rule_version,
+        description=rule.description,
+        severity=rule.severity,
+        array_pointer=rule.array_pointer,
+        key_pointers=rule.key_pointers,
     )
 
 

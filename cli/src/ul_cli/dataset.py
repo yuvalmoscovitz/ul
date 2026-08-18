@@ -29,8 +29,12 @@ from ul import (
     builtin_dataset_augmentation_operators,
 )
 from ul.dataset_invariants import (
+    DatasetInvariantArrayUniqueTrialEvaluation,
     DatasetInvariantEvaluation,
     DatasetInvariantSuite,
+    DatasetInvariantTrialEvaluation,
+    DatasetInvariantValueEqualsTrialEvaluation,
+    DatasetInvariantValueInSetTrialEvaluation,
     evaluate_dataset_invariants,
     load_dataset_invariant_suite,
 )
@@ -1160,9 +1164,35 @@ def _print_invariant_results(
                 for trial in rule.trials:
                     _print_dataset_plain(
                         f"Trial {trial.repetition}: {trial.status}; "
-                        f"left={trial.left_pointer}; right={trial.right_pointer}; "
+                        f"{_invariant_trial_location(trial)}; "
                         f"reason={trial.reason_code}"
                     )
+
+
+def _invariant_trial_location(
+    trial: DatasetInvariantTrialEvaluation
+    | DatasetInvariantValueEqualsTrialEvaluation
+    | DatasetInvariantValueInSetTrialEvaluation
+    | DatasetInvariantArrayUniqueTrialEvaluation,
+) -> str:
+    if isinstance(trial, DatasetInvariantTrialEvaluation):
+        return f"left={trial.left_pointer}; right={trial.right_pointer}"
+    if isinstance(
+        trial,
+        (DatasetInvariantValueEqualsTrialEvaluation, DatasetInvariantValueInSetTrialEvaluation),
+    ):
+        return f"value={trial.value_pointer}"
+    location = (
+        f"array={trial.array_pointer}; keys={','.join(trial.key_pointers)}; "
+        f"items={trial.item_count}"
+    )
+    if trial.duplicate_indices:
+        location += f"; duplicate_indices={trial.duplicate_indices}"
+    if trial.failed_item_index is not None:
+        location += (
+            f"; failed_item={trial.failed_item_index}; failed_key={trial.failed_key_pointer}"
+        )
+    return location
 
 
 def _print_dataset_plain(message: str) -> None:
@@ -1207,8 +1237,21 @@ def _customer_evidence_record(
                 "inconclusive_reasons": list(case.inconclusive_reasons),
             }
         )
+    uses_extended_invariants = invariant_evaluation is not None and any(
+        rule.rule_type != "json_values_equal"
+        for arm in (invariant_evaluation.baseline, *invariant_evaluation.variations)
+        for rule in arm.rules
+    )
+    if uses_extended_invariants and run_context is None:
+        raise ValueError("extended invariant evidence requires a resumable run context")
+    if uses_extended_invariants:
+        evidence_schema_version = "1.6.0"
+    elif run_context is not None:
+        evidence_schema_version = "1.5.0"
+    else:
+        evidence_schema_version = "1.4.0"
     evidence: dict[str, JsonValue] = {
-        "schema_version": "1.5.0" if run_context is not None else "1.4.0",
+        "schema_version": evidence_schema_version,
         "interaction_id": result.source.id,
         "original_input": result.source.raw_input,
         "execution_plan": {

@@ -16,7 +16,7 @@ from typing import Any, cast
 import httpx
 import pytest
 import typer
-from ul.dataset_invariants import load_dataset_invariant_suite
+from ul.dataset_invariants import JsonValuesEqualInvariant, load_dataset_invariant_suite
 
 from examples.quickstart import run as quickstart
 from examples.quickstart.defective_agent import create_server
@@ -182,9 +182,11 @@ def test_quickstart_invariant_uses_declared_committed_state_fields() -> None:
     assert suite.observation_source == "target_output"
     assert suite.observation_authority == "committed_state_snapshot"
     assert len(suite.rules) == 1
-    assert suite.rules[0].id == "committed-invoice-matches-request"
-    assert suite.rules[0].left_pointer == "/invoice_reference"
-    assert suite.rules[0].right_pointer == "/requested_invoice_reference"
+    rule = suite.rules[0]
+    assert isinstance(rule, JsonValuesEqualInvariant)
+    assert rule.id == "committed-invoice-matches-request"
+    assert rule.left_pointer == "/invoice_reference"
+    assert rule.right_pointer == "/requested_invoice_reference"
 
 
 def _confirmed_evidence() -> dict[str, Any]:

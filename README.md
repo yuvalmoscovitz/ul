@@ -112,10 +112,11 @@ uv run ul regression save PATH_TO_EVIDENCE.jsonl FINDING_ID \
   --confirm-versioned-input
 ```
 
-`--confirm-versioned-input` is required because the case copies the exact raw input and literal
-target-template values, which can contain sensitive data. UL does not automatically redact them:
-changing the input or template could change the behavior being reproduced. Treat the case as
-sensitive, inspect it before committing, and apply your own data-governance policy.
+`--confirm-versioned-input` is required because the case copies the exact raw input, literal
+target-template values, and selected customer-rule definitions. Rule literals and allowed sets
+can contain sensitive data. UL does not automatically redact these values: changing them could
+change the behavior being reproduced. Treat the case as sensitive, inspect it before committing,
+and apply your own data-governance policy.
 
 Replay the saved input and deterministic rules against a sandbox:
 
@@ -261,3 +262,50 @@ that the agent is correct or safe beyond that rule. Non-integer JSON numbers and
 larger than 4 KiB are `not_evaluable` in this first rule type. Represent exact decimal values as
 strings or integer minor units rather than binary JSON floats. `observation_authority` is the
 customer's statement about what the target output represents; UL does not independently verify it.
+
+Invariant schema `1.1.0` also supports literal values, allowed sets, and array uniqueness by a
+customer-declared composite key:
+
+```json
+{
+  "schema_version": "1.1.0",
+  "observation_source": "target_output",
+  "observation_authority": "committed_state_snapshot",
+  "rules": [
+    {
+      "type": "json_value_equals_literal",
+      "id": "approval-is-current",
+      "version": "1.0.0",
+      "description": "The approval version must be current.",
+      "severity": "critical",
+      "value_pointer": "/approval/version",
+      "literal": 7
+    },
+    {
+      "type": "json_value_in_allowed_set",
+      "id": "action-is-allowed",
+      "version": "1.0.0",
+      "description": "The committed action must be explicitly allowed.",
+      "severity": "critical",
+      "value_pointer": "/action",
+      "allowed_values": ["approved", "rejected", "needs_human_review"]
+    },
+    {
+      "type": "json_array_items_unique_by",
+      "id": "never-pay-twice",
+      "version": "1.0.0",
+      "description": "An invoice must not be paid twice from one account.",
+      "severity": "critical",
+      "array_pointer": "/payments",
+      "key_pointers": ["/invoice_reference", "/source_bank_account_id"]
+    }
+  ]
+}
+```
+
+Configured and observed rule values are limited to JSON strings, integers, booleans, or null.
+Comparison is exact and type-sensitive: `true`, `1`, and `"1"` are different values. The
+uniqueness rule checks 1–10 relative JSON pointers for each array item and reports only item counts,
+pointer locations, and duplicate indices to the terminal; selected values remain in private evidence.
+An empty or single-item array satisfies uniqueness but does not prove an action occurred. The rule
+applies only within one declared target-output snapshot, not across independent customer requests.
