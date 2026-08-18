@@ -5,6 +5,8 @@ import hashlib
 import json
 import os
 import re
+import stat
+import sys
 import unicodedata
 from pathlib import Path
 from typing import Annotated, TextIO, cast
@@ -41,7 +43,20 @@ from ul.http_target import (
 from ul_core.dataset import ObservedOutcome
 
 from ul_cli.dataset_ingest import app as ingest_app
-from ul_cli.dataset_review import report_dataset_evidence, review_dataset_finding
+from ul_cli.dataset_review import (
+    DatasetEvidenceRunContext,
+    DatasetEvidenceSemanticSettings,
+    DatasetResumeEvidence,
+    create_dataset_evidence_run_context,
+    report_dataset_evidence,
+    review_dataset_finding,
+    validate_dataset_resume_evidence,
+)
+
+if sys.platform == "win32":
+    import msvcrt
+else:
+    import fcntl
 
 app = typer.Typer(help="Explore behavioral differences in observed agent interactions.")
 console = Console()
@@ -52,10 +67,13 @@ app.command("review")(review_dataset_finding)
 
 _MAXIMUM_DATASET_BYTES = 10_000_000
 _MAXIMUM_DATASET_RECORDS = 100
+_MAXIMUM_EVIDENCE_BYTES = 128_000_000
 _DEFAULT_MAXIMUM_TARGET_CALLS = 100
 _HEADER_NAME_PATTERN = re.compile(r"[!#$%&'*+.^_`|~0-9A-Za-z-]+")
 _ENVIRONMENT_NAME_PATTERN = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
-_DATASET_OPERATOR_IDS = tuple(operator.id for operator in builtin_dataset_augmentation_operators())
+_DATASET_OPERATORS = builtin_dataset_augmentation_operators()
+_DATASET_OPERATOR_IDS = tuple(operator.id for operator in _DATASET_OPERATORS)
+_DATASET_OPERATORS_BY_ID = {operator.id: operator for operator in _DATASET_OPERATORS}
 _CUSTOMER_STATUSES = {
     "augmentation_rejected": "VARIATION DISCARDED",
     "inconclusive": "COULDN'T DETERMINE",
@@ -241,16 +259,37 @@ def evaluate_dataset(
         bool,
         typer.Option(help="Validate and show the execution plan without external calls."),
     ] = False,
+    resume: Annotated[
+        Path | None,
+        typer.Option(
+            exists=True,
+            dir_okay=False,
+            readable=True,
+            help=(
+                "Existing evidence file to resume; validates run compatibility, skips completed "
+                "interactions, and appends."
+            ),
+        ),
+    ] = None,
 ) -> None:
     """Explore behavioral differences against an isolated black-box agent.
 
-    Execution requires UL_DATASET_LIVE_CALLS=true,
-    UL_DATASET_ALLOW_EXTERNAL_DATA_PROCESSING=true, and OPEN_ROUTER_API_KEY.
+    UL_LIVE=true enables billed semantic-model calls and external processing together.
+    UL_DATASET_LIVE_CALLS and UL_DATASET_ALLOW_EXTERNAL_DATA_PROCESSING remain separate,
+    higher-precedence controls. Execution also requires OPEN_ROUTER_API_KEY.
 
     Example: ul dataset evaluate interactions.jsonl --target-url https://sandbox/run
     --allow-target-network --confirm-isolated-sandbox --confirm-fresh-state
     --output results.jsonl
     """
+    if resume is not None:
+        if output is not None and output.resolve() != resume.resolve():
+            raise typer.BadParameter(
+                "--output must point to the same file as --resume, or be omitted",
+                param_hint="--output",
+            )
+        if output is None:
+            output = resume
     try:
         records = _load_interaction_records(data)
         selected_operators = _validate_operator_ids(operator)
@@ -264,46 +303,45 @@ def evaluate_dataset(
         invariant_suite = (
             load_dataset_invariant_suite(invariants) if invariants is not None else None
         )
-    except (_DatasetInputError, ValidationError, ValueError, RuntimeError) as error:
-        raise typer.BadParameter(str(error)) from None
-
-    selected_records = records[:limit]
-    potential_target_calls = len(selected_records) * repetitions * (1 + len(selected_operators))
-    if potential_target_calls > max_target_calls:
-        raise typer.BadParameter(
-            f"selection would make up to {potential_target_calls} target calls, exceeding "
-            f"--max-target-calls {max_target_calls}; reduce --limit, --operator, or "
-            "--repetitions, or explicitly raise the call budget"
-        )
-    if not dry_run:
-        if target_url is None and target_config is None:
-            raise typer.BadParameter(
-                "execution requires --target-url or --target-config",
-                param_hint="--target-url",
+        selected_records = records[:limit]
+        if resume is None:
+            initial_target_calls = (
+                len(selected_records) * repetitions * (1 + len(selected_operators))
             )
-        if not allow_target_network:
-            raise typer.BadParameter(
-                "execution requires --allow-target-network",
-                param_hint="--allow-target-network",
-            )
-        if not confirm_isolated_sandbox:
-            raise typer.BadParameter(
-                "execution requires --confirm-isolated-sandbox",
-                param_hint="--confirm-isolated-sandbox",
-            )
-        if not confirm_fresh_state:
-            raise typer.BadParameter(
-                "execution requires --confirm-fresh-state",
-                param_hint="--confirm-fresh-state",
-            )
-        if output is None:
-            raise typer.BadParameter("execution requires --output", param_hint="--output")
-        if output.exists():
-            raise typer.BadParameter(
-                "output already exists; UL will not overwrite it",
-                param_hint="--output",
-            )
-    try:
+            if initial_target_calls > max_target_calls:
+                raise typer.BadParameter(
+                    f"selection would make up to {initial_target_calls} target calls, exceeding "
+                    f"--max-target-calls {max_target_calls}; reduce --limit, --operator, or "
+                    "--repetitions, or explicitly raise the call budget"
+                )
+        if not dry_run and resume is None:
+            if target_url is None and target_config is None:
+                raise typer.BadParameter(
+                    "execution requires --target-url or --target-config",
+                    param_hint="--target-url",
+                )
+            if not allow_target_network:
+                raise typer.BadParameter(
+                    "execution requires --allow-target-network",
+                    param_hint="--allow-target-network",
+                )
+            if not confirm_isolated_sandbox:
+                raise typer.BadParameter(
+                    "execution requires --confirm-isolated-sandbox",
+                    param_hint="--confirm-isolated-sandbox",
+                )
+            if not confirm_fresh_state:
+                raise typer.BadParameter(
+                    "execution requires --confirm-fresh-state",
+                    param_hint="--confirm-fresh-state",
+                )
+            if output is None:
+                raise typer.BadParameter("execution requires --output", param_hint="--output")
+            if output.exists():
+                raise typer.BadParameter(
+                    "output already exists; UL will not overwrite it",
+                    param_hint="--output",
+                )
         settings = OpenRouterDatasetSettings()
         _validate_model_input_bounds(selected_records, settings.max_input_chars)
         loaded_target_config = (
@@ -314,8 +352,8 @@ def evaluate_dataset(
         if target_url is not None:
             validate_json_http_dataset_target_configuration(
                 target_url,
-                sandbox_confirmed=confirm_isolated_sandbox or dry_run,
-                fresh_state_confirmed=confirm_fresh_state or dry_run,
+                sandbox_confirmed=confirm_isolated_sandbox or dry_run or resume is not None,
+                fresh_state_confirmed=confirm_fresh_state or dry_run or resume is not None,
                 request_field=request_field or "input",
                 header_environment_variables=header_environment_variables,
                 allow_insecure_http=allow_insecure_http,
@@ -323,19 +361,72 @@ def evaluate_dataset(
         if loaded_target_config is not None:
             validate_json_http_dataset_target_configuration(
                 loaded_target_config.url,
-                sandbox_confirmed=confirm_isolated_sandbox or dry_run,
-                fresh_state_confirmed=confirm_fresh_state or dry_run,
+                sandbox_confirmed=confirm_isolated_sandbox or dry_run or resume is not None,
+                fresh_state_confirmed=confirm_fresh_state or dry_run or resume is not None,
                 header_environment_variables=loaded_target_config.headers_from_env,
                 request_json_template=loaded_target_config.request_json_template,
                 response_json_pointer=loaded_target_config.response_json_pointer,
                 allow_insecure_http=allow_insecure_http,
             )
-    except (ValidationError, ValueError, RuntimeError) as error:
+        normalized_target_config = _normalized_target_config(
+            target_url=target_url,
+            loaded_target_config=loaded_target_config,
+            request_field=request_field,
+            header_environment_variables=header_environment_variables,
+        )
+        if resume is not None and normalized_target_config is None:
+            raise ValueError("--resume requires --target-url or --target-config")
+        run_context = (
+            _dataset_evidence_run_context(
+                selected_records=selected_records,
+                selected_operator_ids=selected_operators,
+                repetitions=repetitions,
+                invariant_suite=invariant_suite,
+                target_config=normalized_target_config,
+                settings=settings,
+            )
+            if normalized_target_config is not None
+            else None
+        )
+    except (_DatasetInputError, ValidationError, ValueError, RuntimeError) as error:
         raise typer.BadParameter(str(error)) from None
+
+    resume_evidence: DatasetResumeEvidence | None = None
+    skipped_count = 0
+    if resume is not None:
+        assert output is not None
+        assert run_context is not None
+        try:
+            resume_evidence = _read_resume_evidence(
+                output,
+                expected_context=run_context,
+                selected_records=selected_records,
+                invariant_suite=invariant_suite,
+            )
+        except (OSError, ValueError) as error:
+            message = str(error) if isinstance(error, ValueError) else error.__class__.__name__
+            raise typer.BadParameter(
+                f"cannot safely resume evidence ({message})",
+                param_hint="--resume",
+            ) from None
+        selected_records = tuple(
+            record for record in selected_records if record.id not in resume_evidence.processed_ids
+        )
+        skipped_count = len(resume_evidence.processed_ids)
+
+    potential_target_calls = len(selected_records) * repetitions * (1 + len(selected_operators))
+    if potential_target_calls > max_target_calls:
+        raise typer.BadParameter(
+            f"remaining selection would make up to {potential_target_calls} target calls, "
+            f"exceeding --max-target-calls {max_target_calls}; reduce --limit, --operator, "
+            "or --repetitions, or explicitly raise the call budget"
+        )
+
     if dry_run:
         _print_dataset_plan(
             record_count=len(records),
             selected_count=len(selected_records),
+            skipped_count=skipped_count,
             operator_ids=selected_operators,
             target_configured=target_url is not None or target_config is not None,
             target_endpoint=(
@@ -349,16 +440,62 @@ def evaluate_dataset(
             repetitions=repetitions,
             max_target_calls=max_target_calls,
             invariant_suite=invariant_suite,
+            output=output,
         )
         return
 
+    if not selected_records and skipped_count > 0:
+        assert output is not None
+        assert resume_evidence is not None
+        console.print(
+            f"Resume compatible: all {skipped_count} selected interaction(s) are complete in "
+            f"{output}. Nothing to do."
+        )
+        previous_invariant_exit_code = _invariant_exit_code(resume_evidence.invariant_evaluations)
+        if previous_invariant_exit_code:
+            raise typer.Exit(code=previous_invariant_exit_code)
+        if resume_evidence.has_review_findings:
+            raise typer.Exit(code=1)
+        raise typer.Exit(code=0)
+
+    if target_url is None and target_config is None:
+        raise typer.BadParameter(
+            "execution requires --target-url or --target-config",
+            param_hint="--target-url",
+        )
+    if not allow_target_network:
+        raise typer.BadParameter(
+            "execution requires --allow-target-network",
+            param_hint="--allow-target-network",
+        )
+    if not confirm_isolated_sandbox:
+        raise typer.BadParameter(
+            "execution requires --confirm-isolated-sandbox",
+            param_hint="--confirm-isolated-sandbox",
+        )
+    if not confirm_fresh_state:
+        raise typer.BadParameter(
+            "execution requires --confirm-fresh-state",
+            param_hint="--confirm-fresh-state",
+        )
+    if output is None:
+        raise typer.BadParameter("execution requires --output", param_hint="--output")
+    if output.exists() and resume is None:
+        raise typer.BadParameter(
+            "output already exists; UL will not overwrite it",
+            param_hint="--output",
+        )
+
     assert target_url is not None or loaded_target_config is not None
-    assert output is not None
+    assert run_context is not None
     if not settings.live_calls:
-        raise typer.BadParameter("set UL_DATASET_LIVE_CALLS=true to allow semantic model calls")
+        raise typer.BadParameter(
+            "set UL_LIVE=true (or UL_DATASET_LIVE_CALLS=true) to allow semantic model calls"
+        )
     if not settings.allow_external_data_processing:
         raise typer.BadParameter(
-            "set UL_DATASET_ALLOW_EXTERNAL_DATA_PROCESSING=true to allow semantic model calls"
+            "set UL_LIVE=true (or UL_DATASET_ALLOW_EXTERNAL_DATA_PROCESSING=true) "
+            "to allow semantic model calls"
         )
     if settings.api_key is None or not settings.api_key.get_secret_value().strip():
         raise typer.BadParameter("set OPEN_ROUTER_API_KEY to run an evaluation")
@@ -385,12 +522,25 @@ def evaluate_dataset(
         raise typer.BadParameter(str(error), param_hint="--target-url") from None
 
     try:
-        output_stream = _create_private_output(output)
-    except OSError as error:
+        if resume is None:
+            output_stream = _create_private_output(output)
+        else:
+            assert resume_evidence is not None
+            output_stream, locked_resume_evidence = _open_resume_output(
+                output,
+                expected_context=run_context,
+                selected_records=tuple(records[:limit]),
+                invariant_suite=invariant_suite,
+            )
+            if locked_resume_evidence != resume_evidence:
+                output_stream.close()
+                raise ValueError("resume evidence changed after preflight")
+    except (OSError, ValueError) as error:
         asyncio.run(target.aclose())
+        message = str(error) if isinstance(error, ValueError) else error.__class__.__name__
         raise typer.BadParameter(
-            f"cannot create output file ({error.__class__.__name__})",
-            param_hint="--output",
+            f"cannot safely open output file ({message})",
+            param_hint="--resume" if resume is not None else "--output",
         ) from None
 
     has_review_findings = False
@@ -406,7 +556,12 @@ def evaluate_dataset(
                     output_stream,
                     repetitions=repetitions,
                     max_target_calls=max_target_calls,
-                    planned_target_calls=potential_target_calls,
+                    planned_target_calls=(
+                        (len(selected_records) + skipped_count)
+                        * repetitions
+                        * (1 + len(selected_operators))
+                    ),
+                    run_context=run_context,
                     invariant_suite=invariant_suite,
                     invariant_evaluations=invariant_evaluations,
                 )
@@ -419,7 +574,12 @@ def evaluate_dataset(
                     output_stream,
                     repetitions=repetitions,
                     max_target_calls=max_target_calls,
-                    planned_target_calls=potential_target_calls,
+                    planned_target_calls=(
+                        (len(selected_records) + skipped_count)
+                        * repetitions
+                        * (1 + len(selected_operators))
+                    ),
+                    run_context=run_context,
                 )
             results = asyncio.run(evaluation_coroutine)
             for result in results:
@@ -431,13 +591,23 @@ def evaluate_dataset(
         )
         raise typer.Exit(code=2) from None
 
+    if skipped_count > 0:
+        console.print(
+            f"Resumed: {skipped_count} interaction(s) skipped (already in evidence), "
+            f"{len(results)} newly evaluated."
+        )
     _print_dataset_results(results, output, invariant_evaluations=tuple(invariant_evaluations))
-    invariant_exit_code = _invariant_exit_code(tuple(invariant_evaluations))
+    prior_invariant_evaluations = (
+        resume_evidence.invariant_evaluations if resume_evidence is not None else ()
+    )
+    invariant_exit_code = _invariant_exit_code(
+        (*prior_invariant_evaluations, *invariant_evaluations)
+    )
     if invariant_exit_code == 1:
         raise typer.Exit(code=1)
     if invariant_exit_code == 2:
         raise typer.Exit(code=2)
-    if has_review_findings:
+    if has_review_findings or (resume_evidence is not None and resume_evidence.has_review_findings):
         raise typer.Exit(code=1)
 
 
@@ -612,10 +782,62 @@ def _validate_target_mode_options(
         )
 
 
+def _normalized_target_config(
+    *,
+    target_url: str | None,
+    loaded_target_config: JsonHttpDatasetTargetConfig | None,
+    request_field: str | None,
+    header_environment_variables: dict[str, str],
+) -> JsonHttpDatasetTargetConfig | None:
+    if loaded_target_config is not None:
+        return loaded_target_config
+    if target_url is None:
+        return None
+    return JsonHttpDatasetTargetConfig(
+        version=1,
+        url=target_url,
+        headers_from_env=header_environment_variables,
+        request_json_template={(request_field or "input"): "{{input}}"},
+        response_json_pointer="",
+    )
+
+
+def _dataset_evidence_run_context(
+    *,
+    selected_records: tuple[InteractionRecord, ...],
+    selected_operator_ids: tuple[str, ...],
+    repetitions: int,
+    invariant_suite: DatasetInvariantSuite | None,
+    target_config: JsonHttpDatasetTargetConfig,
+    settings: OpenRouterDatasetSettings,
+) -> DatasetEvidenceRunContext:
+    return create_dataset_evidence_run_context(
+        selected_records=selected_records,
+        operators=tuple(
+            (operator_id, _DATASET_OPERATORS_BY_ID[operator_id].version)
+            for operator_id in selected_operator_ids
+        ),
+        repetitions=repetitions,
+        invariant_suite_sha256=(invariant_suite.sha256 if invariant_suite is not None else None),
+        target_config=target_config,
+        semantic_settings=DatasetEvidenceSemanticSettings(
+            model=settings.model,
+            render_model=settings.render_model,
+            equivalence_model=settings.equivalence_model,
+            max_input_chars=settings.max_input_chars,
+            max_output_tokens=settings.max_output_tokens,
+            max_render_tokens=settings.max_render_tokens,
+            max_response_bytes=settings.max_response_bytes,
+            timeout_seconds=settings.timeout_seconds,
+        ),
+    )
+
+
 def _print_dataset_plan(
     *,
     record_count: int,
     selected_count: int,
+    skipped_count: int,
     operator_ids: tuple[str, ...],
     target_configured: bool,
     target_endpoint: str | None,
@@ -623,13 +845,20 @@ def _print_dataset_plan(
     repetitions: int,
     max_target_calls: int,
     invariant_suite: DatasetInvariantSuite | None,
+    output: Path | None,
 ) -> None:
     potential_target_calls = selected_count * repetitions * (1 + len(operator_ids))
     potential_model_calls = selected_count * (
         1 + 3 * len(operator_ids) + repetitions * (1 + len(operator_ids))
     )
     console.print(f"Dataset valid: {record_count} interaction(s)")
-    console.print(f"Selected interactions: {selected_count}")
+    if skipped_count:
+        console.print(
+            f"Resume compatible: {skipped_count} complete interaction(s) skipped; "
+            f"{selected_count} remaining"
+        )
+    else:
+        console.print(f"Selected interactions: {selected_count}")
     console.print(f"Operators: {', '.join(operator_ids)}")
     console.print(f"Repetitions: {repetitions} per original and accepted variation")
     if invariant_suite is None:
@@ -645,6 +874,8 @@ def _print_dataset_plan(
         f"(authorized maximum: {max_target_calls})"
     )
     console.print(f"Target: {'configured' if target_configured else 'not configured'}")
+    if output is not None:
+        console.print(f"Evidence destination: {output}")
     if target_endpoint is not None:
         console.print(f"Target endpoint: {target_endpoint}")
         if target_header_environment_variables:
@@ -679,6 +910,108 @@ def _create_private_output(path: Path) -> TextIO:
     return os.fdopen(descriptor, "w", encoding="utf-8")
 
 
+def _read_resume_evidence(
+    path: Path,
+    *,
+    expected_context: DatasetEvidenceRunContext,
+    selected_records: tuple[InteractionRecord, ...],
+    invariant_suite: DatasetInvariantSuite | None,
+) -> DatasetResumeEvidence:
+    descriptor = _open_resume_descriptor(path, writable=False)
+    try:
+        return _read_resume_descriptor(
+            descriptor,
+            expected_context=expected_context,
+            selected_records=selected_records,
+            invariant_suite=invariant_suite,
+        )
+    finally:
+        os.close(descriptor)
+
+
+def _open_resume_output(
+    path: Path,
+    *,
+    expected_context: DatasetEvidenceRunContext,
+    selected_records: tuple[InteractionRecord, ...],
+    invariant_suite: DatasetInvariantSuite | None,
+) -> tuple[TextIO, DatasetResumeEvidence]:
+    descriptor = _open_resume_descriptor(path, writable=True)
+    try:
+        resume_evidence = _read_resume_descriptor(
+            descriptor,
+            expected_context=expected_context,
+            selected_records=selected_records,
+            invariant_suite=invariant_suite,
+        )
+        if sys.platform != "win32":
+            os.fchmod(descriptor, 0o600)
+        os.lseek(descriptor, 0, os.SEEK_END)
+        return os.fdopen(descriptor, "a", encoding="utf-8"), resume_evidence
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _open_resume_descriptor(path: Path, *, writable: bool) -> int:
+    no_follow_flag = getattr(os, "O_NOFOLLOW", 0)
+    binary_flag = os.O_BINARY if sys.platform == "win32" else 0
+    path_status = os.lstat(path)
+    if not stat.S_ISREG(path_status.st_mode):
+        raise OSError("resume evidence is not a regular file")
+    access_flags = os.O_RDWR | os.O_APPEND if writable else os.O_RDONLY
+    descriptor = os.open(path, access_flags | no_follow_flag | binary_flag)
+    try:
+        descriptor_status = os.fstat(descriptor)
+        if not stat.S_ISREG(descriptor_status.st_mode) or (
+            path_status.st_dev,
+            path_status.st_ino,
+        ) != (descriptor_status.st_dev, descriptor_status.st_ino):
+            raise OSError("resume evidence changed while opening")
+        if sys.platform == "win32":
+            os.lseek(descriptor, 0, os.SEEK_SET)
+            lock_mode = msvcrt.LK_NBLCK if writable else msvcrt.LK_NBRLCK
+            msvcrt.locking(descriptor, lock_mode, 1)
+        else:
+            lock_mode = fcntl.LOCK_EX if writable else fcntl.LOCK_SH
+            fcntl.flock(descriptor, lock_mode | fcntl.LOCK_NB)
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _read_resume_descriptor(
+    descriptor: int,
+    *,
+    expected_context: DatasetEvidenceRunContext,
+    selected_records: tuple[InteractionRecord, ...],
+    invariant_suite: DatasetInvariantSuite | None,
+) -> DatasetResumeEvidence:
+    size = os.fstat(descriptor).st_size
+    if size > _MAXIMUM_EVIDENCE_BYTES:
+        raise ValueError("resume evidence exceeds the 128 MB limit")
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    chunks: list[bytes] = []
+    remaining = size
+    while remaining:
+        chunk = os.read(descriptor, min(65_536, remaining))
+        if not chunk:
+            break
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    raw_evidence = b"".join(chunks)
+    if raw_evidence and not raw_evidence.endswith(b"\n"):
+        raise ValueError("resume evidence must end with a newline")
+    return validate_dataset_resume_evidence(
+        raw_evidence,
+        expected_context=expected_context,
+        selected_records=selected_records,
+        invariant_suite=invariant_suite,
+        evidence_projector=_customer_evidence_record,
+    )
+
+
 async def _evaluate_interaction_records(
     records: tuple[InteractionRecord, ...],
     operator_ids: tuple[str, ...],
@@ -689,6 +1022,7 @@ async def _evaluate_interaction_records(
     repetitions: int,
     max_target_calls: int,
     planned_target_calls: int,
+    run_context: DatasetEvidenceRunContext | None = None,
     invariant_suite: DatasetInvariantSuite | None = None,
     invariant_evaluations: list[DatasetInvariantEvaluation] | None = None,
 ) -> tuple[DatasetEvaluationResult, ...]:
@@ -720,6 +1054,7 @@ async def _evaluate_interaction_records(
                         repetitions=repetitions,
                         max_target_calls=max_target_calls,
                         planned_target_calls=planned_target_calls,
+                        run_context=run_context,
                         invariant_evaluation=invariant_evaluation,
                     ),
                     ensure_ascii=False,
@@ -727,6 +1062,7 @@ async def _evaluate_interaction_records(
                 + "\n"
             )
             output_stream.flush()
+            os.fsync(output_stream.fileno())
             results.append(result)
     return tuple(results)
 
@@ -846,6 +1182,7 @@ def _customer_evidence_record(
     repetitions: int,
     max_target_calls: int,
     planned_target_calls: int,
+    run_context: DatasetEvidenceRunContext | None = None,
     invariant_evaluation: DatasetInvariantEvaluation | None = None,
 ) -> dict[str, JsonValue]:
     cases: list[JsonValue] = []
@@ -870,8 +1207,8 @@ def _customer_evidence_record(
                 "inconclusive_reasons": list(case.inconclusive_reasons),
             }
         )
-    return {
-        "schema_version": "1.4.0",
+    evidence: dict[str, JsonValue] = {
+        "schema_version": "1.5.0" if run_context is not None else "1.4.0",
         "interaction_id": result.source.id,
         "original_input": result.source.raw_input,
         "execution_plan": {
@@ -894,6 +1231,9 @@ def _customer_evidence_record(
         ),
         "technical_details": cast(JsonValue, result.model_dump(mode="json")),
     }
+    if run_context is not None:
+        evidence["run_context"] = cast(JsonValue, run_context.model_dump(mode="json"))
+    return evidence
 
 
 def _baseline_customer_status(result: DatasetEvaluationResult) -> str:

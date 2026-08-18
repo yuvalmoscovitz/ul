@@ -4,6 +4,7 @@ import asyncio
 import json
 import re
 import stat
+import sys
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -13,7 +14,21 @@ from typing import Any, cast
 import pytest
 from pydantic import SecretStr
 from typer.testing import CliRunner
-from ul import DatasetEvaluationResult
+from ul import (
+    DatasetAugmentationResult,
+    DatasetEvaluationBaseline,
+    DatasetEvaluationCase,
+    DatasetEvaluationFinding,
+    DatasetEvaluationOutcomeGroup,
+    DatasetEvaluationResult,
+    DatasetEvaluationTrial,
+    DatasetEvaluationTrialSet,
+    InteractionRecord,
+    JsonHttpDatasetTargetConfig,
+    ObservedAgentOutput,
+    SemanticFrame,
+)
+from ul.dataset_augmentation import DatasetAugmentationCandidate
 from ul.dataset_invariants import (
     DatasetInvariantArmEvaluation,
     DatasetInvariantEvaluation,
@@ -39,6 +54,130 @@ def _record(identifier: str = "interaction-1") -> dict[str, Any]:
         "input": "Transfer 100 to Alice.",
         "output": {"actions": [{"action": "transfer", "amount": 100, "recipient": "Alice"}]},
     }
+
+
+def _settings(**overrides: object) -> SimpleNamespace:
+    values: dict[str, object] = {
+        "live_calls": True,
+        "allow_external_data_processing": True,
+        "api_key": SecretStr("test-key"),
+        "model": "test/deconstructor",
+        "render_model": "test/renderer",
+        "equivalence_model": "test/equivalence",
+        "max_input_chars": 50_000,
+        "max_output_tokens": 4_096,
+        "max_render_tokens": 512,
+        "max_response_bytes": 1_000_000,
+        "timeout_seconds": 60.0,
+    }
+    values.update(overrides)
+    return SimpleNamespace(**values)
+
+
+def _evaluation_result(
+    identifier: str,
+    *,
+    has_review_finding: bool = False,
+) -> DatasetEvaluationResult:
+    source = InteractionRecord(
+        id=identifier,
+        raw_input="Transfer 100 to Alice.",
+        raw_observed_output={
+            "actions": [{"action": "transfer", "amount": 100, "recipient": "Alice"}]
+        },
+    )
+    source_frame = SemanticFrame(interaction_id=identifier, extractor_version="test")
+    baseline_frame = SemanticFrame(
+        interaction_id=f"{identifier}:current_baseline:round-1",
+        extractor_version="test",
+    )
+    trial_set = DatasetEvaluationTrialSet(
+        requested_repetitions=1,
+        stability="stable",
+        trials=(
+            DatasetEvaluationTrial(
+                repetition=1,
+                target_output=ObservedAgentOutput(raw_output={"status": "ok"}),
+                observed_frame=baseline_frame,
+            ),
+        ),
+        outcome_groups=(
+            DatasetEvaluationOutcomeGroup(repetitions=(1,), representative_effects=()),
+        ),
+    )
+    candidate = DatasetAugmentationCandidate(
+        source_interaction_id=identifier,
+        operator_id="surface.rephrase",
+        augmented_input="Please transfer 100 to Alice.",
+        expected_input_frame=source_frame,
+        reparsed_input_frame=source_frame if has_review_finding else None,
+        passed=has_review_finding,
+        failure_reasons=() if has_review_finding else ("test rejection",),
+    )
+    if has_review_finding:
+        variation_trial_set = DatasetEvaluationTrialSet(
+            requested_repetitions=1,
+            stability="stable",
+            trials=(
+                DatasetEvaluationTrial(
+                    repetition=1,
+                    target_output=ObservedAgentOutput(raw_output={"status": "changed"}),
+                    observed_frame=SemanticFrame(
+                        interaction_id=f"{identifier}:surface.rephrase:round-1",
+                        extractor_version="test",
+                    ),
+                ),
+            ),
+            outcome_groups=(
+                DatasetEvaluationOutcomeGroup(repetitions=(1,), representative_effects=()),
+            ),
+        )
+        evaluation_case = DatasetEvaluationCase(
+            candidate=candidate,
+            verdict="divergence_needs_review",
+            trial_set=variation_trial_set,
+            findings=(
+                DatasetEvaluationFinding(
+                    category="unexpected_effect",
+                    message="The variation changed observable behavior.",
+                ),
+            ),
+        )
+    else:
+        evaluation_case = DatasetEvaluationCase(
+            candidate=candidate,
+            verdict="augmentation_rejected",
+        )
+    return DatasetEvaluationResult(
+        source=source,
+        augmentation=DatasetAugmentationResult(
+            source_frames=(source_frame,),
+            candidates=(candidate,),
+        ),
+        baseline=DatasetEvaluationBaseline(verdict="no_divergence", trial_set=trial_set),
+        cases=(evaluation_case,),
+    )
+
+
+def _run_context(
+    records: tuple[InteractionRecord, ...],
+    *,
+    invariant_suite: object | None = None,
+) -> object:
+    return main._dataset_evidence_run_context(
+        selected_records=records,
+        selected_operator_ids=("surface.rephrase",),
+        repetitions=1,
+        invariant_suite=cast(Any, invariant_suite),
+        target_config=JsonHttpDatasetTargetConfig(
+            version=1,
+            url="https://sandbox.example.test/execute",
+            headers_from_env={},
+            request_json_template={"input": "{{input}}"},
+            response_json_pointer="",
+        ),
+        settings=cast(Any, _settings()),
+    )
 
 
 def _write_target_config(
@@ -92,6 +231,9 @@ def _write_invariant_suite(path: Path) -> None:
 def _invariant_evaluation(
     baseline_status: str = "satisfied",
     variation_status: str | None = None,
+    *,
+    interaction_id: str = "case-1",
+    suite_sha256: str = "a" * 64,
 ) -> DatasetInvariantEvaluation:
     def arm_rule(status: str) -> DatasetInvariantRuleEvaluation:
         if status == "satisfied":
@@ -140,8 +282,8 @@ def _invariant_evaluation(
         )
     )
     return DatasetInvariantEvaluation(
-        interaction_id="case-1",
-        suite_sha256="a" * 64,
+        interaction_id=interaction_id,
+        suite_sha256=suite_sha256,
         observation_authority="committed_state_snapshot",
         baseline=DatasetInvariantArmEvaluation(
             arm="baseline",
@@ -688,7 +830,7 @@ def test_preflight_rejects_selected_model_input_over_limit(
     monkeypatch.setattr(
         main,
         "OpenRouterDatasetSettings",
-        lambda: SimpleNamespace(max_input_chars=50),
+        lambda: _settings(max_input_chars=50),
     )
 
     result = runner.invoke(root_app, ["dataset", "evaluate", str(dataset), "--dry-run"])
@@ -940,12 +1082,7 @@ def test_execution_rejects_missing_header_secret_before_model_or_output(
     monkeypatch.setattr(
         main,
         "OpenRouterDatasetSettings",
-        lambda: SimpleNamespace(
-            live_calls=True,
-            allow_external_data_processing=True,
-            api_key=SecretStr("test-key"),
-            max_input_chars=50_000,
-        ),
+        _settings,
     )
 
     def unexpected_deconstructor(*args: object, **kwargs: object) -> None:
@@ -999,8 +1136,9 @@ def test_execution_creates_private_explicit_output(
         repetitions: int,
         max_target_calls: int,
         planned_target_calls: int,
+        run_context: object,
     ) -> tuple[object, ...]:
-        del settings, target
+        del settings, target, run_context
         captured_records.extend(record.id for record in records)
         assert operator_ids == ("surface.disfluency_repeat",)
         assert repetitions == 3
@@ -1013,12 +1151,7 @@ def test_execution_creates_private_explicit_output(
     monkeypatch.setattr(
         main,
         "OpenRouterDatasetSettings",
-        lambda: SimpleNamespace(
-            live_calls=True,
-            allow_external_data_processing=True,
-            api_key=SecretStr("test-key"),
-            max_input_chars=50_000,
-        ),
+        _settings,
     )
     monkeypatch.setattr(main, "JsonHttpDatasetTarget", FakeTarget)
     monkeypatch.setattr(main, "_evaluate_interaction_records", fake_evaluate)
@@ -1112,8 +1245,16 @@ def test_target_config_runs_nested_request_and_response_against_loopback(
             repetitions: int,
             max_target_calls: int,
             planned_target_calls: int,
+            run_context: object,
         ) -> tuple[object, ...]:
-            del operator_ids, settings, repetitions, max_target_calls, planned_target_calls
+            del (
+                operator_ids,
+                settings,
+                repetitions,
+                max_target_calls,
+                planned_target_calls,
+                run_context,
+            )
             async with target:
                 observed_outputs.append((await target.execute(records[0].raw_input)).raw_output)
             output_stream.write('{"saved":true}\n')
@@ -1122,12 +1263,7 @@ def test_target_config_runs_nested_request_and_response_against_loopback(
         monkeypatch.setattr(
             main,
             "OpenRouterDatasetSettings",
-            lambda: SimpleNamespace(
-                live_calls=True,
-                allow_external_data_processing=True,
-                api_key=SecretStr("test-key"),
-                max_input_chars=50_000,
-            ),
+            _settings,
         )
         monkeypatch.setattr(main, "_evaluate_interaction_records", evaluate_once)
 
@@ -1177,7 +1313,7 @@ def test_help_explains_dataset_target_and_operator_contract() -> None:
     assert "Simple sandbox" in normalized_help
     assert "POST" in result.output
     assert "non-null JSON" in normalized_help
-    assert "UL_DATASET_LIVE_CALLS" in result.output
+    assert "UL_LIVE" in result.output
     assert "same clean state" in normalized_help
     assert "Fresh-state" in normalized_help
     assert "target executions" in normalized_help
@@ -1246,6 +1382,557 @@ def test_operator_list_is_fixed_and_self_correction_keeps_existing_call_accounti
     assert "Operators: intent.self_correction" in dry_run.output
     assert "Potential semantic model calls: up to 10" in dry_run.output
     assert "Potential target calls: up to 6" in dry_run.output
+
+
+def test_resume_skips_already_processed_interaction_ids(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    dataset = tmp_path / "interactions.jsonl"
+    evidence = tmp_path / "evidence.jsonl"
+    _write_dataset(dataset, [_record("interaction-1"), _record("interaction-2")])
+    evaluation_results = (
+        _evaluation_result("interaction-1"),
+        _evaluation_result("interaction-2"),
+    )
+    selected_records = tuple(result.source for result in evaluation_results)
+    run_context = _run_context(selected_records)
+    evidence.write_text(
+        json.dumps(
+            main._customer_evidence_record(
+                evaluation_results[0],
+                repetitions=1,
+                max_target_calls=4,
+                planned_target_calls=4,
+                run_context=cast(Any, run_context),
+            )
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    evaluated_ids: list[str] = []
+
+    class FakeTarget:
+        def __init__(self, endpoint: str, **options: object) -> None:
+            pass
+
+    async def fake_evaluate(
+        records: tuple[Any, ...],
+        operator_ids: tuple[str, ...],
+        settings: object,
+        target: object,
+        output_stream: Any,
+        *,
+        repetitions: int,
+        max_target_calls: int,
+        planned_target_calls: int,
+        run_context: object,
+    ) -> tuple[object, ...]:
+        del operator_ids, settings, target, max_target_calls, planned_target_calls
+        assert repetitions == 1
+        for record in records:
+            evaluated_ids.append(record.id)
+        output_stream.write(
+            json.dumps(
+                main._customer_evidence_record(
+                    evaluation_results[1],
+                    repetitions=1,
+                    max_target_calls=4,
+                    planned_target_calls=4,
+                    run_context=cast(Any, run_context),
+                )
+            )
+            + "\n"
+        )
+        output_stream.flush()
+        return ()
+
+    monkeypatch.setattr(
+        main,
+        "OpenRouterDatasetSettings",
+        _settings,
+    )
+    monkeypatch.setattr(main, "JsonHttpDatasetTarget", FakeTarget)
+    monkeypatch.setattr(main, "_evaluate_interaction_records", fake_evaluate)
+    command = [
+        "dataset",
+        "evaluate",
+        str(dataset),
+        "--target-url",
+        "https://sandbox.example.test/execute",
+        "--allow-target-network",
+        "--confirm-isolated-sandbox",
+        "--confirm-fresh-state",
+        "--repetitions",
+        "1",
+        "--resume",
+        str(evidence),
+    ]
+    dry_run = runner.invoke(root_app, [*command, "--dry-run"])
+
+    assert dry_run.exit_code == 0, dry_run.output
+    assert "Resume compatible: 1 complete interaction(s) skipped; 1 remaining" in dry_run.output
+    assert "Evidence destination:" in dry_run.output
+    assert evidence.name in dry_run.output
+
+    result = runner.invoke(root_app, command)
+
+    assert result.exit_code == 0, result.output
+    assert evaluated_ids == ["interaction-2"]
+    lines = [line for line in evidence.read_text(encoding="utf-8").splitlines() if line.strip()]
+    assert len(lines) == 2
+    assert json.loads(lines[0])["interaction_id"] == "interaction-1"
+    assert json.loads(lines[1])["interaction_id"] == "interaction-2"
+    assert "skipped" in result.output
+    if sys.platform != "win32":
+        assert stat.S_IMODE(evidence.stat().st_mode) == 0o600
+
+
+def test_resume_exits_early_when_all_records_already_processed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    dataset = tmp_path / "interactions.jsonl"
+    evidence = tmp_path / "evidence.jsonl"
+    _write_dataset(dataset, [_record("interaction-1")])
+    evaluation_result = _evaluation_result("interaction-1")
+    run_context = _run_context((evaluation_result.source,))
+    evidence.write_text(
+        json.dumps(
+            main._customer_evidence_record(
+                evaluation_result,
+                repetitions=1,
+                max_target_calls=2,
+                planned_target_calls=2,
+                run_context=cast(Any, run_context),
+            )
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(main, "OpenRouterDatasetSettings", _settings)
+
+    result = runner.invoke(
+        root_app,
+        [
+            "dataset",
+            "evaluate",
+            str(dataset),
+            "--target-url",
+            "https://sandbox.example.test/execute",
+            "--allow-target-network",
+            "--confirm-isolated-sandbox",
+            "--confirm-fresh-state",
+            "--repetitions",
+            "1",
+            "--resume",
+            str(evidence),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "Nothing to do" in result.output
+
+
+def test_all_complete_resume_preserves_prior_review_finding_exit_code(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    dataset = tmp_path / "interactions.jsonl"
+    evidence = tmp_path / "evidence.jsonl"
+    _write_dataset(dataset, [_record()])
+    evaluation_result = _evaluation_result("interaction-1", has_review_finding=True)
+    run_context = _run_context((evaluation_result.source,))
+    evidence.write_text(
+        json.dumps(
+            main._customer_evidence_record(
+                evaluation_result,
+                repetitions=1,
+                max_target_calls=2,
+                planned_target_calls=2,
+                run_context=cast(Any, run_context),
+            )
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(main, "OpenRouterDatasetSettings", _settings)
+
+    result = runner.invoke(
+        root_app,
+        [
+            "dataset",
+            "evaluate",
+            str(dataset),
+            "--target-url",
+            "https://sandbox.example.test/execute",
+            "--repetitions",
+            "1",
+            "--resume",
+            str(evidence),
+        ],
+    )
+
+    assert result.exit_code == 1, result.output
+    assert "Nothing to do" in result.output
+
+
+@pytest.mark.parametrize(
+    ("invariant_status", "expected_exit_code"),
+    [("violated", 1), ("not_evaluable", 2)],
+)
+def test_all_complete_resume_preserves_prior_invariant_exit_code(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    invariant_status: str,
+    expected_exit_code: int,
+) -> None:
+    dataset = tmp_path / "interactions.jsonl"
+    evidence = tmp_path / "evidence.jsonl"
+    invariant_path = tmp_path / "invariants.json"
+    _write_dataset(dataset, [_record()])
+    _write_invariant_suite(invariant_path)
+    invariant_suite = main.load_dataset_invariant_suite(invariant_path)
+    evaluation_result = _evaluation_result("interaction-1")
+    baseline_output = (
+        {"final_amount": 200, "corrected_amount": 100}
+        if invariant_status == "violated"
+        else {"status": "ok"}
+    )
+    baseline_trial = evaluation_result.baseline.trial_set.trials[0].model_copy(
+        update={"target_output": ObservedAgentOutput(raw_output=baseline_output)}
+    )
+    evaluation_result = evaluation_result.model_copy(
+        update={
+            "baseline": evaluation_result.baseline.model_copy(
+                update={
+                    "trial_set": evaluation_result.baseline.trial_set.model_copy(
+                        update={"trials": (baseline_trial,)}
+                    )
+                }
+            )
+        }
+    )
+    invariant_evaluation = main.evaluate_dataset_invariants(evaluation_result, invariant_suite)
+    assert invariant_evaluation.baseline.rules[0].status == invariant_status
+    run_context = _run_context(
+        (evaluation_result.source,),
+        invariant_suite=invariant_suite,
+    )
+    evidence.write_text(
+        json.dumps(
+            main._customer_evidence_record(
+                evaluation_result,
+                repetitions=1,
+                max_target_calls=2,
+                planned_target_calls=2,
+                run_context=cast(Any, run_context),
+                invariant_evaluation=invariant_evaluation,
+            )
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(main, "OpenRouterDatasetSettings", _settings)
+
+    result = runner.invoke(
+        root_app,
+        [
+            "dataset",
+            "evaluate",
+            str(dataset),
+            "--target-url",
+            "https://sandbox.example.test/execute",
+            "--invariants",
+            str(invariant_path),
+            "--repetitions",
+            "1",
+            "--resume",
+            str(evidence),
+        ],
+    )
+
+    assert result.exit_code == expected_exit_code, result.output
+    assert "Nothing to do" in result.output
+
+
+def test_resume_rejects_forged_invariant_outcome(tmp_path: Path) -> None:
+    dataset = tmp_path / "interactions.jsonl"
+    evidence = tmp_path / "evidence.jsonl"
+    invariant_path = tmp_path / "invariants.json"
+    _write_dataset(dataset, [_record()])
+    _write_invariant_suite(invariant_path)
+    invariant_suite = main.load_dataset_invariant_suite(invariant_path)
+    evaluation_result = _evaluation_result("interaction-1")
+    run_context = _run_context(
+        (evaluation_result.source,),
+        invariant_suite=invariant_suite,
+    )
+    evidence.write_text(
+        json.dumps(
+            main._customer_evidence_record(
+                evaluation_result,
+                repetitions=1,
+                max_target_calls=2,
+                planned_target_calls=2,
+                run_context=cast(Any, run_context),
+                invariant_evaluation=_invariant_evaluation(
+                    "violated",
+                    interaction_id="interaction-1",
+                    suite_sha256=invariant_suite.sha256,
+                ),
+            )
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    result = runner.invoke(
+        root_app,
+        [
+            "dataset",
+            "evaluate",
+            str(dataset),
+            "--target-url",
+            "https://sandbox.example.test/execute",
+            "--invariants",
+            str(invariant_path),
+            "--repetitions",
+            "1",
+            "--resume",
+            str(evidence),
+            "--dry-run",
+        ],
+    )
+
+    assert result.exit_code == 2
+    assert "cannot safely resume evidence" in result.output
+
+
+def test_resume_snapshot_detects_same_summary_content_change() -> None:
+    evaluation_result = _evaluation_result("interaction-1")
+    run_context = _run_context((evaluation_result.source,))
+
+    def validated_snapshot(max_target_calls: int) -> main.DatasetResumeEvidence:
+        raw_evidence = (
+            json.dumps(
+                main._customer_evidence_record(
+                    evaluation_result,
+                    repetitions=1,
+                    max_target_calls=max_target_calls,
+                    planned_target_calls=2,
+                    run_context=cast(Any, run_context),
+                )
+            )
+            + "\n"
+        ).encode()
+        return main.validate_dataset_resume_evidence(
+            raw_evidence,
+            expected_context=cast(Any, run_context),
+            selected_records=(evaluation_result.source,),
+            invariant_suite=None,
+            evidence_projector=main._customer_evidence_record,
+        )
+
+    first_snapshot = validated_snapshot(2)
+    changed_snapshot = validated_snapshot(3)
+
+    assert first_snapshot.processed_ids == changed_snapshot.processed_ids
+    assert first_snapshot.has_review_findings == changed_snapshot.has_review_findings
+    assert first_snapshot.raw_evidence_sha256 != changed_snapshot.raw_evidence_sha256
+    assert first_snapshot != changed_snapshot
+
+
+def test_resume_rejects_legacy_unbound_evidence(tmp_path: Path) -> None:
+    dataset = tmp_path / "interactions.jsonl"
+    evidence = tmp_path / "evidence.jsonl"
+    _write_dataset(dataset, [_record()])
+    evidence.write_text(
+        json.dumps({"schema_version": "1.4.0", "interaction_id": "interaction-1"}) + "\n",
+        encoding="utf-8",
+    )
+
+    result = runner.invoke(
+        root_app,
+        [
+            "dataset",
+            "evaluate",
+            str(dataset),
+            "--target-url",
+            "https://sandbox.example.test/execute",
+            "--repetitions",
+            "1",
+            "--resume",
+            str(evidence),
+            "--dry-run",
+        ],
+    )
+
+    assert result.exit_code != 0
+    assert "cannot safely resume evidence" in result.output
+
+
+def test_resume_rejects_changed_evaluation_plan(tmp_path: Path) -> None:
+    dataset = tmp_path / "interactions.jsonl"
+    evidence = tmp_path / "evidence.jsonl"
+    _write_dataset(dataset, [_record()])
+    evaluation_result = _evaluation_result("interaction-1")
+    run_context = _run_context((evaluation_result.source,))
+    evidence.write_text(
+        json.dumps(
+            main._customer_evidence_record(
+                evaluation_result,
+                repetitions=1,
+                max_target_calls=2,
+                planned_target_calls=2,
+                run_context=cast(Any, run_context),
+            )
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    result = runner.invoke(
+        root_app,
+        [
+            "dataset",
+            "evaluate",
+            str(dataset),
+            "--target-url",
+            "https://sandbox.example.test/execute",
+            "--operator",
+            "tone.frustrated",
+            "--repetitions",
+            "1",
+            "--resume",
+            str(evidence),
+            "--dry-run",
+        ],
+    )
+
+    assert result.exit_code != 0
+    assert "incompatible with the current evaluation plan" in result.output
+
+
+def test_resume_rejects_evidence_without_terminal_newline(tmp_path: Path) -> None:
+    dataset = tmp_path / "interactions.jsonl"
+    evidence = tmp_path / "evidence.jsonl"
+    _write_dataset(dataset, [_record()])
+    evaluation_result = _evaluation_result("interaction-1")
+    run_context = _run_context((evaluation_result.source,))
+    evidence.write_text(
+        json.dumps(
+            main._customer_evidence_record(
+                evaluation_result,
+                repetitions=1,
+                max_target_calls=2,
+                planned_target_calls=2,
+                run_context=cast(Any, run_context),
+            )
+        ),
+        encoding="utf-8",
+    )
+
+    result = runner.invoke(
+        root_app,
+        [
+            "dataset",
+            "evaluate",
+            str(dataset),
+            "--target-url",
+            "https://sandbox.example.test/execute",
+            "--repetitions",
+            "1",
+            "--resume",
+            str(evidence),
+            "--dry-run",
+        ],
+    )
+
+    assert result.exit_code != 0
+    assert "must end with a newline" in result.output
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="Unix permission semantics")
+def test_resume_dry_run_accepts_read_only_evidence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    dataset = tmp_path / "interactions.jsonl"
+    evidence = tmp_path / "evidence.jsonl"
+    _write_dataset(dataset, [_record()])
+    evaluation_result = _evaluation_result("interaction-1")
+    run_context = _run_context((evaluation_result.source,))
+    evidence.write_text(
+        json.dumps(
+            main._customer_evidence_record(
+                evaluation_result,
+                repetitions=1,
+                max_target_calls=2,
+                planned_target_calls=2,
+                run_context=cast(Any, run_context),
+            )
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    evidence.chmod(0o400)
+    monkeypatch.setattr(main, "OpenRouterDatasetSettings", _settings)
+
+    result = runner.invoke(
+        root_app,
+        [
+            "dataset",
+            "evaluate",
+            str(dataset),
+            "--target-url",
+            "https://sandbox.example.test/execute",
+            "--repetitions",
+            "1",
+            "--resume",
+            str(evidence),
+            "--dry-run",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert stat.S_IMODE(evidence.stat().st_mode) == 0o400
+
+
+def test_resume_rejects_mismatched_output_path(
+    tmp_path: Path,
+) -> None:
+    """--resume and --output must point to the same file when both are given."""
+    dataset = tmp_path / "interactions.jsonl"
+    evidence = tmp_path / "evidence.jsonl"
+    other_output = tmp_path / "other.jsonl"
+
+    _write_dataset(dataset, [_record()])
+    evidence.write_text(
+        json.dumps({"schema_version": "1.4.0", "interaction_id": "x", "cases": []}) + "\n",
+        encoding="utf-8",
+    )
+    other_output.write_text("", encoding="utf-8")
+
+    result = runner.invoke(
+        root_app,
+        [
+            "dataset",
+            "evaluate",
+            str(dataset),
+            "--target-url",
+            "https://sandbox.example.test/execute",
+            "--allow-target-network",
+            "--confirm-isolated-sandbox",
+            "--confirm-fresh-state",
+            "--resume",
+            str(evidence),
+            "--output",
+            str(other_output),
+        ],
+    )
+
+    assert result.exit_code != 0
+    assert "same file" in result.output
 
 
 @pytest.mark.parametrize(

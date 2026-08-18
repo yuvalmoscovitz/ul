@@ -345,6 +345,47 @@ def test_runner_uses_safe_argv_minimal_environment_private_artifacts_and_cleans_
         _post(observed_endpoint.rsplit("/", 1)[0], _VALID_REQUEST)
 
 
+def test_live_environment_accepts_ul_live_and_forwards_granular_permissions(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    for variable_name in (
+        "UL_LIVE",
+        "UL_DATASET_LIVE_CALLS",
+        "UL_DATASET_ALLOW_EXTERNAL_DATA_PROCESSING",
+    ):
+        monkeypatch.delenv(variable_name, raising=False)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("OPEN_ROUTER_API_KEY", "test-only-secret")
+    monkeypatch.setenv("UL_LIVE", "true")
+
+    subprocess_environment = cast(
+        Callable[..., dict[str, str]], quickstart.__dict__["_subprocess_environment"]
+    )
+    environment = subprocess_environment(dry_run=False)
+
+    assert environment["OPEN_ROUTER_API_KEY"] == "test-only-secret"
+    assert environment["UL_DATASET_LIVE_CALLS"] == "true"
+    assert environment["UL_DATASET_ALLOW_EXTERNAL_DATA_PROCESSING"] == "true"
+    assert "UL_LIVE" not in environment
+
+
+def test_live_environment_respects_granular_false_override(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("OPEN_ROUTER_API_KEY", "test-only-secret")
+    monkeypatch.setenv("UL_LIVE", "true")
+    monkeypatch.setenv("UL_DATASET_ALLOW_EXTERNAL_DATA_PROCESSING", "false")
+
+    subprocess_environment = cast(
+        Callable[..., dict[str, str]], quickstart.__dict__["_subprocess_environment"]
+    )
+    with pytest.raises(ValueError, match="ALLOW_EXTERNAL_DATA_PROCESSING"):
+        subprocess_environment(dry_run=False)
+
+
 def test_runner_accepts_only_the_exact_stable_wrong_invoice_finding(tmp_path: Path) -> None:
     confirms_repeatable_wrong_invoice = cast(
         Callable[[Path], bool],

@@ -21,13 +21,15 @@ git clone https://github.com/yuvalmoscovitz/ul.git
 cd ul
 uv sync
 # Provide OPEN_ROUTER_API_KEY through your environment or secret manager.
-export UL_DATASET_LIVE_CALLS=true
-export UL_DATASET_ALLOW_EXTERNAL_DATA_PROCESSING=true
+export UL_LIVE=true
 uv run python -m examples.quickstart.run
 ```
 
-Never put the key in a committed file or paste it into the command. The two `UL_DATASET_*`
-variables are separate opt-ins to billed model calls and external data processing.
+Never put the key in a committed file or paste it into the command. `UL_LIVE=true` is the
+convenience setting for a local run: it enables both billed semantic-model calls and external
+processing of the selected data. For separate policy control, use
+`UL_DATASET_LIVE_CALLS=true` and `UL_DATASET_ALLOW_EXTERNAL_DATA_PROCESSING=true` instead.
+Either granular variable takes precedence when explicitly set, including `false`.
 
 The command starts an intentionally defective agent on localhost, gives every request clean
 synthetic state, and evaluates one synthetic accounts-payable interaction. A typical run finds
@@ -61,6 +63,22 @@ For the underlying `ul dataset evaluate` command, exit `0` means no review findi
 violation, `1` means an observed difference needs review or a declared rule was violated, and `2`
 means the evaluation could not finish or a declared rule was not evaluable. Exit `1` is not a
 general correctness judgment.
+
+Resume an interrupted evaluation by passing its existing evidence file with the identical
+dataset selection, operators, repetitions, target mapping, invariant suite, and semantic-model
+configuration:
+
+```bash
+uv run ul dataset evaluate interactions.jsonl \
+  --target-config target.json \
+  --resume results.jsonl \
+  --dry-run
+```
+
+The preflight validates the saved run context and reports completed and remaining interactions.
+Execution appends only after the compatibility check succeeds. Older evidence without run-context
+metadata, changed inputs, or changed evaluation semantics are rejected; call-budget and credential
+changes remain allowed because they authorize execution rather than change its meaning.
 
 Review findings without making more model or target calls:
 

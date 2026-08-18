@@ -830,10 +830,10 @@ async def test_every_observed_outcome_requires_output_evidence() -> None:
 @pytest.mark.parametrize(
     ("configured_settings", "message"),
     [
-        (settings(live_calls=False), "UL_DATASET_LIVE_CALLS=true"),
+        (settings(live_calls=False), "UL_LIVE=true"),
         (
             settings(allow_external_data_processing=False),
-            "UL_DATASET_ALLOW_EXTERNAL_DATA_PROCESSING=true",
+            "UL_LIVE=true",
         ),
         (settings(api_key=None), "OPEN_ROUTER_API_KEY"),
         (settings(api_key=SecretStr("   ")), "OPEN_ROUTER_API_KEY"),
@@ -986,6 +986,7 @@ async def test_settings_load_dotenv_and_hide_secrets(
 ) -> None:
     for variable_name in (
         "OPEN_ROUTER_API_KEY",
+        "UL_LIVE",
         "UL_DATASET_LIVE_CALLS",
         "UL_DATASET_ALLOW_EXTERNAL_DATA_PROCESSING",
         "UL_DATASET_MODEL",
@@ -1016,6 +1017,79 @@ async def test_settings_load_dotenv_and_hide_secrets(
     assert configured_settings.api_key is not None
     assert configured_settings.api_key.get_secret_value() == "dotenv-secret"
     assert "dotenv-secret" not in repr(configured_settings)
+
+
+async def test_ul_live_enables_both_permissions(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    for variable_name in (
+        "UL_LIVE",
+        "UL_DATASET_LIVE_CALLS",
+        "UL_DATASET_ALLOW_EXTERNAL_DATA_PROCESSING",
+    ):
+        monkeypatch.delenv(variable_name, raising=False)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("UL_LIVE", "true")
+
+    configured_settings = OpenRouterDatasetSettings()
+
+    assert configured_settings.live_calls is True
+    assert configured_settings.allow_external_data_processing is True
+    assert "ul_live" not in configured_settings.model_dump()
+
+
+@pytest.mark.parametrize(
+    ("override_name", "field_name"),
+    [
+        ("UL_DATASET_LIVE_CALLS", "live_calls"),
+        (
+            "UL_DATASET_ALLOW_EXTERNAL_DATA_PROCESSING",
+            "allow_external_data_processing",
+        ),
+    ],
+)
+async def test_granular_false_overrides_ul_live(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    override_name: str,
+    field_name: str,
+) -> None:
+    for variable_name in (
+        "UL_LIVE",
+        "UL_DATASET_LIVE_CALLS",
+        "UL_DATASET_ALLOW_EXTERNAL_DATA_PROCESSING",
+    ):
+        monkeypatch.delenv(variable_name, raising=False)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("UL_LIVE", "true")
+    monkeypatch.setenv(override_name, "false")
+
+    configured_settings = OpenRouterDatasetSettings()
+
+    assert getattr(configured_settings, field_name) is False
+    other_field = "allow_external_data_processing" if field_name == "live_calls" else "live_calls"
+    assert getattr(configured_settings, other_field) is True
+
+
+async def test_dotenv_ul_live_respects_process_granular_override(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    for variable_name in (
+        "UL_LIVE",
+        "UL_DATASET_LIVE_CALLS",
+        "UL_DATASET_ALLOW_EXTERNAL_DATA_PROCESSING",
+    ):
+        monkeypatch.delenv(variable_name, raising=False)
+    (tmp_path / ".env").write_text("UL_LIVE=true\n", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("UL_DATASET_LIVE_CALLS", "false")
+
+    configured_settings = OpenRouterDatasetSettings()
+
+    assert configured_settings.live_calls is False
+    assert configured_settings.allow_external_data_processing is True
 
 
 async def test_settings_reject_unbounded_values() -> None:

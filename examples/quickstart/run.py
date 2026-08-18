@@ -11,6 +11,7 @@ from threading import Thread
 from typing import Annotated, TextIO, cast
 
 import typer
+from ul import OpenRouterDatasetSettings
 
 from examples.quickstart.defective_agent import create_server
 
@@ -19,11 +20,6 @@ _PROJECT_DIRECTORY = _QUICKSTART_DIRECTORY.parents[1]
 _DATASET_PATH = _QUICKSTART_DIRECTORY / "dataset.jsonl"
 _INVARIANTS_PATH = _QUICKSTART_DIRECTORY / "invariants.json"
 _TARGET_TEMPLATE_PATH = _QUICKSTART_DIRECTORY / "target.json"
-_REQUIRED_LIVE_ENVIRONMENT = (
-    "OPEN_ROUTER_API_KEY",
-    "UL_DATASET_LIVE_CALLS",
-    "UL_DATASET_ALLOW_EXTERNAL_DATA_PROCESSING",
-)
 _QUICKSTART_MODEL_ENVIRONMENT = {
     "UL_DATASET_MODEL": "x-ai/grok-4.6",
     "UL_DATASET_RENDER_MODEL": "x-ai/grok-4.6",
@@ -54,15 +50,21 @@ def _subprocess_environment(*, dry_run: bool) -> dict[str, str]:
         if "PYTHONPATH" in os.environ:
             environment["PYTHONPATH"] = os.environ["PYTHONPATH"]
         return environment
-    api_key = os.environ.get("OPEN_ROUTER_API_KEY", "")
-    if not api_key.strip():
+    settings = OpenRouterDatasetSettings()
+    if settings.api_key is None or not settings.api_key.get_secret_value().strip():
         raise ValueError("set OPEN_ROUTER_API_KEY before running the live quickstart")
-    environment["OPEN_ROUTER_API_KEY"] = api_key
-    for variable_name in _REQUIRED_LIVE_ENVIRONMENT[1:]:
-        value = os.environ.get(variable_name, "")
-        if value.casefold() != "true":
-            raise ValueError(f"set {variable_name}=true before running the live quickstart")
-        environment[variable_name] = value
+    if not settings.live_calls:
+        raise ValueError(
+            "set UL_LIVE=true (or UL_DATASET_LIVE_CALLS=true) before running the live quickstart"
+        )
+    if not settings.allow_external_data_processing:
+        raise ValueError(
+            "set UL_LIVE=true (or UL_DATASET_ALLOW_EXTERNAL_DATA_PROCESSING=true) before "
+            "running the live quickstart"
+        )
+    environment["OPEN_ROUTER_API_KEY"] = settings.api_key.get_secret_value()
+    environment["UL_DATASET_LIVE_CALLS"] = "true"
+    environment["UL_DATASET_ALLOW_EXTERNAL_DATA_PROCESSING"] = "true"
     return environment
 
 
