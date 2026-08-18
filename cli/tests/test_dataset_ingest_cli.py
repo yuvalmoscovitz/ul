@@ -8,6 +8,7 @@ from typing import Any
 
 import pytest
 from typer.testing import CliRunner
+from ul_cli import event_stress
 from ul_cli.main import app
 
 runner = CliRunner()
@@ -117,6 +118,29 @@ def _write_mapping(path: Path, *, include_raw_content: bool = True) -> None:
     )
 
 
+def _write_target_config(path: Path) -> None:
+    path.write_text(
+        json.dumps(
+            {
+                "version": 2,
+                "reset": {
+                    "url": "https://sandbox.example.test/reset",
+                    "generation_json_pointer": "/generation",
+                    "clean_state_json_pointer": "/clean",
+                    "clean_state_value": True,
+                },
+                "setup": {"url": "https://sandbox.example.test/setup"},
+                "execute_turn": {
+                    "url": "https://sandbox.example.test/execute",
+                    "request_json_template": {"input": "{{input}}"},
+                },
+                "snapshot": {"url": "https://sandbox.example.test/snapshot"},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
 def test_trace_native_mapping_preserves_ordered_agent_evidence(tmp_path: Path) -> None:
     output = tmp_path / "dataset.jsonl"
     mapping = tmp_path / "mapping.json"
@@ -188,6 +212,140 @@ def test_trace_native_dry_run_does_not_write_or_print_content(tmp_path: Path) ->
     assert "1 scenario(s) ready" in result.output
     assert "AC-100" not in result.output
     assert "must-not-be-copied" not in result.output
+
+
+def test_trace_native_materializes_private_replay_bundle_and_dry_run_plan(
+    tmp_path: Path,
+) -> None:
+    mapping = tmp_path / "mapping.json"
+    replay_output = tmp_path / "replay.json"
+    target_config = tmp_path / "target.json"
+    _write_mapping(mapping)
+    _write_target_config(target_config)
+
+    ingest_result = runner.invoke(
+        app,
+        [
+            "dataset",
+            "ingest",
+            "otlp",
+            str(FIXTURES / "otlp_agent_trace.json"),
+            "--mapping",
+            str(mapping),
+            "--replay-output",
+            str(replay_output),
+        ],
+    )
+
+    assert ingest_result.exit_code == 0, ingest_result.output
+    bundle = json.loads(replay_output.read_text(encoding="utf-8"))
+    assert bundle["schema_version"] == "1.0.0"
+    assert len(bundle["envelopes"]) == 1
+    assert len(bundle["cases"]) == 1
+    assert bundle["cases"][0]["replay_user_turns"][0]["content"] == ("Pay approved invoice AC-100.")
+    if os.name != "nt":
+        assert stat.S_IMODE(replay_output.stat().st_mode) == 0o600
+
+    dry_run = runner.invoke(
+        app,
+        [
+            "stress",
+            "trace",
+            str(replay_output),
+            "--target-config",
+            str(target_config),
+            "--dry-run",
+        ],
+    )
+
+    assert dry_run.exit_code == 0, dry_run.output
+    assert "Ordered user turns: 1" in dry_run.output
+    assert "Recorded content: not printed" in dry_run.output
+    assert "AC-100" not in dry_run.output
+
+
+def test_replay_output_requires_explicit_raw_content_mapping(tmp_path: Path) -> None:
+    mapping = tmp_path / "mapping.json"
+    replay_output = tmp_path / "replay.json"
+    _write_mapping(mapping, include_raw_content=False)
+
+    result = runner.invoke(
+        app,
+        [
+            "dataset",
+            "ingest",
+            "otlp",
+            str(FIXTURES / "otlp_agent_trace.json"),
+            "--mapping",
+            str(mapping),
+            "--replay-output",
+            str(replay_output),
+        ],
+    )
+
+    assert result.exit_code == 2
+    assert "include_raw_content" in result.output
+    assert not replay_output.exists()
+
+
+def test_trace_replay_output_reservation_failure_makes_no_target_calls(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    mapping = tmp_path / "mapping.json"
+    replay_bundle = tmp_path / "replay.json"
+    target_config = tmp_path / "target.json"
+    output = tmp_path / "evidence.json"
+    _write_mapping(mapping)
+    _write_target_config(target_config)
+    ingest_result = runner.invoke(
+        app,
+        [
+            "dataset",
+            "ingest",
+            "otlp",
+            str(FIXTURES / "otlp_agent_trace.json"),
+            "--mapping",
+            str(mapping),
+            "--replay-output",
+            str(replay_bundle),
+        ],
+    )
+    assert ingest_result.exit_code == 0, ingest_result.output
+
+    target_constructions = 0
+
+    class _TargetMustNotBeConstructed:
+        @classmethod
+        def from_config(cls, *args: object, **kwargs: object) -> object:
+            nonlocal target_constructions
+            target_constructions += 1
+            raise AssertionError("target must not be constructed")
+
+    def reject_output(_path: Path) -> object:
+        raise OSError("simulated output failure")
+
+    monkeypatch.setattr(event_stress, "JsonHttpDatasetTarget", _TargetMustNotBeConstructed)
+    monkeypatch.setattr(event_stress, "_create_private_output", reject_output)
+
+    result = runner.invoke(
+        app,
+        [
+            "stress",
+            "trace",
+            str(replay_bundle),
+            "--target-config",
+            str(target_config),
+            "--allow-target-network",
+            "--confirm-isolated-sandbox",
+            "--output",
+            str(output),
+        ],
+    )
+
+    assert result.exit_code == 2
+    assert "output could not be created" in result.output
+    assert target_constructions == 0
+    assert not output.exists()
 
 
 def test_trace_native_requires_explicit_raw_content_opt_in(tmp_path: Path) -> None:

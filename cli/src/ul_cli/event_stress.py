@@ -31,8 +31,109 @@ from ul.http_target import (
     load_json_http_dataset_target_config,
     validate_json_http_dataset_target_configuration,
 )
+from ul.trace_replay import (
+    TraceReplayCase,
+    TraceReplayResult,
+    load_trace_replay_bundle,
+    plan_trace_replay,
+    run_trace_replay,
+    select_trace_replay_case,
+)
 
 app = typer.Typer(help="Stress stateful agents with ordered conversation events.")
+
+
+@app.command("trace")
+def replay_production_trace(
+    bundle_path: Annotated[Path, typer.Argument(exists=True, dir_okay=False, readable=True)],
+    target_config_path: Annotated[
+        Path, typer.Option("--target-config", exists=True, dir_okay=False, readable=True)
+    ],
+    case_id: Annotated[
+        str | None,
+        typer.Option(help="Replay case ID; optional only when the bundle contains one case."),
+    ] = None,
+    output: Annotated[
+        Path | None, typer.Option(help="New private JSON replay evidence file.")
+    ] = None,
+    repetitions: Annotated[int, typer.Option(min=1)] = 3,
+    max_target_calls: Annotated[int, typer.Option(min=1)] = 100,
+    allow_target_network: Annotated[bool, typer.Option()] = False,
+    confirm_isolated_sandbox: Annotated[bool, typer.Option()] = False,
+    allow_insecure_http: Annotated[bool, typer.Option()] = False,
+    dry_run: Annotated[
+        bool, typer.Option(help="Validate and show the replay plan without target calls.")
+    ] = False,
+) -> None:
+    """Replay a production trace conversation prefix in a clean target."""
+    try:
+        bundle = load_trace_replay_bundle(bundle_path)
+        case = select_trace_replay_case(bundle, case_id)
+        target_config = load_json_http_dataset_target_config(target_config_path)
+        validate_json_http_dataset_target_configuration(
+            target_config,
+            sandbox_confirmed=confirm_isolated_sandbox or dry_run,
+            allow_insecure_http=allow_insecure_http,
+        )
+        plan = plan_trace_replay(
+            case,
+            target_config,
+            repetitions=repetitions,
+            max_target_calls=max_target_calls,
+        )
+    except (ValidationError, ValueError, RuntimeError) as error:
+        raise typer.BadParameter(str(error)) from None
+
+    if dry_run:
+        typer.echo(f"Replay case: {plan.case_id}")
+        typer.echo(f"Ordered user turns: {plan.replay_turn_count}")
+        typer.echo(f"Repetitions: {plan.repetitions}")
+        typer.echo(f"Target calls per repetition: {plan.target_calls_per_repetition}")
+        typer.echo(f"Potential target calls: {plan.required_target_calls}")
+        typer.echo("Recorded content: not printed")
+        typer.echo("External calls: none")
+        return
+    if not allow_target_network:
+        raise typer.BadParameter(
+            "execution requires --allow-target-network", param_hint="--allow-target-network"
+        )
+    if not confirm_isolated_sandbox:
+        raise typer.BadParameter(
+            "execution requires --confirm-isolated-sandbox",
+            param_hint="--confirm-isolated-sandbox",
+        )
+    if output is None:
+        raise typer.BadParameter("execution requires --output", param_hint="--output")
+    if output.exists():
+        raise typer.BadParameter("output already exists; UL will not overwrite it")
+    try:
+        output_stream = _create_private_output(output)
+    except OSError:
+        raise typer.BadParameter("output could not be created", param_hint="--output") from None
+    try:
+        with output_stream:
+            target = JsonHttpDatasetTarget.from_config(
+                target_config,
+                sandbox_confirmed=True,
+                allow_insecure_http=allow_insecure_http,
+                max_target_calls=max_target_calls,
+            )
+            result = asyncio.run(
+                _run_trace_replay_and_close(
+                    case,
+                    target,
+                    repetitions=repetitions,
+                    max_target_calls=max_target_calls,
+                )
+            )
+            json.dump(result.model_dump(mode="json"), output_stream, ensure_ascii=False, indent=2)
+            output_stream.write("\n")
+            output_stream.flush()
+            os.fsync(output_stream.fileno())
+    except BaseException:
+        output.unlink(missing_ok=True)
+        raise
+    _print_trace_replay_result(result, output)
 
 
 @app.command("save")
@@ -239,6 +340,25 @@ async def _run_and_close(
         await target.aclose()
 
 
+async def _run_trace_replay_and_close(
+    case: TraceReplayCase,
+    target: JsonHttpDatasetTarget,
+    *,
+    repetitions: int,
+    max_target_calls: int,
+) -> TraceReplayResult:
+    try:
+        return await run_trace_replay(
+            case,
+            target,
+            repetitions=repetitions,
+            max_target_calls=max_target_calls,
+            allow_network_egress=True,
+        )
+    finally:
+        await target.aclose()
+
+
 async def _replay_and_close(
     case: MultiTurnRegressionCase,
     target: JsonHttpDatasetTarget,
@@ -292,6 +412,29 @@ def _print_result(result: CorrectionStressResult, output: Path) -> None:
             )
     typer.echo(f"Complete evidence: {output}")
     if result.status == "failed":
+        raise typer.Exit(code=1)
+    if result.status == "inconclusive":
+        raise typer.Exit(code=2)
+
+
+def _print_trace_replay_result(result: TraceReplayResult, output: Path) -> None:
+    typer.echo(f"Trace replay result: {result.status}")
+    typer.echo(f"Replay case: {result.case.case_id}")
+    typer.echo(
+        f"Recorded response matches: {result.response_match_count}/{result.requested_repetitions}"
+    )
+    if result.state_match_count is None:
+        typer.echo("Recorded committed state: unavailable in the imported trace")
+    else:
+        typer.echo(
+            f"Recorded state matches: {result.state_match_count}/{result.requested_repetitions}"
+        )
+    typer.echo(
+        "Interpretation: replay establishes reproducibility only; response or state drift is not "
+        "automatically a correctness failure."
+    )
+    typer.echo(f"Complete evidence: {output}")
+    if result.status == "drifted":
         raise typer.Exit(code=1)
     if result.status == "inconclusive":
         raise typer.Exit(code=2)
