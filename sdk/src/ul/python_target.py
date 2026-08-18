@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import asyncio
 import importlib
 import inspect
 import re
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
+from contextlib import suppress
 from types import TracebackType
 from typing import cast
 
@@ -27,7 +29,7 @@ def load_python_dataset_target(
 ) -> PythonDatasetTarget:
     validate_python_target_factory_reference(reference)
     if max_target_calls is not None and (
-        isinstance(max_target_calls, bool) or max_target_calls <= 0
+        type(max_target_calls) is not int or max_target_calls <= 0
     ):
         raise ValueError("max_target_calls must be positive")
     module_name, factory_name = reference.split(":", maxsplit=1)
@@ -48,13 +50,19 @@ def load_python_dataset_target(
             close()
         raise ValueError("Python target factory must be synchronous")
     if not isinstance(target, DatasetTargetExecutor):
+        _close_rejected_target(target)
         raise ValueError("Python target factory returned an invalid dataset target")
     try:
         safety_envelope: object = target.safety_envelope
         fresh_state_per_execution: object = target.fresh_state_per_execution
     except Exception:
+        _close_rejected_target(target)
         raise ValueError("Python target factory returned an invalid dataset target") from None
-    _validate_target_properties(safety_envelope, fresh_state_per_execution)
+    try:
+        _validate_target_properties(safety_envelope, fresh_state_per_execution)
+    except ValueError:
+        _close_rejected_target(target)
+        raise
     return PythonDatasetTarget(target, max_target_calls=max_target_calls)
 
 
@@ -65,6 +73,10 @@ class PythonDatasetTarget:
         *,
         max_target_calls: int | None,
     ) -> None:
+        if max_target_calls is not None and (
+            type(max_target_calls) is not int or max_target_calls <= 0
+        ):
+            raise ValueError("max_target_calls must be positive")
         self._target = target
         self._remaining_target_calls = max_target_calls
 
@@ -125,3 +137,34 @@ def _validate_observed_output(output: object) -> ObservedAgentOutput:
     if not isinstance(output, ObservedAgentOutput):
         raise RuntimeError("Python dataset target returned an invalid observation")
     return output
+
+
+def _close_rejected_target(target: object) -> None:
+    try:
+        close = getattr(target, "aclose", None)
+        if close is None:
+            close = getattr(target, "close", None)
+        if not callable(close):
+            return
+        result = close()
+        if not inspect.isawaitable(result):
+            return
+        try:
+            running_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            with suppress(Exception):
+                asyncio.run(_await_cleanup(result))
+        else:
+            cleanup_task = running_loop.create_task(_await_cleanup(result))
+            cleanup_task.add_done_callback(_discard_cleanup_error)
+    except Exception:
+        pass
+
+
+def _discard_cleanup_error(cleanup_task: asyncio.Task[object]) -> None:
+    with suppress(asyncio.CancelledError, Exception):
+        cleanup_task.exception()
+
+
+async def _await_cleanup(cleanup: Awaitable[object]) -> object:
+    return await cleanup

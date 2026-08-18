@@ -3,9 +3,12 @@ from __future__ import annotations
 import asyncio
 import sys
 from pathlib import Path
+from typing import Any, cast
 
 import pytest
+from ul import ObservedAgentOutput, SafetyEnvelope
 from ul.python_target import (
+    PythonDatasetTarget,
     load_python_dataset_target,
     validate_python_target_factory_reference,
 )
@@ -193,3 +196,86 @@ def create_target():
     with pytest.raises(RuntimeError, match="execution failed") as error:
         asyncio.run(target.execute("hello"))
     assert "private runtime detail" not in str(error.value)
+
+
+@pytest.mark.parametrize(
+    "invalid_budget",
+    (True, 0, -1, 1.0, float("nan"), float("inf"), float("-inf")),
+)
+def test_python_target_rejects_non_integer_or_non_positive_call_budgets(
+    invalid_budget: object,
+) -> None:
+    class Target:
+        safety_envelope = SafetyEnvelope(
+            description="Disposable test workspace",
+            isolated=True,
+            allows_network_egress=False,
+            allows_business_side_effects=False,
+        )
+        fresh_state_per_execution = True
+
+        async def execute(self, raw_input: str) -> ObservedAgentOutput:
+            return ObservedAgentOutput(raw_output=raw_input)
+
+    with pytest.raises(ValueError, match="max_target_calls must be positive"):
+        PythonDatasetTarget(Target(), max_target_calls=cast(Any, invalid_budget))
+
+
+def test_python_target_factory_closes_target_rejected_after_construction(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _write_factory_module(
+        tmp_path / "rejected_target.py",
+        """
+closed = False
+
+class Target:
+    async def aclose(self):
+        global closed
+        closed = True
+
+def create_target():
+    return Target()
+""",
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+
+    with pytest.raises(ValueError, match="invalid dataset target"):
+        load_python_dataset_target("rejected_target:create_target")
+
+    assert sys.modules["rejected_target"].closed is True
+
+
+def test_python_target_factory_cleanup_failure_does_not_leak_or_replace_validation_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _write_factory_module(
+        tmp_path / "invalid_properties_target.py",
+        """
+from ul import ObservedAgentOutput
+
+cleanup_attempted = False
+
+class Target:
+    safety_envelope = "not a safety envelope"
+    fresh_state_per_execution = True
+
+    async def execute(self, raw_input):
+        return ObservedAgentOutput(raw_output=raw_input)
+
+    async def aclose(self):
+        global cleanup_attempted
+        cleanup_attempted = True
+        raise RuntimeError("private cleanup detail")
+
+def create_target():
+    return Target()
+""",
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+
+    with pytest.raises(ValueError, match="invalid dataset target") as error:
+        load_python_dataset_target("invalid_properties_target:create_target")
+
+    assert "private cleanup detail" not in str(error.value)
+    assert sys.modules["invalid_properties_target"].cleanup_attempted is True
