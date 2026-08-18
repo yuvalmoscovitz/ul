@@ -56,7 +56,10 @@ def save_dataset_regression(
             help="Evaluation evidence JSONL.",
         ),
     ],
-    finding_id: Annotated[str, typer.Argument(help="Confirmed finding ID to save.")],
+    finding_id: Annotated[
+        str,
+        typer.Argument(help="Confirmed semantic or customer-invariant finding ID to save."),
+    ],
     target_config: Annotated[
         Path,
         typer.Option(
@@ -72,7 +75,13 @@ def save_dataset_regression(
     ],
     rules: Annotated[
         list[str] | None,
-        typer.Option("--rule", help="Violated customer rule ID. Repeat to select more than one."),
+        typer.Option(
+            "--rule",
+            help=(
+                "Violated customer rule ID. Required for semantic findings; an invariant "
+                "finding selects its rule automatically."
+            ),
+        ),
     ] = None,
     reviews: Annotated[
         Path | None,
@@ -90,7 +99,7 @@ def save_dataset_regression(
         ),
     ] = False,
 ) -> None:
-    """Create a portable case from a confirmed, invariant-backed finding."""
+    """Create a portable case from a confirmed semantic or invariant finding."""
     if not confirm_versioned_input:
         raise typer.BadParameter(
             "saving requires confirmation that the exact raw input and literal target-template "
@@ -98,9 +107,7 @@ def save_dataset_regression(
             "auto-redacted, and are appropriate to store and version",
             param_hint="--confirm-versioned-input",
         )
-    if not rules:
-        raise typer.BadParameter("pass at least one --rule", param_hint="--rule")
-    if len(rules) != len(set(rules)):
+    if rules is not None and len(rules) != len(set(rules)):
         raise typer.BadParameter("duplicate --rule values are not allowed", param_hint="--rule")
     if output.exists():
         raise typer.BadParameter(
@@ -112,7 +119,7 @@ def save_dataset_regression(
             evidence=evidence,
             reviews=reviews or evidence.with_suffix(".reviews.jsonl"),
             finding_id=finding_id,
-            rule_ids=tuple(rules),
+            rule_ids=tuple(rules or ()),
             target_config_path=target_config,
         )
         output_stream = _create_private_output(output)
@@ -501,7 +508,18 @@ def _build_regression_case(
         raise ValueError("finding does not map to exactly one invariant variation arm")
     baseline_rules = {rule.rule_id: rule for rule in evaluation.baseline.rules}
     variation_rules = {rule.rule_id: rule for rule in variation_evaluations[0].rules}
-    selected_rule_ids = set(rule_ids)
+    if selected.kind == "customer_invariant_violation":
+        if selected.invariant_rule_id is None:
+            raise ValueError("invariant finding does not identify its violated rule")
+        if rule_ids and rule_ids != (selected.invariant_rule_id,):
+            raise ValueError(
+                "an invariant finding automatically selects its one violated customer rule"
+            )
+        selected_rule_ids = {selected.invariant_rule_id}
+    else:
+        if not rule_ids:
+            raise ValueError("semantic findings require at least one --rule")
+        selected_rule_ids = set(rule_ids)
     missing_rule_ids = selected_rule_ids - baseline_rules.keys()
     if missing_rule_ids:
         raise ValueError(f"rule {sorted(missing_rule_ids)[0]!r} was not evaluated for both arms")

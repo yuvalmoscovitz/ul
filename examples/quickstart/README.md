@@ -90,6 +90,14 @@ unchanged. UL creates it with mode `0600` on Unix; on Windows it inherits the pa
 access controls, so use a directory restricted to the review team. The report keeps UL's machine
 observation separate from the reviewer's contextual judgment.
 
+If the original satisfies a declared invariant and the variation violates it, UL gives that rule
+transition its own reviewable finding ID even when no semantic difference was found.
+
+Invariant values remain hidden from terminal output by default. If they are needed to make the
+review decision, use `ul dataset report PATH_TO_EVIDENCE.jsonl --show-sensitive-values --finding
+FINDING_ID`. The all-or-none bounded output is limited to that finding, may contain secrets or PII,
+and may be retained in terminal scrollback, CI output, or logs.
+
 The bundled runner stops its ephemeral server and deletes its temporary target configuration
 when it exits, so its evidence is intentionally not replayable afterward. In a customer workflow,
 keep a persistent sandbox configuration and use it to preserve a confirmed finding as an exact
@@ -111,6 +119,9 @@ uv run ul regression replay regressions/quickstart-wrong-invoice.json \
   --max-target-calls 3 \
   --output tmp/quickstart-replay.json
 ```
+
+When saving the invariant-violation finding itself, omit `--rule`; UL selects the rule identified
+by that finding automatically. Semantic findings continue to require an explicit `--rule`.
 
 Saving requires the explicit confirmation because the case contains the exact raw variation and
 literal target-template values, which may be sensitive. UL does not redact them automatically

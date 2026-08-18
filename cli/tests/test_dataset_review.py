@@ -3,19 +3,37 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import stat
 import sys
 from datetime import UTC, datetime
+from io import StringIO
 from pathlib import Path
 from typing import Any
 
 import pytest
+from rich.console import Console
 from typer.testing import CliRunner
+from ul import (
+    DatasetAugmentationResult,
+    DatasetEvaluationBaseline,
+    DatasetEvaluationCase,
+    DatasetEvaluationOutcomeGroup,
+    DatasetEvaluationResult,
+    DatasetEvaluationTrial,
+    DatasetEvaluationTrialSet,
+    InteractionRecord,
+    ObservedAgentOutput,
+    SemanticFrame,
+)
+from ul.dataset_augmentation import DatasetAugmentationCandidate
+from ul.dataset_invariants import DatasetInvariantSuite, JsonValuesEqualInvariant
 from ul_cli import dataset_review
 from ul_cli.main import app
 
 runner = CliRunner()
 FINDING_ID = f"ulf_v1_{'a' * 64}"
+_ANSI_ESCAPE_PATTERN = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 
 
 def _effect(invoice_reference: str) -> dict[str, Any]:
@@ -103,7 +121,7 @@ def _evidence_record(*, finding_id: str = FINDING_ID) -> dict[str, Any]:
                 "inconclusive_reasons": [],
             }
         ],
-        "technical_details": {"fixture": "quickstart-like stable 3/3"},
+        "technical_details": _technical_details(),
     }
 
 
@@ -121,19 +139,36 @@ def _invariant_evaluation() -> dict[str, Any]:
             ),
             "trials": [
                 {
-                    "repetition": 1,
+                    "repetition": repetition,
                     "status": status,
                     "reason_code": "values_equal" if status == "satisfied" else "values_differ",
                     "left_pointer": "/final_amount",
                     "right_pointer": "/corrected_amount",
                     "resolved_values": {"left": left, "right": right},
                 }
+                for repetition in (1, 2, 3)
             ],
         }
 
+    suite = DatasetInvariantSuite(
+        schema_version="1.0.0",
+        observation_source="target_output",
+        observation_authority="committed_state_snapshot",
+        rules=(
+            JsonValuesEqualInvariant(
+                type="json_values_equal",
+                id="final-amount-matches-corrected",
+                version="1.0.0",
+                description="Final amount equals the corrected amount.",
+                severity="critical",
+                left_pointer="/final_amount",
+                right_pointer="/corrected_amount",
+            ),
+        ),
+    )
     return {
         "interaction_id": "quickstart-payment",
-        "suite_sha256": "b" * 64,
+        "suite_sha256": suite.sha256,
         "observation_source": "target_output",
         "observation_authority": "committed_state_snapshot",
         "baseline": {
@@ -149,6 +184,68 @@ def _invariant_evaluation() -> dict[str, Any]:
             }
         ],
     }
+
+
+def _technical_details() -> dict[str, Any]:
+    source_frame = SemanticFrame(interaction_id="quickstart-payment", extractor_version="test")
+    candidate = DatasetAugmentationCandidate(
+        source_interaction_id="quickstart-payment",
+        operator_id="surface.disfluency_repeat",
+        operator_version="1.0.0",
+        augmented_input="Pay pay AC-100.",
+        expected_input_frame=source_frame,
+        reparsed_input_frame=source_frame,
+        passed=True,
+    )
+
+    def trial_set(arm: str, final_amount: int, corrected_amount: int) -> DatasetEvaluationTrialSet:
+        trials = tuple(
+            DatasetEvaluationTrial(
+                repetition=repetition,
+                target_output=ObservedAgentOutput(
+                    raw_output={
+                        "final_amount": final_amount,
+                        "corrected_amount": corrected_amount,
+                    }
+                ),
+                observed_frame=SemanticFrame(
+                    interaction_id=f"quickstart-payment:{arm}:round-{repetition}",
+                    extractor_version="test",
+                ),
+            )
+            for repetition in (1, 2, 3)
+        )
+        return DatasetEvaluationTrialSet(
+            requested_repetitions=3,
+            stability="stable",
+            trials=trials,
+            outcome_groups=(
+                DatasetEvaluationOutcomeGroup(repetitions=(1, 2, 3), representative_effects=()),
+            ),
+        )
+
+    result = DatasetEvaluationResult(
+        source=InteractionRecord(
+            id="quickstart-payment",
+            raw_input="Pay AC-100.",
+            raw_observed_output={"final_amount": 100, "corrected_amount": 100},
+        ),
+        augmentation=DatasetAugmentationResult(
+            source_frames=(source_frame,), candidates=(candidate,)
+        ),
+        baseline=DatasetEvaluationBaseline(
+            verdict="no_divergence",
+            trial_set=trial_set("current_baseline", 100, 100),
+        ),
+        cases=(
+            DatasetEvaluationCase(
+                candidate=candidate,
+                verdict="no_divergence",
+                trial_set=trial_set("surface.disfluency_repeat", 200, 100),
+            ),
+        ),
+    )
+    return result.model_dump(mode="json")
 
 
 def _write_evidence(path: Path, records: list[dict[str, Any]] | None = None) -> bytes:
@@ -267,7 +364,9 @@ def test_report_schema_1_4_shows_customer_invariants_separately(tmp_path: Path) 
 
     assert report.exit_code == 0, report.output
     normalized_output = " ".join(report.output.split())
-    assert "Dataset finding report: 1 finding(s)" in normalized_output
+    assert "Dataset finding report: 2 finding(s)" in normalized_output
+    assert "Category: customer_invariant_violation" in normalized_output
+    assert "Rule transition: original=satisfied; variation=violated" in normalized_output
     assert "Customer invariant evaluation" in normalized_output
     assert "Declared observation authority: committed_state_snapshot" in normalized_output
     assert "severity=critical; arm=original; status=satisfied" in normalized_output
@@ -277,10 +376,404 @@ def test_report_schema_1_4_shows_customer_invariants_separately(tmp_path: Path) 
     )
     assert "Description: Final amount equals the corrected amount." in normalized_output
     assert "reason=one_or_more_trials_violated" in normalized_output
-    assert "satisfied=0, violated=1, not_evaluable=0" in normalized_output
+    assert "satisfied=0, violated=3, not_evaluable=0" in normalized_output
     assert "selected_values=" not in normalized_output
     assert "Customer rule violated against declared committed_state_snapshot." in normalized_output
     assert "agent wrong" not in normalized_output.casefold()
+
+
+def test_invariant_violation_without_semantic_difference_can_be_reviewed(
+    tmp_path: Path,
+) -> None:
+    evidence = tmp_path / "evidence.jsonl"
+    record = _evidence_record()
+    record["schema_version"] = "1.4.0"
+    record["invariant_evaluation"] = _invariant_evaluation()
+    record["cases"][0]["findings"] = []
+    record["cases"][0]["status"] = "NO OBSERVED DIFFERENCE"
+    _write_evidence(evidence, [record])
+
+    report = runner.invoke(app, ["dataset", "report", str(evidence)])
+
+    assert report.exit_code == 0, report.output
+    indexed_findings = dataset_review._index_findings(dataset_review._load_evidence(evidence))
+    assert len(indexed_findings) == 1
+    invariant_finding_id = next(iter(indexed_findings))
+    assert indexed_findings[invariant_finding_id].kind == "customer_invariant_violation"
+    assert f"Finding {invariant_finding_id}" in report.output
+    assert "Category: customer_invariant_violation" in report.output
+    assert "Semantic comparison status: NO OBSERVED DIFFERENCE" in report.output
+    assert "Invariant finding status: original=satisfied; variation=violated" in report.output
+    assert "Machine status: NO OBSERVED DIFFERENCE" not in report.output
+    assert "declared_severity=critical" in report.output.replace("\n", " ")
+    assert "resolved_values" not in report.output
+    assert "200" not in report.output
+
+    sensitive_report = runner.invoke(
+        app,
+        [
+            "dataset",
+            "report",
+            str(evidence),
+            "--show-sensitive-values",
+            "--finding",
+            invariant_finding_id,
+        ],
+    )
+    assert sensitive_report.exit_code == 0, sensitive_report.output
+    assert "may contain secrets or PII" in sensitive_report.output
+    assert 'Original trial 1 selected values: {"left":100,"right":100}' in sensitive_report.output
+    assert 'Variation trial 1 selected values: {"left":200,"right":100}' in sensitive_report.output
+    assert "shown=6; omitted=0" in sensitive_report.output
+
+    review = runner.invoke(
+        app,
+        [
+            "dataset",
+            "review",
+            str(evidence),
+            invariant_finding_id,
+            "--status",
+            "confirmed",
+            "--severity",
+            "critical",
+            "--reviewer",
+            "payments-risk",
+            "--reason",
+            "The variation violated the declared final-amount rule.",
+        ],
+    )
+
+    assert review.exit_code == 0, review.output
+    reviewed_report = runner.invoke(app, ["dataset", "report", str(evidence)])
+    assert reviewed_report.exit_code == 0, reviewed_report.output
+    assert "confirmed=1" in reviewed_report.output
+    assert "Latest review: confirmed, severity=critical" in reviewed_report.output
+
+
+def test_invariant_finding_rejects_changed_values_and_id_tracks_variation_identity(
+    tmp_path: Path,
+) -> None:
+    first_evidence = tmp_path / "first.jsonl"
+    first = _evidence_record()
+    first["schema_version"] = "1.4.0"
+    first["invariant_evaluation"] = _invariant_evaluation()
+    first["cases"][0]["findings"] = []
+    _write_evidence(first_evidence, [first])
+    first_id = next(
+        iter(dataset_review._index_findings(dataset_review._load_evidence(first_evidence)))
+    )
+    expected_identity = {
+        "finding_kind": "customer_invariant_violation",
+        "interaction_id": "quickstart-payment",
+        "original_input": "Pay AC-100.",
+        "operator_id": "surface.disfluency_repeat",
+        "operator_version": "1.0.0",
+        "augmented_input": "Pay pay AC-100.",
+        "suite_sha256": first["invariant_evaluation"]["suite_sha256"],
+        "observation_authority": "committed_state_snapshot",
+        "rule_id": "final-amount-matches-corrected",
+        "rule_version": "1.0.0",
+        "rule_type": "json_values_equal",
+    }
+    assert first_id == f"ulf_v1_{dataset_review._canonical_json_sha256(expected_identity)}"
+
+    changed_values_evidence = tmp_path / "changed-values.jsonl"
+    changed_values = json.loads(json.dumps(first))
+    changed_values["invariant_evaluation"]["variations"][0]["rules"][0]["trials"][0][
+        "resolved_values"
+    ]["left"] = 300
+    _write_evidence(changed_values_evidence, [changed_values])
+    with pytest.raises(
+        dataset_review._ReviewInputError,
+        match="does not match the technical execution evidence",
+    ):
+        dataset_review._index_findings(dataset_review._load_evidence(changed_values_evidence))
+
+    changed_input_evidence = tmp_path / "changed-input.jsonl"
+    changed_input = json.loads(json.dumps(first))
+    changed_input["cases"][0]["augmented_input"] = "Pay pay pay AC-100."
+    changed_input["technical_details"]["augmentation"]["candidates"][0]["augmented_input"] = (
+        "Pay pay pay AC-100."
+    )
+    changed_input["technical_details"]["cases"][0]["candidate"]["augmented_input"] = (
+        "Pay pay pay AC-100."
+    )
+    _write_evidence(changed_input_evidence, [changed_input])
+    changed_input_id = next(
+        iter(dataset_review._index_findings(dataset_review._load_evidence(changed_input_evidence)))
+    )
+
+    assert first_id != changed_input_id
+
+
+def test_invariant_variation_must_map_to_exactly_one_case(tmp_path: Path) -> None:
+    evidence = tmp_path / "ambiguous.jsonl"
+    record = _evidence_record()
+    record["schema_version"] = "1.4.0"
+    record["invariant_evaluation"] = _invariant_evaluation()
+    record["cases"][0]["findings"] = []
+    duplicate_case = json.loads(json.dumps(record["cases"][0]))
+    duplicate_case["augmented_input"] = "Pay pay pay AC-100."
+    record["cases"].append(duplicate_case)
+    _write_evidence(evidence, [record])
+
+    report = runner.invoke(app, ["dataset", "report", str(evidence)])
+
+    assert report.exit_code != 0
+    assert "exactly one evidence case" in report.output
+
+
+def test_invariant_finding_rejects_nonexecuted_variation(tmp_path: Path) -> None:
+    evidence = tmp_path / "nonexecuted.jsonl"
+    record = _evidence_record()
+    record["schema_version"] = "1.4.0"
+    record["invariant_evaluation"] = _invariant_evaluation()
+    record["cases"][0]["findings"] = []
+    record["cases"][0]["variation_accepted"] = False
+    record["cases"][0]["variation_rejection_reasons"] = ["independent validation rejected it"]
+    record["cases"][0]["observations"] = None
+    _write_evidence(evidence, [record])
+
+    report = runner.invoke(app, ["dataset", "report", str(evidence)])
+
+    assert report.exit_code != 0
+    normalized_output = " ".join(report.output.split())
+    assert "accepted" in normalized_output
+    assert "executed" in normalized_output
+    assert "repetition-consistent evidence" in normalized_output
+
+
+def test_invariant_finding_rejects_failed_technical_trials(tmp_path: Path) -> None:
+    evidence = tmp_path / "failed-technical-trials.jsonl"
+    record = _evidence_record()
+    record["schema_version"] = "1.4.0"
+    record["invariant_evaluation"] = _invariant_evaluation()
+    record["cases"][0]["findings"] = []
+    observations = record["cases"][0]["observations"]
+    observations.update(
+        {
+            "stability": "inconclusive",
+            "observed_repetitions": 0,
+            "inconclusive_repetitions": 3,
+            "outcome_group_count": 0,
+            "outcome_groups": [],
+            "trials": [
+                {
+                    "repetition": repetition,
+                    "status": "inconclusive",
+                    "inconclusive_reasons": ["variation execution failed"],
+                }
+                for repetition in (1, 2, 3)
+            ],
+        }
+    )
+    technical_case = record["technical_details"]["cases"][0]
+    technical_case["verdict"] = "inconclusive"
+    technical_case["inconclusive_reasons"] = ["variation execution failed"]
+    technical_case["trial_set"]["stability"] = "inconclusive"
+    technical_case["trial_set"]["outcome_groups"] = []
+    for trial in technical_case["trial_set"]["trials"]:
+        trial["target_output"] = None
+        trial["observed_frame"] = None
+        trial["inconclusive_reasons"] = ["variation execution failed"]
+    _write_evidence(evidence, [record])
+
+    report = runner.invoke(app, ["dataset", "report", str(evidence)])
+
+    assert report.exit_code != 0
+    normalized_output = " ".join(report.output.split())
+    assert "does not match the technical execution" in normalized_output
+    assert "evidence" in normalized_output
+
+
+def test_invariant_finding_rejects_rule_definitions_outside_suite_digest(
+    tmp_path: Path,
+) -> None:
+    evidence = tmp_path / "changed-rule.jsonl"
+    record = _evidence_record()
+    record["schema_version"] = "1.4.0"
+    record["invariant_evaluation"] = _invariant_evaluation()
+    record["cases"][0]["findings"] = []
+    for arm in (
+        record["invariant_evaluation"]["baseline"],
+        *record["invariant_evaluation"]["variations"],
+    ):
+        for trial in arm["rules"][0]["trials"]:
+            trial["left_pointer"] = "/secret"
+    _write_evidence(evidence, [record])
+
+    report = runner.invoke(app, ["dataset", "report", str(evidence)])
+
+    assert report.exit_code != 0
+    assert "suite digest does not match its rule definitions" in " ".join(report.output.split())
+
+
+def test_sensitive_invariant_lines_cover_extended_rules_and_sanitize_controls() -> None:
+    common = {
+        "rule_id": "rule-one",
+        "rule_version": "1.0.0",
+        "description": "A rule.",
+        "severity": "high",
+    }
+    literal_rule = dataset_review.DatasetInvariantValueEqualsRuleEvaluation.model_validate(
+        {
+            **common,
+            "rule_type": "json_value_equals_literal",
+            "status": "violated",
+            "reason_code": "one_or_more_trials_violated",
+            "value_pointer": "/status",
+            "literal": "approved",
+            "trials": (
+                {
+                    "repetition": 1,
+                    "status": "violated",
+                    "reason_code": "value_differs_from_literal",
+                    "value_pointer": "/status",
+                    "resolved_values": {
+                        "actual": (
+                            "denied\n\x1b]8;;bad\x07\u2028line\u2029paragraph\u202eright-to-left"
+                        )
+                    },
+                },
+            ),
+        }
+    )
+    set_rule = dataset_review.DatasetInvariantValueInSetRuleEvaluation.model_validate(
+        {
+            **common,
+            "rule_type": "json_value_in_allowed_set",
+            "status": "violated",
+            "reason_code": "one_or_more_trials_violated",
+            "value_pointer": "/status",
+            "allowed_values": ("approved", "pending"),
+            "trials": (
+                {
+                    "repetition": 1,
+                    "status": "violated",
+                    "reason_code": "value_not_in_allowed_set",
+                    "value_pointer": "/status",
+                    "resolved_values": {"actual": "denied"},
+                },
+            ),
+        }
+    )
+    array_rule = dataset_review.DatasetInvariantArrayUniqueRuleEvaluation.model_validate(
+        {
+            **common,
+            "rule_type": "json_array_items_unique_by",
+            "status": "violated",
+            "reason_code": "one_or_more_trials_violated",
+            "array_pointer": "/payments",
+            "key_pointers": ("/invoice",),
+            "trials": (
+                {
+                    "repetition": 1,
+                    "status": "violated",
+                    "reason_code": "duplicate_array_items",
+                    "array_pointer": "/payments",
+                    "key_pointers": ("/invoice",),
+                    "item_count": 2,
+                    "duplicate_indices": (0, 1),
+                },
+            ),
+        }
+    )
+
+    literal_lines = list(dataset_review._sensitive_invariant_lines(literal_rule, literal_rule))
+    set_lines = list(dataset_review._sensitive_invariant_lines(set_rule, set_rule))
+    array_lines = list(dataset_review._sensitive_invariant_lines(array_rule, array_rule))
+
+    assert 'Configured invariant literal: {"literal":"approved"}' in literal_lines
+    sensitive_literal_output = dataset_review._sanitize_plain_text("\n".join(literal_lines))
+    assert (
+        '"actual":"denied\\n\\u001b]8;;bad\\u0007\\u2028line\\u2029paragraph'
+        '\\u202eright-to-left"' in sensitive_literal_output
+    )
+    assert set_lines[-2:] == [
+        'Configured allowed value 1: {"value":"approved"}',
+        'Configured allowed value 2: {"value":"pending"}',
+    ]
+    assert array_lines == [
+        "Selected values unavailable: array uniqueness evidence intentionally retains indices "
+        "and pointers only."
+    ]
+
+
+def test_sensitive_value_disclosure_rejects_partial_output_over_cap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    evidence = tmp_path / "evidence.jsonl"
+    record = _evidence_record()
+    record["schema_version"] = "1.4.0"
+    record["invariant_evaluation"] = _invariant_evaluation()
+    record["cases"][0]["findings"] = []
+    _write_evidence(evidence, [record])
+    invariant_finding_id = next(
+        iter(dataset_review._index_findings(dataset_review._load_evidence(evidence)))
+    )
+    monkeypatch.setattr(dataset_review, "_MAXIMUM_SENSITIVE_DISCLOSURE_LINES", 1)
+
+    report = runner.invoke(
+        app,
+        [
+            "dataset",
+            "report",
+            str(evidence),
+            "--show-sensitive-values",
+            "--finding",
+            invariant_finding_id,
+        ],
+    )
+
+    assert report.exit_code != 0
+    assert "selected finding values exceed the safe disclosure cap" in " ".join(
+        report.output.split()
+    )
+    assert "selected values:" not in report.output
+
+
+def test_sensitive_value_disclosure_requires_one_invariant_finding(tmp_path: Path) -> None:
+    evidence = tmp_path / "evidence.jsonl"
+    _write_evidence(evidence)
+
+    missing_finding = runner.invoke(
+        app, ["dataset", "report", str(evidence), "--show-sensitive-values"]
+    )
+    semantic_finding = runner.invoke(
+        app,
+        [
+            "dataset",
+            "report",
+            str(evidence),
+            "--show-sensitive-values",
+            "--finding",
+            FINDING_ID,
+        ],
+    )
+
+    assert missing_finding.exit_code != 0
+    missing_output = " ".join(_ANSI_ESCAPE_PATTERN.sub("", missing_finding.output).split())
+    assert "requires --finding FINDING_ID" in missing_output
+    assert semantic_finding.exit_code != 0
+    semantic_output = " ".join(_ANSI_ESCAPE_PATTERN.sub("", semantic_finding.output).split())
+    assert "only for a reviewable" in semantic_output
+    assert "invariant finding" in semantic_output
+
+
+def test_sensitive_value_printer_does_not_wrap_beyond_counted_line(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    output = StringIO()
+    monkeypatch.setattr(
+        dataset_review,
+        "console",
+        Console(file=output, width=20, force_terminal=False),
+    )
+
+    dataset_review._print_sensitive_plain("x" * 4_096)
+
+    assert output.getvalue() == "x" * 4_096 + "\n"
 
 
 @pytest.mark.parametrize(
