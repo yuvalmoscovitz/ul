@@ -4,8 +4,11 @@ from decimal import Decimal
 from typing import Any
 
 from pydantic import Field
+from ul_core.prompts import PromptManager
 
 from examples.accounts_payable.models import Currency, StrictModel
+
+_PROMPTS = PromptManager.instance()
 
 
 class SearchInvoicesArguments(StrictModel):
@@ -60,14 +63,8 @@ TOOL_ARGUMENT_MODELS = {
 
 
 TOOL_DESCRIPTIONS = {
-    "search_invoices": "Search invoices by vendor name, reference, or invoice ID.",
-    "get_invoice": "Get the current invoice record by its exact ID.",
-    "get_vendor": "Get a vendor and its payment destination.",
-    "get_approval_status": "Get the current approval for an invoice.",
-    "get_payment_account": "Find a source account for a legal entity and currency.",
-    "list_payments": "List prior payments, optionally by invoice or idempotency key.",
-    "execute_payment": "Commit a synthetic payment. A timeout can leave the outcome unknown.",
-    "get_payment_status": "Get the status of a known payment operation.",
+    tool_name: _PROMPTS.get_prompt(f"examples.accounts_payable.tools.{tool_name}")
+    for tool_name in TOOL_ARGUMENT_MODELS
 }
 
 

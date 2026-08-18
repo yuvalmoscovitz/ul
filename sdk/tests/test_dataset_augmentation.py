@@ -23,6 +23,7 @@ from ul_core.dataset import (
     SemanticRelation,
     UserInputRecord,
 )
+from ul_core.prompts import prompt_provenance
 
 pytestmark = pytest.mark.asyncio
 
@@ -836,7 +837,11 @@ async def test_behavior_operators_allow_only_their_communication_change(
     assert candidate.allowed_change == "declared_communication_form"
     assert candidate.human_review_required is review_required
     assert candidate.augmented_input == realistic_output
-    assert candidate.renderer_metadata == {"model": "test/model", "seed": 42}
+    assert candidate.renderer_metadata == {
+        "model": "test/model",
+        "seed": 42,
+        "transformation_prompts": prompt_provenance(f"augmentation.{operator_id}"),
+    }
 
 
 async def test_behavior_operator_rejects_relations_touching_its_marker() -> None:
@@ -1270,7 +1275,11 @@ async def test_engine_retains_invalid_candidate_and_continues_to_later_operators
     assert len(result.candidates) == 2
     invalid_candidate = result.candidates[0]
     assert invalid_candidate.augmented_input == "transfer 100 to alice then tell me teh balance"
-    assert invalid_candidate.renderer_metadata == {"model": "test/model", "seed": 42}
+    assert invalid_candidate.renderer_metadata == {
+        "model": "test/model",
+        "seed": 42,
+        "transformation_prompts": prompt_provenance("augmentation.surface.rephrase"),
+    }
     assert invalid_candidate.reparsed_input_frame is None
     assert invalid_candidate.failure_reasons == (
         "candidate semantic deconstruction failed validation",

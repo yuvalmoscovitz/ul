@@ -23,6 +23,9 @@ from ul_core.dataset import (
     UserInputRecord,
 )
 from ul_core.models import ULModel
+from ul_core.prompts import PromptManager, prompt_provenance
+
+_PROMPTS = PromptManager.instance()
 
 OperatorId = Literal[
     "surface.rephrase",
@@ -39,6 +42,17 @@ AllowedChange = Literal[
     "declared_communication_form",
     "structured_self_correction",
 ]
+
+_OPERATOR_PROMPT_NAMES: dict[OperatorId, str] = {
+    "surface.rephrase": "augmentation.surface.rephrase",
+    "surface.typing_noise": "augmentation.surface.typing_noise",
+    "surface.fragmented_syntax": "augmentation.surface.fragmented_syntax",
+    "surface.disfluency_repeat": "augmentation.surface.disfluency_repeat",
+    "style.terse": "augmentation.style.terse",
+    "style.verbose": "augmentation.style.verbose",
+    "tone.frustrated": "augmentation.tone.frustrated",
+    "intent.self_correction": "augmentation.intent.self_correction",
+}
 
 
 class DatasetAugmentationOperator(ULModel):
@@ -66,89 +80,43 @@ class DatasetAugmentationOperator(ULModel):
 _BUILTIN_OPERATORS = (
     DatasetAugmentationOperator(
         id="surface.rephrase",
-        instruction=(
-            "Noticeably rephrase the user input as a natural everyday message; never return the "
-            "exact input or a benchmark-polished sentence. Do not change any meaning, request "
-            "order, or communication behavior. Keep semantic noun phrases and wording directly "
-            "around values intact; change only the request verb or harmless surrounding wording. "
-            "Preserve its language, every request, fact, value, constraint, identifier, and "
-            "relationship. Do not add context."
-        ),
+        instruction=_PROMPTS.get_prompt("augmentation.surface.rephrase"),
         allowed_change="surface_form_only",
     ),
     DatasetAugmentationOperator(
         id="surface.typing_noise",
-        instruction=(
-            "Keep the wording almost identical but make exactly one ordinary word contain a "
-            "plausible human typo. For example only, 'book 2 seats for AB-12' could become 'book "
-            "2 seets for AB-12'. Never copy the example. Do not corrupt names, identifiers, "
-            "amounts, dates, addresses, negation, or any other meaning, and do not change request "
-            "order or other communication behavior."
-        ),
+        instruction=_PROMPTS.get_prompt("augmentation.surface.typing_noise"),
         allowed_change="declared_communication_form",
         target_communication_kind="typing_noise",
     ),
     DatasetAugmentationOperator(
         id="surface.fragmented_syntax",
-        instruction=(
-            "Rewrite the user input in natural chat shorthand or sentence fragments, like a real "
-            "person typing quickly rather than a polished benchmark example. For example only, "
-            "'please book the red item for tomorrow' could become 'pls book red item. tomorrow'. "
-            "Never copy the example. Keep it unambiguous and preserve every request, fact, value, "
-            "constraint, identifier, relationship, and request order. Do not add context."
-        ),
+        instruction=_PROMPTS.get_prompt("augmentation.surface.fragmented_syntax"),
         allowed_change="declared_communication_form",
         target_communication_kind="fragmented_syntax",
         target_marker_required=True,
     ),
     DatasetAugmentationOperator(
         id="surface.disfluency_repeat",
-        instruction=(
-            "Keep the message natural and unpolished, and repeat exactly one ordinary word "
-            "immediately as a small hesitation. For example only, 'please book it' could become "
-            "'please please book it'. Never copy the example. Do not introduce a correction or "
-            "alternative. Preserve every request, fact, value, constraint, identifier, "
-            "relationship, and request order. Do not add context."
-        ),
+        instruction=_PROMPTS.get_prompt("augmentation.surface.disfluency_repeat"),
         allowed_change="declared_communication_form",
         target_communication_kind="repetition",
     ),
     DatasetAugmentationOperator(
         id="style.terse",
-        instruction=(
-            "Rewrite the user input as a visibly shorter, terse but natural message from a busy "
-            "person, not a polished benchmark sentence. Preserve every request, fact, value, "
-            "constraint, identifier, relationship, and request order. Do not make it ambiguous or "
-            "add context."
-        ),
+        instruction=_PROMPTS.get_prompt("augmentation.style.terse"),
         allowed_change="declared_communication_form",
         target_communication_kind="terse",
     ),
     DatasetAugmentationOperator(
         id="style.verbose",
-        instruction=(
-            "Rewrite the user input as a natural, visibly wordier everyday message, roughly one "
-            "and a half to two times as many words. Expand only through harmless restatement, "
-            "never new facts, motivations, requests, constraints, or context. Preserve every "
-            "value, identifier, relationship, and request order, and mention each value and "
-            "identifier exactly once. Use only casual filler and pronouns referring back to the "
-            "same request; do not add statements about what the user needs or why. For example "
-            "only, 'book 2 seats' could become 'hey could you just book 2 seats, just put them in "
-            "there for me'. Never copy the example or make the result more formal."
-        ),
+        instruction=_PROMPTS.get_prompt("augmentation.style.verbose"),
         allowed_change="declared_communication_form",
         target_communication_kind="verbose",
     ),
     DatasetAugmentationOperator(
         id="tone.frustrated",
-        instruction=(
-            "Add one short, clearly visible expression of mild natural frustration while keeping "
-            "the request otherwise almost identical. For example only, 'add 2 items' could become "
-            "'ugh just add 2 items'. Never copy the example. Preserve every request, fact, value, "
-            "constraint, identifier, relationship, and request order. Never invent urgency, "
-            "authority, prior history, threats, deadlines, consequences, or any other facts. Do "
-            "not add insults or abuse."
-        ),
+        instruction=_PROMPTS.get_prompt("augmentation.tone.frustrated"),
         allowed_change="declared_communication_form",
         target_communication_kind="frustrated",
         target_marker_required=True,
@@ -156,15 +124,7 @@ _BUILTIN_OPERATORS = (
     ),
     DatasetAugmentationOperator(
         id="intent.self_correction",
-        instruction=(
-            "Add one natural inline false start for the specified argument: first write one "
-            "plausible temporary value, then immediately and explicitly correct it to the exact "
-            "original value. Write like a real person typing normally, not a polished benchmark "
-            "template. For example only, 'transfer 120$ to alice' could become 'transfer 100$, "
-            "sorry 120$ to alice'. Never copy the example. The original value must be the final "
-            "active value. Preserve every other request, fact, value, constraint, identifier, "
-            "relationship, and request order. Add no other context or correction."
-        ),
+        instruction=_PROMPTS.get_prompt("augmentation.intent.self_correction"),
         allowed_change="structured_self_correction",
         target_communication_kind="self_correction",
         target_marker_required=True,
@@ -248,6 +208,7 @@ class DatasetAugmentationEngine:
                 continue
             generated_inputs: set[str] = set()
             for operator in selected_operators:
+                transformation_prompt_names = (_OPERATOR_PROMPT_NAMES[operator.id],)
                 selected_correction_factor: SemanticFactor | None = None
                 planned_provisional_quote: str | None = None
                 if operator.allowed_change == "structured_self_correction":
@@ -266,24 +227,30 @@ class DatasetAugmentationEngine:
                 elif operator.id == "surface.disfluency_repeat":
                     rendered_input = _add_word_repetition(record, expected_input_frame, operator)
                 elif operator.allowed_change == "structured_self_correction":
+                    transformation_prompt_names += ("augmentation.intent.self_correction_argument",)
                     if selected_correction_factor is None:
                         raise AssertionError("self-correction requires a selected factor")
                     correction_quote = _unique_input_quote(selected_correction_factor)
                     if correction_quote is None:
                         raise AssertionError("selected correction factor requires a unique quote")
+                    argument_instruction = _PROMPTS.get_prompt(
+                        "augmentation.intent.self_correction_argument",
+                        source_text=json.dumps(correction_quote, ensure_ascii=False),
+                        temporary_text=json.dumps(planned_provisional_quote, ensure_ascii=False),
+                    )
                     rendered_input = await self._renderer.render(
                         record.raw_input,
-                        f"{operator.instruction} The specified argument is the exact source text "
-                        f"{json.dumps(correction_quote, ensure_ascii=False)}. Use the exact "
-                        "temporary text "
-                        f"{json.dumps(planned_provisional_quote, ensure_ascii=False)} "
-                        "before it.",
+                        f"{operator.instruction} {argument_instruction}",
                         allow_temporary_value=True,
                     )
                 else:
                     rendered_input = await self._renderer.render(
                         record.raw_input, operator.instruction
                     )
+                renderer_metadata: dict[str, JsonValue] = {
+                    **rendered_input.metadata,
+                    "transformation_prompts": prompt_provenance(*transformation_prompt_names),
+                }
                 augmented_input = rendered_input.text
                 candidate_record = UserInputRecord(
                     id=f"{record.id}:{operator.id}",
@@ -377,7 +344,7 @@ class DatasetAugmentationEngine:
                         allowed_change=operator.allowed_change,
                         human_review_required=operator.human_review_required,
                         augmented_input=augmented_input,
-                        renderer_metadata=rendered_input.metadata,
+                        renderer_metadata=renderer_metadata,
                         expected_input_frame=expected_input_frame,
                         reparsed_input_frame=reparsed_frame,
                         semantic_equivalence_assessment=equivalence_assessment,

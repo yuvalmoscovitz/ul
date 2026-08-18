@@ -100,4 +100,19 @@ async def test_tool_loop_is_bounded_and_uses_safe_request_parameters() -> None:
     assert result.usage["total_tokens"] == 32
     assert abs(result.cost_usd - 0.003) < 1e-12
     assert result.stop_reason == "completed"
+    assert [prompt["name"] for prompt in result.prompts if isinstance(prompt, dict)] == [
+        "examples.accounts_payable.system",
+        "examples.accounts_payable.tools.search_invoices",
+        "examples.accounts_payable.tools.get_invoice",
+        "examples.accounts_payable.tools.get_vendor",
+        "examples.accounts_payable.tools.get_approval_status",
+        "examples.accounts_payable.tools.get_payment_account",
+        "examples.accounts_payable.tools.list_payments",
+        "examples.accounts_payable.tools.execute_payment",
+        "examples.accounts_payable.tools.get_payment_status",
+    ]
+    assert all(
+        isinstance(prompt, dict) and len(str(prompt.get("version", ""))) == 64
+        for prompt in result.prompts
+    )
     assert "test-secret" not in requests[0].content.decode()

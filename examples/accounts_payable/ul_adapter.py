@@ -361,6 +361,7 @@ class AccountsPayableOpenRouterTarget(TargetExecutor):
                     "requested_model": agent_result.model,
                     "generation_ids": agent_result.generation_ids,
                     "usage": agent_result.usage,
+                    "prompts": agent_result.prompts,
                     "max_steps": self._settings.max_steps,
                     "max_output_tokens": self._settings.max_output_tokens,
                     "reasoning_effort": "none",
