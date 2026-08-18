@@ -12,6 +12,12 @@ from typing import Any, cast
 
 import pytest
 from typer.testing import CliRunner
+from ul.dataset_invariants import (
+    DatasetInvariantValueEqualsRuleEvaluation,
+    DatasetInvariantValueEqualsTrialEvaluation,
+    JsonValueEqualsLiteralInvariant,
+)
+from ul_cli import dataset_regression as regression_cli
 from ul_cli.main import app
 
 runner = CliRunner()
@@ -19,6 +25,39 @@ FINDING_ID = f"ulf_v1_{'a' * 64}"
 RULE_ID = "committed-invoice-matches-request"
 SECOND_RULE_ID = "committed-amount-matches-request"
 TEST_SECRET = "regression-test-secret-must-not-leak"
+
+
+def test_regression_save_reconstructs_extended_rule_definition() -> None:
+    result = DatasetInvariantValueEqualsRuleEvaluation(
+        rule_type="json_value_equals_literal",
+        rule_id="approval-is-current",
+        rule_version="1.0.0",
+        description="The approval must be current.",
+        severity="critical",
+        status="violated",
+        reason_code="one_or_more_trials_violated",
+        value_pointer="/approval/version",
+        literal=7,
+        trials=(
+            DatasetInvariantValueEqualsTrialEvaluation(
+                repetition=1,
+                status="violated",
+                reason_code="value_differs_from_literal",
+                value_pointer="/approval/version",
+                resolved_values={"actual": 6},
+            ),
+        ),
+    )
+
+    assert regression_cli._invariant_rule_definition(result) == JsonValueEqualsLiteralInvariant(
+        type="json_value_equals_literal",
+        id="approval-is-current",
+        version="1.0.0",
+        description="The approval must be current.",
+        severity="critical",
+        value_pointer="/approval/version",
+        literal=7,
+    )
 
 
 def _effect(invoice_reference: str) -> dict[str, Any]:
@@ -551,7 +590,11 @@ def test_save_requires_explicit_sensitive_input_confirmation_and_confirmed_revie
     assert no_confirmation.exit_code == 2
     assert "exact" in no_confirmation.output.casefold()
     assert "sensitive" in no_confirmation.output.casefold()
+    assert "customer-rule definitions" in no_confirmation.output.replace("\n", " ")
     assert not case_path.exists()
+
+    help_result = runner.invoke(app, ["regression", "save", "--help"], env={"COLUMNS": "300"})
+    assert "selected customer-rule definitions" in help_result.output
 
 
 def test_save_rejects_stale_review_lineage_and_never_overwrites(tmp_path: Path) -> None:

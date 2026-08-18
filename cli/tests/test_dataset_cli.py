@@ -33,8 +33,11 @@ from ul.dataset_invariants import (
     DatasetInvariantArmEvaluation,
     DatasetInvariantEvaluation,
     DatasetInvariantRuleEvaluation,
+    DatasetInvariantSuite,
+    JsonValueEqualsLiteralInvariant,
 )
 from ul_cli import dataset as main
+from ul_cli import dataset_review
 from ul_cli.main import app as root_app
 
 runner = CliRunner()
@@ -462,6 +465,63 @@ def test_invariant_dry_run_reports_rules_authority_and_no_extra_calls(
     assert "Additional target calls for customer invariants: 0" in result.output
     assert "Potential semantic model calls: up to 10" in result.output
     assert "Potential target calls: up to 6" in result.output
+
+
+def test_extended_invariants_use_new_evidence_schema_and_hide_values_from_terminal(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    suite = DatasetInvariantSuite(
+        schema_version="1.1.0",
+        observation_source="target_output",
+        observation_authority="committed_state_snapshot",
+        rules=(
+            JsonValueEqualsLiteralInvariant(
+                type="json_value_equals_literal",
+                id="approval-is-current",
+                version="1.0.0",
+                description="The approval must be current.",
+                severity="critical",
+                value_pointer="/approval",
+                literal="private-current-version",
+            ),
+        ),
+    )
+    evaluation_result = _evaluation_result("interaction-1")
+    baseline_trial = evaluation_result.baseline.trial_set.trials[0].model_copy(
+        update={
+            "target_output": ObservedAgentOutput(raw_output={"approval": "private-stale-version"})
+        }
+    )
+    evaluation_result = evaluation_result.model_copy(
+        update={
+            "baseline": evaluation_result.baseline.model_copy(
+                update={
+                    "trial_set": evaluation_result.baseline.trial_set.model_copy(
+                        update={"trials": (baseline_trial,)}
+                    )
+                }
+            )
+        }
+    )
+    invariant_evaluation = main.evaluate_dataset_invariants(evaluation_result, suite)
+    run_context = _run_context((evaluation_result.source,), invariant_suite=suite)
+
+    record = main._customer_evidence_record(
+        evaluation_result,
+        repetitions=1,
+        max_target_calls=2,
+        planned_target_calls=2,
+        run_context=cast(Any, run_context),
+        invariant_evaluation=invariant_evaluation,
+    )
+    parsed = dataset_review._EvidenceRecord.model_validate_json(json.dumps(record))
+    main._print_invariant_results((invariant_evaluation,))
+    terminal_output = capsys.readouterr().out
+
+    assert parsed.schema_version == "1.6.0"
+    assert "value=/approval" in terminal_output
+    assert "private-current-version" not in terminal_output
+    assert "private-stale-version" not in terminal_output
 
 
 def test_invalid_invariant_config_stops_before_settings_network_or_output(
@@ -1740,6 +1800,66 @@ def test_resume_snapshot_detects_same_summary_content_change() -> None:
     assert first_snapshot.has_review_findings == changed_snapshot.has_review_findings
     assert first_snapshot.raw_evidence_sha256 != changed_snapshot.raw_evidence_sha256
     assert first_snapshot != changed_snapshot
+
+
+def test_resume_accepts_extended_invariant_evidence_schema() -> None:
+    evaluation_result = _evaluation_result("interaction-1")
+    suite = DatasetInvariantSuite(
+        schema_version="1.1.0",
+        observation_source="target_output",
+        observation_authority="committed_state_snapshot",
+        rules=(
+            JsonValueEqualsLiteralInvariant(
+                type="json_value_equals_literal",
+                id="approval-is-current",
+                version="1.0.0",
+                description="The approval must be current.",
+                severity="critical",
+                value_pointer="/approval",
+                literal="current",
+            ),
+        ),
+    )
+    baseline_trial = evaluation_result.baseline.trial_set.trials[0].model_copy(
+        update={"target_output": ObservedAgentOutput(raw_output={"approval": "current"})}
+    )
+    evaluation_result = evaluation_result.model_copy(
+        update={
+            "baseline": evaluation_result.baseline.model_copy(
+                update={
+                    "trial_set": evaluation_result.baseline.trial_set.model_copy(
+                        update={"trials": (baseline_trial,)}
+                    )
+                }
+            )
+        }
+    )
+    invariant_evaluation = main.evaluate_dataset_invariants(evaluation_result, suite)
+    run_context = _run_context((evaluation_result.source,), invariant_suite=suite)
+    raw_evidence = (
+        json.dumps(
+            main._customer_evidence_record(
+                evaluation_result,
+                repetitions=1,
+                max_target_calls=2,
+                planned_target_calls=2,
+                run_context=cast(Any, run_context),
+                invariant_evaluation=invariant_evaluation,
+            )
+        )
+        + "\n"
+    ).encode()
+
+    snapshot = main.validate_dataset_resume_evidence(
+        raw_evidence,
+        expected_context=cast(Any, run_context),
+        selected_records=(evaluation_result.source,),
+        invariant_suite=suite,
+        evidence_projector=main._customer_evidence_record,
+    )
+
+    assert snapshot.processed_ids == frozenset({"interaction-1"})
+    assert snapshot.invariant_evaluations == (invariant_evaluation,)
 
 
 def test_resume_rejects_legacy_unbound_evidence(tmp_path: Path) -> None:

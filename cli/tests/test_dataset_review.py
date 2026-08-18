@@ -436,6 +436,16 @@ def test_malformed_truncated_extra_field_and_empty_evidence_are_rejected(
     assert "evidence" in result.output.casefold()
 
 
+def test_invalid_evidence_diagnostic_lists_current_schema(tmp_path: Path) -> None:
+    evidence = tmp_path / "evidence.jsonl"
+    evidence.write_bytes(b'{"schema_version":')
+
+    result = runner.invoke(app, ["dataset", "report", str(evidence)])
+
+    assert result.exit_code != 0
+    assert "1.6.0" in result.output
+
+
 def test_malformed_extra_field_and_digest_mismatch_reviews_are_rejected(tmp_path: Path) -> None:
     evidence = tmp_path / "evidence.jsonl"
     evidence_bytes = _write_evidence(evidence).rstrip(b"\n")

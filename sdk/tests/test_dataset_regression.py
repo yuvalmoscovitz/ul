@@ -7,9 +7,16 @@ from pathlib import Path
 
 import pytest
 from pydantic import ValidationError
-from ul.dataset_invariants import JsonValuesEqualInvariant
+from ul.dataset_invariants import (
+    DatasetInvariantRule,
+    JsonArrayItemsUniqueByInvariant,
+    JsonValueEqualsLiteralInvariant,
+    JsonValueInAllowedSetInvariant,
+    JsonValuesEqualInvariant,
+)
 from ul.dataset_regression import (
     DatasetRegressionCase,
+    DatasetRegressionRunResult,
     create_dataset_regression_case,
     load_dataset_regression_case,
     replay_dataset_regression,
@@ -121,6 +128,94 @@ def test_case_is_content_addressed_and_loader_round_trips(tmp_path: Path) -> Non
     assert load_dataset_regression_case(path) == case
     assert case.target.provenance == "declared_at_case_creation"
     assert case.target.config_sha256 == equivalent.target.config_sha256
+
+
+@pytest.mark.parametrize(
+    ("rule", "raw_output", "expected_status"),
+    [
+        (
+            JsonValueEqualsLiteralInvariant(
+                type="json_value_equals_literal",
+                id="approval-is-current",
+                version="1.0.0",
+                description="The approval version must be current.",
+                severity="critical",
+                value_pointer="/approval_version",
+                literal=7,
+            ),
+            {"approval_version": 6},
+            "failed",
+        ),
+        (
+            JsonValueInAllowedSetInvariant(
+                type="json_value_in_allowed_set",
+                id="action-is-allowed",
+                version="1.0.0",
+                description="The action must be allowed.",
+                severity="high",
+                value_pointer="/action",
+                allowed_values=("approved", "rejected"),
+            ),
+            {"action": "paid"},
+            "failed",
+        ),
+        (
+            JsonArrayItemsUniqueByInvariant(
+                type="json_array_items_unique_by",
+                id="never-pay-twice",
+                version="1.0.0",
+                description="An invoice must not be paid twice from one account.",
+                severity="critical",
+                array_pointer="/payments",
+                key_pointers=("/invoice", "/account"),
+            ),
+            {
+                "payments": [
+                    {"id": "pay-1", "invoice": "AC-100", "account": "main"},
+                    {"id": "pay-2", "invoice": "AC-100", "account": "main"},
+                ]
+            },
+            "failed",
+        ),
+    ],
+)
+def test_extended_rules_round_trip_and_replay(
+    rule: DatasetInvariantRule,
+    raw_output: object,
+    expected_status: str,
+    tmp_path: Path,
+) -> None:
+    base = _case(repetitions=1)
+    case = create_dataset_regression_case(
+        finding_id=FINDING_ID,
+        evidence_sha256="3" * 64,
+        review_id=REVIEW_ID,
+        interaction_id="extended-rule",
+        operator_id="context.pasted_block",
+        operator_version="1.0.0",
+        original_input="Original input.",
+        variation_input="Variation input.",
+        target_config=base.target.config,
+        source_suite_sha256=SUITE_SHA256,
+        observation_authority="committed_state_snapshot",
+        selected_rules=(rule,),
+        discovery_repetitions=1,
+    )
+    path = tmp_path / "extended-case.json"
+    path.write_text(case.model_dump_json(), encoding="utf-8")
+
+    loaded = load_dataset_regression_case(path)
+    result = asyncio.run(
+        replay_dataset_regression(
+            loaded,
+            _Target([ObservedAgentOutput.model_validate({"raw_output": raw_output})]),
+        )
+    )
+
+    assert loaded == case
+    assert case.schema_version == "1.1.0"
+    assert result.schema_version == "1.1.0"
+    assert result.status == expected_status
 
 
 def test_case_rejects_tampered_case_and_target_digests() -> None:
@@ -261,6 +356,49 @@ def test_run_returns_inconclusive_when_no_case_fails() -> None:
     assert result.status == "inconclusive"
     assert result.passed_case_count == 1
     assert result.inconclusive_case_count == 1
+
+
+def test_run_uses_extended_schema_when_any_case_uses_extended_rules() -> None:
+    legacy_case = _case(repetitions=1)
+    extended_case = create_dataset_regression_case(
+        finding_id=FINDING_ID,
+        evidence_sha256="3" * 64,
+        review_id=REVIEW_ID,
+        interaction_id="extended-rule",
+        operator_id="context.pasted_block",
+        operator_version="1.0.0",
+        original_input="Original input.",
+        variation_input="Variation input.",
+        target_config=legacy_case.target.config,
+        source_suite_sha256=SUITE_SHA256,
+        observation_authority="committed_state_snapshot",
+        selected_rules=(
+            JsonValueEqualsLiteralInvariant(
+                type="json_value_equals_literal",
+                id="approval-is-current",
+                version="1.0.0",
+                description="The approval version must be current.",
+                severity="critical",
+                value_pointer="/approval_version",
+                literal=7,
+            ),
+        ),
+        discovery_repetitions=1,
+    )
+    target = _Target(
+        [
+            _output("AC-101", "AC-101"),
+            ObservedAgentOutput(raw_output={"approval_version": 7}),
+        ]
+    )
+
+    result = asyncio.run(run_dataset_regressions((legacy_case, extended_case), target))
+
+    assert result.schema_version == "1.1.0"
+    serialized = result.model_dump(mode="json")
+    serialized["schema_version"] = "1.0.0"
+    with pytest.raises(ValidationError, match=r"only supports result schema 1\.0\.0"):
+        DatasetRegressionRunResult.model_validate_json(json.dumps(serialized))
 
 
 def test_run_enforces_total_budget_and_unique_cases_before_execution() -> None:
