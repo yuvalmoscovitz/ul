@@ -40,6 +40,7 @@ testpaths = [
     "cli/tests",
     "examples/accounts_payable/tests",
     "examples/quickstart/tests",
+    "examples/multiturn_correction/tests",
 ]
 
 [tool.ruff]
@@ -58,5 +59,6 @@ include = [
     "cli/src",
     "examples/accounts_payable",
     "examples/quickstart",
+    "examples/multiturn_correction",
 ]
 extraPaths = ["core/src", "sdk/src", "cli/src"]

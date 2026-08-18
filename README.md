@@ -319,6 +319,47 @@ Each physical lifecycle request counts toward `--max-target-calls`. A configurat
 uses five calls per repetition; without setup it uses four. `committed_state_snapshot` is
 evaluable only when the snapshot call succeeds.
 
+### Stress a later correction across turns
+
+UL includes one trace-independent multi-turn event operator:
+`event.correction_after_first_response`. A correction case contains exactly two ordered user
+turns. For each repetition UL runs a fresh one-turn baseline, resets the sandbox, then runs the
+initial turn and correction together in one lifecycle. It captures the agent response and a
+committed-state snapshot after both variation turns, then cleans up before the next pair.
+
+```bash
+uv run ul stress correction examples/multiturn_correction/case.json \
+  --target-config examples/multiturn_correction/target.json \
+  --invariants examples/multiturn_correction/invariants.json \
+  --allow-target-network --allow-insecure-http --confirm-isolated-sandbox \
+  --max-target-calls 36 --output tmp/multiturn-correction-evidence.json
+```
+
+Use `--dry-run` to validate the exact conversation, target, invariant suite, and physical call
+budget without making a request. With setup, one paired repetition uses 12 calls: five for the
+baseline and seven for the two-turn variation. Evidence identifies the first turn whose response
+or committed state differs from the baseline and retains every ordered intermediate observation.
+The customer-declared invariant evaluates the final corrected state; UL does not infer whether a
+changed state is correct.
+
+Save and replay the exact conversation without semantic-model calls:
+
+```bash
+uv run ul stress save examples/multiturn_correction/case.json \
+  --target-config examples/multiturn_correction/target.json \
+  --invariants examples/multiturn_correction/invariants.json \
+  --confirm-versioned-input --output tmp/correction-regression.json
+
+uv run ul stress replay tmp/correction-regression.json \
+  --target-config examples/multiturn_correction/target.json \
+  --allow-target-network --allow-insecure-http --confirm-isolated-sandbox \
+  --max-target-calls 36 --output tmp/correction-replay.json
+```
+
+Saved cases contain the exact conversation and invariant literals and can therefore be sensitive.
+The embedded target config is digest-bound but never trusted for execution; replay requires a
+separately supplied target config with the same digest.
+
 To add customer-defined deterministic checks, provide a strict invariant file:
 
 ```json
