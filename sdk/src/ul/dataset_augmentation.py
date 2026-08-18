@@ -208,7 +208,7 @@ class DatasetAugmentationEngine:
                 continue
             generated_inputs: set[str] = set()
             for operator in selected_operators:
-                transformation_prompt_names = (_OPERATOR_PROMPT_NAMES[operator.id],)
+                transformation_prompt_names: tuple[str, ...] = ()
                 selected_correction_factor: SemanticFactor | None = None
                 planned_provisional_quote: str | None = None
                 if operator.allowed_change == "structured_self_correction":
@@ -227,7 +227,10 @@ class DatasetAugmentationEngine:
                 elif operator.id == "surface.disfluency_repeat":
                     rendered_input = _add_word_repetition(record, expected_input_frame, operator)
                 elif operator.allowed_change == "structured_self_correction":
-                    transformation_prompt_names += ("augmentation.intent.self_correction_argument",)
+                    transformation_prompt_names = (
+                        _OPERATOR_PROMPT_NAMES[operator.id],
+                        "augmentation.intent.self_correction_argument",
+                    )
                     if selected_correction_factor is None:
                         raise AssertionError("self-correction requires a selected factor")
                     correction_quote = _unique_input_quote(selected_correction_factor)
@@ -244,6 +247,7 @@ class DatasetAugmentationEngine:
                         allow_temporary_value=True,
                     )
                 else:
+                    transformation_prompt_names = (_OPERATOR_PROMPT_NAMES[operator.id],)
                     rendered_input = await self._renderer.render(
                         record.raw_input, operator.instruction
                     )

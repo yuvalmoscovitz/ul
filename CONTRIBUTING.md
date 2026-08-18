@@ -26,3 +26,7 @@ uv build --no-sources
 
 Keep pull requests focused. Add behavior-level tests, update affected documentation, and explain
 the user outcome and limitations. Discuss new major dependencies before adding them.
+
+Model-facing instructions must follow the
+[prompt catalog contract](core/src/ul_core/prompt_templates/README.md); do not embed prompt bodies
+in runtime Python strings.

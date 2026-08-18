@@ -1029,6 +1029,7 @@ async def test_typing_noise_is_deterministic_protects_factors_and_needs_no_model
     assert model.rendered_inputs == []
     assert candidate.renderer_metadata["renderer"] == "deterministic"
     assert candidate.renderer_metadata["algorithm"] == "protected_adjacent_transposition"
+    assert candidate.renderer_metadata["transformation_prompts"] == []
 
 
 async def test_word_repetition_is_deterministic_and_protects_factors() -> None:
@@ -1050,6 +1051,7 @@ async def test_word_repetition_is_deterministic_and_protects_factors() -> None:
     assert model.rendered_inputs == []
     assert candidate.renderer_metadata["renderer"] == "deterministic"
     assert candidate.renderer_metadata["algorithm"] == ("protected_immediate_word_repetition")
+    assert candidate.renderer_metadata["transformation_prompts"] == []
 
 
 async def test_factor_evidence_does_not_protect_unrelated_words_in_its_span() -> None:

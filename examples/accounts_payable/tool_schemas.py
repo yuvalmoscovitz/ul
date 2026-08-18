@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from decimal import Decimal
+from types import MappingProxyType
 from typing import Any
 
 from pydantic import Field
@@ -62,10 +63,12 @@ TOOL_ARGUMENT_MODELS = {
 }
 
 
-TOOL_DESCRIPTIONS = {
-    tool_name: _PROMPTS.get_prompt(f"examples.accounts_payable.tools.{tool_name}")
-    for tool_name in TOOL_ARGUMENT_MODELS
-}
+TOOL_DESCRIPTIONS = MappingProxyType(
+    {
+        tool_name: _PROMPTS.get_prompt(f"examples.accounts_payable.tools.{tool_name}")
+        for tool_name in TOOL_ARGUMENT_MODELS
+    }
+)
 
 
 def openrouter_tool_definitions() -> list[dict[str, Any]]:
