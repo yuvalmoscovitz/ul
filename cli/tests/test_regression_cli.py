@@ -13,10 +13,25 @@ from typing import Any, cast
 
 import pytest
 from typer.testing import CliRunner
+from ul import (
+    DatasetAugmentationResult,
+    DatasetEvaluationBaseline,
+    DatasetEvaluationCase,
+    DatasetEvaluationOutcomeGroup,
+    DatasetEvaluationResult,
+    DatasetEvaluationTrial,
+    DatasetEvaluationTrialSet,
+    InteractionRecord,
+    ObservedAgentOutput,
+    SemanticFrame,
+)
+from ul.dataset_augmentation import DatasetAugmentationCandidate
 from ul.dataset_invariants import (
+    DatasetInvariantSuite,
     DatasetInvariantValueEqualsRuleEvaluation,
     DatasetInvariantValueEqualsTrialEvaluation,
     JsonValueEqualsLiteralInvariant,
+    JsonValuesEqualInvariant,
 )
 from ul_cli import dataset_regression as regression_cli
 from ul_cli import dataset_review
@@ -137,6 +152,31 @@ def _amount_rule(status: str) -> dict[str, Any]:
 def _evidence_record() -> dict[str, Any]:
     original_effect = _effect("AC-100")
     changed_effect = _effect("AC-101")
+    suite = DatasetInvariantSuite(
+        schema_version="1.0.0",
+        observation_source="target_output",
+        observation_authority="committed_state_snapshot",
+        rules=(
+            JsonValuesEqualInvariant(
+                type="json_values_equal",
+                id=RULE_ID,
+                version="1.0.0",
+                description="The committed invoice must equal the requested invoice.",
+                severity="high",
+                left_pointer="/invoice_reference",
+                right_pointer="/requested_invoice_reference",
+            ),
+            JsonValuesEqualInvariant(
+                type="json_values_equal",
+                id=SECOND_RULE_ID,
+                version="1.0.0",
+                description="The committed amount must equal the requested amount.",
+                severity="high",
+                left_pointer="/amount",
+                right_pointer="/requested_amount",
+            ),
+        ),
+    )
     return {
         "schema_version": "1.4.0",
         "interaction_id": "quickstart-payment",
@@ -178,7 +218,7 @@ def _evidence_record() -> dict[str, Any]:
         ],
         "invariant_evaluation": {
             "interaction_id": "quickstart-payment",
-            "suite_sha256": "b" * 64,
+            "suite_sha256": suite.sha256,
             "observation_source": "target_output",
             "observation_authority": "committed_state_snapshot",
             "baseline": {
@@ -200,8 +240,72 @@ def _evidence_record() -> dict[str, Any]:
                 }
             ],
         },
-        "technical_details": {"fixture": "saved-regression-e2e"},
+        "technical_details": _technical_details(),
     }
+
+
+def _technical_details() -> dict[str, Any]:
+    source_frame = SemanticFrame(interaction_id="quickstart-payment", extractor_version="test")
+    candidate = DatasetAugmentationCandidate(
+        source_interaction_id="quickstart-payment",
+        operator_id="surface.disfluency_repeat",
+        operator_version="1.0.0",
+        augmented_input="Pay pay AC-100.",
+        expected_input_frame=source_frame,
+        reparsed_input_frame=source_frame,
+        passed=True,
+    )
+
+    def trial_set(arm: str, invoice: str, amount: str) -> DatasetEvaluationTrialSet:
+        trials = tuple(
+            DatasetEvaluationTrial(
+                repetition=repetition,
+                target_output=ObservedAgentOutput(
+                    raw_output={
+                        "invoice_reference": invoice,
+                        "requested_invoice_reference": "AC-100",
+                        "amount": amount,
+                        "requested_amount": "12500",
+                    }
+                ),
+                observed_frame=SemanticFrame(
+                    interaction_id=f"quickstart-payment:{arm}:round-{repetition}",
+                    extractor_version="test",
+                ),
+            )
+            for repetition in (1, 2, 3)
+        )
+        return DatasetEvaluationTrialSet(
+            requested_repetitions=3,
+            stability="stable",
+            trials=trials,
+            outcome_groups=(
+                DatasetEvaluationOutcomeGroup(repetitions=(1, 2, 3), representative_effects=()),
+            ),
+        )
+
+    result = DatasetEvaluationResult(
+        source=InteractionRecord(
+            id="quickstart-payment",
+            raw_input="Pay AC-100.",
+            raw_observed_output={},
+        ),
+        augmentation=DatasetAugmentationResult(
+            source_frames=(source_frame,), candidates=(candidate,)
+        ),
+        baseline=DatasetEvaluationBaseline(
+            verdict="no_divergence",
+            trial_set=trial_set("current_baseline", "AC-100", "12500"),
+        ),
+        cases=(
+            DatasetEvaluationCase(
+                candidate=candidate,
+                verdict="no_divergence",
+                trial_set=trial_set("surface.disfluency_repeat", "AC-101", "12600"),
+            ),
+        ),
+    )
+    return result.model_dump(mode="json")
 
 
 def _write_evidence(path: Path) -> None:
