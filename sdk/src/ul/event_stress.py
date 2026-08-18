@@ -109,6 +109,11 @@ class CorrectionStressResult(_StrictModel):
     status: Literal["passed", "failed", "inconclusive"]
     first_response_divergence_turn_id: str | None = None
     first_committed_state_divergence_turn_id: str | None = None
+    response_divergence_stability: Literal["stable", "unstable", "none", "inconclusive"]
+    committed_state_divergence_stability: Literal["stable", "unstable", "none", "inconclusive"]
+    response_divergence_counts: dict[str, int]
+    committed_state_divergence_counts: dict[str, int]
+    baseline_drift_observed: bool
     trials: tuple[CorrectionStressTrial, ...] = Field(min_length=1)
     baseline_invariant_rules: tuple[DatasetInvariantRuleResult, ...] = Field(min_length=1)
     corrected_invariant_rules: tuple[DatasetInvariantRuleResult, ...] = Field(min_length=1)
@@ -265,22 +270,31 @@ async def run_correction_stress_test(
         status = "inconclusive"
     else:
         status = "passed"
-    conclusive_divergences = tuple(
-        divergence
-        for trial in trials
-        if trial.inconclusive_reason is None
-        for divergence in trial.divergences
-    )
+    turn_ids = tuple(turn.id for turn in case.conversation)
+    (
+        first_response_divergence_turn_id,
+        response_divergence_counts,
+        response_divergence_stability,
+    ) = _summarize_divergences(tuple(trials), turn_ids, "response_diverged")
+    (
+        first_committed_state_divergence_turn_id,
+        committed_state_divergence_counts,
+        committed_state_divergence_stability,
+    ) = _summarize_divergences(tuple(trials), turn_ids, "committed_state_diverged")
     return CorrectionStressResult(
         case=case,
         requested_repetitions=repetitions,
         required_target_calls=required_target_calls,
         status=status,
-        first_response_divergence_turn_id=_first_consistent_divergence(
-            conclusive_divergences, "response_diverged"
-        ),
-        first_committed_state_divergence_turn_id=_first_consistent_divergence(
-            conclusive_divergences, "committed_state_diverged"
+        first_response_divergence_turn_id=first_response_divergence_turn_id,
+        first_committed_state_divergence_turn_id=first_committed_state_divergence_turn_id,
+        response_divergence_stability=response_divergence_stability,
+        committed_state_divergence_stability=committed_state_divergence_stability,
+        response_divergence_counts=response_divergence_counts,
+        committed_state_divergence_counts=committed_state_divergence_counts,
+        baseline_drift_observed=(
+            response_divergence_counts.get(initial_turn.id, 0) > 0
+            or committed_state_divergence_counts.get(initial_turn.id, 0) > 0
         ),
         trials=tuple(trials),
         baseline_invariant_rules=baseline_invariant_results,
@@ -462,16 +476,48 @@ def _divergences(
     return tuple(divergences)
 
 
-def _first_consistent_divergence(
-    divergences: tuple[CorrectionDivergence, ...],
+def _summarize_divergences(
+    trials: tuple[CorrectionStressTrial, ...],
+    turn_ids: tuple[str, ...],
     field: Literal["response_diverged", "committed_state_diverged"],
-) -> str | None:
-    turn_ids = tuple(
-        dict.fromkeys(
-            divergence.variation_turn_id for divergence in divergences if getattr(divergence, field)
+) -> tuple[
+    str | None,
+    dict[str, int],
+    Literal["stable", "unstable", "none", "inconclusive"],
+]:
+    conclusive_trials = tuple(trial for trial in trials if trial.inconclusive_reason is None)
+    counts = {
+        turn_id: sum(
+            any(
+                divergence.variation_turn_id == turn_id and getattr(divergence, field)
+                for divergence in trial.divergences
+            )
+            for trial in conclusive_trials
         )
-    )
-    return turn_ids[0] if turn_ids else None
+        for turn_id in turn_ids
+    }
+    first_turn_id = next((turn_id for turn_id in turn_ids if counts[turn_id] > 0), None)
+    if not conclusive_trials:
+        stability: Literal["stable", "unstable", "none", "inconclusive"] = "inconclusive"
+    else:
+        divergence_patterns = {
+            tuple(
+                turn_id
+                for turn_id in turn_ids
+                if any(
+                    divergence.variation_turn_id == turn_id and getattr(divergence, field)
+                    for divergence in trial.divergences
+                )
+            )
+            for trial in conclusive_trials
+        }
+        if divergence_patterns == {()}:
+            stability = "none"
+        elif len(divergence_patterns) == 1:
+            stability = "stable"
+        else:
+            stability = "unstable"
+    return first_turn_id, counts, stability
 
 
 def _lifecycle_failure(error: DatasetTargetLifecycleError) -> DatasetTargetLifecycleFailure:

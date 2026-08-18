@@ -261,6 +261,21 @@ def _print_result(result: CorrectionStressResult, output: Path) -> None:
         "First committed-state divergence: "
         f"{result.first_committed_state_divergence_turn_id or 'none'}"
     )
+    typer.echo(
+        "Response divergence stability: "
+        f"{result.response_divergence_stability}; "
+        f"counts={_format_divergence_counts(result.response_divergence_counts)}"
+    )
+    typer.echo(
+        "Committed-state divergence stability: "
+        f"{result.committed_state_divergence_stability}; "
+        f"counts={_format_divergence_counts(result.committed_state_divergence_counts)}"
+    )
+    if result.baseline_drift_observed:
+        typer.echo(
+            "Causal warning: the variation diverged before the correction; do not attribute "
+            "the corrected-arm failure to the correction alone."
+        )
     for trial in result.trials:
         typer.echo(f"Repetition {trial.repetition}")
         arms = (("baseline", trial.baseline), ("variation", trial.variation))
@@ -280,6 +295,10 @@ def _print_result(result: CorrectionStressResult, output: Path) -> None:
         raise typer.Exit(code=1)
     if result.status == "inconclusive":
         raise typer.Exit(code=2)
+
+
+def _format_divergence_counts(counts: dict[str, int]) -> str:
+    return ", ".join(f"{turn_id}={count}" for turn_id, count in counts.items())
 
 
 def _create_private_output(path: Path) -> TextIO:

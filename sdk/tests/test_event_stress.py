@@ -4,6 +4,7 @@ import asyncio
 from pathlib import Path
 
 import pytest
+import typer
 from ul.dataset_invariants import JsonValuesEqualInvariant
 from ul.event_stress import (
     CorrectionAfterFirstResponseCase,
@@ -14,6 +15,7 @@ from ul.event_stress import (
     run_correction_stress_test,
 )
 from ul.http_target import JsonHttpDatasetTargetConfig
+from ul_cli.event_stress import _print_result
 from ul_core.dataset import ObservedAgentOutput
 from ul_core.models import ConversationRole, ConversationTurn, SafetyEnvelope
 
@@ -110,6 +112,33 @@ class _DefectiveCorrectionTarget:
         return tuple(outputs)
 
 
+class _NondeterministicCorrectionTarget(_DefectiveCorrectionTarget):
+    def __init__(self) -> None:
+        super().__init__()
+        self.variation_repetition = 0
+
+    async def execute_conversation(
+        self, raw_inputs: tuple[str, ...]
+    ) -> tuple[ObservedAgentOutput, ...]:
+        outputs = await super().execute_conversation(raw_inputs)
+        if len(raw_inputs) != 2:
+            return outputs
+        self.variation_repetition += 1
+        if self.variation_repetition != 2:
+            return outputs
+        drifted_outputs: list[ObservedAgentOutput] = []
+        for output in outputs:
+            snapshot = dict(output.metadata["committed_state_snapshot"])
+            snapshot["baseline_drift"] = True
+            drifted_outputs.append(
+                ObservedAgentOutput(
+                    raw_output={"message": f"drifted: {output.raw_output['message']}"},
+                    metadata={"committed_state_snapshot": snapshot},
+                )
+            )
+        return tuple(drifted_outputs)
+
+
 @pytest.mark.asyncio
 async def test_finds_repeatable_correction_failure_and_preserves_ordered_evidence() -> None:
     target = _DefectiveCorrectionTarget()
@@ -144,6 +173,46 @@ async def test_finds_repeatable_correction_failure_and_preserves_ordered_evidenc
         ]
         * 3
     )
+
+
+@pytest.mark.asyncio
+async def test_first_divergence_uses_conversation_order_and_flags_nondeterminism(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    result = await run_correction_stress_test(
+        _case(),
+        _NondeterministicCorrectionTarget(),
+        invariant_rules=(_invariant(),),
+        repetitions=2,
+        max_target_calls=24,
+    )
+
+    assert [
+        [
+            divergence.variation_turn_id
+            for divergence in trial.divergences
+            if divergence.response_diverged
+        ]
+        for trial in result.trials
+    ] == [["corrected-request"], ["initial-request", "corrected-request"]]
+    assert result.first_response_divergence_turn_id == "initial-request"
+    assert result.response_divergence_counts == {
+        "initial-request": 1,
+        "corrected-request": 2,
+    }
+    assert result.response_divergence_stability == "unstable"
+    assert result.first_committed_state_divergence_turn_id == "initial-request"
+    assert result.committed_state_divergence_stability == "unstable"
+    assert result.baseline_drift_observed is True
+
+    with pytest.raises(typer.Exit):
+        _print_result(result, Path("private-evidence.json"))
+    report = capsys.readouterr().out
+    assert (
+        "Response divergence stability: unstable; "
+        "counts=initial-request=1, corrected-request=2" in report
+    )
+    assert "do not attribute the corrected-arm failure to the correction alone" in report
 
 
 def test_dry_run_plan_enforces_complete_pair_budget_without_target_calls() -> None:
