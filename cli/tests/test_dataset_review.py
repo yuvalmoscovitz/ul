@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import stat
 import sys
 from datetime import UTC, datetime
@@ -32,6 +33,7 @@ from ul_cli.main import app
 
 runner = CliRunner()
 FINDING_ID = f"ulf_v1_{'a' * 64}"
+_ANSI_ESCAPE_PATTERN = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 
 
 def _effect(invoice_reference: str) -> dict[str, Any]:
@@ -751,9 +753,10 @@ def test_sensitive_value_disclosure_requires_one_invariant_finding(tmp_path: Pat
     )
 
     assert missing_finding.exit_code != 0
-    assert "requires --finding FINDING_ID" in " ".join(missing_finding.output.split())
+    missing_output = " ".join(_ANSI_ESCAPE_PATTERN.sub("", missing_finding.output).split())
+    assert "requires --finding FINDING_ID" in missing_output
     assert semantic_finding.exit_code != 0
-    semantic_output = " ".join(semantic_finding.output.split())
+    semantic_output = " ".join(_ANSI_ESCAPE_PATTERN.sub("", semantic_finding.output).split())
     assert "only for a reviewable" in semantic_output
     assert "invariant finding" in semantic_output
 
