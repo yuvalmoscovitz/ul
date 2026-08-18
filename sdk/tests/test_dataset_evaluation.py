@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from collections.abc import Iterable
+from pathlib import Path
 from typing import Literal, cast
 
 import pytest
-from pydantic import JsonValue, ValidationError
+from pydantic import JsonValue, SecretStr, ValidationError
 from ul.dataset_augmentation import DatasetAugmentationEngine
 from ul.dataset_evaluation import (
     DatasetEvaluationBaseline,
@@ -17,6 +19,14 @@ from ul.dataset_evaluation import (
     DatasetEvaluationTrialSet,
 )
 from ul.dataset_evaluation import DatasetEvaluationRunner as _DatasetEvaluationRunner
+from ul.redaction import (
+    LocalPseudonymStore,
+    RedactedSemanticPipeline,
+    RedactionEngine,
+    RedactionPolicy,
+    RedactionRule,
+)
+from ul_cli.dataset import _customer_evidence_record
 from ul_core.contracts import DatasetTargetLifecycleError
 from ul_core.dataset import (
     CommunicationAct,
@@ -282,6 +292,18 @@ class DeterministicTarget:
         )
 
 
+class SecretBearingTarget(DeterministicTarget):
+    async def execute(self, raw_input: str) -> ObservedAgentOutput:
+        output = await super().execute(raw_input)
+        assert isinstance(output.raw_output, dict)
+        return output.model_copy(
+            update={
+                "raw_output": {**output.raw_output, "private_secret": "target-secret"},
+                "metadata": {"trace_private": "target-secret"},
+            }
+        )
+
+
 class BlockingTarget(DeterministicTarget):
     async def execute(self, raw_input: str) -> ObservedAgentOutput:
         self.raw_inputs.append(raw_input)
@@ -444,6 +466,48 @@ async def test_runner_executes_only_accepted_candidates_and_keeps_rejected_candi
         == accepted.target_output.raw_output
     )
     assert DatasetEvaluationResult.model_validate_json(result.model_dump_json()) == result
+
+
+async def test_redacted_runner_evidence_never_persists_target_secrets(tmp_path: Path) -> None:
+    private_directory = tmp_path / "private"
+    private_directory.mkdir(mode=0o700)
+    engine = RedactionEngine(
+        RedactionPolicy(
+            rules=(
+                RedactionRule(
+                    name="target_secret",
+                    locations=("output",),
+                    literal="target-secret",
+                ),
+            )
+        ),
+        LocalPseudonymStore(
+            private_directory / "pseudonyms.json",
+            SecretStr("a-private-test-key-with-at-least-32-bytes"),
+        ),
+    )
+    semantic_pipeline = DeterministicSemanticPipeline((_source_outcomes()[0],))
+    boundary = RedactedSemanticPipeline(semantic_pipeline, engine)
+    target = SecretBearingTarget()
+    runner = DatasetEvaluationRunner(
+        DatasetAugmentationEngine(boundary, boundary),
+        boundary,
+        boundary.wrap_target(target),
+    )
+    source = boundary.protect_record(_source())
+    assert isinstance(source, InteractionRecord)
+
+    result = await runner.run(source, operator_ids=("tone.frustrated",))
+    evidence = _customer_evidence_record(
+        result,
+        repetitions=1,
+        max_target_calls=10,
+        planned_target_calls=2,
+    )
+    serialized_evidence = json.dumps(evidence, sort_keys=True)
+
+    assert "target-secret" not in serialized_evidence
+    assert "__UL_SECRET_target_secret_" in serialized_evidence
 
 
 async def test_current_baseline_drift_is_not_blame_on_augmentation() -> None:

@@ -119,6 +119,18 @@ from ul.http_target import (
     load_json_http_dataset_target_config,
 )
 from ul.otlp_ingest import OtlpIngestResult, OtlpInteractionRecord, parse_otlp_traces
+from ul.redaction import (
+    LocalPseudonymStore,
+    RedactedSemanticPipeline,
+    RedactionBoundaryError,
+    RedactionCoverage,
+    RedactionEngine,
+    RedactionPolicy,
+    RedactionResult,
+    RedactionRule,
+    RehydratingDatasetTarget,
+    load_redaction_policy,
+)
 
 __all__ = [
     "Action",
@@ -180,6 +192,7 @@ __all__ = [
     "JsonValueEqualsLiteralInvariant",
     "JsonValueInAllowedSetInvariant",
     "JsonValuesEqualInvariant",
+    "LocalPseudonymStore",
     "MaterializedScenario",
     "MultiTurnDatasetTargetExecutor",
     "MultiTurnRegressionCase",
@@ -191,6 +204,14 @@ __all__ = [
     "OtlpInteractionRecord",
     "PromptManager",
     "PromptTemplateInfo",
+    "RedactedSemanticPipeline",
+    "RedactionBoundaryError",
+    "RedactionCoverage",
+    "RedactionEngine",
+    "RedactionPolicy",
+    "RedactionResult",
+    "RedactionRule",
+    "RehydratingDatasetTarget",
     "RenderedUserInput",
     "SafetyEnvelope",
     "Scenario",
@@ -216,6 +237,7 @@ __all__ = [
     "load_dataset_semantic_settings",
     "load_json_http_dataset_target_config",
     "load_multi_turn_regression_case",
+    "load_redaction_policy",
     "parse_otlp_traces",
     "plan_correction_stress_test",
     "replay_dataset_regression",

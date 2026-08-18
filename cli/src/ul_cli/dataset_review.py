@@ -159,6 +159,13 @@ class DatasetEvidenceSemanticSettings(_StrictModel):
     timeout_seconds: float = Field(gt=0)
 
 
+class DatasetEvidenceRedactionCoverage(_StrictModel):
+    location: Literal["input", "output"]
+    matched_values: int = Field(ge=0)
+    matched_paths: tuple[str, ...] = ()
+    matches_by_rule: dict[str, int] = Field(default_factory=dict)
+
+
 class DatasetEvidenceRunContext(_StrictModel):
     schema_version: Literal["1.0.0"] = "1.0.0"
     pipeline_version: Literal["1.1.0"] = _DATASET_EVALUATION_PIPELINE_VERSION
@@ -169,15 +176,20 @@ class DatasetEvidenceRunContext(_StrictModel):
     target_config: JsonHttpDatasetTargetConfig
     target_config_sha256: str = Field(pattern=_SHA256_PATTERN)
     semantic_settings: DatasetEvidenceSemanticSettings
+    redaction_policy_sha256: str | None = Field(default=None, pattern=_SHA256_PATTERN)
+    redaction_coverage: tuple[DatasetEvidenceRedactionCoverage, ...] = ()
     context_sha256: str = Field(pattern=_SHA256_PATTERN)
 
     @model_validator(mode="after")
     def validate_digests(self) -> Self:
         if self.target_config_sha256 != dataset_regression_target_config_sha256(self.target_config):
             raise ValueError("run context target config digest must match its snapshot")
-        expected_context_sha256 = _canonical_json_sha256(
-            self.model_dump(mode="json", exclude={"context_sha256"})
-        )
+        context_content = self.model_dump(mode="json", exclude={"context_sha256"})
+        if self.redaction_policy_sha256 is None:
+            context_content.pop("redaction_policy_sha256")
+        if not self.redaction_coverage:
+            context_content.pop("redaction_coverage")
+        expected_context_sha256 = _canonical_json_sha256(context_content)
         if self.context_sha256 != expected_context_sha256:
             raise ValueError("run context digest must match its canonical content")
         return self
@@ -255,6 +267,8 @@ def create_dataset_evidence_run_context(
     invariant_suite_sha256: str | None,
     target_config: JsonHttpDatasetTargetConfig,
     semantic_settings: DatasetEvidenceSemanticSettings,
+    redaction_policy_sha256: str | None = None,
+    redaction_coverage: tuple[DatasetEvidenceRedactionCoverage, ...] = (),
 ) -> DatasetEvidenceRunContext:
     selected_dataset_sha256 = _canonical_json_sha256(
         [record.model_dump(mode="json") for record in selected_records]
@@ -275,6 +289,12 @@ def create_dataset_evidence_run_context(
         "target_config_sha256": target_config_sha256,
         "semantic_settings": semantic_settings.model_dump(mode="json"),
     }
+    if redaction_policy_sha256 is not None:
+        content["redaction_policy_sha256"] = redaction_policy_sha256
+    if redaction_coverage:
+        content["redaction_coverage"] = [
+            item.model_dump(mode="json") for item in redaction_coverage
+        ]
     return DatasetEvidenceRunContext(
         selected_dataset_sha256=selected_dataset_sha256,
         operators=operator_snapshots,
@@ -283,6 +303,8 @@ def create_dataset_evidence_run_context(
         target_config=target_config,
         target_config_sha256=target_config_sha256,
         semantic_settings=semantic_settings,
+        redaction_policy_sha256=redaction_policy_sha256,
+        redaction_coverage=redaction_coverage,
         context_sha256=_canonical_json_sha256(content),
     )
 

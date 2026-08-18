@@ -12,7 +12,7 @@ from typing import Annotated, TextIO, cast
 
 import httpx
 import typer
-from pydantic import JsonValue, ValidationError
+from pydantic import JsonValue, SecretStr, ValidationError
 from rich.console import Console
 from rich.table import Table
 from ul import (
@@ -25,9 +25,13 @@ from ul import (
     DatasetSemanticSettings,
     DatasetTargetLifecycleFailure,
     InteractionRecord,
+    LocalPseudonymStore,
+    RedactedSemanticPipeline,
+    RedactionEngine,
     builtin_dataset_augmentation_operators,
     create_semantic_model_deconstructor,
     load_dataset_semantic_settings,
+    load_redaction_policy,
 )
 from ul.dataset_invariants import (
     DatasetInvariantArrayUniqueTrialEvaluation,
@@ -51,6 +55,7 @@ from ul_core.dataset import ObservedOutcome
 
 from ul_cli.dataset_ingest import app as ingest_app
 from ul_cli.dataset_review import (
+    DatasetEvidenceRedactionCoverage,
     DatasetEvidenceRunContext,
     DatasetEvidenceSemanticSettings,
     DatasetResumeEvidence,
@@ -76,6 +81,7 @@ _MAXIMUM_DATASET_BYTES = 10_000_000
 _MAXIMUM_DATASET_RECORDS = 100
 _MAXIMUM_EVIDENCE_BYTES = 128_000_000
 _DEFAULT_MAXIMUM_TARGET_CALLS = 100
+_REDACTION_KEY_ENVIRONMENT_VARIABLE = "UL_DATASET_REDACTION_KEY"
 _DATASET_OPERATORS = builtin_dataset_augmentation_operators()
 _DATASET_OPERATOR_IDS = tuple(operator.id for operator in _DATASET_OPERATORS)
 _DATASET_OPERATORS_BY_ID = {operator.id: operator for operator in _DATASET_OPERATORS}
@@ -279,6 +285,19 @@ def evaluate_dataset(
             ),
         ),
     ] = None,
+    redaction_policy: Annotated[
+        Path | None,
+        typer.Option(
+            exists=True,
+            dir_okay=False,
+            readable=True,
+            help="Explicit literal/JSON-pointer policy for semantic-provider data.",
+        ),
+    ] = None,
+    redaction_state: Annotated[
+        Path | None,
+        typer.Option(help="Private local reversible pseudonym mapping state."),
+    ] = None,
 ) -> None:
     """Explore behavioral differences against an isolated black-box agent.
 
@@ -308,6 +327,15 @@ def evaluate_dataset(
             load_dataset_invariant_suite(invariants) if invariants is not None else None
         )
         selected_records = records[:limit]
+        redaction_engine = _load_redaction_engine(
+            redaction_policy,
+            redaction_state,
+            state_required=not dry_run or resume is not None,
+        )
+        redaction_coverage = _redaction_coverage(selected_records, redaction_engine)
+        if redaction_engine is not None and (not dry_run or resume is not None):
+            selected_records = _protect_interaction_records(selected_records, redaction_engine)
+        all_selected_records = selected_records
         if not dry_run and resume is None:
             if target_config is None:
                 raise typer.BadParameter(
@@ -373,6 +401,10 @@ def evaluate_dataset(
                 invariant_suite=invariant_suite,
                 target_config=normalized_target_config,
                 settings=settings,
+                redaction_policy_sha256=(
+                    redaction_engine.policy.digest if redaction_engine is not None else None
+                ),
+                redaction_coverage=redaction_coverage,
             )
             if normalized_target_config is not None
             else None
@@ -438,6 +470,10 @@ def evaluate_dataset(
             output=output,
             semantic_provider_id=settings.semantic_provider_id,
             semantic_endpoint_sha256=settings.semantic_endpoint_sha256,
+            redaction_policy_sha256=(
+                redaction_engine.policy.digest if redaction_engine is not None else None
+            ),
+            redaction_coverage=redaction_coverage,
         )
         return
 
@@ -514,7 +550,7 @@ def evaluate_dataset(
             output_stream, locked_resume_evidence = _open_resume_output(
                 output,
                 expected_context=run_context,
-                selected_records=tuple(records[:limit]),
+                selected_records=all_selected_records,
                 invariant_suite=invariant_suite,
             )
             if locked_resume_evidence != resume_evidence:
@@ -550,6 +586,7 @@ def evaluate_dataset(
                     run_context=run_context,
                     invariant_suite=invariant_suite,
                     invariant_evaluations=invariant_evaluations,
+                    redaction_engine=redaction_engine,
                 )
             else:
                 evaluation_coroutine = _evaluate_interaction_records(
@@ -567,6 +604,7 @@ def evaluate_dataset(
                         * target_calls_per_execution
                     ),
                     run_context=run_context,
+                    redaction_engine=redaction_engine,
                 )
             results = asyncio.run(evaluation_coroutine)
             for result in results:
@@ -726,6 +764,82 @@ def _validate_operator_ids(operator_ids: list[str] | None) -> tuple[str, ...]:
     return selected_ids
 
 
+def _load_redaction_engine(
+    policy_path: Path | None,
+    state_path: Path | None,
+    *,
+    state_required: bool,
+) -> RedactionEngine | None:
+    if policy_path is None:
+        if state_path is not None:
+            raise ValueError("--redaction-state requires --redaction-policy")
+        return None
+    policy = load_redaction_policy(policy_path)
+    if not state_required:
+        return RedactionEngine(
+            policy,
+            LocalPseudonymStore(Path("unused-redaction-state"), SecretStr("0" * 32)),
+        )
+    if state_path is None:
+        raise ValueError("--redaction-policy requires --redaction-state for execution and resume")
+    key = os.environ.get(_REDACTION_KEY_ENVIRONMENT_VARIABLE, "")
+    if len(key.encode()) < 32:
+        raise ValueError(f"set {_REDACTION_KEY_ENVIRONMENT_VARIABLE} to at least 32 UTF-8 bytes")
+    return RedactionEngine(policy, LocalPseudonymStore(state_path, SecretStr(key)))
+
+
+def _redaction_coverage(
+    records: tuple[InteractionRecord, ...],
+    engine: RedactionEngine | None,
+) -> tuple[DatasetEvidenceRedactionCoverage, ...]:
+    if engine is None:
+        return ()
+    coverage_by_location: list[DatasetEvidenceRedactionCoverage] = []
+    for location in ("input", "output"):
+        matched_values = 0
+        matched_paths: set[str] = set()
+        matches_by_rule: dict[str, int] = {}
+        for record in records:
+            value: JsonValue = (
+                record.raw_input if location == "input" else record.raw_observed_output
+            )
+            coverage = engine.transform(value, location=location, dry_run=True).coverage
+            matched_values += coverage.matched_values
+            matched_paths.update(coverage.matched_paths)
+            for rule_name, count in coverage.matches_by_rule.items():
+                matches_by_rule[rule_name] = matches_by_rule.get(rule_name, 0) + count
+        coverage_by_location.append(
+            DatasetEvidenceRedactionCoverage(
+                location=location,
+                matched_values=matched_values,
+                matched_paths=tuple(sorted(matched_paths)),
+                matches_by_rule=dict(sorted(matches_by_rule.items())),
+            )
+        )
+    return tuple(coverage_by_location)
+
+
+def _protect_interaction_records(
+    records: tuple[InteractionRecord, ...], engine: RedactionEngine
+) -> tuple[InteractionRecord, ...]:
+    protected_records: list[InteractionRecord] = []
+    for record in records:
+        protected_input = engine.transform(record.raw_input, location="input").value
+        if not isinstance(protected_input, str):
+            raise ValueError("redaction policy did not preserve executable input as text")
+        protected_records.append(
+            record.model_copy(
+                update={
+                    "raw_input": protected_input,
+                    "raw_observed_output": engine.transform(
+                        record.raw_observed_output, location="output"
+                    ).value,
+                }
+            )
+        )
+    return tuple(protected_records)
+
+
 def _dataset_evidence_run_context(
     *,
     selected_records: tuple[InteractionRecord, ...],
@@ -734,6 +848,8 @@ def _dataset_evidence_run_context(
     invariant_suite: DatasetInvariantSuite | None,
     target_config: JsonHttpDatasetTargetConfig,
     settings: DatasetSemanticSettings,
+    redaction_policy_sha256: str | None = None,
+    redaction_coverage: tuple[DatasetEvidenceRedactionCoverage, ...] = (),
 ) -> DatasetEvidenceRunContext:
     return create_dataset_evidence_run_context(
         selected_records=selected_records,
@@ -756,6 +872,8 @@ def _dataset_evidence_run_context(
             max_response_bytes=settings.max_response_bytes,
             timeout_seconds=settings.timeout_seconds,
         ),
+        redaction_policy_sha256=redaction_policy_sha256,
+        redaction_coverage=redaction_coverage,
     )
 
 
@@ -775,6 +893,8 @@ def _print_dataset_plan(
     output: Path | None,
     semantic_provider_id: str,
     semantic_endpoint_sha256: str,
+    redaction_policy_sha256: str | None,
+    redaction_coverage: tuple[DatasetEvidenceRedactionCoverage, ...],
 ) -> None:
     potential_target_calls = (
         selected_count * repetitions * (1 + len(operator_ids)) * target_calls_per_execution
@@ -804,6 +924,14 @@ def _print_dataset_plan(
         f"Semantic provider: {semantic_provider_id} "
         f"(endpoint sha256: {semantic_endpoint_sha256[:12]})"
     )
+    if redaction_policy_sha256 is not None:
+        console.print(f"Redaction policy sha256: {redaction_policy_sha256}")
+        for coverage in redaction_coverage:
+            console.print(
+                f"Redaction coverage ({coverage.location}): "
+                f"{coverage.matched_values} selected value(s) across "
+                f"{len(coverage.matched_paths)} path(s)"
+            )
     console.print(
         f"Potential target calls: up to {potential_target_calls} "
         f"(authorized maximum: {max_target_calls})"
@@ -965,13 +1093,28 @@ async def _evaluate_interaction_records(
     run_context: DatasetEvidenceRunContext | None = None,
     invariant_suite: DatasetInvariantSuite | None = None,
     invariant_evaluations: list[DatasetInvariantEvaluation] | None = None,
+    redaction_engine: RedactionEngine | None = None,
 ) -> tuple[DatasetEvaluationResult, ...]:
     results: list[DatasetEvaluationResult] = []
     async with create_semantic_model_deconstructor(settings) as deconstructor, target:
+        semantic_pipeline = (
+            RedactedSemanticPipeline(deconstructor, redaction_engine)
+            if redaction_engine is not None
+            else deconstructor
+        )
+        evaluation_target = (
+            semantic_pipeline.wrap_target(target)
+            if isinstance(semantic_pipeline, RedactedSemanticPipeline)
+            else target
+        )
         runner = DatasetEvaluationRunner(
-            DatasetAugmentationEngine(deconstructor, deconstructor, deconstructor),
-            deconstructor,
-            target,
+            DatasetAugmentationEngine(
+                semantic_pipeline,
+                semantic_pipeline,
+                semantic_pipeline,
+            ),
+            semantic_pipeline,
+            evaluation_target,
             allow_network_egress=True,
         )
         for record in records:

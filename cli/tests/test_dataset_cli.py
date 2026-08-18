@@ -518,6 +518,60 @@ def test_dry_run_validates_and_makes_no_external_calls(
     assert "Transfer 100" not in result.output
 
 
+def test_redaction_dry_run_reports_value_free_coverage_without_key_or_state(
+    tmp_path: Path,
+) -> None:
+    dataset = tmp_path / "interactions.jsonl"
+    policy = tmp_path / "redaction.json"
+    secret = "customer-secret-value"
+    _write_dataset(
+        dataset,
+        [
+            {
+                "id": "private-interaction",
+                "input": f"Use {secret}",
+                "output": {"private": secret},
+            }
+        ],
+    )
+    policy.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "rules": [
+                    {
+                        "name": "customer_secret",
+                        "locations": ["input", "output"],
+                        "selector": "$text",
+                        "literal": secret,
+                        "action": "pseudonymize",
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = runner.invoke(
+        root_app,
+        [
+            "dataset",
+            "evaluate",
+            str(dataset),
+            "--redaction-policy",
+            str(policy),
+            "--dry-run",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "Redaction policy sha256:" in result.output
+    assert "Redaction coverage (input): 1 selected value(s) across 1 path(s)" in result.output
+    assert "Redaction coverage (output): 1 selected value(s) across 1 path(s)" in result.output
+    assert secret not in result.output
+    assert not (tmp_path / "pseudonyms.json").exists()
+
+
 def test_openai_compatible_dry_run_reports_provider_without_making_calls(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1327,8 +1381,10 @@ def test_execution_creates_private_explicit_output(
         max_target_calls: int,
         planned_target_calls: int,
         run_context: object,
+        redaction_engine: object,
     ) -> tuple[object, ...]:
         del settings, target, run_context
+        assert redaction_engine is None
         captured_records.extend(record.id for record in records)
         assert operator_ids == ("surface.disfluency_repeat",)
         assert repetitions == 3
@@ -1370,6 +1426,99 @@ def test_execution_creates_private_explicit_output(
     assert "Complete evidence" in result.output
     assert "Next: ul dataset report" in result.output
     assert "Transfer 100" not in result.output
+
+
+def test_execution_wires_redaction_into_records_pipeline_and_run_context(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    dataset = tmp_path / "interactions.jsonl"
+    output = tmp_path / "results.jsonl"
+    target_config = tmp_path / "target.json"
+    policy_path = tmp_path / "redaction.json"
+    state_path = tmp_path / "private" / "pseudonyms.json"
+    secret = "customer-secret-value"
+    key = "customer-key-with-at-least-thirty-two-bytes"
+    _write_dataset(
+        dataset,
+        [{"id": "private", "input": f"Use {secret}", "output": {"private": secret}}],
+    )
+    _write_target_config(target_config, url="http://127.0.0.1:8765/execute")
+    policy_path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "rules": [
+                    {
+                        "name": "customer_secret",
+                        "locations": ["input", "output"],
+                        "selector": "$text",
+                        "literal": secret,
+                        "action": "pseudonymize",
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("UL_DATASET_REDACTION_KEY", key)
+
+    class FakeTarget:
+        @classmethod
+        def from_config(cls, *_args: object, **_kwargs: object) -> FakeTarget:
+            return cls()
+
+    async def fake_evaluate(
+        records: tuple[InteractionRecord, ...],
+        _operator_ids: tuple[str, ...],
+        _settings: object,
+        _target: object,
+        output_stream: Any,
+        *,
+        repetitions: int,
+        max_target_calls: int,
+        planned_target_calls: int,
+        run_context: object,
+        redaction_engine: object,
+    ) -> tuple[object, ...]:
+        del repetitions, max_target_calls, planned_target_calls
+        assert redaction_engine is not None
+        assert secret not in records[0].model_dump_json()
+        serialized_context = cast(Any, run_context).model_dump_json()
+        assert secret not in serialized_context
+        assert key not in serialized_context
+        assert '"matched_values":1' in serialized_context
+        output_stream.write(serialized_context + "\n")
+        return ()
+
+    monkeypatch.setattr(main, "load_dataset_semantic_settings", _settings)
+    monkeypatch.setattr(main, "JsonHttpDatasetTarget", FakeTarget)
+    monkeypatch.setattr(main, "_evaluate_interaction_records", fake_evaluate)
+
+    result = runner.invoke(
+        root_app,
+        [
+            "dataset",
+            "evaluate",
+            str(dataset),
+            "--target-config",
+            str(target_config),
+            "--allow-insecure-http",
+            "--allow-target-network",
+            "--confirm-isolated-sandbox",
+            "--output",
+            str(output),
+            "--redaction-policy",
+            str(policy_path),
+            "--redaction-state",
+            str(state_path),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert secret not in output.read_text()
+    assert key not in output.read_text()
+    assert secret not in state_path.read_text()
+    assert stat.S_IMODE(state_path.stat().st_mode) == 0o600
 
 
 def test_target_config_runs_nested_request_and_response_against_loopback(
@@ -1451,6 +1600,7 @@ def test_target_config_runs_nested_request_and_response_against_loopback(
             max_target_calls: int,
             planned_target_calls: int,
             run_context: object,
+            redaction_engine: object,
         ) -> tuple[object, ...]:
             del (
                 operator_ids,
@@ -1460,6 +1610,7 @@ def test_target_config_runs_nested_request_and_response_against_loopback(
                 planned_target_calls,
                 run_context,
             )
+            assert redaction_engine is None
             async with target:
                 observed_outputs.append((await target.execute(records[0].raw_input)).raw_output)
             output_stream.write('{"saved":true}\n')
@@ -1673,8 +1824,10 @@ def test_resume_skips_already_processed_interaction_ids(
         max_target_calls: int,
         planned_target_calls: int,
         run_context: object,
+        redaction_engine: object,
     ) -> tuple[object, ...]:
         del operator_ids, settings, target, max_target_calls, planned_target_calls
+        assert redaction_engine is None
         assert repetitions == 1
         for record in records:
             evaluated_ids.append(record.id)

@@ -21,11 +21,16 @@ from ul import (
     JsonHttpDatasetTarget,
     JsonHttpDatasetTargetConfig,
     JsonValuesEqualInvariant,
+    LocalPseudonymStore,
     ObservedAgentOutput,
     OpenAICompatibleDatasetSettings,
     OpenRouterDatasetSettings,
     PromptManager,
     PromptTemplateInfo,
+    RedactedSemanticPipeline,
+    RedactionEngine,
+    RedactionPolicy,
+    RedactionRule,
     RenderedUserInput,
     Scenario,
     ScenarioProvenance,
@@ -45,6 +50,7 @@ from ul import (
     load_dataset_regression_case,
     load_dataset_semantic_settings,
     load_json_http_dataset_target_config,
+    load_redaction_policy,
     replay_dataset_regression,
 )
 
@@ -108,7 +114,9 @@ def test_sdk_exposes_dataset_augmentation_api() -> None:
     assert JsonHttpDatasetTarget.__name__ == "JsonHttpDatasetTarget"
     assert JsonHttpDatasetTargetConfig.__name__ == "JsonHttpDatasetTargetConfig"
     assert JsonValuesEqualInvariant.__name__ == "JsonValuesEqualInvariant"
+    assert LocalPseudonymStore.__name__ == "LocalPseudonymStore"
     assert load_json_http_dataset_target_config.__name__ == ("load_json_http_dataset_target_config")
+    assert load_redaction_policy.__name__ == "load_redaction_policy"
     assert evaluate_dataset_invariants.__name__ == "evaluate_dataset_invariants"
     assert create_dataset_regression_case.__name__ == "create_dataset_regression_case"
     assert dataset_regression_target_config_sha256.__name__ == (
@@ -125,6 +133,10 @@ def test_sdk_exposes_dataset_augmentation_api() -> None:
     assert load_dataset_semantic_settings is not None
     assert PromptManager.instance().list_templates()
     assert PromptTemplateInfo.__name__ == "PromptTemplateInfo"
+    assert RedactedSemanticPipeline.__name__ == "RedactedSemanticPipeline"
+    assert RedactionEngine.__name__ == "RedactionEngine"
+    assert RedactionPolicy.__name__ == "RedactionPolicy"
+    assert RedactionRule.__name__ == "RedactionRule"
     assert ObservedAgentOutput(raw_output={"action": "visit_booked"}).raw_output == {
         "action": "visit_booked"
     }
