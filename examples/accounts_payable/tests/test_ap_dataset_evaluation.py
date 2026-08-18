@@ -5,7 +5,7 @@ import re
 import pytest
 from ul.dataset_augmentation import DatasetAugmentationEngine
 from ul.dataset_evaluation import DatasetEvaluationRunner
-from ul.deconstruction import OpenRouterDatasetSettings, OpenRouterSemanticDeconstructor
+from ul.deconstruction import OpenRouterDatasetSettings, create_semantic_model_deconstructor
 from ul_core.contracts import DatasetTargetExecutor
 from ul_core.dataset import (
     CommunicationAct,
@@ -485,7 +485,7 @@ async def test_live_deconstructor_discovers_seeded_duplicate_payment() -> None:
         raw_input=SOURCE_INPUT,
         raw_observed_output=source_output.raw_output,
     )
-    async with OpenRouterSemanticDeconstructor(_LIVE_SETTINGS) as semantic_model:
+    async with create_semantic_model_deconstructor(_LIVE_SETTINGS) as semantic_model:
         result = await DatasetEvaluationRunner(
             DatasetAugmentationEngine(semantic_model, semantic_model),
             semantic_model,
@@ -519,7 +519,7 @@ async def test_live_pipeline_discovers_seeded_first_value_wins_defect() -> None:
             "actions": [{"action": "transfer", "amount": "120", "recipient": "alice"}]
         },
     )
-    async with OpenRouterSemanticDeconstructor(_LIVE_SETTINGS) as semantic_model:
+    async with create_semantic_model_deconstructor(_LIVE_SETTINGS) as semantic_model:
         result = await DatasetEvaluationRunner(
             DatasetAugmentationEngine(semantic_model, semantic_model),
             semantic_model,

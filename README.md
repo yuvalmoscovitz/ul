@@ -14,7 +14,8 @@ correct, prove causality, or estimate a production failure rate.
 
 ## Quickstart
 
-You need Python 3.12+, [`uv`](https://docs.astral.sh/uv/), and an OpenRouter API key.
+You need Python 3.12+, [`uv`](https://docs.astral.sh/uv/), and access to either OpenRouter or an
+OpenAI-compatible semantic-model endpoint.
 
 ```bash
 git clone https://github.com/yuvalmoscovitz/ul.git
@@ -33,7 +34,7 @@ Either granular variable takes precedence when explicitly set, including `false`
 
 ### Semantic model providers
 
-OpenRouter remains the default, so existing configurations continue to use
+OpenRouter is the default and uses
 `OPEN_ROUTER_API_KEY` and the existing `UL_DATASET_*_MODEL` variables. To send semantic-model
 requests to a customer-controlled OpenAI-compatible Chat Completions endpoint instead, configure
 the API root and a provider-scoped key:
@@ -65,11 +66,11 @@ Use an API-root URL such as `https://models.example.com/v1`, not the full
 redirects, ignores ambient proxy settings for customer-configured endpoints, and requires HTTPS
 except for exact loopback addresses such as `http://127.0.0.1:8000/v1`. The scoped key is optional
 for the generic provider; when it is unset, UL omits the authorization header so unauthenticated
-local runtimes work without a placeholder secret. OpenRouter retains its existing environment
-transport behavior and still requires `OPEN_ROUTER_API_KEY`. UL records the provider identifier,
-normalized base URL, protocol, generation ID, and resolved model in evidence, but never records an
-API key or authorization header. The explicit live-call and data-processing permissions still
-apply to customer-controlled and local endpoints.
+local runtimes work without a placeholder secret. OpenRouter retains its environment transport
+behavior and requires `OPEN_ROUTER_API_KEY`. UL records the provider identifier, a SHA-256 endpoint
+identity, protocol, generation ID, and resolved model in evidence, but never records the custom
+base URL, API key, or authorization header. The explicit live-call and data-processing permissions
+still apply to customer-controlled and local endpoints.
 
 The command starts an intentionally defective agent on localhost, gives every request clean
 synthetic state, and evaluates one synthetic accounts-payable interaction. A typical run finds
@@ -116,8 +117,8 @@ uv run ul dataset evaluate interactions.jsonl \
 ```
 
 The preflight validates the saved run context and reports completed and remaining interactions.
-Execution appends only after the compatibility check succeeds. Older evidence without run-context
-metadata, changed inputs, or changed evaluation semantics are rejected; call-budget and credential
+Execution appends only after the compatibility check succeeds. Evidence without run-context
+metadata, changed inputs, or changed evaluation semantics is rejected; call-budget and credential
 changes remain allowed because they authorize execution rather than change its meaning.
 
 Review findings without making more model or target calls:

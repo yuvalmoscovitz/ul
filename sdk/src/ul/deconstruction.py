@@ -5,6 +5,7 @@ import hashlib
 import ipaddress
 import json
 import re
+from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from types import TracebackType
 from typing import Any, Literal, Protocol, Self, cast
@@ -33,6 +34,10 @@ from ul_core.dataset import (
 from ul_core.prompts import PromptManager, prompt_provenance
 
 _PROMPTS = PromptManager.instance()
+
+
+def _sha256_text(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
 class OpenRouterDatasetSettings(BaseSettings):
@@ -114,12 +119,24 @@ class OpenRouterDatasetSettings(BaseSettings):
         return "openrouter"
 
     @property
+    def semantic_provider_type(self) -> Literal["openrouter", "openai-compatible"]:
+        return "openrouter"
+
+    @property
     def semantic_base_url(self) -> str:
         return "https://openrouter.ai/api/v1"
 
     @property
+    def semantic_endpoint_sha256(self) -> str:
+        return _sha256_text(self.semantic_base_url)
+
+    @property
     def api_key_environment_variable(self) -> str:
         return "OPEN_ROUTER_API_KEY"
+
+    @property
+    def api_key_required(self) -> bool:
+        return True
 
 
 class OpenAICompatibleDatasetSettings(BaseSettings):
@@ -228,15 +245,27 @@ class OpenAICompatibleDatasetSettings(BaseSettings):
         return self.provider_id
 
     @property
+    def semantic_provider_type(self) -> Literal["openrouter", "openai-compatible"]:
+        return "openai-compatible"
+
+    @property
     def semantic_base_url(self) -> str:
         return self.base_url
+
+    @property
+    def semantic_endpoint_sha256(self) -> str:
+        return _sha256_text(self.semantic_base_url)
 
     @property
     def api_key_environment_variable(self) -> str:
         return "UL_DATASET_OPENAI_API_KEY"
 
+    @property
+    def api_key_required(self) -> bool:
+        return False
 
-class DatasetSemanticProviderSelection(BaseSettings):
+
+class _DatasetSemanticProviderSelection(BaseSettings):
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",
@@ -254,15 +283,95 @@ type DatasetSemanticSettings = OpenRouterDatasetSettings | OpenAICompatibleDatas
 
 
 def load_dataset_semantic_settings() -> DatasetSemanticSettings:
-    selection = DatasetSemanticProviderSelection()
+    try:
+        selection = _DatasetSemanticProviderSelection()
+    except ValidationError as error:
+        raise _semantic_configuration_error(error, provider="selection") from None
     if selection.provider == "openai-compatible":
         try:
             return OpenAICompatibleDatasetSettings()
-        except ValidationError:
-            raise ValueError(
-                "OpenAI-compatible semantic provider configuration is invalid"
-            ) from None
-    return OpenRouterDatasetSettings()
+        except ValidationError as error:
+            raise _semantic_configuration_error(error, provider="openai-compatible") from None
+    try:
+        return OpenRouterDatasetSettings()
+    except ValidationError as error:
+        raise _semantic_configuration_error(error, provider="openrouter") from None
+
+
+def _semantic_configuration_error(
+    error: ValidationError,
+    *,
+    provider: Literal["selection", "openrouter", "openai-compatible"],
+) -> ValueError:
+    first_error = error.errors(include_input=False, include_url=False)[0]
+    location = first_error["loc"]
+    field_name = str(location[0]) if location else ""
+    field_name = {
+        "UL_DATASET_SEMANTIC_PROVIDER": "provider",
+        "UL_DATASET_OPENAI_BASE_URL": "base_url",
+        "UL_DATASET_OPENAI_PROVIDER_ID": "provider_id",
+        "UL_DATASET_MODEL": "model",
+        "UL_DATASET_RENDER_MODEL": "render_model",
+        "UL_DATASET_EQUIVALENCE_MODEL": "equivalence_model",
+        "UL_DATASET_MAX_INPUT_CHARS": "max_input_chars",
+        "UL_DATASET_MAX_OUTPUT_TOKENS": "max_output_tokens",
+        "UL_DATASET_MAX_RENDER_TOKENS": "max_render_tokens",
+        "UL_DATASET_MAX_RESPONSE_BYTES": "max_response_bytes",
+        "UL_DATASET_TIMEOUT_SECONDS": "timeout_seconds",
+        "UL_DATASET_LIVE_CALLS": "live_calls",
+        "UL_DATASET_ALLOW_EXTERNAL_DATA_PROCESSING": "allow_external_data_processing",
+        "UL_LIVE": "ul_live",
+    }.get(field_name, field_name)
+    if not field_name:
+        safe_detail = str(first_error.get("ctx", {}).get("error", ""))
+        field_name = next(
+            (
+                candidate
+                for environment_name, candidate in {
+                    "UL_DATASET_OPENAI_BASE_URL": "base_url",
+                    "UL_DATASET_OPENAI_PROVIDER_ID": "provider_id",
+                    "UL_DATASET_RENDER_MODEL": "render_model",
+                    "UL_DATASET_EQUIVALENCE_MODEL": "equivalence_model",
+                    "UL_DATASET_MODEL": "model",
+                }.items()
+                if environment_name in safe_detail
+            ),
+            "",
+        )
+    messages = {
+        "provider": "UL_DATASET_SEMANTIC_PROVIDER must be openrouter or openai-compatible",
+        "base_url": (
+            "UL_DATASET_OPENAI_BASE_URL must be an HTTPS API root without credentials, query, "
+            "fragment, or /chat/completions; loopback HTTP is allowed"
+        ),
+        "provider_id": (
+            "UL_DATASET_OPENAI_PROVIDER_ID must be 1-100 lowercase letters, digits, dots, "
+            "underscores, or hyphens and must not be openrouter"
+        ),
+        "model": "UL_DATASET_MODEL must be 1-200 non-whitespace characters",
+        "render_model": (
+            "UL_DATASET_RENDER_MODEL must be 1-200 non-whitespace characters when set"
+        ),
+        "equivalence_model": (
+            "UL_DATASET_EQUIVALENCE_MODEL must be 1-200 non-whitespace characters when set"
+        ),
+        "max_input_chars": "UL_DATASET_MAX_INPUT_CHARS must be between 1 and 1000000",
+        "max_output_tokens": "UL_DATASET_MAX_OUTPUT_TOKENS must be between 1 and 32768",
+        "max_render_tokens": "UL_DATASET_MAX_RENDER_TOKENS must be between 1 and 4096",
+        "max_response_bytes": ("UL_DATASET_MAX_RESPONSE_BYTES must be between 1024 and 5000000"),
+        "timeout_seconds": "UL_DATASET_TIMEOUT_SECONDS must be greater than 0 and at most 300",
+        "live_calls": "UL_DATASET_LIVE_CALLS must be true or false",
+        "allow_external_data_processing": (
+            "UL_DATASET_ALLOW_EXTERNAL_DATA_PROCESSING must be true or false"
+        ),
+        "ul_live": "UL_LIVE must be true or false",
+    }
+    fallback = (
+        "OpenRouter semantic provider configuration is invalid"
+        if provider == "openrouter"
+        else "OpenAI-compatible semantic provider configuration is invalid"
+    )
+    return ValueError(messages.get(field_name, fallback))
 
 
 def _validated_openai_compatible_base_url(value: str) -> str:
@@ -334,7 +443,7 @@ class _ChatCompletionResponse(BaseModel):
     model: str = Field(min_length=1, max_length=200)
     provider: str | None = Field(default=None, max_length=200)
     choices: tuple[_ResponseChoice, ...] = Field(min_length=1)
-    usage: _UsageMetadata = Field(default_factory=_UsageMetadata)
+    usage: _UsageMetadata | None = None
 
 
 class _RenderedInput(BaseModel):
@@ -349,6 +458,9 @@ class SemanticCompletionProvider(Protocol):
 
     @property
     def base_url(self) -> str: ...
+
+    @property
+    def endpoint_sha256(self) -> str: ...
 
     @property
     def extractor_version(self) -> str: ...
@@ -378,8 +490,9 @@ class SemanticCompletionProvider(Protocol):
 class OpenAICompatibleSemanticProvider:
     provider_id: str
     base_url: str
-    extractor_version: str = "openai-compatible-semantic-deconstructor/1.0.0"
-    equivalence_verifier_version: str = "openai-compatible-semantic-equivalence-verifier/1.0.0"
+    endpoint_sha256: str
+    extractor_version: str = "semantic-deconstructor/2.0.0"
+    equivalence_verifier_version: str = "semantic-equivalence-verifier/2.0.0"
     requires_api_key: bool = False
     trust_environment_transport: bool = False
 
@@ -394,11 +507,11 @@ class OpenAICompatibleSemanticProvider:
         self,
         response: _ChatCompletionResponse,
     ) -> dict[str, JsonValue]:
-        usage = response.usage.evidence_value()
+        usage = response.usage.evidence_value() if response.usage is not None else {}
         return {
             "semantic_provider": self.provider_id,
             "semantic_protocol": "openai-chat-completions",
-            "semantic_base_url": self.base_url,
+            "semantic_endpoint_sha256": self.endpoint_sha256,
             "semantic_generation_id": response.id,
             "semantic_model": response.model,
             "semantic_upstream_provider": response.provider,
@@ -410,8 +523,7 @@ class OpenAICompatibleSemanticProvider:
 class OpenRouterSemanticProvider(OpenAICompatibleSemanticProvider):
     provider_id: str = "openrouter"
     base_url: str = "https://openrouter.ai/api/v1"
-    extractor_version: str = "openrouter-semantic-deconstructor/1.0.0"
-    equivalence_verifier_version: str = "openrouter-semantic-equivalence-verifier/1.0.0"
+    endpoint_sha256: str = _sha256_text("https://openrouter.ai/api/v1")
     requires_api_key: bool = True
     trust_environment_transport: bool = True
 
@@ -425,19 +537,6 @@ class OpenRouterSemanticProvider(OpenAICompatibleSemanticProvider):
             "require_parameters": True,
             "data_collection": "deny",
             "zdr": True,
-        }
-
-    def generation_metadata(
-        self,
-        response: _ChatCompletionResponse,
-    ) -> dict[str, JsonValue]:
-        return {
-            **super().generation_metadata(response),
-            "openrouter_generation_id": response.id,
-            "openrouter_model": response.model,
-            "openrouter_provider": response.provider,
-            "openrouter_usage": response.usage.evidence_value(),
-            "openrouter_cost": response.usage.cost,
         }
 
 
@@ -680,9 +779,9 @@ class SemanticModelDeconstructor:
             if top_p is not None:
                 request_body["top_p"] = top_p
             endpoint = f"{self.provider.base_url}/chat/completions"
-            request_headers = (
-                {"Authorization": f"Bearer {api_key}"} if api_key is not None else None
-            )
+            request_headers = {"Accept-Encoding": "identity"}
+            if api_key is not None:
+                request_headers["Authorization"] = f"Bearer {api_key}"
             async with self._client.stream(
                 "POST",
                 endpoint,
@@ -696,14 +795,26 @@ class SemanticModelDeconstructor:
                 if 300 <= response.status_code < 400:
                     raise ValueError("semantic provider redirects are not allowed")
                 response.raise_for_status()
+                content_encoding = response.headers.get("content-encoding", "identity")
+                if content_encoding.strip().lower() != "identity":
+                    raise ValueError("semantic provider response Content-Encoding is not allowed")
                 chunks: list[bytes] = []
                 response_size = 0
-                async for chunk in response.aiter_bytes():
+                response_chunks = (
+                    _single_chunk(response.content)
+                    if response.is_stream_consumed
+                    else response.aiter_raw()
+                )
+                async for chunk in response_chunks:
                     response_size += len(chunk)
                     if response_size > self.settings.max_response_bytes:
                         raise ValueError("semantic provider response exceeds max_response_bytes")
                     chunks.append(chunk)
         completion_response = _ChatCompletionResponse.model_validate_json(b"".join(chunks))
+        if _contains_secret(
+            completion_response.model_dump(mode="json"), self.settings.semantic_base_url
+        ):
+            raise ValueError("semantic provider response contains the configured endpoint URL")
         if api_key is not None and _contains_secret(
             completion_response.model_dump(mode="json"), api_key
         ):
@@ -1005,49 +1116,28 @@ class SemanticModelDeconstructor:
         return self.provider.generation_metadata(response)
 
 
-class OpenRouterSemanticDeconstructor(SemanticModelDeconstructor):
-    def __init__(
-        self,
-        settings: OpenRouterDatasetSettings | None = None,
-        *,
-        client: httpx.AsyncClient | None = None,
-    ) -> None:
-        super().__init__(
-            settings or OpenRouterDatasetSettings(),
-            OpenRouterSemanticProvider(),
-            client=client,
-        )
-
-
-class OpenAICompatibleSemanticDeconstructor(SemanticModelDeconstructor):
-    def __init__(
-        self,
-        settings: OpenAICompatibleDatasetSettings,
-        *,
-        client: httpx.AsyncClient | None = None,
-    ) -> None:
-        super().__init__(
-            settings,
-            OpenAICompatibleSemanticProvider(
-                provider_id=settings.provider_id,
-                base_url=settings.base_url,
-            ),
-            client=client,
-        )
-
-
 def create_semantic_model_deconstructor(
     settings: DatasetSemanticSettings,
     *,
     client: httpx.AsyncClient | None = None,
 ) -> SemanticModelDeconstructor:
     if isinstance(settings, OpenAICompatibleDatasetSettings):
-        return OpenAICompatibleSemanticDeconstructor(settings, client=client)
-    return OpenRouterSemanticDeconstructor(settings, client=client)
+        provider: SemanticCompletionProvider = OpenAICompatibleSemanticProvider(
+            provider_id=settings.semantic_provider_id,
+            base_url=settings.semantic_base_url,
+            endpoint_sha256=settings.semantic_endpoint_sha256,
+        )
+    else:
+        provider = OpenRouterSemanticProvider()
+    return SemanticModelDeconstructor(settings, provider, client=client)
 
 
 def _same_origin(left: httpx.URL, right: httpx.URL) -> bool:
     return (left.scheme, left.host, left.port) == (right.scheme, right.host, right.port)
+
+
+async def _single_chunk(content: bytes) -> AsyncIterator[bytes]:
+    yield content
 
 
 def _contains_secret(value: object, secret: str) -> bool:

@@ -1021,8 +1021,8 @@ def test_report_and_review_make_no_model_or_network_calls(
     def unexpected_call(*args: object, **kwargs: object) -> None:
         raise AssertionError("report/review attempted an external call")
 
-    monkeypatch.setattr("ul_cli.dataset.OpenRouterDatasetSettings", unexpected_call)
-    monkeypatch.setattr("ul_cli.dataset.OpenRouterSemanticDeconstructor", unexpected_call)
+    monkeypatch.setattr("ul_cli.dataset.load_dataset_semantic_settings", unexpected_call)
+    monkeypatch.setattr("ul_cli.dataset.create_semantic_model_deconstructor", unexpected_call)
     monkeypatch.setattr("ul_cli.dataset.JsonHttpDatasetTarget", unexpected_call)
 
     report = runner.invoke(app, ["dataset", "report", str(evidence)])
