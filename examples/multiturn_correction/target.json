@@ -1,0 +1,25 @@
+{
+  "version": 2,
+  "headers_from_env": {},
+  "reset": {
+    "url": "http://127.0.0.1:8765/reset",
+    "request_json": {},
+    "generation_json_pointer": "/generation",
+    "clean_state_json_pointer": "/clean",
+    "clean_state_value": true
+  },
+  "setup": {
+    "url": "http://127.0.0.1:8765/setup",
+    "request_json": {}
+  },
+  "execute_turn": {
+    "url": "http://127.0.0.1:8765/execute",
+    "request_json_template": {"input": "{{input}}"},
+    "response_json_pointer": "/response"
+  },
+  "snapshot": {
+    "url": "http://127.0.0.1:8765/snapshot",
+    "request_json": {},
+    "response_json_pointer": "/state"
+  }
+}

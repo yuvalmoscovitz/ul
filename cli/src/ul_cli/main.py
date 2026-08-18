@@ -21,6 +21,7 @@ from examples.accounts_payable.ul_adapter import (
 )
 from ul_cli.dataset import app as dataset_app
 from ul_cli.dataset_regression import app as regression_app
+from ul_cli.event_stress import app as stress_app
 
 app = typer.Typer(
     name="ul",
@@ -32,6 +33,7 @@ demo_app = typer.Typer(help="Run an isolated proving-ground agent.")
 app.add_typer(augmentations_app, name="augmentations")
 app.add_typer(dataset_app, name="dataset")
 app.add_typer(regression_app, name="regression")
+app.add_typer(stress_app, name="stress")
 app.add_typer(demo_app, name="demo")
 
 console = Console()

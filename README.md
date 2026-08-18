@@ -275,6 +275,36 @@ versioned artifacts only when that matches your access-control and retention pol
 See [the quickstart details](examples/quickstart/README.md) for the expanded command and file
 layout.
 
+## Import agent traces
+
+Turn an OTLP JSON or OTLP File Exporter JSON Lines export into trace-native UL scenarios with the
+built-in OpenTelemetry GenAI and OpenInference mapping:
+
+```bash
+uv run ul dataset ingest otlp traces.json \
+  --mapping examples/otlp_mapping.json \
+  --dry-run
+uv run ul dataset ingest otlp traces.json \
+  --mapping examples/otlp_mapping.json \
+  --output interactions.jsonl
+```
+
+Dry-run reports only counts and mapping gaps; it never prints trace values. Each imported output
+contains ordered messages, parent-child span topology, tool calls and results, errors and retries,
+mapped state snapshots and deltas, session identity, agent version, and source references. Unknown
+attributes are dropped. Cumulative per-span histories are retained on their spans but collapsed into
+one compatible top-level conversation; traces with conflicting histories are skipped and reported.
+Each output record is capped at 1 MB, and the output is created with mode `0600` on Unix.
+
+[`examples/otlp_mapping.json`](examples/otlp_mapping.json) explicitly enables raw message, tool,
+error, and state content. Those values can contain credentials, personal data, or business data.
+Keep raw content disabled unless the export is approved for local processing, customize the
+allowlisted attribute names under `attributes`, and apply your retention policy to the resulting
+dataset. The default conventions cover current structured `gen_ai.input.messages` /
+`gen_ai.output.messages`, flattened OpenInference `llm.input_messages` /
+`llm.output_messages`, and the earlier `gen_ai.prompt` / `gen_ai.completion` form. UL reads a file
+export only; it does not connect to a telemetry backend or guess arbitrary vendor fields.
+
 ## Connect your own agent
 
 Create a target description and adapt its nested request and response paths:
@@ -318,6 +348,47 @@ in the `execute_turn` template for now.
 Each physical lifecycle request counts toward `--max-target-calls`. A configuration with setup
 uses five calls per repetition; without setup it uses four. `committed_state_snapshot` is
 evaluable only when the snapshot call succeeds.
+
+### Stress a later correction across turns
+
+UL includes one trace-independent multi-turn event operator:
+`event.correction_after_first_response`. A correction case contains exactly two ordered user
+turns. For each repetition UL runs a fresh one-turn baseline, resets the sandbox, then runs the
+initial turn and correction together in one lifecycle. It captures the agent response and a
+committed-state snapshot after both variation turns, then cleans up before the next pair.
+
+```bash
+uv run ul stress correction examples/multiturn_correction/case.json \
+  --target-config examples/multiturn_correction/target.json \
+  --invariants examples/multiturn_correction/invariants.json \
+  --allow-target-network --allow-insecure-http --confirm-isolated-sandbox \
+  --max-target-calls 36 --output tmp/multiturn-correction-evidence.json
+```
+
+Use `--dry-run` to validate the exact conversation, target, invariant suite, and physical call
+budget without making a request. With setup, one paired repetition uses 12 calls: five for the
+baseline and seven for the two-turn variation. Evidence identifies the first turn whose response
+or committed state differs from the baseline and retains every ordered intermediate observation.
+The customer-declared invariant evaluates the final corrected state; UL does not infer whether a
+changed state is correct.
+
+Save and replay the exact conversation without semantic-model calls:
+
+```bash
+uv run ul stress save examples/multiturn_correction/case.json \
+  --target-config examples/multiturn_correction/target.json \
+  --invariants examples/multiturn_correction/invariants.json \
+  --confirm-versioned-input --output tmp/correction-regression.json
+
+uv run ul stress replay tmp/correction-regression.json \
+  --target-config examples/multiturn_correction/target.json \
+  --allow-target-network --allow-insecure-http --confirm-isolated-sandbox \
+  --max-target-calls 36 --output tmp/correction-replay.json
+```
+
+Saved cases contain the exact conversation and invariant literals and can therefore be sensitive.
+The embedded target config is digest-bound but never trusted for execution; replay requires a
+separately supplied target config with the same digest.
 
 To add customer-defined deterministic checks, provide a strict invariant file:
 

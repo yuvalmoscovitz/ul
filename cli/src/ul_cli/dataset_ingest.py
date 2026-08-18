@@ -10,13 +10,18 @@ from pathlib import Path
 from typing import Annotated, TextIO, cast
 
 import typer
-from ul.otlp_ingest import OtlpIngestResult, parse_otlp_traces
+from pydantic import ValidationError
+from ul.otlp_ingest import OtlpIngestResult, OtlpMappingConfig, parse_otlp_traces
 
 app = typer.Typer(help="Import production traces as a UL dataset.")
 
 _MAXIMUM_FILE_BYTES = 50_000_000
 _MAXIMUM_RECORDS = 100
 _MAXIMUM_JSON_DEPTH = 100
+
+
+class _OtlpJsonInputError(ValueError):
+    pass
 
 
 @app.command("otlp")
@@ -31,9 +36,22 @@ def ingest_otlp_traces(
         ),
     ],
     output: Annotated[
-        Path,
+        Path | None,
         typer.Option(help="New JSONL dataset file for ul dataset evaluate."),
-    ],
+    ] = None,
+    mapping: Annotated[
+        Path | None,
+        typer.Option(
+            exists=True,
+            dir_okay=False,
+            readable=True,
+            help="Declarative JSON mapping for trace-native scenario ingestion.",
+        ),
+    ] = None,
+    dry_run: Annotated[
+        bool,
+        typer.Option(help="Validate and summarize ingestion without writing content."),
+    ] = False,
     limit: Annotated[
         int,
         typer.Option(
@@ -50,7 +68,11 @@ def ingest_otlp_traces(
 
     Example: ul dataset ingest otlp traces.json --output dataset.jsonl
     """
-    if output.exists():
+    if output is None and not dry_run:
+        raise typer.BadParameter(
+            "--output is required unless --dry-run is used", param_hint="--output"
+        )
+    if output is not None and output.exists():
         raise typer.BadParameter(
             "output already exists; UL will not overwrite it", param_hint="--output"
         )
@@ -69,22 +91,65 @@ def ingest_otlp_traces(
         )
 
     try:
-        data = json.loads(
-            raw_bytes.decode("utf-8"),
-            object_pairs_hook=_reject_duplicate_keys,
-            parse_constant=_reject_nonstandard_constant,
-            parse_float=_parse_finite_float,
-        )
+        data = _parse_otlp_json(raw_bytes.decode("utf-8"))
         _reject_deep_json(data)
     except UnicodeDecodeError:
         raise typer.BadParameter("trace file must be UTF-8", param_hint="TRACES") from None
+    except _OtlpJsonInputError as error:
+        raise typer.BadParameter(_terminal_safe(str(error)), param_hint="TRACES") from None
     except (json.JSONDecodeError, RecursionError, ValueError):
-        raise typer.BadParameter("trace file contains invalid JSON", param_hint="TRACES") from None
+        raise typer.BadParameter(
+            "trace file must be one OTLP JSON object, an array of objects, or JSON Lines",
+            param_hint="TRACES",
+        ) from None
+
+    mapping_config: OtlpMappingConfig | None = None
+    if mapping is not None:
+        try:
+            mapping_bytes = _read_bounded_file(mapping, maximum_bytes=1_000_000)
+            mapping_data = json.loads(
+                mapping_bytes.decode("utf-8"),
+                object_pairs_hook=_reject_duplicate_keys,
+                parse_constant=_reject_nonstandard_constant,
+                parse_float=_parse_finite_float,
+            )
+            _reject_deep_json(mapping_data)
+            mapping_config = OtlpMappingConfig.model_validate(mapping_data)
+        except OSError as error:
+            raise typer.BadParameter(
+                f"cannot read mapping file ({error.__class__.__name__})", param_hint="--mapping"
+            ) from None
+        except (
+            UnicodeDecodeError,
+            json.JSONDecodeError,
+            RecursionError,
+            ValueError,
+            ValidationError,
+        ):
+            raise typer.BadParameter(
+                "mapping file is invalid; expected the UL OTLP mapping schema",
+                param_hint="--mapping",
+            ) from None
 
     try:
-        result = parse_otlp_traces(data, limit=limit)
+        result = parse_otlp_traces(data, limit=limit, mapping=mapping_config)
     except ValueError as error:
         raise typer.BadParameter(_terminal_safe(str(error)), param_hint="TRACES") from None
+
+    if dry_run:
+        _print_safe(
+            f"Dry run: {len(result.records)} scenario(s) ready; "
+            "no trace content was printed or written."
+        )
+        skipped_summary = _skipped_summary(result)
+        if skipped_summary:
+            _print_safe(f"Skipped traces:{skipped_summary}")
+        if mapping_config is not None and not mapping_config.include_raw_content:
+            _print_safe(
+                "Raw content is disabled by the mapping; enable include_raw_content only for "
+                "approved trace data."
+            )
+        return
 
     if not result.records:
         skipped_summary = _skipped_summary(result)
@@ -95,6 +160,7 @@ def ingest_otlp_traces(
             param_hint="TRACES",
         )
 
+    assert output is not None
     try:
         output_stream = _create_private_output(output)
     except OSError as error:
@@ -137,7 +203,39 @@ def _skipped_summary(result: OtlpIngestResult) -> str:
         parts.append(f"{result.skipped_no_input} without extractable input")
     if result.skipped_no_output:
         parts.append(f"{result.skipped_no_output} without extractable output")
+    if result.skipped_limit:
+        parts.append(f"{result.skipped_limit} over trace evidence limits")
+    if result.skipped_incompatible_histories:
+        parts.append(f"{result.skipped_incompatible_histories} with incompatible message histories")
     return (" " + ", ".join(parts)) if parts else ""
+
+
+def _parse_otlp_json(text: str) -> object:
+    try:
+        return _load_json_value(text)
+    except json.JSONDecodeError as whole_document_error:
+        batches: list[object] = []
+        for line_number, line in enumerate(text.splitlines(), start=1):
+            if not line.strip():
+                continue
+            try:
+                batches.append(_load_json_value(line))
+            except (json.JSONDecodeError, ValueError):
+                raise _OtlpJsonInputError(
+                    f"invalid OTLP JSON Lines record at line {line_number}"
+                ) from None
+        if not batches:
+            raise whole_document_error
+        return batches
+
+
+def _load_json_value(text: str) -> object:
+    return json.loads(
+        text,
+        object_pairs_hook=_reject_duplicate_keys,
+        parse_constant=_reject_nonstandard_constant,
+        parse_float=_parse_finite_float,
+    )
 
 
 def _read_bounded_file(path: Path, *, maximum_bytes: int) -> bytes:

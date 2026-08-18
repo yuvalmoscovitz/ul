@@ -77,6 +77,15 @@ class DatasetTargetExecutor(Protocol):
 
 
 @runtime_checkable
+class MultiTurnDatasetTargetExecutor(DatasetTargetExecutor, Protocol):
+    def target_calls_for_conversation(self, turn_count: int) -> int: ...
+
+    def execute_conversation(
+        self, raw_inputs: tuple[str, ...]
+    ) -> Awaitable[tuple[ObservedAgentOutput, ...]]: ...
+
+
+@runtime_checkable
 class ScenarioMaterializer(Protocol):
     def materialize(self, scenario: Scenario) -> MaterializedScenario: ...
 

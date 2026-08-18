@@ -1,0 +1,17 @@
+{
+  "schema_version": "1.0.0",
+  "id": "invoice-correction",
+  "operator_id": "event.correction_after_first_response",
+  "conversation": [
+    {
+      "id": "initial-request",
+      "role": "user",
+      "content": "Pay invoice AC-100."
+    },
+    {
+      "id": "corrected-request",
+      "role": "user",
+      "content": "Correction: pay invoice AC-101 instead."
+    }
+  ]
+}

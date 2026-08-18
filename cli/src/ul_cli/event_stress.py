@@ -1,0 +1,318 @@
+from __future__ import annotations
+
+import asyncio
+import json
+import os
+import stat
+from pathlib import Path
+from typing import Annotated, TextIO
+
+import typer
+from pydantic import ValidationError
+from ul.dataset_invariants import (
+    DatasetInvariantRule,
+    ObservationAuthority,
+    load_dataset_invariant_suite,
+)
+from ul.dataset_regression import dataset_regression_target_config_sha256
+from ul.event_stress import (
+    CorrectionAfterFirstResponseCase,
+    CorrectionStressResult,
+    MultiTurnRegressionCase,
+    create_multi_turn_regression_case,
+    load_correction_after_first_response_case,
+    load_multi_turn_regression_case,
+    plan_correction_stress_test,
+    replay_multi_turn_regression,
+    run_correction_stress_test,
+)
+from ul.http_target import (
+    JsonHttpDatasetTarget,
+    load_json_http_dataset_target_config,
+    validate_json_http_dataset_target_configuration,
+)
+
+app = typer.Typer(help="Stress stateful agents with ordered conversation events.")
+
+
+@app.command("save")
+def save_multi_turn_regression(
+    case_path: Annotated[Path, typer.Argument(exists=True, dir_okay=False, readable=True)],
+    target_config_path: Annotated[
+        Path, typer.Option("--target-config", exists=True, dir_okay=False, readable=True)
+    ],
+    invariants_path: Annotated[
+        Path, typer.Option("--invariants", exists=True, dir_okay=False, readable=True)
+    ],
+    output: Annotated[Path, typer.Option(help="New private regression case file.")],
+    repetitions: Annotated[int, typer.Option(min=1)] = 3,
+    confirm_versioned_input: Annotated[
+        bool,
+        typer.Option(
+            help="Confirm the exact conversation and invariant literals are safe to version."
+        ),
+    ] = False,
+) -> None:
+    """Save an exact correction conversation as a content-addressed regression."""
+    if not confirm_versioned_input:
+        raise typer.BadParameter(
+            "saving requires --confirm-versioned-input because conversation turns may be sensitive"
+        )
+    if output.exists():
+        raise typer.BadParameter("output already exists; UL will not overwrite it")
+    try:
+        case = load_correction_after_first_response_case(case_path)
+        target_config = load_json_http_dataset_target_config(target_config_path)
+        invariant_suite = load_dataset_invariant_suite(invariants_path)
+        regression = create_multi_turn_regression_case(
+            stress_case=case,
+            target_config=target_config,
+            source_suite_sha256=invariant_suite.sha256,
+            observation_authority=invariant_suite.observation_authority,
+            invariant_rules=invariant_suite.rules,
+            repetitions=repetitions,
+        )
+    except (ValidationError, ValueError, RuntimeError) as error:
+        raise typer.BadParameter(str(error)) from None
+    with _create_private_output(output) as output_stream:
+        json.dump(regression.model_dump(mode="json"), output_stream, ensure_ascii=False, indent=2)
+        output_stream.write("\n")
+        output_stream.flush()
+        os.fsync(output_stream.fileno())
+    typer.echo(f"Saved multi-turn regression {regression.case_id}: {output}")
+
+
+@app.command("correction")
+def run_correction_after_first_response(
+    case_path: Annotated[Path, typer.Argument(exists=True, dir_okay=False, readable=True)],
+    target_config_path: Annotated[
+        Path, typer.Option("--target-config", exists=True, dir_okay=False, readable=True)
+    ],
+    invariants_path: Annotated[
+        Path, typer.Option("--invariants", exists=True, dir_okay=False, readable=True)
+    ],
+    output: Annotated[Path | None, typer.Option(help="New private JSON evidence file.")] = None,
+    repetitions: Annotated[int, typer.Option(min=1)] = 3,
+    max_target_calls: Annotated[int, typer.Option(min=1)] = 100,
+    allow_target_network: Annotated[bool, typer.Option()] = False,
+    confirm_isolated_sandbox: Annotated[bool, typer.Option()] = False,
+    allow_insecure_http: Annotated[bool, typer.Option()] = False,
+    dry_run: Annotated[
+        bool, typer.Option(help="Validate and show the complete plan without target calls.")
+    ] = False,
+) -> None:
+    """Run the fixed correction-after-first-response event operator."""
+    try:
+        case = load_correction_after_first_response_case(case_path)
+        target_config = load_json_http_dataset_target_config(target_config_path)
+        invariant_suite = load_dataset_invariant_suite(invariants_path)
+        validate_json_http_dataset_target_configuration(
+            target_config,
+            sandbox_confirmed=confirm_isolated_sandbox or dry_run,
+            allow_insecure_http=allow_insecure_http,
+        )
+        plan = plan_correction_stress_test(
+            case,
+            target_config,
+            repetitions=repetitions,
+            max_target_calls=max_target_calls,
+        )
+    except (ValidationError, ValueError, RuntimeError) as error:
+        raise typer.BadParameter(str(error)) from None
+
+    if dry_run:
+        typer.echo(f"Operator: {plan.operator_id}")
+        typer.echo("Ordered turns: initial request -> correction after first response")
+        typer.echo(f"Repetitions: {plan.repetitions}")
+        typer.echo(f"Target calls per paired repetition: {plan.target_calls_per_pair}")
+        typer.echo(f"Potential target calls: {plan.required_target_calls}")
+        typer.echo("External calls: none")
+        return
+    if not allow_target_network:
+        raise typer.BadParameter(
+            "execution requires --allow-target-network", param_hint="--allow-target-network"
+        )
+    if not confirm_isolated_sandbox:
+        raise typer.BadParameter(
+            "execution requires --confirm-isolated-sandbox",
+            param_hint="--confirm-isolated-sandbox",
+        )
+    if output is None:
+        raise typer.BadParameter("execution requires --output", param_hint="--output")
+    if output.exists():
+        raise typer.BadParameter("output already exists; UL will not overwrite it")
+    target = JsonHttpDatasetTarget.from_config(
+        target_config,
+        sandbox_confirmed=True,
+        allow_insecure_http=allow_insecure_http,
+        max_target_calls=max_target_calls,
+    )
+    result = asyncio.run(
+        _run_and_close(
+            case,
+            target,
+            invariant_rules=invariant_suite.rules,
+            observation_authority=invariant_suite.observation_authority,
+            repetitions=repetitions,
+            max_target_calls=max_target_calls,
+        )
+    )
+    with _create_private_output(output) as output_stream:
+        json.dump(result.model_dump(mode="json"), output_stream, ensure_ascii=False, indent=2)
+        output_stream.write("\n")
+        output_stream.flush()
+        os.fsync(output_stream.fileno())
+    _print_result(result, output)
+
+
+@app.command("replay")
+def replay_saved_multi_turn_case(
+    case_path: Annotated[Path, typer.Argument(exists=True, dir_okay=False, readable=True)],
+    target_config_path: Annotated[
+        Path, typer.Option("--target-config", exists=True, dir_okay=False, readable=True)
+    ],
+    output: Annotated[Path, typer.Option(help="New private JSON replay evidence file.")],
+    max_target_calls: Annotated[int, typer.Option(min=1)] = 100,
+    allow_target_network: Annotated[bool, typer.Option()] = False,
+    confirm_isolated_sandbox: Annotated[bool, typer.Option()] = False,
+    allow_insecure_http: Annotated[bool, typer.Option()] = False,
+) -> None:
+    """Replay a content-addressed multi-turn correction regression."""
+    try:
+        case = load_multi_turn_regression_case(case_path)
+        target_config = load_json_http_dataset_target_config(target_config_path)
+        if dataset_regression_target_config_sha256(target_config) != case.target.config_sha256:
+            raise ValueError("trusted target config digest does not match the regression case")
+        plan_correction_stress_test(
+            case.stress_case,
+            target_config,
+            repetitions=case.repetitions,
+            max_target_calls=max_target_calls,
+        )
+    except (ValidationError, ValueError, RuntimeError) as error:
+        raise typer.BadParameter(str(error)) from None
+    if not allow_target_network or not confirm_isolated_sandbox:
+        raise typer.BadParameter(
+            "replay requires --allow-target-network and --confirm-isolated-sandbox"
+        )
+    if output.exists():
+        raise typer.BadParameter("output already exists; UL will not overwrite it")
+    target = JsonHttpDatasetTarget.from_config(
+        target_config,
+        sandbox_confirmed=True,
+        allow_insecure_http=allow_insecure_http,
+        max_target_calls=max_target_calls,
+    )
+    result = asyncio.run(
+        _replay_and_close(
+            case,
+            target,
+            max_target_calls=max_target_calls,
+        )
+    )
+    with _create_private_output(output) as output_stream:
+        json.dump(result.model_dump(mode="json"), output_stream, ensure_ascii=False, indent=2)
+        output_stream.write("\n")
+    _print_result(result, output)
+
+
+async def _run_and_close(
+    case: CorrectionAfterFirstResponseCase,
+    target: JsonHttpDatasetTarget,
+    *,
+    invariant_rules: tuple[DatasetInvariantRule, ...],
+    observation_authority: ObservationAuthority,
+    repetitions: int,
+    max_target_calls: int,
+) -> CorrectionStressResult:
+    try:
+        return await run_correction_stress_test(
+            case,
+            target,
+            invariant_rules=invariant_rules,
+            observation_authority=observation_authority,
+            repetitions=repetitions,
+            max_target_calls=max_target_calls,
+            allow_network_egress=True,
+        )
+    finally:
+        await target.aclose()
+
+
+async def _replay_and_close(
+    case: MultiTurnRegressionCase,
+    target: JsonHttpDatasetTarget,
+    *,
+    max_target_calls: int,
+) -> CorrectionStressResult:
+    try:
+        return await replay_multi_turn_regression(
+            case, target, max_target_calls=max_target_calls, allow_network_egress=True
+        )
+    finally:
+        await target.aclose()
+
+
+def _print_result(result: CorrectionStressResult, output: Path) -> None:
+    typer.echo(f"Correction stress result: {result.status}")
+    typer.echo("Exact baseline/variation responses and state snapshots are in private evidence.")
+    typer.echo(f"First response divergence: {result.first_response_divergence_turn_id or 'none'}")
+    typer.echo(
+        "First committed-state divergence: "
+        f"{result.first_committed_state_divergence_turn_id or 'none'}"
+    )
+    typer.echo(
+        "Response divergence stability: "
+        f"{result.response_divergence_stability}; "
+        f"counts={_format_divergence_counts(result.response_divergence_counts)}"
+    )
+    typer.echo(
+        "Committed-state divergence stability: "
+        f"{result.committed_state_divergence_stability}; "
+        f"counts={_format_divergence_counts(result.committed_state_divergence_counts)}"
+    )
+    if result.baseline_drift_observed:
+        typer.echo(
+            "Causal warning: the variation diverged before the correction; do not attribute "
+            "the corrected-arm failure to the correction alone."
+        )
+    for trial in result.trials:
+        typer.echo(f"Repetition {trial.repetition}")
+        arms = (("baseline", trial.baseline), ("variation", trial.variation))
+        for arm_name, observations in arms:
+            for index, observation in enumerate(observations, start=1):
+                typer.echo(f"  {arm_name} turn {index}: {observation.turn.id}")
+    for arm, rules in (
+        ("baseline", result.baseline_invariant_rules),
+        ("corrected", result.corrected_invariant_rules),
+    ):
+        for rule in rules:
+            typer.echo(
+                f"Invariant {rule.rule_id}: {rule.status}; arm={arm}; severity={rule.severity}"
+            )
+    typer.echo(f"Complete evidence: {output}")
+    if result.status == "failed":
+        raise typer.Exit(code=1)
+    if result.status == "inconclusive":
+        raise typer.Exit(code=2)
+
+
+def _format_divergence_counts(counts: dict[str, int]) -> str:
+    return ", ".join(f"{turn_id}={count}" for turn_id, count in counts.items())
+
+
+def _create_private_output(path: Path) -> TextIO:
+    descriptor = os.open(
+        path,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+        0o600,
+    )
+    try:
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            raise OSError("output is not a regular file")
+        if os.name != "nt":
+            os.fchmod(descriptor, 0o600)
+        return os.fdopen(descriptor, "w", encoding="utf-8")
+    except BaseException:
+        os.close(descriptor)
+        raise
