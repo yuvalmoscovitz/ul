@@ -438,6 +438,72 @@ def test_dry_run_validates_and_makes_no_external_calls(
     assert "Transfer 100" not in result.output
 
 
+def test_openai_compatible_dry_run_reports_provider_without_making_calls(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    dataset = tmp_path / "interactions.jsonl"
+    _write_dataset(dataset, [_record()])
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("UL_DATASET_SEMANTIC_PROVIDER", "openai-compatible")
+    monkeypatch.setenv("UL_DATASET_OPENAI_BASE_URL", "http://localhost:8000/v1")
+    monkeypatch.setenv("UL_DATASET_MODEL", "local-semantic-model")
+
+    def unexpected_deconstructor(*args: object, **kwargs: object) -> None:
+        raise AssertionError("dry-run constructed a semantic model client")
+
+    monkeypatch.setattr(main, "OpenAICompatibleSemanticDeconstructor", unexpected_deconstructor)
+    result = runner.invoke(root_app, ["dataset", "evaluate", str(dataset), "--dry-run"])
+
+    assert result.exit_code == 0, result.output
+    assert "Semantic provider: openai-compatible (http://localhost:8000/v1)" in result.output
+    assert "No model or target requests sent." in result.output
+
+
+def test_openai_compatible_execution_allows_an_unauthenticated_endpoint(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    dataset = tmp_path / "interactions.jsonl"
+    output = tmp_path / "results.jsonl"
+    _write_dataset(dataset, [_record()])
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("UL_DATASET_SEMANTIC_PROVIDER", "openai-compatible")
+    monkeypatch.setenv("UL_DATASET_OPENAI_BASE_URL", "https://models.example.test/v1")
+    monkeypatch.setenv("UL_DATASET_MODEL", "customer/model")
+    monkeypatch.setenv("UL_LIVE", "true")
+    monkeypatch.delenv("UL_DATASET_OPENAI_API_KEY", raising=False)
+
+    class FakeTarget:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            pass
+
+    async def fake_evaluate(*args: object, **kwargs: object) -> tuple[object, ...]:
+        return ()
+
+    monkeypatch.setattr(main, "JsonHttpDatasetTarget", FakeTarget)
+    monkeypatch.setattr(main, "_evaluate_interaction_records", fake_evaluate)
+
+    result = runner.invoke(
+        root_app,
+        [
+            "dataset",
+            "evaluate",
+            str(dataset),
+            "--target-url",
+            "https://sandbox.example.test/execute",
+            "--allow-target-network",
+            "--confirm-isolated-sandbox",
+            "--confirm-fresh-state",
+            "--output",
+            str(output),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert output.exists()
+
+
 def test_invariant_dry_run_reports_rules_authority_and_no_extra_calls(
     tmp_path: Path,
 ) -> None:
@@ -1442,6 +1508,46 @@ def test_operator_list_is_fixed_and_self_correction_keeps_existing_call_accounti
     assert "Operators: intent.self_correction" in dry_run.output
     assert "Potential semantic model calls: up to 10" in dry_run.output
     assert "Potential target calls: up to 6" in dry_run.output
+
+
+def test_run_context_records_provider_and_parses_legacy_openrouter_context() -> None:
+    record = _evaluation_result("interaction-1").source
+    openrouter_context = cast(Any, _run_context((record,)))
+    legacy_payload = openrouter_context.model_dump(mode="json")
+    legacy_payload["semantic_settings"].pop("provider")
+    legacy_payload["semantic_settings"].pop("base_url")
+
+    parsed_legacy = dataset_review.DatasetEvidenceRunContext.model_validate_json(
+        json.dumps(legacy_payload)
+    )
+    assert parsed_legacy == openrouter_context
+
+    custom_settings = main.OpenAICompatibleDatasetSettings(
+        live_calls=True,
+        allow_external_data_processing=True,
+        api_key=SecretStr("test-key"),
+        provider_id="customer-gateway",
+        base_url="https://models.example.test/v1",
+        model="customer/model",
+    )
+    custom_context = main._dataset_evidence_run_context(
+        selected_records=(record,),
+        selected_operator_ids=("surface.rephrase",),
+        repetitions=1,
+        invariant_suite=None,
+        target_config=JsonHttpDatasetTargetConfig(
+            version=1,
+            url="https://sandbox.example.test/execute",
+            headers_from_env={},
+            request_json_template={"input": "{{input}}"},
+            response_json_pointer="",
+        ),
+        settings=custom_settings,
+    )
+
+    assert custom_context.semantic_settings.provider == "customer-gateway"
+    assert custom_context.semantic_settings.base_url == "https://models.example.test/v1"
+    assert custom_context.context_sha256 != openrouter_context.context_sha256
 
 
 def test_resume_skips_already_processed_interaction_ids(

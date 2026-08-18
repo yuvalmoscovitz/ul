@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import ipaddress
 import json
 import re
+from dataclasses import dataclass
 from types import TracebackType
-from typing import Any, Self, cast
+from typing import Any, Literal, Protocol, Self, cast
+from urllib.parse import urlsplit, urlunsplit
 
 import httpx
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, SecretStr, model_validator
@@ -98,6 +101,187 @@ class OpenRouterDatasetSettings(BaseSettings):
         validation_alias="UL_DATASET_TIMEOUT_SECONDS",
     )
 
+    @property
+    def semantic_provider_id(self) -> str:
+        return "openrouter"
+
+    @property
+    def semantic_base_url(self) -> str:
+        return "https://openrouter.ai/api/v1"
+
+    @property
+    def api_key_environment_variable(self) -> str:
+        return "OPEN_ROUTER_API_KEY"
+
+
+class OpenAICompatibleDatasetSettings(BaseSettings):
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding="utf-8",
+        extra="ignore",
+        populate_by_name=True,
+    )
+
+    live_calls: bool = Field(default=False, validation_alias="UL_DATASET_LIVE_CALLS")
+    allow_external_data_processing: bool = Field(
+        default=False,
+        validation_alias="UL_DATASET_ALLOW_EXTERNAL_DATA_PROCESSING",
+    )
+    api_key: SecretStr | None = Field(
+        default=None,
+        validation_alias="UL_DATASET_OPENAI_API_KEY",
+    )
+    ul_live: bool = Field(default=False, validation_alias="UL_LIVE", exclude=True, repr=False)
+    provider_id: str = Field(
+        default="openai-compatible",
+        min_length=1,
+        max_length=100,
+        pattern=r"[a-z0-9][a-z0-9._-]*",
+        validation_alias="UL_DATASET_OPENAI_PROVIDER_ID",
+    )
+    base_url: str = Field(
+        default="",
+        min_length=1,
+        max_length=2_000,
+        validation_alias="UL_DATASET_OPENAI_BASE_URL",
+    )
+    model: str = Field(
+        default="",
+        min_length=1,
+        max_length=200,
+        validation_alias="UL_DATASET_MODEL",
+    )
+    render_model: str = Field(
+        default="",
+        max_length=200,
+        validation_alias="UL_DATASET_RENDER_MODEL",
+    )
+    equivalence_model: str = Field(
+        default="",
+        max_length=200,
+        validation_alias="UL_DATASET_EQUIVALENCE_MODEL",
+    )
+    max_input_chars: int = Field(
+        default=50_000,
+        ge=1,
+        le=1_000_000,
+        validation_alias="UL_DATASET_MAX_INPUT_CHARS",
+    )
+    max_output_tokens: int = Field(
+        default=4_096,
+        ge=1,
+        le=32_768,
+        validation_alias="UL_DATASET_MAX_OUTPUT_TOKENS",
+    )
+    max_render_tokens: int = Field(
+        default=512,
+        ge=1,
+        le=4_096,
+        validation_alias="UL_DATASET_MAX_RENDER_TOKENS",
+    )
+    max_response_bytes: int = Field(
+        default=1_000_000,
+        ge=1_024,
+        le=5_000_000,
+        validation_alias="UL_DATASET_MAX_RESPONSE_BYTES",
+    )
+    timeout_seconds: float = Field(
+        default=60,
+        gt=0,
+        le=300,
+        validation_alias="UL_DATASET_TIMEOUT_SECONDS",
+    )
+
+    @model_validator(mode="after")
+    def validate_and_normalize(self) -> Self:
+        if self.ul_live:
+            if "live_calls" not in self.model_fields_set:
+                self.live_calls = True
+            if "allow_external_data_processing" not in self.model_fields_set:
+                self.allow_external_data_processing = True
+        self.base_url = _validated_openai_compatible_base_url(self.base_url)
+        if self.provider_id == "openrouter":
+            raise ValueError("UL_DATASET_OPENAI_PROVIDER_ID cannot use the reserved openrouter ID")
+        if not self.model.strip():
+            raise ValueError("UL_DATASET_MODEL must contain non-whitespace text")
+        if not self.render_model:
+            self.render_model = self.model
+        elif not self.render_model.strip():
+            raise ValueError("UL_DATASET_RENDER_MODEL must contain non-whitespace text")
+        if not self.equivalence_model:
+            self.equivalence_model = self.model
+        elif not self.equivalence_model.strip():
+            raise ValueError("UL_DATASET_EQUIVALENCE_MODEL must contain non-whitespace text")
+        return self
+
+    @property
+    def semantic_provider_id(self) -> str:
+        return self.provider_id
+
+    @property
+    def semantic_base_url(self) -> str:
+        return self.base_url
+
+    @property
+    def api_key_environment_variable(self) -> str:
+        return "UL_DATASET_OPENAI_API_KEY"
+
+
+class DatasetSemanticProviderSelection(BaseSettings):
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
+
+    provider: Literal["openrouter", "openai-compatible"] = Field(
+        default="openrouter",
+        validation_alias="UL_DATASET_SEMANTIC_PROVIDER",
+    )
+
+
+type DatasetSemanticSettings = OpenRouterDatasetSettings | OpenAICompatibleDatasetSettings
+
+
+def load_dataset_semantic_settings() -> DatasetSemanticSettings:
+    selection = DatasetSemanticProviderSelection()
+    if selection.provider == "openai-compatible":
+        return OpenAICompatibleDatasetSettings()
+    return OpenRouterDatasetSettings()
+
+
+def _validated_openai_compatible_base_url(value: str) -> str:
+    parsed = urlsplit(value)
+    if parsed.scheme not in {"http", "https"}:
+        raise ValueError("UL_DATASET_OPENAI_BASE_URL must use https or loopback http")
+    if not parsed.hostname:
+        raise ValueError("UL_DATASET_OPENAI_BASE_URL must include a host")
+    try:
+        _ = parsed.port
+    except ValueError:
+        raise ValueError("UL_DATASET_OPENAI_BASE_URL has an invalid port") from None
+    if parsed.username is not None or parsed.password is not None:
+        raise ValueError("UL_DATASET_OPENAI_BASE_URL must not include credentials")
+    if parsed.query or parsed.fragment:
+        raise ValueError("UL_DATASET_OPENAI_BASE_URL must not include a query or fragment")
+    if parsed.scheme == "http" and not _is_loopback_host(parsed.hostname):
+        raise ValueError("UL_DATASET_OPENAI_BASE_URL only permits plaintext HTTP on loopback")
+    normalized_path = parsed.path.rstrip("/")
+    if normalized_path.endswith("/chat/completions"):
+        raise ValueError(
+            "UL_DATASET_OPENAI_BASE_URL must be an API root, not a chat-completions endpoint"
+        )
+    return urlunsplit((parsed.scheme, parsed.netloc, normalized_path, "", ""))
+
+
+def _is_loopback_host(host: str) -> bool:
+    if host.lower() == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
 
 class _ResponseMessage(BaseModel):
     model_config = ConfigDict(extra="ignore")
@@ -127,20 +311,119 @@ class _RenderedInput(BaseModel):
     rendered_input: str = Field(min_length=1)
 
 
-class OpenRouterSemanticDeconstructor:
-    _endpoint = "https://openrouter.ai/api/v1/chat/completions"
-    _extractor_version = "openrouter-semantic-deconstructor/1.0.0"
-    _equivalence_verifier_version = "openrouter-semantic-equivalence-verifier/1.0.0"
+class SemanticCompletionProvider(Protocol):
+    @property
+    def provider_id(self) -> str: ...
 
+    @property
+    def base_url(self) -> str: ...
+
+    @property
+    def extractor_version(self) -> str: ...
+
+    @property
+    def equivalence_verifier_version(self) -> str: ...
+
+    @property
+    def requires_api_key(self) -> bool: ...
+
+    @property
+    def trust_environment_transport(self) -> bool: ...
+
+    def add_request_options(
+        self,
+        request_body: dict[str, Any],
+        reasoning: dict[str, JsonValue],
+    ) -> None: ...
+
+    def generation_metadata(
+        self,
+        response: _ChatCompletionResponse,
+    ) -> dict[str, JsonValue]: ...
+
+
+@dataclass(frozen=True)
+class OpenAICompatibleSemanticProvider:
+    provider_id: str
+    base_url: str
+    extractor_version: str = "openai-compatible-semantic-deconstructor/1.0.0"
+    equivalence_verifier_version: str = "openai-compatible-semantic-equivalence-verifier/1.0.0"
+    requires_api_key: bool = False
+    trust_environment_transport: bool = False
+
+    def add_request_options(
+        self,
+        request_body: dict[str, Any],
+        reasoning: dict[str, JsonValue],
+    ) -> None:
+        return None
+
+    def generation_metadata(
+        self,
+        response: _ChatCompletionResponse,
+    ) -> dict[str, JsonValue]:
+        return {
+            "semantic_provider": self.provider_id,
+            "semantic_protocol": "openai-chat-completions",
+            "semantic_base_url": self.base_url,
+            "semantic_generation_id": response.id,
+            "semantic_model": response.model,
+            "semantic_upstream_provider": response.provider,
+            "semantic_usage": response.usage,
+        }
+
+
+@dataclass(frozen=True)
+class OpenRouterSemanticProvider(OpenAICompatibleSemanticProvider):
+    provider_id: str = "openrouter"
+    base_url: str = "https://openrouter.ai/api/v1"
+    extractor_version: str = "openrouter-semantic-deconstructor/1.0.0"
+    equivalence_verifier_version: str = "openrouter-semantic-equivalence-verifier/1.0.0"
+    requires_api_key: bool = True
+    trust_environment_transport: bool = True
+
+    def add_request_options(
+        self,
+        request_body: dict[str, Any],
+        reasoning: dict[str, JsonValue],
+    ) -> None:
+        request_body["reasoning"] = reasoning
+        request_body["provider"] = {
+            "require_parameters": True,
+            "data_collection": "deny",
+            "zdr": True,
+        }
+
+    def generation_metadata(
+        self,
+        response: _ChatCompletionResponse,
+    ) -> dict[str, JsonValue]:
+        return {
+            **super().generation_metadata(response),
+            "openrouter_generation_id": response.id,
+            "openrouter_model": response.model,
+            "openrouter_provider": response.provider,
+            "openrouter_usage": response.usage,
+            "openrouter_cost": response.usage.get("cost"),
+        }
+
+
+class SemanticModelDeconstructor:
     def __init__(
         self,
-        settings: OpenRouterDatasetSettings | None = None,
+        settings: DatasetSemanticSettings,
+        provider: SemanticCompletionProvider,
         *,
         client: httpx.AsyncClient | None = None,
     ) -> None:
-        self.settings = settings or OpenRouterDatasetSettings()
+        self.settings = settings
+        self.provider = provider
         self._owns_client = client is None
-        self._client = client or httpx.AsyncClient(timeout=self.settings.timeout_seconds)
+        self._client = client or httpx.AsyncClient(
+            timeout=self.settings.timeout_seconds,
+            follow_redirects=False,
+            trust_env=self.provider.trust_environment_transport,
+        )
 
     async def __aenter__(self) -> Self:
         return self
@@ -190,7 +473,7 @@ class OpenRouterSemanticDeconstructor:
             {
                 "schema_version": "1.0.0",
                 "interaction_id": record.id,
-                "extractor_version": self._extractor_version,
+                "extractor_version": self.provider.extractor_version,
                 "metadata": {
                     **self._generation_metadata(response),
                     "prompts": prompt_provenance("semantic.deconstruct"),
@@ -283,7 +566,7 @@ class OpenRouterSemanticDeconstructor:
         raw_assessment.update(
             {
                 "schema_version": "1.0.0",
-                "verifier_version": self._equivalence_verifier_version,
+                "verifier_version": self.provider.equivalence_verifier_version,
                 "metadata": {
                     **self._generation_metadata(response),
                     "requested_model": self.settings.equivalence_model,
@@ -343,7 +626,6 @@ class OpenRouterSemanticDeconstructor:
         async with asyncio.timeout(self.settings.timeout_seconds):
             request_body: dict[str, Any] = {
                 "model": model,
-                "reasoning": reasoning,
                 "messages": [
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": untrusted_payload},
@@ -359,29 +641,34 @@ class OpenRouterSemanticDeconstructor:
                         "schema": schema,
                     },
                 },
-                "provider": {
-                    "require_parameters": True,
-                    "data_collection": "deny",
-                    "zdr": True,
-                },
                 "stream": False,
             }
+            self.provider.add_request_options(request_body, reasoning)
             if top_p is not None:
                 request_body["top_p"] = top_p
+            endpoint = f"{self.provider.base_url}/chat/completions"
+            request_headers = (
+                {"Authorization": f"Bearer {api_key}"} if api_key is not None else None
+            )
             async with self._client.stream(
                 "POST",
-                self._endpoint,
-                headers={"Authorization": f"Bearer {api_key}"},
+                endpoint,
+                headers=request_headers,
                 json=request_body,
                 timeout=self.settings.timeout_seconds,
+                follow_redirects=False,
             ) as response:
+                if not _same_origin(response.url, httpx.URL(endpoint)):
+                    raise ValueError("semantic provider response changed request origin")
+                if 300 <= response.status_code < 400:
+                    raise ValueError("semantic provider redirects are not allowed")
                 response.raise_for_status()
                 chunks: list[bytes] = []
                 response_size = 0
                 async for chunk in response.aiter_bytes():
                     response_size += len(chunk)
                     if response_size > self.settings.max_response_bytes:
-                        raise ValueError("OpenRouter response exceeds max_response_bytes")
+                        raise ValueError("semantic provider response exceeds max_response_bytes")
                     chunks.append(chunk)
         return _ChatCompletionResponse.model_validate_json(b"".join(chunks))
 
@@ -390,19 +677,27 @@ class OpenRouterSemanticDeconstructor:
         digest = hashlib.sha256(f"{raw_input}\0{instruction}".encode()).digest()
         return int.from_bytes(digest[:4], "big")
 
-    def _require_live_access(self) -> str:
+    def _require_live_access(self) -> str | None:
         if not self.settings.live_calls:
             raise RuntimeError(
-                "OpenRouter dataset calls require UL_LIVE=true (or UL_DATASET_LIVE_CALLS=true)"
+                "semantic model calls require UL_LIVE=true (or UL_DATASET_LIVE_CALLS=true)"
             )
         if not self.settings.allow_external_data_processing:
             raise RuntimeError(
-                "OpenRouter dataset calls send raw inputs and outputs externally; set "
+                "semantic model calls process raw inputs and outputs at the configured endpoint; "
+                "set "
                 "UL_LIVE=true (or UL_DATASET_ALLOW_EXTERNAL_DATA_PROCESSING=true) to allow this"
             )
-        if self.settings.api_key is None or not self.settings.api_key.get_secret_value().strip():
-            raise RuntimeError("OpenRouter dataset calls require OPEN_ROUTER_API_KEY")
-        return self.settings.api_key.get_secret_value()
+        api_key = (
+            self.settings.api_key.get_secret_value().strip()
+            if self.settings.api_key is not None
+            else ""
+        )
+        if not api_key and self.provider.requires_api_key:
+            raise RuntimeError(
+                f"semantic model calls require {self.settings.api_key_environment_variable}"
+            )
+        return api_key or None
 
     def _bounded_json(self, payload: dict[str, JsonValue]) -> str:
         serialized = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
@@ -665,12 +960,53 @@ class OpenRouterSemanticDeconstructor:
             raise ValueError("structured response must be a JSON object")
         return cast(dict[str, Any], decoded)
 
-    @staticmethod
-    def _generation_metadata(response: _ChatCompletionResponse) -> dict[str, JsonValue]:
-        return {
-            "openrouter_generation_id": response.id,
-            "openrouter_model": response.model,
-            "openrouter_provider": response.provider,
-            "openrouter_usage": response.usage,
-            "openrouter_cost": response.usage.get("cost"),
-        }
+    def _generation_metadata(
+        self,
+        response: _ChatCompletionResponse,
+    ) -> dict[str, JsonValue]:
+        return self.provider.generation_metadata(response)
+
+
+class OpenRouterSemanticDeconstructor(SemanticModelDeconstructor):
+    def __init__(
+        self,
+        settings: OpenRouterDatasetSettings | None = None,
+        *,
+        client: httpx.AsyncClient | None = None,
+    ) -> None:
+        super().__init__(
+            settings or OpenRouterDatasetSettings(),
+            OpenRouterSemanticProvider(),
+            client=client,
+        )
+
+
+class OpenAICompatibleSemanticDeconstructor(SemanticModelDeconstructor):
+    def __init__(
+        self,
+        settings: OpenAICompatibleDatasetSettings,
+        *,
+        client: httpx.AsyncClient | None = None,
+    ) -> None:
+        super().__init__(
+            settings,
+            OpenAICompatibleSemanticProvider(
+                provider_id=settings.provider_id,
+                base_url=settings.base_url,
+            ),
+            client=client,
+        )
+
+
+def create_semantic_model_deconstructor(
+    settings: DatasetSemanticSettings,
+    *,
+    client: httpx.AsyncClient | None = None,
+) -> SemanticModelDeconstructor:
+    if isinstance(settings, OpenAICompatibleDatasetSettings):
+        return OpenAICompatibleSemanticDeconstructor(settings, client=client)
+    return OpenRouterSemanticDeconstructor(settings, client=client)
+
+
+def _same_origin(left: httpx.URL, right: httpx.URL) -> bool:
+    return (left.scheme, left.host, left.port) == (right.scheme, right.host, right.port)

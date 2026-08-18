@@ -11,7 +11,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Annotated, Literal, Protocol, Self
+from typing import Annotated, Literal, Protocol, Self, cast
 from uuid import uuid4
 
 import typer
@@ -138,6 +138,12 @@ class DatasetEvidenceOperator(_StrictModel):
 
 
 class DatasetEvidenceSemanticSettings(_StrictModel):
+    provider: str = Field(default="openrouter", min_length=1, max_length=100)
+    base_url: str = Field(
+        default="https://openrouter.ai/api/v1",
+        min_length=1,
+        max_length=2_000,
+    )
     model: str
     render_model: str
     equivalence_model: str
@@ -146,6 +152,13 @@ class DatasetEvidenceSemanticSettings(_StrictModel):
     max_render_tokens: int = Field(ge=1)
     max_response_bytes: int = Field(ge=1)
     timeout_seconds: float = Field(gt=0)
+
+    def compatibility_dump(self) -> dict[str, JsonValue]:
+        content = self.model_dump(mode="json")
+        if self.provider == "openrouter" and self.base_url == "https://openrouter.ai/api/v1":
+            content.pop("provider")
+            content.pop("base_url")
+        return cast(dict[str, JsonValue], content)
 
 
 class DatasetEvidenceRunContext(_StrictModel):
@@ -164,9 +177,9 @@ class DatasetEvidenceRunContext(_StrictModel):
     def validate_digests(self) -> Self:
         if self.target_config_sha256 != dataset_regression_target_config_sha256(self.target_config):
             raise ValueError("run context target config digest must match its snapshot")
-        expected_context_sha256 = _canonical_json_sha256(
-            self.model_dump(mode="json", exclude={"context_sha256"})
-        )
+        context_content = self.model_dump(mode="json", exclude={"context_sha256"})
+        context_content["semantic_settings"] = self.semantic_settings.compatibility_dump()
+        expected_context_sha256 = _canonical_json_sha256(context_content)
         if self.context_sha256 != expected_context_sha256:
             raise ValueError("run context digest must match its canonical content")
         return self
@@ -262,7 +275,7 @@ def create_dataset_evidence_run_context(
         "invariant_suite_sha256": invariant_suite_sha256,
         "target_config": target_config.model_dump(mode="json"),
         "target_config_sha256": target_config_sha256,
-        "semantic_settings": semantic_settings.model_dump(mode="json"),
+        "semantic_settings": semantic_settings.compatibility_dump(),
     }
     return DatasetEvidenceRunContext(
         selected_dataset_sha256=selected_dataset_sha256,

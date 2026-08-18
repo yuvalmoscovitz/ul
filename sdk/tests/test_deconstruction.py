@@ -12,12 +12,19 @@ from ul.dataset_augmentation import (
     DatasetAugmentationEngine,
     builtin_dataset_augmentation_operators,
 )
-from ul.deconstruction import OpenRouterDatasetSettings, OpenRouterSemanticDeconstructor
+from ul.deconstruction import (
+    OpenAICompatibleDatasetSettings,
+    OpenAICompatibleSemanticDeconstructor,
+    OpenRouterDatasetSettings,
+    OpenRouterSemanticDeconstructor,
+    load_dataset_semantic_settings,
+)
 from ul_core.dataset import InteractionRecord, SemanticFrame, UserInputRecord
 from ul_core.prompts import prompt_provenance
 
 pytestmark = pytest.mark.asyncio
 _TEST_API_KEY = SecretStr("test-openrouter-key")
+_TEST_CUSTOMER_API_KEY = SecretStr("test-customer-key")
 
 
 def settings(
@@ -40,6 +47,27 @@ def settings(
         max_render_tokens=max_render_tokens,
         max_response_bytes=max_response_bytes,
         timeout_seconds=timeout_seconds,
+    )
+
+
+def openai_compatible_settings(
+    *,
+    live_calls: bool = True,
+    allow_external_data_processing: bool = True,
+    api_key: SecretStr | None = _TEST_CUSTOMER_API_KEY,
+    provider_id: str = "customer-model-gateway",
+    base_url: str = "https://models.example.test/openai/v1/",
+    model: str = "customer/semantic-model",
+) -> OpenAICompatibleDatasetSettings:
+    return OpenAICompatibleDatasetSettings(
+        live_calls=live_calls,
+        allow_external_data_processing=allow_external_data_processing,
+        api_key=api_key,
+        provider_id=provider_id,
+        base_url=base_url,
+        model=model,
+        max_output_tokens=321,
+        timeout_seconds=12,
     )
 
 
@@ -242,6 +270,18 @@ async def test_deconstruct_sends_one_bounded_strict_structured_request() -> None
     assert frame.schema_version == "1.0.0"
     assert frame.extractor_version == "openrouter-semantic-deconstructor/1.0.0"
     assert frame.metadata == {
+        "semantic_provider": "openrouter",
+        "semantic_protocol": "openai-chat-completions",
+        "semantic_base_url": "https://openrouter.ai/api/v1",
+        "semantic_generation_id": "generation-1",
+        "semantic_model": "provider/resolved-model",
+        "semantic_upstream_provider": "provider-name",
+        "semantic_usage": {
+            "prompt_tokens": 100,
+            "completion_tokens": 25,
+            "total_tokens": 125,
+            "cost": 0.00042,
+        },
         "openrouter_generation_id": "generation-1",
         "openrouter_model": "provider/resolved-model",
         "openrouter_provider": "provider-name",
@@ -255,6 +295,51 @@ async def test_deconstruct_sends_one_bounded_strict_structured_request() -> None
         "prompts": prompt_provenance("semantic.deconstruct"),
     }
     await client.aclose()
+
+
+async def test_openai_compatible_deconstruction_uses_generic_chat_contract() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url == "https://models.example.test/openai/v1/chat/completions"
+        assert request.headers["authorization"] == "Bearer test-customer-key"
+        body = json.loads(request.content)
+        assert body["model"] == "customer/semantic-model"
+        assert body["max_tokens"] == 321
+        assert body["response_format"]["type"] == "json_schema"
+        assert "reasoning" not in body
+        assert "provider" not in body
+        return completion(json.dumps(frame_payload()))
+
+    client = mock_client(handler)
+    async with OpenAICompatibleSemanticDeconstructor(
+        openai_compatible_settings(),
+        client=client,
+    ) as deconstructor:
+        frame = await deconstructor.deconstruct(interaction())
+
+    assert frame.extractor_version == "openai-compatible-semantic-deconstructor/1.0.0"
+    assert frame.metadata["semantic_provider"] == "customer-model-gateway"
+    assert frame.metadata["semantic_protocol"] == "openai-chat-completions"
+    assert frame.metadata["semantic_base_url"] == ("https://models.example.test/openai/v1")
+    assert frame.metadata["semantic_generation_id"] == "generation-1"
+    assert frame.metadata["semantic_model"] == "provider/resolved-model"
+    assert "openrouter_generation_id" not in frame.metadata
+    await client.aclose()
+
+
+async def test_semantic_provider_redirect_is_rejected() -> None:
+    redirect_client = mock_client(
+        lambda request: httpx.Response(
+            307,
+            headers={"Location": "https://attacker.example.test/steal"},
+        )
+    )
+    async with OpenAICompatibleSemanticDeconstructor(
+        openai_compatible_settings(),
+        client=redirect_client,
+    ) as deconstructor:
+        with pytest.raises(ValueError, match="redirects are not allowed"):
+            await deconstructor.deconstruct(interaction())
+    await redirect_client.aclose()
 
 
 async def test_render_keeps_caller_instruction_out_of_the_system_prompt() -> None:
@@ -302,6 +387,18 @@ async def test_render_keeps_caller_instruction_out_of_the_system_prompt() -> Non
 
     assert rendered.text == "Please pay INV-104."
     assert rendered.metadata == {
+        "semantic_provider": "openrouter",
+        "semantic_protocol": "openai-chat-completions",
+        "semantic_base_url": "https://openrouter.ai/api/v1",
+        "semantic_generation_id": "generation-1",
+        "semantic_model": "provider/resolved-model",
+        "semantic_upstream_provider": "provider-name",
+        "semantic_usage": {
+            "prompt_tokens": 100,
+            "completion_tokens": 25,
+            "total_tokens": 125,
+            "cost": 0.00042,
+        },
         "openrouter_generation_id": "generation-1",
         "openrouter_model": "provider/resolved-model",
         "openrouter_provider": "provider-name",
@@ -971,8 +1068,10 @@ async def test_cancellation_is_not_swallowed_and_client_closes() -> None:
 async def test_owned_client_closes_on_context_exit(monkeypatch: pytest.MonkeyPatch) -> None:
     original_client_class = httpx.AsyncClient
     created_clients: list[httpx.AsyncClient] = []
+    client_options: list[dict[str, Any]] = []
 
     def recording_client(*args: Any, **kwargs: Any) -> httpx.AsyncClient:
+        client_options.append(kwargs)
         client = original_client_class(*args, **kwargs)
         created_clients.append(client)
         return client
@@ -984,6 +1083,97 @@ async def test_owned_client_closes_on_context_exit(monkeypatch: pytest.MonkeyPat
         assert not created_clients[0].is_closed
 
     assert created_clients[0].is_closed
+    async with OpenAICompatibleSemanticDeconstructor(openai_compatible_settings()):
+        assert not created_clients[1].is_closed
+
+    assert created_clients[1].is_closed
+    assert client_options == [
+        {
+            "timeout": 12,
+            "follow_redirects": False,
+            "trust_env": True,
+        },
+        {
+            "timeout": 12,
+            "follow_redirects": False,
+            "trust_env": False,
+        },
+    ]
+
+
+@pytest.mark.parametrize(
+    "base_url",
+    [
+        "http://models.example.test/v1",
+        "ftp://localhost:8000/v1",
+        "https://user:password@models.example.test/v1",
+        "https://models.example.test/v1?tenant=secret",
+        "https://models.example.test/v1#fragment",
+        "https://models.example.test:invalid/v1",
+        "https://models.example.test/v1/chat/completions",
+    ],
+)
+async def test_openai_compatible_settings_reject_unsafe_base_urls(base_url: str) -> None:
+    with pytest.raises(ValidationError):
+        openai_compatible_settings(base_url=base_url)
+
+
+async def test_openai_compatible_settings_allow_loopback_http_and_inherit_models() -> None:
+    configured_settings = openai_compatible_settings(
+        base_url="http://127.0.0.1:8000/v1/",
+        model="local-model",
+    )
+
+    assert configured_settings.base_url == "http://127.0.0.1:8000/v1"
+    assert configured_settings.model == "local-model"
+    assert configured_settings.render_model == "local-model"
+    assert configured_settings.equivalence_model == "local-model"
+
+    with pytest.raises(ValidationError):
+        OpenAICompatibleDatasetSettings(base_url="https://models.example.test/v1")
+    with pytest.raises(ValidationError):
+        OpenAICompatibleDatasetSettings(model="customer/model")
+    with pytest.raises(ValidationError, match="reserved openrouter ID"):
+        openai_compatible_settings(provider_id="openrouter")
+
+
+async def test_openai_compatible_calls_can_omit_the_scoped_api_key() -> None:
+    configured_settings = openai_compatible_settings(api_key=None)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert "authorization" not in request.headers
+        return completion(json.dumps(frame_payload()))
+
+    client = mock_client(handler)
+
+    async with OpenAICompatibleSemanticDeconstructor(
+        configured_settings,
+        client=client,
+    ) as deconstructor:
+        frame = await deconstructor.deconstruct(interaction())
+
+    assert frame.interaction_id == "interaction-1"
+    await client.aclose()
+
+
+async def test_openai_compatible_selection_loads_scoped_environment(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("UL_DATASET_SEMANTIC_PROVIDER", "openai-compatible")
+    monkeypatch.setenv("UL_DATASET_OPENAI_BASE_URL", "https://models.example.test/v1")
+    monkeypatch.setenv("UL_DATASET_OPENAI_API_KEY", "customer-secret")
+    monkeypatch.setenv("OPENAI_API_KEY", "ambient-key-must-not-be-used")
+    monkeypatch.setenv("UL_DATASET_MODEL", "customer/model")
+
+    configured_settings = load_dataset_semantic_settings()
+
+    assert isinstance(configured_settings, OpenAICompatibleDatasetSettings)
+    assert configured_settings.api_key is not None
+    assert configured_settings.api_key.get_secret_value() == "customer-secret"
+    assert configured_settings.render_model == "customer/model"
+    assert "customer-secret" not in repr(configured_settings)
 
 
 async def test_settings_load_dotenv_and_hide_secrets(

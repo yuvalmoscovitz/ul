@@ -31,6 +31,46 @@ processing of the selected data. For separate policy control, use
 `UL_DATASET_LIVE_CALLS=true` and `UL_DATASET_ALLOW_EXTERNAL_DATA_PROCESSING=true` instead.
 Either granular variable takes precedence when explicitly set, including `false`.
 
+### Semantic model providers
+
+OpenRouter remains the default, so existing configurations continue to use
+`OPEN_ROUTER_API_KEY` and the existing `UL_DATASET_*_MODEL` variables. To send semantic-model
+requests to a customer-controlled OpenAI-compatible Chat Completions endpoint instead, configure
+the API root and a provider-scoped key:
+
+```bash
+export UL_DATASET_SEMANTIC_PROVIDER=openai-compatible
+export UL_DATASET_OPENAI_BASE_URL=https://models.example.com/v1
+export UL_DATASET_OPENAI_API_KEY=YOUR_SECRET_FROM_A_SECRET_MANAGER  # if required
+export UL_DATASET_MODEL=your-semantic-model
+export UL_LIVE=true
+
+uv run ul dataset evaluate interactions.jsonl \
+  --target-config target.json \
+  --allow-target-network \
+  --confirm-isolated-sandbox \
+  --confirm-fresh-state \
+  --output results.jsonl
+```
+
+`UL_DATASET_RENDER_MODEL` and `UL_DATASET_EQUIVALENCE_MODEL` are optional for an
+OpenAI-compatible provider; both inherit `UL_DATASET_MODEL` when omitted. Set
+`UL_DATASET_OPENAI_PROVIDER_ID` to a stable lowercase identifier when evidence should distinguish
+multiple internal gateways. The endpoint must support `POST /chat/completions` and strict JSON
+Schema response formatting. UL sends only standard Chat Completions request fields to this generic
+provider; OpenRouter-only routing and reasoning fields are not sent.
+
+Use an API-root URL such as `https://models.example.com/v1`, not the full
+`/chat/completions` URL. UL rejects credentials, queries, and fragments in the URL, rejects
+redirects, ignores ambient proxy settings for customer-configured endpoints, and requires HTTPS
+except for exact loopback addresses such as `http://127.0.0.1:8000/v1`. The scoped key is optional
+for the generic provider; when it is unset, UL omits the authorization header so unauthenticated
+local runtimes work without a placeholder secret. OpenRouter retains its existing environment
+transport behavior and still requires `OPEN_ROUTER_API_KEY`. UL records the provider identifier,
+normalized base URL, protocol, generation ID, and resolved model in evidence, but never records an
+API key or authorization header. The explicit live-call and data-processing permissions still
+apply to customer-controlled and local endpoints.
+
 The command starts an intentionally defective agent on localhost, gives every request clean
 synthetic state, and evaluates one synthetic accounts-payable interaction. A typical run finds
 a `REPEATABLE DIFFERENCE — REVIEW`: the agent pays invoice `AC-100` for the original request but

@@ -22,6 +22,8 @@ from ul import (
     JsonHttpDatasetTargetConfig,
     JsonValuesEqualInvariant,
     ObservedAgentOutput,
+    OpenAICompatibleDatasetSettings,
+    OpenAICompatibleSemanticDeconstructor,
     OpenRouterDatasetSettings,
     OpenRouterSemanticDeconstructor,
     PromptManager,
@@ -33,14 +35,17 @@ from ul import (
     SemanticEquivalenceAssessment,
     SemanticEquivalenceVerifier,
     SemanticFrame,
+    SemanticModelDeconstructor,
     UserInputRecord,
     builtin_augmentation_registry,
     builtin_dataset_augmentation_operators,
     create_dataset_regression_case,
+    create_semantic_model_deconstructor,
     dataset_regression_target_config_sha256,
     evaluate_dataset_invariants,
     load_dataset_invariant_suite,
     load_dataset_regression_case,
+    load_dataset_semantic_settings,
     load_json_http_dataset_target_config,
     replay_dataset_regression,
 )
@@ -117,6 +122,11 @@ def test_sdk_exposes_dataset_augmentation_api() -> None:
     assert len(builtin_dataset_augmentation_operators()) == 8
     assert OpenRouterSemanticDeconstructor is not None
     assert OpenRouterDatasetSettings is not None
+    assert OpenAICompatibleSemanticDeconstructor is not None
+    assert OpenAICompatibleDatasetSettings is not None
+    assert SemanticModelDeconstructor is not None
+    assert create_semantic_model_deconstructor is not None
+    assert load_dataset_semantic_settings is not None
     assert PromptManager.instance().list_templates()
     assert PromptTemplateInfo.__name__ == "PromptTemplateInfo"
     assert ObservedAgentOutput(raw_output={"action": "visit_booked"}).raw_output == {
