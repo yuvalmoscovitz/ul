@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Any, cast
 
@@ -14,6 +15,7 @@ from examples.accounts_payable.tool_schemas import openrouter_tool_definitions
 
 DEFAULT_OPENROUTER_MODEL = "deepseek/deepseek-v4-flash-0731"
 _PROMPTS = PromptManager.instance()
+_MAXIMUM_MODEL_CALLS = 10
 
 
 class OpenRouterSettings(BaseSettings):
@@ -46,6 +48,8 @@ class AgentToolStep:
 class AgentRunResult:
     final_answer: str
     tool_steps: tuple[AgentToolStep, ...]
+    cost_usd: float
+    error: str | None = None
 
 
 async def run_openrouter_agent(
@@ -67,29 +71,67 @@ async def run_openrouter_agent(
     ]
     owns_client = client is None
     active_client = client or httpx.AsyncClient(timeout=settings.request_timeout_seconds)
+    tool_steps: list[AgentToolStep] = []
+    cost_usd = 0.0
 
     try:
-        response = await active_client.post(
-            "https://openrouter.ai/api/v1/chat/completions",
-            headers={"Authorization": f"Bearer {settings.api_key.get_secret_value()}"},
-            json={
-                "model": settings.model,
-                "messages": messages,
-                "tools": openrouter_tool_definitions(),
-                "tool_choice": "auto",
-                "parallel_tool_calls": False,
-                "reasoning": {"effort": "none", "exclude": True},
-                "temperature": 0,
-                "max_completion_tokens": settings.max_output_tokens,
-            },
-        )
-        response.raise_for_status()
+        for _ in range(_MAXIMUM_MODEL_CALLS):
+            response = await active_client.post(
+                "https://openrouter.ai/api/v1/chat/completions",
+                headers={"Authorization": f"Bearer {settings.api_key.get_secret_value()}"},
+                json={
+                    "model": settings.model,
+                    "messages": messages,
+                    "tools": openrouter_tool_definitions(),
+                    "tool_choice": "auto",
+                    "parallel_tool_calls": False,
+                    "reasoning": {"effort": "none", "exclude": True},
+                    "temperature": 0,
+                    "max_completion_tokens": settings.max_output_tokens,
+                },
+            )
+            response.raise_for_status()
+            assistant_message, tool_calls, response_cost = _parse_response(response)
+            accumulated_cost = cost_usd + response_cost
+            if not math.isfinite(accumulated_cost):
+                raise ValueError("OpenRouter returned an invalid accumulated cost")
+            cost_usd = accumulated_cost
+            messages.append(assistant_message)
+            if not tool_calls:
+                content = assistant_message.get("content")
+                return AgentRunResult(
+                    content if isinstance(content, str) else "",
+                    tuple(tool_steps),
+                    cost_usd,
+                )
+
+            for tool_call_id, tool_name, arguments_json in tool_calls:
+                result_json = environment.dispatch_json(tool_name, arguments_json)
+                tool_steps.append(AgentToolStep(tool_name, arguments_json, result_json))
+                messages.append(
+                    {"role": "tool", "tool_call_id": tool_call_id, "content": result_json}
+                )
     finally:
         if owns_client:
             await active_client.aclose()
 
+    return AgentRunResult(
+        "The model call limit was reached before the task completed.",
+        tuple(tool_steps),
+        cost_usd,
+        "OpenRouter agent reached the model call limit.",
+    )
+
+
+def _parse_response(
+    response: httpx.Response,
+) -> tuple[dict[str, Any], list[tuple[str, str, str]], float]:
+    raw_response_data = response.json()
+    if not isinstance(raw_response_data, dict):
+        raise ValueError("OpenRouter returned an invalid assistant message")
+    response_data = cast(dict[str, Any], raw_response_data)
     try:
-        raw_assistant_message = response.json()["choices"][0]["message"]
+        raw_assistant_message = response_data["choices"][0]["message"]
     except (KeyError, IndexError, TypeError) as error:
         raise ValueError("OpenRouter returned an invalid assistant message") from error
     if not isinstance(raw_assistant_message, dict):
@@ -101,25 +143,31 @@ async def run_openrouter_agent(
     if not isinstance(raw_tool_calls, list):
         raise ValueError("OpenRouter returned invalid tool calls")
 
-    parsed_tool_calls: list[tuple[str, str]] = []
+    parsed_tool_calls: list[tuple[str, str, str]] = []
     for raw_tool_call in cast(list[object], raw_tool_calls):
         if not isinstance(raw_tool_call, dict):
             raise ValueError("OpenRouter returned an invalid tool call")
         tool_call = cast(dict[str, Any], raw_tool_call)
         try:
+            tool_call_id = tool_call["id"]
             function = tool_call["function"]
             tool_name = function["name"]
             arguments_json = function["arguments"]
         except (KeyError, TypeError) as error:
             raise ValueError("OpenRouter returned an invalid tool call") from error
-        if not isinstance(tool_name, str) or not isinstance(arguments_json, str):
+        if not all(isinstance(value, str) for value in (tool_call_id, tool_name, arguments_json)):
             raise ValueError("OpenRouter returned an invalid tool call")
-        parsed_tool_calls.append((tool_name, arguments_json))
+        parsed_tool_calls.append((tool_call_id, tool_name, arguments_json))
 
-    tool_steps: list[AgentToolStep] = []
-    for tool_name, arguments_json in parsed_tool_calls:
-        result_json = environment.dispatch_json(tool_name, arguments_json)
-        tool_steps.append(AgentToolStep(tool_name, arguments_json, result_json))
-
-    content = assistant_message.get("content")
-    return AgentRunResult(content if isinstance(content, str) else "", tuple(tool_steps))
+    raw_usage: object = response_data.get("usage", {})
+    raw_cost: object = (
+        cast(dict[str, object], raw_usage).get("cost", 0) if isinstance(raw_usage, dict) else 0
+    )
+    if (
+        isinstance(raw_cost, bool)
+        or not isinstance(raw_cost, (int, float))
+        or not math.isfinite(raw_cost)
+        or raw_cost < 0
+    ):
+        raise ValueError("OpenRouter returned an invalid cost")
+    return assistant_message, parsed_tool_calls, float(raw_cost)

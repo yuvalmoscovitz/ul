@@ -340,7 +340,9 @@ class AccountsPayableOpenRouterTarget(TargetExecutor):
         )
         return ExecutionResult(
             scenario_id=scenario.scenario_id,
-            status=ExecutionStatus.SUCCEEDED,
+            status=(
+                ExecutionStatus.SUCCEEDED if agent_result.error is None else ExecutionStatus.FAILED
+            ),
             tool_calls=tuple(
                 ToolCall(
                     name=step.tool_name,
@@ -352,6 +354,8 @@ class AccountsPayableOpenRouterTarget(TargetExecutor):
             final_output=agent_result.final_answer,
             state_before=scenario.environment,
             state_after=environment.state.model_dump(mode="json"),
+            error=agent_result.error,
+            cost_usd=agent_result.cost_usd,
             metadata=cast(
                 dict[str, JsonValue],
                 {
