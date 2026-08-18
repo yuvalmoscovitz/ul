@@ -11,7 +11,7 @@ from threading import Thread
 from typing import Annotated, TextIO, cast
 
 import typer
-from ul import OpenRouterDatasetSettings
+from ul import load_dataset_semantic_settings
 
 from examples.quickstart.defective_agent import create_server
 
@@ -53,14 +53,28 @@ def load_target_template(base_url: str | None = None) -> dict[str, object]:
 
 
 def _subprocess_environment(*, dry_run: bool) -> dict[str, str]:
-    environment = dict(_QUICKSTART_MODEL_ENVIRONMENT)
+    settings = load_dataset_semantic_settings()
+    if settings.semantic_provider_type == "openrouter":
+        environment = dict(_QUICKSTART_MODEL_ENVIRONMENT)
+    else:
+        environment = {
+            "UL_DATASET_SEMANTIC_PROVIDER": "openai-compatible",
+            "UL_DATASET_OPENAI_PROVIDER_ID": settings.semantic_provider_id,
+            "UL_DATASET_OPENAI_BASE_URL": settings.semantic_base_url,
+            "UL_DATASET_MODEL": settings.model,
+            "UL_DATASET_RENDER_MODEL": settings.render_model,
+            "UL_DATASET_EQUIVALENCE_MODEL": settings.equivalence_model,
+        }
     if dry_run:
         if "PYTHONPATH" in os.environ:
             environment["PYTHONPATH"] = os.environ["PYTHONPATH"]
         return environment
-    settings = OpenRouterDatasetSettings()
-    if settings.api_key is None or not settings.api_key.get_secret_value().strip():
-        raise ValueError("set OPEN_ROUTER_API_KEY before running the live quickstart")
+    if settings.api_key_required and (
+        settings.api_key is None or not settings.api_key.get_secret_value().strip()
+    ):
+        raise ValueError(
+            f"set {settings.api_key_environment_variable} before running the live quickstart"
+        )
     if not settings.live_calls:
         raise ValueError(
             "set UL_LIVE=true (or UL_DATASET_LIVE_CALLS=true) before running the live quickstart"
@@ -70,7 +84,8 @@ def _subprocess_environment(*, dry_run: bool) -> dict[str, str]:
             "set UL_LIVE=true (or UL_DATASET_ALLOW_EXTERNAL_DATA_PROCESSING=true) before "
             "running the live quickstart"
         )
-    environment["OPEN_ROUTER_API_KEY"] = settings.api_key.get_secret_value()
+    if settings.api_key is not None and settings.api_key.get_secret_value().strip():
+        environment[settings.api_key_environment_variable] = settings.api_key.get_secret_value()
     environment["UL_DATASET_LIVE_CALLS"] = "true"
     environment["UL_DATASET_ALLOW_EXTERNAL_DATA_PROCESSING"] = "true"
     return environment

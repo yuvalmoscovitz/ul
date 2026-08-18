@@ -147,6 +147,8 @@ class DatasetEvidenceOperator(_StrictModel):
 
 
 class DatasetEvidenceSemanticSettings(_StrictModel):
+    provider: str = Field(min_length=1, max_length=100)
+    endpoint_sha256: str = Field(pattern=_SHA256_PATTERN)
     model: str
     render_model: str
     equivalence_model: str

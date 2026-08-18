@@ -10,8 +10,8 @@ This package is a complete but synthetic black-box evaluation:
 - `defective_agent.py` is a resettable local HTTP sandbox with one seeded parsing defect.
 - `run.py` starts that sandbox and runs UL.
 
-Run from the repository root after installing dependencies and setting the three environment
-variables shown in the [main README](../../README.md):
+Run from the repository root after installing dependencies and configuring either OpenRouter or
+an OpenAI-compatible provider as shown in the [main README](../../README.md):
 
 ```bash
 uv run python -m examples.quickstart.run
@@ -137,14 +137,13 @@ case; it is not proof that the implementation is correct or that every related f
 
 ## Limitations
 
-The example is intentionally small and deterministic on the target side. Variation generation,
-validation, and behavioral comparison explicitly request `x-ai/grok-4.6` for
-deconstruction, rendering, and equivalence checking. This may cost more and can improve
-consistency, but OpenRouter and its underlying provider may still vary; the finding is not
-guaranteed. The invariant result applies only to the configured fields returned by the sandbox's
-separate committed-state snapshot endpoint. UL validates the reset acknowledgement contract but
-cannot independently prove that the sandbox erased every state store. Satisfying the rule does not
-establish overall correctness or safety.
+The example is intentionally small and deterministic on the target side. With OpenRouter,
+variation generation, validation, and behavioral comparison explicitly request `x-ai/grok-4.6`;
+an OpenAI-compatible provider uses its configured models. Model behavior may still vary, so the
+finding is not guaranteed. The invariant result applies only to configured fields returned by the
+sandbox's separate committed-state snapshot endpoint. UL validates the reset acknowledgement
+contract but cannot independently prove that the sandbox erased every state store. Satisfying the
+rule does not establish overall correctness or safety.
 The behavioral result is evidence for human review, not a causal proof or production-rate
 estimate. Do not point the command at a production system or any endpoint that can cause business
 side effects.
