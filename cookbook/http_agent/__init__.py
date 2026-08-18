@@ -1,1 +1,0 @@
-"""Existing HTTP agent cookbook."""

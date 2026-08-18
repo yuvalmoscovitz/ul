@@ -32,6 +32,7 @@ from ul_core.models import (
 )
 from ul_core.prompts import PromptManager, PromptTemplateInfo
 
+from ul.callable_target import callable_target_factory
 from ul.campaign import CampaignRunner
 from ul.dataset_augmentation import (
     DatasetAugmentationEngine,
@@ -250,6 +251,7 @@ __all__ = [
     "UserInputRecord",
     "builtin_augmentation_registry",
     "builtin_dataset_augmentation_operators",
+    "callable_target_factory",
     "create_dataset_regression_case",
     "create_multi_turn_regression_case",
     "create_semantic_model_deconstructor",

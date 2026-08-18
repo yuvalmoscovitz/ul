@@ -42,6 +42,7 @@ from ul import (
     UserInputRecord,
     builtin_augmentation_registry,
     builtin_dataset_augmentation_operators,
+    callable_target_factory,
     create_dataset_regression_case,
     create_semantic_model_deconstructor,
     dataset_regression_target_config_sha256,
@@ -126,6 +127,7 @@ def test_sdk_exposes_dataset_augmentation_api() -> None:
     assert load_dataset_regression_case.__name__ == "load_dataset_regression_case"
     assert replay_dataset_regression.__name__ == "replay_dataset_regression"
     assert len(builtin_dataset_augmentation_operators()) == 8
+    assert callable_target_factory.__name__ == "callable_target_factory"
     assert OpenRouterDatasetSettings is not None
     assert OpenAICompatibleDatasetSettings is not None
     assert SemanticModelDeconstructor is not None
