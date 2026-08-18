@@ -25,7 +25,9 @@ create_target = callable_target_factory(
 Those are the only integration lines. `agent.invoke` may be synchronous or asynchronous; its
 existing non-null JSON-compatible return becomes UL's `raw_output` unchanged. `reset` runs before
 every evaluation. The optional `snapshot` receives the original result and supplies committed state
-for invariant checks. An optional `cleanup` hook can release resources when UL closes the target.
+for invariant checks. UL serializes reset, invoke, and snapshot so concurrent callers cannot overlap
+one target's evaluation cycles. An optional `cleanup` hook can release resources when UL closes the
+target.
 
 The safety envelope and `fresh_state_per_execution=True` are explicit assertions about your test
 harness. UL does not infer isolation. If the reset does not actually create fresh, side-effect-free

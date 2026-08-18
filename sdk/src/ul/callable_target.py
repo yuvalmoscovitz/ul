@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import inspect
 from collections.abc import Awaitable, Callable
 from typing import Literal, cast
@@ -53,21 +54,24 @@ class _CallableDatasetTarget:
         self._reset = reset
         self._snapshot = snapshot
         self._cleanup = cleanup
+        self._execution_lock = asyncio.Lock()
 
     async def execute(self, raw_input: str) -> ObservedAgentOutput:
-        if self._reset is not None:
-            await _call_hook(self._reset, phase="reset")
-        result = await _call_hook(self._invoke, raw_input, phase="invoke")
-        raw_output = _validate_json_value(result, name="result")
-        metadata: dict[str, JsonValue] = {}
-        if self._snapshot is not None:
-            state = await _call_hook(self._snapshot, result, phase="snapshot")
-            metadata["committed_state_snapshot"] = _validate_json_value(state, name="snapshot")
-        return ObservedAgentOutput(raw_output=raw_output, metadata=metadata)
+        async with self._execution_lock:
+            if self._reset is not None:
+                await _call_hook(self._reset, phase="reset")
+            result = await _call_hook(self._invoke, raw_input, phase="invoke")
+            raw_output = _validate_json_value(result, name="result")
+            metadata: dict[str, JsonValue] = {}
+            if self._snapshot is not None:
+                state = await _call_hook(self._snapshot, result, phase="snapshot")
+                metadata["committed_state_snapshot"] = _validate_json_value(state, name="snapshot")
+            return ObservedAgentOutput(raw_output=raw_output, metadata=metadata)
 
     async def aclose(self) -> None:
-        if self._cleanup is not None:
-            await _call_hook(self._cleanup, phase="cleanup")
+        async with self._execution_lock:
+            if self._cleanup is not None:
+                await _call_hook(self._cleanup, phase="cleanup")
 
 
 async def _call_hook(hook: Callable[..., object], *args: object, phase: str) -> object:

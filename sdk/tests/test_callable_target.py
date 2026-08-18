@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from typing import Any, cast
 
 import pytest
@@ -80,6 +81,43 @@ async def test_supports_async_invoke_and_hooks() -> None:
     assert (await target.execute("run")).raw_output == "done"
     await cast(Any, target).aclose()
     assert calls == ["reset", "run", "cleanup"]
+
+
+@pytest.mark.asyncio
+async def test_serializes_reset_invoke_and_snapshot() -> None:
+    cycle_active = False
+
+    async def reset() -> None:
+        nonlocal cycle_active
+        assert cycle_active is False
+        cycle_active = True
+        await asyncio.sleep(0)
+
+    async def invoke(raw_input: str) -> str:
+        assert cycle_active is True
+        await asyncio.sleep(0)
+        return raw_input
+
+    async def snapshot(result: object) -> dict[str, object]:
+        nonlocal cycle_active
+        assert cycle_active is True
+        await asyncio.sleep(0)
+        cycle_active = False
+        return {"result": result}
+
+    target = callable_target_factory(
+        invoke,
+        reset=reset,
+        snapshot=snapshot,
+        safety_envelope=_SAFE_ENVELOPE,
+        fresh_state_per_execution=True,
+    )()
+
+    first, second = await asyncio.gather(target.execute("first"), target.execute("second"))
+
+    assert first.raw_output == "first"
+    assert second.raw_output == "second"
+    assert cycle_active is False
 
 
 def test_requires_explicit_fresh_state_declaration() -> None:
