@@ -773,14 +773,16 @@ def _outputs_for_observation_authority(
     outputs: tuple[ObservedAgentOutput | None, ...],
     observation_authority: ObservationAuthority,
 ) -> tuple[ObservedAgentOutput | None, ...]:
-    if observation_authority != "committed_state_snapshot":
+    if observation_authority == "agent_response":
         return outputs
-    return tuple(
-        None
-        if output is None or "committed_state_snapshot" not in output.metadata
-        else ObservedAgentOutput(raw_output=output.metadata["committed_state_snapshot"])
-        for output in outputs
-    )
+    if observation_authority == "committed_state_snapshot":
+        return tuple(
+            None
+            if output is None or "committed_state_snapshot" not in output.metadata
+            else ObservedAgentOutput(raw_output=output.metadata["committed_state_snapshot"])
+            for output in outputs
+        )
+    raise ValueError("unsupported observation authority")
 
 
 def _evaluate_rule_from_outputs(

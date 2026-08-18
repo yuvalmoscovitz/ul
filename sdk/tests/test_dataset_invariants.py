@@ -390,6 +390,36 @@ def test_public_evaluation_requires_a_committed_state_snapshot() -> None:
     assert result.baseline.rules[0].status == "not_evaluable"
 
 
+def test_public_rule_evaluation_rejects_unknown_observation_authority() -> None:
+    with pytest.raises(ValueError, match="unsupported observation authority"):
+        evaluate_dataset_invariant_rules(
+            (_rule(),),
+            (_observed(_output("AC-100", "AC-100")),),
+            observation_authority=cast(
+                dataset_invariants.ObservationAuthority,
+                "tool_result",
+            ),
+        )
+
+
+def test_evaluation_rejects_invalid_constructed_suite_authority() -> None:
+    invalid_suite = DatasetInvariantSuite.model_construct(
+        schema_version="1.0.0",
+        observation_source="target_output",
+        observation_authority=cast(
+            dataset_invariants.ObservationAuthority,
+            "tool_result",
+        ),
+        rules=(_rule(),),
+    )
+
+    with pytest.raises(ValueError, match="unsupported observation authority"):
+        evaluate_dataset_invariants(
+            _evaluation_result([_output("AC-100", "AC-100")]),
+            invalid_suite,
+        )
+
+
 def test_allowed_set_is_strict_ordered_and_rejects_duplicate_configuration() -> None:
     rule = JsonValueInAllowedSetInvariant(
         type="json_value_in_allowed_set",
