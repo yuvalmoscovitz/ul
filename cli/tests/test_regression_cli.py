@@ -540,7 +540,7 @@ def test_semantic_finding_still_requires_an_explicit_rule(tmp_path: Path) -> Non
     )
 
     assert result.exit_code == 2
-    assert "semantic findings require at least one --rule" in result.output
+    assert "semantic findings require at least one --rule" in " ".join(result.output.split())
     assert not case_path.exists()
 
 
