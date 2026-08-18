@@ -18,6 +18,7 @@ from ul.dataset_invariants import (
     JsonValueEqualsLiteralInvariant,
 )
 from ul_cli import dataset_regression as regression_cli
+from ul_cli import dataset_review
 from ul_cli.main import app
 
 runner = CliRunner()
@@ -208,6 +209,25 @@ def _write_evidence(path: Path) -> None:
     )
 
 
+def _write_invariant_only_evidence(path: Path) -> str:
+    record = _evidence_record()
+    cast(list[dict[str, Any]], record["cases"])[0]["findings"] = []
+    path.write_text(
+        json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n",
+        encoding="utf-8",
+    )
+    indexed_findings = dataset_review._index_findings(dataset_review._load_evidence(path))
+    rule_finding_ids = [
+        finding.finding_id
+        for finding in indexed_findings.values()
+        if finding.kind == "customer_invariant_violation"
+        and finding.variation_rule is not None
+        and finding.variation_rule.rule_id == RULE_ID
+    ]
+    assert len(rule_finding_ids) == 1
+    return rule_finding_ids[0]
+
+
 class _ReplayServer(ThreadingHTTPServer):
     fixed: bool
     unavailable: bool
@@ -287,17 +307,17 @@ def _write_target_config(path: Path, endpoint: str) -> None:
     )
 
 
-def _confirm_finding(evidence: Path) -> None:
+def _confirm_finding(evidence: Path, finding_id: str = FINDING_ID) -> None:
     report = runner.invoke(app, ["dataset", "report", str(evidence)])
     assert report.exit_code == 0, report.output
-    assert "needs_review=1" in report.output
+    assert f"Finding {finding_id}" in report.output
     review = runner.invoke(
         app,
         [
             "dataset",
             "review",
             str(evidence),
-            FINDING_ID,
+            finding_id,
             "--status",
             "confirmed",
             "--severity",
@@ -314,20 +334,28 @@ def _confirm_finding(evidence: Path) -> None:
     assert "confirmed=1" in reviewed_report.output
 
 
-def _save_arguments(evidence: Path, target_config: Path, case_path: Path) -> list[str]:
-    return [
+def _save_arguments(
+    evidence: Path,
+    target_config: Path,
+    case_path: Path,
+    *,
+    finding_id: str = FINDING_ID,
+    rule_id: str | None = RULE_ID,
+) -> list[str]:
+    arguments = [
         "regression",
         "save",
         str(evidence),
-        FINDING_ID,
-        "--rule",
-        RULE_ID,
+        finding_id,
         "--target-config",
         str(target_config),
         "--output",
         str(case_path),
         "--confirm-versioned-input",
     ]
+    if rule_id is not None:
+        arguments[4:4] = ["--rule", rule_id]
+    return arguments
 
 
 def _replay_arguments(case_path: Path, target_config: Path, result_path: Path) -> list[str]:
@@ -431,6 +459,89 @@ def test_confirmed_finding_save_and_replay_real_loopback(
     assert defective_result["status"] == "failed"
     assert fixed_result["status"] == "passed"
     assert len(defective_result["executions"]) == len(fixed_result["executions"]) == 3
+
+
+def test_invariant_violation_without_semantic_finding_saves_and_replays(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    evidence = tmp_path / "evidence.jsonl"
+    case_path = tmp_path / "wrong-invoice.regression.json"
+    defective_result_path = tmp_path / "defective-replay.json"
+    fixed_result_path = tmp_path / "fixed-replay.json"
+    invariant_finding_id = _write_invariant_only_evidence(evidence)
+    monkeypatch.setenv("UL_REGRESSION_TEST_SECRET", TEST_SECRET)
+    _confirm_finding(evidence, invariant_finding_id)
+
+    with _running_server() as (server, endpoint):
+        target_config = tmp_path / "target.json"
+        _write_target_config(target_config, endpoint)
+        saved = runner.invoke(
+            app,
+            _save_arguments(
+                evidence,
+                target_config,
+                case_path,
+                finding_id=invariant_finding_id,
+                rule_id=None,
+            ),
+        )
+        assert saved.exit_code == 0, saved.output
+        saved_case = json.loads(case_path.read_text(encoding="utf-8"))
+        assert saved_case["lineage"]["finding_id"] == invariant_finding_id
+        assert [rule["id"] for rule in saved_case["invariant_suite"]["rules"]] == [RULE_ID]
+
+        defective = runner.invoke(
+            app, _replay_arguments(case_path, target_config, defective_result_path)
+        )
+        assert defective.exit_code == 1, defective.output
+        assert len(server.requests) == 3
+
+        server.fixed = True
+        fixed = runner.invoke(app, _replay_arguments(case_path, target_config, fixed_result_path))
+        assert fixed.exit_code == 0, fixed.output
+        assert len(server.requests) == 6
+
+
+def test_invariant_finding_rejects_unrelated_explicit_rule(tmp_path: Path) -> None:
+    evidence = tmp_path / "evidence.jsonl"
+    target_config = tmp_path / "target.json"
+    case_path = tmp_path / "case.json"
+    invariant_finding_id = _write_invariant_only_evidence(evidence)
+    _write_target_config(target_config, "https://sandbox.example.test/execute")
+    _confirm_finding(evidence, invariant_finding_id)
+
+    result = runner.invoke(
+        app,
+        _save_arguments(
+            evidence,
+            target_config,
+            case_path,
+            finding_id=invariant_finding_id,
+            rule_id=SECOND_RULE_ID,
+        ),
+    )
+
+    assert result.exit_code == 2
+    assert "automatically selects" in result.output
+    assert not case_path.exists()
+
+
+def test_semantic_finding_still_requires_an_explicit_rule(tmp_path: Path) -> None:
+    evidence = tmp_path / "evidence.jsonl"
+    target_config = tmp_path / "target.json"
+    case_path = tmp_path / "case.json"
+    _write_evidence(evidence)
+    _write_target_config(target_config, "https://sandbox.example.test/execute")
+    _confirm_finding(evidence)
+
+    result = runner.invoke(
+        app,
+        _save_arguments(evidence, target_config, case_path, rule_id=None),
+    )
+
+    assert result.exit_code == 2
+    assert "semantic findings require at least one --rule" in result.output
+    assert not case_path.exists()
 
 
 def test_regression_run_monitors_saved_cases_against_current_black_box_target(

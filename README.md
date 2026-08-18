@@ -101,6 +101,11 @@ supported), and `inconclusive` (the reviewer needs more context). These are huma
 UL correctness labels. Correcting a judgment requires `--supersedes REVIEW_ID`, preserving the
 earlier decision.
 
+When an original satisfies a customer invariant and its variation violates that same rule,
+`dataset report` assigns the transition its own finding ID even if the semantic comparison found
+no behavioral difference. Review that ID with the same command. Other invariant outcomes remain
+visible in the invariant evaluation but are not presented as variation-caused findings.
+
 After a finding has an active `confirmed` review, save its exact variation and one or more
 violated customer rules as a replayable regression case:
 
@@ -111,6 +116,10 @@ uv run ul regression save PATH_TO_EVIDENCE.jsonl FINDING_ID \
   --output regressions/wrong-invoice.json \
   --confirm-versioned-input
 ```
+
+For a customer-invariant finding, omit `--rule`: the finding already identifies its one violated
+rule, and UL selects it automatically. Semantic findings still require one or more explicit
+`--rule` options.
 
 `--confirm-versioned-input` is required because the case copies the exact raw input, literal
 target-template values, and selected customer-rule definitions. Rule literals and allowed sets

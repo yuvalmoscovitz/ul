@@ -267,7 +267,9 @@ def test_report_schema_1_4_shows_customer_invariants_separately(tmp_path: Path) 
 
     assert report.exit_code == 0, report.output
     normalized_output = " ".join(report.output.split())
-    assert "Dataset finding report: 1 finding(s)" in normalized_output
+    assert "Dataset finding report: 2 finding(s)" in normalized_output
+    assert "Category: customer_invariant_violation" in normalized_output
+    assert "Rule transition: original=satisfied; variation=violated" in normalized_output
     assert "Customer invariant evaluation" in normalized_output
     assert "Declared observation authority: committed_state_snapshot" in normalized_output
     assert "severity=critical; arm=original; status=satisfied" in normalized_output
@@ -281,6 +283,106 @@ def test_report_schema_1_4_shows_customer_invariants_separately(tmp_path: Path) 
     assert "selected_values=" not in normalized_output
     assert "Customer rule violated against declared committed_state_snapshot." in normalized_output
     assert "agent wrong" not in normalized_output.casefold()
+
+
+def test_invariant_violation_without_semantic_difference_can_be_reviewed(
+    tmp_path: Path,
+) -> None:
+    evidence = tmp_path / "evidence.jsonl"
+    record = _evidence_record()
+    record["schema_version"] = "1.4.0"
+    record["invariant_evaluation"] = _invariant_evaluation()
+    record["cases"][0]["findings"] = []
+    _write_evidence(evidence, [record])
+
+    report = runner.invoke(app, ["dataset", "report", str(evidence)])
+
+    assert report.exit_code == 0, report.output
+    indexed_findings = dataset_review._index_findings(dataset_review._load_evidence(evidence))
+    assert len(indexed_findings) == 1
+    invariant_finding_id = next(iter(indexed_findings))
+    assert indexed_findings[invariant_finding_id].kind == "customer_invariant_violation"
+    assert f"Finding {invariant_finding_id}" in report.output
+    assert "Category: customer_invariant_violation" in report.output
+    assert "declared_severity=critical" in report.output.replace("\n", " ")
+    assert "resolved_values" not in report.output
+    assert "200" not in report.output
+
+    review = runner.invoke(
+        app,
+        [
+            "dataset",
+            "review",
+            str(evidence),
+            invariant_finding_id,
+            "--status",
+            "confirmed",
+            "--severity",
+            "critical",
+            "--reviewer",
+            "payments-risk",
+            "--reason",
+            "The variation violated the declared final-amount rule.",
+        ],
+    )
+
+    assert review.exit_code == 0, review.output
+    reviewed_report = runner.invoke(app, ["dataset", "report", str(evidence)])
+    assert reviewed_report.exit_code == 0, reviewed_report.output
+    assert "confirmed=1" in reviewed_report.output
+    assert "Latest review: confirmed, severity=critical" in reviewed_report.output
+
+
+def test_invariant_finding_id_ignores_resolved_values_but_tracks_variation_identity(
+    tmp_path: Path,
+) -> None:
+    first_evidence = tmp_path / "first.jsonl"
+    first = _evidence_record()
+    first["schema_version"] = "1.4.0"
+    first["invariant_evaluation"] = _invariant_evaluation()
+    first["cases"][0]["findings"] = []
+    _write_evidence(first_evidence, [first])
+    first_id = next(
+        iter(dataset_review._index_findings(dataset_review._load_evidence(first_evidence)))
+    )
+
+    changed_values_evidence = tmp_path / "changed-values.jsonl"
+    changed_values = json.loads(json.dumps(first))
+    changed_values["invariant_evaluation"]["variations"][0]["rules"][0]["trials"][0][
+        "resolved_values"
+    ]["left"] = 300
+    _write_evidence(changed_values_evidence, [changed_values])
+    changed_values_id = next(
+        iter(dataset_review._index_findings(dataset_review._load_evidence(changed_values_evidence)))
+    )
+
+    changed_input_evidence = tmp_path / "changed-input.jsonl"
+    changed_input = json.loads(json.dumps(first))
+    changed_input["cases"][0]["augmented_input"] = "Pay pay pay AC-100."
+    _write_evidence(changed_input_evidence, [changed_input])
+    changed_input_id = next(
+        iter(dataset_review._index_findings(dataset_review._load_evidence(changed_input_evidence)))
+    )
+
+    assert first_id == changed_values_id
+    assert first_id != changed_input_id
+
+
+def test_invariant_variation_must_map_to_exactly_one_case(tmp_path: Path) -> None:
+    evidence = tmp_path / "ambiguous.jsonl"
+    record = _evidence_record()
+    record["schema_version"] = "1.4.0"
+    record["invariant_evaluation"] = _invariant_evaluation()
+    record["cases"][0]["findings"] = []
+    duplicate_case = json.loads(json.dumps(record["cases"][0]))
+    duplicate_case["augmented_input"] = "Pay pay pay AC-100."
+    record["cases"].append(duplicate_case)
+    _write_evidence(evidence, [record])
+
+    report = runner.invoke(app, ["dataset", "report", str(evidence)])
+
+    assert report.exit_code != 0
+    assert "exactly one evidence case" in report.output
 
 
 @pytest.mark.parametrize(

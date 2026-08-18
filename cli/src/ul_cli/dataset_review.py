@@ -21,6 +21,7 @@ from ul import DatasetEvaluationResult, InteractionRecord
 from ul.dataset_invariants import (
     DatasetInvariantArrayUniqueTrialEvaluation,
     DatasetInvariantEvaluation,
+    DatasetInvariantRuleResult,
     DatasetInvariantSuite,
     DatasetInvariantTrialEvaluation,
     DatasetInvariantValueEqualsTrialEvaluation,
@@ -399,12 +400,25 @@ class _LoadedEvidenceRecord(BaseModel):
     sha256: str
 
 
+@dataclass(frozen=True)
+class _IndexedFinding:
+    finding_id: str
+    kind: Literal["semantic_difference", "customer_invariant_violation"]
+    evidence_record: _LoadedEvidenceRecord
+    case: _Case
+    semantic_finding: _Finding | None = None
+    baseline_rule: DatasetInvariantRuleResult | None = None
+    variation_rule: DatasetInvariantRuleResult | None = None
+
+
 class ConfirmedDatasetFinding(BaseModel):
     model_config = ConfigDict(arbitrary_types_allowed=True, frozen=True)
 
     evidence_record: _LoadedEvidenceRecord
     case: _Case
     review: ReviewRecord
+    kind: Literal["semantic_difference", "customer_invariant_violation"]
+    invariant_rule_id: str | None = None
 
 
 def load_confirmed_dataset_finding(
@@ -423,9 +437,13 @@ def load_confirmed_dataset_finding(
     if active_review is None or active_review.status != "confirmed":
         raise ValueError("finding must have an active confirmed review")
     return ConfirmedDatasetFinding(
-        evidence_record=selected[0],
-        case=selected[1],
+        evidence_record=selected.evidence_record,
+        case=selected.case,
         review=active_review,
+        kind=selected.kind,
+        invariant_rule_id=(
+            selected.variation_rule.rule_id if selected.variation_rule is not None else None
+        ),
     )
 
 
@@ -456,24 +474,43 @@ def report_dataset_evidence(
         status: 0
         for status in ("needs_review", "confirmed", "expected", "unsupported", "inconclusive")
     }
-    for _, _, finding in findings.values():
-        active_review = active_reviews.get(finding.finding_id)
+    for indexed_finding in findings.values():
+        active_review = active_reviews.get(indexed_finding.finding_id)
         status_counts[active_review.status if active_review else "needs_review"] += 1
 
     _print_plain(f"Dataset finding report: {len(findings)} finding(s)")
     _print_plain(
         "Reviews: " + ", ".join(f"{status}={count}" for status, count in status_counts.items())
     )
-    for loaded_record, case, finding in findings.values():
+    for indexed_finding in findings.values():
+        loaded_record = indexed_finding.evidence_record
+        case = indexed_finding.case
         matching_reviews = [
-            review for review in review_records if review.finding_id == finding.finding_id
+            review for review in review_records if review.finding_id == indexed_finding.finding_id
         ]
-        latest_review = active_reviews.get(finding.finding_id)
+        latest_review = active_reviews.get(indexed_finding.finding_id)
         _print_plain("")
-        _print_plain(f"Finding {finding.finding_id}")
+        _print_plain(f"Finding {indexed_finding.finding_id}")
         _print_plain(f"Machine status: {case.status}")
-        _print_plain(f"Category: {finding.category}")
-        _print_plain(f"Summary: {finding.summary}")
+        if indexed_finding.semantic_finding is not None:
+            finding = indexed_finding.semantic_finding
+            _print_plain(f"Category: {finding.category}")
+            _print_plain(f"Summary: {finding.summary}")
+        else:
+            baseline_rule = indexed_finding.baseline_rule
+            variation_rule = indexed_finding.variation_rule
+            if baseline_rule is None or variation_rule is None:
+                raise AssertionError("invariant finding requires both rule results")
+            _print_plain("Category: customer_invariant_violation")
+            _print_plain(
+                f"Summary: Customer rule {variation_rule.rule_id} was satisfied by the original "
+                "and violated by the variation."
+            )
+            _print_plain(
+                f"Rule: {variation_rule.rule_id} ({variation_rule.rule_version}); "
+                f"type={variation_rule.rule_type}; declared_severity={variation_rule.severity}"
+            )
+            _print_plain(f"Description: {variation_rule.description}")
         _print_plain(f"Original: {loaded_record.evidence.original_input}")
         _print_plain(f"Variation: {case.augmented_input}")
         _print_plain(f"Operator: {case.operator_id} ({case.operator_version})")
@@ -482,8 +519,29 @@ def report_dataset_evidence(
             + _observations_summary(loaded_record.evidence.current_baseline.observations)
         )
         _print_plain("Variation trials: " + _observations_summary(case.observations))
-        _print_plain("Reference effects: " + _effects_summary(finding.reference_effects))
-        _print_plain("Observed effects: " + _effects_summary(finding.observed_effects))
+        if indexed_finding.semantic_finding is not None:
+            _print_plain(
+                "Reference effects: "
+                + _effects_summary(indexed_finding.semantic_finding.reference_effects)
+            )
+            _print_plain(
+                "Observed effects: "
+                + _effects_summary(indexed_finding.semantic_finding.observed_effects)
+            )
+        else:
+            baseline_rule = indexed_finding.baseline_rule
+            variation_rule = indexed_finding.variation_rule
+            if baseline_rule is None or variation_rule is None:
+                raise AssertionError("invariant finding requires both rule results")
+            _print_plain(
+                f"Rule transition: original={baseline_rule.status}; "
+                f"variation={variation_rule.status}"
+            )
+            for trial in variation_rule.trials:
+                _print_plain(
+                    f"Variation rule trial {trial.repetition}: {trial.status}; "
+                    f"{_invariant_trial_location(trial)}; reason={trial.reason_code}"
+                )
         if latest_review is None:
             _print_plain(f"Latest review: needs_review (history: {len(matching_reviews)})")
         else:
@@ -551,7 +609,7 @@ def review_dataset_finding(
         selected = findings.get(finding_id)
         if selected is None:
             raise _ReviewInputError("finding ID was not found in the evidence")
-        loaded_record, _, _ = selected
+        loaded_record = selected.evidence_record
         new_review = ReviewRecord(
             review_id=f"ulr_{uuid4()}",
             evidence_record_sha256=loaded_record.sha256,
@@ -765,20 +823,84 @@ def _set_private_file_permissions(descriptor: int) -> None:
 
 def _index_findings(
     records: list[_LoadedEvidenceRecord],
-) -> dict[str, tuple[_LoadedEvidenceRecord, _Case, _Finding]]:
-    findings: dict[str, tuple[_LoadedEvidenceRecord, _Case, _Finding]] = {}
+) -> dict[str, _IndexedFinding]:
+    findings: dict[str, _IndexedFinding] = {}
     for loaded_record in records:
         for case in loaded_record.evidence.cases:
             for finding in case.findings:
                 if finding.finding_id in findings:
                     raise _ReviewInputError("evidence contains a duplicate finding ID")
-                findings[finding.finding_id] = (loaded_record, case, finding)
+                findings[finding.finding_id] = _IndexedFinding(
+                    finding_id=finding.finding_id,
+                    kind="semantic_difference",
+                    evidence_record=loaded_record,
+                    case=case,
+                    semantic_finding=finding,
+                )
+        evaluation = loaded_record.evidence.invariant_evaluation
+        if evaluation is None:
+            continue
+        cases_by_operator: dict[str, list[_Case]] = {}
+        for case in loaded_record.evidence.cases:
+            cases_by_operator.setdefault(case.operator_id, []).append(case)
+        baseline_rules = {rule.rule_id: rule for rule in evaluation.baseline.rules}
+        for variation in evaluation.variations:
+            if variation.operator_id is None:
+                raise _ReviewInputError("invariant variation is missing its operator ID")
+            matching_cases = cases_by_operator.get(variation.operator_id, [])
+            if len(matching_cases) != 1:
+                raise _ReviewInputError("invariant variation must map to exactly one evidence case")
+            case = matching_cases[0]
+            for variation_rule in variation.rules:
+                baseline_rule = baseline_rules.get(variation_rule.rule_id)
+                if baseline_rule is None:
+                    raise _ReviewInputError("invariant variation rule is missing from the baseline")
+                if baseline_rule.status != "satisfied" or variation_rule.status != "violated":
+                    continue
+                finding_id = _invariant_finding_id(
+                    loaded_record.evidence,
+                    case,
+                    evaluation,
+                    variation_rule,
+                )
+                if finding_id in findings:
+                    raise _ReviewInputError("evidence contains a duplicate finding ID")
+                findings[finding_id] = _IndexedFinding(
+                    finding_id=finding_id,
+                    kind="customer_invariant_violation",
+                    evidence_record=loaded_record,
+                    case=case,
+                    baseline_rule=baseline_rule,
+                    variation_rule=variation_rule,
+                )
     return findings
+
+
+def _invariant_finding_id(
+    evidence: _EvidenceRecord,
+    case: _Case,
+    evaluation: DatasetInvariantEvaluation,
+    rule: DatasetInvariantRuleResult,
+) -> str:
+    identity = {
+        "finding_kind": "customer_invariant_violation",
+        "interaction_id": evidence.interaction_id,
+        "original_input": evidence.original_input,
+        "operator_id": case.operator_id,
+        "operator_version": case.operator_version,
+        "augmented_input": case.augmented_input,
+        "suite_sha256": evaluation.suite_sha256,
+        "observation_authority": evaluation.observation_authority,
+        "rule_id": rule.rule_id,
+        "rule_version": rule.rule_version,
+        "rule_type": rule.rule_type,
+    }
+    return f"ulf_v1_{_canonical_json_sha256(identity)}"
 
 
 def _validate_review_history(
     reviews: list[ReviewRecord],
-    findings: dict[str, tuple[_LoadedEvidenceRecord, _Case, _Finding]],
+    findings: dict[str, _IndexedFinding],
 ) -> None:
     reviews_by_id: dict[str, ReviewRecord] = {}
     superseded_ids: set[str] = set()
@@ -789,7 +911,7 @@ def _validate_review_history(
         selected = findings.get(review.finding_id)
         if selected is None:
             raise _ReviewInputError("review references a finding outside this evidence")
-        if review.evidence_record_sha256 != selected[0].sha256:
+        if review.evidence_record_sha256 != selected.evidence_record.sha256:
             raise _ReviewInputError("review evidence digest does not match the evidence record")
         current_active = active_by_finding.get(review.finding_id)
         if current_active is None:
