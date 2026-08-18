@@ -100,6 +100,17 @@ from ul.http_target import (
     load_json_http_dataset_target_config,
 )
 from ul.otlp_ingest import OtlpIngestResult, OtlpInteractionRecord, parse_otlp_traces
+from ul.redaction import (
+    LocalPseudonymStore,
+    RedactedSemanticPipeline,
+    RedactionBoundaryError,
+    RedactionCoverage,
+    RedactionEngine,
+    RedactionPolicy,
+    RedactionResult,
+    RedactionRule,
+    RehydratingDatasetTarget,
+)
 
 __all__ = [
     "Action",
@@ -155,6 +166,7 @@ __all__ = [
     "JsonValueEqualsLiteralInvariant",
     "JsonValueInAllowedSetInvariant",
     "JsonValuesEqualInvariant",
+    "LocalPseudonymStore",
     "MaterializedScenario",
     "ObservedAgentOutput",
     "OpenAICompatibleDatasetSettings",
@@ -164,6 +176,14 @@ __all__ = [
     "OtlpInteractionRecord",
     "PromptManager",
     "PromptTemplateInfo",
+    "RedactedSemanticPipeline",
+    "RedactionBoundaryError",
+    "RedactionCoverage",
+    "RedactionEngine",
+    "RedactionPolicy",
+    "RedactionResult",
+    "RedactionRule",
+    "RehydratingDatasetTarget",
     "RenderedUserInput",
     "SafetyEnvelope",
     "Scenario",
