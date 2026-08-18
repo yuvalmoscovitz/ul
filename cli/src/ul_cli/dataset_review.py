@@ -166,6 +166,27 @@ class DatasetEvidenceRedactionCoverage(_StrictModel):
     matches_by_rule: dict[str, int] = Field(default_factory=dict)
 
 
+class DatasetEvidenceTarget(_StrictModel):
+    kind: Literal["json_http", "python_factory"]
+    config: JsonHttpDatasetTargetConfig | None = None
+    factory: str | None = Field(default=None, min_length=1, max_length=500)
+    sha256: str = Field(pattern=_SHA256_PATTERN)
+
+    @model_validator(mode="after")
+    def validate_target(self) -> Self:
+        if self.kind == "json_http":
+            if self.config is None or self.factory is not None:
+                raise ValueError("HTTP target evidence requires only its config")
+            expected_sha256 = dataset_regression_target_config_sha256(self.config)
+        else:
+            if self.factory is None or self.config is not None:
+                raise ValueError("Python target evidence requires only its factory")
+            expected_sha256 = _canonical_json_sha256({"kind": self.kind, "factory": self.factory})
+        if self.sha256 != expected_sha256:
+            raise ValueError("run context target digest must match its snapshot")
+        return self
+
+
 class DatasetEvidenceRunContext(_StrictModel):
     schema_version: Literal["1.0.0"] = "1.0.0"
     pipeline_version: Literal["1.1.0"] = _DATASET_EVALUATION_PIPELINE_VERSION
@@ -173,8 +194,7 @@ class DatasetEvidenceRunContext(_StrictModel):
     operators: tuple[DatasetEvidenceOperator, ...] = Field(min_length=1)
     repetitions: int = Field(ge=1)
     invariant_suite_sha256: str | None = Field(default=None, pattern=_SHA256_PATTERN)
-    target_config: JsonHttpDatasetTargetConfig
-    target_config_sha256: str = Field(pattern=_SHA256_PATTERN)
+    target: DatasetEvidenceTarget
     semantic_settings: DatasetEvidenceSemanticSettings
     redaction_policy_sha256: str | None = Field(default=None, pattern=_SHA256_PATTERN)
     redaction_coverage: tuple[DatasetEvidenceRedactionCoverage, ...] = ()
@@ -182,8 +202,6 @@ class DatasetEvidenceRunContext(_StrictModel):
 
     @model_validator(mode="after")
     def validate_digests(self) -> Self:
-        if self.target_config_sha256 != dataset_regression_target_config_sha256(self.target_config):
-            raise ValueError("run context target config digest must match its snapshot")
         context_content = self.model_dump(mode="json", exclude={"context_sha256"})
         if self.redaction_policy_sha256 is None:
             context_content.pop("redaction_policy_sha256")
@@ -265,7 +283,8 @@ def create_dataset_evidence_run_context(
     operators: tuple[tuple[str, str], ...],
     repetitions: int,
     invariant_suite_sha256: str | None,
-    target_config: JsonHttpDatasetTargetConfig,
+    target_config: JsonHttpDatasetTargetConfig | None = None,
+    target_factory: str | None = None,
     semantic_settings: DatasetEvidenceSemanticSettings,
     redaction_policy_sha256: str | None = None,
     redaction_coverage: tuple[DatasetEvidenceRedactionCoverage, ...] = (),
@@ -277,7 +296,21 @@ def create_dataset_evidence_run_context(
         DatasetEvidenceOperator(id=operator_id, version=version)
         for operator_id, version in operators
     )
-    target_config_sha256 = dataset_regression_target_config_sha256(target_config)
+    if (target_config is None) == (target_factory is None):
+        raise ValueError("run context requires exactly one target")
+    if target_config is not None:
+        target = DatasetEvidenceTarget(
+            kind="json_http",
+            config=target_config,
+            sha256=dataset_regression_target_config_sha256(target_config),
+        )
+    else:
+        assert target_factory is not None
+        target = DatasetEvidenceTarget(
+            kind="python_factory",
+            factory=target_factory,
+            sha256=_canonical_json_sha256({"kind": "python_factory", "factory": target_factory}),
+        )
     content = {
         "schema_version": "1.0.0",
         "pipeline_version": _DATASET_EVALUATION_PIPELINE_VERSION,
@@ -285,8 +318,7 @@ def create_dataset_evidence_run_context(
         "operators": [operator.model_dump(mode="json") for operator in operator_snapshots],
         "repetitions": repetitions,
         "invariant_suite_sha256": invariant_suite_sha256,
-        "target_config": target_config.model_dump(mode="json"),
-        "target_config_sha256": target_config_sha256,
+        "target": target.model_dump(mode="json"),
         "semantic_settings": semantic_settings.model_dump(mode="json"),
     }
     if redaction_policy_sha256 is not None:
@@ -300,8 +332,7 @@ def create_dataset_evidence_run_context(
         operators=operator_snapshots,
         repetitions=repetitions,
         invariant_suite_sha256=invariant_suite_sha256,
-        target_config=target_config,
-        target_config_sha256=target_config_sha256,
+        target=target,
         semantic_settings=semantic_settings,
         redaction_policy_sha256=redaction_policy_sha256,
         redaction_coverage=redaction_coverage,
