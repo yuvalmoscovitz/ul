@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+from threading import Event
 from typing import Any, cast
 
 import pytest
 from ul.callable_target import callable_target_factory
+from ul_core.contracts import DatasetTargetLifecycleError
 from ul_core.models import SafetyEnvelope
 
 _SAFE_ENVELOPE = SafetyEnvelope(
@@ -118,6 +120,33 @@ async def test_serializes_reset_invoke_and_snapshot() -> None:
     assert first.raw_output == "first"
     assert second.raw_output == "second"
     assert cycle_active is False
+
+
+@pytest.mark.asyncio
+async def test_sync_timeout_does_not_block_or_allow_hook_overlap() -> None:
+    release_invoke = Event()
+    invoke_finished = Event()
+
+    def invoke(raw_input: str) -> str:
+        release_invoke.wait()
+        invoke_finished.set()
+        return raw_input
+
+    target = callable_target_factory(
+        invoke,
+        safety_envelope=_SAFE_ENVELOPE,
+        fresh_state_per_execution=True,
+    )()
+
+    with pytest.raises(TimeoutError):
+        async with asyncio.timeout(0.01):
+            await target.execute("first")
+    with pytest.raises(DatasetTargetLifecycleError) as error:
+        await target.execute("second")
+    assert error.value.target_state_uncertain is True
+
+    release_invoke.set()
+    assert await asyncio.to_thread(invoke_finished.wait, 1)
 
 
 def test_requires_explicit_fresh_state_declaration() -> None:

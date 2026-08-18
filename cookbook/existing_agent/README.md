@@ -27,7 +27,8 @@ existing non-null JSON-compatible return becomes UL's `raw_output` unchanged. `r
 every evaluation. The optional `snapshot` receives the original result and supplies committed state
 for invariant checks. UL serializes reset, invoke, and snapshot so concurrent callers cannot overlap
 one target's evaluation cycles. An optional `cleanup` hook can release resources when UL closes the
-target.
+target. Synchronous hooks run off the event loop so UL's timeout remains effective; if timed-out
+synchronous work is still running, the target refuses further hooks because its state is uncertain.
 
 The safety envelope and `fresh_state_per_execution=True` are explicit assertions about your test
 harness. UL does not infer isolation. If the reset does not actually create fresh, side-effect-free
