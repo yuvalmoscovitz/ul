@@ -351,6 +351,27 @@ def test_committed_state_authority_uses_snapshot_not_execute_response() -> None:
     assert committed_state_result.status == "satisfied"
 
 
+def test_committed_state_authority_does_not_fall_back_to_execute_response() -> None:
+    rule = JsonValueEqualsLiteralInvariant(
+        type="json_value_equals_literal",
+        id="amount-is-committed",
+        version="1.0.0",
+        description="The committed amount must be 150.",
+        severity="high",
+        value_pointer="/amount",
+        literal=150,
+    )
+
+    result = evaluate_dataset_invariant_rules(
+        (rule,),
+        (ObservedAgentOutput(raw_output={"amount": 150}),),
+        observation_authority="committed_state_snapshot",
+    )[0]
+
+    assert result.status == "not_evaluable"
+    assert result.trials[0].reason_code == "target_output_missing"
+
+
 def test_allowed_set_is_strict_ordered_and_rejects_duplicate_configuration() -> None:
     rule = JsonValueInAllowedSetInvariant(
         type="json_value_in_allowed_set",

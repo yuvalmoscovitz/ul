@@ -213,7 +213,12 @@ def _write_stateful_target_config(path: Path) -> None:
             {
                 "version": 2,
                 "headers_from_env": {},
-                "reset": {"url": "https://sandbox.example.test/reset"},
+                "reset": {
+                    "url": "https://sandbox.example.test/reset",
+                    "generation_json_pointer": "/generation",
+                    "clean_state_json_pointer": "/clean",
+                    "clean_state_value": True,
+                },
                 "setup": {
                     "url": "https://sandbox.example.test/setup",
                     "request_json": {"seed": "standard"},
@@ -492,7 +497,9 @@ def test_stateful_target_dry_run_counts_physical_lifecycle_calls(
         result.output.split()
     )
     assert "Lifecycle calls per execution: 5" in result.output
-    assert "Version 2 targets enforce this with lifecycle calls" in " ".join(result.output.split())
+    assert "Version 2 targets invoke and validate the configured reset contract" in " ".join(
+        result.output.split()
+    )
 
 
 def test_invariant_dry_run_reports_rules_authority_and_no_extra_calls(
@@ -1716,7 +1723,16 @@ def test_all_complete_resume_preserves_prior_invariant_exit_code(
         else {"status": "ok"}
     )
     baseline_trial = evaluation_result.baseline.trial_set.trials[0].model_copy(
-        update={"target_output": ObservedAgentOutput(raw_output=baseline_output)}
+        update={
+            "target_output": ObservedAgentOutput(
+                raw_output=baseline_output,
+                metadata=(
+                    {"committed_state_snapshot": baseline_output}
+                    if invariant_status == "violated"
+                    else {}
+                ),
+            )
+        }
     )
     evaluation_result = evaluation_result.model_copy(
         update={

@@ -24,6 +24,7 @@ from pydantic import (
     field_validator,
     model_validator,
 )
+from ul_core.contracts import DatasetTargetLifecycleError
 from ul_core.dataset import ObservedAgentOutput
 from ul_core.models import SafetyEnvelope
 
@@ -119,6 +120,31 @@ class JsonHttpLifecycleObservationConfig(JsonHttpLifecycleCallConfig):
         return pointer
 
 
+class JsonHttpLifecycleResetConfig(JsonHttpLifecycleCallConfig):
+    generation_json_pointer: str
+    clean_state_json_pointer: str
+    clean_state_value: JsonValue
+
+    @field_validator("generation_json_pointer", "clean_state_json_pointer")
+    @classmethod
+    def validate_json_pointer(cls, pointer: str) -> str:
+        _parse_json_pointer(pointer)
+        return pointer
+
+    @field_validator("clean_state_value")
+    @classmethod
+    def validate_clean_state_value(cls, value: JsonValue) -> JsonValue:
+        if isinstance(value, dict | list | float):
+            raise ValueError("clean_state_value must be a JSON string, integer, boolean, or null")
+        return value
+
+    @model_validator(mode="after")
+    def validate_distinct_pointers(self) -> Self:
+        if self.generation_json_pointer == self.clean_state_json_pointer:
+            raise ValueError("reset generation and clean-state pointers must be different")
+        return self
+
+
 class JsonHttpLifecycleExecuteTurnConfig(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
@@ -149,7 +175,7 @@ class JsonHttpStatefulDatasetTargetConfig(BaseModel):
 
     version: Literal[2]
     headers_from_env: dict[str, str] = Field(default_factory=dict)
-    reset: JsonHttpLifecycleCallConfig
+    reset: JsonHttpLifecycleResetConfig
     setup: JsonHttpLifecycleCallConfig | None = None
     execute_turn: JsonHttpLifecycleExecuteTurnConfig
     snapshot: JsonHttpLifecycleObservationConfig
@@ -230,11 +256,13 @@ class JsonHttpDatasetTarget:
         timeout_seconds: float = 30,
         max_request_bytes: int = 1_000_000,
         max_response_bytes: int = 1_000_000,
-        max_target_calls: int = 100,
+        max_target_calls: int | None = None,
         lifecycle_config: JsonHttpStatefulDatasetTargetConfig | None = None,
         client: httpx.AsyncClient | None = None,
     ) -> None:
-        if isinstance(max_target_calls, bool) or max_target_calls <= 0:
+        if max_target_calls is not None and (
+            isinstance(max_target_calls, bool) or max_target_calls <= 0
+        ):
             raise ValueError("max_target_calls must be positive")
         if lifecycle_config is None:
             self._headers = validate_json_http_dataset_target_configuration(
@@ -272,6 +300,9 @@ class JsonHttpDatasetTarget:
         self._max_response_bytes = max_response_bytes
         self._remaining_target_calls = max_target_calls
         self._lifecycle_config = lifecycle_config
+        self._lifecycle_lock = asyncio.Lock()
+        self._last_reset_generation: str | int | None = None
+        self._lifecycle_state_uncertain = False
         self._owns_client = client is None
         self._client = client or httpx.AsyncClient(follow_redirects=False, trust_env=False)
         self.safety_envelope = SafetyEnvelope(
@@ -296,7 +327,7 @@ class JsonHttpDatasetTarget:
         timeout_seconds: float = 30,
         max_request_bytes: int = 1_000_000,
         max_response_bytes: int = 1_000_000,
-        max_target_calls: int = 100,
+        max_target_calls: int | None = None,
         client: httpx.AsyncClient | None = None,
     ) -> JsonHttpDatasetTarget:
         if isinstance(config, JsonHttpStatefulDatasetTargetConfig):
@@ -351,7 +382,8 @@ class JsonHttpDatasetTarget:
 
     async def execute(self, raw_input: str) -> ObservedAgentOutput:
         if self._lifecycle_config is not None:
-            return await self._execute_stateful(raw_input)
+            async with self._lifecycle_lock:
+                return await self._execute_stateful(raw_input)
         raw_output = await self._post_for_json(
             self._endpoint,
             self._request_body(raw_input),
@@ -366,44 +398,68 @@ class JsonHttpDatasetTarget:
         config = self._lifecycle_config
         if config is None:
             raise AssertionError("stateful execution requires lifecycle config")
+        if self._lifecycle_state_uncertain:
+            raise DatasetTargetLifecycleError(
+                failed_phase="blocked_state_uncertain",
+                completed_phases=(),
+                cleanup_reset_failed=True,
+            )
+        self._reserve_target_calls(json_http_target_calls_per_execution(config))
+        completed_phase_names: list[str] = []
         completed_phases: list[JsonValue] = []
         lifecycle_started = False
-        execution_error: RuntimeError | None = None
+        failed_phase: str | None = None
+        cleanup_reset_failed = False
         execute_response: JsonValue | None = None
         committed_state_snapshot: JsonValue | None = None
         try:
             lifecycle_started = True
-            await self._post_without_observation(config.reset.url, config.reset.request_json)
+            await self._reset(config.reset)
+            completed_phase_names.append("reset")
             completed_phases.append({"phase": "reset", "status": "succeeded"})
             if config.setup is not None:
-                await self._post_without_observation(config.setup.url, config.setup.request_json)
+                await self._post_without_observation(
+                    config.setup.url,
+                    config.setup.request_json,
+                    consume_budget=False,
+                )
+                completed_phase_names.append("setup")
                 completed_phases.append({"phase": "setup", "status": "succeeded"})
             execute_response = await self._post_for_json(
                 config.execute_turn.url,
                 _replace_input_placeholder(config.execute_turn.request_json_template, raw_input),
                 config.execute_turn.response_json_pointer,
+                consume_budget=False,
             )
+            completed_phase_names.append("execute_turn")
             completed_phases.append({"phase": "execute_turn", "status": "succeeded"})
             committed_state_snapshot = await self._post_for_json(
                 config.snapshot.url,
                 config.snapshot.request_json,
                 config.snapshot.response_json_pointer,
+                consume_budget=False,
             )
+            completed_phase_names.append("snapshot")
             completed_phases.append({"phase": "snapshot", "status": "succeeded"})
-        except RuntimeError as error:
-            execution_error = error
+        except RuntimeError:
+            failed_phase = _next_lifecycle_phase(
+                tuple(completed_phase_names), config.setup is not None
+            )
         finally:
             if lifecycle_started:
                 try:
-                    await self._post_without_observation(
-                        config.reset.url,
-                        config.reset.request_json,
-                    )
+                    await self._reset(config.reset)
+                    completed_phase_names.append("cleanup_reset")
                     completed_phases.append({"phase": "cleanup_reset", "status": "succeeded"})
-                except RuntimeError as error:
-                    execution_error = execution_error or error
-        if execution_error is not None:
-            raise RuntimeError("HTTP dataset target lifecycle failed") from None
+                except RuntimeError:
+                    cleanup_reset_failed = True
+                    self._lifecycle_state_uncertain = True
+        if failed_phase is not None or cleanup_reset_failed:
+            raise DatasetTargetLifecycleError(
+                failed_phase=failed_phase or "cleanup_reset",
+                completed_phases=tuple(completed_phase_names),
+                cleanup_reset_failed=cleanup_reset_failed,
+            ) from None
         if execute_response is None or committed_state_snapshot is None:
             raise AssertionError(
                 "successful lifecycle requires execution and snapshot observations"
@@ -420,19 +476,55 @@ class JsonHttpDatasetTarget:
         except (RecursionError, ValidationError):
             raise RuntimeError("HTTP dataset target returned invalid JSON") from None
 
-    async def _post_without_observation(self, endpoint: str, request_json: JsonValue) -> None:
-        await self._post(endpoint, request_json, response_json_pointer=None)
+    async def _reset(self, config: JsonHttpLifecycleResetConfig) -> None:
+        reset_response = await self._post_for_json(
+            config.url,
+            config.request_json,
+            "",
+            consume_budget=False,
+        )
+        generation = _resolve_json_pointer(reset_response, config.generation_json_pointer)
+        if isinstance(generation, bool) or not isinstance(generation, str | int):
+            raise RuntimeError("HTTP dataset target reset generation is invalid")
+        if isinstance(generation, str) and not generation:
+            raise RuntimeError("HTTP dataset target reset generation is invalid")
+        if generation == self._last_reset_generation:
+            raise RuntimeError("HTTP dataset target reset generation did not change")
+        clean_state = _resolve_json_pointer(reset_response, config.clean_state_json_pointer)
+        if (
+            type(clean_state) is not type(config.clean_state_value)
+            or clean_state != config.clean_state_value
+        ):
+            raise RuntimeError("HTTP dataset target reset did not report clean state")
+        self._last_reset_generation = generation
+
+    async def _post_without_observation(
+        self,
+        endpoint: str,
+        request_json: JsonValue,
+        *,
+        consume_budget: bool = True,
+    ) -> None:
+        await self._post(
+            endpoint,
+            request_json,
+            response_json_pointer=None,
+            consume_budget=consume_budget,
+        )
 
     async def _post_for_json(
         self,
         endpoint: str,
         request_json: JsonValue,
         response_json_pointer: str,
+        *,
+        consume_budget: bool = True,
     ) -> JsonValue:
         result = await self._post(
             endpoint,
             request_json,
             response_json_pointer=response_json_pointer,
+            consume_budget=consume_budget,
         )
         if result is None:
             raise AssertionError("JSON observation request requires a result")
@@ -444,9 +536,10 @@ class JsonHttpDatasetTarget:
         request_json: JsonValue,
         *,
         response_json_pointer: str | None,
+        consume_budget: bool = True,
     ) -> JsonValue | None:
-        if self._remaining_target_calls == 0:
-            raise RuntimeError("HTTP dataset target call budget exhausted")
+        if consume_budget:
+            self._reserve_target_calls(1)
         request_body = json.dumps(
             request_json,
             ensure_ascii=True,
@@ -454,7 +547,6 @@ class JsonHttpDatasetTarget:
         ).encode("utf-8")
         if len(request_body) > self._max_request_bytes:
             raise RuntimeError("HTTP dataset target request exceeds the size limit")
-        self._remaining_target_calls -= 1
         try:
             async with asyncio.timeout(self._timeout_seconds):
                 async with self._client.stream(
@@ -507,6 +599,13 @@ class JsonHttpDatasetTarget:
         if self._request_json_template is None:
             return {self._request_field: raw_input}
         return _replace_input_placeholder(self._request_json_template, raw_input)
+
+    def _reserve_target_calls(self, target_calls: int) -> None:
+        if self._remaining_target_calls is None:
+            return
+        if target_calls > self._remaining_target_calls:
+            raise RuntimeError("HTTP dataset target call budget exhausted")
+        self._remaining_target_calls -= target_calls
 
 
 def validate_json_http_dataset_target_configuration(
@@ -596,6 +695,14 @@ def json_http_target_config_urls(
         config.execute_turn.url,
         config.snapshot.url,
     )
+
+
+def _next_lifecycle_phase(
+    completed_phases: tuple[str, ...],
+    setup_configured: bool,
+) -> str:
+    phases = ("reset", *(("setup",) if setup_configured else ()), "execute_turn", "snapshot")
+    return phases[len(completed_phases)]
 
 
 def _endpoint_origin(endpoint: str) -> tuple[str, str, int]:

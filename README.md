@@ -258,13 +258,18 @@ original or variation repetition, UL sends these same-origin POST requests in or
 reset → optional setup → execute_turn → snapshot → cleanup reset
 ```
 
+Each reset must return JSON containing a configured clean-state field and a generation string or
+integer that changes on every reset. UL validates both fields before setup and again during cleanup.
+This proves the adapter returned a fresh acknowledgement, not that the underlying system actually
+erased every state store.
+
 `execute_turn` returns the agent response used for semantic comparison. `snapshot` separately
 returns committed state used by invariants whose `observation_authority` is
 `committed_state_snapshot`. A failed reset, setup, execution, snapshot, or cleanup reset makes the
 repetition inconclusive. UL disables redirects, ignores proxy environment variables, applies the
 same environment-backed headers to every operation, and rejects lifecycle URLs that do not share
-one origin. Setup and reset may return an empty successful response; execute and snapshot must
-return bounded JSON. UL verifies successful HTTP acknowledgement and ordering, but cannot prove
+one origin. Setup may return an empty successful response; reset, execute, and snapshot must
+return bounded JSON. UL verifies the reset response contract and ordering, but cannot prove
 that the sandbox actually erased or seeded its internal state. The sandbox implementation remains
 responsible for making reset deterministic and complete.
 

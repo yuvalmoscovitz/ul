@@ -17,6 +17,7 @@ from ul.dataset_evaluation import (
     DatasetEvaluationTrialSet,
 )
 from ul.dataset_evaluation import DatasetEvaluationRunner as _DatasetEvaluationRunner
+from ul_core.contracts import DatasetTargetLifecycleError
 from ul_core.dataset import (
     CommunicationAct,
     EvidenceReference,
@@ -298,6 +299,16 @@ class FailingTarget(DeterministicTarget):
             self.raw_inputs.append(raw_input)
             raise RuntimeError("untrusted target failure detail")
         return await super().execute(raw_input)
+
+
+class LifecycleFailingTarget(DeterministicTarget):
+    async def execute(self, raw_input: str) -> ObservedAgentOutput:
+        self.raw_inputs.append(raw_input)
+        raise DatasetTargetLifecycleError(
+            failed_phase="snapshot",
+            completed_phases=("reset", "setup", "execute_turn"),
+            cleanup_reset_failed=True,
+        )
 
 
 class SequenceTarget(DeterministicTarget):
@@ -1740,3 +1751,28 @@ async def test_runner_marks_target_runtime_failures_inconclusive(
     assert result.cases[0].verdict == "inconclusive"
     assert result.cases[0].target_output is None
     assert "untrusted target failure detail" not in result.model_dump_json()
+
+
+async def test_runner_surfaces_cleanup_failure_and_stops_further_execution() -> None:
+    semantic_pipeline = DeterministicSemanticPipeline((_source_outcomes()[0],))
+    target = LifecycleFailingTarget()
+    runner = DatasetEvaluationRunner(
+        DatasetAugmentationEngine(semantic_pipeline, semantic_pipeline),
+        semantic_pipeline,
+        target,
+    )
+
+    result = await runner.run(_source(), repetitions=2)
+
+    first_trial, second_trial = result.baseline.trial_set.trials
+    assert target.raw_inputs == ["Transfer 100 to Alice."]
+    assert first_trial.lifecycle_failure is not None
+    assert first_trial.lifecycle_failure.failed_phase == "snapshot"
+    assert first_trial.lifecycle_failure.completed_phases == (
+        "reset",
+        "setup",
+        "execute_turn",
+    )
+    assert first_trial.lifecycle_failure.cleanup_reset_failed is True
+    assert "sandbox state may remain" in first_trial.inconclusive_reasons[0]
+    assert "not executed" in second_trial.inconclusive_reasons[0]

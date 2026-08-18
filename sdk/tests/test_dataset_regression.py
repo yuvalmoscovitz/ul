@@ -83,7 +83,12 @@ def _stateful_case(*, repetitions: int = 3) -> DatasetRegressionCase:
         target_config=JsonHttpStatefulDatasetTargetConfig.model_validate(
             {
                 "version": 2,
-                "reset": {"url": "https://sandbox.example.test/reset"},
+                "reset": {
+                    "url": "https://sandbox.example.test/reset",
+                    "generation_json_pointer": "/generation",
+                    "clean_state_json_pointer": "/clean",
+                    "clean_state_value": True,
+                },
                 "setup": {"url": "https://sandbox.example.test/setup"},
                 "execute_turn": {
                     "url": "https://sandbox.example.test/execute",
@@ -123,11 +128,13 @@ class _Target:
 
 
 def _output(invoice: str, requested: str) -> ObservedAgentOutput:
+    snapshot = {
+        "invoice_reference": invoice,
+        "requested_invoice_reference": requested,
+    }
     return ObservedAgentOutput(
-        raw_output={
-            "invoice_reference": invoice,
-            "requested_invoice_reference": requested,
-        }
+        raw_output=snapshot,
+        metadata={"committed_state_snapshot": snapshot},
     )
 
 

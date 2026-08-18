@@ -44,6 +44,7 @@ from ul.dataset_evaluation import (
     DatasetEvaluationRunner,
     DatasetEvaluationTrial,
     DatasetEvaluationTrialSet,
+    DatasetTargetLifecycleFailure,
 )
 from ul.dataset_invariants import (
     DatasetInvariantArmEvaluation,
@@ -132,6 +133,7 @@ __all__ = [
     "DatasetRegressionTargetSnapshot",
     "DatasetRegressionVariation",
     "DatasetTargetExecutor",
+    "DatasetTargetLifecycleFailure",
     "ExecutionMode",
     "ExecutionResult",
     "ExecutionStatus",

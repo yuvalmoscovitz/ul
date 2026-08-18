@@ -22,6 +22,7 @@ from ul.http_target import (
     load_json_http_dataset_target_config,
     validate_json_http_dataset_target_configuration,
 )
+from ul_core.contracts import DatasetTargetLifecycleError
 
 pytestmark = pytest.mark.asyncio
 
@@ -150,7 +151,12 @@ def _stateful_config(base_url: str) -> JsonHttpStatefulDatasetTargetConfig:
         {
             "version": 2,
             "headers_from_env": {},
-            "reset": {"url": f"{base_url}/reset"},
+            "reset": {
+                "url": f"{base_url}/reset",
+                "generation_json_pointer": "/generation",
+                "clean_state_json_pointer": "/clean",
+                "clean_state_value": True,
+            },
             "setup": {
                 "url": f"{base_url}/setup",
                 "request_json": {"starting_amount": 100},
@@ -171,6 +177,7 @@ def _stateful_config(base_url: str) -> JsonHttpStatefulDatasetTargetConfig:
 class _StatefulTargetHandler(BaseHTTPRequestHandler):
     events: ClassVar[list[str]] = []
     amount = 0
+    generation = 0
 
     def do_POST(self) -> None:
         content_length = int(self.headers.get("content-length", "0"))
@@ -178,10 +185,9 @@ class _StatefulTargetHandler(BaseHTTPRequestHandler):
         type(self).events.append(self.path)
         if self.path == "/reset":
             type(self).amount = 0
-            self.send_response(204)
-            self.end_headers()
-            return
-        if self.path == "/setup":
+            type(self).generation += 1
+            response = {"generation": type(self).generation, "clean": True}
+        elif self.path == "/setup":
             type(self).amount = request["starting_amount"]
             response = {}
         elif self.path == "/execute":
@@ -208,6 +214,7 @@ class _StatefulTargetHandler(BaseHTTPRequestHandler):
 def _stateful_loopback_server() -> Generator[str]:
     _StatefulTargetHandler.events = []
     _StatefulTargetHandler.amount = 0
+    _StatefulTargetHandler.generation = 0
     server = ThreadingHTTPServer(("127.0.0.1", 0), _StatefulTargetHandler)
     server_thread = threading.Thread(target=server.serve_forever)
     server_thread.start()
@@ -253,7 +260,7 @@ async def test_stateful_target_cleanup_failure_fails_execution_closed() -> None:
         if request.url.path == "/reset":
             reset_calls += 1
             return (
-                _raw_response(b"", content_type="application/json")
+                _raw_response(b'{"generation":1,"clean":true}', content_type="application/json")
                 if reset_calls == 1
                 else httpx.Response(500)
             )
@@ -272,17 +279,95 @@ async def test_stateful_target_cleanup_failure_fails_execution_closed() -> None:
             max_target_calls=5,
             client=client,
         )
-        with pytest.raises(RuntimeError, match="lifecycle failed"):
+        with pytest.raises(DatasetTargetLifecycleError) as captured_error:
             await target.execute("do work")
+    assert reset_calls == 2
+    assert captured_error.value.failed_phase == "cleanup_reset"
+    assert captured_error.value.cleanup_reset_failed is True
+
+
+async def test_stateful_target_validates_clean_state_and_changing_generation() -> None:
+    reset_calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal reset_calls
+        if request.url.path == "/reset":
+            reset_calls += 1
+            return _raw_response(
+                json.dumps(
+                    {
+                        "generation": reset_calls,
+                        "clean": reset_calls > 1,
+                    }
+                ).encode(),
+                content_type="application/json",
+            )
+        return _raw_response(b"", content_type="application/json")
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        target = JsonHttpDatasetTarget.from_config(
+            _stateful_config("https://sandbox.example.test"),
+            sandbox_confirmed=True,
+            fresh_state_confirmed=False,
+            max_target_calls=5,
+            client=client,
+        )
+        with pytest.raises(DatasetTargetLifecycleError) as captured_error:
+            await target.execute("do work")
+
+    assert captured_error.value.failed_phase == "reset"
+    assert captured_error.value.cleanup_reset_failed is False
     assert reset_calls == 2
 
 
-async def test_stateful_target_budget_counts_every_physical_request() -> None:
+async def test_stateful_target_serializes_complete_lifecycles() -> None:
     observed_paths: list[str] = []
+    reset_generation = 0
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal reset_generation
+        observed_paths.append(request.url.path)
+        if request.url.path == "/reset":
+            reset_generation += 1
+            return _raw_response(
+                json.dumps({"generation": reset_generation, "clean": True}).encode(),
+                content_type="application/json",
+            )
+        if request.url.path == "/setup":
+            return _raw_response(b"", content_type="application/json")
+        if request.url.path == "/execute":
+            await asyncio.sleep(0)
+            return _raw_response(b'{"agent_response":{"ok":true}}', content_type="application/json")
+        return _raw_response(b'{"state":{"committed":true}}', content_type="application/json")
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        target = JsonHttpDatasetTarget.from_config(
+            _stateful_config("https://sandbox.example.test"),
+            sandbox_confirmed=True,
+            fresh_state_confirmed=False,
+            max_target_calls=10,
+            client=client,
+        )
+        await asyncio.gather(target.execute("first"), target.execute("second"))
+
+    expected_lifecycle = ["/reset", "/setup", "/execute", "/snapshot", "/reset"]
+    assert observed_paths == [*expected_lifecycle, *expected_lifecycle]
+
+
+async def test_stateful_target_reserves_complete_budget_before_first_request() -> None:
+    observed_paths: list[str] = []
+    reset_generation = 0
 
     def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal reset_generation
         observed_paths.append(request.url.path)
-        if request.url.path in {"/reset", "/setup"}:
+        if request.url.path == "/reset":
+            reset_generation += 1
+            return _raw_response(
+                json.dumps({"generation": reset_generation, "clean": True}).encode(),
+                content_type="application/json",
+            )
+        if request.url.path == "/setup":
             return _raw_response(b"", content_type="application/json")
         if request.url.path == "/execute":
             return _raw_response(b'{"agent_response":{"ok":true}}', content_type="application/json")
@@ -296,9 +381,9 @@ async def test_stateful_target_budget_counts_every_physical_request() -> None:
             max_target_calls=4,
             client=client,
         )
-        with pytest.raises(RuntimeError, match="lifecycle failed"):
+        with pytest.raises(RuntimeError, match="call budget exhausted"):
             await target.execute("do work")
-    assert observed_paths == ["/reset", "/setup", "/execute", "/snapshot"]
+    assert observed_paths == []
 
 
 async def test_stateful_config_rejects_cross_origin_credentials_scope() -> None:

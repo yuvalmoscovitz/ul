@@ -143,9 +143,9 @@ The example is intentionally small and deterministic on the target side. Variati
 validation, and behavioral comparison explicitly request `x-ai/grok-4.6` for
 deconstruction, rendering, and equivalence checking. This may cost more and can improve
 consistency, but OpenRouter and its underlying provider may still vary; the finding is not
-guaranteed. The invariant result applies only to the configured fields in the target output that
-the example declares to be a committed-state snapshot. UL does not independently verify that
-authority declaration, and satisfying the rule does not establish overall correctness or safety.
+guaranteed. The invariant result applies only to the configured fields in the agent response. The
+example's version 1 target does not provide a separate committed-state snapshot, and satisfying the
+rule does not establish overall correctness or safety.
 The behavioral result is evidence for human review, not a causal proof or production-rate
 estimate. Do not point the command at a production system or any endpoint that can cause business
 side effects.

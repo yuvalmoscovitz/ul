@@ -23,6 +23,7 @@ from ul import (
     DatasetEvaluationResult,
     DatasetEvaluationRunner,
     DatasetEvaluationTrialSet,
+    DatasetTargetLifecycleFailure,
     InteractionRecord,
     OpenRouterDatasetSettings,
     OpenRouterSemanticDeconstructor,
@@ -951,8 +952,8 @@ def _print_dataset_plan(
         "live control responses, and variation responses on execution."
     )
     console.print(
-        "Every execution must start from the same clean state. Version 2 targets enforce this "
-        "with lifecycle calls; version 1 targets rely on customer confirmation."
+        "Every execution must start from the same clean state. Version 2 targets invoke and "
+        "validate the configured reset contract; version 1 targets rely on customer confirmation."
     )
     console.print(
         "Target requests and semantic model calls may be billed separately. Repetitions only "
@@ -1383,6 +1384,7 @@ def _customer_trial_set(trial_set: DatasetEvaluationTrialSet | None) -> JsonValu
             "repetition": trial.repetition,
             "status": "inconclusive" if trial.inconclusive_reasons else "observed",
             "inconclusive_reasons": list(trial.inconclusive_reasons),
+            "lifecycle_failure": _customer_lifecycle_failure(trial),
         }
         for trial in trial_set.trials
     ]
@@ -1408,6 +1410,13 @@ def _customer_trial_set(trial_set: DatasetEvaluationTrialSet | None) -> JsonValu
             "trials": trials,
         },
     )
+
+
+def _customer_lifecycle_failure(trial: object) -> JsonValue:
+    lifecycle_failure = getattr(trial, "lifecycle_failure", None)
+    if lifecycle_failure is None:
+        return None
+    return cast(DatasetTargetLifecycleFailure, lifecycle_failure).model_dump(mode="json")
 
 
 def _customer_findings(

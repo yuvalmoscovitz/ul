@@ -180,7 +180,7 @@ def test_quickstart_invariant_uses_declared_committed_state_fields() -> None:
     suite = load_dataset_invariant_suite(_QUICKSTART_DIRECTORY / "invariants.json")
 
     assert suite.observation_source == "target_output"
-    assert suite.observation_authority == "committed_state_snapshot"
+    assert suite.observation_authority == "agent_response"
     assert len(suite.rules) == 1
     rule = suite.rules[0]
     assert isinstance(rule, JsonValuesEqualInvariant)

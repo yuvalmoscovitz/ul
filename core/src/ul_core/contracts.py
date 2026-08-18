@@ -20,6 +20,20 @@ from ul_core.models import (
 )
 
 
+class DatasetTargetLifecycleError(RuntimeError):
+    def __init__(
+        self,
+        *,
+        failed_phase: str,
+        completed_phases: tuple[str, ...],
+        cleanup_reset_failed: bool,
+    ) -> None:
+        super().__init__("dataset target lifecycle failed")
+        self.failed_phase = failed_phase
+        self.completed_phases = completed_phases
+        self.cleanup_reset_failed = cleanup_reset_failed
+
+
 @runtime_checkable
 class SemanticDeconstructor(Protocol):
     def deconstruct(

@@ -13,10 +13,11 @@ from pathlib import Path
 from typing import Literal, Self, cast
 
 from pydantic import ConfigDict, Field, JsonValue, ValidationError, field_validator, model_validator
-from ul_core.contracts import DatasetTargetExecutor
+from ul_core.contracts import DatasetTargetExecutor, DatasetTargetLifecycleError
 from ul_core.dataset import ObservedAgentOutput
 from ul_core.models import ULModel
 
+from ul.dataset_evaluation import DatasetTargetLifecycleFailure
 from ul.dataset_invariants import (
     DatasetInvariantRule,
     DatasetInvariantRuleEvaluation,
@@ -26,6 +27,7 @@ from ul.dataset_invariants import (
     evaluate_dataset_invariant_rules,
 )
 from ul.http_target import (
+    JsonHttpDatasetTargetConfig,
     JsonHttpDatasetTargetConfiguration,
     json_http_target_calls_per_execution,
 )
@@ -38,7 +40,10 @@ _REVIEW_ID_PATTERN = r"^ulr_[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{
 _CASE_ID_PATTERN = r"^ulrc_v1_[0-9a-f]{64}$"
 RegressionStatus = Literal["passed", "failed", "inconclusive"]
 RegressionExecutionStatus = Literal[
-    "observed", "target_execution_timed_out", "target_execution_failed"
+    "observed",
+    "target_execution_timed_out",
+    "target_execution_failed",
+    "target_state_uncertain",
 ]
 
 
@@ -117,6 +122,7 @@ class DatasetRegressionExecution(_StrictModel):
     repetition: int = Field(ge=1)
     status: RegressionExecutionStatus
     target_output: ObservedAgentOutput | None = None
+    lifecycle_failure: DatasetTargetLifecycleFailure | None = None
 
     @model_validator(mode="after")
     def validate_execution(self) -> Self:
@@ -360,7 +366,16 @@ async def replay_dataset_regression(
         raise ValueError("dataset target must start from fresh state for every execution")
 
     executions: list[DatasetRegressionExecution] = []
+    target_state_uncertain = False
     for repetition in range(1, case.discovery_repetitions + 1):
+        if target_state_uncertain:
+            executions.append(
+                DatasetRegressionExecution(
+                    repetition=repetition,
+                    status="target_state_uncertain",
+                )
+            )
+            continue
         try:
             async with asyncio.timeout(target_timeout_seconds):
                 target_output = await target.execute(case.variation.variation_input)
@@ -369,6 +384,24 @@ async def replay_dataset_regression(
                 DatasetRegressionExecution(
                     repetition=repetition,
                     status="target_execution_timed_out",
+                )
+            )
+        except DatasetTargetLifecycleError as error:
+            target_state_uncertain = error.cleanup_reset_failed
+            executions.append(
+                DatasetRegressionExecution(
+                    repetition=repetition,
+                    status=(
+                        "target_state_uncertain"
+                        if error.cleanup_reset_failed
+                        else "target_execution_failed"
+                    ),
+                    lifecycle_failure=DatasetTargetLifecycleFailure(
+                        failed_phase=error.failed_phase,
+                        completed_phases=error.completed_phases,
+                        cleanup_reset_failed=error.cleanup_reset_failed,
+                        sandbox_state_may_remain=error.cleanup_reset_failed,
+                    ),
                 )
             )
         except RuntimeError:
@@ -390,6 +423,9 @@ async def replay_dataset_regression(
         case.invariant_suite.rules,
         tuple(execution.target_output for execution in executions),
         observation_authority=case.invariant_suite.observation_authority,
+        allow_legacy_committed_state_fallback=isinstance(
+            case.target.config, JsonHttpDatasetTargetConfig
+        ),
     )
     rule_statuses = {rule.status for rule in rules}
     status: RegressionStatus

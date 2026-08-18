@@ -5,7 +5,10 @@
   },
   "reset": {
     "url": "https://sandbox.example.test/reset",
-    "request_json": {}
+    "request_json": {},
+    "generation_json_pointer": "/generation",
+    "clean_state_json_pointer": "/clean",
+    "clean_state_value": true
   },
   "setup": {
     "url": "https://sandbox.example.test/setup",
