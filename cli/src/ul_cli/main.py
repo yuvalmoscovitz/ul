@@ -150,7 +150,6 @@ async def _run_accounts_payable_campaigns(
         AccountsPayableOpenRouterTarget(
             OpenRouterSettings(
                 live_calls_enabled=True,
-                max_steps=10,
                 max_output_tokens=800,
             )
         )

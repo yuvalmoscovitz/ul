@@ -164,9 +164,7 @@ async def test_openrouter_target_receives_augmented_materialized_conversation() 
     source = to_ul_scenario(get_seed_scenario("single-approved-invoice"))
     corrected = LaterCorrectionAugmentation().apply(source)[0].scenario
     materialized = AccountsPayableScenarioMaterializer(ExecutionMode.LIVE).materialize(corrected)
-    settings = OpenRouterSettings(
-        api_key=SecretStr("test-key"), live_calls_enabled=True, max_steps=2
-    )
+    settings = OpenRouterSettings(api_key=SecretStr("test-key"), live_calls_enabled=True)
     client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
     target = AccountsPayableOpenRouterTarget(settings, client)
 
@@ -177,15 +175,20 @@ async def test_openrouter_target_receives_augmented_materialized_conversation() 
     assert isinstance(messages, list)
     assert '"content": "Correction:' in json.dumps(messages[-1])
     assert execution.final_output == "I need to validate the correction."
-    assert execution.metadata["generation_ids"] == ["augmented-generation"]
     assert execution.metadata["requested_model"] == settings.model
+    prompts = execution.metadata["prompts"]
+    assert isinstance(prompts, list)
+    assert len(prompts) == 9
+    assert all(
+        isinstance(prompt, dict) and len(str(prompt.get("version", ""))) == 64 for prompt in prompts
+    )
     assert execution.cost_usd == 0
     assert materialized.safety_envelope.allows_network_egress
     assert not materialized.safety_envelope.allows_business_side_effects
 
 
 @pytest.mark.asyncio
-async def test_campaign_deadline_cancels_openrouter_before_more_requests_or_tools(
+async def test_campaign_deadline_cancels_openrouter_before_tools(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     requests: list[httpx.Request] = []
@@ -194,31 +197,6 @@ async def test_campaign_deadline_cancels_openrouter_before_more_requests_or_tool
 
     async def handler(request: httpx.Request) -> httpx.Response:
         requests.append(request)
-        if len(requests) == 1:
-            return httpx.Response(
-                200,
-                json={
-                    "id": "first-generation",
-                    "choices": [
-                        {
-                            "message": {
-                                "role": "assistant",
-                                "content": None,
-                                "tool_calls": [
-                                    {
-                                        "id": "first-tool-call",
-                                        "type": "function",
-                                        "function": {
-                                            "name": "get_invoice",
-                                            "arguments": '{"invoice_id":"inv-acme-100"}',
-                                        },
-                                    }
-                                ],
-                            }
-                        }
-                    ],
-                },
-            )
         try:
             await asyncio.sleep(60)
         except asyncio.CancelledError:
@@ -244,7 +222,6 @@ async def test_campaign_deadline_cancels_openrouter_before_more_requests_or_tool
             OpenRouterSettings(
                 api_key=SecretStr("test-key"),
                 live_calls_enabled=True,
-                max_steps=3,
             ),
             client,
         ),
@@ -265,8 +242,8 @@ async def test_campaign_deadline_cancels_openrouter_before_more_requests_or_tool
     await client.aclose()
 
     assert result.cases[0].execution.status == ExecutionStatus.TIMED_OUT
-    assert request_count_at_deadline == len(requests) == 2
-    assert tool_count_at_deadline == len(tool_activity) == 1
+    assert request_count_at_deadline == len(requests) == 1
+    assert tool_count_at_deadline == len(tool_activity) == 0
 
 
 def test_every_scripted_campaign_case_passes_the_financial_oracle() -> None:
