@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import stat
 import threading
 from collections.abc import Generator
@@ -26,6 +27,7 @@ FINDING_ID = f"ulf_v1_{'a' * 64}"
 RULE_ID = "committed-invoice-matches-request"
 SECOND_RULE_ID = "committed-amount-matches-request"
 TEST_SECRET = "regression-test-secret-must-not-leak"
+_ANSI_ESCAPE_PATTERN = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 
 
 def test_regression_save_reconstructs_extended_rule_definition() -> None:
@@ -540,7 +542,8 @@ def test_semantic_finding_still_requires_an_explicit_rule(tmp_path: Path) -> Non
     )
 
     assert result.exit_code == 2
-    assert "semantic findings require at least one --rule" in " ".join(result.output.split())
+    normalized_output = " ".join(_ANSI_ESCAPE_PATTERN.sub("", result.output).split())
+    assert "semantic findings require at least one --rule" in normalized_output
     assert not case_path.exists()
 
 
