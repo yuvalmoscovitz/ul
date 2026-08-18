@@ -22,7 +22,7 @@ from ul.dataset_regression import (
     replay_dataset_regression,
     run_dataset_regressions,
 )
-from ul.http_target import JsonHttpDatasetTargetConfig, JsonHttpStatefulDatasetTargetConfig
+from ul.http_target import JsonHttpDatasetTargetConfig
 from ul_core.dataset import ObservedAgentOutput
 from ul_core.models import SafetyEnvelope
 
@@ -57,11 +57,23 @@ def _case(
         operator_version="1.0.0",
         original_input="Pay invoice AC-100.",
         variation_input=variation_input,
-        target_config=JsonHttpDatasetTargetConfig(
-            version=1,
-            url="http://127.0.0.1:8765/execute",
-            headers_from_env={"Authorization": "TARGET_TOKEN"},
-            request_json_template={"input": "{{input}}"},
+        target_config=JsonHttpDatasetTargetConfig.model_validate(
+            {
+                "version": 2,
+                "headers_from_env": {"Authorization": "TARGET_TOKEN"},
+                "reset": {
+                    "url": "http://127.0.0.1:8765/reset",
+                    "generation_json_pointer": "/generation",
+                    "clean_state_json_pointer": "/clean",
+                    "clean_state_value": True,
+                },
+                "setup": {"url": "http://127.0.0.1:8765/setup"},
+                "execute_turn": {
+                    "url": "http://127.0.0.1:8765/execute",
+                    "request_json_template": {"input": "{{input}}"},
+                },
+                "snapshot": {"url": "http://127.0.0.1:8765/snapshot"},
+            }
         ),
         source_suite_sha256=SUITE_SHA256,
         observation_authority="committed_state_snapshot",
@@ -80,7 +92,7 @@ def _stateful_case(*, repetitions: int = 3) -> DatasetRegressionCase:
         operator_version="1.0.0",
         original_input="Pay invoice AC-100.",
         variation_input="Pay invoice AC-101 instead of AC-100.",
-        target_config=JsonHttpStatefulDatasetTargetConfig.model_validate(
+        target_config=JsonHttpDatasetTargetConfig.model_validate(
             {
                 "version": 2,
                 "reset": {
@@ -384,7 +396,7 @@ def test_run_executes_cases_in_order_and_aggregates_statuses() -> None:
     assert result.passed_case_count == 1
     assert result.failed_case_count == 1
     assert result.inconclusive_case_count == 0
-    assert result.requested_target_calls == 4
+    assert result.requested_target_calls == 20
     assert [case_result.label for case_result in result.cases] == [
         "invoice-correction.json",
         "invoice-substitution.json",

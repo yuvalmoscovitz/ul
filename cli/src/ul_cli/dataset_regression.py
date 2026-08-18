@@ -34,8 +34,7 @@ from ul.dataset_regression import (
 )
 from ul.http_target import (
     JsonHttpDatasetTarget,
-    JsonHttpDatasetTargetConfiguration,
-    JsonHttpStatefulDatasetTargetConfig,
+    JsonHttpDatasetTargetConfig,
     json_http_target_calls_per_execution,
     json_http_target_config_urls,
     load_json_http_dataset_target_config,
@@ -166,16 +165,11 @@ def save_dataset_regression(
     target_calls = case.discovery_repetitions * json_http_target_calls_per_execution(
         case.target.config
     )
-    fresh_state_option = (
-        ""
-        if isinstance(case.target.config, JsonHttpStatefulDatasetTargetConfig)
-        else " --confirm-fresh-state"
-    )
     _print_safe(
         "Replay: ul regression replay "
         f"{shlex.quote(str(output))} --target-config {shlex.quote(str(target_config))} "
         "--allow-target-network --confirm-isolated-sandbox"
-        f"{fresh_state_option} --max-target-calls {target_calls}{insecure_http_option} "
+        f" --max-target-calls {target_calls}{insecure_http_option} "
         "--output replay.json"
     )
 
@@ -209,9 +203,6 @@ def replay_saved_dataset_regression(
     ] = False,
     confirm_isolated_sandbox: Annotated[
         bool, typer.Option(help="Confirm the target cannot cause real business effects.")
-    ] = False,
-    confirm_fresh_state: Annotated[
-        bool, typer.Option(help="Confirm every target request starts from the same clean state.")
     ] = False,
     allow_insecure_http: Annotated[
         bool, typer.Option(help="Allow an HTTP target. Intended for local sandboxes.")
@@ -250,13 +241,6 @@ def replay_saved_dataset_regression(
             "replay requires --confirm-isolated-sandbox",
             param_hint="--confirm-isolated-sandbox",
         )
-    if (
-        not isinstance(trusted_target_config, JsonHttpStatefulDatasetTargetConfig)
-        and not confirm_fresh_state
-    ):
-        raise typer.BadParameter(
-            "replay requires --confirm-fresh-state", param_hint="--confirm-fresh-state"
-        )
     if output.exists():
         raise typer.BadParameter(
             "output already exists; UL will not overwrite it", param_hint="--output"
@@ -266,7 +250,6 @@ def replay_saved_dataset_regression(
         target = JsonHttpDatasetTarget.from_config(
             trusted_target_config,
             sandbox_confirmed=True,
-            fresh_state_confirmed=True,
             allow_insecure_http=allow_insecure_http,
             max_target_calls=max_target_calls,
         )
@@ -339,9 +322,6 @@ def run_saved_dataset_regressions(
     confirm_isolated_sandbox: Annotated[
         bool, typer.Option(help="Confirm the target cannot cause real business effects.")
     ] = False,
-    confirm_fresh_state: Annotated[
-        bool, typer.Option(help="Confirm every target request starts from the same clean state.")
-    ] = False,
     allow_insecure_http: Annotated[
         bool, typer.Option(help="Allow an HTTP target. Intended for local sandboxes.")
     ] = False,
@@ -384,14 +364,6 @@ def run_saved_dataset_regressions(
             "regression run requires --confirm-isolated-sandbox",
             param_hint="--confirm-isolated-sandbox",
         )
-    if (
-        not isinstance(trusted_target_config, JsonHttpStatefulDatasetTargetConfig)
-        and not confirm_fresh_state
-    ):
-        raise typer.BadParameter(
-            "regression run requires --confirm-fresh-state",
-            param_hint="--confirm-fresh-state",
-        )
     if output.exists():
         raise typer.BadParameter(
             "output already exists; UL will not overwrite it", param_hint="--output"
@@ -401,7 +373,6 @@ def run_saved_dataset_regressions(
         target = JsonHttpDatasetTarget.from_config(
             trusted_target_config,
             sandbox_confirmed=True,
-            fresh_state_confirmed=True,
             allow_insecure_http=allow_insecure_http,
             max_target_calls=max_target_calls,
         )
@@ -632,7 +603,7 @@ def _invariant_rule_definition(rule: DatasetInvariantRuleResult) -> DatasetInvar
     )
 
 
-def _target_config_sha256(config: JsonHttpDatasetTargetConfiguration) -> str:
+def _target_config_sha256(config: JsonHttpDatasetTargetConfig) -> str:
     return dataset_regression_target_config_sha256(config)
 
 

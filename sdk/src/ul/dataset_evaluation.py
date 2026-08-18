@@ -454,7 +454,7 @@ class DatasetEvaluationRunner:
             return DatasetEvaluationTrial(
                 repetition=repetition,
                 inconclusive_reasons=(
-                    f"{subject} not executed because cleanup reset previously failed; "
+                    f"{subject} not executed because target state is uncertain; "
                     "sandbox state may remain",
                 ),
             )
@@ -467,13 +467,13 @@ class DatasetEvaluationRunner:
                 inconclusive_reasons=(f"{subject} execution timed out",),
             )
         except DatasetTargetLifecycleError as error:
-            sandbox_state_may_remain = error.cleanup_reset_failed
+            sandbox_state_may_remain = error.target_state_uncertain
             if sandbox_state_may_remain:
                 self._target_state_uncertain = True
             cleanup_reason = (
                 "; cleanup reset also failed; sandbox state may remain"
                 if error.cleanup_reset_failed and error.failed_phase != "cleanup_reset"
-                else ("; sandbox state may remain" if error.cleanup_reset_failed else "")
+                else ("; sandbox state may remain" if sandbox_state_may_remain else "")
             )
             return DatasetEvaluationTrial(
                 repetition=repetition,

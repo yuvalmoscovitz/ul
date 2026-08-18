@@ -27,7 +27,7 @@ from ul.dataset_invariants import (
     evaluate_dataset_invariant_rules,
 )
 from ul.http_target import (
-    JsonHttpDatasetTargetConfiguration,
+    JsonHttpDatasetTargetConfig,
     json_http_target_calls_per_execution,
 )
 
@@ -66,7 +66,7 @@ class DatasetRegressionVariation(_StrictModel):
 
 class DatasetRegressionTargetSnapshot(_StrictModel):
     provenance: Literal["declared_at_case_creation"]
-    config: JsonHttpDatasetTargetConfiguration
+    config: JsonHttpDatasetTargetConfig
     config_sha256: str = Field(pattern=_SHA256_PATTERN)
 
     @model_validator(mode="after")
@@ -248,7 +248,7 @@ def create_dataset_regression_case(
     operator_version: str,
     original_input: str,
     variation_input: str,
-    target_config: JsonHttpDatasetTargetConfiguration,
+    target_config: JsonHttpDatasetTargetConfig,
     source_suite_sha256: str,
     observation_authority: ObservationAuthority,
     selected_rules: tuple[DatasetInvariantRule, ...],
@@ -304,7 +304,7 @@ def create_dataset_regression_case(
     )
 
 
-def dataset_regression_target_config_sha256(config: JsonHttpDatasetTargetConfiguration) -> str:
+def dataset_regression_target_config_sha256(config: JsonHttpDatasetTargetConfig) -> str:
     return _canonical_json_sha256(config.model_dump(mode="json"))
 
 
@@ -386,20 +386,20 @@ async def replay_dataset_regression(
                 )
             )
         except DatasetTargetLifecycleError as error:
-            target_state_uncertain = error.cleanup_reset_failed
+            target_state_uncertain = error.target_state_uncertain
             executions.append(
                 DatasetRegressionExecution(
                     repetition=repetition,
                     status=(
                         "target_state_uncertain"
-                        if error.cleanup_reset_failed
+                        if error.target_state_uncertain
                         else "target_execution_failed"
                     ),
                     lifecycle_failure=DatasetTargetLifecycleFailure(
                         failed_phase=error.failed_phase,
                         completed_phases=error.completed_phases,
                         cleanup_reset_failed=error.cleanup_reset_failed,
-                        sandbox_state_may_remain=error.cleanup_reset_failed,
+                        sandbox_state_may_remain=error.target_state_uncertain,
                     ),
                 )
             )

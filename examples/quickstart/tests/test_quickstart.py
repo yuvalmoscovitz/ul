@@ -17,7 +17,7 @@ import httpx
 import pytest
 import typer
 from ul.dataset_invariants import JsonValuesEqualInvariant, load_dataset_invariant_suite
-from ul.http_target import JsonHttpDatasetTarget, JsonHttpStatefulDatasetTargetConfig
+from ul.http_target import JsonHttpDatasetTarget, JsonHttpDatasetTargetConfig
 
 from examples.quickstart import run as quickstart
 from examples.quickstart.defective_agent import create_server
@@ -115,13 +115,12 @@ def test_server_starts_every_request_from_identical_fresh_state() -> None:
 @pytest.mark.asyncio
 async def test_stateful_target_adapter_resets_executes_and_snapshots() -> None:
     with _running_server() as (base_url, _server):
-        config = JsonHttpStatefulDatasetTargetConfig.model_validate(
+        config = JsonHttpDatasetTargetConfig.model_validate(
             quickstart.load_target_template(base_url)
         )
         async with JsonHttpDatasetTarget.from_config(
             config,
             sandbox_confirmed=True,
-            fresh_state_confirmed=False,
             allow_insecure_http=True,
             max_target_calls=5,
         ) as target:

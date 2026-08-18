@@ -339,6 +339,8 @@ class _ReplayServer(ThreadingHTTPServer):
     unavailable: bool
     requests: list[dict[str, Any]]
     authorization_headers: list[str | None]
+    generation: int
+    committed_result: dict[str, Any] | None
 
 
 class _ReplayHandler(BaseHTTPRequestHandler):
@@ -346,26 +348,38 @@ class _ReplayHandler(BaseHTTPRequestHandler):
         replay_server = cast(_ReplayServer, self.server)
         content_length = int(self.headers.get("Content-Length", "0"))
         payload = json.loads(self.rfile.read(content_length))
-        replay_server.requests.append(cast(dict[str, Any], payload))
-        replay_server.authorization_headers.append(self.headers.get("X-Test-Token"))
         if replay_server.unavailable:
             self.send_response(500)
             self.send_header("Content-Length", "0")
             self.end_headers()
             return
-        invoice_reference = "AC-100" if replay_server.fixed else "AC-101"
-        response = json.dumps(
-            {
-                "result": {
-                    "action": "payment_committed",
-                    "payment_id": "pay-0001",
-                    "invoice_reference": invoice_reference,
-                    "requested_invoice_reference": "AC-100",
-                    "amount": "12500" if replay_server.fixed else "12600",
-                    "requested_amount": "12500",
-                }
+        if self.path == "/reset":
+            replay_server.generation += 1
+            replay_server.committed_result = None
+            response_payload: dict[str, Any] = {
+                "generation": replay_server.generation,
+                "clean": True,
             }
-        ).encode()
+        elif self.path == "/execute":
+            replay_server.requests.append(cast(dict[str, Any], payload))
+            replay_server.authorization_headers.append(self.headers.get("X-Test-Token"))
+            invoice_reference = "AC-100" if replay_server.fixed else "AC-101"
+            replay_server.committed_result = {
+                "action": "payment_committed",
+                "payment_id": "pay-0001",
+                "invoice_reference": invoice_reference,
+                "requested_invoice_reference": "AC-100",
+                "amount": "12500" if replay_server.fixed else "12600",
+                "requested_amount": "12500",
+            }
+            response_payload = {"result": replay_server.committed_result}
+        elif self.path == "/snapshot":
+            response_payload = {"state": replay_server.committed_result}
+        else:
+            self.send_response(404)
+            self.end_headers()
+            return
+        response = json.dumps(response_payload).encode()
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(response)))
@@ -383,6 +397,8 @@ def _running_server() -> Generator[tuple[_ReplayServer, str]]:
     server.unavailable = False
     server.requests = []
     server.authorization_headers = []
+    server.generation = 0
+    server.committed_result = None
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     host, port = cast(tuple[str, int], server.server_address)
@@ -396,17 +412,30 @@ def _running_server() -> Generator[tuple[_ReplayServer, str]]:
 
 
 def _write_target_config(path: Path, endpoint: str) -> None:
+    base_url = endpoint.removesuffix("/execute")
     path.write_text(
         json.dumps(
             {
-                "version": 1,
-                "url": endpoint,
+                "version": 2,
                 "headers_from_env": {"X-Test-Token": "UL_REGRESSION_TEST_SECRET"},
-                "request_json_template": {
-                    "request": {"message": "{{input}}"},
-                    "settings": {"mode": "sandbox"},
+                "reset": {
+                    "url": f"{base_url}/reset",
+                    "generation_json_pointer": "/generation",
+                    "clean_state_json_pointer": "/clean",
+                    "clean_state_value": True,
                 },
-                "response_json_pointer": "/result",
+                "execute_turn": {
+                    "url": endpoint,
+                    "request_json_template": {
+                        "request": {"message": "{{input}}"},
+                        "settings": {"mode": "sandbox"},
+                    },
+                    "response_json_pointer": "/result",
+                },
+                "snapshot": {
+                    "url": f"{base_url}/snapshot",
+                    "response_json_pointer": "/state",
+                },
             }
         ),
         encoding="utf-8",
@@ -473,10 +502,9 @@ def _replay_arguments(case_path: Path, target_config: Path, result_path: Path) -
         str(target_config),
         "--allow-target-network",
         "--confirm-isolated-sandbox",
-        "--confirm-fresh-state",
         "--allow-insecure-http",
         "--max-target-calls",
-        "3",
+        "12",
         "--output",
         str(result_path),
     ]
@@ -497,7 +525,6 @@ def _run_arguments(
         str(target_config),
         "--allow-target-network",
         "--confirm-isolated-sandbox",
-        "--confirm-fresh-state",
         "--allow-insecure-http",
         "--max-target-calls",
         str(max_target_calls),
@@ -525,7 +552,7 @@ def test_confirmed_finding_save_and_replay_real_loopback(
         saved = runner.invoke(app, _save_arguments(evidence, target_config, case_path))
         assert saved.exit_code == 0, saved.output
         assert "Saved regression case ulrc_v1_" in saved.output
-        assert "--max-target-calls 3" in saved.output
+        assert "--max-target-calls 12" in saved.output
         assert "--allow-insecure-http" in saved.output
         assert "not verified as the discovery target" in saved.output
         assert case_path.exists()
@@ -688,7 +715,7 @@ def test_regression_run_monitors_saved_cases_against_current_black_box_target(
                 cases_directory,
                 target_config,
                 defective_result_path,
-                max_target_calls=6,
+                max_target_calls=24,
             ),
         )
         assert defective.exit_code == 1, defective.output
@@ -713,7 +740,7 @@ def test_regression_run_monitors_saved_cases_against_current_black_box_target(
                 cases_directory,
                 target_config,
                 fixed_result_path,
-                max_target_calls=6,
+                max_target_calls=24,
             ),
         )
         assert fixed.exit_code == 0, fixed.output
@@ -727,12 +754,12 @@ def test_regression_run_monitors_saved_cases_against_current_black_box_target(
                 invoice_case_path,
                 target_config,
                 inconclusive_result_path,
-                max_target_calls=3,
+                max_target_calls=12,
             ),
         )
         assert inconclusive.exit_code == 2, inconclusive.output
         assert "passed=0, failed=0, inconclusive=1" in inconclusive.output
-        assert len(server.requests) == 15
+        assert len(server.requests) == 12
 
     for artifact in (
         defective_result_path,
@@ -783,7 +810,7 @@ def test_regression_run_preflights_total_budget_before_secrets_output_or_network
         )
 
     assert run.exit_code == 2
-    assert "6" in run.output and "5" in run.output
+    assert "24" in run.output and "5" in run.output
     assert server.requests == []
     assert TEST_SECRET not in run.output
     assert not result_path.exists()
@@ -932,7 +959,7 @@ def test_replay_enforces_target_call_budget_before_secret_resolution_or_output(
     replay = runner.invoke(app, arguments)
 
     assert replay.exit_code == 2
-    assert "3" in replay.output and "2" in replay.output
+    assert "12" in replay.output and "2" in replay.output
     assert "target" in replay.output.casefold() and "call" in replay.output.casefold()
     assert TEST_SECRET not in replay.output
     assert not result_path.exists()
@@ -940,7 +967,7 @@ def test_replay_enforces_target_call_budget_before_secret_resolution_or_output(
 
 @pytest.mark.parametrize(
     "missing_option",
-    ["--allow-target-network", "--confirm-isolated-sandbox", "--confirm-fresh-state"],
+    ["--allow-target-network", "--confirm-isolated-sandbox"],
 )
 def test_replay_requires_every_target_safety_confirmation(
     tmp_path: Path, missing_option: str

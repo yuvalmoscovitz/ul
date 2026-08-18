@@ -141,8 +141,7 @@ uv run ul regression replay regressions/wrong-invoice.json \
   --target-config target.json \
   --allow-target-network \
   --confirm-isolated-sandbox \
-  --confirm-fresh-state \
-  --max-target-calls 3 \
+  --max-target-calls 12 \
   --output tmp/wrong-invoice-replay.json
 ```
 
@@ -160,7 +159,6 @@ uv run ul regression run regressions/ \
   --target-config target.json \
   --allow-target-network \
   --confirm-isolated-sandbox \
-  --confirm-fresh-state \
   --max-target-calls 100 \
   --output tmp/regression-run.json
 ```
@@ -207,7 +205,7 @@ jobs:
       - name: Run UL regressions
         env:
           TARGET_TOKEN: ${{ secrets.TARGET_TOKEN }}
-        run: uv run --frozen ul regression run regressions/ --target-config target.json --allow-target-network --confirm-isolated-sandbox --confirm-fresh-state --max-target-calls 100 --output tmp/regression-run-${{ github.run_id }}.json
+        run: uv run --frozen ul regression run regressions/ --target-config target.json --allow-target-network --confirm-isolated-sandbox --max-target-calls 100 --output tmp/regression-run-${{ github.run_id }}.json
       - name: Upload UL evidence
         if: ${{ !cancelled() && vars.UL_UPLOAD_RAW_EVIDENCE == 'true' }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
@@ -242,17 +240,16 @@ layout.
 Create a target description and adapt its nested request and response paths:
 
 ```bash
-uv run ul dataset init target.json --url https://your-sandbox.example/execute
+uv run ul dataset init target.json --url https://your-sandbox.example
 uv run ul dataset evaluate your-data.jsonl --target-config target.json --dry-run
 ```
 
-The target must be an isolated sandbox that starts every request from the same clean state.
+The target must be an isolated sandbox with reset, execute, and snapshot lifecycle endpoints.
 Use `headers_from_env` in the target file for credentials so secret values remain outside the
 configuration. Dry-run validates the dataset and target mapping without making external calls.
 
-For an agent whose state must be actively prepared and inspected, use a version 2 lifecycle
-configuration such as [`examples/stateful_target.json`](examples/stateful_target.json). The
-[quickstart sandbox](examples/quickstart/README.md) is a runnable version 2 adapter. For every
+Use a lifecycle configuration such as [`examples/stateful_target.json`](examples/stateful_target.json). The
+[quickstart sandbox](examples/quickstart/README.md) is a runnable adapter. For every
 original or variation repetition, UL sends these same-origin POST requests in order:
 
 ```text
@@ -274,11 +271,13 @@ return bounded JSON. UL verifies the reset response contract and ordering, but c
 that the sandbox actually erased or seeded its internal state. The sandbox implementation remains
 responsible for making reset deterministic and complete.
 
+Setup is one static JSON fixture from the target configuration and is reused for every repetition
+in the run. Per-record setup fixtures are intentionally deferred. Put record-specific content only
+in the `execute_turn` template for now.
+
 Each physical lifecycle request counts toward `--max-target-calls`. A configuration with setup
-uses five calls per repetition; without setup it uses four. Version 2 therefore does not require
-`--confirm-fresh-state`. Version 1 remains supported and still requires that confirmation because
-it has no explicit reset operation. Version 1 invariant suites must use `agent_response`;
-`committed_state_snapshot` is evaluable only when a version 2 snapshot call succeeds.
+uses five calls per repetition; without setup it uses four. `committed_state_snapshot` is
+evaluable only when the snapshot call succeeds.
 
 To add customer-defined deterministic checks, provide a strict invariant file:
 

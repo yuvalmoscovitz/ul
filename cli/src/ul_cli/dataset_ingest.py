@@ -124,7 +124,7 @@ def ingest_otlp_traces(
         _print_safe(f"Trace file contains more than {limit} interactions; use --limit to adjust.")
     _print_safe(
         "Next: create a target config with "
-        "'ul dataset init target.json --url https://your-sandbox/run', "
+        "'ul dataset init target.json --url https://your-sandbox', "
         f"then run 'ul dataset evaluate {output} --target-config target.json --dry-run'."
     )
 

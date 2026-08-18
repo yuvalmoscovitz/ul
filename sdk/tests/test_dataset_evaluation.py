@@ -308,6 +308,7 @@ class LifecycleFailingTarget(DeterministicTarget):
             failed_phase="snapshot",
             completed_phases=("reset", "setup", "execute_turn"),
             cleanup_reset_failed=True,
+            target_state_uncertain=True,
         )
 
 
