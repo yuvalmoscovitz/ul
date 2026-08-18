@@ -35,18 +35,17 @@ class OpenRouterDatasetSettings(BaseSettings):
         validation_alias="UL_DATASET_ALLOW_EXTERNAL_DATA_PROCESSING",
     )
     api_key: SecretStr | None = Field(default=None, validation_alias="OPEN_ROUTER_API_KEY")
+    ul_live: bool = Field(default=False, validation_alias="UL_LIVE", exclude=True, repr=False)
 
-    @model_validator(mode="before")
-    @classmethod
-    def apply_ul_live_shorthand(cls, data: Any) -> Any:
-        if not isinstance(data, dict):
-            return data
-        if str(data.get("UL_LIVE", "")).casefold() != "true":
-            return data
-        data = dict(data)
-        data.setdefault("UL_DATASET_LIVE_CALLS", "true")
-        data.setdefault("UL_DATASET_ALLOW_EXTERNAL_DATA_PROCESSING", "true")
-        return data
+    @model_validator(mode="after")
+    def apply_ul_live_shorthand(self) -> Self:
+        if self.ul_live:
+            if "live_calls" not in self.model_fields_set:
+                self.live_calls = True
+            if "allow_external_data_processing" not in self.model_fields_set:
+                self.allow_external_data_processing = True
+        return self
+
     model: str = Field(
         default="google/gemini-2.5-flash",
         min_length=1,
@@ -484,8 +483,7 @@ class OpenRouterSemanticDeconstructor:
     def _require_live_access(self) -> str:
         if not self.settings.live_calls:
             raise RuntimeError(
-                "OpenRouter dataset calls require UL_LIVE=true "
-                "(or UL_DATASET_LIVE_CALLS=true)"
+                "OpenRouter dataset calls require UL_LIVE=true (or UL_DATASET_LIVE_CALLS=true)"
             )
         if not self.settings.allow_external_data_processing:
             raise RuntimeError(

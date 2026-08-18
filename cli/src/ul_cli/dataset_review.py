@@ -6,8 +6,9 @@ import os
 import stat
 import sys
 import unicodedata
-from collections.abc import Generator
+from collections.abc import Callable, Generator
 from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Annotated, Literal, Self
@@ -16,7 +17,14 @@ from uuid import uuid4
 import typer
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, ValidationError, model_validator
 from rich.console import Console
-from ul.dataset_invariants import DatasetInvariantEvaluation
+from ul import DatasetEvaluationResult, InteractionRecord
+from ul.dataset_invariants import (
+    DatasetInvariantEvaluation,
+    DatasetInvariantSuite,
+    evaluate_dataset_invariants,
+)
+from ul.dataset_regression import dataset_regression_target_config_sha256
+from ul.http_target import JsonHttpDatasetTargetConfig
 
 if sys.platform == "win32":
     import msvcrt
@@ -30,6 +38,7 @@ _MAXIMUM_REVIEW_RECORDS = 10_000
 _SHA256_PATTERN = r"^[0-9a-f]{64}$"
 _FINDING_ID_PATTERN = r"^ulf_v1_[0-9a-f]{64}$"
 _REVIEW_ID_PATTERN = r"^ulr_[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+_DATASET_EVALUATION_PIPELINE_VERSION = "1.0.0"
 
 ReviewStatus = Literal["confirmed", "expected", "unsupported", "inconclusive"]
 ReviewSeverity = Literal["unrated", "low", "medium", "high", "critical"]
@@ -99,6 +108,46 @@ class _ExecutionPlan(_StrictModel):
     dataset_planned_target_calls: int = Field(ge=1)
 
 
+class DatasetEvidenceOperator(_StrictModel):
+    id: str = Field(min_length=1)
+    version: str = Field(min_length=1)
+
+
+class DatasetEvidenceSemanticSettings(_StrictModel):
+    model: str
+    render_model: str
+    equivalence_model: str
+    max_input_chars: int = Field(ge=1)
+    max_output_tokens: int = Field(ge=1)
+    max_render_tokens: int = Field(ge=1)
+    max_response_bytes: int = Field(ge=1)
+    timeout_seconds: float = Field(gt=0)
+
+
+class DatasetEvidenceRunContext(_StrictModel):
+    schema_version: Literal["1.0.0"] = "1.0.0"
+    pipeline_version: Literal["1.0.0"] = _DATASET_EVALUATION_PIPELINE_VERSION
+    selected_dataset_sha256: str = Field(pattern=_SHA256_PATTERN)
+    operators: tuple[DatasetEvidenceOperator, ...] = Field(min_length=1)
+    repetitions: int = Field(ge=1)
+    invariant_suite_sha256: str | None = Field(default=None, pattern=_SHA256_PATTERN)
+    target_config: JsonHttpDatasetTargetConfig
+    target_config_sha256: str = Field(pattern=_SHA256_PATTERN)
+    semantic_settings: DatasetEvidenceSemanticSettings
+    context_sha256: str = Field(pattern=_SHA256_PATTERN)
+
+    @model_validator(mode="after")
+    def validate_digests(self) -> Self:
+        if self.target_config_sha256 != dataset_regression_target_config_sha256(self.target_config):
+            raise ValueError("run context target config digest must match its snapshot")
+        expected_context_sha256 = _canonical_json_sha256(
+            self.model_dump(mode="json", exclude={"context_sha256"})
+        )
+        if self.context_sha256 != expected_context_sha256:
+            raise ValueError("run context digest must match its canonical content")
+        return self
+
+
 class _Baseline(_StrictModel):
     status: str
     observations: _Observations
@@ -118,7 +167,7 @@ class _Case(_StrictModel):
 
 
 class _EvidenceRecord(_StrictModel):
-    schema_version: Literal["1.3.0", "1.4.0"]
+    schema_version: Literal["1.3.0", "1.4.0", "1.5.0"]
     interaction_id: str
     original_input: str
     execution_plan: _ExecutionPlan
@@ -126,18 +175,179 @@ class _EvidenceRecord(_StrictModel):
     current_baseline: _Baseline
     cases: list[_Case]
     invariant_evaluation: DatasetInvariantEvaluation | None = None
+    run_context: DatasetEvidenceRunContext | None = None
     technical_details: JsonValue
 
     @model_validator(mode="after")
     def validate_invariant_evaluation(self) -> Self:
         if self.schema_version == "1.3.0" and "invariant_evaluation" in self.model_fields_set:
             raise ValueError("schema 1.3.0 does not include invariant evaluation")
+        if self.schema_version == "1.5.0" and self.run_context is None:
+            raise ValueError("schema 1.5.0 requires run context")
+        if self.schema_version != "1.5.0" and "run_context" in self.model_fields_set:
+            raise ValueError("legacy evidence does not include run context")
         if (
             self.invariant_evaluation is not None
             and self.invariant_evaluation.interaction_id != self.interaction_id
         ):
             raise ValueError("invariant evaluation must match the evidence interaction")
         return self
+
+
+@dataclass(frozen=True)
+class DatasetResumeEvidence:
+    processed_ids: frozenset[str]
+    has_review_findings: bool
+    invariant_evaluations: tuple[DatasetInvariantEvaluation, ...]
+    raw_evidence_sha256: str
+
+
+def create_dataset_evidence_run_context(
+    *,
+    selected_records: tuple[InteractionRecord, ...],
+    operators: tuple[tuple[str, str], ...],
+    repetitions: int,
+    invariant_suite_sha256: str | None,
+    target_config: JsonHttpDatasetTargetConfig,
+    semantic_settings: DatasetEvidenceSemanticSettings,
+) -> DatasetEvidenceRunContext:
+    selected_dataset_sha256 = _canonical_json_sha256(
+        [record.model_dump(mode="json") for record in selected_records]
+    )
+    operator_snapshots = tuple(
+        DatasetEvidenceOperator(id=operator_id, version=version)
+        for operator_id, version in operators
+    )
+    target_config_sha256 = dataset_regression_target_config_sha256(target_config)
+    content = {
+        "schema_version": "1.0.0",
+        "pipeline_version": _DATASET_EVALUATION_PIPELINE_VERSION,
+        "selected_dataset_sha256": selected_dataset_sha256,
+        "operators": [operator.model_dump(mode="json") for operator in operator_snapshots],
+        "repetitions": repetitions,
+        "invariant_suite_sha256": invariant_suite_sha256,
+        "target_config": target_config.model_dump(mode="json"),
+        "target_config_sha256": target_config_sha256,
+        "semantic_settings": semantic_settings.model_dump(mode="json"),
+    }
+    return DatasetEvidenceRunContext(
+        selected_dataset_sha256=selected_dataset_sha256,
+        operators=operator_snapshots,
+        repetitions=repetitions,
+        invariant_suite_sha256=invariant_suite_sha256,
+        target_config=target_config,
+        target_config_sha256=target_config_sha256,
+        semantic_settings=semantic_settings,
+        context_sha256=_canonical_json_sha256(content),
+    )
+
+
+def validate_dataset_resume_evidence(
+    raw_evidence: bytes,
+    *,
+    expected_context: DatasetEvidenceRunContext,
+    selected_records: tuple[InteractionRecord, ...],
+    invariant_suite: DatasetInvariantSuite | None,
+    evidence_projector: Callable[..., dict[str, JsonValue]],
+) -> DatasetResumeEvidence:
+    if invariant_suite is None:
+        if expected_context.invariant_suite_sha256 is not None:
+            raise ValueError("resume invariant suite is missing from the current evaluation plan")
+    elif invariant_suite.sha256 != expected_context.invariant_suite_sha256:
+        raise ValueError("resume invariant suite does not match the current evaluation plan")
+    raw_lines = raw_evidence.splitlines()
+    if not raw_lines or len(raw_lines) > _MAXIMUM_EVIDENCE_RECORDS:
+        raise ValueError("resume evidence must contain 1 to 100 JSONL records")
+    if any(not raw_line.strip() for raw_line in raw_lines):
+        raise ValueError("resume evidence contains an empty JSONL record")
+    selected_records_by_id = {record.id: record for record in selected_records}
+    processed_ids: set[str] = set()
+    has_review_findings = False
+    invariant_evaluations: list[DatasetInvariantEvaluation] = []
+    for raw_line in raw_lines:
+        try:
+            evidence = _EvidenceRecord.model_validate_json(raw_line)
+        except (ValidationError, ValueError):
+            raise ValueError("resume evidence is not valid UL JSONL") from None
+        if evidence.schema_version != "1.5.0" or evidence.run_context is None:
+            raise ValueError(
+                "resume requires evidence created with schema 1.5.0 run compatibility metadata"
+            )
+        if evidence.run_context != expected_context:
+            raise ValueError("resume evidence is incompatible with the current evaluation plan")
+        if evidence.interaction_id in processed_ids:
+            raise ValueError("resume evidence contains duplicate interaction IDs")
+        selected_record = selected_records_by_id.get(evidence.interaction_id)
+        if selected_record is None:
+            raise ValueError("resume evidence contains an interaction outside the selected dataset")
+        try:
+            technical_result = DatasetEvaluationResult.model_validate_json(
+                json.dumps(evidence.technical_details, ensure_ascii=False)
+            )
+        except (ValidationError, ValueError):
+            raise ValueError("resume evidence contains invalid technical details") from None
+        if technical_result.source != selected_record:
+            raise ValueError("resume evidence source does not match the selected dataset")
+        if evidence.original_input != technical_result.source.raw_input:
+            raise ValueError("resume evidence original input does not match its technical details")
+        if evidence.execution_plan.repetitions != expected_context.repetitions:
+            raise ValueError("resume evidence repetitions do not match the current evaluation plan")
+        technical_operators = tuple(
+            (case.candidate.operator_id, case.candidate.operator_version)
+            for case in technical_result.cases
+        )
+        public_operators = tuple(
+            (case.operator_id, case.operator_version) for case in evidence.cases
+        )
+        expected_operators = tuple(
+            (operator.id, operator.version) for operator in expected_context.operators
+        )
+        if technical_operators != expected_operators or public_operators != expected_operators:
+            raise ValueError("resume evidence operators do not match the current evaluation plan")
+        if (
+            technical_result.baseline.trial_set.requested_repetitions
+            != expected_context.repetitions
+        ):
+            raise ValueError("resume evidence technical repetitions are incompatible")
+        expected_invariant_evaluation = (
+            evaluate_dataset_invariants(technical_result, invariant_suite)
+            if invariant_suite is not None
+            else None
+        )
+        if evidence.invariant_evaluation != expected_invariant_evaluation:
+            raise ValueError("resume evidence invariant results do not match technical details")
+        projected_evidence = evidence_projector(
+            technical_result,
+            repetitions=evidence.execution_plan.repetitions,
+            max_target_calls=evidence.execution_plan.max_target_calls,
+            planned_target_calls=evidence.execution_plan.dataset_planned_target_calls,
+            run_context=expected_context,
+            invariant_evaluation=expected_invariant_evaluation,
+        )
+        if evidence.model_dump(mode="json") != projected_evidence:
+            raise ValueError("resume evidence public summary does not match its technical details")
+        has_review_findings |= any(
+            case.verdict == "divergence_needs_review" for case in technical_result.cases
+        )
+        if expected_invariant_evaluation is not None:
+            invariant_evaluations.append(expected_invariant_evaluation)
+        processed_ids.add(evidence.interaction_id)
+    return DatasetResumeEvidence(
+        processed_ids=frozenset(processed_ids),
+        has_review_findings=has_review_findings,
+        invariant_evaluations=tuple(invariant_evaluations),
+        raw_evidence_sha256=hashlib.sha256(raw_evidence).hexdigest(),
+    )
+
+
+def _canonical_json_sha256(value: object) -> str:
+    encoded = json.dumps(
+        value,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 class ReviewRecord(_StrictModel):
@@ -404,7 +614,9 @@ def _load_evidence(path: Path) -> list[_LoadedEvidenceRecord]:
                 )
             )
     except (ValidationError, ValueError):
-        raise _ReviewInputError("evidence is not valid UL schema 1.3.0 or 1.4.0 JSONL") from None
+        raise _ReviewInputError(
+            "evidence is not valid UL schema 1.3.0, 1.4.0, or 1.5.0 JSONL"
+        ) from None
     return records
 
 

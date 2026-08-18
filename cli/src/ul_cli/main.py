@@ -10,7 +10,6 @@ from rich.table import Table
 from ul import CampaignResult, CampaignRunner, ExecutionMode
 
 from examples.accounts_payable.agent import OpenRouterSettings
-from examples.e2e_regression.run import main as _e2e_regression_main
 from examples.accounts_payable.scenarios import get_seed_scenario, seed_scenarios
 from examples.accounts_payable.ul_adapter import (
     AccountsPayableOpenRouterTarget,
@@ -34,7 +33,6 @@ app.add_typer(augmentations_app, name="augmentations")
 app.add_typer(dataset_app, name="dataset")
 app.add_typer(regression_app, name="regression")
 app.add_typer(demo_app, name="demo")
-demo_app.command("e2e-regression")(_e2e_regression_main)
 
 console = Console()
 
