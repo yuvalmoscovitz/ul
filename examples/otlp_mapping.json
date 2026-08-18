@@ -1,0 +1,6 @@
+{
+  "schema_version": "1.0.0",
+  "include_raw_content": true,
+  "maximum_content_characters": 16000,
+  "attributes": {}
+}

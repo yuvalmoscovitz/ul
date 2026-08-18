@@ -275,6 +275,34 @@ versioned artifacts only when that matches your access-control and retention pol
 See [the quickstart details](examples/quickstart/README.md) for the expanded command and file
 layout.
 
+## Import agent traces
+
+Turn an OTLP JSON file export into trace-native UL scenarios with the built-in OpenTelemetry GenAI
+and OpenInference mapping:
+
+```bash
+uv run ul dataset ingest otlp traces.json \
+  --mapping examples/otlp_mapping.json \
+  --dry-run
+uv run ul dataset ingest otlp traces.json \
+  --mapping examples/otlp_mapping.json \
+  --output interactions.jsonl
+```
+
+Dry-run reports only counts and mapping gaps; it never prints trace values. Each imported output
+contains ordered messages, parent-child span topology, tool calls and results, errors and retries,
+mapped state snapshots and deltas, session identity, agent version, and source references. Unknown
+attributes are dropped. The output is created with mode `0600` on Unix.
+
+[`examples/otlp_mapping.json`](examples/otlp_mapping.json) explicitly enables raw message, tool,
+error, and state content. Those values can contain credentials, personal data, or business data.
+Keep raw content disabled unless the export is approved for local processing, customize the
+allowlisted attribute names under `attributes`, and apply your retention policy to the resulting
+dataset. The default conventions cover current structured `gen_ai.input.messages` /
+`gen_ai.output.messages`, flattened OpenInference `llm.input_messages` /
+`llm.output_messages`, and the earlier `gen_ai.prompt` / `gen_ai.completion` form. UL reads a file
+export only; it does not connect to a telemetry backend or guess arbitrary vendor fields.
+
 ## Connect your own agent
 
 Create a target description and adapt its nested request and response paths:

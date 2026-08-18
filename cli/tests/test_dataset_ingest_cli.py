@@ -11,6 +11,7 @@ from typer.testing import CliRunner
 from ul_cli.main import app
 
 runner = CliRunner()
+FIXTURES = Path(__file__).parent / "fixtures"
 
 
 def _attr(key: str, string_value: str) -> dict[str, Any]:
@@ -100,6 +101,142 @@ def _ingest_arguments(traces: Path, output: Path, *, limit: int | None = None) -
     if limit is not None:
         args += ["--limit", str(limit)]
     return args
+
+
+def _write_mapping(path: Path, *, include_raw_content: bool = True) -> None:
+    path.write_text(
+        json.dumps(
+            {
+                "schema_version": "1.0.0",
+                "include_raw_content": include_raw_content,
+                "maximum_content_characters": 1000,
+                "attributes": {},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
+def test_trace_native_mapping_preserves_ordered_agent_evidence(tmp_path: Path) -> None:
+    output = tmp_path / "dataset.jsonl"
+    mapping = tmp_path / "mapping.json"
+    _write_mapping(mapping)
+
+    result = runner.invoke(
+        app,
+        [
+            "dataset",
+            "ingest",
+            "otlp",
+            str(FIXTURES / "otlp_agent_trace.json"),
+            "--mapping",
+            str(mapping),
+            "--output",
+            str(output),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    record = json.loads(output.read_text(encoding="utf-8"))
+    assert record["input"] == "Pay approved invoice AC-100."
+    scenario = record["output"]
+    assert scenario["kind"] == "ul.trace_scenario"
+    assert scenario["session_id"] == "session-42"
+    assert scenario["agent"] == {"name": "invoice-reviewer", "version": "2026.08.18"}
+    assert scenario["source"]["reference"] == "response-17"
+    assert [span["span_id"] for span in scenario["spans"]] == [
+        "1111111111111111",
+        "2222222222222222",
+        "3333333333333333",
+    ]
+    tool_span = scenario["spans"][2]
+    assert tool_span["parent_span_id"] == "2222222222222222"
+    assert tool_span["retry_attempt"] == 2
+    assert tool_span["tool_calls"][0]["arguments"] == {"invoice_id": "AC-100"}
+    assert tool_span["state_delta"] == {"invoice_checked": True}
+    assert tool_span["errors"] == [
+        {"type": "TransientTimeout", "message": "first attempt timed out"}
+    ]
+    assert "must-not-be-copied" not in output.read_text(encoding="utf-8")
+    if os.name != "nt":
+        assert stat.S_IMODE(output.stat().st_mode) == 0o600
+
+    evaluation = runner.invoke(app, ["dataset", "evaluate", str(output), "--dry-run"])
+
+    assert evaluation.exit_code == 0, evaluation.output
+    assert "1 interaction" in evaluation.output
+
+
+def test_trace_native_dry_run_does_not_write_or_print_content(tmp_path: Path) -> None:
+    mapping = tmp_path / "mapping.json"
+    _write_mapping(mapping)
+
+    result = runner.invoke(
+        app,
+        [
+            "dataset",
+            "ingest",
+            "otlp",
+            str(FIXTURES / "otlp_agent_trace.json"),
+            "--mapping",
+            str(mapping),
+            "--dry-run",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "1 scenario(s) ready" in result.output
+    assert "AC-100" not in result.output
+    assert "must-not-be-copied" not in result.output
+
+
+def test_trace_native_requires_explicit_raw_content_opt_in(tmp_path: Path) -> None:
+    mapping = tmp_path / "mapping.json"
+    _write_mapping(mapping, include_raw_content=False)
+
+    result = runner.invoke(
+        app,
+        [
+            "dataset",
+            "ingest",
+            "otlp",
+            str(FIXTURES / "otlp_agent_trace.json"),
+            "--mapping",
+            str(mapping),
+            "--dry-run",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "0 scenario(s) ready" in result.output
+    assert "Raw content is disabled" in result.output
+
+
+def test_trace_native_rejects_unknown_mapping_fields_without_echoing_values(
+    tmp_path: Path,
+) -> None:
+    mapping = tmp_path / "mapping.json"
+    mapping.write_text(
+        json.dumps({"schema_version": "1.0.0", "secret_mapping": "do-not-echo"}),
+        encoding="utf-8",
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "dataset",
+            "ingest",
+            "otlp",
+            str(FIXTURES / "otlp_agent_trace.json"),
+            "--mapping",
+            str(mapping),
+            "--dry-run",
+        ],
+    )
+
+    assert result.exit_code == 2
+    assert "mapping file is invalid" in result.output
+    assert "do-not-echo" not in result.output
 
 
 def test_ingest_extracts_records_from_event_based_spans(tmp_path: Path) -> None:
