@@ -305,6 +305,38 @@ dataset. The default conventions cover current structured `gen_ai.input.messages
 `llm.output_messages`, and the earlier `gen_ai.prompt` / `gen_ai.completion` form. UL reads a file
 export only; it does not connect to a telemetry backend or guess arbitrary vendor fields.
 
+### Replay a production conversation turn
+
+Materialize one replay case for every completed user turn in an imported trace:
+
+```bash
+uv run ul dataset ingest otlp traces.json \
+  --mapping examples/otlp_mapping.json \
+  --replay-output tmp/trace-replay.json
+
+uv run ul stress trace tmp/trace-replay.json \
+  --target-config target.json \
+  --case-id ultr_v1_CASE_ID \
+  --dry-run
+```
+
+Each case preserves the ordered conversation prefix, the user turns UL will send to the target,
+the recorded terminal assistant response, available committed-state snapshots, source span IDs,
+and a digest-bound copy of the canonical trace envelope. If a bundle contains one case,
+`--case-id` is optional. For a live replay, add `--allow-target-network`,
+`--confirm-isolated-sandbox`, and `--output`.
+
+UL starts a clean target lifecycle and re-executes the user turns through the existing multi-turn
+target protocol. Recorded assistant and tool messages remain provenance: UL does not inject them
+into the target or pretend it can restore an opaque production checkpoint. A `reproduced` result
+means the selected response and any available committed-state snapshot matched across the requested
+repetitions. `drifted` means they differed; it is evidence for investigation, not an automatic
+correctness failure.
+
+Replay bundles contain approved raw trace content and are created with mode `0600` on Unix. They
+require an explicit mapping with `include_raw_content` enabled, are digest-bound, and remain subject
+to the 50 MB bundle limit. Keep them in governed local storage.
+
 ## Connect your own agent
 
 Create a target description and adapt its nested request and response paths:

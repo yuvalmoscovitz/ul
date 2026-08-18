@@ -12,6 +12,7 @@ from typing import Annotated, TextIO, cast
 import typer
 from pydantic import ValidationError
 from ul.otlp_ingest import OtlpIngestResult, OtlpMappingConfig, parse_otlp_traces
+from ul.trace_replay import TraceReplayBundle, materialize_trace_replay_bundle
 
 app = typer.Typer(help="Import production traces as a UL dataset.")
 
@@ -38,6 +39,13 @@ def ingest_otlp_traces(
     output: Annotated[
         Path | None,
         typer.Option(help="New JSONL dataset file for ul dataset evaluate."),
+    ] = None,
+    replay_output: Annotated[
+        Path | None,
+        typer.Option(
+            "--replay-output",
+            help="New private trace-replay bundle with one case per eligible user turn.",
+        ),
     ] = None,
     mapping: Annotated[
         Path | None,
@@ -68,13 +76,24 @@ def ingest_otlp_traces(
 
     Example: ul dataset ingest otlp traces.json --output dataset.jsonl
     """
-    if output is None and not dry_run:
+    if output is None and replay_output is None and not dry_run:
         raise typer.BadParameter(
-            "--output is required unless --dry-run is used", param_hint="--output"
+            "--output or --replay-output is required unless --dry-run is used",
+            param_hint="--output",
         )
     if output is not None and output.exists():
         raise typer.BadParameter(
             "output already exists; UL will not overwrite it", param_hint="--output"
+        )
+    if replay_output is not None and replay_output.exists():
+        raise typer.BadParameter(
+            "replay output already exists; UL will not overwrite it",
+            param_hint="--replay-output",
+        )
+    if output is not None and replay_output is not None:
+        raise typer.BadParameter(
+            "--output and --replay-output are separate artifact modes; choose one",
+            param_hint="--replay-output",
         )
 
     try:
@@ -136,6 +155,20 @@ def ingest_otlp_traces(
     except ValueError as error:
         raise typer.BadParameter(_terminal_safe(str(error)), param_hint="TRACES") from None
 
+    replay_bundle: TraceReplayBundle | None = None
+    if replay_output is not None:
+        if mapping_config is None or not mapping_config.include_raw_content:
+            raise typer.BadParameter(
+                "--replay-output requires a mapping with include_raw_content enabled",
+                param_hint="--replay-output",
+            )
+        try:
+            replay_bundle = materialize_trace_replay_bundle(result.records)
+        except ValueError as error:
+            raise typer.BadParameter(
+                _terminal_safe(str(error)), param_hint="--replay-output"
+            ) from None
+
     if dry_run:
         _print_safe(
             f"Dry run: {len(result.records)} scenario(s) ready; "
@@ -149,6 +182,11 @@ def ingest_otlp_traces(
                 "Raw content is disabled by the mapping; enable include_raw_content only for "
                 "approved trace data."
             )
+        if replay_bundle is not None:
+            _print_safe(
+                f"Replay plan: {len(replay_bundle.cases)} user-turn case(s) ready; "
+                "no trace content was printed or written."
+            )
         return
 
     if not result.records:
@@ -160,39 +198,61 @@ def ingest_otlp_traces(
             param_hint="TRACES",
         )
 
-    assert output is not None
-    try:
-        output_stream = _create_private_output(output)
-    except OSError as error:
-        raise typer.BadParameter(
-            f"cannot create output file ({error.__class__.__name__})",
-            param_hint="--output",
-        ) from None
+    if output is not None:
+        try:
+            output_stream = _create_private_output(output)
+        except OSError as error:
+            raise typer.BadParameter(
+                f"cannot create output file ({error.__class__.__name__})",
+                param_hint="--output",
+            ) from None
 
-    with output_stream:
-        for record in result.records:
-            output_stream.write(
-                json.dumps(
-                    {"id": record.interaction_id, "input": record.input, "output": record.output},
-                    ensure_ascii=False,
-                    separators=(",", ":"),
+        with output_stream:
+            for record in result.records:
+                output_stream.write(
+                    json.dumps(
+                        {
+                            "id": record.interaction_id,
+                            "input": record.input,
+                            "output": record.output,
+                        },
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    )
+                    + "\n"
                 )
-                + "\n"
-            )
-        output_stream.flush()
-        os.fsync(output_stream.fileno())
-
-    _print_safe(f"Extracted {len(result.records)} interaction(s) → {output}")
+            output_stream.flush()
+            os.fsync(output_stream.fileno())
+        _print_safe(f"Extracted {len(result.records)} interaction(s) → {output}")
+    if replay_output is not None and replay_bundle is not None:
+        try:
+            replay_stream = _create_private_output(replay_output)
+        except OSError as error:
+            raise typer.BadParameter(
+                f"cannot create replay output ({error.__class__.__name__})",
+                param_hint="--replay-output",
+            ) from None
+        with replay_stream:
+            replay_stream.write(replay_bundle.model_dump_json())
+            replay_stream.write("\n")
+            replay_stream.flush()
+            os.fsync(replay_stream.fileno())
+        _print_safe(f"Materialized {len(replay_bundle.cases)} replay case(s) → {replay_output}")
     skipped_summary = _skipped_summary(result)
     if skipped_summary:
         _print_safe(f"Skipped traces:{skipped_summary}")
     if result.truncated:
         _print_safe(f"Trace file contains more than {limit} interactions; use --limit to adjust.")
-    _print_safe(
-        "Next: create a target config with "
-        "'ul dataset init target.json --url https://your-sandbox', "
-        f"then run 'ul dataset evaluate {output} --target-config target.json --dry-run'."
-    )
+    if output is not None:
+        _print_safe(
+            "Next: create a target config with "
+            "'ul dataset init target.json --url https://your-sandbox', "
+            f"then run 'ul dataset evaluate {output} --target-config target.json --dry-run'."
+        )
+    if replay_output is not None:
+        _print_safe(
+            f"Next: run 'ul stress trace {replay_output} --target-config target.json --dry-run'."
+        )
 
 
 def _skipped_summary(result: OtlpIngestResult) -> str:

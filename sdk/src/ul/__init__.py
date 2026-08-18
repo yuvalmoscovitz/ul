@@ -131,6 +131,19 @@ from ul.redaction import (
     RehydratingDatasetTarget,
     load_redaction_policy,
 )
+from ul.trace_replay import (
+    TraceReplayBundle,
+    TraceReplayCase,
+    TraceReplayEnvelope,
+    TraceReplayPlan,
+    TraceReplayResult,
+    TraceReplayTrial,
+    load_trace_replay_bundle,
+    materialize_trace_replay_bundle,
+    plan_trace_replay,
+    run_trace_replay,
+    select_trace_replay_case,
+)
 
 __all__ = [
     "Action",
@@ -222,6 +235,12 @@ __all__ = [
     "SemanticEquivalenceVerifier",
     "SemanticFrame",
     "SemanticModelDeconstructor",
+    "TraceReplayBundle",
+    "TraceReplayCase",
+    "TraceReplayEnvelope",
+    "TraceReplayPlan",
+    "TraceReplayResult",
+    "TraceReplayTrial",
     "UserInputRecord",
     "builtin_augmentation_registry",
     "builtin_dataset_augmentation_operators",
@@ -238,10 +257,15 @@ __all__ = [
     "load_json_http_dataset_target_config",
     "load_multi_turn_regression_case",
     "load_redaction_policy",
+    "load_trace_replay_bundle",
+    "materialize_trace_replay_bundle",
     "parse_otlp_traces",
     "plan_correction_stress_test",
+    "plan_trace_replay",
     "replay_dataset_regression",
     "replay_multi_turn_regression",
     "run_correction_stress_test",
     "run_dataset_regressions",
+    "run_trace_replay",
+    "select_trace_replay_case",
 ]
