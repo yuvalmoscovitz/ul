@@ -35,10 +35,11 @@ from ul_core.models import (
     ToolCall,
 )
 from ul_core.operators import BUILTIN_AUGMENTATIONS
+from ul_core.prompts import prompt_provenance
 
 from examples.accounts_payable.agent import (
-    OpenRouterAccountsPayableAgent,
     OpenRouterSettings,
+    run_openrouter_agent,
 )
 from examples.accounts_payable.control import ScriptedControlExecutor
 from examples.accounts_payable.environment import AccountsPayableEnvironment
@@ -57,6 +58,7 @@ from examples.accounts_payable.models import (
 )
 from examples.accounts_payable.oracles import evaluate_financial_outcome
 from examples.accounts_payable.scenarios import get_seed_scenario, seed_scenarios
+from examples.accounts_payable.tool_schemas import TOOL_DESCRIPTIONS
 
 DOMAIN_PACK_ID = "accounts-payable"
 PAYMENT_ACTION_ID = "execute-approved-payments"
@@ -66,6 +68,10 @@ SUPPORTED_AUGMENTATION_IDS = {
     "tool.timeout_before_commit",
     "tool.timeout_after_commit",
 }
+_OPENROUTER_PROMPT_NAMES = (
+    "examples.accounts_payable.system",
+    *(f"examples.accounts_payable.tools.{tool_name}" for tool_name in TOOL_DESCRIPTIONS),
+)
 
 
 def to_ul_scenario(scenario: AccountsPayableScenario) -> Scenario:
@@ -326,17 +332,15 @@ class AccountsPayableOpenRouterTarget(TargetExecutor):
             )
         materialized_ap_scenario = _materialized_ap_scenario(scenario)
         environment = AccountsPayableEnvironment(materialized_ap_scenario.state)
-        agent_result = await OpenRouterAccountsPayableAgent(self._settings, self._client).run(
+        agent_result = await run_openrouter_agent(
             materialized_ap_scenario,
             environment,
+            self._settings,
+            self._client,
         )
         return ExecutionResult(
             scenario_id=scenario.scenario_id,
-            status=(
-                ExecutionStatus.SUCCEEDED
-                if agent_result.stop_reason == "completed"
-                else ExecutionStatus.FAILED
-            ),
+            status=ExecutionStatus.SUCCEEDED,
             tool_calls=tuple(
                 ToolCall(
                     name=step.tool_name,
@@ -348,21 +352,12 @@ class AccountsPayableOpenRouterTarget(TargetExecutor):
             final_output=agent_result.final_answer,
             state_before=scenario.environment,
             state_after=environment.state.model_dump(mode="json"),
-            error=(
-                None
-                if agent_result.stop_reason == "completed"
-                else "OpenRouter agent reached its configured step limit."
-            ),
-            cost_usd=agent_result.cost_usd,
             metadata=cast(
                 dict[str, JsonValue],
                 {
                     "provider": "openrouter",
-                    "requested_model": agent_result.model,
-                    "generation_ids": agent_result.generation_ids,
-                    "usage": agent_result.usage,
-                    "prompts": agent_result.prompts,
-                    "max_steps": self._settings.max_steps,
+                    "requested_model": self._settings.model,
+                    "prompts": prompt_provenance(*_OPENROUTER_PROMPT_NAMES),
                     "max_output_tokens": self._settings.max_output_tokens,
                     "reasoning_effort": "none",
                 },
