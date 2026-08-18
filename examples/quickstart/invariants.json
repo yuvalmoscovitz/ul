@@ -1,7 +1,7 @@
 {
   "schema_version": "1.0.0",
   "observation_source": "target_output",
-  "observation_authority": "agent_response",
+  "observation_authority": "committed_state_snapshot",
   "rules": [
     {
       "type": "json_values_equal",

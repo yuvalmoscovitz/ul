@@ -1,14 +1,34 @@
 {
-  "version": 1,
-  "url": "http://127.0.0.1:8765/execute",
+  "version": 2,
   "headers_from_env": {},
-  "request_json_template": {
-    "request": {
-      "message": "{{input}}"
-    },
-    "settings": {
-      "mode": "sandbox"
+  "reset": {
+    "url": "http://127.0.0.1:8765/reset",
+    "request_json": {},
+    "generation_json_pointer": "/generation",
+    "clean_state_json_pointer": "/clean",
+    "clean_state_value": true
+  },
+  "setup": {
+    "url": "http://127.0.0.1:8765/setup",
+    "request_json": {
+      "scenario": "accounts-payable"
     }
   },
-  "response_json_pointer": "/result"
+  "execute_turn": {
+    "url": "http://127.0.0.1:8765/execute",
+    "request_json_template": {
+      "request": {
+        "message": "{{input}}"
+      },
+      "settings": {
+        "mode": "sandbox"
+      }
+    },
+    "response_json_pointer": "/result"
+  },
+  "snapshot": {
+    "url": "http://127.0.0.1:8765/snapshot",
+    "request_json": {},
+    "response_json_pointer": "/state"
+  }
 }

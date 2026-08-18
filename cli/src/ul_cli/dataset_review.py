@@ -38,7 +38,7 @@ from ul.dataset_invariants import (
     evaluate_dataset_invariants,
 )
 from ul.dataset_regression import dataset_regression_target_config_sha256
-from ul.http_target import JsonHttpDatasetTargetConfiguration
+from ul.http_target import JsonHttpDatasetTargetConfig, JsonHttpDatasetTargetConfiguration
 
 if sys.platform == "win32":
     import msvcrt
@@ -354,7 +354,13 @@ def validate_dataset_resume_evidence(
         ):
             raise ValueError("resume evidence technical repetitions are incompatible")
         expected_invariant_evaluation = (
-            evaluate_dataset_invariants(technical_result, invariant_suite)
+            evaluate_dataset_invariants(
+                technical_result,
+                invariant_suite,
+                allow_legacy_committed_state_fallback=isinstance(
+                    expected_context.target_config, JsonHttpDatasetTargetConfig
+                ),
+            )
             if invariant_suite is not None
             else None
         )
@@ -1120,7 +1126,8 @@ def _validate_invariant_technical_details(
             technical_details,
             suite,
             allow_legacy_committed_state_fallback=(
-                evidence.run_context is None or evidence.run_context.pipeline_version == "1.0.0"
+                evidence.run_context is None
+                or isinstance(evidence.run_context.target_config, JsonHttpDatasetTargetConfig)
             ),
         )
     except (ValidationError, ValueError):

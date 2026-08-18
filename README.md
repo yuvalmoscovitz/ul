@@ -251,7 +251,8 @@ Use `headers_from_env` in the target file for credentials so secret values remai
 configuration. Dry-run validates the dataset and target mapping without making external calls.
 
 For an agent whose state must be actively prepared and inspected, use a version 2 lifecycle
-configuration such as [`examples/stateful_target.json`](examples/stateful_target.json). For every
+configuration such as [`examples/stateful_target.json`](examples/stateful_target.json). The
+[quickstart sandbox](examples/quickstart/README.md) is a runnable version 2 adapter. For every
 original or variation repetition, UL sends these same-origin POST requests in order:
 
 ```text

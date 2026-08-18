@@ -203,7 +203,9 @@ class JsonHttpStatefulDatasetTargetConfig(BaseModel):
 JsonHttpDatasetTargetConfiguration = (
     JsonHttpDatasetTargetConfig | JsonHttpStatefulDatasetTargetConfig
 )
-_TARGET_CONFIG_ADAPTER = TypeAdapter(JsonHttpDatasetTargetConfiguration)
+_TARGET_CONFIG_ADAPTER = TypeAdapter(
+    cast(type[JsonHttpDatasetTargetConfiguration], JsonHttpDatasetTargetConfiguration)
+)
 
 
 def load_json_http_dataset_target_config(path: str | Path) -> JsonHttpDatasetTargetConfiguration:
@@ -224,10 +226,7 @@ def load_json_http_dataset_target_config(path: str | Path) -> JsonHttpDatasetTar
     except (UnicodeDecodeError, json.JSONDecodeError, RecursionError, ValueError):
         raise ValueError("HTTP target config contains invalid JSON") from None
     try:
-        return cast(
-            JsonHttpDatasetTargetConfig | JsonHttpStatefulDatasetTargetConfig,
-            _TARGET_CONFIG_ADAPTER.validate_python(raw_config),
-        )
+        return _TARGET_CONFIG_ADAPTER.validate_python(raw_config)
     except RecursionError:
         raise ValueError("HTTP target config is invalid") from None
     except ValidationError as error:
@@ -365,6 +364,10 @@ class JsonHttpDatasetTarget:
     def fresh_state_per_execution(self) -> bool:
         return True
 
+    @property
+    def protocol_version(self) -> Literal[1, 2]:
+        return 2 if self._lifecycle_config is not None else 1
+
     async def __aenter__(self) -> JsonHttpDatasetTarget:
         return self
 
@@ -405,6 +408,7 @@ class JsonHttpDatasetTarget:
                 cleanup_reset_failed=True,
             )
         self._reserve_target_calls(json_http_target_calls_per_execution(config))
+        self._lifecycle_state_uncertain = True
         completed_phase_names: list[str] = []
         completed_phases: list[JsonValue] = []
         lifecycle_started = False
@@ -451,9 +455,9 @@ class JsonHttpDatasetTarget:
                     await self._reset(config.reset)
                     completed_phase_names.append("cleanup_reset")
                     completed_phases.append({"phase": "cleanup_reset", "status": "succeeded"})
+                    self._lifecycle_state_uncertain = False
                 except RuntimeError:
                     cleanup_reset_failed = True
-                    self._lifecycle_state_uncertain = True
         if failed_phase is not None or cleanup_reset_failed:
             raise DatasetTargetLifecycleError(
                 failed_phase=failed_phase or "cleanup_reset",
@@ -490,13 +494,13 @@ class JsonHttpDatasetTarget:
             raise RuntimeError("HTTP dataset target reset generation is invalid")
         if generation == self._last_reset_generation:
             raise RuntimeError("HTTP dataset target reset generation did not change")
+        self._last_reset_generation = generation
         clean_state = _resolve_json_pointer(reset_response, config.clean_state_json_pointer)
         if (
             type(clean_state) is not type(config.clean_state_value)
             or clean_state != config.clean_state_value
         ):
             raise RuntimeError("HTTP dataset target reset did not report clean state")
-        self._last_reset_generation = generation
 
     async def _post_without_observation(
         self,
@@ -538,8 +542,6 @@ class JsonHttpDatasetTarget:
         response_json_pointer: str | None,
         consume_budget: bool = True,
     ) -> JsonValue | None:
-        if consume_budget:
-            self._reserve_target_calls(1)
         request_body = json.dumps(
             request_json,
             ensure_ascii=True,
@@ -547,6 +549,8 @@ class JsonHttpDatasetTarget:
         ).encode("utf-8")
         if len(request_body) > self._max_request_bytes:
             raise RuntimeError("HTTP dataset target request exceeds the size limit")
+        if consume_budget:
+            self._reserve_target_calls(1)
         try:
             async with asyncio.timeout(self._timeout_seconds):
                 async with self._client.stream(

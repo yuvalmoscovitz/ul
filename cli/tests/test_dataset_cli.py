@@ -651,7 +651,7 @@ def test_invariant_evaluation_reuses_results_without_extra_runner_calls(
 
     evaluation = _invariant_evaluation("satisfied", "violated")
 
-    def evaluate_once(*args: object) -> DatasetInvariantEvaluation:
+    def evaluate_once(*args: object, **kwargs: object) -> DatasetInvariantEvaluation:
         nonlocal invariant_calls
         invariant_calls += 1
         return evaluation
@@ -1745,7 +1745,11 @@ def test_all_complete_resume_preserves_prior_invariant_exit_code(
             )
         }
     )
-    invariant_evaluation = main.evaluate_dataset_invariants(evaluation_result, invariant_suite)
+    invariant_evaluation = main.evaluate_dataset_invariants(
+        evaluation_result,
+        invariant_suite,
+        allow_legacy_committed_state_fallback=True,
+    )
     assert invariant_evaluation.baseline.rules[0].status == invariant_status
     run_context = _run_context(
         (evaluation_result.source,),
@@ -1907,7 +1911,11 @@ def test_resume_accepts_extended_invariant_evidence_schema() -> None:
             )
         }
     )
-    invariant_evaluation = main.evaluate_dataset_invariants(evaluation_result, suite)
+    invariant_evaluation = main.evaluate_dataset_invariants(
+        evaluation_result,
+        suite,
+        allow_legacy_committed_state_fallback=True,
+    )
     run_context = _run_context((evaluation_result.source,), invariant_suite=suite)
     raw_evidence = (
         json.dumps(

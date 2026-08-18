@@ -114,6 +114,7 @@ async def test_posts_input_to_real_json_endpoint_and_preserves_response(
         "actions": [{"action": "transfer", "amount": 100, "recipient": "Alice"}]
     }
     assert output.metadata == {}
+    assert target.protocol_version == 1
     assert target.fresh_state_per_execution is True
     assert target.safety_envelope.isolated is True
     assert target.safety_envelope.allows_network_egress is True
@@ -286,6 +287,50 @@ async def test_stateful_target_cleanup_failure_fails_execution_closed() -> None:
     assert captured_error.value.cleanup_reset_failed is True
 
 
+async def test_stateful_target_cancellation_during_cleanup_blocks_later_execution() -> None:
+    cleanup_started = asyncio.Event()
+    never_complete_cleanup = asyncio.Event()
+    observed_paths: list[str] = []
+    reset_calls = 0
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal reset_calls
+        observed_paths.append(request.url.path)
+        if request.url.path == "/reset":
+            reset_calls += 1
+            if reset_calls == 2:
+                cleanup_started.set()
+                await never_complete_cleanup.wait()
+            return _raw_response(
+                json.dumps({"generation": reset_calls, "clean": True}).encode(),
+                content_type="application/json",
+            )
+        if request.url.path == "/setup":
+            return _raw_response(b"", content_type="application/json")
+        if request.url.path == "/execute":
+            return _raw_response(b'{"agent_response":{"ok":true}}', content_type="application/json")
+        return _raw_response(b'{"state":{"committed":true}}', content_type="application/json")
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        target = JsonHttpDatasetTarget.from_config(
+            _stateful_config("https://sandbox.example.test"),
+            sandbox_confirmed=True,
+            fresh_state_confirmed=False,
+            max_target_calls=10,
+            client=client,
+        )
+        execution = asyncio.create_task(target.execute("do work"))
+        await cleanup_started.wait()
+        execution.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await execution
+        with pytest.raises(DatasetTargetLifecycleError) as captured_error:
+            await target.execute("do more work")
+
+    assert captured_error.value.failed_phase == "blocked_state_uncertain"
+    assert observed_paths == ["/reset", "/setup", "/execute", "/snapshot", "/reset"]
+
+
 async def test_stateful_target_validates_clean_state_and_changing_generation() -> None:
     reset_calls = 0
 
@@ -296,7 +341,7 @@ async def test_stateful_target_validates_clean_state_and_changing_generation() -
             return _raw_response(
                 json.dumps(
                     {
-                        "generation": reset_calls,
+                        "generation": 1,
                         "clean": reset_calls > 1,
                     }
                 ).encode(),
@@ -316,7 +361,7 @@ async def test_stateful_target_validates_clean_state_and_changing_generation() -
             await target.execute("do work")
 
     assert captured_error.value.failed_phase == "reset"
-    assert captured_error.value.cleanup_reset_failed is False
+    assert captured_error.value.cleanup_reset_failed is True
     assert reset_calls == 2
 
 
@@ -672,12 +717,15 @@ async def test_rejects_oversized_rendered_request_before_network() -> None:
             fresh_state_confirmed=True,
             request_json_template={"request": "{{input}}"},
             max_request_bytes=20,
+            max_target_calls=1,
             client=client,
         )
         with pytest.raises(RuntimeError, match="request exceeds the size limit"):
             await target.execute("a request that is too large")
+        output = await target.execute("ok")
 
-    assert request_count == 0
+    assert request_count == 1
+    assert output.raw_output == {"answer": "ok"}
 
 
 @pytest.mark.parametrize(
