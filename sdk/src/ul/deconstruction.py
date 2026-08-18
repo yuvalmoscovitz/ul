@@ -11,7 +11,15 @@ from typing import Any, Literal, Protocol, Self, cast
 from urllib.parse import urlsplit, urlunsplit
 
 import httpx
-from pydantic import BaseModel, ConfigDict, Field, JsonValue, SecretStr, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    JsonValue,
+    SecretStr,
+    ValidationError,
+    model_validator,
+)
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from ul_core.dataset import (
     EvidenceReference,
@@ -119,6 +127,7 @@ class OpenAICompatibleDatasetSettings(BaseSettings):
         env_file=".env",
         env_file_encoding="utf-8",
         extra="ignore",
+        hide_input_in_errors=True,
         populate_by_name=True,
     )
 
@@ -232,6 +241,7 @@ class DatasetSemanticProviderSelection(BaseSettings):
         env_file=".env",
         env_file_encoding="utf-8",
         extra="ignore",
+        hide_input_in_errors=True,
     )
 
     provider: Literal["openrouter", "openai-compatible"] = Field(
@@ -246,7 +256,12 @@ type DatasetSemanticSettings = OpenRouterDatasetSettings | OpenAICompatibleDatas
 def load_dataset_semantic_settings() -> DatasetSemanticSettings:
     selection = DatasetSemanticProviderSelection()
     if selection.provider == "openai-compatible":
-        return OpenAICompatibleDatasetSettings()
+        try:
+            return OpenAICompatibleDatasetSettings()
+        except ValidationError:
+            raise ValueError(
+                "OpenAI-compatible semantic provider configuration is invalid"
+            ) from None
     return OpenRouterDatasetSettings()
 
 
@@ -284,25 +299,42 @@ def _is_loopback_host(host: str) -> bool:
 
 
 class _ResponseMessage(BaseModel):
-    model_config = ConfigDict(extra="ignore")
+    model_config = ConfigDict(extra="ignore", hide_input_in_errors=True)
 
     content: str
 
 
 class _ResponseChoice(BaseModel):
-    model_config = ConfigDict(extra="ignore")
+    model_config = ConfigDict(extra="ignore", hide_input_in_errors=True)
 
     message: _ResponseMessage
 
 
-class _ChatCompletionResponse(BaseModel):
-    model_config = ConfigDict(extra="ignore")
+class _UsageMetadata(BaseModel):
+    model_config = ConfigDict(extra="ignore", strict=True, hide_input_in_errors=True)
 
-    id: str = Field(min_length=1)
-    model: str = Field(min_length=1)
-    provider: str | None = None
+    prompt_tokens: int | None = Field(default=None, ge=0, le=1_000_000_000_000)
+    completion_tokens: int | None = Field(default=None, ge=0, le=1_000_000_000_000)
+    total_tokens: int | None = Field(default=None, ge=0, le=1_000_000_000_000)
+    cost: float | None = Field(
+        default=None,
+        ge=0,
+        le=1_000_000_000,
+        allow_inf_nan=False,
+    )
+
+    def evidence_value(self) -> dict[str, JsonValue]:
+        return cast(dict[str, JsonValue], self.model_dump(mode="json", exclude_none=True))
+
+
+class _ChatCompletionResponse(BaseModel):
+    model_config = ConfigDict(extra="ignore", hide_input_in_errors=True)
+
+    id: str = Field(min_length=1, max_length=500)
+    model: str = Field(min_length=1, max_length=200)
+    provider: str | None = Field(default=None, max_length=200)
     choices: tuple[_ResponseChoice, ...] = Field(min_length=1)
-    usage: dict[str, JsonValue] = Field(default_factory=dict)
+    usage: _UsageMetadata = Field(default_factory=_UsageMetadata)
 
 
 class _RenderedInput(BaseModel):
@@ -362,6 +394,7 @@ class OpenAICompatibleSemanticProvider:
         self,
         response: _ChatCompletionResponse,
     ) -> dict[str, JsonValue]:
+        usage = response.usage.evidence_value()
         return {
             "semantic_provider": self.provider_id,
             "semantic_protocol": "openai-chat-completions",
@@ -369,7 +402,7 @@ class OpenAICompatibleSemanticProvider:
             "semantic_generation_id": response.id,
             "semantic_model": response.model,
             "semantic_upstream_provider": response.provider,
-            "semantic_usage": response.usage,
+            "semantic_usage": usage,
         }
 
 
@@ -403,8 +436,8 @@ class OpenRouterSemanticProvider(OpenAICompatibleSemanticProvider):
             "openrouter_generation_id": response.id,
             "openrouter_model": response.model,
             "openrouter_provider": response.provider,
-            "openrouter_usage": response.usage,
-            "openrouter_cost": response.usage.get("cost"),
+            "openrouter_usage": response.usage.evidence_value(),
+            "openrouter_cost": response.usage.cost,
         }
 
 
@@ -670,7 +703,12 @@ class SemanticModelDeconstructor:
                     if response_size > self.settings.max_response_bytes:
                         raise ValueError("semantic provider response exceeds max_response_bytes")
                     chunks.append(chunk)
-        return _ChatCompletionResponse.model_validate_json(b"".join(chunks))
+        completion_response = _ChatCompletionResponse.model_validate_json(b"".join(chunks))
+        if api_key is not None and _contains_secret(
+            completion_response.model_dump(mode="json"), api_key
+        ):
+            raise ValueError("semantic provider response contains the configured credential")
+        return completion_response
 
     @staticmethod
     def _render_seed(raw_input: str, instruction: str) -> int:
@@ -1010,3 +1048,15 @@ def create_semantic_model_deconstructor(
 
 def _same_origin(left: httpx.URL, right: httpx.URL) -> bool:
     return (left.scheme, left.host, left.port) == (right.scheme, right.host, right.port)
+
+
+def _contains_secret(value: object, secret: str) -> bool:
+    if isinstance(value, str):
+        return secret in value
+    if isinstance(value, dict):
+        mapping = cast(dict[object, object], value)
+        return any(_contains_secret(item, secret) for item in mapping.values())
+    if isinstance(value, list):
+        sequence = cast(list[object], value)
+        return any(_contains_secret(item, secret) for item in sequence)
+    return False

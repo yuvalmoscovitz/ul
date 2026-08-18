@@ -326,6 +326,136 @@ async def test_openai_compatible_deconstruction_uses_generic_chat_contract() -> 
     await client.aclose()
 
 
+async def test_provider_provenance_is_bounded_and_usage_is_allowlisted() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "id": "generation-1",
+                "model": "resolved-model",
+                "provider": "customer-runtime",
+                "choices": [
+                    {
+                        "message": {
+                            "content": json.dumps(frame_payload()),
+                        }
+                    }
+                ],
+                "usage": {
+                    "prompt_tokens": 10,
+                    "completion_tokens": 5,
+                    "total_tokens": 15,
+                    "cost": 0.01,
+                    "untrusted_note": "must-not-enter-evidence",
+                    "nested": {"secret": "must-not-enter-evidence"},
+                },
+            },
+        )
+
+    client = mock_client(handler)
+    async with OpenAICompatibleSemanticDeconstructor(
+        openai_compatible_settings(), client=client
+    ) as deconstructor:
+        frame = await deconstructor.deconstruct(interaction())
+
+    assert frame.metadata["semantic_usage"] == {
+        "prompt_tokens": 10,
+        "completion_tokens": 5,
+        "total_tokens": 15,
+        "cost": 0.01,
+    }
+    assert "must-not-enter-evidence" not in json.dumps(frame.metadata)
+    await client.aclose()
+
+
+@pytest.mark.parametrize(
+    ("field_name", "field_value"),
+    [
+        ("id", "x" * 501),
+        ("model", "x" * 201),
+        ("provider", "x" * 201),
+    ],
+)
+async def test_provider_provenance_strings_are_bounded(
+    field_name: str,
+    field_value: str,
+) -> None:
+    response_body: dict[str, object] = {
+        "id": "generation-1",
+        "model": "resolved-model",
+        "provider": "customer-runtime",
+        "choices": [{"message": {"content": json.dumps(frame_payload())}}],
+    }
+    response_body[field_name] = field_value
+    client = mock_client(lambda request: httpx.Response(200, json=response_body))
+
+    async with OpenAICompatibleSemanticDeconstructor(
+        openai_compatible_settings(), client=client
+    ) as deconstructor:
+        with pytest.raises(ValidationError) as error:
+            await deconstructor.deconstruct(interaction())
+
+    assert field_value not in str(error.value)
+    await client.aclose()
+
+
+@pytest.mark.parametrize(
+    "usage",
+    [
+        {"prompt_tokens": -1},
+        {"total_tokens": 1_000_000_000_001},
+        {"completion_tokens": "5"},
+        {"cost": "0.01"},
+    ],
+)
+async def test_provider_usage_values_are_size_and_type_bounded(
+    usage: dict[str, object],
+) -> None:
+    client = mock_client(
+        lambda request: httpx.Response(
+            200,
+            json={
+                "id": "generation-1",
+                "model": "resolved-model",
+                "choices": [{"message": {"content": json.dumps(frame_payload())}}],
+                "usage": usage,
+            },
+        )
+    )
+
+    async with OpenAICompatibleSemanticDeconstructor(
+        openai_compatible_settings(), client=client
+    ) as deconstructor:
+        with pytest.raises(ValidationError):
+            await deconstructor.deconstruct(interaction())
+    await client.aclose()
+
+
+@pytest.mark.parametrize("reflected_field", ["id", "model", "provider", "content"])
+async def test_provider_cannot_persist_a_reflected_api_key(reflected_field: str) -> None:
+    secret = _TEST_CUSTOMER_API_KEY.get_secret_value()
+    response_body: dict[str, object] = {
+        "id": "generation-1",
+        "model": "resolved-model",
+        "provider": "customer-runtime",
+        "choices": [{"message": {"content": json.dumps(frame_payload())}}],
+    }
+    if reflected_field == "content":
+        response_body["choices"] = [{"message": {"content": secret}}]
+    else:
+        response_body[reflected_field] = secret
+    client = mock_client(lambda request: httpx.Response(200, json=response_body))
+
+    async with OpenAICompatibleSemanticDeconstructor(
+        openai_compatible_settings(), client=client
+    ) as deconstructor:
+        with pytest.raises(ValueError, match="contains the configured credential") as error:
+            await deconstructor.deconstruct(interaction())
+
+    assert secret not in str(error.value)
+    await client.aclose()
+
+
 async def test_semantic_provider_redirect_is_rejected() -> None:
     redirect_client = mock_client(
         lambda request: httpx.Response(
@@ -1116,6 +1246,22 @@ async def test_owned_client_closes_on_context_exit(monkeypatch: pytest.MonkeyPat
 async def test_openai_compatible_settings_reject_unsafe_base_urls(base_url: str) -> None:
     with pytest.raises(ValidationError):
         openai_compatible_settings(base_url=base_url)
+
+
+async def test_openai_compatible_settings_hide_rejected_url_credentials_and_queries() -> None:
+    credential_sentinel = "credential-sentinel"
+    query_sentinel = "query-sentinel"
+    rejected_url = (
+        f"https://user:{credential_sentinel}@models.example.test/v1?token={query_sentinel}"
+    )
+
+    with pytest.raises(ValidationError) as error:
+        openai_compatible_settings(base_url=rejected_url)
+
+    rendered_error = str(error.value)
+    assert credential_sentinel not in rendered_error
+    assert query_sentinel not in rendered_error
+    assert rejected_url not in rendered_error
 
 
 async def test_openai_compatible_settings_allow_loopback_http_and_inherit_models() -> None:

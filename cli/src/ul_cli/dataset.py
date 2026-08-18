@@ -90,7 +90,12 @@ _DATASET_OPERATORS_BY_ID = {operator.id: operator for operator in _DATASET_OPERA
 def _load_dataset_semantic_settings() -> DatasetSemanticSettings:
     selection = DatasetSemanticProviderSelection()
     if selection.provider == "openai-compatible":
-        return OpenAICompatibleDatasetSettings()
+        try:
+            return OpenAICompatibleDatasetSettings()
+        except ValidationError:
+            raise ValueError(
+                "OpenAI-compatible semantic provider configuration is invalid"
+            ) from None
     return OpenRouterDatasetSettings()
 
 

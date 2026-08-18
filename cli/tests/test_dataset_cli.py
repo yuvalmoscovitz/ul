@@ -460,6 +460,32 @@ def test_openai_compatible_dry_run_reports_provider_without_making_calls(
     assert "No model or target requests sent." in result.output
 
 
+def test_openai_compatible_cli_hides_rejected_base_url_secrets(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    dataset = tmp_path / "interactions.jsonl"
+    _write_dataset(dataset, [_record()])
+    credential_sentinel = "credential-sentinel"
+    query_sentinel = "query-sentinel"
+    rejected_url = (
+        f"https://user:{credential_sentinel}@models.example.test/v1?token={query_sentinel}"
+    )
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("UL_DATASET_SEMANTIC_PROVIDER", "openai-compatible")
+    monkeypatch.setenv("UL_DATASET_OPENAI_BASE_URL", rejected_url)
+    monkeypatch.setenv("UL_DATASET_MODEL", "customer/model")
+
+    result = runner.invoke(root_app, ["dataset", "evaluate", str(dataset), "--dry-run"])
+
+    normalized_output = " ".join(_ANSI_ESCAPE_PATTERN.sub("", result.output).split())
+    assert result.exit_code != 0
+    assert "OpenAI-compatible semantic provider configuration is invalid" in normalized_output
+    assert credential_sentinel not in normalized_output
+    assert query_sentinel not in normalized_output
+    assert rejected_url not in normalized_output
+
+
 def test_openai_compatible_execution_allows_an_unauthenticated_endpoint(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
