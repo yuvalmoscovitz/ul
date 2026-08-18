@@ -31,7 +31,6 @@ InvariantStatus = Literal["satisfied", "violated", "not_evaluable"]
 InvariantSeverity = Literal["low", "medium", "high", "critical"]
 ObservationAuthority = Literal[
     "agent_response",
-    "tool_result",
     "committed_state_snapshot",
 ]
 EqualityTrialReasonCode = Literal[

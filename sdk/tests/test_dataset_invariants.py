@@ -153,6 +153,13 @@ def test_suite_is_strict_bounded_unique_and_content_addressed(tmp_path: Path) ->
             observation_authority="agent_response",
             rules=tuple(_rule(id=f"rule-{index}") for index in range(101)),
         )
+    with pytest.raises(ValidationError, match="observation_authority"):
+        DatasetInvariantSuite.model_validate(
+            {
+                **payload,
+                "observation_authority": "tool_result",
+            }
+        )
 
 
 @pytest.mark.parametrize(
