@@ -1,0 +1,67 @@
+{
+  "resourceSpans": [
+    {
+      "resource": {
+        "attributes": [
+          {"key": "service.name", "value": {"stringValue": "invoice-agent"}},
+          {"key": "service.version", "value": {"stringValue": "2026.08.18"}}
+        ]
+      },
+      "scopeSpans": [
+        {
+          "scope": {"name": "opentelemetry.instrumentation.openai", "version": "1.2.0"},
+          "spans": [
+            {
+              "traceId": "aabbccddaabbccddaabbccddaabbccdd",
+              "spanId": "3333333333333333",
+              "parentSpanId": "2222222222222222",
+              "name": "execute_tool accounting.lookup_invoice",
+              "startTimeUnixNano": "3000",
+              "endTimeUnixNano": "4000",
+              "status": {"code": 2},
+              "attributes": [
+                {"key": "gen_ai.operation.name", "value": {"stringValue": "execute_tool"}},
+                {"key": "gen_ai.tool.call.id", "value": {"stringValue": "call-1"}},
+                {"key": "gen_ai.tool.name", "value": {"stringValue": "accounting.lookup_invoice"}},
+                {"key": "gen_ai.tool.call.arguments", "value": {"stringValue": "{\"invoice_id\":\"AC-100\"}"}},
+                {"key": "gen_ai.tool.call.result", "value": {"stringValue": "{\"status\":\"approved\"}"}},
+                {"key": "retry.attempt", "value": {"intValue": "2"}},
+                {"key": "error.type", "value": {"stringValue": "TransientTimeout"}},
+                {"key": "exception.message", "value": {"stringValue": "first attempt timed out"}},
+                {"key": "ul.state.delta", "value": {"stringValue": "{\"invoice_checked\":true}"}},
+                {"key": "customer.secret", "value": {"stringValue": "must-not-be-copied"}}
+              ]
+            },
+            {
+              "traceId": "aabbccddaabbccddaabbccddaabbccdd",
+              "spanId": "1111111111111111",
+              "name": "invoice agent",
+              "startTimeUnixNano": "1000",
+              "endTimeUnixNano": "5000",
+              "attributes": [
+                {"key": "gen_ai.operation.name", "value": {"stringValue": "invoke_agent"}},
+                {"key": "gen_ai.conversation.id", "value": {"stringValue": "session-42"}},
+                {"key": "gen_ai.agent.name", "value": {"stringValue": "invoice-reviewer"}},
+                {"key": "gen_ai.response.id", "value": {"stringValue": "response-17"}},
+                {"key": "ul.state.snapshot", "value": {"stringValue": "{\"invoice_id\":\"AC-100\",\"approved\":false}"}}
+              ]
+            },
+            {
+              "traceId": "aabbccddaabbccddaabbccddaabbccdd",
+              "spanId": "2222222222222222",
+              "parentSpanId": "1111111111111111",
+              "name": "chat gpt-4.1",
+              "startTimeUnixNano": "2000",
+              "endTimeUnixNano": "4500",
+              "attributes": [
+                {"key": "gen_ai.operation.name", "value": {"stringValue": "chat"}},
+                {"key": "gen_ai.input.messages", "value": {"stringValue": "[{\"role\":\"user\",\"parts\":[{\"type\":\"text\",\"content\":\"Pay approved invoice AC-100.\"}]}]"}},
+                {"key": "gen_ai.output.messages", "value": {"stringValue": "[{\"role\":\"assistant\",\"parts\":[{\"type\":\"tool_call\",\"id\":\"call-1\",\"name\":\"accounting.lookup_invoice\",\"arguments\":{\"invoice_id\":\"AC-100\"}},{\"type\":\"text\",\"content\":\"Invoice checked and payment queued.\"}]}]"}}
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}
