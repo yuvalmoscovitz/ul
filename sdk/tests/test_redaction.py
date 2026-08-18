@@ -33,7 +33,7 @@ def policy() -> RedactionPolicy:
             RedactionRule(
                 name="email",
                 locations=("input", "output", "context"),
-                pattern=r"[a-z]+@example\.com",
+                literal=_SECRET,
             ),
             RedactionRule(
                 name="token",
@@ -152,11 +152,36 @@ def test_policy_rejects_unsupported_or_irreversible_input_selectors() -> None:
         RedactionRule(
             name="secret",
             locations=("input",),
-            pattern="secret",
+            literal="secret",
             action="remove",
         )
-    with pytest.raises(ValidationError, match="match empty"):
-        RedactionRule(name="secret", pattern=".*")
+    with pytest.raises(ValidationError, match="literal value"):
+        RedactionRule(name="secret")
+
+    literal_rule = RedactionRule(name="safe", literal="(a+)+$")
+    assert literal_rule.literal == "(a+)+$"
+
+
+def test_provider_only_text_remove_uses_an_empty_substring(tmp_path: Path) -> None:
+    private_directory = tmp_path / "private-remove"
+    private_directory.mkdir(mode=0o700)
+    redaction = RedactionEngine(
+        RedactionPolicy(
+            rules=(
+                RedactionRule(
+                    name="remove",
+                    locations=("output",),
+                    literal="private ",
+                    action="remove",
+                ),
+            )
+        ),
+        LocalPseudonymStore(private_directory / "state.json", _KEY),
+    )
+
+    result = redaction.transform("private context", location="output")
+
+    assert result.value == "context"
 
 
 class _RecordingPipeline:
@@ -225,7 +250,10 @@ class _RecordingTarget:
 
     async def execute(self, raw_input: str) -> ObservedAgentOutput:
         self.inputs.append(raw_input)
-        return ObservedAgentOutput(raw_output={"ok": True})
+        return ObservedAgentOutput(
+            raw_output={"ok": True, "contact": _SECRET},
+            metadata={"operator": _SECRET},
+        )
 
 
 @pytest.mark.asyncio
@@ -250,7 +278,7 @@ async def test_pipeline_is_one_boundary_and_target_rehydrates(tmp_path: Path) ->
     )
     assessment = await pipeline.verify(protected_source.raw_input, rendered.text)
     target = _RecordingTarget()
-    await pipeline.wrap_target(target).execute(rendered.text)
+    protected_target_output = await pipeline.wrap_target(target).execute(rendered.text)
 
     provider_payloads = json.dumps(
         {
@@ -264,6 +292,8 @@ async def test_pipeline_is_one_boundary_and_target_rehydrates(tmp_path: Path) ->
     assert "secret-token" not in provider_payloads
     assert "private context" not in provider_payloads
     assert target.inputs == [f"Please Email {_SECRET}"]
+    assert _SECRET not in protected_target_output.model_dump_json()
+    assert "__UL_SECRET_email_" in protected_target_output.model_dump_json()
     for metadata in (frame.metadata, rendered.metadata, assessment.metadata):
         assert metadata == {"redaction_policy_sha256": policy().digest}
         assert _SECRET not in json.dumps(metadata)

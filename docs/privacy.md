@@ -4,8 +4,8 @@ UL can keep explicitly selected sensitive values outside the semantic model prov
 preserving the identity relationships needed to generate executable stress-test variations.
 
 The boundary is opt-in and intentionally explicit. It does not attempt automatic PII detection.
-Text rules use regular expressions, structured rules use RFC 6901 JSON pointers, and unsupported
-selectors fail validation. Executable input supports only reversible pseudonymization. Provider-only
+Text rules use bounded literal matching, structured rules use RFC 6901 JSON pointers, and
+unsupported selectors fail validation. Executable input supports only reversible pseudonymization. Provider-only
 output and transformation-instruction context can also be removed or replaced.
 
 ```python
@@ -25,7 +25,7 @@ policy = RedactionPolicy(
         RedactionRule(
             name="account",
             locations=("input", "output", "context"),
-            pattern=r"ACCT-[0-9]{8}",
+            literal="ACCT-12345678",
         ),
         RedactionRule(
             name="access_token",
@@ -69,3 +69,43 @@ integrity rather than encrypting those mappings. Losing either prevents rehydrat
 
 Dry-run coverage contains only the policy SHA-256, match counts, rule names, and JSON paths. It does
 not write mappings or include selected values.
+
+The CLI accepts the same policy as strict JSON:
+
+```json
+{
+  "version": 1,
+  "rules": [
+    {
+      "name": "account",
+      "locations": ["input", "output", "context"],
+      "selector": "$text",
+      "literal": "ACCT-12345678",
+      "action": "pseudonymize"
+    },
+    {
+      "name": "debug_context",
+      "locations": ["output"],
+      "selector": "/debug/internal_context",
+      "action": "remove"
+    }
+  ]
+}
+```
+
+Set the key through the environment, never a command argument:
+
+```console
+export UL_DATASET_REDACTION_KEY="$(your-secret-manager read ul-redaction-key)"
+ul dataset evaluate interactions.jsonl \
+  --redaction-policy redaction.json \
+  --redaction-state .ul-private/pseudonyms.json \
+  --target-config target.json \
+  --allow-target-network --confirm-isolated-sandbox \
+  --output evidence.jsonl
+```
+
+`--dry-run` needs only `--redaction-policy`; it reports value-free coverage without reading a key
+or writing mapping state. Execution and resume also require `--redaction-state` and the
+`UL_DATASET_REDACTION_KEY` environment variable. The evidence run context contains the policy
+digest and aggregate input/output coverage, never the key, selected values, state path, or mapping.

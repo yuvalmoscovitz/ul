@@ -110,6 +110,7 @@ from ul.redaction import (
     RedactionResult,
     RedactionRule,
     RehydratingDatasetTarget,
+    load_redaction_policy,
 )
 
 __all__ = [
@@ -206,6 +207,7 @@ __all__ = [
     "load_dataset_regression_case",
     "load_dataset_semantic_settings",
     "load_json_http_dataset_target_config",
+    "load_redaction_policy",
     "parse_otlp_traces",
     "replay_dataset_regression",
     "run_dataset_regressions",

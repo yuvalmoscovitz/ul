@@ -42,6 +42,9 @@ RedactionAction = Literal["pseudonymize", "remove", "replace"]
 _TEXT_SELECTOR = "$text"
 _PLACEHOLDER_PATTERN = re.compile(r"__UL_SECRET_[a-z][a-z0-9_-]{0,31}_[0-9a-f]{32}__")
 _MAXIMUM_STATE_BYTES = 64 * 1024 * 1024
+_MAXIMUM_POLICY_BYTES = 1_000_000
+_MAXIMUM_VALUE_BYTES = 5_000_000
+_MAXIMUM_MATCHES = 100_000
 
 
 class RedactionBoundaryError(RuntimeError):
@@ -55,7 +58,7 @@ class RedactionRule(ULModel):
     name: str = Field(pattern=r"^[a-z][a-z0-9_-]{0,31}$")
     locations: tuple[RedactionLocation, ...] = ("input",)
     selector: str = _TEXT_SELECTOR
-    pattern: str | None = Field(default=None, min_length=1, max_length=2_000)
+    literal: str | None = Field(default=None, min_length=1, max_length=1_000)
     action: RedactionAction = "pseudonymize"
     replacement: JsonValue = "[REDACTED]"
 
@@ -64,18 +67,14 @@ class RedactionRule(ULModel):
         if not self.locations or len(set(self.locations)) != len(self.locations):
             raise ValueError("rule locations must be non-empty and unique")
         if self.selector == _TEXT_SELECTOR:
-            if self.pattern is None:
-                raise ValueError("text selectors require a regular expression pattern")
-            try:
-                compiled_pattern = re.compile(self.pattern)
-            except re.error:
-                raise ValueError("text selector pattern is invalid") from None
-            if compiled_pattern.search("") is not None:
-                raise ValueError("text selector pattern must not match empty text")
+            if self.literal is None:
+                raise ValueError("text selectors require a literal value")
+            if self.action == "replace" and not isinstance(self.replacement, str):
+                raise ValueError("text replacement must be a string")
         else:
             _parse_json_pointer(self.selector)
-            if self.pattern is not None:
-                raise ValueError("JSON pointer selectors do not accept a pattern")
+            if self.literal is not None:
+                raise ValueError("JSON pointer selectors do not accept a literal")
         if self.action != "pseudonymize" and "input" in self.locations:
             raise ValueError("executable input only supports reversible pseudonymization")
         if self.action != "replace" and self.replacement != "[REDACTED]":
@@ -87,7 +86,7 @@ class RedactionPolicy(ULModel):
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
     version: Literal[1] = 1
-    rules: tuple[RedactionRule, ...] = Field(min_length=1)
+    rules: tuple[RedactionRule, ...] = Field(min_length=1, max_length=100)
 
     @model_validator(mode="after")
     def validate_rules(self) -> Self:
@@ -304,6 +303,14 @@ class RedactionEngine:
         location: RedactionLocation,
         dry_run: bool = False,
     ) -> RedactionResult:
+        try:
+            encoded_value_size = len(
+                json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode()
+            )
+        except (RecursionError, ValueError):
+            raise RedactionBoundaryError() from None
+        if encoded_value_size > _MAXIMUM_VALUE_BYTES:
+            raise RedactionBoundaryError()
         self.store.validate_placeholders(value)
         transformed = _copy_json(value)
         matches_by_rule: Counter[str] = Counter()
@@ -367,15 +374,21 @@ class RedactionEngine:
                 (match.start(), match.end()) for match in _PLACEHOLDER_PATTERN.finditer(value)
             )
             for rule in rules:
-                if rule.pattern is None:
-                    raise AssertionError("validated text rules require patterns")
-                for match in re.finditer(rule.pattern, value):
+                if rule.literal is None:
+                    raise AssertionError("validated text rules require literals")
+                start = 0
+                while (match_start := value.find(rule.literal, start)) >= 0:
+                    match_end = match_start + len(rule.literal)
                     if any(
-                        match.start() < protected_end and match.end() > protected_start
+                        match_start < protected_end and match_end > protected_start
                         for protected_start, protected_end in protected_spans
                     ):
+                        start = match_end
                         continue
-                    matches.append((match.start(), match.end(), rule, match.group()))
+                    matches.append((match_start, match_end, rule, rule.literal))
+                    if len(matches) + sum(matches_by_rule.values()) > _MAXIMUM_MATCHES:
+                        raise RedactionBoundaryError()
+                    start = match_end
             matches.sort(key=lambda item: (item[0], item[1], item[2].name))
             if any(left[1] > right[0] for left, right in pairwise(matches)):
                 raise RedactionBoundaryError()
@@ -422,8 +435,22 @@ class RedactionEngine:
         if rule.action == "pseudonymize":
             return self.store.pseudonymize(rule.name, selected_value, dry_run=dry_run)
         if rule.action == "remove":
-            return None
+            return "" if rule.selector == _TEXT_SELECTOR else None
         return rule.replacement
+
+
+def load_redaction_policy(path: str | Path) -> RedactionPolicy:
+    policy_path = Path(path)
+    try:
+        encoded_policy = policy_path.read_bytes()
+    except OSError:
+        raise RuntimeError("redaction policy could not be read") from None
+    if len(encoded_policy) > _MAXIMUM_POLICY_BYTES:
+        raise ValueError("redaction policy exceeds the 1 MB limit")
+    try:
+        return RedactionPolicy.model_validate_json(encoded_policy)
+    except ValueError:
+        raise ValueError("redaction policy is invalid") from None
 
 
 class _SemanticPipeline(
@@ -520,16 +547,16 @@ class RedactedSemanticPipeline:
             raise RedactionBoundaryError() from None
 
     def wrap_target(self, target: DatasetTargetExecutor) -> RehydratingDatasetTarget:
-        return RehydratingDatasetTarget(target, self.engine.store)
+        return RehydratingDatasetTarget(target, self.engine)
 
     def _metadata(self, metadata: dict[str, JsonValue]) -> dict[str, JsonValue]:
         return {**metadata, "redaction_policy_sha256": self.engine.policy.digest}
 
 
 class RehydratingDatasetTarget:
-    def __init__(self, target: DatasetTargetExecutor, store: LocalPseudonymStore) -> None:
+    def __init__(self, target: DatasetTargetExecutor, engine: RedactionEngine) -> None:
         self._target = target
-        self._store = store
+        self._engine = engine
 
     @property
     def safety_envelope(self) -> SafetyEnvelope:
@@ -541,10 +568,17 @@ class RehydratingDatasetTarget:
 
     async def execute(self, raw_input: str) -> ObservedAgentOutput:
         try:
-            rehydrated_input = self._store.rehydrate_text(raw_input)
+            rehydrated_input = self._engine.store.rehydrate_text(raw_input)
         except RedactionBoundaryError:
             raise
-        return await self._target.execute(rehydrated_input)
+        target_output = await self._target.execute(rehydrated_input)
+        protected_output = self._engine.transform(target_output.raw_output, location="output").value
+        protected_metadata = self._engine.transform(target_output.metadata, location="output").value
+        if not isinstance(protected_metadata, dict):
+            raise RedactionBoundaryError()
+        return target_output.model_copy(
+            update={"raw_output": protected_output, "metadata": protected_metadata}
+        )
 
 
 def _parse_json_pointer(pointer: str) -> tuple[str, ...]:
