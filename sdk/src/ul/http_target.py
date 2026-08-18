@@ -10,17 +10,25 @@ import sys
 from collections.abc import Mapping
 from pathlib import Path
 from types import TracebackType
-from typing import Any, Literal, Never, cast
+from typing import Any, Literal, Never, Self, cast
 from urllib.parse import urlsplit
 
 import httpx
-from pydantic import BaseModel, ConfigDict, Field, JsonValue, ValidationError, field_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    JsonValue,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
+from ul_core.contracts import DatasetTargetLifecycleError
 from ul_core.dataset import ObservedAgentOutput
 from ul_core.models import SafetyEnvelope
 
 _HEADER_NAME_PATTERN = re.compile(r"[!#$%&'*+.^_`|~0-9A-Za-z-]+")
 _ENVIRONMENT_VARIABLE_PATTERN = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
-_REQUEST_FIELD_PATTERN = re.compile(r"[A-Za-z_][A-Za-z0-9_-]{0,127}")
 _INPUT_PLACEHOLDER = "{{input}}"
 _MAXIMUM_CONFIG_BYTES = 1_000_000
 _MAXIMUM_HEADER_COUNT = 32
@@ -43,21 +51,15 @@ _UNSAFE_HEADER_NAMES = {
 }
 
 
-class JsonHttpDatasetTargetConfig(BaseModel):
+class _TargetDeliveryUncertainError(RuntimeError):
+    pass
+
+
+class JsonHttpLifecycleCallConfig(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
-    version: Literal[1]
     url: str
-    headers_from_env: dict[str, str] = Field(default_factory=dict)
-    request_json_template: JsonValue
-    response_json_pointer: str = ""
-
-    @field_validator("version", mode="before")
-    @classmethod
-    def validate_version(cls, version: object) -> object:
-        if type(version) is not int or version != 1:
-            raise ValueError("version must be 1")
-        return version
+    request_json: JsonValue = Field(default_factory=dict)
 
     @field_validator("url")
     @classmethod
@@ -65,10 +67,59 @@ class JsonHttpDatasetTargetConfig(BaseModel):
         _validate_endpoint(url, allow_insecure_http=True)
         return url
 
-    @field_validator("headers_from_env")
+    @field_validator("request_json", mode="before")
     @classmethod
-    def validate_headers_from_env(cls, headers: dict[str, str]) -> dict[str, str]:
-        return _validate_header_environment_variables(headers)
+    def validate_request_json(cls, request_json: object) -> JsonValue:
+        return _validated_static_request_json(request_json)
+
+
+class JsonHttpLifecycleObservationConfig(JsonHttpLifecycleCallConfig):
+    response_json_pointer: str = ""
+
+    @field_validator("response_json_pointer")
+    @classmethod
+    def validate_response_json_pointer(cls, pointer: str) -> str:
+        _parse_json_pointer(pointer)
+        return pointer
+
+
+class JsonHttpLifecycleResetConfig(JsonHttpLifecycleCallConfig):
+    generation_json_pointer: str
+    clean_state_json_pointer: str
+    clean_state_value: JsonValue
+
+    @field_validator("generation_json_pointer", "clean_state_json_pointer")
+    @classmethod
+    def validate_json_pointer(cls, pointer: str) -> str:
+        _parse_json_pointer(pointer)
+        return pointer
+
+    @field_validator("clean_state_value")
+    @classmethod
+    def validate_clean_state_value(cls, value: JsonValue) -> JsonValue:
+        if isinstance(value, dict | list | float):
+            raise ValueError("clean_state_value must be a JSON string, integer, boolean, or null")
+        return value
+
+    @model_validator(mode="after")
+    def validate_distinct_pointers(self) -> Self:
+        if self.generation_json_pointer == self.clean_state_json_pointer:
+            raise ValueError("reset generation and clean-state pointers must be different")
+        return self
+
+
+class JsonHttpLifecycleExecuteTurnConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    url: str
+    request_json_template: JsonValue
+    response_json_pointer: str = ""
+
+    @field_validator("url")
+    @classmethod
+    def validate_url(cls, url: str) -> str:
+        _validate_endpoint(url, allow_insecure_http=True)
+        return url
 
     @field_validator("request_json_template", mode="before")
     @classmethod
@@ -80,6 +131,36 @@ class JsonHttpDatasetTargetConfig(BaseModel):
     def validate_response_json_pointer(cls, pointer: str) -> str:
         _parse_json_pointer(pointer)
         return pointer
+
+
+class JsonHttpDatasetTargetConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    version: Literal[2]
+    headers_from_env: dict[str, str] = Field(default_factory=dict)
+    reset: JsonHttpLifecycleResetConfig
+    setup: JsonHttpLifecycleCallConfig | None = None
+    execute_turn: JsonHttpLifecycleExecuteTurnConfig
+    snapshot: JsonHttpLifecycleObservationConfig
+
+    @field_validator("version", mode="before")
+    @classmethod
+    def validate_version(cls, version: object) -> object:
+        if type(version) is not int or version != 2:
+            raise ValueError("version must be 2")
+        return version
+
+    @field_validator("headers_from_env")
+    @classmethod
+    def validate_headers_from_env(cls, headers: dict[str, str]) -> dict[str, str]:
+        return _validate_header_environment_variables(headers)
+
+    @model_validator(mode="after")
+    def validate_same_origin(self) -> Self:
+        origins = {_endpoint_origin(url) for url in json_http_target_config_urls(self)}
+        if len(origins) != 1:
+            raise ValueError("all lifecycle endpoints must use the same origin")
+        return self
 
 
 def load_json_http_dataset_target_config(path: str | Path) -> JsonHttpDatasetTargetConfig:
@@ -117,48 +198,40 @@ def load_json_http_dataset_target_config(path: str | Path) -> JsonHttpDatasetTar
 class JsonHttpDatasetTarget:
     def __init__(
         self,
-        endpoint: str,
+        config: JsonHttpDatasetTargetConfig,
         *,
         sandbox_confirmed: bool,
-        fresh_state_confirmed: bool,
-        request_field: str = "input",
-        header_environment_variables: Mapping[str, str] | None = None,
-        request_json_template: JsonValue | None = None,
-        response_json_pointer: str = "",
         allow_insecure_http: bool = False,
         timeout_seconds: float = 30,
         max_request_bytes: int = 1_000_000,
         max_response_bytes: int = 1_000_000,
+        max_target_calls: int | None = None,
         client: httpx.AsyncClient | None = None,
     ) -> None:
+        if max_target_calls is not None and (
+            isinstance(max_target_calls, bool) or max_target_calls <= 0
+        ):
+            raise ValueError("max_target_calls must be positive")
         self._headers = validate_json_http_dataset_target_configuration(
-            endpoint,
+            config,
             sandbox_confirmed=sandbox_confirmed,
-            fresh_state_confirmed=fresh_state_confirmed,
-            request_field=request_field,
-            header_environment_variables=header_environment_variables,
-            request_json_template=request_json_template,
-            response_json_pointer=response_json_pointer,
             allow_insecure_http=allow_insecure_http,
             timeout_seconds=timeout_seconds,
             max_request_bytes=max_request_bytes,
             max_response_bytes=max_response_bytes,
         )
-        self._endpoint = endpoint
-        self._request_field = request_field
-        self._request_json_template = (
-            None
-            if request_json_template is None
-            else _validated_request_json_template(request_json_template)
-        )
-        self._response_json_pointer = response_json_pointer
         self._timeout_seconds = timeout_seconds
         self._max_request_bytes = max_request_bytes
         self._max_response_bytes = max_response_bytes
+        self._remaining_target_calls = max_target_calls
+        self._config = config
+        self._lifecycle_lock = asyncio.Lock()
+        self._last_reset_generation: str | int | None = None
+        self._lifecycle_state_uncertain = False
         self._owns_client = client is None
         self._client = client or httpx.AsyncClient(follow_redirects=False, trust_env=False)
         self.safety_envelope = SafetyEnvelope(
-            description="Customer-confirmed isolated, fresh-state JSON HTTP sandbox.",
+            description="Customer-confirmed isolated JSON HTTP sandbox with an explicit lifecycle.",
             isolated=True,
             allows_network_egress=True,
             allows_business_side_effects=False,
@@ -170,24 +243,21 @@ class JsonHttpDatasetTarget:
         config: JsonHttpDatasetTargetConfig,
         *,
         sandbox_confirmed: bool,
-        fresh_state_confirmed: bool,
         allow_insecure_http: bool = False,
         timeout_seconds: float = 30,
         max_request_bytes: int = 1_000_000,
         max_response_bytes: int = 1_000_000,
+        max_target_calls: int | None = None,
         client: httpx.AsyncClient | None = None,
     ) -> JsonHttpDatasetTarget:
         return cls(
-            config.url,
+            config,
             sandbox_confirmed=sandbox_confirmed,
-            fresh_state_confirmed=fresh_state_confirmed,
-            header_environment_variables=config.headers_from_env,
-            request_json_template=config.request_json_template,
-            response_json_pointer=config.response_json_pointer,
             allow_insecure_http=allow_insecure_http,
             timeout_seconds=timeout_seconds,
             max_request_bytes=max_request_bytes,
             max_response_bytes=max_response_bytes,
+            max_target_calls=max_target_calls,
             client=client,
         )
 
@@ -211,18 +281,185 @@ class JsonHttpDatasetTarget:
             await self._client.aclose()
 
     async def execute(self, raw_input: str) -> ObservedAgentOutput:
+        async with self._lifecycle_lock:
+            return await self._execute_stateful(raw_input)
+
+    async def _execute_stateful(self, raw_input: str) -> ObservedAgentOutput:
+        config = self._config
+        if self._lifecycle_state_uncertain:
+            raise DatasetTargetLifecycleError(
+                failed_phase="blocked_state_uncertain",
+                completed_phases=(),
+                cleanup_reset_failed=True,
+                target_state_uncertain=True,
+            )
+        self._reserve_target_calls(json_http_target_calls_per_execution(config))
+        self._lifecycle_state_uncertain = True
+        completed_phase_names: list[str] = []
+        completed_phases: list[JsonValue] = []
+        lifecycle_started = False
+        failed_phase: str | None = None
+        cleanup_reset_failed = False
+        delivery_uncertain = False
+        current_phase = "reset"
+        execute_response: JsonValue | None = None
+        committed_state_snapshot: JsonValue | None = None
+        try:
+            lifecycle_started = True
+            await self._reset(config.reset)
+            completed_phase_names.append("reset")
+            completed_phases.append({"phase": "reset", "status": "succeeded"})
+            if config.setup is not None:
+                current_phase = "setup"
+                await self._post_without_observation(
+                    config.setup.url,
+                    config.setup.request_json,
+                    consume_budget=False,
+                )
+                completed_phase_names.append("setup")
+                completed_phases.append({"phase": "setup", "status": "succeeded"})
+            current_phase = "execute_turn"
+            execute_response = await self._post_for_json(
+                config.execute_turn.url,
+                _replace_input_placeholder(config.execute_turn.request_json_template, raw_input),
+                config.execute_turn.response_json_pointer,
+                consume_budget=False,
+            )
+            completed_phase_names.append("execute_turn")
+            completed_phases.append({"phase": "execute_turn", "status": "succeeded"})
+            current_phase = "snapshot"
+            committed_state_snapshot = await self._post_for_json(
+                config.snapshot.url,
+                config.snapshot.request_json,
+                config.snapshot.response_json_pointer,
+                consume_budget=False,
+            )
+            completed_phase_names.append("snapshot")
+            completed_phases.append({"phase": "snapshot", "status": "succeeded"})
+        except _TargetDeliveryUncertainError:
+            failed_phase = current_phase
+            delivery_uncertain = current_phase in {"setup", "execute_turn", "snapshot"}
+        except asyncio.CancelledError:
+            if current_phase in {"setup", "execute_turn", "snapshot"}:
+                delivery_uncertain = True
+            raise
+        except RuntimeError:
+            failed_phase = _next_lifecycle_phase(
+                tuple(completed_phase_names), config.setup is not None
+            )
+        finally:
+            if lifecycle_started:
+                try:
+                    await self._reset(config.reset)
+                    completed_phase_names.append("cleanup_reset")
+                    completed_phases.append({"phase": "cleanup_reset", "status": "succeeded"})
+                    if not delivery_uncertain:
+                        self._lifecycle_state_uncertain = False
+                except RuntimeError:
+                    cleanup_reset_failed = True
+        if failed_phase is not None or cleanup_reset_failed:
+            raise DatasetTargetLifecycleError(
+                failed_phase=failed_phase or "cleanup_reset",
+                completed_phases=tuple(completed_phase_names),
+                cleanup_reset_failed=cleanup_reset_failed,
+                target_state_uncertain=self._lifecycle_state_uncertain,
+            ) from None
+        if execute_response is None or committed_state_snapshot is None:
+            raise AssertionError(
+                "successful lifecycle requires execution and snapshot observations"
+            )
+        try:
+            return ObservedAgentOutput(
+                raw_output=execute_response,
+                metadata={
+                    "target_protocol_version": 2,
+                    "lifecycle_calls": completed_phases,
+                    "committed_state_snapshot": committed_state_snapshot,
+                },
+            )
+        except (RecursionError, ValidationError):
+            raise RuntimeError("HTTP dataset target returned invalid JSON") from None
+
+    async def _reset(self, config: JsonHttpLifecycleResetConfig) -> None:
+        reset_response = await self._post_for_json(
+            config.url,
+            config.request_json,
+            "",
+            consume_budget=False,
+        )
+        generation = _resolve_json_pointer(reset_response, config.generation_json_pointer)
+        if isinstance(generation, bool) or not isinstance(generation, str | int):
+            raise RuntimeError("HTTP dataset target reset generation is invalid")
+        if isinstance(generation, str) and not generation:
+            raise RuntimeError("HTTP dataset target reset generation is invalid")
+        if generation == self._last_reset_generation:
+            raise RuntimeError("HTTP dataset target reset generation did not change")
+        self._last_reset_generation = generation
+        clean_state = _resolve_json_pointer(
+            reset_response,
+            config.clean_state_json_pointer,
+            allow_null=True,
+        )
+        if (
+            type(clean_state) is not type(config.clean_state_value)
+            or clean_state != config.clean_state_value
+        ):
+            raise RuntimeError("HTTP dataset target reset did not report clean state")
+
+    async def _post_without_observation(
+        self,
+        endpoint: str,
+        request_json: JsonValue,
+        *,
+        consume_budget: bool = True,
+    ) -> None:
+        await self._post(
+            endpoint,
+            request_json,
+            response_json_pointer=None,
+            consume_budget=consume_budget,
+        )
+
+    async def _post_for_json(
+        self,
+        endpoint: str,
+        request_json: JsonValue,
+        response_json_pointer: str,
+        *,
+        consume_budget: bool = True,
+    ) -> JsonValue:
+        result = await self._post(
+            endpoint,
+            request_json,
+            response_json_pointer=response_json_pointer,
+            consume_budget=consume_budget,
+        )
+        if result is None:
+            raise AssertionError("JSON observation request requires a result")
+        return result
+
+    async def _post(
+        self,
+        endpoint: str,
+        request_json: JsonValue,
+        *,
+        response_json_pointer: str | None,
+        consume_budget: bool = True,
+    ) -> JsonValue | None:
         request_body = json.dumps(
-            self._request_body(raw_input),
+            request_json,
             ensure_ascii=True,
             separators=(",", ":"),
         ).encode("utf-8")
         if len(request_body) > self._max_request_bytes:
             raise RuntimeError("HTTP dataset target request exceeds the size limit")
+        if consume_budget:
+            self._reserve_target_calls(1)
         try:
             async with asyncio.timeout(self._timeout_seconds):
                 async with self._client.stream(
                     "POST",
-                    self._endpoint,
+                    endpoint,
                     headers={
                         "Accept-Encoding": "identity",
                         "Content-Type": "application/json",
@@ -234,7 +471,9 @@ class JsonHttpDatasetTarget:
                 ) as response:
                     if not 200 <= response.status_code < 300:
                         raise RuntimeError("HTTP dataset target returned a non-success status")
-                    if not _is_json_content_type(response.headers.get("content-type")):
+                    if response_json_pointer is not None and not _is_json_content_type(
+                        response.headers.get("content-type")
+                    ):
                         raise RuntimeError("HTTP dataset target response must be JSON")
                     content_encoding = response.headers.get("content-encoding")
                     if content_encoding is not None and content_encoding.casefold() != "identity":
@@ -243,12 +482,18 @@ class JsonHttpDatasetTarget:
                         )
                     response_body = await _read_bounded_response(response, self._max_response_bytes)
         except TimeoutError:
-            raise RuntimeError("HTTP dataset target request timed out") from None
+            raise _TargetDeliveryUncertainError(
+                "HTTP dataset target request delivery is uncertain"
+            ) from None
         except RuntimeError:
             raise
         except httpx.HTTPError:
-            raise RuntimeError("HTTP dataset target request failed") from None
+            raise _TargetDeliveryUncertainError(
+                "HTTP dataset target request delivery is uncertain"
+            ) from None
 
+        if response_json_pointer is None:
+            return None
         try:
             raw_output = json.loads(
                 response_body,
@@ -260,27 +505,20 @@ class JsonHttpDatasetTarget:
             raise RuntimeError("HTTP dataset target returned invalid JSON") from None
         if raw_output is None:
             raise RuntimeError("HTTP dataset target returned null JSON")
-        raw_output = _resolve_json_pointer(raw_output, self._response_json_pointer)
-        try:
-            return ObservedAgentOutput(raw_output=raw_output)
-        except (RecursionError, ValidationError):
-            raise RuntimeError("HTTP dataset target returned invalid JSON") from None
+        return _resolve_json_pointer(raw_output, response_json_pointer)
 
-    def _request_body(self, raw_input: str) -> JsonValue:
-        if self._request_json_template is None:
-            return {self._request_field: raw_input}
-        return _replace_input_placeholder(self._request_json_template, raw_input)
+    def _reserve_target_calls(self, target_calls: int) -> None:
+        if self._remaining_target_calls is None:
+            return
+        if target_calls > self._remaining_target_calls:
+            raise RuntimeError("HTTP dataset target call budget exhausted")
+        self._remaining_target_calls -= target_calls
 
 
 def validate_json_http_dataset_target_configuration(
-    endpoint: str,
+    config: JsonHttpDatasetTargetConfig,
     *,
     sandbox_confirmed: bool,
-    fresh_state_confirmed: bool,
-    request_field: str = "input",
-    header_environment_variables: Mapping[str, str] | None = None,
-    request_json_template: JsonValue | None = None,
-    response_json_pointer: str = "",
     allow_insecure_http: bool = False,
     timeout_seconds: float = 30,
     max_request_bytes: int = 1_000_000,
@@ -288,16 +526,8 @@ def validate_json_http_dataset_target_configuration(
 ) -> dict[str, str]:
     if sandbox_confirmed is not True:
         raise ValueError("HTTP dataset targets require explicit sandbox confirmation")
-    if fresh_state_confirmed is not True:
-        raise ValueError("HTTP dataset targets require explicit fresh-state confirmation")
-    _validate_endpoint(endpoint, allow_insecure_http)
-    if _REQUEST_FIELD_PATTERN.fullmatch(request_field) is None:
-        raise ValueError("request_field must be a simple JSON field name")
-    if request_json_template is not None:
-        if request_field != "input":
-            raise ValueError("request_field cannot be combined with request_json_template")
-        _validated_request_json_template(request_json_template)
-    _parse_json_pointer(response_json_pointer)
+    for endpoint in json_http_target_config_urls(config):
+        _validate_endpoint(endpoint, allow_insecure_http)
     if (
         isinstance(timeout_seconds, bool)
         or not math.isfinite(timeout_seconds)
@@ -308,10 +538,41 @@ def validate_json_http_dataset_target_configuration(
         raise ValueError("max_request_bytes must be positive")
     if isinstance(max_response_bytes, bool) or max_response_bytes <= 0:
         raise ValueError("max_response_bytes must be positive")
-    validated_header_environment_variables = _validate_header_environment_variables(
-        header_environment_variables or {}
+    return _headers_from_environment(config.headers_from_env)
+
+
+def json_http_target_calls_per_execution(
+    config: JsonHttpDatasetTargetConfig,
+) -> int:
+    return 5 if config.setup is not None else 4
+
+
+def json_http_target_config_urls(
+    config: JsonHttpDatasetTargetConfig,
+) -> tuple[str, ...]:
+    return (
+        config.reset.url,
+        *((config.setup.url,) if config.setup is not None else ()),
+        config.execute_turn.url,
+        config.snapshot.url,
     )
-    return _headers_from_environment(validated_header_environment_variables)
+
+
+def _next_lifecycle_phase(
+    completed_phases: tuple[str, ...],
+    setup_configured: bool,
+) -> str:
+    phases = ("reset", *(("setup",) if setup_configured else ()), "execute_turn", "snapshot")
+    return phases[len(completed_phases)]
+
+
+def _endpoint_origin(endpoint: str) -> tuple[str, str, int]:
+    parsed = urlsplit(endpoint)
+    hostname = parsed.hostname
+    if hostname is None:
+        raise ValueError("endpoint must be a valid HTTP(S) URL")
+    default_port = 443 if parsed.scheme == "https" else 80
+    return parsed.scheme, hostname.casefold(), parsed.port or default_port
 
 
 def _validate_endpoint(endpoint: str, allow_insecure_http: bool) -> str:
@@ -482,6 +743,49 @@ def _validated_request_json_template(template: object) -> JsonValue:
     return validated_template
 
 
+def _validated_static_request_json(request_json: object) -> JsonValue:
+    if not isinstance(request_json, dict | list):
+        raise ValueError("request_json must be an object or array")
+    validated = _validated_request_json_value(cast(object, request_json))
+    if _contains_input_placeholder(validated):
+        raise ValueError("request_json must not contain {{input}}")
+    return validated
+
+
+def _validated_request_json_value(value: object, depth: int = 0) -> JsonValue:
+    if depth > _MAXIMUM_JSON_DEPTH:
+        raise ValueError("request_json exceeds the nesting limit")
+    if value is None or isinstance(value, bool | int | str):
+        return cast(JsonValue, value)
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise ValueError("request_json must contain standard JSON values")
+        return value
+    if isinstance(value, list):
+        return [
+            _validated_request_json_value(item, depth + 1) for item in cast(list[object], value)
+        ]
+    if isinstance(value, dict):
+        object_value = cast(dict[object, object], value)
+        if not all(isinstance(key, str) for key in object_value):
+            raise ValueError("request_json object keys must be strings")
+        return {
+            cast(str, key): _validated_request_json_value(item, depth + 1)
+            for key, item in object_value.items()
+        }
+    raise ValueError("request_json must contain JSON values")
+
+
+def _contains_input_placeholder(value: JsonValue) -> bool:
+    if value == _INPUT_PLACEHOLDER:
+        return True
+    if isinstance(value, list):
+        return any(_contains_input_placeholder(item) for item in value)
+    if isinstance(value, dict):
+        return any(_contains_input_placeholder(item) for item in value.values())
+    return False
+
+
 def _replace_input_placeholder(template: JsonValue, raw_input: str) -> JsonValue:
     if template == _INPUT_PLACEHOLDER:
         return raw_input
@@ -517,7 +821,12 @@ def _parse_json_pointer(pointer: str) -> tuple[str, ...]:
     return tuple(tokens)
 
 
-def _resolve_json_pointer(document: JsonValue, pointer: str) -> JsonValue:
+def _resolve_json_pointer(
+    document: JsonValue,
+    pointer: str,
+    *,
+    allow_null: bool = False,
+) -> JsonValue:
     selected: JsonValue = document
     for token in _parse_json_pointer(pointer):
         if isinstance(selected, dict):
@@ -535,7 +844,7 @@ def _resolve_json_pointer(document: JsonValue, pointer: str) -> JsonValue:
             selected = selected[index]
         else:
             raise RuntimeError("HTTP dataset target response JSON pointer was not found")
-    if selected is None:
+    if selected is None and not allow_null:
         raise RuntimeError("HTTP dataset target response JSON pointer selected null")
     return selected
 

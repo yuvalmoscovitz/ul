@@ -4,6 +4,7 @@ import json
 import re
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from threading import Lock
 from typing import Any, cast
 
 _MAXIMUM_REQUEST_BYTES = 16_384
@@ -39,9 +40,12 @@ def _payment_action(invoice_reference: str) -> dict[str, str]:
 
 class _DefectiveAgentRequestHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
+    state_lock = Lock()
+    reset_generation = 0
+    committed_action: dict[str, str] | None = None
 
     def do_POST(self) -> None:
-        if self.path != "/execute":
+        if self.path not in {"/reset", "/setup", "/execute", "/snapshot"}:
             self._send_json(HTTPStatus.NOT_FOUND, {"error": "not found"})
             return
         if self.headers.get("Transfer-Encoding") is not None:
@@ -71,8 +75,38 @@ class _DefectiveAgentRequestHandler(BaseHTTPRequestHandler):
                 object_pairs_hook=_reject_duplicate_json_keys,
                 parse_constant=_reject_nonstandard_json_constant,
             )
-            message = _validated_message(request)
         except (UnicodeDecodeError, json.JSONDecodeError, RecursionError, ValueError):
+            self._send_json(HTTPStatus.BAD_REQUEST, {"error": "invalid request"})
+            return
+
+        if self.path == "/reset":
+            if request != {}:
+                self._send_json(HTTPStatus.BAD_REQUEST, {"error": "invalid reset request"})
+                return
+            with type(self).state_lock:
+                type(self).reset_generation += 1
+                type(self).committed_action = None
+                generation = type(self).reset_generation
+            self._send_json(HTTPStatus.OK, {"generation": generation, "clean": True})
+            return
+        if self.path == "/setup":
+            if request != {"scenario": "accounts-payable"}:
+                self._send_json(HTTPStatus.BAD_REQUEST, {"error": "invalid setup request"})
+                return
+            self._send_json(HTTPStatus.OK, {})
+            return
+        if self.path == "/snapshot":
+            if request != {}:
+                self._send_json(HTTPStatus.BAD_REQUEST, {"error": "invalid snapshot request"})
+                return
+            with type(self).state_lock:
+                committed_action = type(self).committed_action
+            self._send_json(HTTPStatus.OK, {"state": committed_action})
+            return
+
+        try:
+            message = _validated_message(request)
+        except ValueError:
             self._send_json(HTTPStatus.BAD_REQUEST, {"error": "invalid request"})
             return
 
@@ -83,10 +117,10 @@ class _DefectiveAgentRequestHandler(BaseHTTPRequestHandler):
         invoice_reference = (
             "AC-101" if _REPEATED_PAYMENT_REQUEST_PATTERN.fullmatch(message) else "AC-100"
         )
-        self._send_json(
-            HTTPStatus.OK,
-            {"result": _payment_action(invoice_reference)},
-        )
+        action = _payment_action(invoice_reference)
+        with type(self).state_lock:
+            type(self).committed_action = action
+        self._send_json(HTTPStatus.OK, {"result": action})
 
     def _send_json(self, status: HTTPStatus, payload: dict[str, Any]) -> None:
         encoded_payload = json.dumps(payload, separators=(",", ":")).encode("utf-8")
@@ -126,6 +160,9 @@ def _validated_message(request: object) -> str:
 
 
 def create_server() -> ThreadingHTTPServer:
+    with _DefectiveAgentRequestHandler.state_lock:
+        _DefectiveAgentRequestHandler.reset_generation = 0
+        _DefectiveAgentRequestHandler.committed_action = None
     server = ThreadingHTTPServer(("127.0.0.1", 0), _DefectiveAgentRequestHandler)
     server.daemon_threads = True
     return server

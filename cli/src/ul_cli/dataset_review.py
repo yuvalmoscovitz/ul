@@ -54,7 +54,7 @@ _MAXIMUM_SENSITIVE_DISCLOSURE_LINES = 50
 _SHA256_PATTERN = r"^[0-9a-f]{64}$"
 _FINDING_ID_PATTERN = r"^ulf_v1_[0-9a-f]{64}$"
 _REVIEW_ID_PATTERN = r"^ulr_[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
-_DATASET_EVALUATION_PIPELINE_VERSION = "1.0.0"
+_DATASET_EVALUATION_PIPELINE_VERSION = "1.1.0"
 
 ReviewStatus = Literal["confirmed", "expected", "unsupported", "inconclusive"]
 ReviewSeverity = Literal["unrated", "low", "medium", "high", "critical"]
@@ -110,10 +110,19 @@ class _OutcomeGroup(_StrictModel):
     representative_effects: list[_Effect]
 
 
+class _LifecycleFailure(_StrictModel):
+    protocol_version: Literal[2]
+    failed_phase: str
+    completed_phases: list[str]
+    cleanup_reset_failed: bool
+    sandbox_state_may_remain: bool
+
+
 class _Trial(_StrictModel):
     repetition: int = Field(ge=1)
     status: Literal["observed", "inconclusive"]
     inconclusive_reasons: list[str]
+    lifecycle_failure: _LifecycleFailure | None = None
 
 
 class _Observations(_StrictModel):
@@ -152,7 +161,7 @@ class DatasetEvidenceSemanticSettings(_StrictModel):
 
 class DatasetEvidenceRunContext(_StrictModel):
     schema_version: Literal["1.0.0"] = "1.0.0"
-    pipeline_version: Literal["1.0.0"] = _DATASET_EVALUATION_PIPELINE_VERSION
+    pipeline_version: Literal["1.1.0"] = _DATASET_EVALUATION_PIPELINE_VERSION
     selected_dataset_sha256: str = Field(pattern=_SHA256_PATTERN)
     operators: tuple[DatasetEvidenceOperator, ...] = Field(min_length=1)
     repetitions: int = Field(ge=1)

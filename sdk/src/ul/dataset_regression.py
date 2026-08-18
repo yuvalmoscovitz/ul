@@ -13,10 +13,11 @@ from pathlib import Path
 from typing import Literal, Self, cast
 
 from pydantic import ConfigDict, Field, JsonValue, ValidationError, field_validator, model_validator
-from ul_core.contracts import DatasetTargetExecutor
+from ul_core.contracts import DatasetTargetExecutor, DatasetTargetLifecycleError
 from ul_core.dataset import ObservedAgentOutput
 from ul_core.models import ULModel
 
+from ul.dataset_evaluation import DatasetTargetLifecycleFailure
 from ul.dataset_invariants import (
     DatasetInvariantRule,
     DatasetInvariantRuleEvaluation,
@@ -25,7 +26,10 @@ from ul.dataset_invariants import (
     ObservationAuthority,
     evaluate_dataset_invariant_rules,
 )
-from ul.http_target import JsonHttpDatasetTargetConfig
+from ul.http_target import (
+    JsonHttpDatasetTargetConfig,
+    json_http_target_calls_per_execution,
+)
 
 _MAXIMUM_CASE_BYTES = 1_000_000
 _MAXIMUM_JSON_DEPTH = 100
@@ -35,7 +39,10 @@ _REVIEW_ID_PATTERN = r"^ulr_[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{
 _CASE_ID_PATTERN = r"^ulrc_v1_[0-9a-f]{64}$"
 RegressionStatus = Literal["passed", "failed", "inconclusive"]
 RegressionExecutionStatus = Literal[
-    "observed", "target_execution_timed_out", "target_execution_failed"
+    "observed",
+    "target_execution_timed_out",
+    "target_execution_failed",
+    "target_state_uncertain",
 ]
 
 
@@ -114,6 +121,7 @@ class DatasetRegressionExecution(_StrictModel):
     repetition: int = Field(ge=1)
     status: RegressionExecutionStatus
     target_output: ObservedAgentOutput | None = None
+    lifecycle_failure: DatasetTargetLifecycleFailure | None = None
 
     @model_validator(mode="after")
     def validate_execution(self) -> Self:
@@ -128,6 +136,7 @@ class DatasetRegressionResult(_StrictModel):
     target_config_sha256: str = Field(pattern=_SHA256_PATTERN)
     source_suite_sha256: str = Field(pattern=_SHA256_PATTERN)
     requested_repetitions: int = Field(ge=1)
+    target_calls_per_execution: int = Field(default=1, ge=1)
     status: RegressionStatus
     executions: tuple[DatasetRegressionExecution, ...] = Field(min_length=1)
     rules: tuple[DatasetInvariantRuleResult, ...] = Field(min_length=1, max_length=100)
@@ -203,7 +212,8 @@ class DatasetRegressionRunResult(_StrictModel):
         ):
             raise ValueError("regression run results must use one target config digest")
         if self.requested_target_calls != sum(
-            case.result.requested_repetitions for case in self.cases
+            case.result.requested_repetitions * case.result.target_calls_per_execution
+            for case in self.cases
         ):
             raise ValueError("requested target calls must match regression result repetitions")
         expected_counts = {
@@ -338,7 +348,9 @@ async def replay_dataset_regression(
 ) -> DatasetRegressionResult:
     if type(max_target_calls) is not int or max_target_calls < 1:
         raise ValueError("max_target_calls must be a positive integer")
-    if case.discovery_repetitions > max_target_calls:
+    target_calls_per_execution = json_http_target_calls_per_execution(case.target.config)
+    required_target_calls = case.discovery_repetitions * target_calls_per_execution
+    if required_target_calls > max_target_calls:
         raise ValueError("regression case exceeds the authorized target call budget")
     if not math.isfinite(target_timeout_seconds) or target_timeout_seconds <= 0:
         raise ValueError("target_timeout_seconds must be positive and finite")
@@ -353,7 +365,16 @@ async def replay_dataset_regression(
         raise ValueError("dataset target must start from fresh state for every execution")
 
     executions: list[DatasetRegressionExecution] = []
+    target_state_uncertain = False
     for repetition in range(1, case.discovery_repetitions + 1):
+        if target_state_uncertain:
+            executions.append(
+                DatasetRegressionExecution(
+                    repetition=repetition,
+                    status="target_state_uncertain",
+                )
+            )
+            continue
         try:
             async with asyncio.timeout(target_timeout_seconds):
                 target_output = await target.execute(case.variation.variation_input)
@@ -362,6 +383,24 @@ async def replay_dataset_regression(
                 DatasetRegressionExecution(
                     repetition=repetition,
                     status="target_execution_timed_out",
+                )
+            )
+        except DatasetTargetLifecycleError as error:
+            target_state_uncertain = error.target_state_uncertain
+            executions.append(
+                DatasetRegressionExecution(
+                    repetition=repetition,
+                    status=(
+                        "target_state_uncertain"
+                        if error.target_state_uncertain
+                        else "target_execution_failed"
+                    ),
+                    lifecycle_failure=DatasetTargetLifecycleFailure(
+                        failed_phase=error.failed_phase,
+                        completed_phases=error.completed_phases,
+                        cleanup_reset_failed=error.cleanup_reset_failed,
+                        sandbox_state_may_remain=error.target_state_uncertain,
+                    ),
                 )
             )
         except RuntimeError:
@@ -382,6 +421,7 @@ async def replay_dataset_regression(
     rules = evaluate_dataset_invariant_rules(
         case.invariant_suite.rules,
         tuple(execution.target_output for execution in executions),
+        observation_authority=case.invariant_suite.observation_authority,
     )
     rule_statuses = {rule.status for rule in rules}
     status: RegressionStatus
@@ -397,6 +437,7 @@ async def replay_dataset_regression(
         target_config_sha256=case.target.config_sha256,
         source_suite_sha256=case.invariant_suite.source_suite_sha256,
         requested_repetitions=case.discovery_repetitions,
+        target_calls_per_execution=target_calls_per_execution,
         status=status,
         executions=tuple(executions),
         rules=rules,
@@ -431,7 +472,10 @@ async def run_dataset_regressions(
         raise ValueError("regression run cases must use one target config digest")
     if type(max_target_calls) is not int or max_target_calls < 1:
         raise ValueError("max_target_calls must be a positive integer")
-    requested_target_calls = sum(case.discovery_repetitions for case in cases)
+    requested_target_calls = sum(
+        case.discovery_repetitions * json_http_target_calls_per_execution(case.target.config)
+        for case in cases
+    )
     if requested_target_calls > max_target_calls:
         raise ValueError("regression run exceeds the authorized target call budget")
 
@@ -444,7 +488,10 @@ async def run_dataset_regressions(
                 target,
                 target_timeout_seconds=target_timeout_seconds,
                 allow_network_egress=allow_network_egress,
-                max_target_calls=case.discovery_repetitions,
+                max_target_calls=(
+                    case.discovery_repetitions
+                    * json_http_target_calls_per_execution(case.target.config)
+                ),
             )
         )
     results = tuple(result_list)

@@ -50,7 +50,6 @@ uv run ul dataset evaluate interactions.jsonl \
   --target-config target.json \
   --allow-target-network \
   --confirm-isolated-sandbox \
-  --confirm-fresh-state \
   --output results.jsonl
 ```
 
@@ -182,8 +181,7 @@ uv run ul regression replay regressions/wrong-invoice.json \
   --target-config target.json \
   --allow-target-network \
   --confirm-isolated-sandbox \
-  --confirm-fresh-state \
-  --max-target-calls 3 \
+  --max-target-calls 12 \
   --output tmp/wrong-invoice-replay.json
 ```
 
@@ -201,7 +199,6 @@ uv run ul regression run regressions/ \
   --target-config target.json \
   --allow-target-network \
   --confirm-isolated-sandbox \
-  --confirm-fresh-state \
   --max-target-calls 100 \
   --output tmp/regression-run.json
 ```
@@ -248,7 +245,7 @@ jobs:
       - name: Run UL regressions
         env:
           TARGET_TOKEN: ${{ secrets.TARGET_TOKEN }}
-        run: uv run --frozen ul regression run regressions/ --target-config target.json --allow-target-network --confirm-isolated-sandbox --confirm-fresh-state --max-target-calls 100 --output tmp/regression-run-${{ github.run_id }}.json
+        run: uv run --frozen ul regression run regressions/ --target-config target.json --allow-target-network --confirm-isolated-sandbox --max-target-calls 100 --output tmp/regression-run-${{ github.run_id }}.json
       - name: Upload UL evidence
         if: ${{ !cancelled() && vars.UL_UPLOAD_RAW_EVIDENCE == 'true' }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
@@ -283,13 +280,44 @@ layout.
 Create a target description and adapt its nested request and response paths:
 
 ```bash
-uv run ul dataset init target.json --url https://your-sandbox.example/execute
+uv run ul dataset init target.json --url https://your-sandbox.example
 uv run ul dataset evaluate your-data.jsonl --target-config target.json --dry-run
 ```
 
-The target must be an isolated sandbox that starts every request from the same clean state.
+The target must be an isolated sandbox with reset, execute, and snapshot lifecycle endpoints.
 Use `headers_from_env` in the target file for credentials so secret values remain outside the
 configuration. Dry-run validates the dataset and target mapping without making external calls.
+
+Use a lifecycle configuration such as [`examples/stateful_target.json`](examples/stateful_target.json). The
+[quickstart sandbox](examples/quickstart/README.md) is a runnable adapter. For every
+original or variation repetition, UL sends these same-origin POST requests in order:
+
+```text
+reset → optional setup → execute_turn → snapshot → cleanup reset
+```
+
+Each reset must return JSON containing a configured clean-state field and a generation string or
+integer that changes on every reset. UL validates both fields before setup and again during cleanup.
+This proves the adapter returned a fresh acknowledgement, not that the underlying system actually
+erased every state store.
+
+`execute_turn` returns the agent response used for semantic comparison. `snapshot` separately
+returns committed state used by invariants whose `observation_authority` is
+`committed_state_snapshot`. A failed reset, setup, execution, snapshot, or cleanup reset makes the
+repetition inconclusive. UL disables redirects, ignores proxy environment variables, applies the
+same environment-backed headers to every operation, and rejects lifecycle URLs that do not share
+one origin. Setup may return an empty successful response; reset, execute, and snapshot must
+return bounded JSON. UL verifies the reset response contract and ordering, but cannot prove
+that the sandbox actually erased or seeded its internal state. The sandbox implementation remains
+responsible for making reset deterministic and complete.
+
+Setup is one static JSON fixture from the target configuration and is reused for every repetition
+in the run. Per-record setup fixtures are intentionally deferred. Put record-specific content only
+in the `execute_turn` template for now.
+
+Each physical lifecycle request counts toward `--max-target-calls`. A configuration with setup
+uses five calls per repetition; without setup it uses four. `committed_state_snapshot` is
+evaluable only when the snapshot call succeeds.
 
 To add customer-defined deterministic checks, provide a strict invariant file:
 
@@ -318,7 +346,8 @@ non-scalar values never silently satisfy a rule. A satisfied declared rule does 
 that the agent is correct or safe beyond that rule. Non-integer JSON numbers and selected values
 larger than 4 KiB are `not_evaluable` in this first rule type. Represent exact decimal values as
 strings or integer minor units rather than binary JSON floats. `observation_authority` is the
-customer's statement about what the target output represents; UL does not independently verify it.
+customer's choice of the agent-response or committed-snapshot channel. UL keeps those channels
+separate and never substitutes an agent response for a missing committed-state snapshot.
 
 Invariant schema `1.1.0` also supports literal values, allowed sets, and array uniqueness by a
 customer-declared composite key:

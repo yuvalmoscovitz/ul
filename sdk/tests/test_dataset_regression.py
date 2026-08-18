@@ -57,11 +57,57 @@ def _case(
         operator_version="1.0.0",
         original_input="Pay invoice AC-100.",
         variation_input=variation_input,
-        target_config=JsonHttpDatasetTargetConfig(
-            version=1,
-            url="http://127.0.0.1:8765/execute",
-            headers_from_env={"Authorization": "TARGET_TOKEN"},
-            request_json_template={"input": "{{input}}"},
+        target_config=JsonHttpDatasetTargetConfig.model_validate(
+            {
+                "version": 2,
+                "headers_from_env": {"Authorization": "TARGET_TOKEN"},
+                "reset": {
+                    "url": "http://127.0.0.1:8765/reset",
+                    "generation_json_pointer": "/generation",
+                    "clean_state_json_pointer": "/clean",
+                    "clean_state_value": True,
+                },
+                "setup": {"url": "http://127.0.0.1:8765/setup"},
+                "execute_turn": {
+                    "url": "http://127.0.0.1:8765/execute",
+                    "request_json_template": {"input": "{{input}}"},
+                },
+                "snapshot": {"url": "http://127.0.0.1:8765/snapshot"},
+            }
+        ),
+        source_suite_sha256=SUITE_SHA256,
+        observation_authority="committed_state_snapshot",
+        selected_rules=(_rule(),),
+        discovery_repetitions=repetitions,
+    )
+
+
+def _stateful_case(*, repetitions: int = 3) -> DatasetRegressionCase:
+    return create_dataset_regression_case(
+        finding_id=FINDING_ID,
+        evidence_sha256="3" * 64,
+        review_id=REVIEW_ID,
+        interaction_id="invoice-correction",
+        operator_id="context.pasted_block",
+        operator_version="1.0.0",
+        original_input="Pay invoice AC-100.",
+        variation_input="Pay invoice AC-101 instead of AC-100.",
+        target_config=JsonHttpDatasetTargetConfig.model_validate(
+            {
+                "version": 2,
+                "reset": {
+                    "url": "https://sandbox.example.test/reset",
+                    "generation_json_pointer": "/generation",
+                    "clean_state_json_pointer": "/clean",
+                    "clean_state_value": True,
+                },
+                "setup": {"url": "https://sandbox.example.test/setup"},
+                "execute_turn": {
+                    "url": "https://sandbox.example.test/execute",
+                    "request_json_template": {"input": "{{input}}"},
+                },
+                "snapshot": {"url": "https://sandbox.example.test/snapshot"},
+            }
         ),
         source_suite_sha256=SUITE_SHA256,
         observation_authority="committed_state_snapshot",
@@ -94,11 +140,13 @@ class _Target:
 
 
 def _output(invoice: str, requested: str) -> ObservedAgentOutput:
+    snapshot = {
+        "invoice_reference": invoice,
+        "requested_invoice_reference": requested,
+    }
     return ObservedAgentOutput(
-        raw_output={
-            "invoice_reference": invoice,
-            "requested_invoice_reference": requested,
-        }
+        raw_output=snapshot,
+        metadata={"committed_state_snapshot": snapshot},
     )
 
 
@@ -208,7 +256,16 @@ def test_extended_rules_round_trip_and_replay(
     result = asyncio.run(
         replay_dataset_regression(
             loaded,
-            _Target([ObservedAgentOutput.model_validate({"raw_output": raw_output})]),
+            _Target(
+                [
+                    ObservedAgentOutput.model_validate(
+                        {
+                            "raw_output": {"message": "completed"},
+                            "metadata": {"committed_state_snapshot": raw_output},
+                        }
+                    )
+                ]
+            ),
         )
     )
 
@@ -298,6 +355,20 @@ def test_replay_rejects_case_over_sdk_target_call_budget_before_execution() -> N
     assert target.inputs == []
 
 
+def test_stateful_replay_budget_counts_physical_lifecycle_calls() -> None:
+    case = _stateful_case()
+    target = _Target([_output("AC-101", "AC-101")] * 3)
+
+    with pytest.raises(ValueError, match="authorized target call budget"):
+        asyncio.run(replay_dataset_regression(case, target, max_target_calls=14))
+    assert target.inputs == []
+
+    result = asyncio.run(replay_dataset_regression(case, target, max_target_calls=15))
+
+    assert result.target_calls_per_execution == 5
+    assert result.requested_repetitions * result.target_calls_per_execution == 15
+
+
 def test_run_executes_cases_in_order_and_aggregates_statuses() -> None:
     passing_case = _case(repetitions=2)
     failing_case = _case(
@@ -325,7 +396,7 @@ def test_run_executes_cases_in_order_and_aggregates_statuses() -> None:
     assert result.passed_case_count == 1
     assert result.failed_case_count == 1
     assert result.inconclusive_case_count == 0
-    assert result.requested_target_calls == 4
+    assert result.requested_target_calls == 20
     assert [case_result.label for case_result in result.cases] == [
         "invoice-correction.json",
         "invoice-substitution.json",

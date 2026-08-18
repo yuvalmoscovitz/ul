@@ -1,0 +1,31 @@
+{
+  "version": 2,
+  "headers_from_env": {
+    "Authorization": "UL_SANDBOX_AUTHORIZATION"
+  },
+  "reset": {
+    "url": "https://sandbox.example.test/reset",
+    "request_json": {},
+    "generation_json_pointer": "/generation",
+    "clean_state_json_pointer": "/clean",
+    "clean_state_value": true
+  },
+  "setup": {
+    "url": "https://sandbox.example.test/setup",
+    "request_json": {
+      "fixture": "standard-account"
+    }
+  },
+  "execute_turn": {
+    "url": "https://sandbox.example.test/execute",
+    "request_json_template": {
+      "input": "{{input}}"
+    },
+    "response_json_pointer": "/agent_response"
+  },
+  "snapshot": {
+    "url": "https://sandbox.example.test/snapshot",
+    "request_json": {},
+    "response_json_pointer": "/committed_state"
+  }
+}

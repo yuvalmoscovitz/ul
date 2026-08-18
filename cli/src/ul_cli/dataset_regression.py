@@ -35,6 +35,8 @@ from ul.dataset_regression import (
 from ul.http_target import (
     JsonHttpDatasetTarget,
     JsonHttpDatasetTargetConfig,
+    json_http_target_calls_per_execution,
+    json_http_target_config_urls,
     load_json_http_dataset_target_config,
 )
 
@@ -153,13 +155,21 @@ def save_dataset_regression(
         "the discovery target, and is never executed by replay."
     )
     insecure_http_option = (
-        " --allow-insecure-http" if case.target.config.url.casefold().startswith("http:") else ""
+        " --allow-insecure-http"
+        if any(
+            url.casefold().startswith("http:")
+            for url in json_http_target_config_urls(case.target.config)
+        )
+        else ""
+    )
+    target_calls = case.discovery_repetitions * json_http_target_calls_per_execution(
+        case.target.config
     )
     _print_safe(
         "Replay: ul regression replay "
         f"{shlex.quote(str(output))} --target-config {shlex.quote(str(target_config))} "
-        "--allow-target-network --confirm-isolated-sandbox --confirm-fresh-state "
-        f"--max-target-calls {case.discovery_repetitions}{insecure_http_option} "
+        "--allow-target-network --confirm-isolated-sandbox"
+        f" --max-target-calls {target_calls}{insecure_http_option} "
         "--output replay.json"
     )
 
@@ -194,9 +204,6 @@ def replay_saved_dataset_regression(
     confirm_isolated_sandbox: Annotated[
         bool, typer.Option(help="Confirm the target cannot cause real business effects.")
     ] = False,
-    confirm_fresh_state: Annotated[
-        bool, typer.Option(help="Confirm every target request starts from the same clean state.")
-    ] = False,
     allow_insecure_http: Annotated[
         bool, typer.Option(help="Allow an HTTP target. Intended for local sandboxes.")
     ] = False,
@@ -214,9 +221,13 @@ def replay_saved_dataset_regression(
     except (ValidationError, ValueError, RuntimeError) as error:
         raise typer.BadParameter(_terminal_safe(str(error))) from None
 
-    if regression_case.discovery_repetitions > max_target_calls:
+    requested_target_calls = (
+        regression_case.discovery_repetitions
+        * json_http_target_calls_per_execution(trusted_target_config)
+    )
+    if requested_target_calls > max_target_calls:
         raise typer.BadParameter(
-            f"case requires {regression_case.discovery_repetitions} target calls, exceeding "
+            f"case requires {requested_target_calls} target calls, exceeding "
             f"--max-target-calls {max_target_calls}; explicitly raise the call budget",
             param_hint="--max-target-calls",
         )
@@ -230,10 +241,6 @@ def replay_saved_dataset_regression(
             "replay requires --confirm-isolated-sandbox",
             param_hint="--confirm-isolated-sandbox",
         )
-    if not confirm_fresh_state:
-        raise typer.BadParameter(
-            "replay requires --confirm-fresh-state", param_hint="--confirm-fresh-state"
-        )
     if output.exists():
         raise typer.BadParameter(
             "output already exists; UL will not overwrite it", param_hint="--output"
@@ -243,8 +250,8 @@ def replay_saved_dataset_regression(
         target = JsonHttpDatasetTarget.from_config(
             trusted_target_config,
             sandbox_confirmed=True,
-            fresh_state_confirmed=True,
             allow_insecure_http=allow_insecure_http,
+            max_target_calls=max_target_calls,
         )
     except (ValueError, RuntimeError) as error:
         raise typer.BadParameter(_terminal_safe(str(error)), param_hint="--target-config") from None
@@ -315,9 +322,6 @@ def run_saved_dataset_regressions(
     confirm_isolated_sandbox: Annotated[
         bool, typer.Option(help="Confirm the target cannot cause real business effects.")
     ] = False,
-    confirm_fresh_state: Annotated[
-        bool, typer.Option(help="Confirm every target request starts from the same clean state.")
-    ] = False,
     allow_insecure_http: Annotated[
         bool, typer.Option(help="Allow an HTTP target. Intended for local sandboxes.")
     ] = False,
@@ -338,7 +342,9 @@ def run_saved_dataset_regressions(
                     "the trusted target config"
                 )
         requested_target_calls = sum(
-            regression_case.discovery_repetitions for regression_case in regression_cases
+            regression_case.discovery_repetitions
+            * json_http_target_calls_per_execution(regression_case.target.config)
+            for regression_case in regression_cases
         )
         if requested_target_calls > max_target_calls:
             raise ValueError(
@@ -358,11 +364,6 @@ def run_saved_dataset_regressions(
             "regression run requires --confirm-isolated-sandbox",
             param_hint="--confirm-isolated-sandbox",
         )
-    if not confirm_fresh_state:
-        raise typer.BadParameter(
-            "regression run requires --confirm-fresh-state",
-            param_hint="--confirm-fresh-state",
-        )
     if output.exists():
         raise typer.BadParameter(
             "output already exists; UL will not overwrite it", param_hint="--output"
@@ -372,8 +373,8 @@ def run_saved_dataset_regressions(
         target = JsonHttpDatasetTarget.from_config(
             trusted_target_config,
             sandbox_confirmed=True,
-            fresh_state_confirmed=True,
             allow_insecure_http=allow_insecure_http,
+            max_target_calls=max_target_calls,
         )
     except (ValueError, RuntimeError) as error:
         raise typer.BadParameter(_terminal_safe(str(error)), param_hint="--target-config") from None

@@ -31,7 +31,6 @@ InvariantStatus = Literal["satisfied", "violated", "not_evaluable"]
 InvariantSeverity = Literal["low", "medium", "high", "critical"]
 ObservationAuthority = Literal[
     "agent_response",
-    "tool_result",
     "committed_state_snapshot",
 ]
 EqualityTrialReasonCode = Literal[
@@ -713,12 +712,19 @@ def evaluate_dataset_invariants(
 def evaluate_dataset_invariant_rules(
     rules: tuple[DatasetInvariantRule, ...],
     outputs: tuple[ObservedAgentOutput | None, ...],
+    *,
+    observation_authority: ObservationAuthority = "agent_response",
 ) -> tuple[DatasetInvariantRuleResult, ...]:
     if not outputs:
         raise ValueError("invariant evaluation requires at least one target output")
     array_work_budget = _ArrayInvariantWorkBudget(_MAXIMUM_ARRAY_INVARIANT_WORK_UNITS)
+    selected_outputs = _outputs_for_observation_authority(outputs, observation_authority)
     return tuple(
-        _evaluate_rule_from_outputs(rule, outputs, array_work_budget=array_work_budget)
+        _evaluate_rule_from_outputs(
+            rule,
+            selected_outputs,
+            array_work_budget=array_work_budget,
+        )
         for rule in rules
     )
 
@@ -735,7 +741,12 @@ def _evaluate_arm(
         arm=arm,
         operator_id=operator_id,
         rules=tuple(
-            _evaluate_rule(rule, trials, array_work_budget=array_work_budget)
+            _evaluate_rule(
+                rule,
+                trials,
+                observation_authority=suite.observation_authority,
+                array_work_budget=array_work_budget,
+            )
             for rule in suite.rules
         ),
     )
@@ -745,13 +756,33 @@ def _evaluate_rule(
     rule: DatasetInvariantRule,
     trials: tuple[DatasetEvaluationTrial, ...],
     *,
+    observation_authority: ObservationAuthority,
     array_work_budget: _ArrayInvariantWorkBudget,
 ) -> DatasetInvariantRuleResult:
     return _evaluate_rule_from_outputs(
         rule,
-        tuple(trial.target_output for trial in trials),
+        _outputs_for_observation_authority(
+            tuple(trial.target_output for trial in trials),
+            observation_authority,
+        ),
         array_work_budget=array_work_budget,
     )
+
+
+def _outputs_for_observation_authority(
+    outputs: tuple[ObservedAgentOutput | None, ...],
+    observation_authority: ObservationAuthority,
+) -> tuple[ObservedAgentOutput | None, ...]:
+    if observation_authority == "agent_response":
+        return outputs
+    if observation_authority == "committed_state_snapshot":
+        return tuple(
+            None
+            if output is None or "committed_state_snapshot" not in output.metadata
+            else ObservedAgentOutput(raw_output=output.metadata["committed_state_snapshot"])
+            for output in outputs
+        )
+    raise ValueError("unsupported observation authority")
 
 
 def _evaluate_rule_from_outputs(

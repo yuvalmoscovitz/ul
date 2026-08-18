@@ -199,14 +199,16 @@ def _technical_details() -> dict[str, Any]:
     )
 
     def trial_set(arm: str, final_amount: int, corrected_amount: int) -> DatasetEvaluationTrialSet:
+        committed_state_snapshot = {
+            "final_amount": final_amount,
+            "corrected_amount": corrected_amount,
+        }
         trials = tuple(
             DatasetEvaluationTrial(
                 repetition=repetition,
                 target_output=ObservedAgentOutput(
-                    raw_output={
-                        "final_amount": final_amount,
-                        "corrected_amount": corrected_amount,
-                    }
+                    raw_output={"message": "completed"},
+                    metadata={"committed_state_snapshot": committed_state_snapshot},
                 ),
                 observed_frame=SemanticFrame(
                     interaction_id=f"quickstart-payment:{arm}:round-{repetition}",

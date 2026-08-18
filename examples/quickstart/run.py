@@ -33,14 +33,22 @@ def _create_private_file(path: Path) -> TextIO:
     return os.fdopen(descriptor, "w", encoding="utf-8")
 
 
-def _load_target_template(endpoint: str | None = None) -> dict[str, object]:
+def load_target_template(base_url: str | None = None) -> dict[str, object]:
     with _TARGET_TEMPLATE_PATH.open(encoding="utf-8") as target_template_file:
         untyped_target_config: object = json.load(target_template_file)
     if type(untyped_target_config) is not dict:
         raise ValueError("quickstart target configuration must be a JSON object")
     target_config = cast(dict[str, object], untyped_target_config)
-    if endpoint is not None:
-        target_config["url"] = endpoint
+    if base_url is not None:
+        endpoints = {
+            "reset": "reset",
+            "setup": "setup",
+            "execute_turn": "execute",
+            "snapshot": "snapshot",
+        }
+        for phase, endpoint in endpoints.items():
+            phase_config = cast(dict[str, object], target_config[phase])
+            phase_config["url"] = f"{base_url}/{endpoint}"
     return target_config
 
 
@@ -222,17 +230,17 @@ def main(
     server_thread: Thread | None = None
 
     try:
-        endpoint: str | None = None
+        base_url: str | None = None
         if not dry_run:
             server = create_server()
             server_host, server_port = cast(tuple[str, int], server.server_address)
-            endpoint = f"http://{server_host}:{server_port}/execute"
+            base_url = f"http://{server_host}:{server_port}"
             server_thread = Thread(
                 target=server.serve_forever,
                 name="quickstart-agent",
                 daemon=True,
             )
-        target_config = _load_target_template(endpoint)
+        target_config = load_target_template(base_url)
         with _create_private_file(target_config_path) as target_config_file:
             json.dump(target_config, target_config_file, indent=2)
             target_config_file.write("\n")
@@ -257,12 +265,11 @@ def main(
             "--repetitions",
             "3",
             "--max-target-calls",
-            "6",
+            "30",
             "--output",
             str(evidence_path),
             "--allow-target-network",
             "--confirm-isolated-sandbox",
-            "--confirm-fresh-state",
             "--allow-insecure-http",
         ]
         if dry_run:

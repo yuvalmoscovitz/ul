@@ -3,8 +3,8 @@
 This package is a complete but synthetic black-box evaluation:
 
 - `dataset.jsonl` contains one historical accounts-payable interaction.
-- `target.json` maps UL's input into a nested vendor-style request and extracts `/result` from
-  the nested response.
+- `target.json` maps UL's reset, setup, execution, and committed-state snapshot calls to the local
+  sandbox.
 - `invariants.json` declares that the committed invoice must match the requested invoice in the
   structured target result.
 - `defective_agent.py` is a resettable local HTTP sandbox with one seeded parsing defect.
@@ -17,8 +17,8 @@ an OpenAI-compatible provider as shown in the [main README](../../README.md):
 uv run python -m examples.quickstart.run
 ```
 
-The runner chooses a free localhost port and changes only the URL from the checked-in
-`target.json`. The checked-in mapping describes this exchange:
+The runner chooses a free localhost port and changes only the four lifecycle URLs from the
+checked-in `target.json`. The execution mapping describes this exchange:
 
 ```json
 {
@@ -62,10 +62,9 @@ uv run ul dataset evaluate examples/quickstart/dataset.jsonl \
   --operator surface.disfluency_repeat \
   --limit 1 \
   --repetitions 3 \
-  --max-target-calls 6 \
+  --max-target-calls 30 \
   --allow-target-network \
   --confirm-isolated-sandbox \
-  --confirm-fresh-state \
   --allow-insecure-http \
   --output tmp/quickstart-.../evidence.jsonl
 ```
@@ -114,9 +113,8 @@ uv run ul regression replay regressions/quickstart-wrong-invoice.json \
   --target-config PATH_TO_TARGET.json \
   --allow-target-network \
   --confirm-isolated-sandbox \
-  --confirm-fresh-state \
   --allow-insecure-http \
-  --max-target-calls 3 \
+  --max-target-calls 15 \
   --output tmp/quickstart-replay.json
 ```
 
@@ -142,10 +140,10 @@ case; it is not proof that the implementation is correct or that every related f
 The example is intentionally small and deterministic on the target side. With OpenRouter,
 variation generation, validation, and behavioral comparison explicitly request `x-ai/grok-4.6`;
 an OpenAI-compatible provider uses its configured models. Model behavior may still vary, so the
-finding is not guaranteed. The invariant result applies only to the configured fields in the
-target output that
-the example declares to be a committed-state snapshot. UL does not independently verify that
-authority declaration, and satisfying the rule does not establish overall correctness or safety.
+finding is not guaranteed. The invariant result applies only to configured fields returned by the
+sandbox's separate committed-state snapshot endpoint. UL validates the reset acknowledgement
+contract but cannot independently prove that the sandbox erased every state store. Satisfying the
+rule does not establish overall correctness or safety.
 The behavioral result is evidence for human review, not a causal proof or production-rate
 estimate. Do not point the command at a production system or any endpoint that can cause business
 side effects.

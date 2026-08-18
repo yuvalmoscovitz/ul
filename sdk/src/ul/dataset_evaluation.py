@@ -10,7 +10,11 @@ from decimal import Decimal, InvalidOperation
 from typing import Literal, Self
 
 from pydantic import ConfigDict, Field, JsonValue, model_validator
-from ul_core.contracts import DatasetTargetExecutor, SemanticDeconstructor
+from ul_core.contracts import (
+    DatasetTargetExecutor,
+    DatasetTargetLifecycleError,
+    SemanticDeconstructor,
+)
 from ul_core.dataset import InteractionRecord, ObservedAgentOutput, ObservedOutcome, SemanticFrame
 from ul_core.models import ULModel
 
@@ -51,11 +55,20 @@ class DatasetEvaluationFinding(_StrictULModel):
     grounded_field_names: tuple[str, ...] = ()
 
 
+class DatasetTargetLifecycleFailure(_StrictULModel):
+    protocol_version: Literal[2] = 2
+    failed_phase: str = Field(min_length=1)
+    completed_phases: tuple[str, ...] = ()
+    cleanup_reset_failed: bool
+    sandbox_state_may_remain: bool
+
+
 class DatasetEvaluationTrial(_StrictULModel):
     repetition: int = Field(ge=1)
     target_output: ObservedAgentOutput | None = None
     observed_frame: SemanticFrame | None = None
     inconclusive_reasons: tuple[str, ...] = ()
+    lifecycle_failure: DatasetTargetLifecycleFailure | None = None
 
     @model_validator(mode="after")
     def validate_execution_state(self) -> Self:
@@ -269,6 +282,7 @@ class DatasetEvaluationRunner:
         self._deconstructor = deconstructor
         self._target = target
         self._target_timeout_seconds = target_timeout_seconds
+        self._target_state_uncertain = False
 
     async def run(
         self,
@@ -436,6 +450,14 @@ class DatasetEvaluationRunner:
         source: InteractionRecord,
         subject: Literal["current baseline", "variation"],
     ) -> DatasetEvaluationTrial:
+        if self._target_state_uncertain:
+            return DatasetEvaluationTrial(
+                repetition=repetition,
+                inconclusive_reasons=(
+                    f"{subject} not executed because target state is uncertain; "
+                    "sandbox state may remain",
+                ),
+            )
         try:
             async with asyncio.timeout(self._target_timeout_seconds):
                 target_output = await self._target.execute(raw_input)
@@ -443,6 +465,27 @@ class DatasetEvaluationRunner:
             return DatasetEvaluationTrial(
                 repetition=repetition,
                 inconclusive_reasons=(f"{subject} execution timed out",),
+            )
+        except DatasetTargetLifecycleError as error:
+            sandbox_state_may_remain = error.target_state_uncertain
+            if sandbox_state_may_remain:
+                self._target_state_uncertain = True
+            cleanup_reason = (
+                "; cleanup reset also failed; sandbox state may remain"
+                if error.cleanup_reset_failed and error.failed_phase != "cleanup_reset"
+                else ("; sandbox state may remain" if sandbox_state_may_remain else "")
+            )
+            return DatasetEvaluationTrial(
+                repetition=repetition,
+                inconclusive_reasons=(
+                    f"{subject} lifecycle failed during {error.failed_phase}{cleanup_reason}",
+                ),
+                lifecycle_failure=DatasetTargetLifecycleFailure(
+                    failed_phase=error.failed_phase,
+                    completed_phases=error.completed_phases,
+                    cleanup_reset_failed=error.cleanup_reset_failed,
+                    sandbox_state_may_remain=sandbox_state_may_remain,
+                ),
             )
         except RuntimeError:
             return DatasetEvaluationTrial(

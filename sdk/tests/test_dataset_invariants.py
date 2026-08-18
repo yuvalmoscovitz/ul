@@ -153,6 +153,13 @@ def test_suite_is_strict_bounded_unique_and_content_addressed(tmp_path: Path) ->
             observation_authority="agent_response",
             rules=tuple(_rule(id=f"rule-{index}") for index in range(101)),
         )
+    with pytest.raises(ValidationError, match="observation_authority"):
+        DatasetInvariantSuite.model_validate(
+            {
+                **payload,
+                "observation_authority": "tool_result",
+            }
+        )
 
 
 @pytest.mark.parametrize(
@@ -319,6 +326,98 @@ def test_literal_rule_does_not_silently_accept_missing_or_unsupported_values() -
         "value_non_integer_number_not_supported",
     ]
     assert all(result.status == "not_evaluable" for result in results)
+
+
+def test_committed_state_authority_uses_snapshot_not_execute_response() -> None:
+    rule = JsonValueEqualsLiteralInvariant(
+        type="json_value_equals_literal",
+        id="amount-is-committed",
+        version="1.0.0",
+        description="The committed amount must be 150.",
+        severity="high",
+        value_pointer="/amount",
+        literal=150,
+    )
+    output = ObservedAgentOutput(
+        raw_output={"amount": 100},
+        metadata={"committed_state_snapshot": {"amount": 150}},
+    )
+
+    agent_response_result = evaluate_dataset_invariant_rules(
+        (rule,),
+        (output,),
+        observation_authority="agent_response",
+    )[0]
+    committed_state_result = evaluate_dataset_invariant_rules(
+        (rule,),
+        (output,),
+        observation_authority="committed_state_snapshot",
+    )[0]
+
+    assert agent_response_result.status == "violated"
+    assert committed_state_result.status == "satisfied"
+
+
+def test_committed_state_authority_does_not_fall_back_to_execute_response() -> None:
+    rule = JsonValueEqualsLiteralInvariant(
+        type="json_value_equals_literal",
+        id="amount-is-committed",
+        version="1.0.0",
+        description="The committed amount must be 150.",
+        severity="high",
+        value_pointer="/amount",
+        literal=150,
+    )
+
+    result = evaluate_dataset_invariant_rules(
+        (rule,),
+        (ObservedAgentOutput(raw_output={"amount": 150}),),
+        observation_authority="committed_state_snapshot",
+    )[0]
+
+    assert result.status == "not_evaluable"
+    assert result.trials[0].reason_code == "target_output_missing"
+
+
+def test_public_evaluation_requires_a_committed_state_snapshot() -> None:
+    suite = _suite().model_copy(update={"observation_authority": "committed_state_snapshot"})
+
+    result = evaluate_dataset_invariants(
+        _evaluation_result([_output("AC-100", "AC-100")]),
+        suite,
+    )
+
+    assert result.baseline.rules[0].status == "not_evaluable"
+
+
+def test_public_rule_evaluation_rejects_unknown_observation_authority() -> None:
+    with pytest.raises(ValueError, match="unsupported observation authority"):
+        evaluate_dataset_invariant_rules(
+            (_rule(),),
+            (_observed(_output("AC-100", "AC-100")),),
+            observation_authority=cast(
+                dataset_invariants.ObservationAuthority,
+                "tool_result",
+            ),
+        )
+
+
+def test_evaluation_rejects_invalid_constructed_suite_authority() -> None:
+    invalid_suite = DatasetInvariantSuite.model_construct(
+        schema_version="1.0.0",
+        observation_source="target_output",
+        observation_authority=cast(
+            dataset_invariants.ObservationAuthority,
+            "tool_result",
+        ),
+        rules=(_rule(),),
+    )
+
+    with pytest.raises(ValueError, match="unsupported observation authority"):
+        evaluate_dataset_invariants(
+            _evaluation_result([_output("AC-100", "AC-100")]),
+            invalid_suite,
+        )
 
 
 def test_allowed_set_is_strict_ordered_and_rejects_duplicate_configuration() -> None:

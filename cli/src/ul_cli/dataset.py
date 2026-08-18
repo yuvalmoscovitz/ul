@@ -4,7 +4,6 @@ import asyncio
 import hashlib
 import json
 import os
-import re
 import stat
 import sys
 import unicodedata
@@ -24,6 +23,7 @@ from ul import (
     DatasetEvaluationRunner,
     DatasetEvaluationTrialSet,
     DatasetSemanticSettings,
+    DatasetTargetLifecycleFailure,
     InteractionRecord,
     builtin_dataset_augmentation_operators,
     create_semantic_model_deconstructor,
@@ -42,6 +42,8 @@ from ul.dataset_invariants import (
 from ul.http_target import (
     JsonHttpDatasetTarget,
     JsonHttpDatasetTargetConfig,
+    json_http_target_calls_per_execution,
+    json_http_target_config_urls,
     load_json_http_dataset_target_config,
     validate_json_http_dataset_target_configuration,
 )
@@ -74,8 +76,6 @@ _MAXIMUM_DATASET_BYTES = 10_000_000
 _MAXIMUM_DATASET_RECORDS = 100
 _MAXIMUM_EVIDENCE_BYTES = 128_000_000
 _DEFAULT_MAXIMUM_TARGET_CALLS = 100
-_HEADER_NAME_PATTERN = re.compile(r"[!#$%&'*+.^_`|~0-9A-Za-z-]+")
-_ENVIRONMENT_NAME_PATTERN = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 _DATASET_OPERATORS = builtin_dataset_augmentation_operators()
 _DATASET_OPERATOR_IDS = tuple(operator.id for operator in _DATASET_OPERATORS)
 _DATASET_OPERATORS_BY_ID = {operator.id: operator for operator in _DATASET_OPERATORS}
@@ -124,12 +124,33 @@ def initialize_dataset_target(
     JSON Pointer such as /choices/0/message/content selects the observable result.
     """
     try:
-        config = JsonHttpDatasetTargetConfig(
-            version=1,
-            url=url,
-            headers_from_env={},
-            request_json_template={"input": "{{input}}"},
-            response_json_pointer="",
+        base_url = url.rstrip("/")
+        config = JsonHttpDatasetTargetConfig.model_validate(
+            {
+                "version": 2,
+                "headers_from_env": {},
+                "reset": {
+                    "url": f"{base_url}/reset",
+                    "request_json": {},
+                    "generation_json_pointer": "/generation",
+                    "clean_state_json_pointer": "/clean",
+                    "clean_state_value": True,
+                },
+                "setup": {
+                    "url": f"{base_url}/setup",
+                    "request_json": {"fixture": "default"},
+                },
+                "execute_turn": {
+                    "url": f"{base_url}/execute",
+                    "request_json_template": {"input": "{{input}}"},
+                    "response_json_pointer": "/response",
+                },
+                "snapshot": {
+                    "url": f"{base_url}/snapshot",
+                    "request_json": {},
+                    "response_json_pointer": "/state",
+                },
+            }
         )
         output_stream = _create_private_output(target_config)
     except (OSError, ValidationError, ValueError) as error:
@@ -149,13 +170,14 @@ def initialize_dataset_target(
 
     console.print(f"Created private target config: {target_config}")
     console.print(
-        "Next: adjust request_json_template and response_json_pointer, add any "
+        "Next: adjust the lifecycle request bodies and response pointers, add any "
         "headers_from_env, then run 'ul dataset evaluate DATASET --target-config "
         f"{target_config} --dry-run'."
     )
     console.print(
-        "Keep exactly one complete {{input}} value. headers_from_env maps HTTP header names "
-        "to environment-variable names; secret values stay outside this file."
+        "Setup uses one static fixture for the target config. Keep exactly one complete "
+        "{{input}} value in execute_turn. headers_from_env maps HTTP header names to "
+        "environment-variable names; secret values stay outside this file."
     )
 
 
@@ -182,12 +204,6 @@ def evaluate_dataset(
             help='JSONL containing one {"id": ..., "input": ..., "output": ...} object per line.',
         ),
     ],
-    target_url: Annotated[
-        str | None,
-        typer.Option(
-            help="Simple sandbox endpoint: POST one JSON string field and return non-null JSON."
-        ),
-    ] = None,
     target_config: Annotated[
         Path | None,
         typer.Option(
@@ -235,17 +251,6 @@ def evaluate_dataset(
             help="Maximum target requests authorized for this evaluation.",
         ),
     ] = _DEFAULT_MAXIMUM_TARGET_CALLS,
-    request_field: Annotated[
-        str | None,
-        typer.Option(help="JSON request field that receives the augmented input."),
-    ] = None,
-    header_env: Annotated[
-        list[str] | None,
-        typer.Option(
-            "--header-env",
-            help="HTTP header and environment variable as HEADER=ENV. Repeat as needed.",
-        ),
-    ] = None,
     allow_target_network: Annotated[
         bool,
         typer.Option(help="Allow requests to the configured sandbox endpoint."),
@@ -253,10 +258,6 @@ def evaluate_dataset(
     confirm_isolated_sandbox: Annotated[
         bool,
         typer.Option(help="Confirm the target cannot cause real business effects."),
-    ] = False,
-    confirm_fresh_state: Annotated[
-        bool,
-        typer.Option(help="Confirm every target request starts from the same clean state."),
     ] = False,
     allow_insecure_http: Annotated[
         bool,
@@ -286,8 +287,10 @@ def evaluate_dataset(
     higher-precedence controls. OpenRouter remains the default; set
     UL_DATASET_SEMANTIC_PROVIDER=openai-compatible for a customer-controlled endpoint.
 
-    Example: ul dataset evaluate interactions.jsonl --target-url https://sandbox/run
-    --allow-target-network --confirm-isolated-sandbox --confirm-fresh-state
+    Target configurations run an explicit reset/setup/execute/snapshot lifecycle.
+
+    Example: ul dataset evaluate interactions.jsonl --target-config target.json
+    --allow-target-network --confirm-isolated-sandbox
     --output results.jsonl
     """
     if resume is not None:
@@ -301,32 +304,15 @@ def evaluate_dataset(
     try:
         records = _load_interaction_records(data)
         selected_operators = _validate_operator_ids(operator)
-        _validate_target_mode_options(
-            target_url=target_url,
-            target_config=target_config,
-            request_field=request_field,
-            header_env=header_env,
-        )
-        header_environment_variables = _parse_header_environment_variables(header_env)
         invariant_suite = (
             load_dataset_invariant_suite(invariants) if invariants is not None else None
         )
         selected_records = records[:limit]
-        if resume is None:
-            initial_target_calls = (
-                len(selected_records) * repetitions * (1 + len(selected_operators))
-            )
-            if initial_target_calls > max_target_calls:
-                raise typer.BadParameter(
-                    f"selection would make up to {initial_target_calls} target calls, exceeding "
-                    f"--max-target-calls {max_target_calls}; reduce --limit, --operator, or "
-                    "--repetitions, or explicitly raise the call budget"
-                )
         if not dry_run and resume is None:
-            if target_url is None and target_config is None:
+            if target_config is None:
                 raise typer.BadParameter(
-                    "execution requires --target-url or --target-config",
-                    param_hint="--target-url",
+                    "execution requires --target-config",
+                    param_hint="--target-config",
                 )
             if not allow_target_network:
                 raise typer.BadParameter(
@@ -338,11 +324,38 @@ def evaluate_dataset(
                     "execution requires --confirm-isolated-sandbox",
                     param_hint="--confirm-isolated-sandbox",
                 )
-            if not confirm_fresh_state:
-                raise typer.BadParameter(
-                    "execution requires --confirm-fresh-state",
-                    param_hint="--confirm-fresh-state",
-                )
+        loaded_target_config = (
+            load_json_http_dataset_target_config(target_config)
+            if target_config is not None
+            else None
+        )
+        if loaded_target_config is not None:
+            validate_json_http_dataset_target_configuration(
+                loaded_target_config,
+                sandbox_confirmed=confirm_isolated_sandbox or dry_run or resume is not None,
+                allow_insecure_http=allow_insecure_http,
+            )
+        normalized_target_config = loaded_target_config
+        if resume is not None and normalized_target_config is None:
+            raise ValueError("--resume requires --target-config")
+        target_calls_per_execution = (
+            json_http_target_calls_per_execution(normalized_target_config)
+            if normalized_target_config is not None
+            else 1
+        )
+        initial_target_calls = (
+            len(selected_records)
+            * repetitions
+            * (1 + len(selected_operators))
+            * target_calls_per_execution
+        )
+        if resume is None and initial_target_calls > max_target_calls:
+            raise ValueError(
+                f"selection would make up to {initial_target_calls} target calls, exceeding "
+                f"--max-target-calls {max_target_calls}; reduce --limit, --operator, or "
+                "--repetitions, or explicitly raise the call budget"
+            )
+        if not dry_run and resume is None:
             if output is None:
                 raise typer.BadParameter("execution requires --output", param_hint="--output")
             if output.exists():
@@ -352,38 +365,6 @@ def evaluate_dataset(
                 )
         settings = load_dataset_semantic_settings()
         _validate_model_input_bounds(selected_records, settings.max_input_chars)
-        loaded_target_config = (
-            load_json_http_dataset_target_config(target_config)
-            if target_config is not None
-            else None
-        )
-        if target_url is not None:
-            validate_json_http_dataset_target_configuration(
-                target_url,
-                sandbox_confirmed=confirm_isolated_sandbox or dry_run or resume is not None,
-                fresh_state_confirmed=confirm_fresh_state or dry_run or resume is not None,
-                request_field=request_field or "input",
-                header_environment_variables=header_environment_variables,
-                allow_insecure_http=allow_insecure_http,
-            )
-        if loaded_target_config is not None:
-            validate_json_http_dataset_target_configuration(
-                loaded_target_config.url,
-                sandbox_confirmed=confirm_isolated_sandbox or dry_run or resume is not None,
-                fresh_state_confirmed=confirm_fresh_state or dry_run or resume is not None,
-                header_environment_variables=loaded_target_config.headers_from_env,
-                request_json_template=loaded_target_config.request_json_template,
-                response_json_pointer=loaded_target_config.response_json_pointer,
-                allow_insecure_http=allow_insecure_http,
-            )
-        normalized_target_config = _normalized_target_config(
-            target_url=target_url,
-            loaded_target_config=loaded_target_config,
-            request_field=request_field,
-            header_environment_variables=header_environment_variables,
-        )
-        if resume is not None and normalized_target_config is None:
-            raise ValueError("--resume requires --target-url or --target-config")
         run_context = (
             _dataset_evidence_run_context(
                 selected_records=selected_records,
@@ -422,7 +403,12 @@ def evaluate_dataset(
         )
         skipped_count = len(resume_evidence.processed_ids)
 
-    potential_target_calls = len(selected_records) * repetitions * (1 + len(selected_operators))
+    potential_target_calls = (
+        len(selected_records)
+        * repetitions
+        * (1 + len(selected_operators))
+        * target_calls_per_execution
+    )
     if potential_target_calls > max_target_calls:
         raise typer.BadParameter(
             f"remaining selection would make up to {potential_target_calls} target calls, "
@@ -436,17 +422,18 @@ def evaluate_dataset(
             selected_count=len(selected_records),
             skipped_count=skipped_count,
             operator_ids=selected_operators,
-            target_configured=target_url is not None or target_config is not None,
+            target_configured=target_config is not None,
             target_endpoint=(
-                loaded_target_config.url if loaded_target_config is not None else target_url
+                json_http_target_config_urls(loaded_target_config)[0]
+                if loaded_target_config is not None
+                else None
             ),
             target_header_environment_variables=(
-                loaded_target_config.headers_from_env
-                if loaded_target_config is not None
-                else header_environment_variables
+                loaded_target_config.headers_from_env if loaded_target_config is not None else {}
             ),
             repetitions=repetitions,
             max_target_calls=max_target_calls,
+            target_calls_per_execution=target_calls_per_execution,
             invariant_suite=invariant_suite,
             output=output,
             semantic_provider_id=settings.semantic_provider_id,
@@ -468,10 +455,10 @@ def evaluate_dataset(
             raise typer.Exit(code=1)
         raise typer.Exit(code=0)
 
-    if target_url is None and target_config is None:
+    if target_config is None:
         raise typer.BadParameter(
-            "execution requires --target-url or --target-config",
-            param_hint="--target-url",
+            "execution requires --target-config",
+            param_hint="--target-config",
         )
     if not allow_target_network:
         raise typer.BadParameter(
@@ -483,11 +470,6 @@ def evaluate_dataset(
             "execution requires --confirm-isolated-sandbox",
             param_hint="--confirm-isolated-sandbox",
         )
-    if not confirm_fresh_state:
-        raise typer.BadParameter(
-            "execution requires --confirm-fresh-state",
-            param_hint="--confirm-fresh-state",
-        )
     if output is None:
         raise typer.BadParameter("execution requires --output", param_hint="--output")
     if output.exists() and resume is None:
@@ -496,7 +478,7 @@ def evaluate_dataset(
             param_hint="--output",
         )
 
-    assert target_url is not None or loaded_target_config is not None
+    assert loaded_target_config is not None
     assert run_context is not None
     if not settings.live_calls:
         raise typer.BadParameter(
@@ -515,25 +497,14 @@ def evaluate_dataset(
         )
 
     try:
-        if loaded_target_config is not None:
-            target = JsonHttpDatasetTarget.from_config(
-                loaded_target_config,
-                sandbox_confirmed=True,
-                fresh_state_confirmed=True,
-                allow_insecure_http=allow_insecure_http,
-            )
-        else:
-            assert target_url is not None
-            target = JsonHttpDatasetTarget(
-                target_url,
-                sandbox_confirmed=True,
-                fresh_state_confirmed=True,
-                request_field=request_field or "input",
-                header_environment_variables=header_environment_variables,
-                allow_insecure_http=allow_insecure_http,
-            )
+        target = JsonHttpDatasetTarget.from_config(
+            loaded_target_config,
+            sandbox_confirmed=True,
+            allow_insecure_http=allow_insecure_http,
+            max_target_calls=max_target_calls,
+        )
     except ValueError as error:
-        raise typer.BadParameter(str(error), param_hint="--target-url") from None
+        raise typer.BadParameter(str(error), param_hint="--target-config") from None
 
     try:
         if resume is None:
@@ -574,6 +545,7 @@ def evaluate_dataset(
                         (len(selected_records) + skipped_count)
                         * repetitions
                         * (1 + len(selected_operators))
+                        * target_calls_per_execution
                     ),
                     run_context=run_context,
                     invariant_suite=invariant_suite,
@@ -592,6 +564,7 @@ def evaluate_dataset(
                         (len(selected_records) + skipped_count)
                         * repetitions
                         * (1 + len(selected_operators))
+                        * target_calls_per_execution
                     ),
                     run_context=run_context,
                 )
@@ -753,69 +726,6 @@ def _validate_operator_ids(operator_ids: list[str] | None) -> tuple[str, ...]:
     return selected_ids
 
 
-def _parse_header_environment_variables(
-    header_options: list[str] | None,
-) -> dict[str, str]:
-    parsed_headers: dict[str, str] = {}
-    normalized_names: set[str] = set()
-    for option in header_options or []:
-        header_name, separator, environment_name = option.partition("=")
-        if (
-            separator != "="
-            or _HEADER_NAME_PATTERN.fullmatch(header_name) is None
-            or _ENVIRONMENT_NAME_PATTERN.fullmatch(environment_name) is None
-        ):
-            raise _DatasetInputError("--header-env must use valid HEADER=ENV names")
-        normalized_name = header_name.casefold()
-        if normalized_name in normalized_names:
-            raise _DatasetInputError(f"duplicate header name: {header_name}")
-        normalized_names.add(normalized_name)
-        parsed_headers[header_name] = environment_name
-    return parsed_headers
-
-
-def _validate_target_mode_options(
-    *,
-    target_url: str | None,
-    target_config: Path | None,
-    request_field: str | None,
-    header_env: list[str] | None,
-) -> None:
-    if target_config is None:
-        return
-    conflicting_options: list[str] = []
-    if target_url is not None:
-        conflicting_options.append("--target-url")
-    if request_field is not None:
-        conflicting_options.append("--request-field")
-    if header_env:
-        conflicting_options.append("--header-env")
-    if conflicting_options:
-        raise _DatasetInputError(
-            f"--target-config cannot be combined with {', '.join(conflicting_options)}"
-        )
-
-
-def _normalized_target_config(
-    *,
-    target_url: str | None,
-    loaded_target_config: JsonHttpDatasetTargetConfig | None,
-    request_field: str | None,
-    header_environment_variables: dict[str, str],
-) -> JsonHttpDatasetTargetConfig | None:
-    if loaded_target_config is not None:
-        return loaded_target_config
-    if target_url is None:
-        return None
-    return JsonHttpDatasetTargetConfig(
-        version=1,
-        url=target_url,
-        headers_from_env=header_environment_variables,
-        request_json_template={(request_field or "input"): "{{input}}"},
-        response_json_pointer="",
-    )
-
-
 def _dataset_evidence_run_context(
     *,
     selected_records: tuple[InteractionRecord, ...],
@@ -860,12 +770,15 @@ def _print_dataset_plan(
     target_header_environment_variables: dict[str, str],
     repetitions: int,
     max_target_calls: int,
+    target_calls_per_execution: int,
     invariant_suite: DatasetInvariantSuite | None,
     output: Path | None,
     semantic_provider_id: str,
     semantic_endpoint_sha256: str,
 ) -> None:
-    potential_target_calls = selected_count * repetitions * (1 + len(operator_ids))
+    potential_target_calls = (
+        selected_count * repetitions * (1 + len(operator_ids)) * target_calls_per_execution
+    )
     potential_model_calls = selected_count * (
         1 + 3 * len(operator_ids) + repetitions * (1 + len(operator_ids))
     )
@@ -895,6 +808,11 @@ def _print_dataset_plan(
         f"Potential target calls: up to {potential_target_calls} "
         f"(authorized maximum: {max_target_calls})"
     )
+    if target_calls_per_execution > 1:
+        console.print(
+            f"Lifecycle calls per execution: {target_calls_per_execution} "
+            "(reset, optional setup, execute_turn, snapshot, cleanup reset)"
+        )
     console.print(f"Target: {'configured' if target_configured else 'not configured'}")
     if output is not None:
         console.print(f"Evidence destination: {output}")
@@ -915,8 +833,8 @@ def _print_dataset_plan(
         "live control responses, and variation responses on execution."
     )
     console.print(
-        "Every target request must start from the same clean state. The target receives each "
-        "selected original input and each accepted variation for every repetition."
+        "Every execution invokes and validates the configured reset contract. Optional setup "
+        "uses one static fixture from the target config for the entire run."
     )
     console.print(
         "Target requests and semantic model calls may be billed separately. Repetitions only "
@@ -1347,6 +1265,7 @@ def _customer_trial_set(trial_set: DatasetEvaluationTrialSet | None) -> JsonValu
             "repetition": trial.repetition,
             "status": "inconclusive" if trial.inconclusive_reasons else "observed",
             "inconclusive_reasons": list(trial.inconclusive_reasons),
+            "lifecycle_failure": _customer_lifecycle_failure(trial),
         }
         for trial in trial_set.trials
     ]
@@ -1372,6 +1291,13 @@ def _customer_trial_set(trial_set: DatasetEvaluationTrialSet | None) -> JsonValu
             "trials": trials,
         },
     )
+
+
+def _customer_lifecycle_failure(trial: object) -> JsonValue:
+    lifecycle_failure = getattr(trial, "lifecycle_failure", None)
+    if lifecycle_failure is None:
+        return None
+    return cast(DatasetTargetLifecycleFailure, lifecycle_failure).model_dump(mode="json")
 
 
 def _customer_findings(

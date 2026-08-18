@@ -44,6 +44,7 @@ from ul.dataset_evaluation import (
     DatasetEvaluationRunner,
     DatasetEvaluationTrial,
     DatasetEvaluationTrialSet,
+    DatasetTargetLifecycleFailure,
 )
 from ul.dataset_invariants import (
     DatasetInvariantArmEvaluation,
@@ -93,6 +94,9 @@ from ul.deconstruction import (
 from ul.http_target import (
     JsonHttpDatasetTarget,
     JsonHttpDatasetTargetConfig,
+    JsonHttpLifecycleCallConfig,
+    JsonHttpLifecycleExecuteTurnConfig,
+    JsonHttpLifecycleObservationConfig,
     load_json_http_dataset_target_config,
 )
 from ul.otlp_ingest import OtlpIngestResult, OtlpInteractionRecord, parse_otlp_traces
@@ -136,6 +140,7 @@ __all__ = [
     "DatasetRegressionVariation",
     "DatasetSemanticSettings",
     "DatasetTargetExecutor",
+    "DatasetTargetLifecycleFailure",
     "ExecutionMode",
     "ExecutionResult",
     "ExecutionStatus",
@@ -144,6 +149,9 @@ __all__ = [
     "JsonArrayItemsUniqueByInvariant",
     "JsonHttpDatasetTarget",
     "JsonHttpDatasetTargetConfig",
+    "JsonHttpLifecycleCallConfig",
+    "JsonHttpLifecycleExecuteTurnConfig",
+    "JsonHttpLifecycleObservationConfig",
     "JsonValueEqualsLiteralInvariant",
     "JsonValueInAllowedSetInvariant",
     "JsonValuesEqualInvariant",

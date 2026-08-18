@@ -17,6 +17,7 @@ import httpx
 import pytest
 import typer
 from ul.dataset_invariants import JsonValuesEqualInvariant, load_dataset_invariant_suite
+from ul.http_target import JsonHttpDatasetTarget, JsonHttpDatasetTargetConfig
 
 from examples.quickstart import run as quickstart
 from examples.quickstart.defective_agent import create_server
@@ -111,6 +112,33 @@ def test_server_starts_every_request_from_identical_fresh_state() -> None:
     assert wrong_invoice_responses[0] == wrong_invoice_responses[1] == wrong_invoice_responses[2]
 
 
+@pytest.mark.asyncio
+async def test_stateful_target_adapter_resets_executes_and_snapshots() -> None:
+    with _running_server() as (base_url, _server):
+        config = JsonHttpDatasetTargetConfig.model_validate(
+            quickstart.load_target_template(base_url)
+        )
+        async with JsonHttpDatasetTarget.from_config(
+            config,
+            sandbox_confirmed=True,
+            allow_insecure_http=True,
+            max_target_calls=5,
+        ) as target:
+            output = await target.execute("Pay AC-100.")
+
+    raw_output = cast(dict[str, object], output.raw_output)
+    lifecycle_calls = cast(list[dict[str, object]], output.metadata["lifecycle_calls"])
+    assert raw_output["invoice_reference"] == "AC-100"
+    assert output.metadata["committed_state_snapshot"] == raw_output
+    assert [call["phase"] for call in lifecycle_calls] == [
+        "reset",
+        "setup",
+        "execute_turn",
+        "snapshot",
+        "cleanup_reset",
+    ]
+
+
 @pytest.mark.parametrize(
     ("body", "content_type", "path"),
     [
@@ -169,11 +197,13 @@ def test_quickstart_target_contains_no_authentication_mapping() -> None:
     target = json.loads((_QUICKSTART_DIRECTORY / "target.json").read_text(encoding="utf-8"))
 
     assert target["headers_from_env"] == {}
-    assert target["request_json_template"] == {
+    assert target["version"] == 2
+    assert target["execute_turn"]["request_json_template"] == {
         "request": {"message": "{{input}}"},
         "settings": {"mode": "sandbox"},
     }
-    assert target["response_json_pointer"] == "/result"
+    assert target["execute_turn"]["response_json_pointer"] == "/result"
+    assert target["snapshot"]["response_json_pointer"] == "/state"
 
 
 def test_quickstart_invariant_uses_declared_committed_state_fields() -> None:
@@ -327,7 +357,7 @@ def test_runner_uses_safe_argv_minimal_environment_private_artifacts_and_cleans_
         target = json.loads(target_config_path.read_text(encoding="utf-8"))
         assert "test-only-secret" not in json.dumps(target)
         assert "test-only-secret" not in command
-        observed_endpoint = target["url"]
+        observed_endpoint = target["execute_turn"]["url"]
         assert _actions(_post(observed_endpoint.rsplit("/", 1)[0], _VALID_REQUEST))
         descriptor = os.open(evidence_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         with os.fdopen(descriptor, "w", encoding="utf-8") as evidence_file:

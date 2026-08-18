@@ -179,15 +179,29 @@ def _run_context(
         selected_operator_ids=("surface.rephrase",),
         repetitions=1,
         invariant_suite=cast(Any, invariant_suite),
-        target_config=JsonHttpDatasetTargetConfig(
-            version=1,
-            url="https://sandbox.example.test/execute",
-            headers_from_env={},
-            request_json_template={"input": "{{input}}"},
-            response_json_pointer="",
+        target_config=JsonHttpDatasetTargetConfig.model_validate(
+            {
+                "version": 2,
+                "reset": {
+                    "url": "https://sandbox.example.test/reset",
+                    "generation_json_pointer": "/generation",
+                    "clean_state_json_pointer": "/clean",
+                    "clean_state_value": True,
+                },
+                "execute_turn": {
+                    "url": "https://sandbox.example.test/execute",
+                    "request_json_template": {"input": "{{input}}"},
+                },
+                "snapshot": {"url": "https://sandbox.example.test/snapshot"},
+            }
         ),
         settings=cast(Any, _settings()),
     )
+
+
+def test_run_context_uses_current_pipeline() -> None:
+    record = _evaluation_result("interaction-1").source
+    assert _run_context((record,)).pipeline_version == "1.1.0"
 
 
 def _write_target_config(
@@ -198,16 +212,57 @@ def _write_target_config(
     request_json_template: object | None = None,
     response_json_pointer: str = "",
 ) -> None:
+    base_url = url.removesuffix("/execute")
     path.write_text(
         json.dumps(
             {
-                "version": 1,
-                "url": url,
+                "version": 2,
                 "headers_from_env": headers_from_env or {},
-                "request_json_template": request_json_template
-                if request_json_template is not None
-                else {"input": "{{input}}"},
-                "response_json_pointer": response_json_pointer,
+                "reset": {
+                    "url": f"{base_url}/reset",
+                    "generation_json_pointer": "/generation",
+                    "clean_state_json_pointer": "/clean",
+                    "clean_state_value": True,
+                },
+                "execute_turn": {
+                    "url": url,
+                    "request_json_template": request_json_template
+                    if request_json_template is not None
+                    else {"input": "{{input}}"},
+                    "response_json_pointer": response_json_pointer,
+                },
+                "snapshot": {"url": f"{base_url}/snapshot"},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
+def _write_stateful_target_config(path: Path) -> None:
+    path.write_text(
+        json.dumps(
+            {
+                "version": 2,
+                "headers_from_env": {},
+                "reset": {
+                    "url": "https://sandbox.example.test/reset",
+                    "generation_json_pointer": "/generation",
+                    "clean_state_json_pointer": "/clean",
+                    "clean_state_value": True,
+                },
+                "setup": {
+                    "url": "https://sandbox.example.test/setup",
+                    "request_json": {"seed": "standard"},
+                },
+                "execute_turn": {
+                    "url": "https://sandbox.example.test/execute",
+                    "request_json_template": {"input": "{{input}}"},
+                    "response_json_pointer": "/response",
+                },
+                "snapshot": {
+                    "url": "https://sandbox.example.test/snapshot",
+                    "response_json_pointer": "/state",
+                },
             }
         ),
         encoding="utf-8",
@@ -313,21 +368,38 @@ def test_init_creates_private_strict_starter_config(tmp_path: Path) -> None:
             "init",
             str(target_config),
             "--url",
-            "https://sandbox.example.test/execute",
+            "https://sandbox.example.test",
         ],
     )
 
     assert result.exit_code == 0, result.output
     assert json.loads(target_config.read_text(encoding="utf-8")) == {
-        "version": 1,
-        "url": "https://sandbox.example.test/execute",
+        "version": 2,
         "headers_from_env": {},
-        "request_json_template": {"input": "{{input}}"},
-        "response_json_pointer": "",
+        "reset": {
+            "url": "https://sandbox.example.test/reset",
+            "request_json": {},
+            "generation_json_pointer": "/generation",
+            "clean_state_json_pointer": "/clean",
+            "clean_state_value": True,
+        },
+        "setup": {
+            "url": "https://sandbox.example.test/setup",
+            "request_json": {"fixture": "default"},
+        },
+        "execute_turn": {
+            "url": "https://sandbox.example.test/execute",
+            "request_json_template": {"input": "{{input}}"},
+            "response_json_pointer": "/response",
+        },
+        "snapshot": {
+            "url": "https://sandbox.example.test/snapshot",
+            "request_json": {},
+            "response_json_pointer": "/state",
+        },
     }
     assert stat.S_IMODE(target_config.stat().st_mode) == 0o600
-    assert "request_json_template" in result.output
-    assert "response_json_pointer" in result.output
+    assert "lifecycle request bodies and response pointers" in result.output
     assert "headers_from_env" in result.output
     assert "--dry-run" in result.output
 
@@ -400,7 +472,9 @@ def test_dry_run_validates_and_makes_no_external_calls(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     dataset = tmp_path / "interactions.jsonl"
+    target_config = tmp_path / "target.json"
     _write_dataset(dataset, [_record(), _record("interaction-2")])
+    _write_target_config(target_config)
 
     def unexpected_deconstructor(*args: object, **kwargs: object) -> None:
         raise AssertionError("dry-run constructed a semantic model client")
@@ -420,8 +494,8 @@ def test_dry_run_validates_and_makes_no_external_calls(
             "surface.disfluency_repeat",
             "--limit",
             "1",
-            "--target-url",
-            "https://sandbox.example.test/execute",
+            "--target-config",
+            str(target_config),
             "--dry-run",
         ],
     )
@@ -431,13 +505,12 @@ def test_dry_run_validates_and_makes_no_external_calls(
     assert "Selected interactions: 1" in result.output
     assert "Repetitions: 3 per original and accepted variation" in result.output
     assert "Potential semantic model calls: up to 10" in result.output
-    assert "Potential target calls: up to 6" in result.output
+    assert "Potential target calls: up to 24" in result.output
     assert "authorized maximum: 100" in result.output
     assert "Semantic models receive historical inputs and outputs" in result.output
     assert "generated variations" in result.output
     assert "live control responses" in result.output
-    assert "Every target request must start from the same clean state" in result.output
-    assert "each accepted variation for every repetition" in " ".join(result.output.split())
+    assert "Every execution invokes and validates the configured reset contract" in result.output
     assert "do not determine correctness" in result.output
     assert "identify causality" in result.output
     assert "estimate a production failure rate" in result.output
@@ -507,10 +580,13 @@ def test_openai_compatible_execution_allows_an_unauthenticated_endpoint(
     monkeypatch.setenv("UL_DATASET_MODEL", "customer/model")
     monkeypatch.setenv("UL_LIVE", "true")
     monkeypatch.delenv("UL_DATASET_OPENAI_API_KEY", raising=False)
+    target_config = tmp_path / "target.json"
+    _write_target_config(target_config)
 
     class FakeTarget:
-        def __init__(self, *args: object, **kwargs: object) -> None:
-            pass
+        @classmethod
+        def from_config(cls, *args: object, **kwargs: object) -> FakeTarget:
+            return cls()
 
     async def fake_evaluate(*args: object, **kwargs: object) -> tuple[object, ...]:
         return ()
@@ -524,11 +600,10 @@ def test_openai_compatible_execution_allows_an_unauthenticated_endpoint(
             "dataset",
             "evaluate",
             str(dataset),
-            "--target-url",
-            "https://sandbox.example.test/execute",
+            "--target-config",
+            str(target_config),
             "--allow-target-network",
             "--confirm-isolated-sandbox",
-            "--confirm-fresh-state",
             "--output",
             str(output),
         ],
@@ -536,6 +611,40 @@ def test_openai_compatible_execution_allows_an_unauthenticated_endpoint(
 
     assert result.exit_code == 0, result.output
     assert output.exists()
+
+
+def test_stateful_target_dry_run_counts_physical_lifecycle_calls(
+    tmp_path: Path,
+) -> None:
+    dataset = tmp_path / "interactions.jsonl"
+    target_config = tmp_path / "target.json"
+    _write_dataset(dataset, [_record()])
+    _write_stateful_target_config(target_config)
+
+    result = runner.invoke(
+        root_app,
+        [
+            "dataset",
+            "evaluate",
+            str(dataset),
+            "--target-config",
+            str(target_config),
+            "--repetitions",
+            "2",
+            "--max-target-calls",
+            "20",
+            "--dry-run",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "Potential target calls: up to 20 (authorized maximum: 20)" in " ".join(
+        result.output.split()
+    )
+    assert "Lifecycle calls per execution: 5" in result.output
+    assert "Every execution invokes and validates the configured reset contract" in " ".join(
+        result.output.split()
+    )
 
 
 def test_invariant_dry_run_reports_rules_authority_and_no_extra_calls(
@@ -687,7 +796,7 @@ def test_invariant_evaluation_reuses_results_without_extra_runner_calls(
 
     evaluation = _invariant_evaluation("satisfied", "violated")
 
-    def evaluate_once(*args: object) -> DatasetInvariantEvaluation:
+    def evaluate_once(*args: object, **kwargs: object) -> DatasetInvariantEvaluation:
         nonlocal invariant_calls
         invariant_calls += 1
         return evaluation
@@ -764,7 +873,6 @@ def test_target_config_dry_run_validates_environment_and_makes_no_calls(
 
     assert result.exit_code == 0, result.output
     assert "Target: configured" in result.output
-    assert "https://sandbox.example.test/execute" in result.output
     assert "Authorization=SANDBOX_TOKEN" in result.output
     assert "Bearer test-token" not in result.output
     assert "No model or target requests sent" in result.output
@@ -788,64 +896,33 @@ def test_target_config_dry_run_validates_environment_and_makes_no_calls(
 
 
 @pytest.mark.parametrize(
-    "conflicting_options",
-    [
-        ["--target-url", "https://sandbox.example.test/execute"],
-        ["--request-field", "message"],
-        ["--header-env", "Authorization=SANDBOX_TOKEN"],
-    ],
-)
-def test_target_config_rejects_legacy_target_options(
-    tmp_path: Path,
-    conflicting_options: list[str],
-) -> None:
-    dataset = tmp_path / "interactions.jsonl"
-    target_config = tmp_path / "target.json"
-    _write_dataset(dataset, [_record()])
-    _write_target_config(target_config)
-
-    result = runner.invoke(
-        root_app,
-        [
-            "dataset",
-            "evaluate",
-            str(dataset),
-            "--target-config",
-            str(target_config),
-            *conflicting_options,
-            "--dry-run",
-        ],
-    )
-
-    assert result.exit_code != 0
-    normalized_output = " ".join(_ANSI_ESCAPE_PATTERN.sub("", result.output).split())
-    assert "--target-config cannot be combined" in normalized_output
-
-
-@pytest.mark.parametrize(
     "payload",
     [
         {
-            "version": 1,
-            "url": "https://sandbox.example.test/execute",
-            "headers_from_env": {},
-            "request_json_template": {"input": "{{input}}"},
-            "response_json_pointer": "",
+            "version": 2,
             "unknown": True,
         },
         {
-            "version": 1,
-            "url": "https://sandbox.example.test/execute",
-            "headers_from_env": {},
-            "request_json_template": {"input": "missing marker"},
-            "response_json_pointer": "",
+            **JsonHttpDatasetTargetConfig.model_validate(
+                json.loads(
+                    (Path(__file__).parents[2] / "examples/stateful_target.json").read_text()
+                )
+            ).model_dump(mode="json"),
+            "execute_turn": {
+                "url": "https://sandbox.example.test/execute",
+                "request_json_template": {"input": "missing marker"},
+            },
         },
         {
-            "version": 1,
-            "url": "https://sandbox.example.test/execute",
-            "headers_from_env": {},
-            "request_json_template": {"input": "{{input}}"},
-            "response_json_pointer": "not-a-pointer",
+            **JsonHttpDatasetTargetConfig.model_validate(
+                json.loads(
+                    (Path(__file__).parents[2] / "examples/stateful_target.json").read_text()
+                )
+            ).model_dump(mode="json"),
+            "snapshot": {
+                "url": "https://sandbox.example.test/snapshot",
+                "response_json_pointer": "not-a-pointer",
+            },
         },
     ],
 )
@@ -865,43 +942,6 @@ def test_dry_run_rejects_invalid_target_config(tmp_path: Path, payload: dict[str
             str(target_config),
             "--dry-run",
         ],
-    )
-
-    assert result.exit_code != 0
-    assert "No model or target requests sent" not in result.output
-
-
-@pytest.mark.parametrize(
-    "options",
-    [
-        ["--target-url", "file:///etc/passwd"],
-        ["--target-url", "https://sandbox.test", "--request-field", "bad.field"],
-        [
-            "--target-url",
-            "https://sandbox.test",
-            "--header-env",
-            "Host=PATH",
-        ],
-        [
-            "--target-url",
-            "https://sandbox.test",
-            "--header-env",
-            "Authorization=MISSING_SANDBOX_TOKEN",
-        ],
-    ],
-)
-def test_dry_run_rejects_invalid_target_configuration(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    options: list[str],
-) -> None:
-    dataset = tmp_path / "interactions.jsonl"
-    _write_dataset(dataset, [_record()])
-    monkeypatch.delenv("MISSING_SANDBOX_TOKEN", raising=False)
-
-    result = runner.invoke(
-        root_app,
-        ["dataset", "evaluate", str(dataset), *options, "--dry-run"],
     )
 
     assert result.exit_code != 0
@@ -1151,53 +1191,36 @@ def test_default_limit_and_repetitions_fit_the_default_call_budget(tmp_path: Pat
     assert "Potential target calls: up to 60" in result.output
 
 
-@pytest.mark.parametrize(
-    ("options", "expected_error"),
-    [
-        ([], "execution requires --target-url"),
-        (["--target-url", "https://sandbox.example.test"], "--allow-target-network"),
+def test_execution_requires_config_network_confirmation_sandbox_and_output(
+    tmp_path: Path,
+) -> None:
+    dataset = tmp_path / "interactions.jsonl"
+    target_config = tmp_path / "target.json"
+    _write_dataset(dataset, [_record()])
+    _write_target_config(target_config)
+
+    option_stages = [
+        ([], "execution requires --target-config"),
+        (["--target-config", str(target_config)], "--allow-target-network"),
         (
-            [
-                "--target-url",
-                "https://sandbox.example.test",
-                "--allow-target-network",
-            ],
+            ["--target-config", str(target_config), "--allow-target-network"],
             "--confirm-isolated-sandbox",
         ),
         (
             [
-                "--target-url",
-                "https://sandbox.example.test",
+                "--target-config",
+                str(target_config),
                 "--allow-target-network",
                 "--confirm-isolated-sandbox",
-            ],
-            "--confirm-fresh-state",
-        ),
-        (
-            [
-                "--target-url",
-                "https://sandbox.example.test",
-                "--allow-target-network",
-                "--confirm-isolated-sandbox",
-                "--confirm-fresh-state",
             ],
             "execution requires --output",
         ),
-    ],
-)
-def test_execution_requires_explicit_target_confirmations_and_output(
-    tmp_path: Path,
-    options: list[str],
-    expected_error: str,
-) -> None:
-    dataset = tmp_path / "interactions.jsonl"
-    _write_dataset(dataset, [_record()])
-
-    result = runner.invoke(root_app, ["dataset", "evaluate", str(dataset), *options])
-
-    assert result.exit_code != 0
-    normalized_output = " ".join(_ANSI_ESCAPE_PATTERN.sub("", result.output).split())
-    assert expected_error in normalized_output
+    ]
+    for options, expected_error in option_stages:
+        result = runner.invoke(root_app, ["dataset", "evaluate", str(dataset), *options])
+        assert result.exit_code != 0
+        normalized_output = " ".join(_ANSI_ESCAPE_PATTERN.sub("", result.output).split())
+        assert expected_error in normalized_output
 
 
 def test_execution_refuses_to_overwrite_output_before_model_setup(
@@ -1205,7 +1228,9 @@ def test_execution_refuses_to_overwrite_output_before_model_setup(
 ) -> None:
     dataset = tmp_path / "interactions.jsonl"
     output = tmp_path / "results.jsonl"
+    target_config = tmp_path / "target.json"
     _write_dataset(dataset, [_record()])
+    _write_target_config(target_config)
     output.write_text("keep me", encoding="utf-8")
 
     def unexpected_settings() -> None:
@@ -1218,11 +1243,10 @@ def test_execution_refuses_to_overwrite_output_before_model_setup(
             "dataset",
             "evaluate",
             str(dataset),
-            "--target-url",
-            "https://sandbox.example.test",
+            "--target-config",
+            str(target_config),
             "--allow-target-network",
             "--confirm-isolated-sandbox",
-            "--confirm-fresh-state",
             "--output",
             str(output),
         ],
@@ -1239,7 +1263,12 @@ def test_execution_rejects_missing_header_secret_before_model_or_output(
 ) -> None:
     dataset = tmp_path / "interactions.jsonl"
     output = tmp_path / "results.jsonl"
+    target_config = tmp_path / "target.json"
     _write_dataset(dataset, [_record()])
+    _write_target_config(
+        target_config,
+        headers_from_env={"Authorization": "MISSING_SANDBOX_TOKEN"},
+    )
     monkeypatch.delenv("MISSING_SANDBOX_TOKEN", raising=False)
     monkeypatch.setattr(
         main,
@@ -1257,13 +1286,10 @@ def test_execution_rejects_missing_header_secret_before_model_or_output(
             "dataset",
             "evaluate",
             str(dataset),
-            "--target-url",
-            "https://sandbox.example.test",
-            "--header-env",
-            "Authorization=MISSING_SANDBOX_TOKEN",
+            "--target-config",
+            str(target_config),
             "--allow-target-network",
             "--confirm-isolated-sandbox",
-            "--confirm-fresh-state",
             "--output",
             str(output),
         ],
@@ -1278,15 +1304,17 @@ def test_execution_creates_private_explicit_output(
 ) -> None:
     dataset = tmp_path / "interactions.jsonl"
     output = tmp_path / "results.jsonl"
+    target_config = tmp_path / "target.json"
     _write_dataset(dataset, [_record()])
+    _write_target_config(target_config, url="http://127.0.0.1:8765/execute")
     captured_records: list[str] = []
 
     class FakeTarget:
-        def __init__(self, endpoint: str, **options: object) -> None:
-            assert endpoint == "http://127.0.0.1:8765/execute"
+        @classmethod
+        def from_config(cls, config: JsonHttpDatasetTargetConfig, **options: object) -> FakeTarget:
+            assert config.execute_turn.url == "http://127.0.0.1:8765/execute"
             assert options["sandbox_confirmed"] is True
-            assert options["fresh_state_confirmed"] is True
-            assert options["request_field"] == "query"
+            return cls()
 
     async def fake_evaluate(
         records: tuple[Any, ...],
@@ -1305,7 +1333,7 @@ def test_execution_creates_private_explicit_output(
         assert operator_ids == ("surface.disfluency_repeat",)
         assert repetitions == 3
         assert max_target_calls == 100
-        assert planned_target_calls == 6
+        assert planned_target_calls == 24
         output_stream.write('{"saved":true}\n')
         output_stream.flush()
         return ()
@@ -1325,14 +1353,11 @@ def test_execution_creates_private_explicit_output(
             str(dataset),
             "--operator",
             "surface.disfluency_repeat",
-            "--target-url",
-            "http://127.0.0.1:8765/execute",
-            "--request-field",
-            "query",
+            "--target-config",
+            str(target_config),
             "--allow-insecure-http",
             "--allow-target-network",
             "--confirm-isolated-sandbox",
-            "--confirm-fresh-state",
             "--output",
             str(output),
         ],
@@ -1351,20 +1376,35 @@ def test_target_config_runs_nested_request_and_response_against_loopback(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     received_requests: list[object] = []
+    generation = 0
+    committed_state: object = None
 
     class TargetHandler(BaseHTTPRequestHandler):
         def do_POST(self) -> None:
+            nonlocal committed_state, generation
             content_length = int(self.headers["Content-Length"])
-            received_requests.append(json.loads(self.rfile.read(content_length)))
-            response = json.dumps(
-                {
+            request = json.loads(self.rfile.read(content_length))
+            if self.path == "/reset":
+                generation += 1
+                committed_state = None
+                response_value: object = {"generation": generation, "clean": True}
+            elif self.path == "/execute":
+                received_requests.append(request)
+                committed_state = {
                     "envelope": {
                         "agent": {
                             "actions": [{"action": "transfer", "amount": 100, "recipient": "Alice"}]
                         }
                     }
                 }
-            ).encode()
+                response_value = committed_state
+            elif self.path == "/snapshot":
+                response_value = {"state": committed_state}
+            else:
+                self.send_response(404)
+                self.end_headers()
+                return
+            response = json.dumps(response_value).encode()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(response)))
@@ -1395,6 +1435,9 @@ def test_target_config_runs_nested_request_and_response_against_loopback(
             },
             response_json_pointer="/envelope/agent",
         )
+        target_payload = json.loads(target_config.read_text(encoding="utf-8"))
+        target_payload["snapshot"]["response_json_pointer"] = "/state/envelope/agent"
+        target_config.write_text(json.dumps(target_payload), encoding="utf-8")
         observed_outputs: list[object] = []
 
         async def evaluate_once(
@@ -1440,7 +1483,6 @@ def test_target_config_runs_nested_request_and_response_against_loopback(
                 "--allow-insecure-http",
                 "--allow-target-network",
                 "--confirm-isolated-sandbox",
-                "--confirm-fresh-state",
                 "--output",
                 str(output),
             ],
@@ -1472,11 +1514,8 @@ def test_help_explains_dataset_target_and_operator_contract() -> None:
     assert '"input"' in result.output
     assert '"output"' in result.output
     normalized_help = " ".join(_ANSI_ESCAPE_PATTERN.sub("", result.output).split())
-    assert "Simple sandbox" in normalized_help
-    assert "POST" in result.output
-    assert "non-null JSON" in normalized_help
+    assert "explicit reset/setup/execute/snapshot lifecycle" in normalized_help
     assert "UL_LIVE" in result.output
-    assert "same clean state" in normalized_help
     assert "Fresh-state" in normalized_help
     assert "target executions" in normalized_help
     assert "Maximum target" in normalized_help
@@ -1563,12 +1602,21 @@ def test_run_context_records_canonical_provider_identity() -> None:
         selected_operator_ids=("surface.rephrase",),
         repetitions=1,
         invariant_suite=None,
-        target_config=JsonHttpDatasetTargetConfig(
-            version=1,
-            url="https://sandbox.example.test/execute",
-            headers_from_env={},
-            request_json_template={"input": "{{input}}"},
-            response_json_pointer="",
+        target_config=JsonHttpDatasetTargetConfig.model_validate(
+            {
+                "version": 2,
+                "reset": {
+                    "url": "https://sandbox.example.test/reset",
+                    "generation_json_pointer": "/generation",
+                    "clean_state_json_pointer": "/clean",
+                    "clean_state_value": True,
+                },
+                "execute_turn": {
+                    "url": "https://sandbox.example.test/execute",
+                    "request_json_template": {"input": "{{input}}"},
+                },
+                "snapshot": {"url": "https://sandbox.example.test/snapshot"},
+            }
         ),
         settings=custom_settings,
     )
@@ -1584,7 +1632,9 @@ def test_resume_skips_already_processed_interaction_ids(
 ) -> None:
     dataset = tmp_path / "interactions.jsonl"
     evidence = tmp_path / "evidence.jsonl"
+    target_config = tmp_path / "target.json"
     _write_dataset(dataset, [_record("interaction-1"), _record("interaction-2")])
+    _write_target_config(target_config)
     evaluation_results = (
         _evaluation_result("interaction-1"),
         _evaluation_result("interaction-2"),
@@ -1608,8 +1658,9 @@ def test_resume_skips_already_processed_interaction_ids(
     evaluated_ids: list[str] = []
 
     class FakeTarget:
-        def __init__(self, endpoint: str, **options: object) -> None:
-            pass
+        @classmethod
+        def from_config(cls, config: JsonHttpDatasetTargetConfig, **options: object) -> FakeTarget:
+            return cls()
 
     async def fake_evaluate(
         records: tuple[Any, ...],
@@ -1653,11 +1704,10 @@ def test_resume_skips_already_processed_interaction_ids(
         "dataset",
         "evaluate",
         str(dataset),
-        "--target-url",
-        "https://sandbox.example.test/execute",
+        "--target-config",
+        str(target_config),
         "--allow-target-network",
         "--confirm-isolated-sandbox",
-        "--confirm-fresh-state",
         "--repetitions",
         "1",
         "--resume",
@@ -1688,7 +1738,9 @@ def test_resume_exits_early_when_all_records_already_processed(
 ) -> None:
     dataset = tmp_path / "interactions.jsonl"
     evidence = tmp_path / "evidence.jsonl"
+    target_config = tmp_path / "target.json"
     _write_dataset(dataset, [_record("interaction-1")])
+    _write_target_config(target_config)
     evaluation_result = _evaluation_result("interaction-1")
     run_context = _run_context((evaluation_result.source,))
     evidence.write_text(
@@ -1712,11 +1764,10 @@ def test_resume_exits_early_when_all_records_already_processed(
             "dataset",
             "evaluate",
             str(dataset),
-            "--target-url",
-            "https://sandbox.example.test/execute",
+            "--target-config",
+            str(target_config),
             "--allow-target-network",
             "--confirm-isolated-sandbox",
-            "--confirm-fresh-state",
             "--repetitions",
             "1",
             "--resume",
@@ -1734,7 +1785,9 @@ def test_all_complete_resume_preserves_prior_review_finding_exit_code(
 ) -> None:
     dataset = tmp_path / "interactions.jsonl"
     evidence = tmp_path / "evidence.jsonl"
+    target_config = tmp_path / "target.json"
     _write_dataset(dataset, [_record()])
+    _write_target_config(target_config)
     evaluation_result = _evaluation_result("interaction-1", has_review_finding=True)
     run_context = _run_context((evaluation_result.source,))
     evidence.write_text(
@@ -1758,8 +1811,8 @@ def test_all_complete_resume_preserves_prior_review_finding_exit_code(
             "dataset",
             "evaluate",
             str(dataset),
-            "--target-url",
-            "https://sandbox.example.test/execute",
+            "--target-config",
+            str(target_config),
             "--repetitions",
             "1",
             "--resume",
@@ -1784,7 +1837,9 @@ def test_all_complete_resume_preserves_prior_invariant_exit_code(
     dataset = tmp_path / "interactions.jsonl"
     evidence = tmp_path / "evidence.jsonl"
     invariant_path = tmp_path / "invariants.json"
+    target_config = tmp_path / "target.json"
     _write_dataset(dataset, [_record()])
+    _write_target_config(target_config)
     _write_invariant_suite(invariant_path)
     invariant_suite = main.load_dataset_invariant_suite(invariant_path)
     evaluation_result = _evaluation_result("interaction-1")
@@ -1794,7 +1849,16 @@ def test_all_complete_resume_preserves_prior_invariant_exit_code(
         else {"status": "ok"}
     )
     baseline_trial = evaluation_result.baseline.trial_set.trials[0].model_copy(
-        update={"target_output": ObservedAgentOutput(raw_output=baseline_output)}
+        update={
+            "target_output": ObservedAgentOutput(
+                raw_output=baseline_output,
+                metadata=(
+                    {"committed_state_snapshot": baseline_output}
+                    if invariant_status == "violated"
+                    else {}
+                ),
+            )
+        }
     )
     evaluation_result = evaluation_result.model_copy(
         update={
@@ -1807,7 +1871,10 @@ def test_all_complete_resume_preserves_prior_invariant_exit_code(
             )
         }
     )
-    invariant_evaluation = main.evaluate_dataset_invariants(evaluation_result, invariant_suite)
+    invariant_evaluation = main.evaluate_dataset_invariants(
+        evaluation_result,
+        invariant_suite,
+    )
     assert invariant_evaluation.baseline.rules[0].status == invariant_status
     run_context = _run_context(
         (evaluation_result.source,),
@@ -1835,8 +1902,8 @@ def test_all_complete_resume_preserves_prior_invariant_exit_code(
             "dataset",
             "evaluate",
             str(dataset),
-            "--target-url",
-            "https://sandbox.example.test/execute",
+            "--target-config",
+            str(target_config),
             "--invariants",
             str(invariant_path),
             "--repetitions",
@@ -1854,7 +1921,9 @@ def test_resume_rejects_forged_invariant_outcome(tmp_path: Path) -> None:
     dataset = tmp_path / "interactions.jsonl"
     evidence = tmp_path / "evidence.jsonl"
     invariant_path = tmp_path / "invariants.json"
+    target_config = tmp_path / "target.json"
     _write_dataset(dataset, [_record()])
+    _write_target_config(target_config)
     _write_invariant_suite(invariant_path)
     invariant_suite = main.load_dataset_invariant_suite(invariant_path)
     evaluation_result = _evaluation_result("interaction-1")
@@ -1887,8 +1956,8 @@ def test_resume_rejects_forged_invariant_outcome(tmp_path: Path) -> None:
             "dataset",
             "evaluate",
             str(dataset),
-            "--target-url",
-            "https://sandbox.example.test/execute",
+            "--target-config",
+            str(target_config),
             "--invariants",
             str(invariant_path),
             "--repetitions",
@@ -1969,7 +2038,10 @@ def test_resume_accepts_extended_invariant_evidence_schema() -> None:
             )
         }
     )
-    invariant_evaluation = main.evaluate_dataset_invariants(evaluation_result, suite)
+    invariant_evaluation = main.evaluate_dataset_invariants(
+        evaluation_result,
+        suite,
+    )
     run_context = _run_context((evaluation_result.source,), invariant_suite=suite)
     raw_evidence = (
         json.dumps(
@@ -2000,7 +2072,9 @@ def test_resume_accepts_extended_invariant_evidence_schema() -> None:
 def test_resume_rejects_legacy_unbound_evidence(tmp_path: Path) -> None:
     dataset = tmp_path / "interactions.jsonl"
     evidence = tmp_path / "evidence.jsonl"
+    target_config = tmp_path / "target.json"
     _write_dataset(dataset, [_record()])
+    _write_target_config(target_config)
     evidence.write_text(
         json.dumps({"schema_version": "1.4.0", "interaction_id": "interaction-1"}) + "\n",
         encoding="utf-8",
@@ -2012,8 +2086,8 @@ def test_resume_rejects_legacy_unbound_evidence(tmp_path: Path) -> None:
             "dataset",
             "evaluate",
             str(dataset),
-            "--target-url",
-            "https://sandbox.example.test/execute",
+            "--target-config",
+            str(target_config),
             "--repetitions",
             "1",
             "--resume",
@@ -2029,7 +2103,9 @@ def test_resume_rejects_legacy_unbound_evidence(tmp_path: Path) -> None:
 def test_resume_rejects_changed_evaluation_plan(tmp_path: Path) -> None:
     dataset = tmp_path / "interactions.jsonl"
     evidence = tmp_path / "evidence.jsonl"
+    target_config = tmp_path / "target.json"
     _write_dataset(dataset, [_record()])
+    _write_target_config(target_config)
     evaluation_result = _evaluation_result("interaction-1")
     run_context = _run_context((evaluation_result.source,))
     evidence.write_text(
@@ -2052,8 +2128,8 @@ def test_resume_rejects_changed_evaluation_plan(tmp_path: Path) -> None:
             "dataset",
             "evaluate",
             str(dataset),
-            "--target-url",
-            "https://sandbox.example.test/execute",
+            "--target-config",
+            str(target_config),
             "--operator",
             "tone.frustrated",
             "--repetitions",
@@ -2071,7 +2147,9 @@ def test_resume_rejects_changed_evaluation_plan(tmp_path: Path) -> None:
 def test_resume_rejects_evidence_without_terminal_newline(tmp_path: Path) -> None:
     dataset = tmp_path / "interactions.jsonl"
     evidence = tmp_path / "evidence.jsonl"
+    target_config = tmp_path / "target.json"
     _write_dataset(dataset, [_record()])
+    _write_target_config(target_config)
     evaluation_result = _evaluation_result("interaction-1")
     run_context = _run_context((evaluation_result.source,))
     evidence.write_text(
@@ -2093,8 +2171,8 @@ def test_resume_rejects_evidence_without_terminal_newline(tmp_path: Path) -> Non
             "dataset",
             "evaluate",
             str(dataset),
-            "--target-url",
-            "https://sandbox.example.test/execute",
+            "--target-config",
+            str(target_config),
             "--repetitions",
             "1",
             "--resume",
@@ -2114,7 +2192,9 @@ def test_resume_dry_run_accepts_read_only_evidence(
 ) -> None:
     dataset = tmp_path / "interactions.jsonl"
     evidence = tmp_path / "evidence.jsonl"
+    target_config = tmp_path / "target.json"
     _write_dataset(dataset, [_record()])
+    _write_target_config(target_config)
     evaluation_result = _evaluation_result("interaction-1")
     run_context = _run_context((evaluation_result.source,))
     evidence.write_text(
@@ -2139,8 +2219,8 @@ def test_resume_dry_run_accepts_read_only_evidence(
             "dataset",
             "evaluate",
             str(dataset),
-            "--target-url",
-            "https://sandbox.example.test/execute",
+            "--target-config",
+            str(target_config),
             "--repetitions",
             "1",
             "--resume",
@@ -2160,8 +2240,10 @@ def test_resume_rejects_mismatched_output_path(
     dataset = tmp_path / "interactions.jsonl"
     evidence = tmp_path / "evidence.jsonl"
     other_output = tmp_path / "other.jsonl"
+    target_config = tmp_path / "target.json"
 
     _write_dataset(dataset, [_record()])
+    _write_target_config(target_config)
     evidence.write_text(
         json.dumps({"schema_version": "1.4.0", "interaction_id": "x", "cases": []}) + "\n",
         encoding="utf-8",
@@ -2174,11 +2256,10 @@ def test_resume_rejects_mismatched_output_path(
             "dataset",
             "evaluate",
             str(dataset),
-            "--target-url",
-            "https://sandbox.example.test/execute",
+            "--target-config",
+            str(target_config),
             "--allow-target-network",
             "--confirm-isolated-sandbox",
-            "--confirm-fresh-state",
             "--resume",
             str(evidence),
             "--output",
