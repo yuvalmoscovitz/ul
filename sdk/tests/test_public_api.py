@@ -24,6 +24,8 @@ from ul import (
     ObservedAgentOutput,
     OpenRouterDatasetSettings,
     OpenRouterSemanticDeconstructor,
+    PromptManager,
+    PromptTemplateInfo,
     RenderedUserInput,
     Scenario,
     ScenarioProvenance,
@@ -115,6 +117,8 @@ def test_sdk_exposes_dataset_augmentation_api() -> None:
     assert len(builtin_dataset_augmentation_operators()) == 8
     assert OpenRouterSemanticDeconstructor is not None
     assert OpenRouterDatasetSettings is not None
+    assert PromptManager.instance().list_templates()
+    assert PromptTemplateInfo.__name__ == "PromptTemplateInfo"
     assert ObservedAgentOutput(raw_output={"action": "visit_booked"}).raw_output == {
         "action": "visit_booked"
     }

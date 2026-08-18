@@ -32,6 +32,7 @@ from ul_core.models import (
     OracleRelation,
     Scenario,
 )
+from ul_core.prompts import PromptManager, PromptTemplateInfo
 
 __all__ = [
     "AugmentationApplication",
@@ -48,6 +49,8 @@ __all__ = [
     "OracleEvaluator",
     "OracleFinding",
     "OracleRelation",
+    "PromptManager",
+    "PromptTemplateInfo",
     "Scenario",
     "ScenarioMaterializer",
     "SemanticDelta",

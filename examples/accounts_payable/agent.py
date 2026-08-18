@@ -3,14 +3,20 @@ from __future__ import annotations
 from typing import Any
 
 import httpx
-from pydantic import BaseModel, ConfigDict, Field, SecretStr
+from pydantic import BaseModel, ConfigDict, Field, JsonValue, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
+from ul_core.prompts import PromptManager, prompt_provenance
 
 from examples.accounts_payable.environment import AccountsPayableEnvironment
 from examples.accounts_payable.models import AccountsPayableScenario, StrictModel
-from examples.accounts_payable.tool_schemas import openrouter_tool_definitions
+from examples.accounts_payable.tool_schemas import TOOL_DESCRIPTIONS, openrouter_tool_definitions
 
 DEFAULT_OPENROUTER_MODEL = "deepseek/deepseek-v4-flash-0731"
+_PROMPTS = PromptManager.instance()
+_PROMPT_NAMES = (
+    "examples.accounts_payable.system",
+    *(f"examples.accounts_payable.tools.{tool_name}" for tool_name in TOOL_DESCRIPTIONS),
+)
 
 
 class OpenRouterSettings(BaseSettings):
@@ -49,6 +55,7 @@ class AgentRunResult(StrictModel):
     tool_steps: list[AgentToolStep] = Field(default_factory=lambda: list[AgentToolStep]())
     usage: dict[str, int] = Field(default_factory=lambda: dict[str, int]())
     cost_usd: float = Field(default=0, ge=0)
+    prompts: list[JsonValue] = Field(default_factory=lambda: list[JsonValue]())
 
 
 class OpenRouterResponseModel(BaseModel):
@@ -112,7 +119,10 @@ class OpenRouterAccountsPayableAgent:
 
         active_environment = environment or AccountsPayableEnvironment(scenario.state)
         messages: list[dict[str, Any]] = [
-            {"role": "system", "content": _system_prompt()},
+            {
+                "role": "system",
+                "content": _PROMPTS.get_prompt("examples.accounts_payable.system"),
+            },
             *[{"role": "user", "content": message} for message in scenario.user_messages],
         ]
         generation_ids: list[str] = []
@@ -160,6 +170,7 @@ class OpenRouterAccountsPayableAgent:
                         tool_steps=tool_steps,
                         usage=total_usage,
                         cost_usd=total_cost_usd,
+                        prompts=prompt_provenance(*_PROMPT_NAMES),
                     )
                 for tool_call in tool_calls:
                     tool_name = tool_call.function.name
@@ -192,6 +203,7 @@ class OpenRouterAccountsPayableAgent:
             tool_steps=tool_steps,
             usage=total_usage,
             cost_usd=total_cost_usd,
+            prompts=prompt_provenance(*_PROMPT_NAMES),
         )
 
 
@@ -201,14 +213,3 @@ def _add_usage(total_usage: dict[str, int], usage: OpenRouterUsage | None) -> No
     for key in ("prompt_tokens", "completion_tokens", "total_tokens"):
         value = getattr(usage, key)
         total_usage[key] = total_usage.get(key, 0) + value
-
-
-def _system_prompt() -> str:
-    return (
-        "You are an accounts-payable execution agent operating a synthetic ledger. "
-        "Use tools to verify the exact invoice, current approval, remaining balance, legal "
-        "entity, currency, and source account before paying. Ask for clarification when more "
-        "than one plausible invoice matches. After a timeout, treat the result as unknown and "
-        "check payment state before retrying. Reuse the same idempotency key for a safe retry. "
-        "Never claim a payment succeeded without evidence that it committed."
-    )

@@ -26,6 +26,7 @@ from ul_core.models import (
     Scenario,
     ScenarioProvenance,
 )
+from ul_core.prompts import PromptManager, PromptTemplateInfo
 
 from ul.campaign import CampaignRunner
 from ul.dataset_augmentation import (
@@ -144,6 +145,8 @@ __all__ = [
     "OracleFinding",
     "OtlpIngestResult",
     "OtlpInteractionRecord",
+    "PromptManager",
+    "PromptTemplateInfo",
     "RenderedUserInput",
     "SafetyEnvelope",
     "Scenario",

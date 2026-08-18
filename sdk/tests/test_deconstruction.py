@@ -14,6 +14,7 @@ from ul.dataset_augmentation import (
 )
 from ul.deconstruction import OpenRouterDatasetSettings, OpenRouterSemanticDeconstructor
 from ul_core.dataset import InteractionRecord, SemanticFrame, UserInputRecord
+from ul_core.prompts import prompt_provenance
 
 pytestmark = pytest.mark.asyncio
 _TEST_API_KEY = SecretStr("test-openrouter-key")
@@ -251,6 +252,7 @@ async def test_deconstruct_sends_one_bounded_strict_structured_request() -> None
             "cost": 0.00042,
         },
         "openrouter_cost": 0.00042,
+        "prompts": prompt_provenance("semantic.deconstruct"),
     }
     await client.aclose()
 
@@ -311,6 +313,10 @@ async def test_render_keeps_caller_instruction_out_of_the_system_prompt() -> Non
         },
         "openrouter_cost": 0.00042,
         "requested_model": "x-ai/grok-4.3",
+        "prompts": prompt_provenance(
+            "semantic.render",
+            "semantic.render.temporary_value_forbidden",
+        ),
         "sampling": {
             "temperature": 0.7,
             "top_p": 0.95,
