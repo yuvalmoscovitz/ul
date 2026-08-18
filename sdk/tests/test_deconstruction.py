@@ -830,10 +830,10 @@ async def test_every_observed_outcome_requires_output_evidence() -> None:
 @pytest.mark.parametrize(
     ("configured_settings", "message"),
     [
-        (settings(live_calls=False), "UL_DATASET_LIVE_CALLS=true"),
+        (settings(live_calls=False), "UL_LIVE=true"),
         (
             settings(allow_external_data_processing=False),
-            "UL_DATASET_ALLOW_EXTERNAL_DATA_PROCESSING=true",
+            "UL_LIVE=true",
         ),
         (settings(api_key=None), "OPEN_ROUTER_API_KEY"),
         (settings(api_key=SecretStr("   ")), "OPEN_ROUTER_API_KEY"),
@@ -986,6 +986,7 @@ async def test_settings_load_dotenv_and_hide_secrets(
 ) -> None:
     for variable_name in (
         "OPEN_ROUTER_API_KEY",
+        "UL_LIVE",
         "UL_DATASET_LIVE_CALLS",
         "UL_DATASET_ALLOW_EXTERNAL_DATA_PROCESSING",
         "UL_DATASET_MODEL",

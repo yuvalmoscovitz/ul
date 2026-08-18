@@ -1177,7 +1177,7 @@ def test_help_explains_dataset_target_and_operator_contract() -> None:
     assert "Simple sandbox" in normalized_help
     assert "POST" in result.output
     assert "non-null JSON" in normalized_help
-    assert "UL_DATASET_LIVE_CALLS" in result.output
+    assert "UL_LIVE" in result.output
     assert "same clean state" in normalized_help
     assert "Fresh-state" in normalized_help
     assert "target executions" in normalized_help
@@ -1246,6 +1246,162 @@ def test_operator_list_is_fixed_and_self_correction_keeps_existing_call_accounti
     assert "Operators: intent.self_correction" in dry_run.output
     assert "Potential semantic model calls: up to 10" in dry_run.output
     assert "Potential target calls: up to 6" in dry_run.output
+
+
+def test_resume_skips_already_processed_interaction_ids(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """--resume reads existing evidence, skips processed IDs, and appends new results."""
+    dataset = tmp_path / "interactions.jsonl"
+    evidence = tmp_path / "evidence.jsonl"
+
+    # Two interactions; first one is already in the evidence file.
+    _write_dataset(dataset, [_record("interaction-1"), _record("interaction-2")])
+    already_processed = json.dumps(
+        {"schema_version": "1.4.0", "interaction_id": "interaction-1", "cases": []}
+    )
+    evidence.write_text(already_processed + "\n", encoding="utf-8")
+
+    evaluated_ids: list[str] = []
+
+    class FakeTarget:
+        def __init__(self, endpoint: str, **options: object) -> None:
+            pass
+
+    async def fake_evaluate(
+        records: tuple[Any, ...],
+        operator_ids: tuple[str, ...],
+        settings: object,
+        target: object,
+        output_stream: Any,
+        *,
+        repetitions: int,
+        max_target_calls: int,
+        planned_target_calls: int,
+    ) -> tuple[object, ...]:
+        for record in records:
+            evaluated_ids.append(record.id)
+        output_stream.write(
+            json.dumps({"schema_version": "1.4.0", "interaction_id": "interaction-2", "cases": []})
+            + "\n"
+        )
+        output_stream.flush()
+        return ()
+
+    monkeypatch.setattr(
+        main,
+        "OpenRouterDatasetSettings",
+        lambda: SimpleNamespace(
+            live_calls=True,
+            allow_external_data_processing=True,
+            api_key=SecretStr("test-key"),
+            max_input_chars=50_000,
+        ),
+    )
+    monkeypatch.setattr(main, "JsonHttpDatasetTarget", FakeTarget)
+    monkeypatch.setattr(main, "_evaluate_interaction_records", fake_evaluate)
+
+    result = runner.invoke(
+        root_app,
+        [
+            "dataset",
+            "evaluate",
+            str(dataset),
+            "--target-url",
+            "https://sandbox.example.test/execute",
+            "--allow-target-network",
+            "--confirm-isolated-sandbox",
+            "--confirm-fresh-state",
+            "--resume",
+            str(evidence),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    # Only interaction-2 should have been evaluated.
+    assert evaluated_ids == ["interaction-2"]
+    # The evidence file should now contain both records (original + appended).
+    lines = [l for l in evidence.read_text(encoding="utf-8").splitlines() if l.strip()]
+    assert len(lines) == 2
+    assert json.loads(lines[0])["interaction_id"] == "interaction-1"
+    assert json.loads(lines[1])["interaction_id"] == "interaction-2"
+    # Summary should mention the skipped count.
+    assert "skipped" in result.output
+
+
+def test_resume_exits_early_when_all_records_already_processed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """--resume exits 0 with a message when every selected interaction is already in evidence."""
+    dataset = tmp_path / "interactions.jsonl"
+    evidence = tmp_path / "evidence.jsonl"
+
+    _write_dataset(dataset, [_record("interaction-1")])
+    already_processed = json.dumps(
+        {"schema_version": "1.4.0", "interaction_id": "interaction-1", "cases": []}
+    )
+    evidence.write_text(already_processed + "\n", encoding="utf-8")
+
+    def unexpected_settings() -> None:
+        raise AssertionError("all-done resume reached model setup")
+
+    monkeypatch.setattr(main, "OpenRouterDatasetSettings", unexpected_settings)
+
+    result = runner.invoke(
+        root_app,
+        [
+            "dataset",
+            "evaluate",
+            str(dataset),
+            "--target-url",
+            "https://sandbox.example.test/execute",
+            "--allow-target-network",
+            "--confirm-isolated-sandbox",
+            "--confirm-fresh-state",
+            "--resume",
+            str(evidence),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "Nothing to do" in result.output
+
+
+def test_resume_rejects_mismatched_output_path(
+    tmp_path: Path,
+) -> None:
+    """--resume and --output must point to the same file when both are given."""
+    dataset = tmp_path / "interactions.jsonl"
+    evidence = tmp_path / "evidence.jsonl"
+    other_output = tmp_path / "other.jsonl"
+
+    _write_dataset(dataset, [_record()])
+    evidence.write_text(
+        json.dumps({"schema_version": "1.4.0", "interaction_id": "x", "cases": []}) + "\n",
+        encoding="utf-8",
+    )
+    other_output.write_text("", encoding="utf-8")
+
+    result = runner.invoke(
+        root_app,
+        [
+            "dataset",
+            "evaluate",
+            str(dataset),
+            "--target-url",
+            "https://sandbox.example.test/execute",
+            "--allow-target-network",
+            "--confirm-isolated-sandbox",
+            "--confirm-fresh-state",
+            "--resume",
+            str(evidence),
+            "--output",
+            str(other_output),
+        ],
+    )
+
+    assert result.exit_code != 0
+    assert "same file" in result.output
 
 
 @pytest.mark.parametrize(

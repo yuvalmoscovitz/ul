@@ -24,6 +24,10 @@ _REQUIRED_LIVE_ENVIRONMENT = (
     "UL_DATASET_LIVE_CALLS",
     "UL_DATASET_ALLOW_EXTERNAL_DATA_PROCESSING",
 )
+_UL_LIVE_ALIASES = {
+    "UL_DATASET_LIVE_CALLS": "UL_LIVE",
+    "UL_DATASET_ALLOW_EXTERNAL_DATA_PROCESSING": "UL_LIVE",
+}
 _QUICKSTART_MODEL_ENVIRONMENT = {
     "UL_DATASET_MODEL": "x-ai/grok-4.6",
     "UL_DATASET_RENDER_MODEL": "x-ai/grok-4.6",
@@ -58,11 +62,18 @@ def _subprocess_environment(*, dry_run: bool) -> dict[str, str]:
     if not api_key.strip():
         raise ValueError("set OPEN_ROUTER_API_KEY before running the live quickstart")
     environment["OPEN_ROUTER_API_KEY"] = api_key
+    ul_live = os.environ.get("UL_LIVE", "").casefold() == "true"
     for variable_name in _REQUIRED_LIVE_ENVIRONMENT[1:]:
         value = os.environ.get(variable_name, "")
-        if value.casefold() != "true":
-            raise ValueError(f"set {variable_name}=true before running the live quickstart")
-        environment[variable_name] = value
+        alias = _UL_LIVE_ALIASES.get(variable_name)
+        if value.casefold() != "true" and not (alias and ul_live):
+            raise ValueError(
+                f"set UL_LIVE=true (or {variable_name}=true) before running the live quickstart"
+            )
+        if value.casefold() == "true":
+            environment[variable_name] = value
+        else:
+            environment["UL_LIVE"] = os.environ["UL_LIVE"]
     return environment
 
 

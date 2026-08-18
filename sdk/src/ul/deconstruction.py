@@ -8,7 +8,7 @@ from types import TracebackType
 from typing import Any, Self, cast
 
 import httpx
-from pydantic import BaseModel, ConfigDict, Field, JsonValue, SecretStr
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field, JsonValue, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from ul_core.dataset import (
     EvidenceReference,
@@ -29,10 +29,13 @@ class OpenRouterDatasetSettings(BaseSettings):
         populate_by_name=True,
     )
 
-    live_calls: bool = Field(default=False, validation_alias="UL_DATASET_LIVE_CALLS")
+    live_calls: bool = Field(
+        default=False,
+        validation_alias=AliasChoices("UL_DATASET_LIVE_CALLS", "UL_LIVE"),
+    )
     allow_external_data_processing: bool = Field(
         default=False,
-        validation_alias="UL_DATASET_ALLOW_EXTERNAL_DATA_PROCESSING",
+        validation_alias=AliasChoices("UL_DATASET_ALLOW_EXTERNAL_DATA_PROCESSING", "UL_LIVE"),
     )
     api_key: SecretStr | None = Field(default=None, validation_alias="OPEN_ROUTER_API_KEY")
     model: str = Field(
@@ -471,11 +474,14 @@ class OpenRouterSemanticDeconstructor:
 
     def _require_live_access(self) -> str:
         if not self.settings.live_calls:
-            raise RuntimeError("OpenRouter dataset calls require UL_DATASET_LIVE_CALLS=true")
+            raise RuntimeError(
+                "OpenRouter dataset calls require UL_LIVE=true "
+                "(or UL_DATASET_LIVE_CALLS=true)"
+            )
         if not self.settings.allow_external_data_processing:
             raise RuntimeError(
                 "OpenRouter dataset calls send raw inputs and outputs externally; set "
-                "UL_DATASET_ALLOW_EXTERNAL_DATA_PROCESSING=true to allow this"
+                "UL_LIVE=true (or UL_DATASET_ALLOW_EXTERNAL_DATA_PROCESSING=true) to allow this"
             )
         if self.settings.api_key is None or not self.settings.api_key.get_secret_value().strip():
             raise RuntimeError("OpenRouter dataset calls require OPEN_ROUTER_API_KEY")

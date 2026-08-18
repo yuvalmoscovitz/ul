@@ -241,11 +241,20 @@ def evaluate_dataset(
         bool,
         typer.Option(help="Validate and show the execution plan without external calls."),
     ] = False,
+    resume: Annotated[
+        Path | None,
+        typer.Option(
+            exists=True,
+            dir_okay=False,
+            readable=True,
+            help="Existing evidence file to resume; skips already-processed interaction IDs and appends.",
+        ),
+    ] = None,
 ) -> None:
     """Explore behavioral differences against an isolated black-box agent.
 
-    Execution requires UL_DATASET_LIVE_CALLS=true,
-    UL_DATASET_ALLOW_EXTERNAL_DATA_PROCESSING=true, and OPEN_ROUTER_API_KEY.
+    Execution requires UL_LIVE=true (or UL_DATASET_LIVE_CALLS=true and
+    UL_DATASET_ALLOW_EXTERNAL_DATA_PROCESSING=true individually), and OPEN_ROUTER_API_KEY.
 
     Example: ul dataset evaluate interactions.jsonl --target-url https://sandbox/run
     --allow-target-network --confirm-isolated-sandbox --confirm-fresh-state
@@ -268,6 +277,24 @@ def evaluate_dataset(
         raise typer.BadParameter(str(error)) from None
 
     selected_records = records[:limit]
+
+    # Handle --resume: determine effective output path and skip processed IDs.
+    skipped_count = 0
+    if resume is not None:
+        # Validate --output consistency when both are given.
+        if output is not None and output.resolve() != resume.resolve():
+            raise typer.BadParameter(
+                "--output must point to the same file as --resume, or be omitted",
+                param_hint="--output",
+            )
+        # Derive output from resume if not specified.
+        if output is None:
+            output = resume
+        processed_ids = _read_processed_ids(resume)
+        original_count = len(selected_records)
+        selected_records = tuple(r for r in selected_records if r.id not in processed_ids)
+        skipped_count = original_count - len(selected_records)
+
     potential_target_calls = len(selected_records) * repetitions * (1 + len(selected_operators))
     if potential_target_calls > max_target_calls:
         raise typer.BadParameter(
@@ -298,11 +325,20 @@ def evaluate_dataset(
             )
         if output is None:
             raise typer.BadParameter("execution requires --output", param_hint="--output")
-        if output.exists():
+        if output.exists() and resume is None:
             raise typer.BadParameter(
                 "output already exists; UL will not overwrite it",
                 param_hint="--output",
             )
+
+    # Early exit when resuming and all records are already processed.
+    if not dry_run and not selected_records and skipped_count > 0:
+        console.print(
+            f"All {skipped_count} selected interaction(s) already present in {resume}. "
+            "Nothing to do."
+        )
+        raise typer.Exit(code=0)
+
     try:
         settings = OpenRouterDatasetSettings()
         _validate_model_input_bounds(selected_records, settings.max_input_chars)
@@ -355,10 +391,13 @@ def evaluate_dataset(
     assert target_url is not None or loaded_target_config is not None
     assert output is not None
     if not settings.live_calls:
-        raise typer.BadParameter("set UL_DATASET_LIVE_CALLS=true to allow semantic model calls")
+        raise typer.BadParameter(
+            "set UL_LIVE=true (or UL_DATASET_LIVE_CALLS=true) to allow semantic model calls"
+        )
     if not settings.allow_external_data_processing:
         raise typer.BadParameter(
-            "set UL_DATASET_ALLOW_EXTERNAL_DATA_PROCESSING=true to allow semantic model calls"
+            "set UL_LIVE=true (or UL_DATASET_ALLOW_EXTERNAL_DATA_PROCESSING=true) "
+            "to allow semantic model calls"
         )
     if settings.api_key is None or not settings.api_key.get_secret_value().strip():
         raise typer.BadParameter("set OPEN_ROUTER_API_KEY to run an evaluation")
@@ -385,7 +424,10 @@ def evaluate_dataset(
         raise typer.BadParameter(str(error), param_hint="--target-url") from None
 
     try:
-        output_stream = _create_private_output(output)
+        if resume is not None:
+            output_stream = _open_append_output(output)
+        else:
+            output_stream = _create_private_output(output)
     except OSError as error:
         asyncio.run(target.aclose())
         raise typer.BadParameter(
@@ -431,6 +473,11 @@ def evaluate_dataset(
         )
         raise typer.Exit(code=2) from None
 
+    if skipped_count > 0:
+        console.print(
+            f"Resumed: {skipped_count} interaction(s) skipped (already in evidence), "
+            f"{len(results)} newly evaluated."
+        )
     _print_dataset_results(results, output, invariant_evaluations=tuple(invariant_evaluations))
     invariant_exit_code = _invariant_exit_code(tuple(invariant_evaluations))
     if invariant_exit_code == 1:
@@ -677,6 +724,26 @@ def _create_private_output(path: Path) -> TextIO:
     descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     os.fchmod(descriptor, 0o600)
     return os.fdopen(descriptor, "w", encoding="utf-8")
+
+
+def _open_append_output(path: Path) -> TextIO:
+    descriptor = os.open(path, os.O_WRONLY | os.O_APPEND)
+    return os.fdopen(descriptor, "a", encoding="utf-8")
+
+
+def _read_processed_ids(path: Path) -> set[str]:
+    ids: set[str] = set()
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        try:
+            record = json.loads(line)
+            interaction_id = record.get("interaction_id")
+            if isinstance(interaction_id, str):
+                ids.add(interaction_id)
+        except (json.JSONDecodeError, ValueError):
+            pass
+    return ids
 
 
 async def _evaluate_interaction_records(
