@@ -106,9 +106,7 @@ class DatasetRegressionInvariantSuite(_StrictModel):
         if len(rule_ids) != len(set(rule_ids)):
             raise ValueError("regression invariant rule identifiers must be unique")
         requires_state = self.observation_authority == "committed_state_snapshot"
-        if not requires_state and any(
-            rule.type in _TRANSITION_RULE_TYPES for rule in self.rules
-        ):
+        if not requires_state and any(rule.type in _TRANSITION_RULE_TYPES for rule in self.rules):
             raise ValueError(
                 "state-transition regression rules require committed-state observation"
             )
