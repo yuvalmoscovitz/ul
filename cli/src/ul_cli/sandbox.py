@@ -11,6 +11,7 @@ import typer
 from ul.http_sandbox import (
     JsonHttpSandboxConnection,
     json_http_sandbox_calls_per_execution,
+    json_http_sandbox_config_sha256,
     load_json_http_sandbox_config,
 )
 from ul.sandbox import evaluation_case_from_inputs, validate_execution_evidence
@@ -33,35 +34,54 @@ def check_sandbox(
     ] = None,
     allow_sandbox_network_egress: Annotated[
         bool,
-        typer.Option(help="Allow calls to the configured sandbox API."),
+        typer.Option(
+            "--allow-sandbox-network-egress",
+            help="Authorize configured sandbox API calls.",
+            rich_help_panel="Required safety flags",
+        ),
     ] = False,
     confirm_isolated_sandbox: Annotated[
         bool,
         typer.Option(
-            help=(
-                "Attest that the endpoint is an isolated non-production sandbox. "
-                "UL does not verify its isolation."
-            )
+            "--confirm-isolated-sandbox",
+            help=("Attest the target is isolated and non-production. UL does not verify it."),
+            rich_help_panel="Required safety flags",
         ),
     ] = False,
     confirm_harmless_probe: Annotated[
         bool,
-        typer.Option(help="Attest that the probe cannot cause a real business effect."),
+        typer.Option(
+            "--confirm-harmless-probe",
+            help="Attest the probe cannot cause a real business effect.",
+            rich_help_panel="Required safety flags",
+        ),
     ] = False,
     allow_insecure_http: Annotated[
         bool,
-        typer.Option(help="Allow an HTTP sandbox API. Intended for local sandboxes."),
+        typer.Option(
+            "--allow-insecure-http",
+            help="Allow an HTTP sandbox API. Intended for local sandboxes.",
+        ),
     ] = False,
     request_timeout_seconds: Annotated[
         float,
-        typer.Option(min=0.1, max=60, help="Timeout for each sandbox API request."),
+        typer.Option(
+            "--timeout-seconds",
+            min=0.1,
+            max=60,
+            help="Timeout for each sandbox API request.",
+        ),
     ] = 10,
     output_json: Annotated[
         bool,
         typer.Option("--json", help="Print a safe machine-readable result."),
     ] = False,
 ) -> None:
-    """Run one probe through the complete lifecycle without UL semantic-model calls."""
+    """Run one probe through the complete lifecycle without UL semantic-model calls.
+
+    Requires --allow-sandbox-network-egress, --confirm-isolated-sandbox, and
+    --confirm-harmless-probe.
+    """
     if probe is None or not probe.strip():
         _preflight_failure(
             output_json=output_json,
@@ -70,7 +90,17 @@ def check_sandbox(
             remediation="Provide a non-sensitive input with --probe.",
             param_hint="--probe",
         )
-    if len(probe.encode("utf-8")) > 100_000:
+    try:
+        encoded_probe = probe.encode("utf-8")
+    except UnicodeEncodeError:
+        _preflight_failure(
+            output_json=output_json,
+            code="probe_invalid",
+            reason="probe must be valid UTF-8 text",
+            remediation="Provide a valid non-sensitive UTF-8 probe.",
+            param_hint="--probe",
+        )
+    if len(encoded_probe) > 100_000:
         _preflight_failure(
             output_json=output_json,
             code="probe_too_large",
@@ -125,24 +155,32 @@ def check_sandbox(
         )
     except (ValueError, RuntimeError) as error:
         reason = _terminal_safe(str(error))
-        code = (
-            "credential_configuration"
-            if "header environment variable" in reason
-            else "sandbox_config_invalid"
-        )
+        if "header environment variable" in reason:
+            code = "credential_configuration"
+            remediation = (
+                "Set the configured credential environment variable to a valid non-empty "
+                "ASCII value."
+            )
+            param_hint = "SANDBOX_CONFIG"
+        elif reason == "HTTP endpoints require explicit insecure transport opt-in":
+            code = "insecure_http_not_allowed"
+            remediation = (
+                "For an isolated local sandbox, pass --allow-insecure-http; otherwise use HTTPS."
+            )
+            param_hint = "--allow-insecure-http"
+        else:
+            code = "sandbox_config_invalid"
+            remediation = "Correct the sandbox configuration and try again."
+            param_hint = "SANDBOX_CONFIG"
         _preflight_failure(
             output_json=output_json,
             code=code,
             reason=reason,
-            remediation=(
-                "Set the configured credential environment variable to a valid non-empty value."
-                if code == "credential_configuration"
-                else "Correct the sandbox configuration and try again."
-            ),
-            param_hint="SANDBOX_CONFIG",
+            remediation=remediation,
+            param_hint=param_hint,
         )
     case = evaluation_case_from_inputs(
-        case_id=f"ul-sandbox-check-{uuid.uuid4().hex}",
+        case_id=f"ul-case-{uuid.uuid4().hex}",
         raw_inputs=(probe,),
         max_sandbox_api_calls=sandbox_api_calls,
         timeout_seconds=(sandbox_api_calls + 1) * request_timeout_seconds,
@@ -151,13 +189,27 @@ def check_sandbox(
     try:
         evidence = asyncio.run(_execute_and_close(sandbox, case))
     except TimeoutError:
-        _print_timeout_result(config.sandbox_id, sandbox_api_calls, output_json=output_json)
+        _print_timeout_result(
+            config.sandbox_id,
+            json_http_sandbox_config_sha256(config),
+            sandbox_api_calls,
+            output_json=output_json,
+        )
+        raise typer.Exit(code=2) from None
+    except Exception:
+        _print_unexpected_execution_result(
+            config.sandbox_id,
+            json_http_sandbox_config_sha256(config),
+            sandbox_api_calls,
+            output_json=output_json,
+        )
         raise typer.Exit(code=2) from None
     try:
         validate_execution_evidence(case, sandbox, evidence)
     except ValueError:
         _print_invalid_evidence_result(
             config.sandbox_id,
+            json_http_sandbox_config_sha256(config),
             sandbox_api_calls,
             output_json=output_json,
         )
@@ -182,25 +234,26 @@ async def _execute_and_close(
 def _print_success(
     evidence: ExecutionEvidence, sandbox_api_calls: int, *, output_json: bool
 ) -> None:
-    result = {
-        "status": "ready",
-        "sandbox_id": evidence.sandbox_id,
-        "sandbox_config_sha256": evidence.sandbox_config_sha256,
-        "sandbox_api_calls": sandbox_api_calls,
-        "completed_phases": list(evidence.lifecycle.completed_phases),
-        "state_observation_authority": evidence.final_state.authority
+    result = _sandbox_check_result(
+        status="ready",
+        sandbox_id=evidence.sandbox_id,
+        sandbox_config_sha256=evidence.sandbox_config_sha256,
+        sandbox_api_call_budget=sandbox_api_calls,
+        completed_phases=evidence.lifecycle.completed_phases,
+        state_observation_authority=evidence.final_state.authority
         if evidence.final_state is not None
         else None,
-        "probe_and_observations": "not_printed",
-        "ul_semantic_model_calls": 0,
-    }
+        delivery=evidence.lifecycle.delivery,
+        cleanup=evidence.lifecycle.cleanup,
+        sandbox_state_uncertain=evidence.lifecycle.sandbox_state_uncertain,
+    )
     if output_json:
         _print_safe(json.dumps(result, sort_keys=True))
         return
     _print_safe("Sandbox check: READY")
     _print_safe(f"Sandbox: {evidence.sandbox_id}")
     _print_safe(f"Lifecycle: {' -> '.join(evidence.lifecycle.completed_phases)}")
-    _print_safe(f"Sandbox API calls: {sandbox_api_calls}")
+    _print_safe(f"Sandbox API call budget: {sandbox_api_calls}")
     _print_safe("Probe, response, and state: not printed")
     _print_safe("UL semantic-model calls: 0")
     _print_safe("Isolation and probe safety: customer-attested, not verified by UL")
@@ -211,23 +264,26 @@ def _print_failure(
 ) -> None:
     lifecycle = evidence.lifecycle
     reason = lifecycle.failure_reason or "sandbox lifecycle failed without a diagnostic reason"
-    code, remediation = _diagnose_failure(reason, lifecycle.failed_phase or "unknown")
-    result = {
-        "status": "not_ready",
-        "sandbox_id": evidence.sandbox_id,
-        "sandbox_config_sha256": evidence.sandbox_config_sha256,
-        "sandbox_api_call_budget": sandbox_api_calls,
-        "failed_phase": lifecycle.failed_phase,
-        "error_code": code,
-        "reason": reason,
-        "remediation": remediation,
-        "delivery": lifecycle.delivery,
-        "cleanup": lifecycle.cleanup,
-        "cleanup_failure_reason": lifecycle.cleanup_failure_reason,
-        "sandbox_state_uncertain": lifecycle.sandbox_state_uncertain,
-        "probe_and_observations": "not_printed",
-        "ul_semantic_model_calls": 0,
-    }
+    code = lifecycle.failure_code
+    if code is None:
+        raise AssertionError("failed sandbox lifecycle requires a diagnostic code")
+    remediation = _remediation_for_code(code)
+    result = _sandbox_check_result(
+        status="not_ready",
+        sandbox_id=evidence.sandbox_id,
+        sandbox_config_sha256=evidence.sandbox_config_sha256,
+        sandbox_api_call_budget=sandbox_api_calls,
+        completed_phases=lifecycle.completed_phases,
+        failed_phase=lifecycle.failed_phase,
+        error_code=code,
+        reason=reason,
+        remediation=remediation,
+        delivery=lifecycle.delivery,
+        cleanup=lifecycle.cleanup,
+        cleanup_failure_code=lifecycle.cleanup_failure_code,
+        cleanup_failure_reason=lifecycle.cleanup_failure_reason,
+        sandbox_state_uncertain=lifecycle.sandbox_state_uncertain,
+    )
     if output_json:
         _print_safe(json.dumps(result, sort_keys=True))
         return
@@ -248,21 +304,26 @@ def _print_failure(
     _print_safe("UL semantic-model calls: 0")
 
 
-def _print_timeout_result(sandbox_id: str, sandbox_api_calls: int, *, output_json: bool) -> None:
-    result = {
-        "status": "not_ready",
-        "sandbox_id": sandbox_id,
-        "sandbox_api_call_budget": sandbox_api_calls,
-        "failed_phase": "lifecycle_deadline",
-        "error_code": "lifecycle_timeout",
-        "reason": "complete sandbox lifecycle exceeded its deadline",
-        "remediation": "Inspect sandbox availability and quarantine it before reuse.",
-        "delivery": "uncertain",
-        "cleanup": "unknown",
-        "sandbox_state_uncertain": True,
-        "probe_and_observations": "not_printed",
-        "ul_semantic_model_calls": 0,
-    }
+def _print_timeout_result(
+    sandbox_id: str,
+    sandbox_config_sha256: str,
+    sandbox_api_calls: int,
+    *,
+    output_json: bool,
+) -> None:
+    result = _sandbox_check_result(
+        status="not_ready",
+        sandbox_id=sandbox_id,
+        sandbox_config_sha256=sandbox_config_sha256,
+        sandbox_api_call_budget=sandbox_api_calls,
+        failed_phase="lifecycle_deadline",
+        error_code="lifecycle_timeout",
+        reason="complete sandbox lifecycle exceeded its deadline",
+        remediation="Inspect sandbox availability and quarantine it before reuse.",
+        delivery="uncertain",
+        cleanup="unknown",
+        sandbox_state_uncertain=True,
+    )
     if output_json:
         _print_safe(json.dumps(result, sort_keys=True))
         return
@@ -278,19 +339,25 @@ def _print_timeout_result(sandbox_id: str, sandbox_api_calls: int, *, output_jso
 
 
 def _print_invalid_evidence_result(
-    sandbox_id: str, sandbox_api_calls: int, *, output_json: bool
+    sandbox_id: str,
+    sandbox_config_sha256: str,
+    sandbox_api_calls: int,
+    *,
+    output_json: bool,
 ) -> None:
-    result = {
-        "status": "not_ready",
-        "sandbox_id": sandbox_id,
-        "sandbox_api_call_budget": sandbox_api_calls,
-        "failed_phase": "evidence_validation",
-        "error_code": "invalid_lifecycle_evidence",
-        "reason": "sandbox lifecycle evidence did not match the requested probe",
-        "remediation": "Verify sandbox, case, turn, and state-observer identity handling.",
-        "probe_and_observations": "not_printed",
-        "ul_semantic_model_calls": 0,
-    }
+    result = _sandbox_check_result(
+        status="not_ready",
+        sandbox_id=sandbox_id,
+        sandbox_config_sha256=sandbox_config_sha256,
+        sandbox_api_call_budget=sandbox_api_calls,
+        failed_phase="evidence_validation",
+        error_code="invalid_lifecycle_evidence",
+        reason="sandbox lifecycle evidence did not match the requested probe",
+        remediation="Verify sandbox, case, turn, and state-observer identity handling.",
+        delivery="uncertain",
+        cleanup="unknown",
+        sandbox_state_uncertain=True,
+    )
     if output_json:
         _print_safe(json.dumps(result, sort_keys=True))
         return
@@ -303,147 +370,134 @@ def _print_invalid_evidence_result(
     _print_safe("UL semantic-model calls: 0")
 
 
-def _diagnose_failure(reason: str, phase: str) -> tuple[str, str]:
-    if reason.startswith("sandbox API returned HTTP "):
-        status_code = reason.removeprefix("sandbox API returned HTTP ")
-        if status_code in {"401", "403"}:
-            return "authentication_rejected", "Verify sandbox credentials and permissions."
-        if status_code == "429":
-            return "rate_limited", "Wait for sandbox capacity or adjust its request quota."
-        return "http_status", "Verify endpoint routing and sandbox service health."
-    diagnostics = (
-        (
-            "header environment variable",
-            "credential_configuration",
-            "Set the configured credential environment variable to a valid non-empty value.",
-        ),
-        (
-            "response must be JSON",
-            "response_content_type",
-            "Return application/json from this lifecycle endpoint.",
-        ),
-        (
-            "must not use content encoding",
-            "response_content_encoding",
-            "Disable compressed lifecycle responses.",
-        ),
-        (
-            "returned invalid JSON",
-            "invalid_json",
-            "Return bounded, standards-compliant JSON without duplicate keys.",
-        ),
-        (
-            "returned null JSON",
-            "null_json",
-            "Return the configured lifecycle response object instead of null.",
-        ),
-        (
-            "JSON pointer",
-            "response_mapping",
-            "Correct the response JSON pointer for this lifecycle phase.",
-        ),
-        (
-            "identity did not match",
-            "sandbox_identity",
-            "Return the configured sandbox_id and the request case identity unchanged.",
-        ),
-        (
-            "response did not match its case",
-            "case_identity",
-            "Echo the request case_id unchanged in the response.",
-        ),
-        (
-            "response did not match its turn",
-            "turn_identity",
-            "Echo the request turn_id unchanged in the response.",
-        ),
-        (
-            "reset generation is invalid",
-            "reset_generation",
-            "Return a non-empty string or integer reset generation.",
-        ),
-        (
-            "reset generation did not change",
-            "reset_generation_reused",
-            "Return a new generation after every reset, including cleanup.",
-        ),
-        (
-            "reset did not report clean state",
-            "reset_not_clean",
-            "Return the configured clean-state acknowledgement only after reset completes.",
-        ),
-        (
-            "request exceeds the size limit",
-            "request_too_large",
-            "Reduce the probe or configured request template size.",
-        ),
-        (
-            "response exceeds the size limit",
-            "response_too_large",
-            "Reduce the lifecycle response size.",
-        ),
-        ("call budget exhausted", "call_budget", "Increase the explicit sandbox API call budget."),
-        (
-            "request timed out",
-            "request_timeout",
-            "Inspect sandbox availability and state; do not retry an ambiguous mutation blindly.",
-        ),
-        (
-            "request write timed out",
-            "write_timeout",
-            "Inspect sandbox availability and state; do not retry an ambiguous mutation blindly.",
-        ),
-        (
-            "response timed out",
-            "response_timeout",
-            "Inspect sandbox availability and state; do not retry an ambiguous mutation blindly.",
-        ),
-        (
-            "connection timed out",
-            "connect_timeout",
-            "Verify the sandbox address, firewall, and service availability.",
-        ),
-        (
-            "connection pool timed out",
-            "pool_timeout",
-            "Reduce local concurrency or increase sandbox connection capacity.",
-        ),
-        (
-            "DNS resolution failed",
-            "dns_resolution",
-            "Verify the configured sandbox hostname and DNS availability.",
-        ),
-        (
-            "TLS connection failed",
-            "tls_connection",
-            "Verify the sandbox certificate, hostname, and trust configuration.",
-        ),
-        (
-            "connection failed",
-            "connect_failed",
-            "Verify the sandbox address, DNS, TLS, firewall, and service availability.",
-        ),
-        (
-            "transport protocol failed",
-            "transport_protocol",
-            "Inspect the sandbox HTTP server and intermediary protocol handling.",
-        ),
-        (
-            "transport failed",
-            "transport_failed",
-            "Inspect transport health and sandbox state; do not retry an ambiguous "
-            "execute blindly.",
-        ),
-        (
-            "state is uncertain",
-            "sandbox_state_uncertain",
-            "Quarantine and independently reset the sandbox before reuse.",
-        ),
+def _print_unexpected_execution_result(
+    sandbox_id: str,
+    sandbox_config_sha256: str,
+    sandbox_api_calls: int,
+    *,
+    output_json: bool,
+) -> None:
+    reason = "sandbox check failed before safe lifecycle evidence was available"
+    remediation = "Quarantine the sandbox before reuse and inspect its lifecycle implementation."
+    result = _sandbox_check_result(
+        status="not_ready",
+        sandbox_id=sandbox_id,
+        sandbox_config_sha256=sandbox_config_sha256,
+        sandbox_api_call_budget=sandbox_api_calls,
+        failed_phase="execution_boundary",
+        error_code="unexpected_execution_error",
+        reason=reason,
+        remediation=remediation,
+        delivery="uncertain",
+        cleanup="unknown",
+        sandbox_state_uncertain=True,
     )
-    for fragment, code, remediation in diagnostics:
-        if fragment in reason:
-            return code, remediation
-    return f"{phase}_protocol_error", "Inspect the configured lifecycle contract for this phase."
+    if output_json:
+        _print_safe(json.dumps(result, sort_keys=True))
+        return
+    _print_safe("Sandbox check: NOT READY")
+    _print_safe("Failed phase: execution_boundary")
+    _print_safe("Error: unexpected_execution_error")
+    _print_safe(f"Reason: {reason}")
+    _print_safe(f"Remediation: {remediation}")
+    _print_safe("Delivery: uncertain")
+    _print_safe("Cleanup: unknown")
+    _print_safe("Sandbox state: UNCERTAIN — quarantine before reuse")
+    _print_safe("Probe, response, and state: not printed")
+    _print_safe("UL semantic-model calls: 0")
+
+
+def _sandbox_check_result(
+    *,
+    status: str,
+    sandbox_id: str | None = None,
+    sandbox_config_sha256: str | None = None,
+    sandbox_api_call_budget: int | None = None,
+    completed_phases: tuple[str, ...] = (),
+    state_observation_authority: str | None = None,
+    failed_phase: str | None = None,
+    error_code: str | None = None,
+    reason: str | None = None,
+    remediation: str | None = None,
+    delivery: str | None = None,
+    cleanup: str | None = None,
+    cleanup_failure_code: str | None = None,
+    cleanup_failure_reason: str | None = None,
+    sandbox_state_uncertain: bool | None = None,
+) -> dict[str, object]:
+    return {
+        "schema_version": 1,
+        "status": status,
+        "sandbox_id": sandbox_id,
+        "sandbox_config_sha256": sandbox_config_sha256,
+        "sandbox_api_call_budget": sandbox_api_call_budget,
+        "completed_phases": list(completed_phases),
+        "state_observation_authority": state_observation_authority,
+        "failed_phase": failed_phase,
+        "error_code": error_code,
+        "reason": reason,
+        "remediation": remediation,
+        "delivery": delivery,
+        "cleanup": cleanup,
+        "cleanup_failure_code": cleanup_failure_code,
+        "cleanup_failure_reason": cleanup_failure_reason,
+        "sandbox_state_uncertain": sandbox_state_uncertain,
+        "probe_and_observations": "not_printed",
+        "ul_semantic_model_calls": 0,
+    }
+
+
+def _remediation_for_code(code: str) -> str:
+    return {
+        "authentication_rejected": "Verify sandbox credentials and permissions.",
+        "rate_limited": "Wait for sandbox capacity or adjust its request quota.",
+        "http_status": "Verify endpoint routing, request identity, and sandbox service logs.",
+        "response_content_type": "Return application/json from this lifecycle endpoint.",
+        "response_content_encoding": "Disable compressed lifecycle responses.",
+        "invalid_json": "Return bounded, standards-compliant JSON without duplicate keys.",
+        "null_json": "Return the configured lifecycle response object instead of null.",
+        "response_mapping": "Correct the response JSON pointer for this lifecycle phase.",
+        "sandbox_identity": (
+            "Return the configured sandbox_id and the request case identity unchanged."
+        ),
+        "case_identity": "Echo the request case_id unchanged in the response.",
+        "turn_identity": "Echo the request turn_id unchanged in the response.",
+        "reset_generation": "Return a non-empty string or integer reset generation.",
+        "reset_generation_reused": "Return a new generation after every reset.",
+        "reset_not_clean": (
+            "Return the configured clean-state acknowledgement only after reset completes."
+        ),
+        "request_too_large": "Reduce the probe or configured request template size.",
+        "response_too_large": "Reduce the lifecycle response size.",
+        "call_budget": "Increase the explicit sandbox API call budget.",
+        "request_timeout": (
+            "Inspect sandbox availability and state; do not retry an ambiguous mutation blindly."
+        ),
+        "write_timeout": (
+            "Inspect sandbox availability and state; do not retry an ambiguous mutation blindly."
+        ),
+        "response_timeout": (
+            "Inspect sandbox availability and state; do not retry an ambiguous mutation blindly."
+        ),
+        "connect_timeout": "Verify the sandbox address, firewall, and service availability.",
+        "pool_timeout": "Reduce local concurrency or increase sandbox connection capacity.",
+        "dns_resolution": "Verify the configured sandbox hostname and DNS availability.",
+        "tls_connection": "Verify the sandbox certificate, hostname, and trust configuration.",
+        "connect_failed": (
+            "Verify the sandbox address, DNS, TLS, firewall, and service availability."
+        ),
+        "transport_protocol": "Inspect the sandbox HTTP server and intermediary protocol handling.",
+        "transport_failed": (
+            "Inspect transport health and sandbox state; do not retry an ambiguous execute blindly."
+        ),
+        "sandbox_state_uncertain": "Quarantine and independently reset the sandbox before reuse.",
+        "sandbox_lifecycle_error": (
+            "Quarantine the sandbox before reuse and inspect its lifecycle implementation."
+        ),
+        "sandbox_cleanup_error": (
+            "Quarantine the sandbox and independently restore clean state before reuse."
+        ),
+    }.get(code, "Inspect the configured lifecycle contract for the failed phase.")
 
 
 def _print_safe(message: str) -> None:
@@ -471,15 +525,13 @@ def _preflight_failure(
     if output_json:
         _print_safe(
             json.dumps(
-                {
-                    "status": "not_ready",
-                    "failed_phase": "preflight",
-                    "error_code": code,
-                    "reason": reason,
-                    "remediation": remediation,
-                    "probe_and_observations": "not_printed",
-                    "ul_semantic_model_calls": 0,
-                },
+                _sandbox_check_result(
+                    status="not_ready",
+                    failed_phase="preflight",
+                    error_code=code,
+                    reason=reason,
+                    remediation=remediation,
+                ),
                 sort_keys=True,
             )
         )

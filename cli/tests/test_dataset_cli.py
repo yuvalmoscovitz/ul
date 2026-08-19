@@ -989,11 +989,11 @@ def test_target_config_dry_run_validates_environment_and_makes_no_calls(
     _write_dataset(dataset, [_record()])
     _write_target_config(
         target_config,
-        headers_from_env={"Authorization": "SANDBOX_TOKEN"},
+        headers_from_env={"Authorization": "UL_SANDBOX_TOKEN"},
         request_json_template={"request": {"message": "{{input}}"}},
         response_json_pointer="/result",
     )
-    monkeypatch.setenv("SANDBOX_TOKEN", "Bearer test-token")
+    monkeypatch.setenv("UL_SANDBOX_TOKEN", "Bearer test-token")
 
     def unexpected_deconstructor(*args: object, **kwargs: object) -> None:
         raise AssertionError("dry-run constructed a semantic model client")
@@ -1013,11 +1013,11 @@ def test_target_config_dry_run_validates_environment_and_makes_no_calls(
 
     assert result.exit_code == 0, result.output
     assert "Customer-managed sandbox API: configured" in result.output
-    assert "Authorization=SANDBOX_TOKEN" in result.output
+    assert "Authorization=UL_SANDBOX_TOKEN" in result.output
     assert "Bearer test-token" not in result.output
     assert "No model or sandbox API requests sent" in result.output
 
-    monkeypatch.delenv("SANDBOX_TOKEN")
+    monkeypatch.delenv("UL_SANDBOX_TOKEN")
     missing_environment = runner.invoke(
         root_app,
         [
@@ -1408,9 +1408,9 @@ def test_execution_rejects_missing_header_secret_before_model_or_output(
     _write_dataset(dataset, [_record()])
     _write_target_config(
         target_config,
-        headers_from_env={"Authorization": "MISSING_SANDBOX_TOKEN"},
+        headers_from_env={"Authorization": "UL_SANDBOX_MISSING_TOKEN"},
     )
-    monkeypatch.delenv("MISSING_SANDBOX_TOKEN", raising=False)
+    monkeypatch.delenv("UL_SANDBOX_MISSING_TOKEN", raising=False)
     monkeypatch.setattr(
         main,
         "load_dataset_semantic_settings",

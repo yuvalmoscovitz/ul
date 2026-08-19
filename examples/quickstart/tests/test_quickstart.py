@@ -16,9 +16,11 @@ from typing import Any, cast
 import httpx
 import pytest
 import typer
+from typer.testing import CliRunner
 from ul.dataset_invariants import JsonValuesEqualInvariant, load_dataset_invariant_suite
 from ul.http_sandbox import JsonHttpSandboxConfig, JsonHttpSandboxConnection
 from ul.sandbox import evaluation_case_from_inputs
+from ul_cli.main import app
 
 from examples.quickstart import run as quickstart
 from examples.quickstart.defective_agent import create_server
@@ -149,6 +151,48 @@ async def test_stateful_target_adapter_resets_executes_and_snapshots() -> None:
         "snapshot",
         "cleanup_reset",
     )
+
+
+def test_sandbox_check_runs_against_the_bundled_quickstart(tmp_path: Path) -> None:
+    probe = "Pay AC-100."
+    with _running_server() as (base_url, _server):
+        target_path = tmp_path / "target.json"
+        target_path.write_text(
+            json.dumps(quickstart.load_target_template(base_url)), encoding="utf-8"
+        )
+        result = CliRunner().invoke(
+            app,
+            [
+                "sandbox",
+                "check",
+                str(target_path),
+                "--probe",
+                probe,
+                "--allow-sandbox-network-egress",
+                "--confirm-isolated-sandbox",
+                "--confirm-harmless-probe",
+                "--allow-insecure-http",
+                "--json",
+            ],
+        )
+
+    assert result.exit_code == 0, result.output
+    summary = json.loads(result.output)
+    assert summary["status"] == "ready"
+    assert summary["sandbox_id"] == "quickstart-accounts-payable"
+    assert summary["sandbox_api_call_budget"] == 6
+    assert summary["completed_phases"] == [
+        "reset",
+        "setup",
+        "initial_snapshot",
+        "execute_turn",
+        "snapshot",
+        "cleanup_reset",
+    ]
+    assert summary["state_observation_authority"] == "sandbox_self_reported"
+    assert summary["ul_semantic_model_calls"] == 0
+    assert probe not in result.output
+    assert "payment_committed" not in result.output
 
 
 @pytest.mark.parametrize(
@@ -589,6 +633,35 @@ def test_dry_run_is_a_real_subprocess_and_needs_no_api_key(tmp_path: Path) -> No
 
     assert completed.returncode == 0, completed.stdout + completed.stderr
     assert "No model or target requests sent." in completed.stdout
+    assert "OPEN_ROUTER_API_KEY" not in environment
+
+
+def test_sandbox_check_is_a_real_subprocess_and_needs_no_api_key() -> None:
+    environment = {
+        "PATH": os.environ["PATH"],
+        "PYTHONPATH": os.pathsep.join(
+            [
+                str(_PROJECT_ROOT / "core/src"),
+                str(_PROJECT_ROOT / "sdk/src"),
+                str(_PROJECT_ROOT / "cli/src"),
+            ]
+        ),
+    }
+
+    completed = subprocess.run(
+        [sys.executable, "-m", "examples.quickstart.run", "--sandbox-check"],
+        cwd=_PROJECT_ROOT,
+        env=environment,
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+        shell=False,
+    )
+
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    assert "Sandbox check: READY" in completed.stdout
+    assert "No API key or UL semantic-model calls used." in completed.stdout
     assert "OPEN_ROUTER_API_KEY" not in environment
 
 

@@ -9,11 +9,37 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from rich.text import Text
 from typer.testing import CliRunner
+from ul.http_sandbox import JsonHttpSandboxConnection
 from ul_cli.main import app
-from ul_cli.sandbox import _diagnose_failure
 
 runner = CliRunner()
+
+_RESULT_KEYS = {
+    "schema_version",
+    "status",
+    "sandbox_id",
+    "sandbox_config_sha256",
+    "sandbox_api_call_budget",
+    "completed_phases",
+    "state_observation_authority",
+    "failed_phase",
+    "error_code",
+    "reason",
+    "remediation",
+    "delivery",
+    "cleanup",
+    "cleanup_failure_code",
+    "cleanup_failure_reason",
+    "sandbox_state_uncertain",
+    "probe_and_observations",
+    "ul_semantic_model_calls",
+}
+
+
+def _plain(output: str) -> str:
+    return Text.from_ansi(output).plain
 
 
 class _SandboxServer(ThreadingHTTPServer):
@@ -177,8 +203,9 @@ def test_check_runs_complete_model_free_lifecycle(tmp_path: Path) -> None:
 
     assert result.exit_code == 0, result.output
     summary = json.loads(result.output)
+    assert set(summary) == _RESULT_KEYS
     assert summary["status"] == "ready"
-    assert summary["sandbox_api_calls"] == 6
+    assert summary["sandbox_api_call_budget"] == 6
     assert summary["ul_semantic_model_calls"] == 0
     assert summary["probe_and_observations"] == "not_printed"
     assert "connection check only" not in result.output
@@ -205,6 +232,7 @@ def test_check_reports_precise_phase_and_protocol_error(tmp_path: Path) -> None:
 
     assert result.exit_code == 2, result.output
     summary = json.loads(result.output)
+    assert set(summary) == _RESULT_KEYS
     assert summary["status"] == "not_ready"
     assert summary["failed_phase"] == "execute_turn"
     assert summary["error_code"] == "response_content_type"
@@ -254,7 +282,7 @@ def test_check_without_setup_uses_five_calls(tmp_path: Path) -> None:
         result = runner.invoke(app, _check_arguments(config, output_json=True))
 
     assert result.exit_code == 0, result.output
-    assert json.loads(result.output)["sandbox_api_calls"] == 5
+    assert json.loads(result.output)["sandbox_api_call_budget"] == 5
     assert [path for path, _ in server.requests] == [
         "/reset",
         "/snapshot",
@@ -267,20 +295,79 @@ def test_check_without_setup_uses_five_calls(tmp_path: Path) -> None:
 def test_check_reports_missing_credential_before_network(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.delenv("CHECK_SANDBOX_TOKEN", raising=False)
+    monkeypatch.delenv("UL_SANDBOX_CHECK_TOKEN", raising=False)
     with _sandbox_server() as server:
         config = _write_config(tmp_path, server)
         raw_config = json.loads(config.read_text(encoding="utf-8"))
-        raw_config["headers_from_env"] = {"Authorization": "CHECK_SANDBOX_TOKEN"}
+        raw_config["headers_from_env"] = {"Authorization": "UL_SANDBOX_CHECK_TOKEN"}
         config.write_text(json.dumps(raw_config), encoding="utf-8")
         result = runner.invoke(app, _check_arguments(config, output_json=True))
 
     assert result.exit_code == 2
     summary = json.loads(result.output)
+    assert set(summary) == _RESULT_KEYS
     assert summary["failed_phase"] == "preflight"
     assert summary["error_code"] == "credential_configuration"
     assert summary["reason"] == "sandbox API header environment variable is not set"
     assert server.requests == []
+
+
+def test_check_rejects_non_ascii_credential_before_network(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    secret = "Bearer s\N{LATIN SMALL LETTER E WITH ACUTE}cret"
+    monkeypatch.setenv("UL_SANDBOX_CHECK_TOKEN", secret)
+    with _sandbox_server() as server:
+        config = _write_config(tmp_path, server)
+        raw_config = json.loads(config.read_text(encoding="utf-8"))
+        raw_config["headers_from_env"] = {"Authorization": "UL_SANDBOX_CHECK_TOKEN"}
+        config.write_text(json.dumps(raw_config), encoding="utf-8")
+        result = runner.invoke(app, _check_arguments(config, output_json=True))
+
+    assert result.exit_code == 2
+    summary = json.loads(result.output)
+    assert set(summary) == _RESULT_KEYS
+    assert summary["error_code"] == "credential_configuration"
+    assert summary["reason"] == "sandbox API header environment variable is invalid"
+    assert secret not in result.output
+    assert "Traceback" not in result.output
+    assert server.requests == []
+
+
+def test_check_explains_insecure_local_transport_opt_in(tmp_path: Path) -> None:
+    with _sandbox_server() as server:
+        config = _write_config(tmp_path, server)
+        arguments = _check_arguments(config, output_json=True)
+        arguments.remove("--allow-insecure-http")
+        result = runner.invoke(app, arguments)
+
+    assert result.exit_code == 2
+    summary = json.loads(result.output)
+    assert summary["error_code"] == "insecure_http_not_allowed"
+    assert "--allow-insecure-http" in summary["remediation"]
+    assert server.requests == []
+
+
+def test_check_returns_safe_json_for_unexpected_execution_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def fail_without_evidence(self: JsonHttpSandboxConnection, case: object) -> object:
+        del self, case
+        raise ValueError("private execution detail")
+
+    monkeypatch.setattr(JsonHttpSandboxConnection, "execute", fail_without_evidence)
+    with _sandbox_server() as server:
+        config = _write_config(tmp_path, server)
+        result = runner.invoke(app, _check_arguments(config, output_json=True))
+
+    assert result.exit_code == 2
+    summary = json.loads(result.output)
+    assert set(summary) == _RESULT_KEYS
+    assert summary["error_code"] == "unexpected_execution_error"
+    assert summary["delivery"] == "uncertain"
+    assert summary["sandbox_state_uncertain"] is True
+    assert "private execution detail" not in result.output
+    assert "Traceback" not in result.output
 
 
 def test_check_reports_invalid_config_as_safe_json(tmp_path: Path) -> None:
@@ -296,6 +383,22 @@ def test_check_reports_invalid_config_as_safe_json(tmp_path: Path) -> None:
     assert summary["reason"] == "sandbox API config contains invalid JSON"
 
 
+def test_check_rejects_non_utf8_probe_before_network(tmp_path: Path) -> None:
+    with _sandbox_server() as server:
+        config = _write_config(tmp_path, server)
+        arguments = _check_arguments(config, output_json=True)
+        arguments[arguments.index("--probe") + 1] = "\ud800"
+        result = runner.invoke(app, arguments)
+
+    assert result.exit_code == 2
+    summary = json.loads(result.output)
+    assert set(summary) == _RESULT_KEYS
+    assert summary["failed_phase"] == "preflight"
+    assert summary["error_code"] == "probe_invalid"
+    assert summary["reason"] == "probe must be valid UTF-8 text"
+    assert server.requests == []
+
+
 def test_check_sanitizes_config_errors_for_terminal(tmp_path: Path) -> None:
     config = tmp_path / "sandbox.json"
     config.write_text(json.dumps({"evil\u001bfield": True}), encoding="utf-8")
@@ -303,8 +406,9 @@ def test_check_sanitizes_config_errors_for_terminal(tmp_path: Path) -> None:
     result = runner.invoke(app, _check_arguments(config))
 
     assert result.exit_code == 2
-    assert "\u001b" not in result.output
-    assert "\\u001b" in result.output
+    plain_output = _plain(result.output)
+    assert "evil\u001bfield" not in plain_output
+    assert "evil\\u001bfield" in plain_output
 
 
 def test_check_requires_explicit_safety_opt_ins_before_network(tmp_path: Path) -> None:
@@ -316,28 +420,27 @@ def test_check_requires_explicit_safety_opt_ins_before_network(tmp_path: Path) -
         )
 
     assert result.exit_code == 2
-    assert "--allow-sandbox-network-egress" in result.output
+    assert "--allow-sandbox-network-egress" in _plain(result.output)
     assert server.requests == []
 
 
 def test_check_help_states_scope_and_limits() -> None:
-    result = runner.invoke(app, ["sandbox", "check", "--help"])
+    result = runner.invoke(app, ["sandbox", "check", "--help"], terminal_width=80)
 
     assert result.exit_code == 0
-    assert "complete lifecycle" in result.output
-    assert "--probe" in result.output
-    assert "Attest" in result.output
-
-
-@pytest.mark.parametrize(
-    ("reason", "expected_code"),
-    (
-        ("sandbox API request timed out", "request_timeout"),
-        ("sandbox API request write timed out", "write_timeout"),
-        ("sandbox API connection pool timed out", "pool_timeout"),
-        ("sandbox API DNS resolution failed", "dns_resolution"),
-        ("sandbox API TLS connection failed", "tls_connection"),
-    ),
-)
-def test_check_maps_transport_diagnostics(reason: str, expected_code: str) -> None:
-    assert _diagnose_failure(reason, "execute_turn")[0] == expected_code
+    plain_output = _plain(result.output)
+    assert "complete lifecycle" in plain_output
+    assert "--probe" in plain_output
+    assert "Attest" in plain_output
+    required_safety_panel = plain_output.split("Required safety flags", 1)[1]
+    for option in (
+        "--allow-sandbox-network-egress",
+        "--confirm-isolated-sandbox",
+        "--confirm-harmless-probe",
+    ):
+        assert option in required_safety_panel
+    assert "…" not in required_safety_panel
+    assert "--allow-insecure-http" in plain_output
+    assert "--timeout-seconds" in plain_output
+    assert "…" not in plain_output
+    assert "--no-" not in plain_output

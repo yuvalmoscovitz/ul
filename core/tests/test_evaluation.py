@@ -146,6 +146,8 @@ def test_uncertain_delivery_requires_uncertain_sandbox_state() -> None:
         SandboxLifecycleEvidence(
             terminal_status="failed",
             failed_phase="execute_turn",
+            failure_code="response_timeout",
+            failure_reason="sandbox API response timed out",
             delivery="uncertain",
             cleanup="succeeded",
             sandbox_state_uncertain=False,
@@ -157,8 +159,36 @@ def test_cleanup_failure_requires_safe_detail() -> None:
         SandboxLifecycleEvidence(
             terminal_status="failed",
             failed_phase="cleanup_reset",
+            failure_code="reset_not_clean",
+            failure_reason="sandbox API reset did not report clean state",
             delivery="certain",
             cleanup="failed",
+            sandbox_state_uncertain=True,
+        )
+
+
+def test_failure_reason_requires_stable_code() -> None:
+    with pytest.raises(ValidationError, match="failure code and reason"):
+        SandboxLifecycleEvidence(
+            terminal_status="failed",
+            failed_phase="execute_turn",
+            failure_reason="sandbox lifecycle failed",
+            delivery="certain",
+            cleanup="succeeded",
+            sandbox_state_uncertain=False,
+        )
+
+
+def test_cleanup_failure_reason_requires_stable_code() -> None:
+    with pytest.raises(ValidationError, match="cleanup failure code and reason"):
+        SandboxLifecycleEvidence(
+            terminal_status="failed",
+            failed_phase="cleanup_reset",
+            failure_code="reset_not_clean",
+            failure_reason="sandbox API reset did not report clean state",
+            delivery="certain",
+            cleanup="failed",
+            cleanup_failure_reason="sandbox API reset did not report clean state",
             sandbox_state_uncertain=True,
         )
 
