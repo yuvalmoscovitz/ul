@@ -110,3 +110,12 @@ ul dataset evaluate interactions.jsonl \
 or writing mapping state. Execution and resume also require `--redaction-state` and the
 `UL_DATASET_REDACTION_KEY` environment variable. The evidence run context contains the policy
 digest and aggregate input/output coverage, never the key, selected values, state path, or mapping.
+
+Dataset execution saves generated augmentations by default beside the evidence file as
+`NAME.augmentations.jsonl`. This private ledger is written before sandbox execution and reused on
+resume. It contains the effective raw or pseudonymized interaction plus derived semantic data; it
+does not serialize configured semantic/sandbox authentication values or reversible pseudonym
+mappings. Raw interaction text may itself contain secrets when redaction is absent or incomplete.
+Mode `0600` limits filesystem access on Unix but does not encrypt or redact the contents. Use `--augmentations-output` to place
+it in an approved retention location, or `--no-save-augmentations` when policy prohibits local
+retention and repeated generation is acceptable.

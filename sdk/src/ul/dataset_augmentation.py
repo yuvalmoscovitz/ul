@@ -175,9 +175,44 @@ class DatasetAugmentationCandidate(ULModel):
     failure_reasons: tuple[str, ...] = ()
 
 
+class DatasetAugmentationOperatorReference(ULModel):
+    id: OperatorId
+    version: str = Field(
+        default="1.0.0",
+        pattern=r"^(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)$",
+    )
+
+
 class DatasetAugmentationResult(ULModel):
+    operator_references: tuple[DatasetAugmentationOperatorReference, ...] = Field(min_length=1)
+    source_records: tuple[InteractionRecord, ...]
     source_frames: tuple[SemanticFrame, ...]
     candidates: tuple[DatasetAugmentationCandidate, ...]
+
+    @model_validator(mode="after")
+    def validate_operator_plan(self) -> Self:
+        if tuple(record.id for record in self.source_records) != tuple(
+            frame.interaction_id for frame in self.source_frames
+        ):
+            raise ValueError("augmentation source records and frames must match")
+        references = tuple(
+            (reference.id, reference.version) for reference in self.operator_references
+        )
+        if len(references) != len(set(references)):
+            raise ValueError("augmentation result contains duplicate operator references")
+        positions = {reference: index for index, reference in enumerate(references)}
+        candidate_references = tuple(
+            (candidate.operator_id, candidate.operator_version) for candidate in self.candidates
+        )
+        try:
+            candidate_positions = tuple(positions[reference] for reference in candidate_references)
+        except KeyError:
+            raise ValueError(
+                "augmentation candidate is outside the requested operator plan"
+            ) from None
+        if candidate_positions != tuple(sorted(candidate_positions)):
+            raise ValueError("augmentation candidates must follow requested operator order")
+        return self
 
 
 class DatasetAugmentationEngine:
@@ -379,7 +414,13 @@ class DatasetAugmentationEngine:
                     )
                 )
         return DatasetAugmentationResult(
-            source_frames=tuple(source_frames), candidates=tuple(candidates)
+            operator_references=tuple(
+                DatasetAugmentationOperatorReference(id=operator.id, version=operator.version)
+                for operator in selected_operators
+            ),
+            source_records=source_records,
+            source_frames=tuple(source_frames),
+            candidates=tuple(candidates),
         )
 
 

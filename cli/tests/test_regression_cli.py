@@ -291,7 +291,16 @@ def _technical_details() -> dict[str, Any]:
             raw_observed_output={},
         ),
         augmentation=DatasetAugmentationResult(
-            source_frames=(source_frame,), candidates=(candidate,)
+            operator_references=({"id": candidate.operator_id, "version": "1.0.0"},),
+            source_records=(
+                InteractionRecord(
+                    id="quickstart-payment",
+                    raw_input="Pay AC-100.",
+                    raw_observed_output={},
+                ),
+            ),
+            source_frames=(source_frame,),
+            candidates=(candidate,),
         ),
         baseline=DatasetEvaluationBaseline(
             verdict="no_divergence",

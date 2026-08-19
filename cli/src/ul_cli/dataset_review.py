@@ -266,6 +266,7 @@ class DatasetResumeEvidence:
     processed_ids: frozenset[str]
     has_review_findings: bool
     invariant_evaluations: tuple[DatasetInvariantEvaluation, ...]
+    technical_results: tuple[DatasetEvaluationResult, ...]
     raw_evidence_sha256: str
 
 
@@ -337,14 +338,23 @@ def validate_dataset_resume_evidence(
     elif invariant_suite.sha256 != expected_context.invariant_suite_sha256:
         raise ValueError("resume invariant suite does not match the current evaluation plan")
     raw_lines = raw_evidence.splitlines()
-    if not raw_lines or len(raw_lines) > _MAXIMUM_EVIDENCE_RECORDS:
-        raise ValueError("resume evidence must contain 1 to 100 JSONL records")
+    if not raw_lines:
+        return DatasetResumeEvidence(
+            processed_ids=frozenset(),
+            has_review_findings=False,
+            invariant_evaluations=(),
+            technical_results=(),
+            raw_evidence_sha256=hashlib.sha256(raw_evidence).hexdigest(),
+        )
+    if len(raw_lines) > _MAXIMUM_EVIDENCE_RECORDS:
+        raise ValueError("resume evidence must contain at most 100 JSONL records")
     if any(not raw_line.strip() for raw_line in raw_lines):
         raise ValueError("resume evidence contains an empty JSONL record")
     selected_records_by_id = {record.id: record for record in selected_records}
     processed_ids: set[str] = set()
     has_review_findings = False
     invariant_evaluations: list[DatasetInvariantEvaluation] = []
+    technical_results: list[DatasetEvaluationResult] = []
     for raw_line in raw_lines:
         try:
             evidence = _EvidenceRecord.model_validate_json(raw_line)
@@ -368,6 +378,7 @@ def validate_dataset_resume_evidence(
             )
         except (ValidationError, ValueError):
             raise ValueError("resume evidence contains invalid technical details") from None
+        technical_results.append(technical_result)
         if technical_result.source != selected_record:
             raise ValueError("resume evidence source does not match the selected dataset")
         if evidence.original_input != technical_result.source.raw_input:
@@ -418,6 +429,7 @@ def validate_dataset_resume_evidence(
         processed_ids=frozenset(processed_ids),
         has_review_findings=has_review_findings,
         invariant_evaluations=tuple(invariant_evaluations),
+        technical_results=tuple(technical_results),
         raw_evidence_sha256=hashlib.sha256(raw_evidence).hexdigest(),
     )
 

@@ -2,13 +2,13 @@ from __future__ import annotations
 
 import asyncio
 import json
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from pathlib import Path
 from typing import Literal, cast
 
 import pytest
 from pydantic import JsonValue, SecretStr, ValidationError
-from ul.dataset_augmentation import DatasetAugmentationEngine
+from ul.dataset_augmentation import DatasetAugmentationEngine, DatasetAugmentationResult
 from ul.dataset_evaluation import (
     DatasetEvaluationBaseline,
     DatasetEvaluationCase,
@@ -76,11 +76,15 @@ class DatasetEvaluationRunner(_DatasetEvaluationRunner):
         *,
         operator_ids: Iterable[str] = ("input.surface.rephrase",),
         repetitions: int = 1,
+        precomputed_augmentation: DatasetAugmentationResult | None = None,
+        augmentation_checkpoint_callback: Callable[[DatasetAugmentationResult], None] | None = None,
     ) -> DatasetEvaluationResult:
         return await super().run(
             source,
             operator_ids=operator_ids,
             repetitions=repetitions,
+            precomputed_augmentation=precomputed_augmentation,
+            augmentation_checkpoint_callback=augmentation_checkpoint_callback,
         )
 
 
@@ -500,6 +504,87 @@ def _sequence_runner(
         semantic_pipeline,
         target,
     )
+
+
+async def test_runner_checkpoints_fresh_augmentation_before_sandbox_execution() -> None:
+    runner, _, target = _runner((_source_outcomes()[0],))
+    checkpoints: list[DatasetAugmentationResult] = []
+
+    def checkpoint(augmentation: DatasetAugmentationResult) -> None:
+        assert target.raw_inputs == []
+        checkpoints.append(augmentation)
+
+    result = await runner.run(
+        _source(),
+        augmentation_checkpoint_callback=checkpoint,
+    )
+
+    assert checkpoints == [result.augmentation]
+    assert target.raw_inputs
+
+
+async def test_runner_uses_valid_precomputed_augmentation_without_regenerating(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = _source()
+    producer_pipeline = DeterministicSemanticPipeline((_source_outcomes()[0],))
+    precomputed = await DatasetAugmentationEngine(producer_pipeline, producer_pipeline).augment(
+        (source,)
+    )
+    consumer_pipeline = DeterministicSemanticPipeline((_source_outcomes()[0],))
+    consumer_engine = DatasetAugmentationEngine(consumer_pipeline, consumer_pipeline)
+    target = DeterministicSandbox()
+    consumer = DatasetEvaluationRunner(consumer_engine, consumer_pipeline, target)
+
+    async def unexpected_augmentation(*args: object, **kwargs: object) -> None:
+        raise AssertionError("precomputed augmentation was regenerated")
+
+    monkeypatch.setattr(consumer_engine, "augment", unexpected_augmentation)
+    checkpoints: list[DatasetAugmentationResult] = []
+
+    result = await consumer.run(
+        source,
+        precomputed_augmentation=precomputed,
+        augmentation_checkpoint_callback=checkpoints.append,
+    )
+
+    assert result.augmentation == precomputed
+    assert checkpoints == []
+    assert target.raw_inputs
+
+
+async def test_runner_rejects_precomputed_operator_or_source_mismatch_before_sandbox() -> None:
+    source = _source()
+    producer_pipeline = DeterministicSemanticPipeline((_source_outcomes()[0],))
+    precomputed = await DatasetAugmentationEngine(producer_pipeline, producer_pipeline).augment(
+        (source,)
+    )
+    runner, _, target = _runner((_source_outcomes()[0],))
+
+    with pytest.raises(ValueError, match="operators do not match"):
+        await runner.run(
+            source,
+            operator_ids=("input.tone.frustrated",),
+            precomputed_augmentation=precomputed,
+        )
+    with pytest.raises(ValueError, match="does not match the source interaction"):
+        await runner.run(
+            source.model_copy(update={"id": "different-source"}),
+            precomputed_augmentation=precomputed,
+        )
+    with pytest.raises(ValueError, match="does not match the source interaction"):
+        await runner.run(
+            source.model_copy(update={"raw_input": "Transfer 100 to Mallory."}),
+            precomputed_augmentation=precomputed,
+        )
+    candidate = precomputed.candidates[0]
+    forged_version = precomputed.model_copy(
+        update={"candidates": (candidate.model_copy(update={"operator_version": "2.0.0"}),)}
+    )
+    with pytest.raises(ValueError, match="unknown operator reference"):
+        await runner.run(source, precomputed_augmentation=forged_version)
+
+    assert target.raw_inputs == []
 
 
 async def test_runner_executes_only_accepted_candidates_and_keeps_rejected_candidates() -> None:

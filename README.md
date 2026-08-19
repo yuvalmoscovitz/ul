@@ -124,7 +124,15 @@ uv run python -m examples.quickstart.run --dry-run
 Dry-run makes no sandbox API or model calls. It prints the dataset plan, destination, external-data
 notice, and maximum call counts first.
 
-The full evidence is written locally as JSONL. The quickstart exits `0` when it confirms both its
+The full evidence is written locally as JSONL. Live dataset evaluation also saves each generated
+augmentation before sandbox execution in a private sibling ledger: `results.jsonl` produces
+`results.augmentations.jsonl`. The ledger is reused by `--resume`, so an interruption after
+generation does not repeat paid or nondeterministic augmentation work. Both files contain
+customer-derived data, use mode `0600` on Unix, and are neither encrypted nor automatically
+redacted. Use `--augmentations-output PATH` to choose its location, or
+`--no-save-augmentations` only when local retention is prohibited and regeneration is acceptable.
+
+The quickstart exits `0` when it confirms both its
 expected stable 3/3 `changed action value` finding and the customer-rule violation; any
 unconfirmed or interrupted run exits nonzero.
 For the underlying `ul dataset evaluate` command, exit `0` means no review finding or declared-rule
@@ -143,8 +151,9 @@ uv run ul dataset evaluate interactions.jsonl \
   --dry-run
 ```
 
-The preflight validates the saved run context and reports completed and remaining interactions.
-Execution appends only after the compatibility check succeeds. Evidence without run-context
+The preflight validates the saved run context and augmentation ledger, then reports completed and
+remaining interactions. Execution reuses saved augmentation records and appends only after the
+compatibility check succeeds. Evidence without run-context
 metadata, changed inputs, or changed evaluation semantics is rejected; call-budget and credential
 changes remain allowed because they authorize execution rather than change its meaning.
 
