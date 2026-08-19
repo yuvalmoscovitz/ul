@@ -157,6 +157,85 @@ class CorrectionStressPlan(_StrictModel):
     required_target_calls: int = Field(ge=1)
 
 
+class RetryAfterSuccessfulCommitCase(_StrictModel):
+    schema_version: Literal["1.0.0"] = "1.0.0"
+    id: str = Field(min_length=1, max_length=200)
+    operator_id: Literal["event.retry_after_successful_commit"] = (
+        "event.retry_after_successful_commit"
+    )
+    operator_version: Literal["1.0.0"] = "1.0.0"
+    conversation: tuple[ConversationTurn, ConversationTurn]
+
+    @field_validator("conversation", mode="before")
+    @classmethod
+    def accept_json_turn_array(cls, turns: object) -> object:
+        return tuple(cast(list[object], turns)) if isinstance(turns, list) else turns
+
+    @model_validator(mode="after")
+    def validate_conversation(self) -> Self:
+        initial_turn, retry_turn = self.conversation
+        if initial_turn.role != ConversationRole.USER or retry_turn.role != ConversationRole.USER:
+            raise ValueError("retry stress cases require exactly two user turns")
+        if not initial_turn.content.strip() or not retry_turn.content.strip():
+            raise ValueError("retry stress turns must contain non-whitespace text")
+        if initial_turn.id == retry_turn.id:
+            raise ValueError("retry stress turn identifiers must be unique")
+        return self
+
+
+class RetryAfterSuccessfulCommitStressResult(_StrictModel):
+    schema_version: Literal["1.0.0"] = "1.0.0"
+    case: RetryAfterSuccessfulCommitCase
+    requested_repetitions: int = Field(ge=1)
+    required_target_calls: int = Field(ge=1)
+    status: Literal["passed", "failed", "inconclusive"]
+    baseline_drift_observed: bool
+    trials: tuple[CorrectionStressTrial, ...] = Field(min_length=1)
+    baseline_invariant_rules: tuple[DatasetInvariantRuleResult, ...] = Field(min_length=1)
+    successful_commit_invariant_rules: tuple[DatasetInvariantRuleResult, ...] = Field(min_length=1)
+    retried_invariant_rules: tuple[DatasetInvariantRuleResult, ...] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def validate_result(self) -> Self:
+        if len(self.trials) != self.requested_repetitions or tuple(
+            trial.repetition for trial in self.trials
+        ) != tuple(range(1, self.requested_repetitions + 1)):
+            raise ValueError("retry trials must preserve every repetition in order")
+        rule_identities = tuple(
+            (rule.rule_id, rule.rule_version, rule.rule_type)
+            for rule in self.baseline_invariant_rules
+        )
+        if any(
+            tuple((rule.rule_id, rule.rule_version, rule.rule_type) for rule in rules)
+            != rule_identities
+            for rules in (
+                self.successful_commit_invariant_rules,
+                self.retried_invariant_rules,
+            )
+        ):
+            raise ValueError("retry checkpoint invariant rules must match")
+        expected_status = _retry_after_successful_commit_status(
+            self.trials,
+            self.baseline_invariant_rules,
+            self.successful_commit_invariant_rules,
+            self.retried_invariant_rules,
+            baseline_drift_observed=self.baseline_drift_observed,
+        )
+        if self.status != expected_status:
+            raise ValueError("retry result status must match its checkpoint evidence")
+        return self
+
+
+class RetryAfterSuccessfulCommitStressPlan(_StrictModel):
+    operator_id: Literal["event.retry_after_successful_commit"]
+    operator_version: Literal["1.0.0"]
+    baseline_turn_count: Literal[1] = 1
+    variation_turn_count: Literal[2] = 2
+    repetitions: int = Field(ge=1)
+    target_calls_per_pair: int = Field(ge=1)
+    required_target_calls: int = Field(ge=1)
+
+
 class MultiTurnRegressionCase(_StrictModel):
     schema_version: Literal["1.0.0"] = "1.0.0"
     case_id: str = Field(pattern=_CASE_ID_PATTERN)
@@ -410,6 +489,111 @@ def plan_correction_stress_test(
     )
 
 
+async def run_retry_after_successful_commit_stress_test(
+    case: RetryAfterSuccessfulCommitCase,
+    sandbox: SandboxExecutor,
+    *,
+    invariant_rules: tuple[DatasetInvariantRule, ...],
+    observation_authority: ObservationAuthority = "committed_state_snapshot",
+    repetitions: int = 3,
+    max_sandbox_api_calls: int = 100,
+    allow_network_egress: bool = False,
+) -> RetryAfterSuccessfulCommitStressResult:
+    if observation_authority != "committed_state_snapshot":
+        raise ValueError("retry stress testing requires committed-state invariant observation")
+    paired_result = await run_correction_stress_test(
+        CorrectionAfterFirstResponseCase(id=case.id, conversation=case.conversation),
+        sandbox,
+        invariant_rules=invariant_rules,
+        observation_authority=observation_authority,
+        repetitions=repetitions,
+        max_sandbox_api_calls=max_sandbox_api_calls,
+        allow_network_egress=allow_network_egress,
+    )
+    successful_commit_outputs = tuple(
+        trial.variation[0].target_output
+        if trial.inconclusive_reason is None and len(trial.variation) == 2
+        else None
+        for trial in paired_result.trials
+    )
+    successful_commit_invariant_rules = evaluate_dataset_invariant_rules(
+        invariant_rules,
+        successful_commit_outputs,
+        observation_authority=observation_authority,
+    )
+    status = _retry_after_successful_commit_status(
+        paired_result.trials,
+        paired_result.baseline_invariant_rules,
+        successful_commit_invariant_rules,
+        paired_result.corrected_invariant_rules,
+        baseline_drift_observed=paired_result.baseline_drift_observed,
+    )
+    return RetryAfterSuccessfulCommitStressResult(
+        case=case,
+        requested_repetitions=repetitions,
+        required_target_calls=paired_result.required_target_calls,
+        status=status,
+        baseline_drift_observed=paired_result.baseline_drift_observed,
+        trials=paired_result.trials,
+        baseline_invariant_rules=paired_result.baseline_invariant_rules,
+        successful_commit_invariant_rules=successful_commit_invariant_rules,
+        retried_invariant_rules=paired_result.corrected_invariant_rules,
+    )
+
+
+def plan_retry_after_successful_commit_stress_test(
+    case: RetryAfterSuccessfulCommitCase,
+    target_config: JsonHttpSandboxConfig,
+    *,
+    repetitions: int = 3,
+    max_sandbox_api_calls: int = 100,
+) -> RetryAfterSuccessfulCommitStressPlan:
+    if type(repetitions) is not int or repetitions < 1:
+        raise ValueError("repetitions must be a positive integer")
+    if type(max_sandbox_api_calls) is not int or max_sandbox_api_calls < 1:
+        raise ValueError("max_sandbox_api_calls must be a positive integer")
+    target_calls_per_pair = json_http_sandbox_calls_per_conversation(
+        target_config, 1
+    ) + json_http_sandbox_calls_per_conversation(target_config, 2)
+    required_target_calls = repetitions * target_calls_per_pair
+    if required_target_calls > max_sandbox_api_calls:
+        raise ValueError("retry stress test exceeds the authorized target call budget")
+    return RetryAfterSuccessfulCommitStressPlan(
+        operator_id=case.operator_id,
+        operator_version=case.operator_version,
+        repetitions=repetitions,
+        target_calls_per_pair=target_calls_per_pair,
+        required_target_calls=required_target_calls,
+    )
+
+
+def _retry_after_successful_commit_status(
+    trials: tuple[CorrectionStressTrial, ...],
+    baseline_rules: tuple[DatasetInvariantRuleResult, ...],
+    successful_commit_rules: tuple[DatasetInvariantRuleResult, ...],
+    retried_rules: tuple[DatasetInvariantRuleResult, ...],
+    *,
+    baseline_drift_observed: bool,
+) -> Literal["passed", "failed", "inconclusive"]:
+    baseline_statuses = {rule.status for rule in baseline_rules}
+    successful_commit_statuses = {rule.status for rule in successful_commit_rules}
+    retried_statuses = {rule.status for rule in retried_rules}
+    evidence_is_inconclusive = (
+        baseline_drift_observed
+        or any(trial.inconclusive_reason is not None for trial in trials)
+        or baseline_statuses != {"satisfied"}
+        or successful_commit_statuses != {"satisfied"}
+        or "not_evaluable" in retried_statuses
+    )
+    if evidence_is_inconclusive:
+        return "inconclusive"
+    if any(all(trial.status == "violated" for trial in rule.trials) for rule in retried_rules):
+        return "failed"
+    if "violated" in retried_statuses:
+        return "inconclusive"
+    return "passed"
+
+
 def create_multi_turn_regression_case(
     *,
     stress_case: CorrectionAfterFirstResponseCase,
@@ -510,6 +694,25 @@ def load_correction_after_first_response_case(
         raise RuntimeError("correction stress case could not be read") from None
     except (UnicodeDecodeError, json.JSONDecodeError, RecursionError, ValidationError, ValueError):
         raise ValueError("correction stress case is invalid") from None
+
+
+def load_retry_after_successful_commit_case(
+    path: str | Path,
+) -> RetryAfterSuccessfulCommitCase:
+    try:
+        encoded = _read_bounded_regular_file(Path(path), _MAXIMUM_CASE_BYTES)
+        raw = json.loads(
+            encoded.decode("utf-8"),
+            object_pairs_hook=_reject_duplicate_object_keys,
+            parse_constant=_reject_nonstandard_json_constant,
+            parse_float=_parse_finite_float,
+        )
+        _reject_deep_json(raw)
+        return RetryAfterSuccessfulCommitCase.model_validate(raw)
+    except OSError:
+        raise RuntimeError("retry stress case could not be read") from None
+    except (UnicodeDecodeError, json.JSONDecodeError, RecursionError, ValidationError, ValueError):
+        raise ValueError("retry stress case is invalid") from None
 
 
 def _observations(

@@ -1,0 +1,25 @@
+{
+  "schema_version": "1.1.0",
+  "observation_source": "target_output",
+  "observation_authority": "committed_state_snapshot",
+  "rules": [
+    {
+      "type": "json_value_equals_literal",
+      "id": "exactly-one-committed-payment",
+      "version": "1.0.0",
+      "description": "The invoice must have exactly one committed payment.",
+      "severity": "critical",
+      "value_pointer": "/committed_effect_count",
+      "literal": 1
+    },
+    {
+      "type": "json_array_items_unique_by",
+      "id": "committed-payments-unique-by-invoice",
+      "version": "1.0.0",
+      "description": "Committed payments must remain unique by invoice reference.",
+      "severity": "critical",
+      "array_pointer": "/committed_effects",
+      "key_pointers": ["/invoice_reference"]
+    }
+  ]
+}
