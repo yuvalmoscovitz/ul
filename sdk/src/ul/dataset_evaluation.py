@@ -6,8 +6,9 @@ import math
 import re
 import secrets
 from collections import defaultdict
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from decimal import Decimal, InvalidOperation
+from itertools import islice
 from typing import Literal, Self
 
 from pydantic import ConfigDict, Field, JsonValue, model_validator
@@ -23,6 +24,7 @@ from ul.dataset_augmentation import (
     DatasetAugmentationCandidate,
     DatasetAugmentationEngine,
     DatasetAugmentationResult,
+    builtin_dataset_augmentation_operators,
 )
 from ul.sandbox import validate_execution_evidence
 
@@ -288,10 +290,21 @@ class DatasetEvaluationRunner:
         *,
         operator_ids: Iterable[str] = ("input.surface.rephrase",),
         repetitions: int = 3,
+        precomputed_augmentation: DatasetAugmentationResult | None = None,
+        augmentation_checkpoint_callback: Callable[[DatasetAugmentationResult], None] | None = None,
     ) -> DatasetEvaluationResult:
         if type(repetitions) is not int or repetitions < 1:
             raise ValueError("repetitions must be a positive integer")
-        augmentation = await self._augmentation_engine.augment((source,), operator_ids=operator_ids)
+        if precomputed_augmentation is None:
+            augmentation = await self._augmentation_engine.augment(
+                (source,), operator_ids=operator_ids
+            )
+            _validate_precomputed_augmentation(source, augmentation, operator_ids=None)
+            if augmentation_checkpoint_callback is not None:
+                augmentation_checkpoint_callback(augmentation)
+        else:
+            augmentation = precomputed_augmentation
+            _validate_precomputed_augmentation(source, augmentation, operator_ids=operator_ids)
         source_frame = augmentation.source_frames[0]
         if not any(outcome.kind == "action" for outcome in source_frame.outcomes):
             raise ValueError("source frame requires at least one observable action outcome")
@@ -591,6 +604,75 @@ class DatasetEvaluationRunner:
             verdict="no_divergence",
             trial_set=trial_set,
         )
+
+
+def _validate_precomputed_augmentation(
+    source: InteractionRecord,
+    augmentation: DatasetAugmentationResult,
+    *,
+    operator_ids: Iterable[str] | None,
+) -> None:
+    if augmentation.source_records != (source,):
+        raise ValueError("precomputed augmentation does not match the source interaction")
+    if len(augmentation.source_frames) != 1:
+        raise ValueError("dataset evaluation requires exactly one source frame")
+    source_frame = augmentation.source_frames[0]
+    if source_frame.interaction_id != source.id:
+        raise ValueError("precomputed augmentation does not match the source interaction")
+
+    known_operators = {
+        (operator.id, operator.version): operator
+        for operator in builtin_dataset_augmentation_operators()
+    }
+    candidate_references: list[tuple[str, str]] = []
+    for candidate in augmentation.candidates:
+        candidate_reference = (candidate.operator_id, candidate.operator_version)
+        if candidate_reference not in known_operators:
+            raise ValueError("precomputed augmentation contains an unknown operator reference")
+        if candidate.source_interaction_id != source.id:
+            raise ValueError("precomputed augmentation candidate does not match the source")
+        if candidate.expected_input_frame.interaction_id != source.id:
+            raise ValueError("precomputed augmentation candidate has invalid source lineage")
+        expected_reparsed_interaction_id = f"{source.id}:{candidate.operator_id}"
+        if (
+            candidate.reparsed_input_frame is not None
+            and candidate.reparsed_input_frame.interaction_id != expected_reparsed_interaction_id
+        ):
+            raise ValueError("precomputed augmentation candidate has invalid reparsed lineage")
+        candidate_references.append(candidate_reference)
+    if len(candidate_references) != len(set(candidate_references)):
+        raise ValueError("precomputed augmentation contains duplicate operator references")
+
+    stored_references = tuple(
+        (reference.id, reference.version) for reference in augmentation.operator_references
+    )
+    if any(reference not in known_operators for reference in stored_references):
+        raise ValueError("precomputed augmentation contains an unknown operator reference")
+    requested_references = stored_references
+    if operator_ids is not None:
+        selected_operator_ids = tuple(islice(operator_ids, len(known_operators) + 1))
+        if not selected_operator_ids:
+            raise ValueError("operator_ids must contain at least one operator")
+        if len(selected_operator_ids) > len(known_operators):
+            raise ValueError("operator count exceeds the built-in library")
+        if len(selected_operator_ids) != len(set(selected_operator_ids)):
+            raise ValueError("operator identifiers must be unique")
+        operators_by_id = {operator.id: operator for operator in known_operators.values()}
+        if any(operator_id not in operators_by_id for operator_id in selected_operator_ids):
+            raise ValueError("operator identifiers contain an unknown operator")
+        requested_references = tuple(
+            (operators_by_id[operator_id].id, operators_by_id[operator_id].version)
+            for operator_id in selected_operator_ids
+        )
+        if stored_references != requested_references:
+            raise ValueError("precomputed augmentation operators do not match the evaluation plan")
+    requested_positions = {
+        reference: position for position, reference in enumerate(requested_references)
+    }
+    if any(reference not in requested_positions for reference in candidate_references) or tuple(
+        requested_positions[reference] for reference in candidate_references
+    ) != tuple(sorted(requested_positions[reference] for reference in candidate_references)):
+        raise ValueError("precomputed augmentation operators do not match the evaluation plan")
 
 
 def _group_evaluation_trials(

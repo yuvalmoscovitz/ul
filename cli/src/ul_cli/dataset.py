@@ -18,6 +18,7 @@ from rich.table import Table
 from ul import (
     DatasetAugmentationEngine,
     DatasetAugmentationOperator,
+    DatasetAugmentationResult,
     DatasetEvaluationCase,
     DatasetEvaluationFinding,
     DatasetEvaluationResult,
@@ -55,6 +56,14 @@ from ul.http_sandbox import (
 from ul_core.augmentation_catalog import builtin_augmentation_catalog
 from ul_core.dataset import ObservedOutcome
 
+from ul_cli.dataset_augmentation_ledger import (
+    DatasetAugmentationLedger,
+    DatasetAugmentationLedgerSemanticSettings,
+    create_dataset_augmentation_generation_context,
+    create_private_augmentation_ledger,
+    open_augmentation_ledger_for_resume,
+    read_augmentation_ledger,
+)
 from ul_cli.dataset_ingest import app as ingest_app
 from ul_cli.dataset_review import (
     DatasetEvidenceRedactionCoverage,
@@ -240,6 +249,23 @@ def evaluate_dataset(
         Path | None,
         typer.Option(help="New JSONL file for complete local evidence."),
     ] = None,
+    augmentations_output: Annotated[
+        Path | None,
+        typer.Option(
+            "--augmentations-output",
+            help=(
+                "Private resumable augmentation JSONL. Defaults beside --output as "
+                "NAME.augmentations.jsonl."
+            ),
+        ),
+    ] = None,
+    no_save_augmentations: Annotated[
+        bool,
+        typer.Option(
+            "--no-save-augmentations",
+            help="Do not retain generated augmentations; interrupted work may be regenerated.",
+        ),
+    ] = False,
     invariants: Annotated[
         Path | None,
         typer.Option(
@@ -344,7 +370,13 @@ def evaluate_dataset(
     --output results.jsonl
 
     Discover operators: ul augmentations list --mode dataset_variation
+    Augmentation retention: --augmentations-output PATH or --no-save-augmentations
     """
+    if augmentations_output is not None and no_save_augmentations:
+        raise typer.BadParameter(
+            "--augmentations-output cannot be used with --no-save-augmentations",
+            param_hint="--augmentations-output",
+        )
     if resume is not None:
         if output is not None and output.resolve() != resume.resolve():
             raise typer.BadParameter(
@@ -353,6 +385,17 @@ def evaluate_dataset(
             )
         if output is None:
             output = resume
+    if not no_save_augmentations and augmentations_output is None and output is not None:
+        augmentations_output = _default_augmentations_output(output)
+    if (
+        output is not None
+        and augmentations_output is not None
+        and output.resolve() == augmentations_output.resolve()
+    ):
+        raise typer.BadParameter(
+            "--augmentations-output must differ from --output",
+            param_hint="--augmentations-output",
+        )
     try:
         records = _load_interaction_records(data)
         selected_operators = _validate_operator_ids(operator)
@@ -422,6 +465,11 @@ def evaluate_dataset(
                     "output already exists; UL will not overwrite it",
                     param_hint="--output",
                 )
+            if augmentations_output is not None and augmentations_output.exists():
+                raise typer.BadParameter(
+                    "augmentations output already exists; UL will not overwrite it",
+                    param_hint="--augmentations-output",
+                )
         settings = load_dataset_semantic_settings()
         _validate_model_input_bounds(selected_records, settings.max_input_chars)
         run_context = (
@@ -440,10 +488,33 @@ def evaluate_dataset(
             if normalized_target_config is not None
             else None
         )
+        augmentation_generation_context = create_dataset_augmentation_generation_context(
+            selected_records=all_selected_records,
+            operators=tuple(
+                _dataset_operator_identity(operator_reference)
+                for operator_reference in selected_operators
+            ),
+            semantic_settings=DatasetAugmentationLedgerSemanticSettings(
+                provider=settings.semantic_provider_id,
+                endpoint_sha256=settings.semantic_endpoint_sha256,
+                model=settings.model,
+                render_model=settings.render_model,
+                equivalence_model=settings.equivalence_model,
+                max_input_chars=settings.max_input_chars,
+                max_output_tokens=settings.max_output_tokens,
+                max_render_tokens=settings.max_render_tokens,
+                max_response_bytes=settings.max_response_bytes,
+                timeout_seconds=settings.timeout_seconds,
+            ),
+            redaction_policy_sha256=(
+                redaction_engine.policy.digest if redaction_engine is not None else None
+            ),
+        )
     except (_DatasetInputError, ValidationError, ValueError, RuntimeError) as error:
         raise typer.BadParameter(str(error)) from None
 
     resume_evidence: DatasetResumeEvidence | None = None
+    saved_augmentations: dict[str, DatasetAugmentationResult] = {}
     skipped_count = 0
     if resume is not None:
         assert output is not None
@@ -455,6 +526,21 @@ def evaluate_dataset(
                 selected_records=selected_records,
                 invariant_suite=invariant_suite,
             )
+            if augmentations_output is not None and augmentations_output.exists():
+                augmentation_snapshot = read_augmentation_ledger(
+                    augmentations_output,
+                    expected_context=augmentation_generation_context,
+                    selected_records=all_selected_records,
+                )
+                saved_augmentations = {
+                    record.source.id: record.augmentation
+                    for record in augmentation_snapshot.records
+                }
+                for prior_result in resume_evidence.technical_results:
+                    if saved_augmentations.get(prior_result.source.id) != prior_result.augmentation:
+                        raise ValueError(
+                            "augmentation ledger does not match completed evaluation evidence"
+                        )
         except (OSError, ValueError) as error:
             message = str(error) if isinstance(error, ValueError) else error.__class__.__name__
             raise typer.BadParameter(
@@ -500,6 +586,7 @@ def evaluate_dataset(
             target_calls_per_execution=target_calls_per_execution,
             invariant_suite=invariant_suite,
             output=output,
+            augmentations_output=augmentations_output,
             semantic_provider_id=settings.semantic_provider_id,
             semantic_endpoint_sha256=settings.semantic_endpoint_sha256,
             redaction_policy_sha256=(
@@ -512,6 +599,34 @@ def evaluate_dataset(
     if not selected_records and skipped_count > 0:
         assert output is not None
         assert resume_evidence is not None
+        if augmentations_output is not None:
+            try:
+                if augmentations_output.exists():
+                    for prior_result in resume_evidence.technical_results:
+                        if (
+                            saved_augmentations.get(prior_result.source.id)
+                            != prior_result.augmentation
+                        ):
+                            raise ValueError(
+                                "augmentation ledger does not match completed evaluation evidence"
+                            )
+                else:
+                    with create_private_augmentation_ledger(
+                        augmentations_output,
+                        generation_context=augmentation_generation_context,
+                        selected_records=all_selected_records,
+                    ) as completed_ledger:
+                        for prior_result in resume_evidence.technical_results:
+                            completed_ledger.append(
+                                source=prior_result.source,
+                                augmentation=prior_result.augmentation,
+                            )
+            except (OSError, ValueError) as error:
+                message = str(error) if isinstance(error, ValueError) else error.__class__.__name__
+                raise typer.BadParameter(
+                    f"cannot safely persist augmentations ({message})",
+                    param_hint="--augmentations-output",
+                ) from None
         console.print(
             f"Resume compatible: all {skipped_count} selected interaction(s) are complete in "
             f"{output}. Nothing to do."
@@ -574,7 +689,42 @@ def evaluate_dataset(
             param_hint="--sandbox-config",
         ) from None
 
+    augmentation_ledger: DatasetAugmentationLedger | None = None
+    augmentation_ledger_was_created = False
+    output_stream: TextIO | None = None
+    failure_parameter = "--augmentations-output"
     try:
+        if augmentations_output is not None:
+            if resume is not None and augmentations_output.exists():
+                augmentation_ledger = open_augmentation_ledger_for_resume(
+                    augmentations_output,
+                    expected_context=augmentation_generation_context,
+                    selected_records=all_selected_records,
+                )
+            else:
+                augmentation_ledger = create_private_augmentation_ledger(
+                    augmentations_output,
+                    generation_context=augmentation_generation_context,
+                    selected_records=all_selected_records,
+                )
+                augmentation_ledger_was_created = True
+                if resume_evidence is not None:
+                    for prior_result in resume_evidence.technical_results:
+                        augmentation_ledger.append(
+                            source=prior_result.source,
+                            augmentation=prior_result.augmentation,
+                        )
+            saved_augmentations = {
+                record.source.id: record.augmentation
+                for record in augmentation_ledger.snapshot.records
+            }
+            if resume_evidence is not None:
+                for prior_result in resume_evidence.technical_results:
+                    if saved_augmentations.get(prior_result.source.id) != prior_result.augmentation:
+                        raise ValueError(
+                            "augmentation ledger does not match completed evaluation evidence"
+                        )
+        failure_parameter = "--resume" if resume is not None else "--output"
         if resume is None:
             output_stream = _create_private_output(output)
         else:
@@ -589,13 +739,21 @@ def evaluate_dataset(
                 output_stream.close()
                 raise ValueError("resume evidence changed after preflight")
     except (OSError, ValueError) as error:
+        if augmentation_ledger is not None:
+            if augmentation_ledger_was_created:
+                assert augmentations_output is not None
+                augmentation_ledger.discard_if_empty(augmentations_output)
+            augmentation_ledger.close()
+        if output_stream is not None and not output_stream.closed:
+            output_stream.close()
         asyncio.run(target.aclose())
         message = str(error) if isinstance(error, ValueError) else error.__class__.__name__
         raise typer.BadParameter(
-            f"cannot safely open output file ({message})",
-            param_hint="--resume" if resume is not None else "--output",
+            f"cannot safely open persistence file ({message})",
+            param_hint=failure_parameter,
         ) from None
 
+    assert output_stream is not None
     has_review_findings = False
     invariant_evaluations: list[DatasetInvariantEvaluation] = []
     try:
@@ -616,6 +774,8 @@ def evaluate_dataset(
                         * target_calls_per_execution
                     ),
                     run_context=run_context,
+                    augmentation_ledger=augmentation_ledger,
+                    saved_augmentations=saved_augmentations,
                     invariant_suite=invariant_suite,
                     invariant_evaluations=invariant_evaluations,
                     redaction_engine=redaction_engine,
@@ -636,6 +796,8 @@ def evaluate_dataset(
                         * target_calls_per_execution
                     ),
                     run_context=run_context,
+                    augmentation_ledger=augmentation_ledger,
+                    saved_augmentations=saved_augmentations,
                     redaction_engine=redaction_engine,
                 )
             results = asyncio.run(evaluation_coroutine)
@@ -646,14 +808,27 @@ def evaluate_dataset(
             f"Evaluation stopped ({error.__class__.__name__}). "
             f"Complete results written before the error remain in {output}."
         )
+        if augmentations_output is not None:
+            _print_dataset_plain(
+                f"Generated augmentations remain in {augmentations_output} and will be reused "
+                f"with --resume {output}."
+            )
         raise typer.Exit(code=2) from None
+    finally:
+        if augmentation_ledger is not None:
+            augmentation_ledger.close()
 
     if skipped_count > 0:
         console.print(
             f"Resumed: {skipped_count} interaction(s) skipped (already in evidence), "
             f"{len(results)} newly evaluated."
         )
-    _print_dataset_results(results, output, invariant_evaluations=tuple(invariant_evaluations))
+    _print_dataset_results(
+        results,
+        output,
+        augmentations_output=augmentations_output,
+        invariant_evaluations=tuple(invariant_evaluations),
+    )
     prior_invariant_evaluations = (
         resume_evidence.invariant_evaluations if resume_evidence is not None else ()
     )
@@ -934,6 +1109,7 @@ def _print_dataset_plan(
     target_calls_per_execution: int,
     invariant_suite: DatasetInvariantSuite | None,
     output: Path | None,
+    augmentations_output: Path | None,
     semantic_provider_id: str,
     semantic_endpoint_sha256: str,
     redaction_policy_sha256: str | None,
@@ -989,6 +1165,16 @@ def _print_dataset_plan(
     )
     if output is not None:
         console.print(f"Evidence destination: {output}")
+    if augmentations_output is None:
+        console.print(
+            "Augmentations will not be saved. Interrupted generation may repeat model calls."
+        )
+    else:
+        _print_dataset_plain(f"Augmentations destination: {augmentations_output}")
+        _print_dataset_plain(
+            "This private artifact may contain sensitive inputs and derived semantic data. It is "
+            "not encrypted or automatically redacted; retain it only under your data policy."
+        )
     if target_endpoint is not None:
         console.print(f"Sandbox API endpoint: {target_endpoint}")
         if target_header_environment_variables:
@@ -1015,6 +1201,12 @@ def _print_dataset_plan(
         "causality, or estimate a production failure rate."
     )
     console.print("No model or sandbox API requests sent.")
+
+
+def _default_augmentations_output(evidence_output: Path) -> Path:
+    if evidence_output.suffix:
+        return evidence_output.with_name(f"{evidence_output.stem}.augmentations.jsonl")
+    return evidence_output.with_name(f"{evidence_output.name}.augmentations.jsonl")
 
 
 def _create_private_output(path: Path) -> TextIO:
@@ -1136,6 +1328,8 @@ async def _evaluate_interaction_records(
     max_sandbox_api_calls: int,
     planned_target_calls: int,
     run_context: DatasetEvidenceRunContext | None = None,
+    augmentation_ledger: DatasetAugmentationLedger | None = None,
+    saved_augmentations: dict[str, DatasetAugmentationResult] | None = None,
     invariant_suite: DatasetInvariantSuite | None = None,
     invariant_evaluations: list[DatasetInvariantEvaluation] | None = None,
     redaction_engine: RedactionEngine | None = None,
@@ -1164,10 +1358,26 @@ async def _evaluate_interaction_records(
             allow_network_egress=allow_network_egress,
         )
         for record in records:
+            precomputed_augmentation = (
+                saved_augmentations.get(record.id) if saved_augmentations is not None else None
+            )
+
+            def checkpoint_augmentation(
+                augmentation: DatasetAugmentationResult,
+                source: InteractionRecord = record,
+            ) -> None:
+                if augmentation_ledger is None:
+                    return
+                augmentation_ledger.append(source=source, augmentation=augmentation)
+
             result = await runner.run(
                 record,
                 operator_ids=operator_ids,
                 repetitions=repetitions,
+                precomputed_augmentation=precomputed_augmentation,
+                augmentation_checkpoint_callback=(
+                    checkpoint_augmentation if augmentation_ledger is not None else None
+                ),
             )
             invariant_evaluation = (
                 evaluate_dataset_invariants(result, invariant_suite)
@@ -1200,6 +1410,7 @@ def _print_dataset_results(
     results: tuple[DatasetEvaluationResult, ...],
     output: Path,
     *,
+    augmentations_output: Path | None = None,
     invariant_evaluations: tuple[DatasetInvariantEvaluation, ...] = (),
 ) -> None:
     table = Table(title="Dataset evaluation")
@@ -1234,6 +1445,8 @@ def _print_dataset_results(
     if invariant_evaluations:
         _print_invariant_results(invariant_evaluations)
     console.print(f"Complete evidence: {output}")
+    if augmentations_output is not None:
+        _print_dataset_plain(f"Saved augmentations: {augmentations_output}")
     console.print(f"Next: ul dataset report {output}")
 
 
@@ -1328,7 +1541,7 @@ def _print_dataset_plain(message: str) -> None:
         else f"\\u{ord(character):04x}"
         for character in message
     )
-    console.print(safe_message, markup=False, highlight=False)
+    console.print(safe_message, markup=False, highlight=False, soft_wrap=True)
 
 
 def _customer_evidence_record(

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import re
 import stat
@@ -162,6 +163,8 @@ def _evaluation_result(
     return DatasetEvaluationResult(
         source=source,
         augmentation=DatasetAugmentationResult(
+            operator_references=({"id": candidate.operator_id, "version": "1.0.0"},),
+            source_records=(source,),
             source_frames=(source_frame,),
             candidates=(candidate,),
         ),
@@ -601,6 +604,125 @@ def test_dry_run_validates_and_makes_no_external_calls(
     assert "estimate a production failure rate" in result.output
     assert "No model or sandbox API requests sent." in result.output
     assert "Transfer 100" not in result.output
+
+
+def test_augmentation_persistence_options_are_discoverable_at_80_columns(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("COLUMNS", "80")
+
+    result = runner.invoke(root_app, ["dataset", "evaluate", "--help"])
+
+    assert result.exit_code == 0, result.output
+    normalized_output = " ".join(_ANSI_ESCAPE_PATTERN.sub("", result.output).split())
+    assert "--augmentations-output" in normalized_output
+    assert "--no-save-augmentations" in normalized_output
+
+
+def test_dry_run_plans_default_augmentations_output_without_creating_files(
+    tmp_path: Path,
+) -> None:
+    dataset = tmp_path / "interactions.jsonl"
+    evidence = tmp_path / "results.jsonl"
+    augmentations = tmp_path / "results.augmentations.jsonl"
+    _write_dataset(dataset, [_record()])
+
+    result = runner.invoke(
+        root_app,
+        [
+            "dataset",
+            "evaluate",
+            str(dataset),
+            "--output",
+            str(evidence),
+            "--dry-run",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    normalized_output = " ".join(_ANSI_ESCAPE_PATTERN.sub("", result.output).split())
+    assert f"Augmentations destination: {augmentations}" in normalized_output
+    assert "may contain sensitive inputs and derived semantic data" in normalized_output
+    assert "retain" in normalized_output
+    assert "data policy" in normalized_output
+    assert not evidence.exists()
+    assert not augmentations.exists()
+
+
+def test_dry_run_supports_custom_or_disabled_augmentation_persistence(
+    tmp_path: Path,
+) -> None:
+    dataset = tmp_path / "interactions.jsonl"
+    evidence = tmp_path / "results.jsonl"
+    custom_augmentations = tmp_path / "review" / "accepted.jsonl"
+    _write_dataset(dataset, [_record()])
+
+    custom = runner.invoke(
+        root_app,
+        [
+            "dataset",
+            "evaluate",
+            str(dataset),
+            "--output",
+            str(evidence),
+            "--augmentations-output",
+            str(custom_augmentations),
+            "--dry-run",
+        ],
+    )
+    disabled = runner.invoke(
+        root_app,
+        [
+            "dataset",
+            "evaluate",
+            str(dataset),
+            "--output",
+            str(evidence),
+            "--no-save-augmentations",
+            "--dry-run",
+        ],
+    )
+
+    assert custom.exit_code == 0, custom.output
+    assert f"Augmentations destination: {custom_augmentations}" in " ".join(
+        _ANSI_ESCAPE_PATTERN.sub("", custom.output).split()
+    )
+    assert disabled.exit_code == 0, disabled.output
+    assert "Augmentations destination:" not in disabled.output
+    assert "Augmentations will not be saved." in " ".join(
+        _ANSI_ESCAPE_PATTERN.sub("", disabled.output).split()
+    )
+    assert not evidence.exists()
+    assert not custom_augmentations.exists()
+
+
+def test_custom_augmentations_output_conflicts_with_no_save(tmp_path: Path) -> None:
+    dataset = tmp_path / "interactions.jsonl"
+    evidence = tmp_path / "results.jsonl"
+    augmentations = tmp_path / "accepted.jsonl"
+    _write_dataset(dataset, [_record()])
+
+    result = runner.invoke(
+        root_app,
+        [
+            "dataset",
+            "evaluate",
+            str(dataset),
+            "--output",
+            str(evidence),
+            "--augmentations-output",
+            str(augmentations),
+            "--no-save-augmentations",
+            "--dry-run",
+        ],
+    )
+
+    assert result.exit_code != 0
+    normalized_output = " ".join(_ANSI_ESCAPE_PATTERN.sub("", result.output).split())
+    assert "--augmentations-output" in normalized_output
+    assert "used with --no-save-augmentations" in normalized_output
+    assert not evidence.exists()
+    assert not augmentations.exists()
 
 
 def test_redaction_dry_run_reports_value_free_coverage_without_key_or_state(
@@ -1398,6 +1520,91 @@ def test_execution_refuses_to_overwrite_output_before_model_setup(
     assert output.read_text(encoding="utf-8") == "keep me"
 
 
+def test_execution_refuses_default_augmentations_collision_before_model_setup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    dataset = tmp_path / "interactions.jsonl"
+    evidence = tmp_path / "results.jsonl"
+    augmentations = tmp_path / "results.augmentations.jsonl"
+    target_config = tmp_path / "target.json"
+    _write_dataset(dataset, [_record()])
+    _write_target_config(target_config)
+    augmentations.write_text("keep me\n", encoding="utf-8")
+
+    def unexpected_settings() -> None:
+        raise AssertionError("augmentations collision reached model setup")
+
+    monkeypatch.setattr(main, "load_dataset_semantic_settings", unexpected_settings)
+    result = runner.invoke(
+        root_app,
+        [
+            "dataset",
+            "evaluate",
+            str(dataset),
+            "--sandbox-config",
+            str(target_config),
+            "--allow-sandbox-network-egress",
+            "--confirm-isolated-sandbox",
+            "--output",
+            str(evidence),
+        ],
+    )
+
+    assert result.exit_code != 0
+    normalized_output = " ".join(_ANSI_ESCAPE_PATTERN.sub("", result.output).split())
+    assert "augmentations output already" in normalized_output
+    assert "exists; UL will not overwrite it" in normalized_output
+    assert not evidence.exists()
+    assert augmentations.read_text(encoding="utf-8") == "keep me\n"
+
+
+def test_invalid_custom_augmentations_path_does_not_strand_evidence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    dataset = tmp_path / "interactions.jsonl"
+    evidence = tmp_path / "results.jsonl"
+    augmentations = tmp_path / "missing" / "augmentations.jsonl"
+    target_config = tmp_path / "target.json"
+    _write_dataset(dataset, [_record()])
+    _write_target_config(target_config)
+
+    class FakeTarget:
+        @classmethod
+        def from_config(cls, *_args: object, **_kwargs: object) -> FakeTarget:
+            return cls()
+
+        async def aclose(self) -> None:
+            return None
+
+    monkeypatch.setattr(main, "load_dataset_semantic_settings", _settings)
+    monkeypatch.setattr(main, "JsonHttpSandboxConnection", FakeTarget)
+
+    result = runner.invoke(
+        root_app,
+        [
+            "dataset",
+            "evaluate",
+            str(dataset),
+            "--sandbox-config",
+            str(target_config),
+            "--allow-sandbox-network-egress",
+            "--confirm-isolated-sandbox",
+            "--output",
+            str(evidence),
+            "--augmentations-output",
+            str(augmentations),
+        ],
+    )
+
+    assert result.exit_code != 0
+    normalized_output = " ".join(_ANSI_ESCAPE_PATTERN.sub("", result.output).split())
+    assert "--augmentations-output" in normalized_output
+    assert "cannot safely open" in normalized_output
+    assert "FileNotFoundError" in normalized_output
+    assert not evidence.exists()
+    assert not augmentations.exists()
+
+
 def test_execution_rejects_missing_header_secret_before_model_or_output(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1468,9 +1675,11 @@ def test_execution_creates_private_explicit_output(
         max_sandbox_api_calls: int,
         planned_target_calls: int,
         run_context: object,
+        augmentation_ledger: object,
+        saved_augmentations: object,
         redaction_engine: object,
     ) -> tuple[object, ...]:
-        del settings, target, run_context
+        del settings, target, run_context, augmentation_ledger, saved_augmentations
         assert redaction_engine is None
         captured_records.extend(record.id for record in records)
         assert operator_ids == ("input.surface.disfluency_repeat",)
@@ -1565,9 +1774,17 @@ def test_execution_wires_redaction_into_records_pipeline_and_run_context(
         max_sandbox_api_calls: int,
         planned_target_calls: int,
         run_context: object,
+        augmentation_ledger: object,
+        saved_augmentations: object,
         redaction_engine: object,
     ) -> tuple[object, ...]:
-        del repetitions, max_sandbox_api_calls, planned_target_calls
+        del (
+            repetitions,
+            max_sandbox_api_calls,
+            planned_target_calls,
+            augmentation_ledger,
+            saved_augmentations,
+        )
         assert redaction_engine is not None
         assert secret not in records[0].model_dump_json()
         serialized_context = cast(Any, run_context).model_dump_json()
@@ -1702,6 +1919,8 @@ def test_target_config_runs_nested_request_and_response_against_loopback(
             max_sandbox_api_calls: int,
             planned_target_calls: int,
             run_context: object,
+            augmentation_ledger: object,
+            saved_augmentations: object,
             redaction_engine: object,
         ) -> tuple[object, ...]:
             del (
@@ -1711,6 +1930,8 @@ def test_target_config_runs_nested_request_and_response_against_loopback(
                 max_sandbox_api_calls,
                 planned_target_calls,
                 run_context,
+                augmentation_ledger,
+                saved_augmentations,
             )
             assert redaction_engine is None
             async with target:
@@ -1919,6 +2140,7 @@ def test_resume_skips_already_processed_interaction_ids(
 ) -> None:
     dataset = tmp_path / "interactions.jsonl"
     evidence = tmp_path / "evidence.jsonl"
+    augmentations = tmp_path / "evidence.augmentations.jsonl"
     target_config = tmp_path / "target.json"
     _write_dataset(dataset, [_record("interaction-1"), _record("interaction-2")])
     _write_target_config(target_config)
@@ -1928,6 +2150,32 @@ def test_resume_skips_already_processed_interaction_ids(
     )
     selected_records = tuple(result.source for result in evaluation_results)
     run_context = _run_context(selected_records)
+    generation_context = main.create_dataset_augmentation_generation_context(
+        selected_records=selected_records,
+        operators=(("input.surface.rephrase", "1.0.0"),),
+        semantic_settings=main.DatasetAugmentationLedgerSemanticSettings(
+            provider="openrouter",
+            endpoint_sha256=_settings().semantic_endpoint_sha256,
+            model=_settings().model,
+            render_model=_settings().render_model,
+            equivalence_model=_settings().equivalence_model,
+            max_input_chars=_settings().max_input_chars,
+            max_output_tokens=_settings().max_output_tokens,
+            max_render_tokens=_settings().max_render_tokens,
+            max_response_bytes=_settings().max_response_bytes,
+            timeout_seconds=_settings().timeout_seconds,
+        ),
+    )
+    with main.create_private_augmentation_ledger(
+        augmentations,
+        generation_context=generation_context,
+        selected_records=selected_records,
+    ) as augmentation_ledger:
+        for evaluation_result in evaluation_results:
+            augmentation_ledger.append(
+                source=evaluation_result.source,
+                augmentation=evaluation_result.augmentation,
+            )
     evidence.write_text(
         json.dumps(
             main._customer_evidence_record(
@@ -1960,9 +2208,22 @@ def test_resume_skips_already_processed_interaction_ids(
         max_sandbox_api_calls: int,
         planned_target_calls: int,
         run_context: object,
+        augmentation_ledger: object,
+        saved_augmentations: object,
         redaction_engine: object,
     ) -> tuple[object, ...]:
-        del operator_ids, settings, target, max_sandbox_api_calls, planned_target_calls
+        del (
+            operator_ids,
+            settings,
+            target,
+            max_sandbox_api_calls,
+            planned_target_calls,
+            augmentation_ledger,
+        )
+        assert (
+            cast(dict[str, DatasetAugmentationResult], saved_augmentations)["interaction-2"]
+            == evaluation_results[1].augmentation
+        )
         assert redaction_engine is None
         assert repetitions == 1
         for record in records:
@@ -2008,6 +2269,9 @@ def test_resume_skips_already_processed_interaction_ids(
     assert "Resume compatible: 1 complete interaction(s) skipped; 1 remaining" in dry_run.output
     assert "Evidence destination:" in dry_run.output
     assert evidence.name in dry_run.output
+    assert f"Augmentations destination: {augmentations}" in " ".join(
+        _ANSI_ESCAPE_PATTERN.sub("", dry_run.output).split()
+    )
 
     result = runner.invoke(root_app, command)
 
@@ -2020,6 +2284,81 @@ def test_resume_skips_already_processed_interaction_ids(
     assert "skipped" in result.output
     if sys.platform != "win32":
         assert stat.S_IMODE(evidence.stat().st_mode) == 0o600
+
+
+def test_resume_dry_run_rejects_ledger_that_disagrees_with_completed_evidence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    dataset = tmp_path / "interactions.jsonl"
+    evidence = tmp_path / "evidence.jsonl"
+    augmentations = tmp_path / "evidence.augmentations.jsonl"
+    target_config = tmp_path / "target.json"
+    _write_dataset(dataset, [_record()])
+    _write_target_config(target_config)
+    evaluation_result = _evaluation_result("interaction-1")
+    selected_records = (evaluation_result.source,)
+    run_context = _run_context(selected_records)
+    evidence.write_text(
+        json.dumps(
+            main._customer_evidence_record(
+                evaluation_result,
+                repetitions=1,
+                max_sandbox_api_calls=2,
+                planned_target_calls=2,
+                run_context=cast(Any, run_context),
+            )
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    generation_context = main.create_dataset_augmentation_generation_context(
+        selected_records=selected_records,
+        operators=(("input.surface.rephrase", "1.0.0"),),
+        semantic_settings=main.DatasetAugmentationLedgerSemanticSettings(
+            provider="openrouter",
+            endpoint_sha256=_settings().semantic_endpoint_sha256,
+            model=_settings().model,
+            render_model=_settings().render_model,
+            equivalence_model=_settings().equivalence_model,
+            max_input_chars=_settings().max_input_chars,
+            max_output_tokens=_settings().max_output_tokens,
+            max_render_tokens=_settings().max_render_tokens,
+            max_response_bytes=_settings().max_response_bytes,
+            timeout_seconds=_settings().timeout_seconds,
+        ),
+    )
+    mismatched_candidate = evaluation_result.augmentation.candidates[0].model_copy(
+        update={"augmented_input": "A different generated variation."}
+    )
+    mismatched_augmentation = evaluation_result.augmentation.model_copy(
+        update={"candidates": (mismatched_candidate,)}
+    )
+    with main.create_private_augmentation_ledger(
+        augmentations,
+        generation_context=generation_context,
+        selected_records=selected_records,
+    ) as ledger:
+        ledger.append(source=evaluation_result.source, augmentation=mismatched_augmentation)
+    monkeypatch.setattr(main, "load_dataset_semantic_settings", _settings)
+
+    result = runner.invoke(
+        root_app,
+        [
+            "dataset",
+            "evaluate",
+            str(dataset),
+            "--sandbox-config",
+            str(target_config),
+            "--repetitions",
+            "1",
+            "--resume",
+            str(evidence),
+            "--dry-run",
+        ],
+    )
+
+    assert result.exit_code != 0
+    assert "cannot safely resume evidence" in result.output
 
 
 def test_resume_exits_early_when_all_records_already_processed(
@@ -2296,6 +2635,21 @@ def test_resume_snapshot_detects_same_summary_content_change() -> None:
     assert first_snapshot.has_review_findings == changed_snapshot.has_review_findings
     assert first_snapshot.raw_evidence_sha256 != changed_snapshot.raw_evidence_sha256
     assert first_snapshot != changed_snapshot
+
+
+def test_resume_accepts_empty_evidence_as_zero_progress() -> None:
+    selected_records = (_evaluation_result("interaction-1").source,)
+    snapshot = main.validate_dataset_resume_evidence(
+        b"",
+        expected_context=cast(Any, _run_context(selected_records)),
+        selected_records=selected_records,
+        invariant_suite=None,
+        evidence_projector=main._customer_evidence_record,
+    )
+
+    assert snapshot.processed_ids == frozenset()
+    assert snapshot.technical_results == ()
+    assert snapshot.raw_evidence_sha256 == hashlib.sha256(b"").hexdigest()
 
 
 def test_resume_accepts_extended_invariant_evidence_schema() -> None:
