@@ -205,11 +205,12 @@ For a customer-invariant finding, omit `--rule`: the finding already identifies 
 rule, and UL selects it automatically. Semantic findings still require one or more explicit
 `--rule` options.
 
-`--confirm-versioned-input` is required because the case copies the exact raw input, literal
-target-template values, and selected customer-rule definitions. Rule literals and allowed sets
-can contain sensitive data. UL does not automatically redact these values: changing them could
-change the behavior being reproduced. Treat the case as sensitive, inspect it before committing,
-and apply your own data-governance policy.
+`--confirm-versioned-input` is required because the case copies the exact raw input, any explicit
+per-record sandbox setup fixture, literal target-template values, and selected customer-rule
+definitions. Fixture values, rule literals, and allowed sets can contain sensitive data. UL does
+not automatically redact these values: changing them could change the behavior being reproduced.
+Treat the case as sensitive, inspect it before committing, and apply your own data-governance
+policy.
 
 Replay the saved input and deterministic rules against a sandbox:
 
@@ -460,9 +461,16 @@ UL applies the same record fixture after every reset for its baseline and all va
 repetitions. Fixtures must be JSON objects, are limited to 64 KiB, 20 nesting levels, and 1,000
 values, and are never inferred from traces or treated as external references. Dry-run reports only
 the fixture count. The run context and execution evidence bind the fixture SHA-256, while private
-evidence and augmentation ledgers retain the fixture values needed for exact resume. Treat those
-files as sensitive. A setup template that contains `{{sandbox_setup}}` requires a fixture on every
-selected record; a fixture is rejected when the template does not consume it.
+evidence, augmentation ledgers, and saved regression cases retain the fixture values needed for
+exact resume and replay. Treat those files as sensitive. A setup template that contains
+`{{sandbox_setup}}` requires a fixture on every selected record; a fixture is rejected when the
+template does not consume it.
+
+This fixture is explicit, customer-authored replay setup for a sandbox whose state model the
+customer controls. It does not reconstruct or fork an opaque provider-managed conversation, hidden
+tool state, or a complete production mid-execution checkpoint. A production trace that cannot be
+represented safely as an approved sandbox fixture remains outside this feature and must not be
+presented as faithfully replayed state.
 
 Each physical lifecycle request counts toward `--max-sandbox-api-calls`. UL snapshots the sandbox
 after reset/setup and before the first test turn, so a configuration with setup uses six calls per

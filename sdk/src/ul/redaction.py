@@ -498,7 +498,12 @@ class RedactedSemanticPipeline:
     ) -> SemanticFrame:
         try:
             protected_record = self.protect_record(record)
-            frame = await self._pipeline.deconstruct(protected_record, reference_frame)
+            provider_record = (
+                protected_record.model_copy(update={"sandbox_setup": None})
+                if isinstance(protected_record, InteractionRecord)
+                else protected_record
+            )
+            frame = await self._pipeline.deconstruct(provider_record, reference_frame)
             return frame.model_copy(update={"metadata": self._metadata(frame.metadata)})
         except RedactionBoundaryError:
             raise

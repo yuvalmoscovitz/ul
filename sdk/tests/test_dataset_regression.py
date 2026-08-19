@@ -30,7 +30,7 @@ from ul.dataset_regression import (
 )
 from ul.http_sandbox import JsonHttpSandboxConfig
 from ul_core.contracts import SandboxExecutor
-from ul_core.dataset import ObservedAgentOutput
+from ul_core.dataset import ObservedAgentOutput, SandboxSetupFixture
 from ul_core.evaluation import (
     EvaluationCase,
     ExecutionEvidence,
@@ -73,6 +73,7 @@ def _case(
     *,
     repetitions: int = 3,
     variation_input: str = "Pay invoice AC-101 instead of AC-100.",
+    sandbox_setup: SandboxSetupFixture | None = None,
 ) -> DatasetRegressionCase:
     return create_dataset_regression_case(
         finding_id=FINDING_ID,
@@ -117,6 +118,7 @@ def _case(
         state_observation_authority="sandbox_self_reported",
         selected_rules=(_rule(),),
         discovery_repetitions=repetitions,
+        sandbox_setup=sandbox_setup,
     )
 
 
@@ -183,6 +185,7 @@ class _Target:
     ) -> None:
         self.outcomes = outcomes
         self.inputs: list[str] = []
+        self.sandbox_setups: list[SandboxSetupFixture | None] = []
         self.config_sha256 = (
             _case().target.config_sha256 if config_sha256 is None else config_sha256
         )
@@ -193,6 +196,7 @@ class _Target:
     async def execute(self, case: EvaluationCase) -> ExecutionEvidence:
         raw_input = case.turns[0].content
         self.inputs.append(raw_input)
+        self.sandbox_setups.append(case.sandbox_setup)
         outcome = self.outcomes.pop(0)
         if isinstance(outcome, RuntimeError):
             raise outcome
@@ -201,6 +205,9 @@ class _Target:
             case_id=case.id,
             sandbox_id=self.sandbox_id,
             sandbox_config_sha256=self.config_sha256,
+            sandbox_setup_sha256=(
+                case.sandbox_setup.sha256 if case.sandbox_setup is not None else None
+            ),
             initial_state=SandboxStateEvidence(value={}, authority="sandbox_self_reported"),
             turns=(
                 SandboxTurnEvidence(
@@ -262,6 +269,23 @@ def test_case_is_content_addressed_and_loader_round_trips(tmp_path: Path) -> Non
     assert load_dataset_regression_case(path) == case
     assert case.target.provenance == "declared_at_case_creation"
     assert case.target.config_sha256 == equivalent.target.config_sha256
+
+
+def test_setup_fixture_changes_case_identity_and_is_replayed_exactly() -> None:
+    fixture = SandboxSetupFixture.from_payload({"invoice": {"id": "AC-100", "status": "approved"}})
+    case = _case(sandbox_setup=fixture)
+    target = _Target([_output("AC-101", "AC-101")] * 3)
+
+    result = asyncio.run(replay_dataset_regression(case, target))
+
+    assert result.status == "passed"
+    assert target.sandbox_setups == [fixture] * 3
+    assert case.case_id != _case().case_id
+    assert all(
+        execution.execution_evidence is not None
+        and execution.execution_evidence.sandbox_setup_sha256 == fixture.sha256
+        for execution in result.executions
+    )
 
 
 @pytest.mark.parametrize(

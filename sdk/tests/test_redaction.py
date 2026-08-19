@@ -17,6 +17,7 @@ from ul.sandbox import evaluation_case_from_inputs
 from ul_core.dataset import (
     InteractionRecord,
     RenderedUserInput,
+    SandboxSetupFixture,
     SemanticEquivalenceAssessment,
     SemanticFrame,
     UserInputRecord,
@@ -32,6 +33,7 @@ from ul_core.evaluation import (
 
 _KEY = SecretStr("a-private-test-key-with-at-least-32-bytes")
 _SECRET = "customer@example.com"
+_FIXTURE_SECRET = "fixture-secret-must-not-reach-provider"
 
 
 def policy() -> RedactionPolicy:
@@ -255,18 +257,23 @@ class _RecordingSandbox:
 
     def __init__(self) -> None:
         self.inputs: list[str] = []
+        self.sandbox_setups: list[SandboxSetupFixture | None] = []
 
     def api_calls_for_case(self, case: EvaluationCase) -> int:
         return len(case.turns)
 
     async def execute(self, case: EvaluationCase) -> ExecutionEvidence:
         self.inputs.extend(turn.content for turn in case.turns)
+        self.sandbox_setups.append(case.sandbox_setup)
         response = {"ok": True, "contact": _SECRET}
         state = {"last_contact": _SECRET}
         return ExecutionEvidence(
             case_id=case.id,
             sandbox_id=self.sandbox_id,
             sandbox_config_sha256=self.config_sha256,
+            sandbox_setup_sha256=(
+                case.sandbox_setup.sha256 if case.sandbox_setup is not None else None
+            ),
             initial_state=SandboxStateEvidence(
                 value={"initial_contact": _SECRET},
                 authority="sandbox_self_reported",
@@ -307,6 +314,9 @@ async def test_pipeline_is_one_boundary_and_sandbox_rehydrates(tmp_path: Path) -
             "credentials": {"token": "secret-token"},
             "internal_note": "private context",
         },
+        sandbox_setup=SandboxSetupFixture.from_payload(
+            {"account": "AC-100", "credential": _FIXTURE_SECRET}
+        ),
     )
     protected_source = pipeline.protect_record(source)
     assert isinstance(protected_source, InteractionRecord)
@@ -323,7 +333,7 @@ async def test_pipeline_is_one_boundary_and_sandbox_rehydrates(tmp_path: Path) -
             raw_inputs=(rendered.text,),
             max_sandbox_api_calls=1,
             timeout_seconds=30,
-        )
+        ).model_copy(update={"sandbox_setup": protected_source.sandbox_setup})
     )
 
     provider_payloads = json.dumps(
@@ -337,13 +347,16 @@ async def test_pipeline_is_one_boundary_and_sandbox_rehydrates(tmp_path: Path) -
     assert _SECRET not in provider_payloads
     assert "secret-token" not in provider_payloads
     assert "private context" not in provider_payloads
+    assert _FIXTURE_SECRET not in provider_payloads
     assert sandbox.inputs == [f"Please Email {_SECRET}"]
+    assert sandbox.sandbox_setups == [protected_source.sandbox_setup]
     assert _SECRET not in protected_evidence.model_dump_json()
     assert "__UL_SECRET_email_" in protected_evidence.model_dump_json()
     for metadata in (frame.metadata, rendered.metadata, assessment.metadata):
         assert metadata == {"redaction_policy_sha256": policy().digest}
         assert _SECRET not in json.dumps(metadata)
     assert _SECRET not in protected_source.model_dump_json()
+    assert _FIXTURE_SECRET in protected_source.model_dump_json()
 
 
 @pytest.mark.asyncio
