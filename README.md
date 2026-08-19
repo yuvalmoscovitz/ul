@@ -439,9 +439,30 @@ return bounded JSON. UL verifies the reset response contract and ordering, but c
 that the sandbox actually erased or seeded its internal state. The sandbox implementation remains
 responsible for making reset deterministic and complete.
 
-Setup is one static JSON fixture from the sandbox configuration and is reused for every repetition
-in the run. Per-record setup fixtures are intentionally deferred. Put record-specific content only
-in the `execute_turn` template for now.
+Setup can use either one static payload from the sandbox configuration or an explicit inline fixture
+from each selected dataset record. To use per-record setup, add a `sandbox_setup` JSON object to
+every selected JSONL record:
+
+```json
+{"id":"payment-1","input":"Pay AC-100","output":{"status":"paid"},"sandbox_setup":{"invoices":[{"id":"AC-100","status":"approved"}]}}
+```
+
+Then place exactly one whole-value `{{sandbox_setup}}` leaf in the setup request template:
+
+```json
+{
+  "case_id": "{{case_id}}",
+  "fixture": "{{sandbox_setup}}"
+}
+```
+
+UL applies the same record fixture after every reset for its baseline and all variations and
+repetitions. Fixtures must be JSON objects, are limited to 64 KiB, 20 nesting levels, and 1,000
+values, and are never inferred from traces or treated as external references. Dry-run reports only
+the fixture count. The run context and execution evidence bind the fixture SHA-256, while private
+evidence and augmentation ledgers retain the fixture values needed for exact resume. Treat those
+files as sensitive. A setup template that contains `{{sandbox_setup}}` requires a fixture on every
+selected record; a fixture is rejected when the template does not consume it.
 
 Each physical lifecycle request counts toward `--max-sandbox-api-calls`. UL snapshots the sandbox
 after reset/setup and before the first test turn, so a configuration with setup uses six calls per

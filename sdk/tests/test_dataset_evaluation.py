@@ -36,6 +36,7 @@ from ul_core.dataset import (
     ObservedOutcome,
     RenderedUserInput,
     RequestUnit,
+    SandboxSetupFixture,
     SemanticFactor,
     SemanticFrame,
     UserInputRecord,
@@ -305,6 +306,7 @@ class DeterministicSandbox:
             cancellation_guarantee=cancellation_guarantee,
         )
         self.raw_inputs: list[str] = []
+        self.executed_cases: list[EvaluationCase] = []
         self.raw_output = (
             raw_output
             if raw_output is not None
@@ -321,6 +323,7 @@ class DeterministicSandbox:
         assert len(case.turns) == 1
         raw_input = case.turns[0].content
         self.raw_inputs.append(raw_input)
+        self.executed_cases.append(case)
         return self._successful_evidence(
             case,
             self.baseline_raw_output if len(self.raw_inputs) == 1 else self.raw_output,
@@ -339,6 +342,9 @@ class DeterministicSandbox:
             case_id=case.id,
             sandbox_id=self.sandbox_id,
             sandbox_config_sha256=self.config_sha256,
+            sandbox_setup_sha256=(
+                case.sandbox_setup.sha256 if case.sandbox_setup is not None else None
+            ),
             initial_state=initial_state,
             turns=(
                 SandboxTurnEvidence(
@@ -638,6 +644,30 @@ async def test_runner_executes_only_accepted_candidates_and_keeps_rejected_candi
         == accepted.target_output.raw_output
     )
     assert DatasetEvaluationResult.model_validate_json(result.model_dump_json()) == result
+
+
+async def test_runner_reuses_record_setup_for_every_baseline_and_variation() -> None:
+    fixture = SandboxSetupFixture.from_payload(
+        {"account": {"id": "AC-100", "balance": 50}, "approved": True}
+    )
+    runner, _, target = _runner((_source_outcomes()[0],))
+
+    result = await runner.run(
+        _source().model_copy(update={"sandbox_setup": fixture}), repetitions=2
+    )
+
+    assert len(target.executed_cases) == 4
+    assert all(case.sandbox_setup == fixture for case in target.executed_cases)
+    evidence_digests = {
+        trial.execution_evidence.sandbox_setup_sha256
+        for trial_set in (
+            result.baseline.trial_set,
+            *(case.trial_set for case in result.cases if case.trial_set is not None),
+        )
+        for trial in trial_set.trials
+        if trial.execution_evidence is not None
+    }
+    assert evidence_digests == {fixture.sha256}
 
 
 async def test_redacted_runner_evidence_never_persists_sandbox_secrets(tmp_path: Path) -> None:

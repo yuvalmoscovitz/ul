@@ -166,6 +166,11 @@ class DatasetEvidenceRedactionCoverage(_StrictModel):
     matches_by_rule: dict[str, int] = Field(default_factory=dict)
 
 
+class DatasetEvidenceSandboxSetup(_StrictModel):
+    interaction_id: str = Field(min_length=1)
+    sha256: str = Field(pattern=_SHA256_PATTERN)
+
+
 class DatasetEvidenceTarget(_StrictModel):
     kind: Literal["sandbox_http"]
     config: JsonHttpSandboxConfig
@@ -190,6 +195,7 @@ class DatasetEvidenceRunContext(_StrictModel):
     semantic_settings: DatasetEvidenceSemanticSettings
     redaction_policy_sha256: str | None = Field(default=None, pattern=_SHA256_PATTERN)
     redaction_coverage: tuple[DatasetEvidenceRedactionCoverage, ...] = ()
+    sandbox_setups: tuple[DatasetEvidenceSandboxSetup, ...] = ()
     context_sha256: str = Field(pattern=_SHA256_PATTERN)
 
     @model_validator(mode="after")
@@ -199,6 +205,8 @@ class DatasetEvidenceRunContext(_StrictModel):
             context_content.pop("redaction_policy_sha256")
         if not self.redaction_coverage:
             context_content.pop("redaction_coverage")
+        if not self.sandbox_setups:
+            context_content.pop("sandbox_setups")
         expected_context_sha256 = _canonical_json_sha256(context_content)
         if self.context_sha256 != expected_context_sha256:
             raise ValueError("run context digest must match its canonical content")
@@ -281,6 +289,9 @@ def create_dataset_evidence_run_context(
     redaction_policy_sha256: str | None = None,
     redaction_coverage: tuple[DatasetEvidenceRedactionCoverage, ...] = (),
 ) -> DatasetEvidenceRunContext:
+    for record in selected_records:
+        if record.sandbox_setup is not None:
+            record.sandbox_setup.verify_digest()
     selected_dataset_sha256 = _canonical_json_sha256(
         [record.model_dump(mode="json") for record in selected_records]
     )
@@ -311,6 +322,16 @@ def create_dataset_evidence_run_context(
         content["redaction_coverage"] = [
             item.model_dump(mode="json") for item in redaction_coverage
         ]
+    sandbox_setups = tuple(
+        DatasetEvidenceSandboxSetup(
+            interaction_id=record.id,
+            sha256=record.sandbox_setup.sha256,
+        )
+        for record in selected_records
+        if record.sandbox_setup is not None
+    )
+    if sandbox_setups:
+        content["sandbox_setups"] = [item.model_dump(mode="json") for item in sandbox_setups]
     return DatasetEvidenceRunContext(
         selected_dataset_sha256=selected_dataset_sha256,
         operators=operator_snapshots,
@@ -320,6 +341,7 @@ def create_dataset_evidence_run_context(
         semantic_settings=semantic_settings,
         redaction_policy_sha256=redaction_policy_sha256,
         redaction_coverage=redaction_coverage,
+        sandbox_setups=sandbox_setups,
         context_sha256=_canonical_json_sha256(content),
     )
 

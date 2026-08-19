@@ -19,6 +19,7 @@ from ul_core.dataset import (
     InteractionRecord,
     ObservedAgentOutput,
     RenderedUserInput,
+    SandboxSetupFixture,
     SemanticDelta,
     SemanticEquivalenceAssessment,
     SemanticFrame,
@@ -146,6 +147,7 @@ from ul.http_sandbox import (
     JsonHttpSandboxConnection,
     JsonHttpTimeoutAfterCommitConfig,
     json_http_sandbox_config_sha256,
+    json_http_sandbox_uses_per_record_setup,
     load_json_http_sandbox_config,
 )
 from ul.otlp_ingest import OtlpIngestResult, OtlpInteractionRecord, parse_otlp_traces
@@ -280,6 +282,7 @@ __all__ = [
     "SafetyEnvelope",
     "SandboxCapabilities",
     "SandboxLifecycleEvidence",
+    "SandboxSetupFixture",
     "SandboxStateEvidence",
     "SandboxTurnEvidence",
     "Scenario",
@@ -315,6 +318,7 @@ __all__ = [
     "evaluate_dataset_invariant_rules",
     "evaluate_dataset_invariants",
     "json_http_sandbox_config_sha256",
+    "json_http_sandbox_uses_per_record_setup",
     "load_correction_after_first_response_case",
     "load_dataset_invariant_suite",
     "load_dataset_regression_case",

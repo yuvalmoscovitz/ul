@@ -45,6 +45,9 @@ def validate_execution_evidence(
         raise ValueError("sandbox evidence identity does not match the connection")
     if evidence.sandbox_config_sha256 != sandbox.config_sha256:
         raise ValueError("sandbox evidence config does not match the connection")
+    expected_setup_sha256 = case.sandbox_setup.sha256 if case.sandbox_setup is not None else None
+    if evidence.sandbox_setup_sha256 != expected_setup_sha256:
+        raise ValueError("sandbox evidence setup fixture does not match the requested case")
     requested_event = case.timeout_after_commit_event
     event_evidence = evidence.timeout_after_commit_event
     if (requested_event is None) != (event_evidence is None):
