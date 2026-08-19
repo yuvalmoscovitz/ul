@@ -1,0 +1,16 @@
+{
+  "schema_version": "1.1.0",
+  "observation_source": "target_output",
+  "observation_authority": "committed_state_snapshot",
+  "rules": [
+    {
+      "type": "json_value_equals_literal",
+      "id": "payment-committed-exactly-once",
+      "version": "1.0.0",
+      "description": "The number of committed matching payments must equal the expected count.",
+      "severity": "critical",
+      "value_pointer": "/matching_payment_count",
+      "literal": 1
+    }
+  ]
+}

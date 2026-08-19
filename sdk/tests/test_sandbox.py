@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Literal
 
 import pytest
-from ul.sandbox import validate_execution_evidence
+from ul.sandbox import execution_evidence_requires_quarantine, validate_execution_evidence
 from ul_core.evaluation import (
     EvaluationCase,
     ExecutionEvidence,
@@ -11,6 +11,8 @@ from ul_core.evaluation import (
     SandboxLifecycleEvidence,
     SandboxStateEvidence,
     SandboxTurnEvidence,
+    TimeoutAfterCommitEventEvidence,
+    TimeoutAfterCommitEventRequest,
 )
 from ul_core.models import ConversationRole, ConversationTurn
 
@@ -110,6 +112,35 @@ def test_required_state_observation_is_enforced() -> None:
 
     with pytest.raises(ValueError, match="required state observation"):
         validate_execution_evidence(case, _SandboxIdentity(), evidence)
+
+
+def test_incomplete_timeout_event_is_rejected_and_quarantined() -> None:
+    case = _case().model_copy(
+        update={
+            "timeout_after_commit_event": TimeoutAfterCommitEventRequest(
+                event_id="lost-ack",
+                turn_id="turn-1",
+                action_id="execute-payment",
+            )
+        }
+    )
+    sandbox = _SandboxIdentity()
+    sandbox.capabilities = sandbox.capabilities.model_copy(
+        update={"timeout_after_commit_version": "1.0.0"}
+    )
+    incomplete_event = TimeoutAfterCommitEventEvidence.model_construct(
+        event_id="lost-ack",
+        turn_id="turn-1",
+        action_id="execute-payment",
+        armed=True,
+        trigger_status="fired",
+        cleaned=False,
+    )
+    evidence = _evidence().model_copy(update={"timeout_after_commit_event": incomplete_event})
+
+    with pytest.raises(ValueError, match="incomplete event lifecycle"):
+        validate_execution_evidence(case, sandbox, evidence)
+    assert execution_evidence_requires_quarantine(evidence) is True
 
 
 def test_every_independent_state_observation_is_bound_to_the_declared_observer() -> None:

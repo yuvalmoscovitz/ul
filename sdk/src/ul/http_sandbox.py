@@ -31,6 +31,9 @@ from ul_core.evaluation import (
     SandboxLifecycleEvidence,
     SandboxStateEvidence,
     SandboxTurnEvidence,
+    TimeoutAfterCommitEventEvidence,
+    TimeoutAfterCommitEventRequest,
+    TimeoutAfterCommitTriggerStatus,
 )
 
 _HEADER_NAME_PATTERN = re.compile(r"[!#$%&'*+.^_`|~0-9A-Za-z-]+")
@@ -199,6 +202,45 @@ class JsonHttpLifecycleExecuteTurnConfig(BaseModel):
         return pointer
 
 
+class JsonHttpTimeoutAfterCommitConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    operator_id: Literal["tool.timeout_after_commit"] = "tool.timeout_after_commit"
+    version: Literal["1.0.0"] = "1.0.0"
+    url: str
+
+    @field_validator("url")
+    @classmethod
+    def validate_url(cls, url: str) -> str:
+        _validate_endpoint(url, allow_insecure_http=True)
+        return url
+
+
+class _TimeoutAfterCommitControlResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    sandbox_id: str = Field(min_length=1, max_length=500)
+    case_id: str = Field(min_length=1, max_length=500)
+    operator_id: Literal["tool.timeout_after_commit"]
+    operator_version: Literal["1.0.0"]
+    event_id: str = Field(min_length=1, max_length=500)
+    turn_id: str = Field(min_length=1, max_length=500)
+    action_id: str = Field(min_length=1, max_length=500)
+    operation: Literal["arm", "observe", "clean"]
+    status: Literal["armed", "fired", "not_fired", "cleaned"]
+
+    @model_validator(mode="after")
+    def validate_operation_status(self) -> Self:
+        valid_statuses = {
+            "arm": {"armed"},
+            "observe": {"fired", "not_fired"},
+            "clean": {"cleaned"},
+        }
+        if self.status not in valid_statuses[self.operation]:
+            raise ValueError("timeout-after-commit status does not match its operation")
+        return self
+
+
 class JsonHttpSandboxConfig(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
@@ -209,6 +251,7 @@ class JsonHttpSandboxConfig(BaseModel):
     setup: JsonHttpLifecycleMutationConfig | None = None
     execute_turn: JsonHttpLifecycleExecuteTurnConfig
     snapshot: JsonHttpLifecycleObservationConfig
+    timeout_after_commit: JsonHttpTimeoutAfterCommitConfig | None = None
 
     @field_validator("version", mode="before")
     @classmethod
@@ -303,6 +346,11 @@ class JsonHttpSandboxConnection:
             supports_state_observation=True,
             state_observation_authority="sandbox_self_reported",
             cancellation_guarantee="best_effort",
+            timeout_after_commit_version=(
+                config.timeout_after_commit.version
+                if config.timeout_after_commit is not None
+                else None
+            ),
         )
 
     @property
@@ -353,7 +401,12 @@ class JsonHttpSandboxConnection:
             await self._client.aclose()
 
     def api_calls_for_case(self, case: EvaluationCase) -> int:
-        return json_http_sandbox_calls_per_conversation(self._config, len(case.turns))
+        calls = json_http_sandbox_calls_per_conversation(self._config, len(case.turns))
+        if case.timeout_after_commit_event is not None:
+            if self._config.timeout_after_commit is None:
+                raise ValueError("sandbox does not support tool.timeout_after_commit@1.0.0")
+            calls += 3
+        return calls
 
     async def execute(self, case: EvaluationCase) -> ExecutionEvidence:
         required_calls = self.api_calls_for_case(case)
@@ -365,6 +418,10 @@ class JsonHttpSandboxConnection:
 
     async def _execute_stateful(self, case: EvaluationCase) -> ExecutionEvidence:
         config = self._config
+        event_request = case.timeout_after_commit_event
+        event_config = config.timeout_after_commit
+        if event_request is not None and event_config is None:
+            raise ValueError("sandbox does not support tool.timeout_after_commit@1.0.0")
         if self._lifecycle_state_uncertain:
             return self._execution_evidence(
                 case,
@@ -383,10 +440,16 @@ class JsonHttpSandboxConnection:
         lifecycle_started = False
         failed_phase: str | None = None
         cleanup_reset_failed = False
+        event_cleanup_failed = False
         delivery_uncertain = False
         current_phase = "reset"
         turn_observations: list[SandboxTurnEvidence] = []
         initial_state: SandboxStateEvidence | None = None
+        event_arm_attempted = False
+        event_armed = False
+        event_trigger_status: TimeoutAfterCommitTriggerStatus = "unknown"
+        event_cleaned = False
+        cleanup_cancellation: asyncio.CancelledError | None = None
         try:
             lifecycle_started = True
             await self._reset(config.reset, case.id)
@@ -419,6 +482,19 @@ class JsonHttpSandboxConnection:
             )
             completed_phase_names.append(current_phase)
             for turn_index, turn in enumerate(case.turns, start=1):
+                if event_request is not None and event_request.turn_id == turn.id:
+                    if event_config is None:
+                        raise AssertionError("event capability was validated before execution")
+                    current_phase = "arm_timeout_after_commit"
+                    event_arm_attempted = True
+                    await self._timeout_after_commit_control(
+                        event_config,
+                        case.id,
+                        event_request,
+                        operation="arm",
+                    )
+                    event_armed = True
+                    completed_phase_names.append(current_phase)
                 current_phase = _conversation_phase_name(
                     "execute_turn", turn_index, len(case.turns)
                 )
@@ -456,18 +532,38 @@ class JsonHttpSandboxConnection:
                         state_observation_authority="sandbox_self_reported",
                     )
                 )
+                if event_request is not None and event_request.turn_id == turn.id:
+                    if event_config is None:
+                        raise AssertionError("event capability was validated before execution")
+                    current_phase = "observe_timeout_after_commit"
+                    observed_status = await self._timeout_after_commit_control(
+                        event_config,
+                        case.id,
+                        event_request,
+                        operation="observe",
+                    )
+                    if observed_status not in {"fired", "not_fired"}:
+                        raise AssertionError("observe operation returned an invalid status")
+                    event_trigger_status = cast(TimeoutAfterCommitTriggerStatus, observed_status)
+                    completed_phase_names.append(current_phase)
         except _TargetDeliveryUncertainError:
             failed_phase = current_phase
-            delivery_uncertain = current_phase in {"setup", "initial_snapshot"} or (
-                current_phase.startswith(("execute_turn", "snapshot"))
-            )
+            delivery_uncertain = current_phase in {
+                "setup",
+                "initial_snapshot",
+                "arm_timeout_after_commit",
+                "observe_timeout_after_commit",
+            } or (current_phase.startswith(("execute_turn", "snapshot")))
         except _SandboxIdentityMismatchError:
             failed_phase = current_phase
             delivery_uncertain = True
         except asyncio.CancelledError:
-            if current_phase in {"setup", "initial_snapshot"} or current_phase.startswith(
-                ("execute_turn", "snapshot")
-            ):
+            if current_phase in {
+                "setup",
+                "initial_snapshot",
+                "arm_timeout_after_commit",
+                "observe_timeout_after_commit",
+            } or current_phase.startswith(("execute_turn", "snapshot")):
                 delivery_uncertain = True
             raise
         except RuntimeError:
@@ -475,23 +571,56 @@ class JsonHttpSandboxConnection:
         finally:
             if lifecycle_started:
                 try:
-                    await self._reset(config.reset, case.id)
-                    completed_phase_names.append("cleanup_reset")
-                    if not delivery_uncertain:
-                        self._lifecycle_state_uncertain = False
-                except RuntimeError:
-                    cleanup_reset_failed = True
-        if failed_phase is not None or cleanup_reset_failed:
+                    if event_arm_attempted:
+                        if event_config is None or event_request is None:
+                            raise AssertionError("event cleanup requires an event configuration")
+                        try:
+                            await self._timeout_after_commit_control(
+                                event_config,
+                                case.id,
+                                event_request,
+                                operation="clean",
+                            )
+                            event_cleaned = True
+                            completed_phase_names.append("cleanup_timeout_after_commit")
+                        except asyncio.CancelledError as error:
+                            event_cleanup_failed = True
+                            self._lifecycle_state_uncertain = True
+                            cleanup_cancellation = error
+                        except RuntimeError:
+                            event_cleanup_failed = True
+                            self._lifecycle_state_uncertain = True
+                finally:
+                    try:
+                        await self._reset(config.reset, case.id)
+                        completed_phase_names.append("cleanup_reset")
+                        if not delivery_uncertain and not event_cleanup_failed:
+                            self._lifecycle_state_uncertain = False
+                    except asyncio.CancelledError as error:
+                        cleanup_reset_failed = True
+                        self._lifecycle_state_uncertain = True
+                        cleanup_cancellation = cleanup_cancellation or error
+                    except RuntimeError:
+                        cleanup_reset_failed = True
+            if cleanup_cancellation is not None:
+                raise cleanup_cancellation
+        if failed_phase is not None or cleanup_reset_failed or event_cleanup_failed:
             return self._execution_evidence(
                 case,
                 tuple(turn_observations),
                 initial_state=initial_state,
                 terminal_status="failed",
                 completed_phases=tuple(completed_phase_names),
-                failed_phase=failed_phase or "cleanup_reset",
+                failed_phase=(
+                    failed_phase
+                    or ("cleanup_timeout_after_commit" if event_cleanup_failed else "cleanup_reset")
+                ),
                 delivery="uncertain" if delivery_uncertain else "certain",
-                cleanup="failed" if cleanup_reset_failed else "succeeded",
+                cleanup=("failed" if cleanup_reset_failed or event_cleanup_failed else "succeeded"),
                 sandbox_state_uncertain=self._lifecycle_state_uncertain,
+                event_armed=event_armed,
+                event_trigger_status=event_trigger_status,
+                event_cleaned=event_cleaned,
             )
         if len(turn_observations) != len(case.turns):
             raise AssertionError(
@@ -507,7 +636,67 @@ class JsonHttpSandboxConnection:
             delivery="certain",
             cleanup="succeeded",
             sandbox_state_uncertain=False,
+            event_armed=event_armed,
+            event_trigger_status=event_trigger_status,
+            event_cleaned=event_cleaned,
         )
+
+    async def _timeout_after_commit_control(
+        self,
+        config: JsonHttpTimeoutAfterCommitConfig,
+        case_id: str,
+        event: TimeoutAfterCommitEventRequest,
+        *,
+        operation: Literal["arm", "observe", "clean"],
+    ) -> Literal["armed", "fired", "not_fired", "cleaned"]:
+        payload = await self._post_for_json(
+            config.url,
+            {
+                "sandbox_id": self._config.sandbox_id,
+                "case_id": case_id,
+                "operator_id": event.operator_id,
+                "operator_version": event.operator_version,
+                "event_id": event.event_id,
+                "turn_id": event.turn_id,
+                "action_id": event.action_id,
+                "operation": operation,
+            },
+            "",
+            consume_budget=False,
+        )
+        try:
+            response = _TimeoutAfterCommitControlResponse.model_validate(payload)
+        except ValidationError:
+            self._lifecycle_state_uncertain = True
+            raise _SandboxIdentityMismatchError(
+                "timeout-after-commit control response is invalid"
+            ) from None
+        expected_identity = (
+            self._config.sandbox_id,
+            case_id,
+            event.operator_id,
+            event.operator_version,
+            event.event_id,
+            event.turn_id,
+            event.action_id,
+            operation,
+        )
+        response_identity = (
+            response.sandbox_id,
+            response.case_id,
+            response.operator_id,
+            response.operator_version,
+            response.event_id,
+            response.turn_id,
+            response.action_id,
+            response.operation,
+        )
+        if response_identity != expected_identity:
+            self._lifecycle_state_uncertain = True
+            raise _SandboxIdentityMismatchError(
+                "timeout-after-commit control response did not match its request"
+            )
+        return response.status
 
     async def _reset(self, config: JsonHttpLifecycleResetConfig, case_id: str) -> JsonValue:
         reset_response = await self._post_for_json(
@@ -604,7 +793,11 @@ class JsonHttpSandboxConnection:
         delivery: Literal["certain", "uncertain"],
         cleanup: Literal["succeeded", "failed", "not_attempted"],
         sandbox_state_uncertain: bool,
+        event_armed: bool = False,
+        event_trigger_status: TimeoutAfterCommitTriggerStatus = "unknown",
+        event_cleaned: bool = False,
     ) -> ExecutionEvidence:
+        event_request = case.timeout_after_commit_event
         return ExecutionEvidence(
             case_id=case.id,
             sandbox_id=self._config.sandbox_id,
@@ -621,6 +814,16 @@ class JsonHttpSandboxConnection:
                 if turns
                 and turns[-1].state_snapshot is not None
                 and turns[-1].state_observation_authority is not None
+                else None
+            ),
+            timeout_after_commit_event=(
+                TimeoutAfterCommitEventEvidence(
+                    **event_request.model_dump(),
+                    armed=event_armed,
+                    trigger_status=event_trigger_status,
+                    cleaned=event_cleaned,
+                )
+                if event_request is not None
                 else None
             ),
             lifecycle=SandboxLifecycleEvidence(
@@ -774,7 +977,7 @@ def json_http_sandbox_calls_per_execution(
 
 def json_http_sandbox_config_sha256(config: JsonHttpSandboxConfig) -> str:
     canonical_config = json.dumps(
-        config.model_dump(mode="json"),
+        config.model_dump(mode="json", exclude_none=True),
         ensure_ascii=True,
         sort_keys=True,
         separators=(",", ":"),
@@ -803,6 +1006,7 @@ def json_http_sandbox_config_urls(
         *((config.setup.url,) if config.setup is not None else ()),
         config.execute_turn.url,
         config.snapshot.url,
+        *((config.timeout_after_commit.url,) if config.timeout_after_commit is not None else ()),
     )
 
 

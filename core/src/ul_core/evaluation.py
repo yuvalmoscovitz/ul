@@ -8,6 +8,7 @@ from pydantic import ConfigDict, Field, JsonValue, model_validator
 from ul_core.models import ConversationTurn, ULModel
 
 StateObservationAuthority = Literal["sandbox_self_reported", "independent_observer"]
+TimeoutAfterCommitTriggerStatus = Literal["unknown", "not_fired", "fired"]
 
 
 class _StrictModel(ULModel):
@@ -41,6 +42,28 @@ class ProductionSourcePage(_StrictModel):
     next_checkpoint: str | None = Field(default=None, min_length=1, max_length=1_000)
 
 
+class TimeoutAfterCommitEventRequest(_StrictModel):
+    operator_id: Literal["tool.timeout_after_commit"] = "tool.timeout_after_commit"
+    operator_version: Literal["1.0.0"] = "1.0.0"
+    event_id: str = Field(min_length=1, max_length=500)
+    turn_id: str = Field(min_length=1, max_length=500)
+    action_id: str = Field(min_length=1, max_length=500)
+
+
+class TimeoutAfterCommitEventEvidence(TimeoutAfterCommitEventRequest):
+    authority: Literal["sandbox_self_reported"] = "sandbox_self_reported"
+    requested: Literal[True] = True
+    armed: bool
+    trigger_status: TimeoutAfterCommitTriggerStatus
+    cleaned: bool
+
+    @model_validator(mode="after")
+    def validate_trigger_status(self) -> Self:
+        if not self.armed and self.trigger_status != "unknown":
+            raise ValueError("an unarmed timeout-after-commit event cannot have a trigger result")
+        return self
+
+
 class EvaluationCase(_StrictModel):
     schema_version: Literal["1.0.0"] = "1.0.0"
     id: str = Field(min_length=1, max_length=500)
@@ -49,6 +72,7 @@ class EvaluationCase(_StrictModel):
     timeout_seconds: float = Field(gt=0)
     required_state_observation_authority: StateObservationAuthority | None = None
     required_state_observer_id: str | None = Field(default=None, min_length=1, max_length=500)
+    timeout_after_commit_event: TimeoutAfterCommitEventRequest | None = None
 
     @model_validator(mode="after")
     def validate_identifiers(self) -> Self:
@@ -57,6 +81,11 @@ class EvaluationCase(_StrictModel):
         turn_ids = tuple(turn.id for turn in self.turns)
         if len(turn_ids) != len(set(turn_ids)):
             raise ValueError("evaluation case turn identifiers must be unique")
+        if (
+            self.timeout_after_commit_event is not None
+            and self.timeout_after_commit_event.turn_id not in turn_ids
+        ):
+            raise ValueError("timeout-after-commit event must reference a case turn")
         if self.required_state_observation_authority == "independent_observer":
             if self.required_state_observer_id is None:
                 raise ValueError("independent state requirements need an observer identifier")
@@ -72,6 +101,7 @@ class SandboxCapabilities(_StrictModel):
     state_observation_authority: StateObservationAuthority | None = None
     state_observer_id: str | None = Field(default=None, min_length=1, max_length=500)
     cancellation_guarantee: Literal["none", "best_effort", "guaranteed"]
+    timeout_after_commit_version: Literal["1.0.0"] | None = None
 
     @model_validator(mode="after")
     def validate_state_observation_authority(self) -> Self:
@@ -157,6 +187,7 @@ class ExecutionEvidence(_StrictModel):
     turns: tuple[SandboxTurnEvidence, ...] = ()
     final_response: JsonValue | None = None
     final_state: SandboxStateEvidence | None = None
+    timeout_after_commit_event: TimeoutAfterCommitEventEvidence | None = None
     lifecycle: SandboxLifecycleEvidence
 
     @model_validator(mode="after")
@@ -179,4 +210,12 @@ class ExecutionEvidence(_StrictModel):
                 or self.final_state.observer_id != final_turn.state_observer_id
             ):
                 raise ValueError("final state must match the last turn")
+            if self.timeout_after_commit_event is not None and (
+                not self.timeout_after_commit_event.armed
+                or self.timeout_after_commit_event.trigger_status == "unknown"
+                or not self.timeout_after_commit_event.cleaned
+            ):
+                raise ValueError(
+                    "successful timeout-after-commit evidence requires a completed event"
+                )
         return self

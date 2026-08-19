@@ -188,7 +188,7 @@ def initialize_dataset_sandbox(
         raise typer.BadParameter(message, param_hint="SANDBOX_CONFIG") from None
 
     with output_stream:
-        json.dump(config.model_dump(mode="json"), output_stream, indent=2)
+        json.dump(config.model_dump(mode="json", exclude_none=True), output_stream, indent=2)
         output_stream.write("\n")
 
     console.print(f"Created private sandbox connection config: {sandbox_config}")
