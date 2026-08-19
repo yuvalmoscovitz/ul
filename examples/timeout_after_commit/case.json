@@ -1,0 +1,13 @@
+{
+  "schema_version": "1.0.0",
+  "id": "retry-payment-after-lost-acknowledgement",
+  "operator_id": "tool.timeout_after_commit",
+  "operator_version": "1.0.0",
+  "event_id": "lose-first-payment-acknowledgement",
+  "action_id": "execute-payment",
+  "turn": {
+    "id": "submit-payment",
+    "role": "user",
+    "content": "Pay approved invoice AC-100 exactly once."
+  }
+}

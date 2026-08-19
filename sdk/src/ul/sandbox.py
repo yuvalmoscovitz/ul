@@ -45,6 +45,33 @@ def validate_execution_evidence(
         raise ValueError("sandbox evidence identity does not match the connection")
     if evidence.sandbox_config_sha256 != sandbox.config_sha256:
         raise ValueError("sandbox evidence config does not match the connection")
+    requested_event = case.timeout_after_commit_event
+    event_evidence = evidence.timeout_after_commit_event
+    if (requested_event is None) != (event_evidence is None):
+        raise ValueError("sandbox event evidence does not match the requested case")
+    if requested_event is not None and event_evidence is not None:
+        if (
+            event_evidence.operator_id,
+            event_evidence.operator_version,
+            event_evidence.event_id,
+            event_evidence.turn_id,
+            event_evidence.action_id,
+        ) != (
+            requested_event.operator_id,
+            requested_event.operator_version,
+            requested_event.event_id,
+            requested_event.turn_id,
+            requested_event.action_id,
+        ):
+            raise ValueError("sandbox event evidence does not match the requested event")
+        if sandbox.capabilities.timeout_after_commit_version != requested_event.operator_version:
+            raise ValueError("sandbox event evidence does not match its advertised capability")
+        if evidence.lifecycle.terminal_status == "succeeded" and (
+            not event_evidence.armed
+            or event_evidence.trigger_status == "unknown"
+            or not event_evidence.cleaned
+        ):
+            raise ValueError("successful sandbox evidence contains an incomplete event lifecycle")
     expected_turn_ids = tuple(turn.id for turn in case.turns)
     evidence_turn_ids = tuple(turn.turn_id for turn in evidence.turns)
     if evidence.lifecycle.terminal_status == "succeeded" and evidence_turn_ids != expected_turn_ids:
@@ -110,4 +137,9 @@ def execution_evidence_requires_quarantine(evidence: ExecutionEvidence) -> bool:
         lifecycle.delivery == "uncertain"
         or lifecycle.cleanup == "failed"
         or lifecycle.sandbox_state_uncertain
+        or (
+            evidence.timeout_after_commit_event is not None
+            and evidence.timeout_after_commit_event.armed
+            and not evidence.timeout_after_commit_event.cleaned
+        )
     )

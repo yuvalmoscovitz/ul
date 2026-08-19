@@ -10,6 +10,8 @@ from ul_core.evaluation import (
     SandboxLifecycleEvidence,
     SandboxStateEvidence,
     SandboxTurnEvidence,
+    TimeoutAfterCommitEventEvidence,
+    TimeoutAfterCommitEventRequest,
 )
 from ul_core.models import ConversationRole, ConversationTurn
 
@@ -52,6 +54,71 @@ def test_evaluation_case_rejects_production_routing_metadata() -> None:
                 "production_endpoint": "https://production.example/execute",
                 "production_headers": {"Authorization": "secret"},
             }
+        )
+
+
+def test_timeout_after_commit_event_must_reference_a_case_turn() -> None:
+    with pytest.raises(ValidationError, match="must reference a case turn"):
+        EvaluationCase(
+            id="case-1",
+            turns=(_turn(),),
+            max_sandbox_api_calls=10,
+            timeout_seconds=30,
+            timeout_after_commit_event=TimeoutAfterCommitEventRequest(
+                event_id="lost-ack",
+                turn_id="other-turn",
+                action_id="execute-payment",
+            ),
+        )
+
+
+def test_unarmed_timeout_after_commit_event_cannot_claim_it_fired() -> None:
+    with pytest.raises(ValidationError, match="unarmed"):
+        TimeoutAfterCommitEventEvidence(
+            event_id="lost-ack",
+            turn_id="turn-1",
+            action_id="execute-payment",
+            armed=False,
+            trigger_status="fired",
+            cleaned=True,
+        )
+
+
+def test_successful_execution_requires_timeout_event_cleanup() -> None:
+    with pytest.raises(ValidationError, match="completed event"):
+        ExecutionEvidence(
+            case_id="case-1",
+            sandbox_id="invoice-sandbox",
+            sandbox_config_sha256="a" * 64,
+            initial_state=SandboxStateEvidence(
+                value={"payments": []}, authority="sandbox_self_reported"
+            ),
+            turns=(
+                SandboxTurnEvidence(
+                    turn_id="turn-1",
+                    response={"status": "ok"},
+                    state_snapshot={"payments": ["payment-1"]},
+                    state_observation_authority="sandbox_self_reported",
+                ),
+            ),
+            final_response={"status": "ok"},
+            final_state=SandboxStateEvidence(
+                value={"payments": ["payment-1"]}, authority="sandbox_self_reported"
+            ),
+            timeout_after_commit_event=TimeoutAfterCommitEventEvidence(
+                event_id="lost-ack",
+                turn_id="turn-1",
+                action_id="execute-payment",
+                armed=True,
+                trigger_status="fired",
+                cleaned=False,
+            ),
+            lifecycle=SandboxLifecycleEvidence(
+                terminal_status="succeeded",
+                delivery="certain",
+                cleanup="succeeded",
+                sandbox_state_uncertain=False,
+            ),
         )
 
 

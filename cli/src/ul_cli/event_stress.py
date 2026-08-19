@@ -36,6 +36,13 @@ from ul.http_sandbox import (
     load_json_http_sandbox_config,
     validate_json_http_sandbox_configuration,
 )
+from ul.timeout_after_commit import (
+    TimeoutAfterCommitCase,
+    TimeoutAfterCommitStressResult,
+    load_timeout_after_commit_case,
+    plan_timeout_after_commit_stress_test,
+    run_timeout_after_commit_stress_test,
+)
 from ul.trace_replay import (
     TraceReplayCase,
     TraceReplayResult,
@@ -46,6 +53,109 @@ from ul.trace_replay import (
 )
 
 app = typer.Typer(help="Stress stateful agents with ordered conversation events.")
+
+
+@app.command("timeout-after-commit")
+def run_timeout_after_commit(
+    case_path: Annotated[Path, typer.Argument(exists=True, dir_okay=False, readable=True)],
+    target_config_path: Annotated[
+        Path, typer.Option("--sandbox-config", exists=True, dir_okay=False, readable=True)
+    ],
+    invariants_path: Annotated[
+        Path, typer.Option("--invariants", exists=True, dir_okay=False, readable=True)
+    ],
+    output: Annotated[Path | None, typer.Option(help="New private JSON evidence file.")] = None,
+    repetitions: Annotated[int, typer.Option(min=1)] = 3,
+    max_target_calls: Annotated[int, typer.Option("--max-sandbox-api-calls", min=1)] = 100,
+    allow_target_network: Annotated[bool, typer.Option("--allow-sandbox-network-egress")] = False,
+    confirm_isolated_sandbox: Annotated[
+        bool,
+        typer.Option(
+            help=(
+                "Attest that the configured endpoint is a customer-managed, isolated "
+                "non-production sandbox. UL does not verify its isolation."
+            )
+        ),
+    ] = False,
+    allow_insecure_http: Annotated[
+        bool, typer.Option(help="Allow an HTTP sandbox API. Intended for local sandboxes.")
+    ] = False,
+    dry_run: Annotated[
+        bool, typer.Option(help="Validate and show the complete plan without sandbox API calls.")
+    ] = False,
+) -> None:
+    """Inject one versioned lost acknowledgement after a committed tool write."""
+    try:
+        case = load_timeout_after_commit_case(case_path)
+        target_config = load_json_http_sandbox_config(target_config_path)
+        invariant_suite = load_dataset_invariant_suite(invariants_path)
+        if invariant_suite.observation_authority != "committed_state_snapshot":
+            raise ValueError("timeout-after-commit testing requires committed-state invariants")
+        validate_json_http_sandbox_configuration(
+            target_config,
+            sandbox_confirmed=confirm_isolated_sandbox or dry_run,
+            allow_insecure_http=allow_insecure_http,
+        )
+        plan = plan_timeout_after_commit_stress_test(
+            case,
+            target_config,
+            repetitions=repetitions,
+            max_sandbox_api_calls=max_target_calls,
+        )
+    except (ValidationError, ValueError, RuntimeError) as error:
+        raise typer.BadParameter(str(error)) from None
+
+    if dry_run:
+        typer.echo(f"Operator: {plan.operator_id}@{plan.operator_version}")
+        typer.echo(f"Repetitions: {plan.repetitions}")
+        typer.echo(f"Target calls per repetition: {plan.target_calls_per_repetition}")
+        typer.echo(f"Potential sandbox API calls: {plan.required_target_calls}")
+        typer.echo("External calls: none")
+        return
+    if not allow_target_network:
+        raise typer.BadParameter(
+            "execution requires --allow-sandbox-network-egress",
+            param_hint="--allow-sandbox-network-egress",
+        )
+    if not confirm_isolated_sandbox:
+        raise typer.BadParameter(
+            "execution requires --confirm-isolated-sandbox",
+            param_hint="--confirm-isolated-sandbox",
+        )
+    if output is None:
+        raise typer.BadParameter("execution requires --output", param_hint="--output")
+    if output.exists():
+        raise typer.BadParameter("output already exists; UL will not overwrite it")
+    try:
+        output_stream = _create_private_output(output)
+    except OSError:
+        raise typer.BadParameter("output could not be created", param_hint="--output") from None
+    try:
+        with output_stream:
+            target = JsonHttpSandboxConnection.from_config(
+                target_config,
+                sandbox_confirmed=True,
+                allow_insecure_http=allow_insecure_http,
+                max_sandbox_api_calls=max_target_calls,
+            )
+            result = asyncio.run(
+                _run_timeout_after_commit_and_close(
+                    case,
+                    target,
+                    invariant_rules=invariant_suite.rules,
+                    observation_authority=invariant_suite.observation_authority,
+                    repetitions=repetitions,
+                    max_target_calls=max_target_calls,
+                )
+            )
+            json.dump(result.model_dump(mode="json"), output_stream, ensure_ascii=False, indent=2)
+            output_stream.write("\n")
+            output_stream.flush()
+            os.fsync(output_stream.fileno())
+    except BaseException:
+        output.unlink(missing_ok=True)
+        raise
+    _print_timeout_after_commit_result(result, output)
 
 
 @app.command("trace")
@@ -496,6 +606,29 @@ async def _run_retry_and_close(
         await target.aclose()
 
 
+async def _run_timeout_after_commit_and_close(
+    case: TimeoutAfterCommitCase,
+    target: JsonHttpSandboxConnection,
+    *,
+    invariant_rules: tuple[DatasetInvariantRule, ...],
+    observation_authority: ObservationAuthority,
+    repetitions: int,
+    max_target_calls: int,
+) -> TimeoutAfterCommitStressResult:
+    try:
+        return await run_timeout_after_commit_stress_test(
+            case,
+            target,
+            invariant_rules=invariant_rules,
+            observation_authority=observation_authority,
+            repetitions=repetitions,
+            max_sandbox_api_calls=max_target_calls,
+            allow_network_egress=True,
+        )
+    finally:
+        await target.aclose()
+
+
 async def _run_trace_replay_and_close(
     case: TraceReplayCase,
     target: JsonHttpSandboxConnection,
@@ -593,6 +726,28 @@ def _print_retry_result(result: RetryAfterSuccessfulCommitStressResult, output: 
             f"first_commit={successful_commit_rule.status}; after_retry={retried_rule.status}; "
             f"severity={baseline_rule.severity}"
         )
+    typer.echo(f"Complete evidence: {output}")
+    if result.status == "failed":
+        raise typer.Exit(code=1)
+    if result.status == "inconclusive":
+        raise typer.Exit(code=2)
+
+
+def _print_timeout_after_commit_result(
+    result: TimeoutAfterCommitStressResult,
+    output: Path,
+) -> None:
+    typer.echo(f"Timeout-after-commit result: {result.status}")
+    fired_count = sum(
+        trial.execution_evidence is not None
+        and trial.execution_evidence.timeout_after_commit_event is not None
+        and trial.execution_evidence.timeout_after_commit_event.trigger_status == "fired"
+        for trial in result.trials
+    )
+    typer.echo(f"Triggered events: {fired_count}/{result.requested_repetitions}")
+    for rule in result.invariant_rules:
+        typer.echo(f"Invariant {rule.rule_id}: {rule.status}; severity={rule.severity}")
+    typer.echo("Exact responses, committed state, and event receipts are in private evidence.")
     typer.echo(f"Complete evidence: {output}")
     if result.status == "failed":
         raise typer.Exit(code=1)

@@ -42,6 +42,7 @@ testpaths = [
     "examples/quickstart/tests",
     "examples/multiturn_correction/tests",
     "examples/retry_after_successful_commit/tests",
+    "examples/timeout_after_commit/tests",
 ]
 
 [tool.ruff]
@@ -62,5 +63,6 @@ include = [
     "examples/quickstart",
     "examples/multiturn_correction",
     "examples/retry_after_successful_commit",
+    "examples/timeout_after_commit",
 ]
 extraPaths = ["core/src", "sdk/src", "cli/src"]

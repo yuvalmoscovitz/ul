@@ -17,7 +17,7 @@ from ul.http_sandbox import (
     load_json_http_sandbox_config,
     validate_json_http_sandbox_configuration,
 )
-from ul_core.evaluation import EvaluationCase
+from ul_core.evaluation import EvaluationCase, TimeoutAfterCommitEventRequest
 from ul_core.models import ConversationRole, ConversationTurn
 
 pytestmark = pytest.mark.asyncio
@@ -45,6 +45,7 @@ def _config(
     headers_from_env: dict[str, str] | None = None,
     clean_state_value: JsonValue = True,
     setup: bool = True,
+    timeout_after_commit: bool = False,
 ) -> JsonHttpSandboxConfig:
     raw: dict[str, Any] = {
         "version": 3,
@@ -93,6 +94,12 @@ def _config(
             "case_id_json_pointer": "/case_id",
             "sandbox_id_json_pointer": "/sandbox_id",
         }
+    if timeout_after_commit:
+        raw["timeout_after_commit"] = {
+            "operator_id": "tool.timeout_after_commit",
+            "version": "1.0.0",
+            "url": f"{base_url}/timeout-after-commit",
+        }
     return JsonHttpSandboxConfig.model_validate(raw)
 
 
@@ -109,6 +116,18 @@ def _case(*inputs: str, max_calls: int = 20) -> EvaluationCase:
         ),
         max_sandbox_api_calls=max_calls,
         timeout_seconds=30,
+    )
+
+
+def _timeout_after_commit_case(*, max_calls: int = 9) -> EvaluationCase:
+    return _case("pay once", max_calls=max_calls).model_copy(
+        update={
+            "timeout_after_commit_event": TimeoutAfterCommitEventRequest(
+                event_id="lost-payment-ack",
+                turn_id="turn-1",
+                action_id="execute-payment",
+            )
+        }
     )
 
 
@@ -192,6 +211,124 @@ async def test_executes_remote_case_and_returns_explicit_evidence() -> None:
     assert evidence.turns[0].response == {"input": "increase the amount"}
     assert evidence.turns[0].state_snapshot == {"committed_amount": 150}
     assert evidence.turns[0].state_observation_authority == "sandbox_self_reported"
+
+
+async def test_timeout_after_commit_receipts_are_correlated_and_budgeted() -> None:
+    handler, _ = _successful_handler()
+
+    def event_handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path != "/timeout-after-commit":
+            return handler(request)
+        body = json.loads(request.content)
+        status = {"arm": "armed", "observe": "fired", "clean": "cleaned"}[body["operation"]]
+        return _raw_response(json.dumps({**body, "status": status}).encode())
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(event_handler)) as client:
+        sandbox = JsonHttpSandboxConnection.from_config(
+            _config(timeout_after_commit=True),
+            sandbox_confirmed=True,
+            max_sandbox_api_calls=9,
+            client=client,
+        )
+        evidence = await sandbox.execute(_timeout_after_commit_case())
+
+    assert sandbox.api_calls_for_case(_timeout_after_commit_case()) == 9
+    assert evidence.lifecycle.terminal_status == "succeeded"
+    event = evidence.timeout_after_commit_event
+    assert event is not None
+    assert event.requested is True
+    assert event.armed is True
+    assert event.trigger_status == "fired"
+    assert event.cleaned is True
+
+
+async def test_timeout_after_commit_reserves_control_calls_before_network() -> None:
+    handler, requests = _successful_handler()
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        sandbox = JsonHttpSandboxConnection.from_config(
+            _config(timeout_after_commit=True),
+            sandbox_confirmed=True,
+            max_sandbox_api_calls=8,
+            client=client,
+        )
+        with pytest.raises(RuntimeError, match="API call budget exhausted"):
+            await sandbox.execute(_timeout_after_commit_case())
+
+    assert requests == []
+
+
+async def test_stale_timeout_after_commit_receipt_fails_and_cleans_by_event_identity() -> None:
+    handler, _ = _successful_handler()
+    operations: list[str] = []
+
+    def stale_event_handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path != "/timeout-after-commit":
+            return handler(request)
+        body = json.loads(request.content)
+        operation = body["operation"]
+        operations.append(operation)
+        response = {
+            **body,
+            "status": {"arm": "armed", "observe": "fired", "clean": "cleaned"}[operation],
+        }
+        if operation == "observe":
+            response["event_id"] = "stale-event"
+        return _raw_response(json.dumps(response).encode())
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(stale_event_handler)) as client:
+        sandbox = JsonHttpSandboxConnection.from_config(
+            _config(timeout_after_commit=True),
+            sandbox_confirmed=True,
+            max_sandbox_api_calls=9,
+            client=client,
+        )
+        evidence = await sandbox.execute(_timeout_after_commit_case())
+
+    assert operations == ["arm", "observe", "clean"]
+    assert evidence.lifecycle.failed_phase == "observe_timeout_after_commit"
+    assert evidence.lifecycle.delivery == "uncertain"
+    assert evidence.lifecycle.sandbox_state_uncertain is True
+    event = evidence.timeout_after_commit_event
+    assert event is not None
+    assert event.armed is True
+    assert event.trigger_status == "unknown"
+    assert event.cleaned is True
+
+
+async def test_timeout_event_cleanup_cancellation_still_attempts_reset_and_quarantines() -> None:
+    handler, requests = _successful_handler()
+    operations: list[str] = []
+
+    def cancelled_cleanup_handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path != "/timeout-after-commit":
+            return handler(request)
+        body = json.loads(request.content)
+        operation = body["operation"]
+        operations.append(operation)
+        if operation == "clean":
+            raise asyncio.CancelledError
+        status = "armed" if operation == "arm" else "fired"
+        return _raw_response(json.dumps({**body, "status": status}).encode())
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(cancelled_cleanup_handler)
+    ) as client:
+        sandbox = JsonHttpSandboxConnection.from_config(
+            _config(timeout_after_commit=True),
+            sandbox_confirmed=True,
+            max_sandbox_api_calls=9,
+            client=client,
+        )
+        with pytest.raises(asyncio.CancelledError):
+            await sandbox.execute(_timeout_after_commit_case())
+        request_count_after_cancellation = len(requests)
+        blocked = await sandbox.execute(_timeout_after_commit_case())
+
+    assert operations == ["arm", "observe", "clean"]
+    assert [path for path, _ in requests][-1] == "/reset"
+    assert len(requests) == request_count_after_cancellation
+    assert blocked.lifecycle.failed_phase == "blocked_state_uncertain"
+    assert blocked.lifecycle.sandbox_state_uncertain is True
 
 
 async def test_preserves_state_within_case_and_resets_between_cases() -> None:
