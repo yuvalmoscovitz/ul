@@ -118,7 +118,7 @@ def _evaluation_result(
     )
     candidate = DatasetAugmentationCandidate(
         source_interaction_id=identifier,
-        operator_id="surface.rephrase",
+        operator_id="input.surface.rephrase",
         augmented_input="Please transfer 100 to Alice.",
         expected_input_frame=source_frame,
         reparsed_input_frame=source_frame if has_review_finding else None,
@@ -134,7 +134,7 @@ def _evaluation_result(
                     repetition=1,
                     target_output=ObservedAgentOutput(raw_output={"status": "changed"}),
                     observed_frame=SemanticFrame(
-                        interaction_id=f"{identifier}:surface.rephrase:round-1",
+                        interaction_id=f"{identifier}:input.surface.rephrase:round-1",
                         extractor_version="test",
                     ),
                 ),
@@ -177,7 +177,7 @@ def _run_context(
 ) -> object:
     return main._dataset_evidence_run_context(
         selected_records=records,
-        selected_operator_ids=("surface.rephrase",),
+        selected_operator_ids=("input.surface.rephrase",),
         repetitions=1,
         invariant_suite=cast(Any, invariant_suite),
         target_config=JsonHttpSandboxConfig.model_validate(
@@ -405,7 +405,7 @@ def _invariant_evaluation(
         else (
             DatasetInvariantArmEvaluation(
                 arm="variation",
-                operator_id="surface.rephrase",
+                operator_id="input.surface.rephrase",
                 rules=(arm_rule(variation_status),),
             ),
         )
@@ -573,7 +573,7 @@ def test_dry_run_validates_and_makes_no_external_calls(
             "evaluate",
             str(dataset),
             "--operator",
-            "surface.disfluency_repeat",
+            "input.surface.disfluency_repeat",
             "--limit",
             "1",
             "--sandbox-config",
@@ -960,7 +960,7 @@ def test_invariant_evaluation_reuses_results_without_extra_runner_calls(
         results = asyncio.run(
             main._evaluate_interaction_records(
                 (cast(Any, SimpleNamespace()),),
-                ("surface.rephrase",),
+                ("input.surface.rephrase",),
                 cast(Any, SimpleNamespace()),
                 cast(Any, AsyncContext()),
                 output_stream,
@@ -1215,7 +1215,7 @@ def test_preflight_enforces_record_and_target_call_bounds(
             "--limit",
             "16",
             "--operator",
-            "surface.rephrase",
+            "input.surface.rephrase",
             "--dry-run",
         ],
     )
@@ -1232,7 +1232,7 @@ def test_preflight_enforces_record_and_target_call_bounds(
             "--limit",
             "17",
             "--operator",
-            "surface.rephrase",
+            "input.surface.rephrase",
             "--dry-run",
         ],
     )
@@ -1473,7 +1473,7 @@ def test_execution_creates_private_explicit_output(
         del settings, target, run_context
         assert redaction_engine is None
         captured_records.extend(record.id for record in records)
-        assert operator_ids == ("surface.disfluency_repeat",)
+        assert operator_ids == ("input.surface.disfluency_repeat",)
         assert repetitions == 3
         assert max_sandbox_api_calls == 100
         assert planned_target_calls == 30
@@ -1495,7 +1495,7 @@ def test_execution_creates_private_explicit_output(
             "evaluate",
             str(dataset),
             "--operator",
-            "surface.disfluency_repeat",
+            "input.surface.disfluency_repeat",
             "--sandbox-config",
             str(target_config),
             "--allow-insecure-http",
@@ -1801,9 +1801,9 @@ def test_help_explains_dataset_sandbox_and_operator_contract() -> None:
 
     operators = runner.invoke(root_app, ["dataset", "operators"])
     assert operators.exit_code == 0, operators.output
-    assert "surface.disfluency_repeat" in operators.output
-    assert "tone.frustrated" in operators.output
-    assert "intent.self_correction" in operators.output
+    assert "input.surface.disfluency_repeat" in operators.output
+    assert "input.tone.frustrated" in operators.output
+    assert "input.intent.self_correction" in operators.output
 
 
 def test_operator_list_is_fixed_and_self_correction_keeps_existing_call_accounting(
@@ -1818,14 +1818,14 @@ def test_operator_list_is_fixed_and_self_correction_keeps_existing_call_accounti
         if line.startswith("- ")
     )
     assert listed_operator_ids == (
-        "surface.rephrase",
-        "surface.typing_noise",
-        "surface.fragmented_syntax",
-        "surface.disfluency_repeat",
-        "style.terse",
-        "style.verbose",
-        "tone.frustrated",
-        "intent.self_correction",
+        "input.surface.rephrase",
+        "input.surface.typing_noise",
+        "input.surface.fragmented_syntax",
+        "input.surface.disfluency_repeat",
+        "input.style.terse",
+        "input.style.verbose",
+        "input.tone.frustrated",
+        "input.intent.self_correction",
     )
 
     dataset = tmp_path / "interactions.jsonl"
@@ -1837,13 +1837,13 @@ def test_operator_list_is_fixed_and_self_correction_keeps_existing_call_accounti
             "evaluate",
             str(dataset),
             "--operator",
-            "intent.self_correction",
+            "input.intent.self_correction",
             "--dry-run",
         ],
     )
 
     assert dry_run.exit_code == 0, dry_run.output
-    assert "Operators: intent.self_correction" in dry_run.output
+    assert "Operators: input.intent.self_correction" in dry_run.output
     assert "Potential semantic model calls: up to 10" in dry_run.output
     assert "Potential sandbox API calls: up to 6" in dry_run.output
 
@@ -1862,7 +1862,7 @@ def test_run_context_records_canonical_provider_identity() -> None:
     )
     custom_context = main._dataset_evidence_run_context(
         selected_records=(record,),
-        selected_operator_ids=("surface.rephrase",),
+        selected_operator_ids=("input.surface.rephrase",),
         repetitions=1,
         invariant_suite=None,
         target_config=JsonHttpSandboxConfig.model_validate(
@@ -2410,7 +2410,7 @@ def test_resume_rejects_changed_evaluation_plan(tmp_path: Path) -> None:
             "--sandbox-config",
             str(target_config),
             "--operator",
-            "tone.frustrated",
+            "input.tone.frustrated",
             "--repetitions",
             "1",
             "--resume",
@@ -2553,7 +2553,7 @@ def test_resume_rejects_mismatched_output_path(
 @pytest.mark.parametrize(
     "operators",
     [
-        ("intent.self_correction", "intent.self_correction"),
+        ("input.intent.self_correction", "input.intent.self_correction"),
         ("intent.self-correction",),
     ],
 )
@@ -2601,7 +2601,7 @@ def test_customer_evidence_keeps_summary_and_nested_technical_details() -> None:
         grounded_field_names=("amount",),
     )
     candidate = SimpleNamespace(
-        operator_id="surface.disfluency_repeat",
+        operator_id="input.surface.disfluency_repeat",
         operator_version="1.0.0",
         augmented_input="transfer transfer 100 to Alice",
         passed=True,
@@ -2656,7 +2656,7 @@ def test_customer_evidence_keeps_summary_and_nested_technical_details() -> None:
         {"kind": "action", "predicate": "transfer"}
     ]
     assert evidence["cases"][0]["findings"][0]["finding_id"] == (
-        "ulf_v1_963abb59403f4bb8ec4e9bb81c8eb38ddc693dc5a28153569723a484baac4625"
+        "ulf_v1_3ece170dbaff96e18428f477f3ea17e1e24f6e2d9cb0c222277699ce624d1b5e"
     )
     assert evidence["cases"][0]["findings"][0]["grounded_field_names"] == ["amount"]
     assert evidence["cases"][0]["findings"][0]["severity"] == "unrated"
@@ -2780,7 +2780,7 @@ def test_finding_id_ignores_volatile_evidence_and_semantic_ordering() -> None:
     finding_id = main._finding_id(
         interaction_id="case-1",
         original_input="Transfer 100 to Alice.",
-        operator_id="surface.rephrase",
+        operator_id="input.surface.rephrase",
         operator_version="1.0.0",
         augmented_input="Please transfer 100 to Alice.",
         finding=finding,
@@ -2788,7 +2788,7 @@ def test_finding_id_ignores_volatile_evidence_and_semantic_ordering() -> None:
     identical_finding_id = main._finding_id(
         interaction_id="case-1",
         original_input="Transfer 100 to Alice.",
-        operator_id="surface.rephrase",
+        operator_id="input.surface.rephrase",
         operator_version="1.0.0",
         augmented_input="Please transfer 100 to Alice.",
         finding=semantically_identical_finding,
@@ -2826,7 +2826,7 @@ def test_finding_id_changes_for_meaningful_variation_or_behavior() -> None:
     finding_id = main._finding_id(
         interaction_id="case-1",
         original_input="Transfer 100 to Alice.",
-        operator_id="surface.rephrase",
+        operator_id="input.surface.rephrase",
         operator_version="1.0.0",
         augmented_input="Please transfer 100 to Alice.",
         finding=finding,
@@ -2834,7 +2834,7 @@ def test_finding_id_changes_for_meaningful_variation_or_behavior() -> None:
     changed_variation_id = main._finding_id(
         interaction_id="case-1",
         original_input="Transfer 100 to Alice.",
-        operator_id="surface.rephrase",
+        operator_id="input.surface.rephrase",
         operator_version="1.0.0",
         augmented_input="Could you transfer 100 to Alice?",
         finding=finding,
@@ -2859,7 +2859,7 @@ def test_finding_id_changes_for_meaningful_variation_or_behavior() -> None:
     changed_behavior_id = main._finding_id(
         interaction_id="case-1",
         original_input="Transfer 100 to Alice.",
-        operator_id="surface.rephrase",
+        operator_id="input.surface.rephrase",
         operator_version="1.0.0",
         augmented_input="Please transfer 100 to Alice.",
         finding=changed_behavior,
@@ -2909,7 +2909,7 @@ def test_duplicate_semantic_findings_get_stable_unique_reportable_ids(tmp_path: 
     finding_context = {
         "interaction_id": "case-1",
         "original_input": "Transfer 100 to Alice.",
-        "operator_id": "surface.rephrase",
+        "operator_id": "input.surface.rephrase",
         "operator_version": "1.0.0",
         "augmented_input": "Please transfer 100 to Alice.",
     }
@@ -2932,7 +2932,7 @@ def test_duplicate_semantic_findings_get_stable_unique_reportable_ids(tmp_path: 
     assert all(re.fullmatch(r"ulf_v1_[0-9a-f]{64}", finding_id) for finding_id in finding_ids)
 
     candidate = SimpleNamespace(
-        operator_id="surface.rephrase",
+        operator_id="input.surface.rephrase",
         operator_version="1.0.0",
         augmented_input="Please transfer 100 to Alice.",
         passed=True,
@@ -2984,7 +2984,7 @@ def test_stored_output_drift_does_not_require_review_or_appear_in_original_repla
         observed_effects=(),
     )
     candidate = SimpleNamespace(
-        operator_id="surface.rephrase",
+        operator_id="input.surface.rephrase",
         operator_version="1.0.0",
         augmented_input="Please transfer 100 to Alice.",
         passed=True,
@@ -3036,7 +3036,7 @@ def test_stored_output_drift_does_not_require_review_or_appear_in_original_repla
         ),
         (
             "2",
-            "surface.rephrase",
+            "input.surface.rephrase",
             "NO OBSERVED DIFFERENCE",
             "stable",
             "3 / 1",

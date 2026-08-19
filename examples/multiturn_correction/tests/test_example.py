@@ -62,6 +62,8 @@ def test_runnable_example_reports_real_repeatable_correction_failure(tmp_path: P
     assert result.exit_code == 1, result.output
     evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
     assert evidence["status"] == "failed"
+    assert evidence["case"]["operator_id"] == "conversation.correction_after_first_response"
+    assert evidence["case"]["operator_version"] == "1.0.0"
     assert evidence["first_response_divergence_turn_id"] == "corrected-request"
     assert evidence["first_committed_state_divergence_turn_id"] == "corrected-request"
     assert evidence["baseline_invariant_rules"][0]["status"] == "satisfied"
@@ -115,6 +117,7 @@ def test_one_command_runner_confirms_finding_without_model_configuration() -> No
             assert evidence_path.stat().st_mode & 0o777 == 0o600
         evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
         assert evidence["status"] == "failed"
+        assert evidence["case"]["operator_version"] == "1.0.0"
         assert evidence["baseline_invariant_rules"][0]["status"] == "satisfied"
         assert evidence["corrected_invariant_rules"][0]["status"] == "violated"
         assert not (evidence_path.parent / "target.json").exists()

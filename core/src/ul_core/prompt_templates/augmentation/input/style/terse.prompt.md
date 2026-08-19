@@ -1,5 +1,5 @@
 +++
-name = "augmentation.style.terse"
+name = "augmentation.input.style.terse"
 description = "Rewrites an input in a terse but natural style."
 author = "UL"
 +++

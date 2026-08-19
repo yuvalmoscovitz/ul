@@ -85,7 +85,7 @@ def _evidence_confirms_repeatable_duplicate(evidence_path: Path) -> bool:
     if any({rule.rule_id for rule in rules} != _EXPECTED_RULE_IDS for rules in checkpoints):
         return False
     return (
-        result.case.operator_id == "event.retry_after_successful_commit"
+        result.case.operator_id == "conversation.retry_after_successful_commit"
         and result.case.operator_version == "1.0.0"
         and result.status == "failed"
         and result.requested_repetitions == 3

@@ -1,5 +1,5 @@
 +++
-name = "augmentation.intent.self_correction_argument"
+name = "augmentation.input.intent.self_correction_argument"
 description = "Specifies the trusted source and planned temporary text for a correction."
 author = "UL"
 +++

@@ -74,7 +74,7 @@ class DatasetEvaluationRunner(_DatasetEvaluationRunner):
         self,
         source: InteractionRecord,
         *,
-        operator_ids: Iterable[str] = ("surface.rephrase",),
+        operator_ids: Iterable[str] = ("input.surface.rephrase",),
         repetitions: int = 1,
     ) -> DatasetEvaluationResult:
         return await super().run(
@@ -515,7 +515,9 @@ async def test_runner_executes_only_accepted_candidates_and_keeps_rejected_candi
     )
     runner, semantic_pipeline, target = _runner(observed_outcomes)
 
-    result = await runner.run(_source(), operator_ids=("surface.rephrase", "tone.frustrated"))
+    result = await runner.run(
+        _source(), operator_ids=("input.surface.rephrase", "input.tone.frustrated")
+    )
 
     assert len(result.cases) == 2
     accepted, rejected = result.cases
@@ -578,7 +580,7 @@ async def test_redacted_runner_evidence_never_persists_sandbox_secrets(tmp_path:
     source = boundary.protect_record(_source())
     assert isinstance(source, InteractionRecord)
 
-    result = await runner.run(source, operator_ids=("tone.frustrated",))
+    result = await runner.run(source, operator_ids=("input.tone.frustrated",))
     evidence = _customer_evidence_record(
         result,
         repetitions=1,
@@ -776,7 +778,7 @@ async def test_one_current_baseline_is_shared_by_all_accepted_candidates() -> No
 
     result = await runner.run(
         _source(),
-        operator_ids=("surface.rephrase", "surface.typing_noise"),
+        operator_ids=("input.surface.rephrase", "input.surface.typing_noise"),
     )
 
     assert all(case.candidate.passed for case in result.cases)
@@ -1055,7 +1057,9 @@ async def test_runner_classifies_extra_effect_with_new_arguments_as_unexpected()
 
 async def test_case_model_rejects_inconsistent_execution_and_verdicts() -> None:
     runner, _, _ = _runner(_source_outcomes())
-    result = await runner.run(_source(), operator_ids=("surface.rephrase", "tone.frustrated"))
+    result = await runner.run(
+        _source(), operator_ids=("input.surface.rephrase", "input.tone.frustrated")
+    )
     accepted_case = result.cases[0]
     rejected_candidate = result.cases[1].candidate
 
@@ -1207,11 +1211,11 @@ async def test_repetitions_are_interleaved_and_group_equivalent_observations() -
     )
     assert [record.id for record in semantic_pipeline.observed_records] == [
         "source:current_baseline:round-1",
-        "source:surface.rephrase:round-1",
+        "source:input.surface.rephrase:round-1",
         "source:current_baseline:round-2",
-        "source:surface.rephrase:round-2",
+        "source:input.surface.rephrase:round-2",
         "source:current_baseline:round-3",
-        "source:surface.rephrase:round-3",
+        "source:input.surface.rephrase:round-3",
     ]
     assert result.baseline.trial_set.stability == "stable"
     assert result.baseline.trial_set.outcome_groups[0].repetitions == (1, 2, 3)
@@ -1307,7 +1311,7 @@ async def test_numeric_identifier_representations_remain_distinct() -> None:
 
     result = await runner.run(
         source,
-        operator_ids=("surface.disfluency_repeat",),
+        operator_ids=("input.surface.disfluency_repeat",),
         repetitions=2,
     )
 

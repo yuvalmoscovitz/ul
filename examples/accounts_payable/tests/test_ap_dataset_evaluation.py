@@ -398,7 +398,7 @@ async def test_self_correction_e2e_compares_real_isolated_payment_actions(
         semantic_pipeline,
         recording_target,
         allow_network_egress=True,
-    ).run(source, operator_ids=("intent.self_correction",))
+    ).run(source, operator_ids=("input.intent.self_correction",))
 
     assert result.baseline.verdict == "no_divergence"
     assert result.baseline.trial_set.requested_repetitions == 3
@@ -454,7 +454,7 @@ async def test_repetition_e2e_compares_two_fresh_runs_per_input(
         allow_network_egress=True,
     ).run(
         source,
-        operator_ids=("surface.disfluency_repeat",),
+        operator_ids=("input.surface.disfluency_repeat",),
         repetitions=2,
     )
 
@@ -499,7 +499,7 @@ async def test_repetition_e2e_reports_seeded_variation_instability() -> None:
         semantic_pipeline,
         recording_target,
         allow_network_egress=True,
-    ).run(source, operator_ids=("surface.disfluency_repeat",))
+    ).run(source, operator_ids=("input.surface.disfluency_repeat",))
 
     case = result.cases[0]
     assert result.baseline.trial_set.stability == "stable"
@@ -536,7 +536,7 @@ async def test_live_deconstructor_discovers_seeded_duplicate_payment() -> None:
             semantic_model,
             _RecordingDatasetTarget(SeededIntentFanOutDefectAccountsPayableDatasetTarget()),
             allow_network_egress=True,
-        ).run(source, operator_ids=("surface.disfluency_repeat",))
+        ).run(source, operator_ids=("input.surface.disfluency_repeat",))
 
     case = result.cases[0]
     assert case.candidate.augmented_input.casefold() == "pay pay ac-100."
@@ -571,7 +571,7 @@ async def test_live_pipeline_discovers_seeded_first_value_wins_defect() -> None:
             semantic_model,
             _RecordingDatasetTarget(_SeededFirstValueWinsTransferTarget()),
             allow_network_egress=True,
-        ).run(source, operator_ids=("intent.self_correction",))
+        ).run(source, operator_ids=("input.intent.self_correction",))
 
     case = result.cases[0]
     assert case.candidate.passed, case.candidate.failure_reasons

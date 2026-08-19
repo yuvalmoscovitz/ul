@@ -784,7 +784,7 @@ def _validate_model_input_bounds(
 
 
 def _validate_operator_ids(operator_ids: list[str] | None) -> tuple[str, ...]:
-    selected_ids = tuple(operator_ids or ["surface.rephrase"])
+    selected_ids = tuple(operator_ids or ["input.surface.rephrase"])
     known_ids = set(_DATASET_OPERATOR_IDS)
     unknown_ids = sorted(set(selected_ids) - known_ids)
     if unknown_ids:

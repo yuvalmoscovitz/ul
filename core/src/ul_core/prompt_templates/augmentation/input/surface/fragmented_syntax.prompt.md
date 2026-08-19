@@ -1,5 +1,5 @@
 +++
-name = "augmentation.surface.fragmented_syntax"
+name = "augmentation.input.surface.fragmented_syntax"
 description = "Rewrites an input with natural fragmented chat syntax."
 author = "UL"
 +++

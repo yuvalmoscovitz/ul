@@ -51,7 +51,7 @@ def test_runnable_timeout_after_commit_variants(
         execution = trial["execution_evidence"]
         event = execution["timeout_after_commit_event"]
         assert event == {
-            "operator_id": "tool.timeout_after_commit",
+            "operator_id": "environment.tool.timeout_after_commit",
             "operator_version": "1.0.0",
             "event_id": "lose-first-payment-acknowledgement",
             "turn_id": "submit-payment",
@@ -76,7 +76,8 @@ def test_unsupported_capability_fails_preflight_without_a_request(tmp_path: Path
     result = _invoke(target_path, tmp_path / "evidence.json")
 
     assert result.exit_code == 2
-    assert "does not support tool.timeout_after_commit@1.0.0" in result.output
+    assert "does not support" in result.output
+    assert "environment.tool.timeout_after_commit@1.0.0" in result.output
     assert server.state.request_count == 0
     server.server_close()
 

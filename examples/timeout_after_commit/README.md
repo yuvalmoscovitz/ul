@@ -31,7 +31,7 @@ Add the optional capability to the existing version 3 HTTP sandbox configuration
 ```json
 {
   "timeout_after_commit": {
-    "operator_id": "tool.timeout_after_commit",
+    "operator_id": "environment.tool.timeout_after_commit",
     "version": "1.0.0",
     "url": "https://sandbox.example/timeout-after-commit"
   }

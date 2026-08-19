@@ -203,6 +203,8 @@ async def test_finds_repeatable_correction_failure_and_preserves_ordered_evidenc
     )
 
     assert result.status == "failed"
+    assert result.case.operator_id == "conversation.correction_after_first_response"
+    assert result.case.operator_version == "1.0.0"
     assert result.required_target_calls == 36
     assert result.first_response_divergence_turn_id == "corrected-request"
     assert result.first_committed_state_divergence_turn_id == "corrected-request"
@@ -270,6 +272,8 @@ async def test_first_divergence_uses_conversation_order_and_flags_nondeterminism
 def test_dry_run_plan_enforces_complete_pair_budget_without_target_calls() -> None:
     plan = plan_correction_stress_test(_case(), _config(), repetitions=2, max_sandbox_api_calls=28)
 
+    assert plan.operator_id == "conversation.correction_after_first_response"
+    assert plan.operator_version == "1.0.0"
     assert plan.target_calls_per_pair == 14
     assert plan.required_target_calls == 28
     with pytest.raises(ValueError, match="authorized target call budget"):

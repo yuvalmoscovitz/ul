@@ -1,5 +1,5 @@
 +++
-name = "augmentation.surface.typing_noise"
+name = "augmentation.input.surface.typing_noise"
 description = "Introduces one harmless human typing error."
 author = "UL"
 +++

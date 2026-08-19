@@ -79,15 +79,15 @@ def test_builtin_library_is_available_without_customer_extensions() -> None:
     registry = builtin_augmentation_registry()
 
     assert [item.metadata.id for item in registry.list()] == [
-        "batch.mixed_validity",
         "conversation.ambiguity",
-        "conversation.later_correction",
-        "policy.boundary_shift",
-        "state.change_between_read_write",
-        "state.existing_partial_operation",
-        "tool.stale_observation",
-        "tool.timeout_after_commit",
-        "tool.timeout_before_commit",
+        "conversation.correction_after_first_response",
+        "environment.state.change_between_read_write",
+        "environment.state.existing_partial_operation",
+        "environment.tool.stale_observation",
+        "environment.tool.timeout_after_commit",
+        "environment.tool.timeout_before_commit",
+        "input.batch.mixed_validity",
+        "input.policy.boundary_shift",
     ]
     assert registry.applicable(example_scenario()) == registry.list()
 
@@ -100,6 +100,9 @@ def test_every_builtin_produces_valid_derived_scenarios_with_lineage() -> None:
 
         assert results
         for result in results:
+            expected_reference = f"{augmentation.metadata.id}@{augmentation.metadata.version}"
+            assert result.augmentation_id == augmentation.metadata.id
+            assert result.scenario.id.startswith(f"{scenario.id}::{expected_reference}:")
             assert result.scenario.provenance.parent_scenario_id == scenario.id
             assert (
                 result.scenario.provenance.lineage[-1].augmentation_id == augmentation.metadata.id
@@ -111,7 +114,7 @@ def test_every_builtin_produces_valid_derived_scenarios_with_lineage() -> None:
 
 
 def test_policy_boundary_generates_below_equal_and_above_variants() -> None:
-    augmentation = builtin_augmentation_registry().get("policy.boundary_shift")
+    augmentation = builtin_augmentation_registry().get("input.policy.boundary_shift")
 
     results = augmentation.apply(example_scenario())
 
@@ -125,7 +128,9 @@ def test_policy_boundary_generates_below_equal_and_above_variants() -> None:
 
 def test_later_correction_changes_semantics_and_conversation_together() -> None:
     scenario = example_scenario()
-    augmentation = builtin_augmentation_registry().get("conversation.later_correction")
+    augmentation = builtin_augmentation_registry().get(
+        "conversation.correction_after_first_response"
+    )
 
     result = augmentation.apply(scenario)[0]
 
@@ -157,7 +162,9 @@ def test_later_correction_uses_adapter_supplied_domain_fact() -> None:
             },
         }
     )
-    augmentation = builtin_augmentation_registry().get("conversation.later_correction")
+    augmentation = builtin_augmentation_registry().get(
+        "conversation.correction_after_first_response"
+    )
 
     result = augmentation.apply(Scenario.model_validate(scenario.model_dump()))[0]
 
@@ -202,8 +209,8 @@ def test_ambiguity_uses_adapter_supplied_artifact_overrides() -> None:
 def test_timeout_variants_encode_commit_state_independently_of_domain() -> None:
     registry = builtin_augmentation_registry()
 
-    before = registry.get("tool.timeout_before_commit").apply(example_scenario())[0]
-    after = registry.get("tool.timeout_after_commit").apply(example_scenario())[0]
+    before = registry.get("environment.tool.timeout_before_commit").apply(example_scenario())[0]
+    after = registry.get("environment.tool.timeout_after_commit").apply(example_scenario())[0]
 
     assert before.scenario.environment_events[-1].payload["commit_state"] == "not_committed"
     assert after.scenario.environment_events[-1].payload["commit_state"] == "committed"
@@ -225,7 +232,7 @@ def test_timeout_augmentation_does_not_duplicate_existing_fault() -> None:
         }
     )
     scenario = Scenario.model_validate(scenario.model_dump())
-    augmentation = builtin_augmentation_registry().get("tool.timeout_after_commit")
+    augmentation = builtin_augmentation_registry().get("environment.tool.timeout_after_commit")
 
     assert not augmentation.applicability(scenario).applicable
     assert augmentation.apply(scenario) == ()
@@ -242,7 +249,9 @@ def test_state_change_includes_resources_used_only_by_write() -> None:
     scenario = Scenario.model_validate(scenario.model_dump())
 
     result = (
-        builtin_augmentation_registry().get("state.change_between_read_write").apply(scenario)[0]
+        builtin_augmentation_registry()
+        .get("environment.state.change_between_read_write")
+        .apply(scenario)[0]
     )
 
     assert "write-only" in result.scenario.environment_events[-1].target_ids
@@ -258,14 +267,16 @@ def test_boundary_shift_skips_semantic_no_op_variant() -> None:
         scenario.model_copy(update={"actions": tuple(actions)}).model_dump()
     )
 
-    results = builtin_augmentation_registry().get("policy.boundary_shift").apply(scenario)
+    results = builtin_augmentation_registry().get("input.policy.boundary_shift").apply(scenario)
 
     assert [result.variant for result in results] == ["below", "above"]
 
 
 def test_mixed_validity_batch_changes_only_one_item() -> None:
     result = (
-        builtin_augmentation_registry().get("batch.mixed_validity").apply(example_scenario())[0]
+        builtin_augmentation_registry()
+        .get("input.batch.mixed_validity")
+        .apply(example_scenario())[0]
     )
 
     assert [item.validity for item in result.scenario.actions[1].batch_items] == [
@@ -284,7 +295,7 @@ def test_inapplicable_augmentation_explains_why_and_returns_no_candidates() -> N
         ),
         provenance=ScenarioProvenance(source="production_trace"),
     )
-    augmentation = builtin_augmentation_registry().get("tool.timeout_after_commit")
+    augmentation = builtin_augmentation_registry().get("environment.tool.timeout_after_commit")
 
     applicability = augmentation.applicability(scenario)
 

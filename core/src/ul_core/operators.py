@@ -180,7 +180,7 @@ class AmbiguityAugmentation(BuiltinAugmentation):
 
 class LaterCorrectionAugmentation(BuiltinAugmentation):
     metadata = AugmentationMetadata(
-        id="conversation.later_correction",
+        id="conversation.correction_after_first_response",
         version="1.0.0",
         category="conversation",
         summary="Add an ordinary later correction to a previously supplied action parameter.",
@@ -249,7 +249,7 @@ class LaterCorrectionAugmentation(BuiltinAugmentation):
 
 class BoundaryShiftAugmentation(BuiltinAugmentation):
     metadata = AugmentationMetadata(
-        id="policy.boundary_shift",
+        id="input.policy.boundary_shift",
         version="1.0.0",
         category="policy",
         summary="Move an action value below, onto, and above a declared policy boundary.",
@@ -303,7 +303,7 @@ class BoundaryShiftAugmentation(BuiltinAugmentation):
 
 class ExistingPartialOperationAugmentation(BuiltinAugmentation):
     metadata = AugmentationMetadata(
-        id="state.existing_partial_operation",
+        id="environment.state.existing_partial_operation",
         version="1.0.0",
         category="state",
         summary="Introduce a plausible prior partial execution of the intended write.",
@@ -345,7 +345,7 @@ class ExistingPartialOperationAugmentation(BuiltinAugmentation):
 
 class StateChangeBetweenReadWriteAugmentation(BuiltinAugmentation):
     metadata = AugmentationMetadata(
-        id="state.change_between_read_write",
+        id="environment.state.change_between_read_write",
         version="1.0.0",
         category="state",
         summary="Change relevant state after observation but before a consequential write.",
@@ -402,7 +402,7 @@ class StateChangeBetweenReadWriteAugmentation(BuiltinAugmentation):
 
 class StaleObservationAugmentation(BuiltinAugmentation):
     metadata = AugmentationMetadata(
-        id="tool.stale_observation",
+        id="environment.tool.stale_observation",
         version="1.0.0",
         category="tool",
         summary="Return a plausible but stale observation for a read action.",
@@ -440,7 +440,7 @@ class StaleObservationAugmentation(BuiltinAugmentation):
 
 class TimeoutBeforeCommitAugmentation(BuiltinAugmentation):
     metadata = AugmentationMetadata(
-        id="tool.timeout_before_commit",
+        id="environment.tool.timeout_before_commit",
         version="1.0.0",
         category="tool",
         summary="Time out a consequential action before any effect commits.",
@@ -473,7 +473,7 @@ class TimeoutBeforeCommitAugmentation(BuiltinAugmentation):
 
 class TimeoutAfterCommitAugmentation(BuiltinAugmentation):
     metadata = AugmentationMetadata(
-        id="tool.timeout_after_commit",
+        id="environment.tool.timeout_after_commit",
         version="1.0.0",
         category="tool",
         summary="Lose the acknowledgement after a consequential effect commits.",
@@ -506,7 +506,7 @@ class TimeoutAfterCommitAugmentation(BuiltinAugmentation):
 
 class MixedValidityBatchAugmentation(BuiltinAugmentation):
     metadata = AugmentationMetadata(
-        id="batch.mixed_validity",
+        id="input.batch.mixed_validity",
         version="1.0.0",
         category="batch",
         summary="Make one item invalid in an otherwise valid multi-item request.",

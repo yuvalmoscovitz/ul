@@ -11,7 +11,7 @@ uv run python -m examples.retry_after_successful_commit.run
 ```
 
 The runner starts the defective sandbox on a free loopback port, runs
-`event.retry_after_successful_commit@1.0.0` three times, and cleans up the server and temporary
+`conversation.retry_after_successful_commit@1.0.0` three times, and cleans up the server and temporary
 connection configuration. A successful demonstration exits `0` after UL confirms that:
 
 - the one-turn baseline has exactly one unique committed payment;

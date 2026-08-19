@@ -1,7 +1,7 @@
 {
   "schema_version": "1.0.0",
   "id": "invoice-retry-after-successful-commit",
-  "operator_id": "event.retry_after_successful_commit",
+  "operator_id": "conversation.retry_after_successful_commit",
   "operator_version": "1.0.0",
   "conversation": [
     {

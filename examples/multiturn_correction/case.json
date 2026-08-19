@@ -1,7 +1,8 @@
 {
   "schema_version": "1.0.0",
   "id": "invoice-correction",
-  "operator_id": "event.correction_after_first_response",
+  "operator_id": "conversation.correction_after_first_response",
+  "operator_version": "1.0.0",
   "conversation": [
     {
       "id": "initial-request",

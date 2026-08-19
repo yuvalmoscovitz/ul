@@ -402,7 +402,7 @@ when the snapshot call succeeds.
 ### Stress a later correction across turns
 
 UL includes one trace-independent multi-turn event operator:
-`event.correction_after_first_response`. A correction case contains exactly two ordered user
+`conversation.correction_after_first_response@1.0.0`. A correction case contains exactly two ordered user
 turns. For each repetition UL runs a fresh one-turn baseline, resets the sandbox, then runs the
 initial turn and correction together in one lifecycle. It captures the agent response and a
 committed-state snapshot after both variation turns, then cleans up before the next pair.

@@ -122,7 +122,7 @@ def _handler_for_state(state: _SandboxState) -> type[BaseHTTPRequestHandler]:
             identity = cast(dict[str, str], {key: request[key] for key in expected_keys})
             if (
                 identity["sandbox_id"] != self.sandbox_id
-                or identity["operator_id"] != "tool.timeout_after_commit"
+                or identity["operator_id"] != "environment.tool.timeout_after_commit"
                 or identity["operator_version"] != "1.0.0"
                 or identity["action_id"] != "execute-payment"
             ):

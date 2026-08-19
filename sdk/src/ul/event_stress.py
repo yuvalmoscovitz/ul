@@ -43,9 +43,10 @@ class _StrictModel(ULModel):
 class CorrectionAfterFirstResponseCase(_StrictModel):
     schema_version: Literal["1.0.0"] = "1.0.0"
     id: str = Field(min_length=1, max_length=200)
-    operator_id: Literal["event.correction_after_first_response"] = (
-        "event.correction_after_first_response"
+    operator_id: Literal["conversation.correction_after_first_response"] = (
+        "conversation.correction_after_first_response"
     )
+    operator_version: Literal["1.0.0"] = "1.0.0"
     conversation: tuple[ConversationTurn, ConversationTurn]
 
     @field_validator("conversation", mode="before")
@@ -149,7 +150,8 @@ class CorrectionStressResult(_StrictModel):
 
 
 class CorrectionStressPlan(_StrictModel):
-    operator_id: Literal["event.correction_after_first_response"]
+    operator_id: Literal["conversation.correction_after_first_response"]
+    operator_version: Literal["1.0.0"]
     baseline_turn_count: Literal[1] = 1
     variation_turn_count: Literal[2] = 2
     repetitions: int = Field(ge=1)
@@ -160,8 +162,8 @@ class CorrectionStressPlan(_StrictModel):
 class RetryAfterSuccessfulCommitCase(_StrictModel):
     schema_version: Literal["1.0.0"] = "1.0.0"
     id: str = Field(min_length=1, max_length=200)
-    operator_id: Literal["event.retry_after_successful_commit"] = (
-        "event.retry_after_successful_commit"
+    operator_id: Literal["conversation.retry_after_successful_commit"] = (
+        "conversation.retry_after_successful_commit"
     )
     operator_version: Literal["1.0.0"] = "1.0.0"
     conversation: tuple[ConversationTurn, ConversationTurn]
@@ -227,7 +229,7 @@ class RetryAfterSuccessfulCommitStressResult(_StrictModel):
 
 
 class RetryAfterSuccessfulCommitStressPlan(_StrictModel):
-    operator_id: Literal["event.retry_after_successful_commit"]
+    operator_id: Literal["conversation.retry_after_successful_commit"]
     operator_version: Literal["1.0.0"]
     baseline_turn_count: Literal[1] = 1
     variation_turn_count: Literal[2] = 2
@@ -483,6 +485,7 @@ def plan_correction_stress_test(
         raise ValueError("correction stress test exceeds the authorized target call budget")
     return CorrectionStressPlan(
         operator_id=case.operator_id,
+        operator_version=case.operator_version,
         repetitions=repetitions,
         target_calls_per_pair=target_calls_per_pair,
         required_target_calls=required_target_calls,

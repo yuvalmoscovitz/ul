@@ -228,7 +228,7 @@ async def test_finds_repeatable_retry_after_successful_commit_failure() -> None:
         allow_network_egress=True,
     )
 
-    assert result.case.operator_id == "event.retry_after_successful_commit"
+    assert result.case.operator_id == "conversation.retry_after_successful_commit"
     assert result.case.operator_version == "1.0.0"
     assert result.status == "failed"
     assert result.required_target_calls == 36
@@ -329,7 +329,7 @@ def test_retry_plan_and_case_loader_preserve_version_and_budget(tmp_path: Path) 
         _case(), _config(), repetitions=2, max_sandbox_api_calls=28
     )
 
-    assert plan.operator_id == "event.retry_after_successful_commit"
+    assert plan.operator_id == "conversation.retry_after_successful_commit"
     assert plan.operator_version == "1.0.0"
     assert plan.target_calls_per_pair == 14
     assert plan.required_target_calls == 28

@@ -18,7 +18,7 @@ def _write_inputs(tmp_path: Path, *, observation_authority: str) -> tuple[Path, 
             {
                 "schema_version": "1.0.0",
                 "id": "invoice-retry-after-commit",
-                "operator_id": "event.retry_after_successful_commit",
+                "operator_id": "conversation.retry_after_successful_commit",
                 "operator_version": "1.0.0",
                 "conversation": [
                     {"id": "initial-payment", "role": "user", "content": "Pay AC-100."},
@@ -108,7 +108,7 @@ def test_retry_dry_run_reports_versioned_complete_plan_without_calls(tmp_path: P
     )
 
     assert result.exit_code == 0, result.output
-    assert "event.retry_after_successful_commit@1.0.0" in result.output
+    assert "conversation.retry_after_successful_commit@1.0.0" in result.output
     assert "initial committed operation -> explicit retry" in result.output
     assert "Target calls per paired repetition: 14" in result.output
     assert "Potential sandbox API calls: 42" in result.output

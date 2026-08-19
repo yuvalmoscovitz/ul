@@ -853,10 +853,10 @@ def test_trial_aggregation_prioritizes_violation_then_not_evaluable() -> None:
 
 def test_evaluates_baseline_and_only_accepted_executed_variations_from_target_outputs() -> None:
     accepted = _case(
-        "surface.rephrase",
+        "input.surface.rephrase",
         [_output("AC-100", "AC-101"), _output("AC-100", "AC-101")],
     )
-    rejected = _case("style.terse", [], passed=False, executed=False)
+    rejected = _case("input.style.terse", [], passed=False, executed=False)
     evaluated = evaluate_dataset_invariants(
         _evaluation_result(
             [_output("AC-100", "AC-100"), _output("AC-100", "AC-100")],
@@ -872,7 +872,7 @@ def test_evaluates_baseline_and_only_accepted_executed_variations_from_target_ou
     assert evaluated.observation_authority == "agent_response"
     assert evaluated.baseline.rules[0].status == "satisfied"
     assert len(evaluated.variations) == 1
-    assert evaluated.variations[0].operator_id == "surface.rephrase"
+    assert evaluated.variations[0].operator_id == "input.surface.rephrase"
     assert evaluated.variations[0].rules[0].status == "violated"
     assert all(
         trial.resolved_values["left"] == "AC-100"
@@ -968,7 +968,7 @@ def test_result_models_reject_inconsistent_statuses_values_and_arms() -> None:
     with pytest.raises(ValidationError, match="operator ID"):
         DatasetInvariantArmEvaluation(
             arm="baseline",
-            operator_id="surface.rephrase",
+            operator_id="input.surface.rephrase",
             rules=(rule_result,),
         )
     baseline = DatasetInvariantArmEvaluation(arm="baseline", rules=(rule_result,))
@@ -1029,7 +1029,7 @@ def test_result_models_preserve_rule_identity_and_pointers_across_arms() -> None
     ):
         variation = DatasetInvariantArmEvaluation(
             arm="variation",
-            operator_id="surface.rephrase",
+            operator_id="input.surface.rephrase",
             rules=(changed_rule,),
         )
         with pytest.raises(ValidationError, match="preserve suite rules"):

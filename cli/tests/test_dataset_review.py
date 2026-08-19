@@ -100,7 +100,7 @@ def _evidence_record(*, finding_id: str = FINDING_ID) -> dict[str, Any]:
         },
         "cases": [
             {
-                "operator_id": "surface.disfluency_repeat",
+                "operator_id": "input.surface.disfluency_repeat",
                 "operator_version": "1.0.0",
                 "augmented_input": "Pay pay AC-100.",
                 "status": "REPEATABLE DIFFERENCE — REVIEW",
@@ -180,7 +180,7 @@ def _invariant_evaluation() -> dict[str, Any]:
         "variations": [
             {
                 "arm": "variation",
-                "operator_id": "surface.disfluency_repeat",
+                "operator_id": "input.surface.disfluency_repeat",
                 "rules": [rule("violated", 200, 100)],
             }
         ],
@@ -191,7 +191,7 @@ def _technical_details() -> dict[str, Any]:
     source_frame = SemanticFrame(interaction_id="quickstart-payment", extractor_version="test")
     candidate = DatasetAugmentationCandidate(
         source_interaction_id="quickstart-payment",
-        operator_id="surface.disfluency_repeat",
+        operator_id="input.surface.disfluency_repeat",
         operator_version="1.0.0",
         augmented_input="Pay pay AC-100.",
         expected_input_frame=source_frame,
@@ -247,7 +247,7 @@ def _technical_details() -> dict[str, Any]:
             DatasetEvaluationCase(
                 candidate=candidate,
                 verdict="no_divergence",
-                trial_set=trial_set("surface.disfluency_repeat", 200, 100),
+                trial_set=trial_set("input.surface.disfluency_repeat", 200, 100),
             ),
         ),
     )
@@ -377,7 +377,7 @@ def test_report_schema_1_4_shows_customer_invariants_separately(tmp_path: Path) 
     assert "Declared observation authority: committed_state_snapshot" in normalized_output
     assert "severity=critical; arm=original; status=satisfied" in normalized_output
     assert (
-        "severity=critical; arm=variation (surface.disfluency_repeat); status=violated"
+        "severity=critical; arm=variation (input.surface.disfluency_repeat); status=violated"
         in normalized_output
     )
     assert "Description: Final amount equals the corrected amount." in normalized_output
@@ -473,7 +473,7 @@ def test_invariant_finding_rejects_changed_values_and_id_tracks_variation_identi
         "finding_kind": "customer_invariant_violation",
         "interaction_id": "quickstart-payment",
         "original_input": "Pay AC-100.",
-        "operator_id": "surface.disfluency_repeat",
+        "operator_id": "input.surface.disfluency_repeat",
         "operator_version": "1.0.0",
         "augmented_input": "Pay pay AC-100.",
         "suite_sha256": first["invariant_evaluation"]["suite_sha256"],
