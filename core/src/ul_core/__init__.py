@@ -4,13 +4,7 @@ from ul_core.augmentation import (
     AugmentationRegistry,
     builtin_augmentation_registry,
 )
-from ul_core.contracts import (
-    DatasetTargetExecutor,
-    OracleEvaluator,
-    ScenarioMaterializer,
-    SemanticEquivalenceVerifier,
-    TargetExecutor,
-)
+from ul_core.contracts import ProductionSource, SemanticEquivalenceVerifier
 from ul_core.coverage import (
     CoverageArchive,
     DeterministicAugmentationSelector,
@@ -20,6 +14,17 @@ from ul_core.dataset import (
     ObservedAgentOutput,
     SemanticDelta,
     SemanticEquivalenceAssessment,
+)
+from ul_core.evaluation import (
+    EvaluationCase,
+    ExecutionEvidence,
+    ProductionObservation,
+    ProductionSourcePage,
+    SandboxCapabilities,
+    SandboxLifecycleEvidence,
+    SandboxStateEvidence,
+    SandboxTurnEvidence,
+    StateObservationAuthority,
 )
 from ul_core.models import (
     AugmentationApplication,
@@ -40,23 +45,29 @@ __all__ = [
     "CampaignCaseResult",
     "CampaignResult",
     "CoverageArchive",
-    "DatasetTargetExecutor",
     "DeterministicAugmentationSelector",
+    "EvaluationCase",
+    "ExecutionEvidence",
     "ExecutionResult",
     "ExecutionStatus",
     "FindingSeverity",
     "ObservedAgentOutput",
-    "OracleEvaluator",
     "OracleFinding",
     "OracleRelation",
+    "ProductionObservation",
+    "ProductionSource",
+    "ProductionSourcePage",
     "PromptManager",
     "PromptTemplateInfo",
+    "SandboxCapabilities",
+    "SandboxLifecycleEvidence",
+    "SandboxStateEvidence",
+    "SandboxTurnEvidence",
     "Scenario",
-    "ScenarioMaterializer",
     "SemanticDelta",
     "SemanticEquivalenceAssessment",
     "SemanticEquivalenceVerifier",
-    "TargetExecutor",
+    "StateObservationAuthority",
     "builtin_augmentation_registry",
     "extract_semantic_coverage",
 ]

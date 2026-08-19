@@ -1,7 +1,6 @@
 from typing import cast
 
 import pytest
-from ul_core.contracts import DatasetTargetExecutor
 from ul_core.dataset import ObservedAgentOutput
 
 from examples.accounts_payable.dataset_target import (
@@ -27,7 +26,6 @@ def _committed_payment_actions(output: ObservedAgentOutput) -> list[dict[str, ob
 async def test_source_and_candidate_each_commit_once_for_correct_target() -> None:
     target = AccountsPayableDatasetTarget()
 
-    assert isinstance(target, DatasetTargetExecutor)
     assert target.fresh_state_per_execution is True
     assert target.safety_envelope.isolated
     assert not target.safety_envelope.allows_network_egress
@@ -44,7 +42,6 @@ async def test_source_and_candidate_each_commit_once_for_correct_target() -> Non
 async def test_seeded_intent_fan_out_defect_commits_repeated_imperatives_twice() -> None:
     target = SeededIntentFanOutDefectAccountsPayableDatasetTarget()
 
-    assert isinstance(target, DatasetTargetExecutor)
     assert target.fresh_state_per_execution is True
     assert target.safety_envelope.isolated
 

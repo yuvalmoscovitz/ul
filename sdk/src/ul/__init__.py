@@ -2,8 +2,7 @@
 
 from ul_core.augmentation import builtin_augmentation_registry
 from ul_core.contracts import (
-    DatasetTargetExecutor,
-    MultiTurnDatasetTargetExecutor,
+    ProductionSource,
     SemanticEquivalenceVerifier,
 )
 from ul_core.coverage import CoverageArchive
@@ -16,10 +15,20 @@ from ul_core.dataset import (
     SemanticFrame,
     UserInputRecord,
 )
+from ul_core.evaluation import (
+    EvaluationCase,
+    ExecutionEvidence,
+    ProductionObservation,
+    ProductionSourcePage,
+    SandboxCapabilities,
+    SandboxLifecycleEvidence,
+    SandboxStateEvidence,
+    SandboxTurnEvidence,
+    StateObservationAuthority,
+)
 from ul_core.models import (
     Action,
     ActionEffect,
-    CampaignResult,
     ExecutionMode,
     ExecutionResult,
     ExecutionStatus,
@@ -32,7 +41,6 @@ from ul_core.models import (
 )
 from ul_core.prompts import PromptManager, PromptTemplateInfo
 
-from ul.campaign import CampaignRunner
 from ul.dataset_augmentation import (
     DatasetAugmentationEngine,
     DatasetAugmentationOperator,
@@ -110,20 +118,17 @@ from ul.event_stress import (
     replay_multi_turn_regression,
     run_correction_stress_test,
 )
-from ul.http_target import (
-    JsonHttpDatasetTarget,
-    JsonHttpDatasetTargetConfig,
+from ul.http_sandbox import (
     JsonHttpLifecycleCallConfig,
     JsonHttpLifecycleExecuteTurnConfig,
+    JsonHttpLifecycleMutationConfig,
     JsonHttpLifecycleObservationConfig,
-    load_json_http_dataset_target_config,
+    JsonHttpSandboxConfig,
+    JsonHttpSandboxConnection,
+    json_http_sandbox_config_sha256,
+    load_json_http_sandbox_config,
 )
 from ul.otlp_ingest import OtlpIngestResult, OtlpInteractionRecord, parse_otlp_traces
-from ul.python_target import (
-    PythonDatasetTarget,
-    load_python_dataset_target,
-    validate_python_target_factory_reference,
-)
 from ul.redaction import (
     LocalPseudonymStore,
     RedactedSemanticPipeline,
@@ -133,7 +138,7 @@ from ul.redaction import (
     RedactionPolicy,
     RedactionResult,
     RedactionRule,
-    RehydratingDatasetTarget,
+    RehydratingSandboxConnection,
     load_redaction_policy,
 )
 from ul.trace_replay import (
@@ -153,8 +158,6 @@ from ul.trace_replay import (
 __all__ = [
     "Action",
     "ActionEffect",
-    "CampaignResult",
-    "CampaignRunner",
     "CorrectionAfterFirstResponseCase",
     "CorrectionDivergence",
     "CorrectionStressPlan",
@@ -194,25 +197,26 @@ __all__ = [
     "DatasetRegressionTargetSnapshot",
     "DatasetRegressionVariation",
     "DatasetSemanticSettings",
-    "DatasetTargetExecutor",
     "DatasetTargetLifecycleFailure",
+    "EvaluationCase",
+    "ExecutionEvidence",
     "ExecutionMode",
     "ExecutionResult",
     "ExecutionStatus",
     "FindingSeverity",
     "InteractionRecord",
     "JsonArrayItemsUniqueByInvariant",
-    "JsonHttpDatasetTarget",
-    "JsonHttpDatasetTargetConfig",
     "JsonHttpLifecycleCallConfig",
     "JsonHttpLifecycleExecuteTurnConfig",
+    "JsonHttpLifecycleMutationConfig",
     "JsonHttpLifecycleObservationConfig",
+    "JsonHttpSandboxConfig",
+    "JsonHttpSandboxConnection",
     "JsonValueEqualsLiteralInvariant",
     "JsonValueInAllowedSetInvariant",
     "JsonValuesEqualInvariant",
     "LocalPseudonymStore",
     "MaterializedScenario",
-    "MultiTurnDatasetTargetExecutor",
     "MultiTurnRegressionCase",
     "ObservedAgentOutput",
     "OpenAICompatibleDatasetSettings",
@@ -220,9 +224,11 @@ __all__ = [
     "OracleFinding",
     "OtlpIngestResult",
     "OtlpInteractionRecord",
+    "ProductionObservation",
+    "ProductionSource",
+    "ProductionSourcePage",
     "PromptManager",
     "PromptTemplateInfo",
-    "PythonDatasetTarget",
     "RedactedSemanticPipeline",
     "RedactionBoundaryError",
     "RedactionCoverage",
@@ -230,9 +236,13 @@ __all__ = [
     "RedactionPolicy",
     "RedactionResult",
     "RedactionRule",
-    "RehydratingDatasetTarget",
+    "RehydratingSandboxConnection",
     "RenderedUserInput",
     "SafetyEnvelope",
+    "SandboxCapabilities",
+    "SandboxLifecycleEvidence",
+    "SandboxStateEvidence",
+    "SandboxTurnEvidence",
     "Scenario",
     "ScenarioProvenance",
     "SemanticCompletionProvider",
@@ -241,6 +251,7 @@ __all__ = [
     "SemanticEquivalenceVerifier",
     "SemanticFrame",
     "SemanticModelDeconstructor",
+    "StateObservationAuthority",
     "TraceReplayBundle",
     "TraceReplayCase",
     "TraceReplayEnvelope",
@@ -256,13 +267,13 @@ __all__ = [
     "dataset_regression_target_config_sha256",
     "evaluate_dataset_invariant_rules",
     "evaluate_dataset_invariants",
+    "json_http_sandbox_config_sha256",
     "load_correction_after_first_response_case",
     "load_dataset_invariant_suite",
     "load_dataset_regression_case",
     "load_dataset_semantic_settings",
-    "load_json_http_dataset_target_config",
+    "load_json_http_sandbox_config",
     "load_multi_turn_regression_case",
-    "load_python_dataset_target",
     "load_redaction_policy",
     "load_trace_replay_bundle",
     "materialize_trace_replay_bundle",
@@ -275,5 +286,4 @@ __all__ = [
     "run_dataset_regressions",
     "run_trace_replay",
     "select_trace_replay_case",
-    "validate_python_target_factory_reference",
 ]

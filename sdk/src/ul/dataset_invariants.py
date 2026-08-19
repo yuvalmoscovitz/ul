@@ -778,7 +778,10 @@ def _outputs_for_observation_authority(
     if observation_authority == "committed_state_snapshot":
         return tuple(
             None
-            if output is None or "committed_state_snapshot" not in output.metadata
+            if output is None
+            or "committed_state_snapshot" not in output.metadata
+            or output.metadata.get("state_observation_authority")
+            not in {"sandbox_self_reported", "independent_observer"}
             else ObservedAgentOutput(raw_output=output.metadata["committed_state_snapshot"])
             for output in outputs
         )

@@ -4,6 +4,7 @@ import asyncio
 import json
 import os
 from pathlib import Path
+from typing import Any
 
 import pytest
 from pydantic import ValidationError
@@ -16,19 +17,44 @@ from ul.dataset_invariants import (
 )
 from ul.dataset_regression import (
     DatasetRegressionCase,
+    DatasetRegressionResult,
     DatasetRegressionRunResult,
     create_dataset_regression_case,
     load_dataset_regression_case,
-    replay_dataset_regression,
-    run_dataset_regressions,
 )
-from ul.http_target import JsonHttpDatasetTargetConfig
+from ul.dataset_regression import (
+    replay_dataset_regression as _replay_dataset_regression,
+)
+from ul.dataset_regression import (
+    run_dataset_regressions as _run_dataset_regressions,
+)
+from ul.http_sandbox import JsonHttpSandboxConfig
+from ul_core.contracts import SandboxExecutor
 from ul_core.dataset import ObservedAgentOutput
-from ul_core.models import SafetyEnvelope
+from ul_core.evaluation import (
+    EvaluationCase,
+    ExecutionEvidence,
+    SandboxCapabilities,
+    SandboxLifecycleEvidence,
+    SandboxStateEvidence,
+    SandboxTurnEvidence,
+)
 
 FINDING_ID = f"ulf_v1_{'1' * 64}"
 REVIEW_ID = "ulr_00000000-0000-4000-8000-000000000000"
 SUITE_SHA256 = "2" * 64
+
+
+async def replay_dataset_regression(
+    case: DatasetRegressionCase, sandbox: SandboxExecutor, **kwargs: Any
+) -> DatasetRegressionResult:
+    return await _replay_dataset_regression(case, sandbox, allow_network_egress=True, **kwargs)
+
+
+async def run_dataset_regressions(
+    cases: tuple[DatasetRegressionCase, ...], sandbox: SandboxExecutor, **kwargs: Any
+) -> DatasetRegressionRunResult:
+    return await _run_dataset_regressions(cases, sandbox, allow_network_egress=True, **kwargs)
 
 
 def _rule(*, rule_id: str = "invoice-matches-request") -> JsonValuesEqualInvariant:
@@ -57,9 +83,10 @@ def _case(
         operator_version="1.0.0",
         original_input="Pay invoice AC-100.",
         variation_input=variation_input,
-        target_config=JsonHttpDatasetTargetConfig.model_validate(
+        target_config=JsonHttpSandboxConfig.model_validate(
             {
-                "version": 2,
+                "version": 3,
+                "sandbox_id": "test-sandbox",
                 "headers_from_env": {"Authorization": "TARGET_TOKEN"},
                 "reset": {
                     "url": "http://127.0.0.1:8765/reset",
@@ -70,13 +97,24 @@ def _case(
                 "setup": {"url": "http://127.0.0.1:8765/setup"},
                 "execute_turn": {
                     "url": "http://127.0.0.1:8765/execute",
-                    "request_json_template": {"input": "{{input}}"},
+                    "request_json_template": {
+                        "case_id": "{{case_id}}",
+                        "turn_id": "{{turn_id}}",
+                        "input": "{{input}}",
+                    },
                 },
-                "snapshot": {"url": "http://127.0.0.1:8765/snapshot"},
+                "snapshot": {
+                    "url": "http://127.0.0.1:8765/snapshot",
+                    "request_json_template": {
+                        "case_id": "{{case_id}}",
+                        "turn_id": "{{turn_id}}",
+                    },
+                },
             }
         ),
         source_suite_sha256=SUITE_SHA256,
         observation_authority="committed_state_snapshot",
+        state_observation_authority="sandbox_self_reported",
         selected_rules=(_rule(),),
         discovery_repetitions=repetitions,
     )
@@ -92,9 +130,10 @@ def _stateful_case(*, repetitions: int = 3) -> DatasetRegressionCase:
         operator_version="1.0.0",
         original_input="Pay invoice AC-100.",
         variation_input="Pay invoice AC-101 instead of AC-100.",
-        target_config=JsonHttpDatasetTargetConfig.model_validate(
+        target_config=JsonHttpSandboxConfig.model_validate(
             {
-                "version": 2,
+                "version": 3,
+                "sandbox_id": "test-sandbox",
                 "reset": {
                     "url": "https://sandbox.example.test/reset",
                     "generation_json_pointer": "/generation",
@@ -104,39 +143,85 @@ def _stateful_case(*, repetitions: int = 3) -> DatasetRegressionCase:
                 "setup": {"url": "https://sandbox.example.test/setup"},
                 "execute_turn": {
                     "url": "https://sandbox.example.test/execute",
-                    "request_json_template": {"input": "{{input}}"},
+                    "request_json_template": {
+                        "case_id": "{{case_id}}",
+                        "turn_id": "{{turn_id}}",
+                        "input": "{{input}}",
+                    },
                 },
-                "snapshot": {"url": "https://sandbox.example.test/snapshot"},
+                "snapshot": {
+                    "url": "https://sandbox.example.test/snapshot",
+                    "request_json_template": {
+                        "case_id": "{{case_id}}",
+                        "turn_id": "{{turn_id}}",
+                    },
+                },
             }
         ),
         source_suite_sha256=SUITE_SHA256,
         observation_authority="committed_state_snapshot",
+        state_observation_authority="sandbox_self_reported",
         selected_rules=(_rule(),),
         discovery_repetitions=repetitions,
     )
 
 
 class _Target:
-    def __init__(self, outcomes: list[ObservedAgentOutput | RuntimeError]) -> None:
+    sandbox_id = "regression-test-sandbox"
+    capabilities = SandboxCapabilities(
+        supports_conversations=True,
+        supports_state_observation=True,
+        state_observation_authority="sandbox_self_reported",
+        cancellation_guarantee="guaranteed",
+    )
+
+    def __init__(
+        self,
+        outcomes: list[ObservedAgentOutput | RuntimeError],
+        *,
+        config_sha256: str | None = None,
+    ) -> None:
         self.outcomes = outcomes
         self.inputs: list[str] = []
-        self.safety_envelope = SafetyEnvelope(
-            description="isolated regression target",
-            isolated=True,
-            allows_network_egress=False,
-            allows_business_side_effects=False,
+        self.config_sha256 = (
+            _case().target.config_sha256 if config_sha256 is None else config_sha256
         )
 
-    @property
-    def fresh_state_per_execution(self) -> bool:
-        return True
+    def api_calls_for_case(self, case: EvaluationCase) -> int:
+        return 5
 
-    async def execute(self, raw_input: str) -> ObservedAgentOutput:
+    async def execute(self, case: EvaluationCase) -> ExecutionEvidence:
+        raw_input = case.turns[0].content
         self.inputs.append(raw_input)
         outcome = self.outcomes.pop(0)
         if isinstance(outcome, RuntimeError):
             raise outcome
-        return outcome
+        snapshot = outcome.metadata.get("committed_state_snapshot")
+        return ExecutionEvidence(
+            case_id=case.id,
+            sandbox_id=self.sandbox_id,
+            sandbox_config_sha256=self.config_sha256,
+            initial_state=SandboxStateEvidence(value={}, authority="sandbox_self_reported"),
+            turns=(
+                SandboxTurnEvidence(
+                    turn_id=case.turns[0].id,
+                    response=outcome.raw_output,
+                    state_snapshot=snapshot,
+                    state_observation_authority=(
+                        "sandbox_self_reported" if snapshot is not None else None
+                    ),
+                ),
+            ),
+            final_response=outcome.raw_output,
+            final_state=SandboxStateEvidence(value=snapshot, authority="sandbox_self_reported"),
+            lifecycle=SandboxLifecycleEvidence(
+                terminal_status="succeeded",
+                completed_phases=("execute", "cleanup"),
+                delivery="certain",
+                cleanup="succeeded",
+                sandbox_state_uncertain=False,
+            ),
+        )
 
 
 def _output(invoice: str, requested: str) -> ObservedAgentOutput:
@@ -165,6 +250,7 @@ def test_case_is_content_addressed_and_loader_round_trips(tmp_path: Path) -> Non
         target_config=case.target.config,
         source_suite_sha256=SUITE_SHA256,
         observation_authority="committed_state_snapshot",
+        state_observation_authority="sandbox_self_reported",
         selected_rules=(_rule(),),
         discovery_repetitions=3,
     )
@@ -246,6 +332,7 @@ def test_extended_rules_round_trip_and_replay(
         target_config=base.target.config,
         source_suite_sha256=SUITE_SHA256,
         observation_authority="committed_state_snapshot",
+        state_observation_authority="sandbox_self_reported",
         selected_rules=(rule,),
         discovery_repetitions=1,
     )
@@ -317,15 +404,9 @@ def test_replay_runs_only_exact_variation_sequentially_and_aggregates(
 
 def test_replay_enforces_target_safety_and_network_opt_in() -> None:
     target = _Target([_output("AC-101", "AC-101")] * 3)
-    target.safety_envelope = SafetyEnvelope(
-        description="networked target",
-        isolated=True,
-        allows_network_egress=True,
-        allows_business_side_effects=False,
-    )
 
-    with pytest.raises(ValueError, match="network egress requires explicit opt-in"):
-        asyncio.run(replay_dataset_regression(_case(), target))
+    with pytest.raises(ValueError, match="sandbox API access requires explicit network opt-in"):
+        asyncio.run(_replay_dataset_regression(_case(), target))
 
 
 @pytest.mark.parametrize("max_target_calls", [True, 0, -1])
@@ -357,7 +438,10 @@ def test_replay_rejects_case_over_sdk_target_call_budget_before_execution() -> N
 
 def test_stateful_replay_budget_counts_physical_lifecycle_calls() -> None:
     case = _stateful_case()
-    target = _Target([_output("AC-101", "AC-101")] * 3)
+    target = _Target(
+        [_output("AC-101", "AC-101")] * 3,
+        config_sha256=case.target.config_sha256,
+    )
 
     with pytest.raises(ValueError, match="authorized target call budget"):
         asyncio.run(replay_dataset_regression(case, target, max_target_calls=14))
@@ -443,6 +527,7 @@ def test_run_uses_extended_schema_when_any_case_uses_extended_rules() -> None:
         target_config=legacy_case.target.config,
         source_suite_sha256=SUITE_SHA256,
         observation_authority="committed_state_snapshot",
+        state_observation_authority="sandbox_self_reported",
         selected_rules=(
             JsonValueEqualsLiteralInvariant(
                 type="json_value_equals_literal",
@@ -459,7 +544,10 @@ def test_run_uses_extended_schema_when_any_case_uses_extended_rules() -> None:
     target = _Target(
         [
             _output("AC-101", "AC-101"),
-            ObservedAgentOutput(raw_output={"approval_version": 7}),
+            ObservedAgentOutput(
+                raw_output={"approval_version": 7},
+                metadata={"committed_state_snapshot": {"approval_version": 7}},
+            ),
         ]
     )
 

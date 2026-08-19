@@ -34,19 +34,40 @@ def _write_inputs(tmp_path: Path) -> tuple[Path, Path, Path]:
     target.write_text(
         json.dumps(
             {
-                "version": 2,
+                "version": 3,
+                "sandbox_id": "test-sandbox",
                 "reset": {
                     "url": "http://127.0.0.1:8765/reset",
+                    "request_json_template": {"case_id": "{{case_id}}"},
+                    "case_id_json_pointer": "/case_id",
                     "generation_json_pointer": "/generation",
                     "clean_state_json_pointer": "/clean",
                     "clean_state_value": True,
                 },
-                "setup": {"url": "http://127.0.0.1:8765/setup"},
+                "setup": {
+                    "url": "http://127.0.0.1:8765/setup",
+                    "request_json_template": {"case_id": "{{case_id}}"},
+                    "case_id_json_pointer": "/case_id",
+                },
                 "execute_turn": {
                     "url": "http://127.0.0.1:8765/execute",
-                    "request_json_template": {"input": "{{input}}"},
+                    "request_json_template": {
+                        "case_id": "{{case_id}}",
+                        "turn_id": "{{turn_id}}",
+                        "input": "{{input}}",
+                    },
+                    "case_id_json_pointer": "/case_id",
+                    "turn_id_json_pointer": "/turn_id",
                 },
-                "snapshot": {"url": "http://127.0.0.1:8765/snapshot"},
+                "snapshot": {
+                    "url": "http://127.0.0.1:8765/snapshot",
+                    "request_json_template": {
+                        "case_id": "{{case_id}}",
+                        "turn_id": "{{turn_id}}",
+                    },
+                    "case_id_json_pointer": "/case_id",
+                    "turn_id_json_pointer": "/turn_id",
+                },
             }
         ),
         encoding="utf-8",
@@ -84,7 +105,7 @@ def test_correction_dry_run_reports_complete_plan_without_calls(tmp_path: Path) 
             "stress",
             "correction",
             str(case),
-            "--target-config",
+            "--sandbox-config",
             str(target),
             "--invariants",
             str(invariants),
@@ -95,8 +116,8 @@ def test_correction_dry_run_reports_complete_plan_without_calls(tmp_path: Path) 
 
     assert result.exit_code == 0, result.output
     assert "event.correction_after_first_response" in result.output
-    assert "Target calls per paired repetition: 12" in result.output
-    assert "Potential target calls: 36" in result.output
+    assert "Target calls per paired repetition: 14" in result.output
+    assert "Potential sandbox API calls: 42" in result.output
     assert "External calls: none" in result.output
 
 
@@ -110,7 +131,7 @@ def test_save_creates_replayable_multi_turn_case(tmp_path: Path) -> None:
             "stress",
             "save",
             str(case),
-            "--target-config",
+            "--sandbox-config",
             str(target),
             "--invariants",
             str(invariants),

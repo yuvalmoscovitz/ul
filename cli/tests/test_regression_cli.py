@@ -357,6 +357,8 @@ class _ReplayHandler(BaseHTTPRequestHandler):
             replay_server.generation += 1
             replay_server.committed_result = None
             response_payload: dict[str, Any] = {
+                "sandbox_id": "test-sandbox",
+                "case_id": payload["case_id"],
                 "generation": replay_server.generation,
                 "clean": True,
             }
@@ -372,9 +374,19 @@ class _ReplayHandler(BaseHTTPRequestHandler):
                 "amount": "12500" if replay_server.fixed else "12600",
                 "requested_amount": "12500",
             }
-            response_payload = {"result": replay_server.committed_result}
+            response_payload = {
+                "sandbox_id": "test-sandbox",
+                "case_id": payload["case_id"],
+                "turn_id": payload["turn_id"],
+                "result": replay_server.committed_result,
+            }
         elif self.path == "/snapshot":
-            response_payload = {"state": replay_server.committed_result}
+            response_payload = {
+                "sandbox_id": "test-sandbox",
+                "case_id": payload["case_id"],
+                "turn_id": payload["turn_id"],
+                "state": replay_server.committed_result,
+            }
         else:
             self.send_response(404)
             self.end_headers()
@@ -416,10 +428,13 @@ def _write_target_config(path: Path, endpoint: str) -> None:
     path.write_text(
         json.dumps(
             {
-                "version": 2,
+                "version": 3,
+                "sandbox_id": "test-sandbox",
                 "headers_from_env": {"X-Test-Token": "UL_REGRESSION_TEST_SECRET"},
                 "reset": {
                     "url": f"{base_url}/reset",
+                    "request_json_template": {"case_id": "{{case_id}}"},
+                    "case_id_json_pointer": "/case_id",
                     "generation_json_pointer": "/generation",
                     "clean_state_json_pointer": "/clean",
                     "clean_state_value": True,
@@ -427,14 +442,24 @@ def _write_target_config(path: Path, endpoint: str) -> None:
                 "execute_turn": {
                     "url": endpoint,
                     "request_json_template": {
+                        "case_id": "{{case_id}}",
+                        "turn_id": "{{turn_id}}",
                         "request": {"message": "{{input}}"},
                         "settings": {"mode": "sandbox"},
                     },
                     "response_json_pointer": "/result",
+                    "case_id_json_pointer": "/case_id",
+                    "turn_id_json_pointer": "/turn_id",
                 },
                 "snapshot": {
                     "url": f"{base_url}/snapshot",
+                    "request_json_template": {
+                        "case_id": "{{case_id}}",
+                        "turn_id": "{{turn_id}}",
+                    },
                     "response_json_pointer": "/state",
+                    "case_id_json_pointer": "/case_id",
+                    "turn_id_json_pointer": "/turn_id",
                 },
             }
         ),
@@ -482,7 +507,7 @@ def _save_arguments(
         "save",
         str(evidence),
         finding_id,
-        "--target-config",
+        "--sandbox-config",
         str(target_config),
         "--output",
         str(case_path),
@@ -498,13 +523,13 @@ def _replay_arguments(case_path: Path, target_config: Path, result_path: Path) -
         "regression",
         "replay",
         str(case_path),
-        "--target-config",
+        "--sandbox-config",
         str(target_config),
-        "--allow-target-network",
+        "--allow-sandbox-network-egress",
         "--confirm-isolated-sandbox",
         "--allow-insecure-http",
-        "--max-target-calls",
-        "12",
+        "--max-sandbox-api-calls",
+        "15",
         "--output",
         str(result_path),
     ]
@@ -521,12 +546,12 @@ def _run_arguments(
         "regression",
         "run",
         str(cases_path),
-        "--target-config",
+        "--sandbox-config",
         str(target_config),
-        "--allow-target-network",
+        "--allow-sandbox-network-egress",
         "--confirm-isolated-sandbox",
         "--allow-insecure-http",
-        "--max-target-calls",
+        "--max-sandbox-api-calls",
         str(max_target_calls),
         "--output",
         str(result_path),
@@ -552,7 +577,7 @@ def test_confirmed_finding_save_and_replay_real_loopback(
         saved = runner.invoke(app, _save_arguments(evidence, target_config, case_path))
         assert saved.exit_code == 0, saved.output
         assert "Saved regression case ulrc_v1_" in saved.output
-        assert "--max-target-calls 12" in saved.output
+        assert "--max-sandbox-api-calls 15" in saved.output
         assert "--allow-insecure-http" in saved.output
         assert "not verified as the discovery target" in saved.output
         assert case_path.exists()
@@ -566,11 +591,10 @@ def test_confirmed_finding_save_and_replay_real_loopback(
         assert ": failed" in defective.output
         assert len(server.requests) == 3
         assert all(
-            request
-            == {
-                "request": {"message": "Pay pay AC-100."},
-                "settings": {"mode": "sandbox"},
-            }
+            request["request"] == {"message": "Pay pay AC-100."}
+            and request["settings"] == {"mode": "sandbox"}
+            and isinstance(request["case_id"], str)
+            and request["case_id"].startswith("ul-case-")
             for request in server.requests
         )
         assert server.authorization_headers == [TEST_SECRET] * 3
@@ -580,7 +604,19 @@ def test_confirmed_finding_save_and_replay_real_loopback(
         assert fixed.exit_code == 0, fixed.output
         assert ": passed" in fixed.output
         assert len(server.requests) == 6
-        assert server.requests[:3] == server.requests[3:]
+        assert [
+            {key: value for key, value in request.items() if key not in {"case_id", "turn_id"}}
+            for request in server.requests[:3]
+        ] == [
+            {key: value for key, value in request.items() if key not in {"case_id", "turn_id"}}
+            for request in server.requests[3:]
+        ]
+        assert all(
+            isinstance(request["case_id"], str)
+            and request["case_id"].startswith("ul-case-")
+            and request["turn_id"] == f"{request['case_id']}:turn-1"
+            for request in server.requests[3:]
+        )
 
     for artifact in (case_path, defective_result_path, fixed_result_path):
         serialized = artifact.read_text(encoding="utf-8")
@@ -715,7 +751,7 @@ def test_regression_run_monitors_saved_cases_against_current_black_box_target(
                 cases_directory,
                 target_config,
                 defective_result_path,
-                max_target_calls=24,
+                max_target_calls=30,
             ),
         )
         assert defective.exit_code == 1, defective.output
@@ -740,7 +776,7 @@ def test_regression_run_monitors_saved_cases_against_current_black_box_target(
                 cases_directory,
                 target_config,
                 fixed_result_path,
-                max_target_calls=24,
+                max_target_calls=30,
             ),
         )
         assert fixed.exit_code == 0, fixed.output
@@ -754,7 +790,7 @@ def test_regression_run_monitors_saved_cases_against_current_black_box_target(
                 invoice_case_path,
                 target_config,
                 inconclusive_result_path,
-                max_target_calls=12,
+                max_target_calls=15,
             ),
         )
         assert inconclusive.exit_code == 2, inconclusive.output
@@ -810,7 +846,7 @@ def test_regression_run_preflights_total_budget_before_secrets_output_or_network
         )
 
     assert run.exit_code == 2
-    assert "24" in run.output and "5" in run.output
+    assert "30" in run.output and "5" in run.output
     assert server.requests == []
     assert TEST_SECRET not in run.output
     assert not result_path.exists()
@@ -939,7 +975,7 @@ def test_replay_rejects_untrusted_or_tampered_inputs_before_target_call(
         assert not result_path.exists()
 
 
-def test_replay_enforces_target_call_budget_before_secret_resolution_or_output(
+def test_replay_enforces_sandbox_call_budget_before_secret_resolution_or_output(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     evidence = tmp_path / "evidence.jsonl"
@@ -953,21 +989,21 @@ def test_replay_enforces_target_call_budget_before_secret_resolution_or_output(
     assert saved.exit_code == 0, saved.output
     monkeypatch.delenv("UL_REGRESSION_TEST_SECRET", raising=False)
     arguments = _replay_arguments(case_path, target_config, result_path)
-    budget_index = arguments.index("--max-target-calls") + 1
+    budget_index = arguments.index("--max-sandbox-api-calls") + 1
     arguments[budget_index] = "2"
 
     replay = runner.invoke(app, arguments)
 
     assert replay.exit_code == 2
-    assert "12" in replay.output and "2" in replay.output
-    assert "target" in replay.output.casefold() and "call" in replay.output.casefold()
+    assert "15" in replay.output and "2" in replay.output
+    assert "sandbox" in replay.output.casefold() and "call" in replay.output.casefold()
     assert TEST_SECRET not in replay.output
     assert not result_path.exists()
 
 
 @pytest.mark.parametrize(
     "missing_option",
-    ["--allow-target-network", "--confirm-isolated-sandbox"],
+    ["--allow-sandbox-network-egress", "--confirm-isolated-sandbox"],
 )
 def test_replay_requires_every_target_safety_confirmation(
     tmp_path: Path, missing_option: str

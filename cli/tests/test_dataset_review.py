@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from pydantic import JsonValue
 from rich.console import Console
 from typer.testing import CliRunner
 from ul import (
@@ -199,7 +200,7 @@ def _technical_details() -> dict[str, Any]:
     )
 
     def trial_set(arm: str, final_amount: int, corrected_amount: int) -> DatasetEvaluationTrialSet:
-        committed_state_snapshot = {
+        committed_state_snapshot: JsonValue = {
             "final_amount": final_amount,
             "corrected_amount": corrected_amount,
         }
@@ -208,7 +209,10 @@ def _technical_details() -> dict[str, Any]:
                 repetition=repetition,
                 target_output=ObservedAgentOutput(
                     raw_output={"message": "completed"},
-                    metadata={"committed_state_snapshot": committed_state_snapshot},
+                    metadata={
+                        "committed_state_snapshot": committed_state_snapshot,
+                        "state_observation_authority": "sandbox_self_reported",
+                    },
                 ),
                 observed_frame=SemanticFrame(
                     interaction_id=f"quickstart-payment:{arm}:round-{repetition}",
@@ -1025,7 +1029,7 @@ def test_report_and_review_make_no_model_or_network_calls(
 
     monkeypatch.setattr("ul_cli.dataset.load_dataset_semantic_settings", unexpected_call)
     monkeypatch.setattr("ul_cli.dataset.create_semantic_model_deconstructor", unexpected_call)
-    monkeypatch.setattr("ul_cli.dataset.JsonHttpDatasetTarget", unexpected_call)
+    monkeypatch.setattr("ul_cli.dataset.JsonHttpSandboxConnection", unexpected_call)
 
     report = runner.invoke(app, ["dataset", "report", str(evidence)])
     review = runner.invoke(app, _review_arguments(evidence))

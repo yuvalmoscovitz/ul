@@ -17,7 +17,8 @@ import httpx
 import pytest
 import typer
 from ul.dataset_invariants import JsonValuesEqualInvariant, load_dataset_invariant_suite
-from ul.http_target import JsonHttpDatasetTarget, JsonHttpDatasetTargetConfig
+from ul.http_sandbox import JsonHttpSandboxConfig, JsonHttpSandboxConnection
+from ul.sandbox import evaluation_case_from_inputs
 
 from examples.quickstart import run as quickstart
 from examples.quickstart.defective_agent import create_server
@@ -25,6 +26,8 @@ from examples.quickstart.defective_agent import create_server
 _PROJECT_ROOT = Path(__file__).parents[3]
 _QUICKSTART_DIRECTORY = Path(__file__).parents[1]
 _VALID_REQUEST = {
+    "case_id": "ul-case-00000000000000000000000000000000",
+    "turn_id": "ul-case-00000000000000000000000000000000:turn-1",
     "request": {"message": "Pay AC-100."},
     "settings": {"mode": "sandbox"},
 }
@@ -52,7 +55,7 @@ def _post(base_url: str, payload: object, **kwargs: Any) -> httpx.Response:
 def _actions(response: httpx.Response) -> list[dict[str, object]]:
     assert response.status_code == 200, response.text
     response_payload = cast(dict[str, Any], response.json())
-    assert set(response_payload) == {"result"}
+    assert set(response_payload) == {"sandbox_id", "case_id", "turn_id", "result"}
     result = response_payload["result"]
     assert isinstance(result, dict)
     return [cast(dict[str, object], result)]
@@ -65,6 +68,8 @@ def test_server_reproduces_the_seeded_wrong_invoice() -> None:
             _post(
                 base_url,
                 {
+                    "case_id": "ul-case-00000000000000000000000000000000",
+                    "turn_id": "ul-case-00000000000000000000000000000000:turn-1",
                     "request": {"message": "Pay pay AC-100."},
                     "settings": {"mode": "sandbox"},
                 },
@@ -100,6 +105,8 @@ def test_server_starts_every_request_from_identical_fresh_state() -> None:
                 _post(
                     base_url,
                     {
+                        "case_id": "ul-case-00000000000000000000000000000000",
+                        "turn_id": "ul-case-00000000000000000000000000000000:turn-1",
                         "request": {"message": "Pay pay AC-100."},
                         "settings": {"mode": "sandbox"},
                     },
@@ -115,28 +122,33 @@ def test_server_starts_every_request_from_identical_fresh_state() -> None:
 @pytest.mark.asyncio
 async def test_stateful_target_adapter_resets_executes_and_snapshots() -> None:
     with _running_server() as (base_url, _server):
-        config = JsonHttpDatasetTargetConfig.model_validate(
-            quickstart.load_target_template(base_url)
-        )
-        async with JsonHttpDatasetTarget.from_config(
+        config = JsonHttpSandboxConfig.model_validate(quickstart.load_target_template(base_url))
+        async with JsonHttpSandboxConnection.from_config(
             config,
             sandbox_confirmed=True,
             allow_insecure_http=True,
-            max_target_calls=5,
+            max_sandbox_api_calls=6,
         ) as target:
-            output = await target.execute("Pay AC-100.")
+            case = evaluation_case_from_inputs(
+                case_id="ul-case-00000000000000000000000000000000",
+                raw_inputs=("Pay AC-100.",),
+                max_sandbox_api_calls=6,
+                timeout_seconds=30,
+            )
+            output = await target.execute(case)
 
-    raw_output = cast(dict[str, object], output.raw_output)
-    lifecycle_calls = cast(list[dict[str, object]], output.metadata["lifecycle_calls"])
+    assert output.lifecycle.terminal_status == "succeeded"
+    raw_output = cast(dict[str, object], output.turns[0].response)
     assert raw_output["invoice_reference"] == "AC-100"
-    assert output.metadata["committed_state_snapshot"] == raw_output
-    assert [call["phase"] for call in lifecycle_calls] == [
+    assert output.turns[0].state_snapshot == raw_output
+    assert output.lifecycle.completed_phases == (
         "reset",
         "setup",
+        "initial_snapshot",
         "execute_turn",
         "snapshot",
         "cleanup_reset",
-    ]
+    )
 
 
 @pytest.mark.parametrize(
@@ -197,8 +209,10 @@ def test_quickstart_target_contains_no_authentication_mapping() -> None:
     target = json.loads((_QUICKSTART_DIRECTORY / "target.json").read_text(encoding="utf-8"))
 
     assert target["headers_from_env"] == {}
-    assert target["version"] == 2
+    assert target["version"] == 3
     assert target["execute_turn"]["request_json_template"] == {
+        "case_id": "{{case_id}}",
+        "turn_id": "{{turn_id}}",
         "request": {"message": "{{input}}"},
         "settings": {"mode": "sandbox"},
     }
@@ -347,7 +361,7 @@ def test_runner_uses_safe_argv_minimal_environment_private_artifacts_and_cleans_
             "UL_DATASET_RENDER_MODEL": "x-ai/grok-4.6",
             "UL_DATASET_EQUIVALENCE_MODEL": "x-ai/grok-4.6",
         }
-        target_config_path = Path(command[command.index("--target-config") + 1])
+        target_config_path = Path(command[command.index("--sandbox-config") + 1])
         assert Path(command[command.index("--invariants") + 1]) == (
             _QUICKSTART_DIRECTORY / "invariants.json"
         )

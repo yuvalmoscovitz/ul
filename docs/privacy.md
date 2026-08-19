@@ -51,13 +51,14 @@ boundary = RedactedSemanticPipeline(
 
 coverage = boundary.dry_run(source_record)
 protected_source = boundary.protect_record(source_record)
-protected_target = boundary.wrap_target(dataset_target)
+protected_sandbox = boundary.wrap_sandbox(sandbox_connection)
 ```
 
 Pass `boundary` as the deconstructor, renderer, and equivalence verifier, pass
-`protected_target` to `DatasetEvaluationRunner`, and run the protected source record. All semantic
-calls use placeholders, including repeated calls. The target receives the rehydrated input just
-before execution. Persisted results contain placeholders and a policy digest, never the mapping.
+`protected_sandbox` to `DatasetEvaluationRunner`, and run the protected source record. All semantic
+calls use placeholders, including repeated calls. The customer-managed sandbox API receives the
+rehydrated input just before execution. Persisted results contain placeholders and a policy digest,
+never the mapping.
 
 The state directory must be private (`0700`) and the mapping file is written as `0600`. The file is
 integrity-protected with the supplied key and updated under a process lock with atomic replacement.
@@ -100,8 +101,8 @@ export UL_DATASET_REDACTION_KEY="$(your-secret-manager read ul-redaction-key)"
 ul dataset evaluate interactions.jsonl \
   --redaction-policy redaction.json \
   --redaction-state .ul-private/pseudonyms.json \
-  --target-config target.json \
-  --allow-target-network --confirm-isolated-sandbox \
+  --sandbox-config sandbox.json \
+  --allow-sandbox-network-egress --confirm-isolated-sandbox \
   --output evidence.jsonl
 ```
 

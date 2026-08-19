@@ -1,16 +1,19 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import math
 import os
+import secrets
 import stat
 from pathlib import Path
 from typing import Literal, Self, cast
 
 from pydantic import ConfigDict, Field, JsonValue, ValidationError, field_validator, model_validator
-from ul_core.contracts import DatasetTargetLifecycleError, MultiTurnDatasetTargetExecutor
+from ul_core.contracts import SandboxExecutor
 from ul_core.dataset import ObservedAgentOutput
+from ul_core.evaluation import EvaluationCase, ExecutionEvidence
 from ul_core.models import ConversationRole, ConversationTurn, ULModel
 
 from ul.dataset_evaluation import DatasetTargetLifecycleFailure
@@ -25,7 +28,8 @@ from ul.dataset_regression import (
     DatasetRegressionTargetSnapshot,
     dataset_regression_target_config_sha256,
 )
-from ul.http_target import JsonHttpDatasetTargetConfig, json_http_target_calls_per_conversation
+from ul.http_sandbox import JsonHttpSandboxConfig, json_http_sandbox_calls_per_conversation
+from ul.sandbox import execution_evidence_requires_quarantine, validate_execution_evidence
 
 _MAXIMUM_CASE_BYTES = 1_000_000
 _MAXIMUM_JSON_DEPTH = 100
@@ -85,6 +89,8 @@ class CorrectionDivergence(_StrictModel):
 
 class CorrectionStressTrial(_StrictModel):
     repetition: int = Field(ge=1)
+    baseline_execution_evidence: ExecutionEvidence | None = None
+    variation_execution_evidence: ExecutionEvidence | None = None
     baseline: tuple[CorrectionTurnObservation, ...] = ()
     variation: tuple[CorrectionTurnObservation, ...] = ()
     divergences: tuple[CorrectionDivergence, ...] = ()
@@ -171,57 +177,130 @@ class MultiTurnRegressionCase(_StrictModel):
 
 async def run_correction_stress_test(
     case: CorrectionAfterFirstResponseCase,
-    target: MultiTurnDatasetTargetExecutor,
+    sandbox: SandboxExecutor,
     *,
     invariant_rules: tuple[DatasetInvariantRule, ...],
     observation_authority: ObservationAuthority = "committed_state_snapshot",
     repetitions: int = 3,
-    max_target_calls: int = 100,
+    max_sandbox_api_calls: int = 100,
     allow_network_egress: bool = False,
 ) -> CorrectionStressResult:
     if type(repetitions) is not int or repetitions < 1:
         raise ValueError("repetitions must be a positive integer")
     if not invariant_rules:
         raise ValueError("correction stress testing requires at least one invariant")
-    if type(max_target_calls) is not int or max_target_calls < 1:
-        raise ValueError("max_target_calls must be a positive integer")
-    if not target.safety_envelope.isolated:
-        raise ValueError("dataset target must be isolated")
-    if target.safety_envelope.allows_network_egress and not allow_network_egress:
-        raise ValueError("dataset target network egress requires explicit opt-in")
-    if target.safety_envelope.allows_business_side_effects:
-        raise ValueError("dataset targets must not allow business side effects")
-    if not target.fresh_state_per_execution:
-        raise ValueError("dataset target must start from fresh state for every conversation")
-
-    baseline_calls = target.target_calls_for_conversation(1)
-    variation_calls = target.target_calls_for_conversation(2)
-    required_target_calls = repetitions * (baseline_calls + variation_calls)
-    if required_target_calls > max_target_calls:
-        raise ValueError("correction stress test exceeds the authorized target call budget")
+    if type(max_sandbox_api_calls) is not int or max_sandbox_api_calls < 1:
+        raise ValueError("max_sandbox_api_calls must be a positive integer")
+    if not allow_network_egress:
+        raise ValueError("correction stress sandbox API access requires explicit network opt-in")
+    if not sandbox.capabilities.supports_conversations:
+        raise ValueError("correction stress testing requires conversation support")
+    if not sandbox.capabilities.supports_state_observation:
+        raise ValueError("correction stress testing requires state observation support")
 
     initial_turn, correction_turn = case.conversation
+    planned_baseline = _evaluation_case(
+        turns=(initial_turn,),
+        max_sandbox_api_calls=max_sandbox_api_calls,
+        sandbox=sandbox,
+    )
+    planned_variation = _evaluation_case(
+        turns=(initial_turn, correction_turn),
+        max_sandbox_api_calls=max_sandbox_api_calls,
+        sandbox=sandbox,
+    )
+    baseline_calls = sandbox.api_calls_for_case(planned_baseline)
+    variation_calls = sandbox.api_calls_for_case(planned_variation)
+    if (
+        type(baseline_calls) is not int
+        or baseline_calls < 1
+        or type(variation_calls) is not int
+        or variation_calls < 1
+    ):
+        raise ValueError("correction stress sandbox returned an invalid API call count")
+    required_target_calls = repetitions * (baseline_calls + variation_calls)
+    if required_target_calls > max_sandbox_api_calls:
+        raise ValueError("correction stress test exceeds the authorized target call budget")
+
     trials: list[CorrectionStressTrial] = []
     baseline_final_outputs: list[ObservedAgentOutput | None] = []
     final_outputs: list[ObservedAgentOutput | None] = []
+    sandbox_state_uncertain = False
     for repetition in range(1, repetitions + 1):
         baseline: tuple[CorrectionTurnObservation, ...] = ()
-        try:
-            baseline_outputs = await target.execute_conversation((initial_turn.content,))
-            baseline = _observations((initial_turn,), baseline_outputs)
-            variation_outputs = await target.execute_conversation(
-                (initial_turn.content, correction_turn.content)
+        baseline_evidence: ExecutionEvidence | None = None
+        variation_evidence: ExecutionEvidence | None = None
+        if sandbox_state_uncertain:
+            baseline_final_outputs.append(None)
+            final_outputs.append(None)
+            trials.append(
+                CorrectionStressTrial(
+                    repetition=repetition,
+                    inconclusive_reason=(
+                        "sandbox not called because prior execution left state uncertain"
+                    ),
+                )
             )
-            variation = _observations(case.conversation, variation_outputs)
-        except DatasetTargetLifecycleError as error:
+            continue
+        try:
+            baseline_case = _evaluation_case(
+                turns=(initial_turn,),
+                max_sandbox_api_calls=baseline_calls,
+                sandbox=sandbox,
+            )
+            async with asyncio.timeout(baseline_case.timeout_seconds):
+                baseline_evidence = await sandbox.execute(baseline_case)
+            validate_execution_evidence(baseline_case, sandbox, baseline_evidence)
+            sandbox_state_uncertain = execution_evidence_requires_quarantine(baseline_evidence)
+            if baseline_evidence.lifecycle.terminal_status != "succeeded":
+                baseline_final_outputs.append(None)
+                final_outputs.append(None)
+                trials.append(
+                    CorrectionStressTrial(
+                        repetition=repetition,
+                        baseline_execution_evidence=baseline_evidence,
+                        inconclusive_reason="sandbox lifecycle failed",
+                        lifecycle_failure=_lifecycle_failure(baseline_evidence),
+                    )
+                )
+                continue
+            baseline = _observations((initial_turn,), baseline_case, baseline_evidence)
+
+            variation_case = _evaluation_case(
+                turns=(initial_turn, correction_turn),
+                max_sandbox_api_calls=variation_calls,
+                sandbox=sandbox,
+            )
+            async with asyncio.timeout(variation_case.timeout_seconds):
+                variation_evidence = await sandbox.execute(variation_case)
+            validate_execution_evidence(variation_case, sandbox, variation_evidence)
+            sandbox_state_uncertain = execution_evidence_requires_quarantine(variation_evidence)
+            if variation_evidence.lifecycle.terminal_status != "succeeded":
+                baseline_final_outputs.append(baseline[-1].target_output)
+                final_outputs.append(None)
+                trials.append(
+                    CorrectionStressTrial(
+                        repetition=repetition,
+                        baseline_execution_evidence=baseline_evidence,
+                        variation_execution_evidence=variation_evidence,
+                        baseline=baseline,
+                        inconclusive_reason="sandbox lifecycle failed",
+                        lifecycle_failure=_lifecycle_failure(variation_evidence),
+                    )
+                )
+                continue
+            variation = _observations(case.conversation, variation_case, variation_evidence)
+        except TimeoutError:
+            sandbox_state_uncertain = sandbox.capabilities.cancellation_guarantee != "guaranteed"
             baseline_final_outputs.append(baseline[-1].target_output if baseline else None)
             final_outputs.append(None)
             trials.append(
                 CorrectionStressTrial(
                     repetition=repetition,
+                    baseline_execution_evidence=baseline_evidence,
+                    variation_execution_evidence=variation_evidence,
                     baseline=baseline,
-                    inconclusive_reason="target lifecycle failed",
-                    lifecycle_failure=_lifecycle_failure(error),
+                    inconclusive_reason="sandbox execution timed out",
                 )
             )
             continue
@@ -231,16 +310,20 @@ async def run_correction_stress_test(
             trials.append(
                 CorrectionStressTrial(
                     repetition=repetition,
+                    baseline_execution_evidence=baseline_evidence,
+                    variation_execution_evidence=variation_evidence,
                     baseline=baseline,
-                    inconclusive_reason="target execution failed",
+                    inconclusive_reason="sandbox execution failed",
                 )
             )
             continue
-        baseline_final_outputs.append(baseline_outputs[-1])
-        final_outputs.append(variation_outputs[-1])
+        baseline_final_outputs.append(baseline[-1].target_output)
+        final_outputs.append(variation[-1].target_output)
         trials.append(
             CorrectionStressTrial(
                 repetition=repetition,
+                baseline_execution_evidence=baseline_evidence,
+                variation_execution_evidence=variation_evidence,
                 baseline=baseline,
                 variation=variation,
                 divergences=_divergences(baseline[0], variation),
@@ -304,20 +387,20 @@ async def run_correction_stress_test(
 
 def plan_correction_stress_test(
     case: CorrectionAfterFirstResponseCase,
-    target_config: JsonHttpDatasetTargetConfig,
+    target_config: JsonHttpSandboxConfig,
     *,
     repetitions: int = 3,
-    max_target_calls: int = 100,
+    max_sandbox_api_calls: int = 100,
 ) -> CorrectionStressPlan:
     if type(repetitions) is not int or repetitions < 1:
         raise ValueError("repetitions must be a positive integer")
-    if type(max_target_calls) is not int or max_target_calls < 1:
-        raise ValueError("max_target_calls must be a positive integer")
-    target_calls_per_pair = json_http_target_calls_per_conversation(
+    if type(max_sandbox_api_calls) is not int or max_sandbox_api_calls < 1:
+        raise ValueError("max_sandbox_api_calls must be a positive integer")
+    target_calls_per_pair = json_http_sandbox_calls_per_conversation(
         target_config, 1
-    ) + json_http_target_calls_per_conversation(target_config, 2)
+    ) + json_http_sandbox_calls_per_conversation(target_config, 2)
     required_target_calls = repetitions * target_calls_per_pair
-    if required_target_calls > max_target_calls:
+    if required_target_calls > max_sandbox_api_calls:
         raise ValueError("correction stress test exceeds the authorized target call budget")
     return CorrectionStressPlan(
         operator_id=case.operator_id,
@@ -330,7 +413,7 @@ def plan_correction_stress_test(
 def create_multi_turn_regression_case(
     *,
     stress_case: CorrectionAfterFirstResponseCase,
-    target_config: JsonHttpDatasetTargetConfig,
+    target_config: JsonHttpSandboxConfig,
     source_suite_sha256: str,
     observation_authority: ObservationAuthority,
     invariant_rules: tuple[DatasetInvariantRule, ...],
@@ -345,6 +428,9 @@ def create_multi_turn_regression_case(
         source_suite_sha256=source_suite_sha256,
         observation_source="target_output",
         observation_authority=observation_authority,
+        state_observation_authority=(
+            "sandbox_self_reported" if observation_authority == "committed_state_snapshot" else None
+        ),
         rules=invariant_rules,
     )
     content = cast(
@@ -368,18 +454,24 @@ def create_multi_turn_regression_case(
 
 async def replay_multi_turn_regression(
     case: MultiTurnRegressionCase,
-    target: MultiTurnDatasetTargetExecutor,
+    sandbox: SandboxExecutor,
     *,
-    max_target_calls: int = 100,
+    max_sandbox_api_calls: int = 100,
     allow_network_egress: bool = False,
 ) -> CorrectionStressResult:
+    if case.invariant_suite.state_observation_authority is not None and (
+        case.invariant_suite.state_observation_authority
+        != sandbox.capabilities.state_observation_authority
+        or case.invariant_suite.state_observer_id != sandbox.capabilities.state_observer_id
+    ):
+        raise ValueError("sandbox state authority does not match the multi-turn regression case")
     return await run_correction_stress_test(
         case.stress_case,
-        target,
+        sandbox,
         invariant_rules=case.invariant_suite.rules,
         observation_authority=case.invariant_suite.observation_authority,
         repetitions=case.repetitions,
-        max_target_calls=max_target_calls,
+        max_sandbox_api_calls=max_sandbox_api_calls,
         allow_network_egress=allow_network_egress,
     )
 
@@ -422,19 +514,34 @@ def load_correction_after_first_response_case(
 
 def _observations(
     turns: tuple[ConversationTurn, ...],
-    outputs: tuple[ObservedAgentOutput, ...],
+    evaluation_case: EvaluationCase,
+    evidence: ExecutionEvidence,
 ) -> tuple[CorrectionTurnObservation, ...]:
-    if len(turns) != len(outputs):
-        raise RuntimeError("target returned an invalid number of turn observations")
+    if len(turns) != len(evaluation_case.turns) or len(turns) != len(evidence.turns):
+        raise RuntimeError("sandbox returned an invalid number of turn observations")
     observations: list[CorrectionTurnObservation] = []
-    for turn, output in zip(turns, outputs, strict=True):
-        if "committed_state_snapshot" not in output.metadata:
-            raise RuntimeError("target omitted a committed state snapshot")
+    for turn, sandbox_turn, turn_evidence in zip(
+        turns, evaluation_case.turns, evidence.turns, strict=True
+    ):
+        if turn_evidence.turn_id != sandbox_turn.id:
+            raise RuntimeError("sandbox returned turn evidence out of order")
+        if turn_evidence.state_snapshot is None:
+            raise RuntimeError("sandbox omitted a committed state snapshot")
+        try:
+            output = ObservedAgentOutput(
+                raw_output=turn_evidence.response,
+                metadata={
+                    "committed_state_snapshot": turn_evidence.state_snapshot,
+                    "state_observation_authority": turn_evidence.state_observation_authority,
+                },
+            )
+        except ValidationError:
+            raise RuntimeError("sandbox returned invalid turn evidence") from None
         observations.append(
             CorrectionTurnObservation(
                 turn=turn,
                 target_output=output,
-                committed_state_snapshot=output.metadata["committed_state_snapshot"],
+                committed_state_snapshot=turn_evidence.state_snapshot,
             )
         )
     return tuple(observations)
@@ -520,12 +627,36 @@ def _summarize_divergences(
     return first_turn_id, counts, stability
 
 
-def _lifecycle_failure(error: DatasetTargetLifecycleError) -> DatasetTargetLifecycleFailure:
+def _evaluation_case(
+    *,
+    turns: tuple[ConversationTurn, ...],
+    max_sandbox_api_calls: int,
+    sandbox: SandboxExecutor,
+) -> EvaluationCase:
+    return EvaluationCase(
+        id=f"ul-case-{secrets.token_hex(16)}",
+        turns=tuple(
+            ConversationTurn(
+                id=f"turn-{index}",
+                role=ConversationRole.USER,
+                content=turn.content,
+            )
+            for index, turn in enumerate(turns, start=1)
+        ),
+        max_sandbox_api_calls=max_sandbox_api_calls,
+        timeout_seconds=30,
+        required_state_observation_authority=(sandbox.capabilities.state_observation_authority),
+        required_state_observer_id=sandbox.capabilities.state_observer_id,
+    )
+
+
+def _lifecycle_failure(evidence: ExecutionEvidence) -> DatasetTargetLifecycleFailure:
+    lifecycle = evidence.lifecycle
     return DatasetTargetLifecycleFailure(
-        failed_phase=error.failed_phase,
-        completed_phases=error.completed_phases,
-        cleanup_reset_failed=error.cleanup_reset_failed,
-        sandbox_state_may_remain=error.target_state_uncertain,
+        failed_phase=lifecycle.failed_phase or "unknown",
+        completed_phases=lifecycle.completed_phases,
+        cleanup_reset_failed=lifecycle.cleanup == "failed",
+        sandbox_state_may_remain=lifecycle.sandbox_state_uncertain,
     )
 
 

@@ -8,6 +8,7 @@ from typing import ClassVar, cast
 
 
 class DefectiveCorrectionHandler(BaseHTTPRequestHandler):
+    sandbox_id: ClassVar[str] = "multiturn-correction-example"
     state_lock: ClassVar[Lock] = Lock()
     generation: ClassVar[int] = 0
     committed_invoice: ClassVar[str | None] = None
@@ -26,16 +27,26 @@ class DefectiveCorrectionHandler(BaseHTTPRequestHandler):
                 type(self).committed_invoice = None
                 type(self).requested_invoice = None
                 generation = type(self).generation
-            self._send(HTTPStatus.OK, {"generation": generation, "clean": True})
+            self._send(
+                HTTPStatus.OK,
+                {"case_id": request.get("case_id"), "generation": generation, "clean": True},
+            )
         elif self.path == "/setup":
-            self._send(HTTPStatus.OK, {})
+            self._send(HTTPStatus.OK, {"case_id": request.get("case_id")})
         elif self.path == "/snapshot":
             with type(self).state_lock:
                 state = {
                     "committed_invoice": type(self).committed_invoice,
                     "requested_invoice": type(self).requested_invoice,
                 }
-            self._send(HTTPStatus.OK, {"state": state})
+            self._send(
+                HTTPStatus.OK,
+                {
+                    "case_id": request.get("case_id"),
+                    "turn_id": request.get("turn_id"),
+                    "state": state,
+                },
+            )
         elif self.path == "/execute":
             raw_input = request.get("input")
             if not isinstance(raw_input, str):
@@ -49,12 +60,21 @@ class DefectiveCorrectionHandler(BaseHTTPRequestHandler):
                     response = f"Paid invoice {requested_invoice}."
                 else:
                     response = "The original payment is already complete."
-            self._send(HTTPStatus.OK, {"response": response})
+            self._send(
+                HTTPStatus.OK,
+                {
+                    "case_id": request.get("case_id"),
+                    "turn_id": request.get("turn_id"),
+                    "response": response,
+                },
+            )
         else:
             self._send(HTTPStatus.NOT_FOUND, {"error": "not found"})
 
     def _send(self, status: HTTPStatus, payload: dict[str, object]) -> None:
-        body = json.dumps(payload, separators=(",", ":")).encode()
+        body = json.dumps(
+            {**payload, "sandbox_id": self.sandbox_id}, separators=(",", ":")
+        ).encode()
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))

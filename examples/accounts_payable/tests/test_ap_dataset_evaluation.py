@@ -1,12 +1,12 @@
 from __future__ import annotations
 
 import re
+from typing import Protocol
 
 import pytest
 from ul.dataset_augmentation import DatasetAugmentationEngine
 from ul.dataset_evaluation import DatasetEvaluationRunner
 from ul.deconstruction import OpenRouterDatasetSettings, create_semantic_model_deconstructor
-from ul_core.contracts import DatasetTargetExecutor
 from ul_core.dataset import (
     CommunicationAct,
     EvidenceReference,
@@ -20,7 +20,14 @@ from ul_core.dataset import (
     SemanticRelation,
     UserInputRecord,
 )
-from ul_core.models import SafetyEnvelope
+from ul_core.evaluation import (
+    EvaluationCase,
+    ExecutionEvidence,
+    SandboxCapabilities,
+    SandboxLifecycleEvidence,
+    SandboxStateEvidence,
+    SandboxTurnEvidence,
+)
 
 from examples.accounts_payable.dataset_target import (
     AMOUNT_SOURCE_INPUT,
@@ -37,27 +44,62 @@ _LIVE_SETTINGS = OpenRouterDatasetSettings()
 _LIVE_TRANSFER_INPUT = "transfer 120$ to alice"
 
 
+class _SingleTurnTestAgent(Protocol):
+    async def execute(self, raw_input: str) -> ObservedAgentOutput: ...
+
+
 class _RecordingDatasetTarget:
-    def __init__(self, target: DatasetTargetExecutor) -> None:
+    sandbox_id = "accounts-payable-test-sandbox"
+    config_sha256 = "0" * 64
+    capabilities = SandboxCapabilities(
+        supports_conversations=True,
+        supports_state_observation=True,
+        state_observation_authority="sandbox_self_reported",
+        cancellation_guarantee="guaranteed",
+    )
+
+    def __init__(self, target: _SingleTurnTestAgent) -> None:
         self._target = target
-        self.safety_envelope = target.safety_envelope
-        self.fresh_state_per_execution = target.fresh_state_per_execution
         self.raw_inputs: list[str] = []
 
-    async def execute(self, raw_input: str) -> ObservedAgentOutput:
-        self.raw_inputs.append(raw_input)
-        return await self._target.execute(raw_input)
+    def api_calls_for_case(self, case: EvaluationCase) -> int:
+        return len(case.turns)
+
+    async def execute(self, case: EvaluationCase) -> ExecutionEvidence:
+        turns: list[SandboxTurnEvidence] = []
+        for turn in case.turns:
+            self.raw_inputs.append(turn.content)
+            output = await self._target.execute(turn.content)
+            turns.append(
+                SandboxTurnEvidence(
+                    turn_id=turn.id,
+                    response=output.raw_output,
+                    state_snapshot=output.raw_output,
+                    state_observation_authority="sandbox_self_reported",
+                )
+            )
+        return ExecutionEvidence(
+            case_id=case.id,
+            sandbox_id=self.sandbox_id,
+            sandbox_config_sha256=self.config_sha256,
+            initial_state=SandboxStateEvidence(value={}, authority="sandbox_self_reported"),
+            turns=tuple(turns),
+            final_response=turns[-1].response,
+            final_state=SandboxStateEvidence(
+                value=turns[-1].state_snapshot,
+                authority="sandbox_self_reported",
+            ),
+            lifecycle=SandboxLifecycleEvidence(
+                terminal_status="succeeded",
+                completed_phases=("execute", "cleanup"),
+                delivery="certain",
+                cleanup="succeeded",
+                sandbox_state_uncertain=False,
+            ),
+        )
 
 
 class _SeededFirstValueWinsTransferTarget:
-    safety_envelope = SafetyEnvelope(
-        description="Isolated synthetic transfer ledger.",
-        isolated=True,
-        allows_network_egress=False,
-        allows_business_side_effects=False,
-    )
-    fresh_state_per_execution = True
-
     async def execute(self, raw_input: str) -> ObservedAgentOutput:
         amounts = re.findall(r"\b\d+\$", raw_input)
         if not amounts or "alice" not in raw_input.casefold():
@@ -355,6 +397,7 @@ async def test_self_correction_e2e_compares_real_isolated_payment_actions(
         DatasetAugmentationEngine(semantic_pipeline, semantic_pipeline),
         semantic_pipeline,
         recording_target,
+        allow_network_egress=True,
     ).run(source, operator_ids=("intent.self_correction",))
 
     assert result.baseline.verdict == "no_divergence"
@@ -408,6 +451,7 @@ async def test_repetition_e2e_compares_two_fresh_runs_per_input(
         DatasetAugmentationEngine(semantic_pipeline, semantic_pipeline),
         semantic_pipeline,
         recording_target,
+        allow_network_egress=True,
     ).run(
         source,
         operator_ids=("surface.disfluency_repeat",),
@@ -454,6 +498,7 @@ async def test_repetition_e2e_reports_seeded_variation_instability() -> None:
         DatasetAugmentationEngine(semantic_pipeline, semantic_pipeline),
         semantic_pipeline,
         recording_target,
+        allow_network_egress=True,
     ).run(source, operator_ids=("surface.disfluency_repeat",))
 
     case = result.cases[0]
@@ -489,7 +534,8 @@ async def test_live_deconstructor_discovers_seeded_duplicate_payment() -> None:
         result = await DatasetEvaluationRunner(
             DatasetAugmentationEngine(semantic_model, semantic_model),
             semantic_model,
-            SeededIntentFanOutDefectAccountsPayableDatasetTarget(),
+            _RecordingDatasetTarget(SeededIntentFanOutDefectAccountsPayableDatasetTarget()),
+            allow_network_egress=True,
         ).run(source, operator_ids=("surface.disfluency_repeat",))
 
     case = result.cases[0]
@@ -523,7 +569,8 @@ async def test_live_pipeline_discovers_seeded_first_value_wins_defect() -> None:
         result = await DatasetEvaluationRunner(
             DatasetAugmentationEngine(semantic_model, semantic_model),
             semantic_model,
-            _SeededFirstValueWinsTransferTarget(),
+            _RecordingDatasetTarget(_SeededFirstValueWinsTransferTarget()),
+            allow_network_egress=True,
         ).run(source, operator_ids=("intent.self_correction",))
 
     case = result.cases[0]

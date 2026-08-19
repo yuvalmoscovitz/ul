@@ -4,6 +4,7 @@ import asyncio
 import json
 import math
 import re
+import secrets
 from collections import defaultdict
 from collections.abc import Iterable
 from decimal import Decimal, InvalidOperation
@@ -11,18 +12,19 @@ from typing import Literal, Self
 
 from pydantic import ConfigDict, Field, JsonValue, model_validator
 from ul_core.contracts import (
-    DatasetTargetExecutor,
-    DatasetTargetLifecycleError,
+    SandboxExecutor,
     SemanticDeconstructor,
 )
 from ul_core.dataset import InteractionRecord, ObservedAgentOutput, ObservedOutcome, SemanticFrame
-from ul_core.models import ULModel
+from ul_core.evaluation import EvaluationCase, ExecutionEvidence
+from ul_core.models import ConversationRole, ConversationTurn, ULModel
 
 from ul.dataset_augmentation import (
     DatasetAugmentationCandidate,
     DatasetAugmentationEngine,
     DatasetAugmentationResult,
 )
+from ul.sandbox import validate_execution_evidence
 
 FindingCategory = Literal[
     "duplicate_effect",
@@ -65,6 +67,7 @@ class DatasetTargetLifecycleFailure(_StrictULModel):
 
 class DatasetEvaluationTrial(_StrictULModel):
     repetition: int = Field(ge=1)
+    execution_evidence: ExecutionEvidence | None = None
     target_output: ObservedAgentOutput | None = None
     observed_frame: SemanticFrame | None = None
     inconclusive_reasons: tuple[str, ...] = ()
@@ -262,25 +265,20 @@ class DatasetEvaluationRunner:
         self,
         augmentation_engine: DatasetAugmentationEngine,
         deconstructor: SemanticDeconstructor,
-        target: DatasetTargetExecutor,
+        sandbox: SandboxExecutor,
         *,
         target_timeout_seconds: float = 30,
         allow_network_egress: bool = False,
     ) -> None:
         if not math.isfinite(target_timeout_seconds) or target_timeout_seconds <= 0:
             raise ValueError("target_timeout_seconds must be positive and finite")
-        safety_envelope = target.safety_envelope
-        if not safety_envelope.isolated:
-            raise ValueError("dataset target must be isolated")
-        if safety_envelope.allows_network_egress and not allow_network_egress:
-            raise ValueError("dataset target network egress requires explicit opt-in")
-        if safety_envelope.allows_business_side_effects:
-            raise ValueError("dataset targets must not allow business side effects")
-        if not target.fresh_state_per_execution:
-            raise ValueError("dataset target must start from fresh state for every execution")
+        if sandbox.capabilities.isolation != "customer_managed":
+            raise ValueError("dataset execution requires a customer-managed sandbox")
+        if not allow_network_egress:
+            raise ValueError("remote sandbox API access requires explicit network opt-in")
         self._augmentation_engine = augmentation_engine
         self._deconstructor = deconstructor
-        self._target = target
+        self._sandbox = sandbox
         self._target_timeout_seconds = target_timeout_seconds
         self._target_state_uncertain = False
 
@@ -460,38 +458,79 @@ class DatasetEvaluationRunner:
             )
         try:
             async with asyncio.timeout(self._target_timeout_seconds):
-                target_output = await self._target.execute(raw_input)
+                evaluation_case = EvaluationCase(
+                    id=f"ul-case-{secrets.token_hex(16)}",
+                    turns=(
+                        ConversationTurn(
+                            id=f"turn-{secrets.token_hex(12)}",
+                            role=ConversationRole.USER,
+                            content=raw_input,
+                        ),
+                    ),
+                    max_sandbox_api_calls=1,
+                    timeout_seconds=self._target_timeout_seconds,
+                )
+                sandbox_api_calls = self._sandbox.api_calls_for_case(evaluation_case)
+                if type(sandbox_api_calls) is not int or sandbox_api_calls < 1:
+                    raise RuntimeError("sandbox returned an invalid API call count")
+                evaluation_case = evaluation_case.model_copy(
+                    update={"max_sandbox_api_calls": sandbox_api_calls}
+                )
+                execution_evidence = await self._sandbox.execute(evaluation_case)
         except TimeoutError:
+            if self._sandbox.capabilities.cancellation_guarantee != "guaranteed":
+                self._target_state_uncertain = True
             return DatasetEvaluationTrial(
                 repetition=repetition,
                 inconclusive_reasons=(f"{subject} execution timed out",),
-            )
-        except DatasetTargetLifecycleError as error:
-            sandbox_state_may_remain = error.target_state_uncertain
-            if sandbox_state_may_remain:
-                self._target_state_uncertain = True
-            cleanup_reason = (
-                "; cleanup reset also failed; sandbox state may remain"
-                if error.cleanup_reset_failed and error.failed_phase != "cleanup_reset"
-                else ("; sandbox state may remain" if sandbox_state_may_remain else "")
-            )
-            return DatasetEvaluationTrial(
-                repetition=repetition,
-                inconclusive_reasons=(
-                    f"{subject} lifecycle failed during {error.failed_phase}{cleanup_reason}",
-                ),
-                lifecycle_failure=DatasetTargetLifecycleFailure(
-                    failed_phase=error.failed_phase,
-                    completed_phases=error.completed_phases,
-                    cleanup_reset_failed=error.cleanup_reset_failed,
-                    sandbox_state_may_remain=sandbox_state_may_remain,
-                ),
             )
         except RuntimeError:
             return DatasetEvaluationTrial(
                 repetition=repetition,
                 inconclusive_reasons=(f"{subject} execution failed",),
             )
+        validate_execution_evidence(evaluation_case, self._sandbox, execution_evidence)
+        lifecycle = execution_evidence.lifecycle
+        if lifecycle.terminal_status != "succeeded":
+            sandbox_state_may_remain = lifecycle.sandbox_state_uncertain
+            if sandbox_state_may_remain:
+                self._target_state_uncertain = True
+            cleanup_reason = (
+                "; cleanup reset also failed; sandbox state may remain"
+                if lifecycle.cleanup == "failed" and lifecycle.failed_phase != "cleanup_reset"
+                else ("; sandbox state may remain" if sandbox_state_may_remain else "")
+            )
+            return DatasetEvaluationTrial(
+                repetition=repetition,
+                inconclusive_reasons=(
+                    f"{subject} lifecycle failed during {lifecycle.failed_phase}{cleanup_reason}",
+                ),
+                lifecycle_failure=DatasetTargetLifecycleFailure(
+                    failed_phase=lifecycle.failed_phase or "unknown",
+                    completed_phases=lifecycle.completed_phases,
+                    cleanup_reset_failed=lifecycle.cleanup == "failed",
+                    sandbox_state_may_remain=sandbox_state_may_remain,
+                ),
+                execution_evidence=execution_evidence,
+            )
+        if len(execution_evidence.turns) != 1:
+            raise RuntimeError("sandbox returned invalid single-turn evidence")
+        turn_evidence = execution_evidence.turns[0]
+        target_output = ObservedAgentOutput(
+            raw_output=turn_evidence.response,
+            metadata={
+                **(
+                    {"committed_state_snapshot": turn_evidence.state_snapshot}
+                    if turn_evidence.state_snapshot is not None
+                    else {}
+                ),
+                **(
+                    {"state_observation_authority": turn_evidence.state_observation_authority}
+                    if turn_evidence.state_observation_authority is not None
+                    else {}
+                ),
+            },
+        )
         record = InteractionRecord(
             id=interaction_id,
             raw_input=raw_input,
@@ -502,6 +541,7 @@ class DatasetEvaluationRunner:
         except ValueError:
             return DatasetEvaluationTrial(
                 repetition=repetition,
+                execution_evidence=execution_evidence,
                 target_output=target_output,
                 inconclusive_reasons=(f"{subject} output could not be semantically deconstructed",),
             )
@@ -516,12 +556,14 @@ class DatasetEvaluationRunner:
         if inconclusive_reasons:
             return DatasetEvaluationTrial(
                 repetition=repetition,
+                execution_evidence=execution_evidence,
                 target_output=target_output,
                 observed_frame=observed_frame,
                 inconclusive_reasons=inconclusive_reasons,
             )
         return DatasetEvaluationTrial(
             repetition=repetition,
+            execution_evidence=execution_evidence,
             target_output=target_output,
             observed_frame=observed_frame,
         )

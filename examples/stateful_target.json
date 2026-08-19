@@ -1,31 +1,45 @@
 {
-  "version": 2,
+  "version": 3,
+  "sandbox_id": "replace-with-stable-sandbox-id",
   "headers_from_env": {
     "Authorization": "UL_SANDBOX_AUTHORIZATION"
   },
   "reset": {
     "url": "https://sandbox.example.test/reset",
-    "request_json": {},
+    "request_json_template": {"case_id": "{{case_id}}"},
+    "case_id_json_pointer": "/case_id",
+    "sandbox_id_json_pointer": "/sandbox_id",
     "generation_json_pointer": "/generation",
     "clean_state_json_pointer": "/clean",
     "clean_state_value": true
   },
   "setup": {
     "url": "https://sandbox.example.test/setup",
-    "request_json": {
+    "request_json_template": {
+      "case_id": "{{case_id}}",
       "fixture": "standard-account"
-    }
+    },
+    "case_id_json_pointer": "/case_id",
+    "sandbox_id_json_pointer": "/sandbox_id"
   },
   "execute_turn": {
     "url": "https://sandbox.example.test/execute",
     "request_json_template": {
+      "case_id": "{{case_id}}",
+      "turn_id": "{{turn_id}}",
       "input": "{{input}}"
     },
-    "response_json_pointer": "/agent_response"
+    "response_json_pointer": "/agent_response",
+    "case_id_json_pointer": "/case_id",
+    "turn_id_json_pointer": "/turn_id",
+    "sandbox_id_json_pointer": "/sandbox_id"
   },
   "snapshot": {
     "url": "https://sandbox.example.test/snapshot",
-    "request_json": {},
-    "response_json_pointer": "/committed_state"
+    "request_json_template": {"case_id": "{{case_id}}", "turn_id": "{{turn_id}}"},
+    "response_json_pointer": "/committed_state",
+    "case_id_json_pointer": "/case_id",
+    "turn_id_json_pointer": "/turn_id",
+    "sandbox_id_json_pointer": "/sandbox_id"
   }
 }

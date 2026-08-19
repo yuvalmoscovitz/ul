@@ -27,7 +27,7 @@ from ul.redaction import (
     RedactionRule,
 )
 from ul_cli.dataset import _customer_evidence_record
-from ul_core.contracts import DatasetTargetLifecycleError
+from ul_core.contracts import SandboxExecutor, SemanticDeconstructor
 from ul_core.dataset import (
     CommunicationAct,
     EvidenceReference,
@@ -40,12 +40,36 @@ from ul_core.dataset import (
     SemanticFrame,
     UserInputRecord,
 )
-from ul_core.models import SafetyEnvelope
+from ul_core.evaluation import (
+    EvaluationCase,
+    ExecutionEvidence,
+    SandboxCapabilities,
+    SandboxLifecycleEvidence,
+    SandboxStateEvidence,
+    SandboxTurnEvidence,
+)
 
 pytestmark = pytest.mark.asyncio
 
 
 class DatasetEvaluationRunner(_DatasetEvaluationRunner):
+    def __init__(
+        self,
+        augmentation_engine: DatasetAugmentationEngine,
+        deconstructor: SemanticDeconstructor,
+        sandbox: SandboxExecutor,
+        *,
+        target_timeout_seconds: float = 30,
+        allow_network_egress: bool = True,
+    ) -> None:
+        super().__init__(
+            augmentation_engine,
+            deconstructor,
+            sandbox,
+            target_timeout_seconds=target_timeout_seconds,
+            allow_network_egress=allow_network_egress,
+        )
+
     async def run(
         self,
         source: InteractionRecord,
@@ -259,20 +283,22 @@ class InvalidObservedOutputPipeline(DeterministicSemanticPipeline):
         return await super().deconstruct(record, reference_frame)
 
 
-class DeterministicTarget:
+class DeterministicSandbox:
+    sandbox_id = "deterministic-test-sandbox"
+    config_sha256 = "1" * 64
+
     def __init__(
         self,
-        safety_envelope: SafetyEnvelope | None = None,
         raw_output: JsonValue | None = None,
         baseline_raw_output: JsonValue | None = None,
-        fresh_state_per_execution: bool = True,
+        *,
+        cancellation_guarantee: Literal["none", "best_effort", "guaranteed"] = "guaranteed",
     ) -> None:
-        self.fresh_state_per_execution = fresh_state_per_execution
-        self.safety_envelope = safety_envelope or SafetyEnvelope(
-            description="Isolated deterministic test target.",
-            isolated=True,
-            allows_network_egress=False,
-            allows_business_side_effects=False,
+        self.capabilities = SandboxCapabilities(
+            supports_conversations=False,
+            supports_state_observation=True,
+            state_observation_authority="sandbox_self_reported",
+            cancellation_guarantee=cancellation_guarantee,
         )
         self.raw_inputs: list[str] = []
         self.raw_output = (
@@ -284,57 +310,107 @@ class DeterministicTarget:
             (_source_outcomes()[0],)
         )
 
-    async def execute(self, raw_input: str) -> ObservedAgentOutput:
+    def api_calls_for_case(self, case: EvaluationCase) -> int:
+        return len(case.turns)
+
+    async def execute(self, case: EvaluationCase) -> ExecutionEvidence:
+        assert len(case.turns) == 1
+        raw_input = case.turns[0].content
         self.raw_inputs.append(raw_input)
-        return ObservedAgentOutput(
-            raw_output=(self.baseline_raw_output if len(self.raw_inputs) == 1 else self.raw_output),
-            metadata={"run_id": "run-1"},
+        return self._successful_evidence(
+            case,
+            self.baseline_raw_output if len(self.raw_inputs) == 1 else self.raw_output,
+        )
+
+    def _successful_evidence(self, case: EvaluationCase, response: JsonValue) -> ExecutionEvidence:
+        initial_state = SandboxStateEvidence(
+            value={"execution_count": 0},
+            authority="sandbox_self_reported",
+        )
+        final_state = SandboxStateEvidence(
+            value={"execution_count": 1},
+            authority="sandbox_self_reported",
+        )
+        return ExecutionEvidence(
+            case_id=case.id,
+            sandbox_id=self.sandbox_id,
+            sandbox_config_sha256=self.config_sha256,
+            initial_state=initial_state,
+            turns=(
+                SandboxTurnEvidence(
+                    turn_id=case.turns[0].id,
+                    response=response,
+                    state_snapshot=final_state.value,
+                    state_observation_authority=final_state.authority,
+                ),
+            ),
+            final_response=response,
+            final_state=final_state,
+            lifecycle=SandboxLifecycleEvidence(
+                terminal_status="succeeded",
+                completed_phases=("reset", "execute_turn", "cleanup_reset"),
+                delivery="certain",
+                cleanup="succeeded",
+                sandbox_state_uncertain=False,
+            ),
         )
 
 
-class SecretBearingTarget(DeterministicTarget):
-    async def execute(self, raw_input: str) -> ObservedAgentOutput:
-        output = await super().execute(raw_input)
-        assert isinstance(output.raw_output, dict)
-        return output.model_copy(
+class SecretBearingSandbox(DeterministicSandbox):
+    async def execute(self, case: EvaluationCase) -> ExecutionEvidence:
+        evidence = await super().execute(case)
+        turn = evidence.turns[0]
+        assert isinstance(turn.response, dict)
+        secret_bearing_response = {
+            **turn.response,
+            "private_secret": "target-secret",
+        }
+        return evidence.model_copy(
             update={
-                "raw_output": {**output.raw_output, "private_secret": "target-secret"},
-                "metadata": {"trace_private": "target-secret"},
+                "turns": (turn.model_copy(update={"response": secret_bearing_response}),),
+                "final_response": secret_bearing_response,
             }
         )
 
 
-class BlockingTarget(DeterministicTarget):
-    async def execute(self, raw_input: str) -> ObservedAgentOutput:
-        self.raw_inputs.append(raw_input)
+class BlockingSandbox(DeterministicSandbox):
+    async def execute(self, case: EvaluationCase) -> ExecutionEvidence:
+        self.raw_inputs.append(case.turns[0].content)
         await asyncio.Event().wait()
-        raise AssertionError("blocking target returned")
+        raise AssertionError("blocking sandbox returned")
 
 
-class FailingTarget(DeterministicTarget):
+class FailingSandbox(DeterministicSandbox):
     def __init__(self, fail_on_execution: int) -> None:
         super().__init__()
         self.fail_on_execution = fail_on_execution
 
-    async def execute(self, raw_input: str) -> ObservedAgentOutput:
+    async def execute(self, case: EvaluationCase) -> ExecutionEvidence:
         if len(self.raw_inputs) + 1 == self.fail_on_execution:
-            self.raw_inputs.append(raw_input)
-            raise RuntimeError("untrusted target failure detail")
-        return await super().execute(raw_input)
+            self.raw_inputs.append(case.turns[0].content)
+            raise RuntimeError("untrusted sandbox failure detail")
+        return await super().execute(case)
 
 
-class LifecycleFailingTarget(DeterministicTarget):
-    async def execute(self, raw_input: str) -> ObservedAgentOutput:
-        self.raw_inputs.append(raw_input)
-        raise DatasetTargetLifecycleError(
-            failed_phase="snapshot",
-            completed_phases=("reset", "setup", "execute_turn"),
-            cleanup_reset_failed=True,
-            target_state_uncertain=True,
+class LifecycleFailingSandbox(DeterministicSandbox):
+    async def execute(self, case: EvaluationCase) -> ExecutionEvidence:
+        self.raw_inputs.append(case.turns[0].content)
+        return ExecutionEvidence(
+            case_id=case.id,
+            sandbox_id=self.sandbox_id,
+            sandbox_config_sha256=self.config_sha256,
+            lifecycle=SandboxLifecycleEvidence(
+                terminal_status="failed",
+                completed_phases=("reset", "setup", "execute_turn"),
+                failed_phase="snapshot",
+                delivery="certain",
+                cleanup="failed",
+                sandbox_state_uncertain=True,
+            ),
         )
 
 
-class SequenceTarget(DeterministicTarget):
+class SequenceSandbox(DeterministicSandbox):
     def __init__(
         self,
         raw_outputs: list[JsonValue],
@@ -345,15 +421,15 @@ class SequenceTarget(DeterministicTarget):
         self.raw_outputs = raw_outputs
         self.failing_executions = failing_executions or set()
 
-    async def execute(self, raw_input: str) -> ObservedAgentOutput:
+    async def execute(self, case: EvaluationCase) -> ExecutionEvidence:
         execution = len(self.raw_inputs) + 1
-        self.raw_inputs.append(raw_input)
+        self.raw_inputs.append(case.turns[0].content)
         if execution in self.failing_executions:
             raise RuntimeError("untrusted sequence failure")
         successful_execution = execution - sum(
             failed_execution <= execution for failed_execution in self.failing_executions
         )
-        return ObservedAgentOutput(raw_output=self.raw_outputs[successful_execution - 1])
+        return self._successful_evidence(case, self.raw_outputs[successful_execution - 1])
 
 
 class OutputDrivenSemanticPipeline(DeterministicSemanticPipeline):
@@ -386,9 +462,9 @@ class OutputDrivenSemanticPipeline(DeterministicSemanticPipeline):
 def _runner(
     observed_outcomes: tuple[ObservedOutcome, ...],
     raw_output: JsonValue | None = None,
-) -> tuple[DatasetEvaluationRunner, DeterministicSemanticPipeline, DeterministicTarget]:
+) -> tuple[DatasetEvaluationRunner, DeterministicSemanticPipeline, DeterministicSandbox]:
     semantic_pipeline = DeterministicSemanticPipeline(observed_outcomes)
-    target = DeterministicTarget(
+    target = DeterministicSandbox(
         raw_output=(
             raw_output if raw_output is not None else _raw_output_for_actions(observed_outcomes)
         )
@@ -408,9 +484,9 @@ def _sequence_runner(
     raw_outputs: list[JsonValue],
     *,
     failing_executions: set[int] | None = None,
-) -> tuple[DatasetEvaluationRunner, OutputDrivenSemanticPipeline, SequenceTarget]:
+) -> tuple[DatasetEvaluationRunner, OutputDrivenSemanticPipeline, SequenceSandbox]:
     semantic_pipeline = OutputDrivenSemanticPipeline((_source_outcomes()[0],))
-    target = SequenceTarget(raw_outputs, failing_executions=failing_executions)
+    target = SequenceSandbox(raw_outputs, failing_executions=failing_executions)
     return (
         DatasetEvaluationRunner(
             DatasetAugmentationEngine(semantic_pipeline, semantic_pipeline),
@@ -446,7 +522,12 @@ async def test_runner_executes_only_accepted_candidates_and_keeps_rejected_candi
     assert accepted.candidate.passed
     assert accepted.verdict == "no_divergence"
     assert accepted.target_output is not None
-    assert accepted.target_output.metadata == {"run_id": "run-1"}
+    assert accepted.target_output.metadata == {
+        "committed_state_snapshot": {"execution_count": 1},
+        "state_observation_authority": "sandbox_self_reported",
+    }
+    assert accepted.trial_set is not None
+    assert accepted.trial_set.trials[0].execution_evidence is not None
     assert accepted.findings == ()
     assert not rejected.candidate.passed
     assert rejected.verdict == "augmentation_rejected"
@@ -468,7 +549,7 @@ async def test_runner_executes_only_accepted_candidates_and_keeps_rejected_candi
     assert DatasetEvaluationResult.model_validate_json(result.model_dump_json()) == result
 
 
-async def test_redacted_runner_evidence_never_persists_target_secrets(tmp_path: Path) -> None:
+async def test_redacted_runner_evidence_never_persists_sandbox_secrets(tmp_path: Path) -> None:
     private_directory = tmp_path / "private"
     private_directory.mkdir(mode=0o700)
     engine = RedactionEngine(
@@ -488,11 +569,11 @@ async def test_redacted_runner_evidence_never_persists_target_secrets(tmp_path: 
     )
     semantic_pipeline = DeterministicSemanticPipeline((_source_outcomes()[0],))
     boundary = RedactedSemanticPipeline(semantic_pipeline, engine)
-    target = SecretBearingTarget()
+    target = SecretBearingSandbox()
     runner = DatasetEvaluationRunner(
         DatasetAugmentationEngine(boundary, boundary),
         boundary,
-        boundary.wrap_target(target),
+        boundary.wrap_sandbox(target),
     )
     source = boundary.protect_record(_source())
     assert isinstance(source, InteractionRecord)
@@ -501,7 +582,7 @@ async def test_redacted_runner_evidence_never_persists_target_secrets(tmp_path: 
     evidence = _customer_evidence_record(
         result,
         repetitions=1,
-        max_target_calls=10,
+        max_sandbox_api_calls=10,
         planned_target_calls=2,
     )
     serialized_evidence = json.dumps(evidence, sort_keys=True)
@@ -521,7 +602,7 @@ async def test_current_baseline_drift_is_not_blame_on_augmentation() -> None:
         baseline_outcomes=(current_outcome,),
     )
     current_raw_output = _raw_output_for_actions((current_outcome,))
-    target = DeterministicTarget(
+    target = DeterministicSandbox(
         raw_output=current_raw_output,
         baseline_raw_output=current_raw_output,
     )
@@ -553,7 +634,7 @@ async def test_candidate_is_compared_with_changed_current_baseline() -> None:
         (candidate_outcome,),
         baseline_outcomes=(baseline_outcome,),
     )
-    target = DeterministicTarget(
+    target = DeterministicSandbox(
         raw_output=_raw_output_for_actions((candidate_outcome,)),
         baseline_raw_output=_raw_output_for_actions((baseline_outcome,)),
     )
@@ -594,7 +675,7 @@ async def test_candidate_change_to_new_baseline_action_is_detected() -> None:
         candidate_outcomes,
         baseline_outcomes=baseline_outcomes,
     )
-    target = DeterministicTarget(
+    target = DeterministicSandbox(
         raw_output=_raw_output_for_actions(candidate_outcomes),
         baseline_raw_output=_raw_output_for_actions(baseline_outcomes),
     )
@@ -627,7 +708,7 @@ async def test_derived_field_is_not_grounded_by_another_action_with_the_same_fie
         baseline_outcomes=live_outcomes,
     )
     semantic_pipeline.source_frame = _frame("source", source_outcomes)
-    target = DeterministicTarget(
+    target = DeterministicSandbox(
         raw_output=_raw_output_for_actions(live_outcomes),
         baseline_raw_output=_raw_output_for_actions(live_outcomes),
     )
@@ -662,7 +743,7 @@ async def test_ambiguous_repeated_action_grounding_is_inconclusive() -> None:
         baseline_outcomes=live_outcomes,
     )
     semantic_pipeline.source_frame = _frame("source", source_outcomes)
-    target = DeterministicTarget(
+    target = DeterministicSandbox(
         raw_output=_raw_output_for_actions(live_outcomes),
         baseline_raw_output=_raw_output_for_actions(live_outcomes),
     )
@@ -708,7 +789,7 @@ async def test_one_current_baseline_is_shared_by_all_accepted_candidates() -> No
 
 async def test_invalid_observed_output_frame_is_retained_as_inconclusive() -> None:
     semantic_pipeline = InvalidObservedOutputPipeline((_source_outcomes()[0],))
-    target = DeterministicTarget()
+    target = DeterministicSandbox()
     runner = DatasetEvaluationRunner(
         DatasetAugmentationEngine(semantic_pipeline, semantic_pipeline),
         semantic_pipeline,
@@ -836,7 +917,7 @@ async def test_poisoned_factor_value_cannot_hide_a_changed_input_value() -> None
             )
 
     semantic_pipeline = PoisonedFactorPipeline((observed_outcome,))
-    target = DeterministicTarget(raw_output=_raw_output_for_actions((observed_outcome,)))
+    target = DeterministicSandbox(raw_output=_raw_output_for_actions((observed_outcome,)))
     runner = DatasetEvaluationRunner(
         DatasetAugmentationEngine(semantic_pipeline, semantic_pipeline),
         semantic_pipeline,
@@ -1547,7 +1628,7 @@ async def test_prompt_injected_ambiguous_observation_is_inconclusive() -> None:
         ),
     )
     semantic_pipeline = DeterministicSemanticPipeline((observed_outcome,))
-    target = DeterministicTarget(raw_output={"message": prompt_injection})
+    target = DeterministicSandbox(raw_output={"message": prompt_injection})
     runner = DatasetEvaluationRunner(
         DatasetAugmentationEngine(semantic_pipeline, semantic_pipeline),
         semantic_pipeline,
@@ -1708,59 +1789,24 @@ async def test_untrusted_output_evidence_fails_closed(
     assert reason in result.cases[0].inconclusive_reasons
 
 
-async def test_runner_requires_isolation_and_independent_effect_opt_ins() -> None:
+async def test_runner_requires_remote_sandbox_network_opt_in() -> None:
     semantic_pipeline = DeterministicSemanticPipeline((_source_outcomes()[0],))
     augmentation_engine = DatasetAugmentationEngine(semantic_pipeline, semantic_pipeline)
-    unsafe_target = DeterministicTarget(
-        SafetyEnvelope(
-            description="Unisolated target.",
-            isolated=False,
-            allows_network_egress=False,
-            allows_business_side_effects=False,
-        )
-    )
-    with pytest.raises(ValueError, match="must be isolated"):
-        DatasetEvaluationRunner(augmentation_engine, semantic_pipeline, unsafe_target)
+    sandbox = DeterministicSandbox()
 
-    network_target = DeterministicTarget(
-        SafetyEnvelope(
-            description="Isolated network target.",
-            isolated=True,
-            allows_network_egress=True,
-            allows_business_side_effects=False,
+    with pytest.raises(ValueError, match="remote sandbox API access"):
+        _DatasetEvaluationRunner(
+            augmentation_engine,
+            semantic_pipeline,
+            sandbox,
         )
-    )
-    with pytest.raises(ValueError, match="network egress requires explicit opt-in"):
-        DatasetEvaluationRunner(augmentation_engine, semantic_pipeline, network_target)
-    DatasetEvaluationRunner(
+
+    _DatasetEvaluationRunner(
         augmentation_engine,
         semantic_pipeline,
-        network_target,
+        sandbox,
         allow_network_egress=True,
     )
-
-    business_target = DeterministicTarget(
-        SafetyEnvelope(
-            description="Isolated business-effect target.",
-            isolated=True,
-            allows_network_egress=False,
-            allows_business_side_effects=True,
-        )
-    )
-    with pytest.raises(ValueError, match="must not allow business side effects"):
-        DatasetEvaluationRunner(
-            augmentation_engine,
-            semantic_pipeline,
-            business_target,
-        )
-
-    stale_state_target = DeterministicTarget(fresh_state_per_execution=False)
-    with pytest.raises(ValueError, match="fresh state for every execution"):
-        DatasetEvaluationRunner(
-            augmentation_engine,
-            semantic_pipeline,
-            stale_state_target,
-        )
 
 
 @pytest.mark.parametrize("target_timeout_seconds", [0, -1, float("inf"), float("nan")])
@@ -1771,14 +1817,14 @@ async def test_runner_rejects_invalid_target_timeouts(target_timeout_seconds: fl
         DatasetEvaluationRunner(
             DatasetAugmentationEngine(semantic_pipeline, semantic_pipeline),
             semantic_pipeline,
-            DeterministicTarget(),
+            DeterministicSandbox(),
             target_timeout_seconds=target_timeout_seconds,
         )
 
 
-async def test_runner_times_out_target_execution() -> None:
+async def test_runner_times_out_sandbox_execution() -> None:
     semantic_pipeline = DeterministicSemanticPipeline((_source_outcomes()[0],))
-    target = BlockingTarget()
+    target = BlockingSandbox()
     runner = DatasetEvaluationRunner(
         DatasetAugmentationEngine(semantic_pipeline, semantic_pipeline),
         semantic_pipeline,
@@ -1796,11 +1842,11 @@ async def test_runner_times_out_target_execution() -> None:
 
 
 @pytest.mark.parametrize("fail_on_execution", [1, 2])
-async def test_runner_marks_target_runtime_failures_inconclusive(
+async def test_runner_marks_sandbox_runtime_failures_inconclusive(
     fail_on_execution: int,
 ) -> None:
     semantic_pipeline = DeterministicSemanticPipeline((_source_outcomes()[0],))
-    target = FailingTarget(fail_on_execution)
+    target = FailingSandbox(fail_on_execution)
     runner = DatasetEvaluationRunner(
         DatasetAugmentationEngine(semantic_pipeline, semantic_pipeline),
         semantic_pipeline,
@@ -1815,12 +1861,12 @@ async def test_runner_marks_target_runtime_failures_inconclusive(
         assert result.baseline.verdict == "no_divergence"
     assert result.cases[0].verdict == "inconclusive"
     assert result.cases[0].target_output is None
-    assert "untrusted target failure detail" not in result.model_dump_json()
+    assert "untrusted sandbox failure detail" not in result.model_dump_json()
 
 
 async def test_runner_surfaces_cleanup_failure_and_stops_further_execution() -> None:
     semantic_pipeline = DeterministicSemanticPipeline((_source_outcomes()[0],))
-    target = LifecycleFailingTarget()
+    target = LifecycleFailingSandbox()
     runner = DatasetEvaluationRunner(
         DatasetAugmentationEngine(semantic_pipeline, semantic_pipeline),
         semantic_pipeline,
