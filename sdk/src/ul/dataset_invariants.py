@@ -730,13 +730,13 @@ class DatasetInvariantTransitionRuleEvaluation(_DatasetInvariantRuleEvaluation):
             "after_checkpoint_missing",
             "before_pointer_missing",
             "after_pointer_missing",
+            "evaluation_work_limit_exceeded",
         }
         effect_only_reasons = {
             "before_value_not_array",
             "after_value_not_array",
             "effect_array_exceeds_limit",
             "effect_history_rewritten",
-            "evaluation_work_limit_exceeded",
         }
         allowed_reasons = rule_reasons[self.rule_type] | shared_reasons
         if self.rule_type != "unchanged_between_checkpoints":
@@ -1095,7 +1095,13 @@ def _evaluate_transition_output(
     if not after_found:
         return result("not_evaluable", "after_pointer_missing")
     if isinstance(rule, UnchangedBetweenCheckpointsInvariant):
-        unchanged = _json_values_equal(before_value, after_value)
+        unchanged = _json_values_equal(
+            before_value,
+            after_value,
+            work_budget=array_work_budget,
+        )
+        if unchanged is None:
+            return result("not_evaluable", "evaluation_work_limit_exceeded")
         return result(
             "satisfied" if unchanged else "violated",
             "value_unchanged" if unchanged else "value_changed",
@@ -1115,17 +1121,31 @@ def _evaluate_transition_output(
             before_item_count=before_count,
             after_item_count=after_count,
         )
-    if not array_work_budget.consume(before_count + after_count):
+    if after_count < before_count:
         return result(
             "not_evaluable",
-            "evaluation_work_limit_exceeded",
+            "effect_history_rewritten",
             before_item_count=before_count,
             after_item_count=after_count,
         )
-    if after_count < before_count or not all(
-        _json_values_equal(before_item, after_item)
-        for before_item, after_item in zip(before_items, after_items, strict=False)
-    ):
+    history_rewritten = False
+    for before_item, after_item in zip(before_items, after_items, strict=False):
+        items_equal = _json_values_equal(
+            before_item,
+            after_item,
+            work_budget=array_work_budget,
+        )
+        if items_equal is None:
+            return result(
+                "not_evaluable",
+                "evaluation_work_limit_exceeded",
+                before_item_count=before_count,
+                after_item_count=after_count,
+            )
+        if not items_equal:
+            history_rewritten = True
+            break
+    if history_rewritten:
         return result(
             "not_evaluable",
             "effect_history_rewritten",
@@ -1656,24 +1676,62 @@ def _json_scalars_equal(left: object, right: object) -> tuple[bool, bool]:
     return True, left == right
 
 
-def _json_values_equal(left: object, right: object) -> bool:
+def _json_values_equal(
+    left: object,
+    right: object,
+    *,
+    work_budget: _ArrayInvariantWorkBudget,
+) -> bool | None:
     if _is_json_scalar(left) or _is_json_scalar(right):
+        if not work_budget.consume(
+            max(_json_scalar_work_units(left), _json_scalar_work_units(right))
+        ):
+            return None
         comparable, equal = _json_scalars_equal(left, right)
         return comparable and equal
+    if not work_budget.consume(1):
+        return None
     if isinstance(left, list) and isinstance(right, list):
         left_items = cast(list[object], left)
         right_items = cast(list[object], right)
-        return len(left_items) == len(right_items) and all(
-            _json_values_equal(left_item, right_item)
-            for left_item, right_item in zip(left_items, right_items, strict=True)
-        )
+        if len(left_items) != len(right_items):
+            return False
+        for left_item, right_item in zip(left_items, right_items, strict=True):
+            items_equal = _json_values_equal(
+                left_item,
+                right_item,
+                work_budget=work_budget,
+            )
+            if items_equal is not True:
+                return items_equal
+        return True
     if isinstance(left, dict) and isinstance(right, dict):
         left_object = cast(dict[str, object], left)
         right_object = cast(dict[str, object], right)
-        return left_object.keys() == right_object.keys() and all(
-            _json_values_equal(left_object[key], right_object[key]) for key in left_object
-        )
+        if len(left_object) != len(right_object):
+            return False
+        for key in left_object:
+            if not work_budget.consume(max(1, len(key))):
+                return None
+            if key not in right_object:
+                return False
+            values_equal = _json_values_equal(
+                left_object[key],
+                right_object[key],
+                work_budget=work_budget,
+            )
+            if values_equal is not True:
+                return values_equal
+        return True
     return False
+
+
+def _json_scalar_work_units(value: object) -> int:
+    if isinstance(value, str):
+        return max(1, len(value))
+    if isinstance(value, int) and not isinstance(value, bool):
+        return max(1, (value.bit_length() + 7) // 8)
+    return 1
 
 
 def _typed_scalar_key(value: object) -> tuple[str, str]:

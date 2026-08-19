@@ -486,6 +486,97 @@ def test_unchanged_transition_compares_nested_typed_json_without_retaining_value
     assert "secret" not in result.model_dump_json()
 
 
+def test_repeated_nested_transition_rules_share_a_bounded_comparison_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(dataset_invariants, "_MAXIMUM_ARRAY_INVARIANT_WORK_UNITS", 60)
+    rules = tuple(
+        UnchangedBetweenCheckpointsInvariant(
+            type="unchanged_between_checkpoints",
+            id=f"unchanged-{index}",
+            version="1.0.0",
+            description="The nested state must remain unchanged.",
+            severity="high",
+            before_checkpoint="before_turn",
+            after_checkpoint="after_turn",
+            observation_pointer="",
+        )
+        for index in range(3)
+    )
+    nested_snapshot = {"records": [{"id": index} for index in range(4)]}
+
+    results = evaluate_dataset_invariant_rules(
+        rules,
+        (_state_transition(nested_snapshot, nested_snapshot),),
+        observation_authority="committed_state_snapshot",
+    )
+
+    assert results[0].status == "satisfied"
+    assert results[-1].status == "not_evaluable"
+    assert results[-1].trials[0].reason_code == "evaluation_work_limit_exceeded"
+    assert "records" not in results[-1].model_dump_json()
+
+
+def test_nested_effect_entries_exhaust_comparison_budget_without_leaking_values(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(dataset_invariants, "_MAXIMUM_ARRAY_INVARIANT_WORK_UNITS", 10)
+    rule = ExactlyOneNewEffectInvariant(
+        type="exactly_one_new_effect",
+        id="one-effect",
+        version="1.0.0",
+        description="Exactly one effect must be appended.",
+        severity="critical",
+        before_checkpoint="before_turn",
+        after_checkpoint="after_turn",
+        observation_pointer="/effects",
+    )
+    secret = "private-nested-effect-value"
+    existing_effect = {"payload": [{"secret": secret, "index": index} for index in range(8)]}
+
+    result = evaluate_dataset_invariant_rules(
+        (rule,),
+        (
+            _state_transition(
+                {"effects": [existing_effect]},
+                {"effects": [existing_effect, {"id": "new-effect"}]},
+            ),
+        ),
+        observation_authority="committed_state_snapshot",
+    )[0]
+
+    assert result.status == "not_evaluable"
+    assert result.trials[0].reason_code == "evaluation_work_limit_exceeded"
+    assert secret not in result.model_dump_json()
+
+
+def test_transition_comparison_charges_large_scalar_values(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(dataset_invariants, "_MAXIMUM_ARRAY_INVARIANT_WORK_UNITS", 10)
+    rule = UnchangedBetweenCheckpointsInvariant(
+        type="unchanged_between_checkpoints",
+        id="large-value-unchanged",
+        version="1.0.0",
+        description="The selected value must remain unchanged.",
+        severity="high",
+        before_checkpoint="before_turn",
+        after_checkpoint="after_turn",
+        observation_pointer="/value",
+    )
+    private_value = "private-value-" * 10
+
+    result = evaluate_dataset_invariant_rules(
+        (rule,),
+        (_state_transition({"value": private_value}, {"value": private_value}),),
+        observation_authority="committed_state_snapshot",
+    )[0]
+
+    assert result.status == "not_evaluable"
+    assert result.trials[0].reason_code == "evaluation_work_limit_exceeded"
+    assert private_value not in result.model_dump_json()
+
+
 @pytest.mark.parametrize(
     ("actual", "literal", "expected_status", "expected_reason"),
     [
