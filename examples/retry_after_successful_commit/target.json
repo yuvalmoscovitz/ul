@@ -1,0 +1,36 @@
+{
+  "version": 3,
+  "sandbox_id": "retry-after-successful-commit-example",
+  "headers_from_env": {},
+  "reset": {
+    "url": "http://127.0.0.1:8766/reset",
+    "request_json_template": {"case_id": "{{case_id}}"},
+    "case_id_json_pointer": "/case_id",
+    "sandbox_id_json_pointer": "/sandbox_id",
+    "generation_json_pointer": "/generation",
+    "clean_state_json_pointer": "/clean",
+    "clean_state_value": true
+  },
+  "setup": {
+    "url": "http://127.0.0.1:8766/setup",
+    "request_json_template": {"case_id": "{{case_id}}"},
+    "case_id_json_pointer": "/case_id",
+    "sandbox_id_json_pointer": "/sandbox_id"
+  },
+  "execute_turn": {
+    "url": "http://127.0.0.1:8766/execute",
+    "request_json_template": {"case_id": "{{case_id}}", "turn_id": "{{turn_id}}", "input": "{{input}}"},
+    "response_json_pointer": "/response",
+    "case_id_json_pointer": "/case_id",
+    "turn_id_json_pointer": "/turn_id",
+    "sandbox_id_json_pointer": "/sandbox_id"
+  },
+  "snapshot": {
+    "url": "http://127.0.0.1:8766/snapshot",
+    "request_json_template": {"case_id": "{{case_id}}", "turn_id": "{{turn_id}}"},
+    "response_json_pointer": "/state",
+    "case_id_json_pointer": "/case_id",
+    "turn_id_json_pointer": "/turn_id",
+    "sandbox_id_json_pointer": "/sandbox_id"
+  }
+}

@@ -13,6 +13,21 @@ UL never executes augmentations against the production system it observed.
 UL reports observed differences for human review. It does not decide which behavior is
 correct, prove causality, or estimate a production failure rate.
 
+## Model-free first finding
+
+Run a deterministic, consequential failure locally without an API key or semantic-model calls:
+
+```bash
+uv sync
+uv run python -m examples.retry_after_successful_commit.run
+```
+
+The isolated example commits one synthetic payment successfully, then explicitly retries it. Its
+seeded agent creates a duplicate payment, and UL confirms the critical exactly-once violation from
+three committed-state repetitions. The command retains private evidence and exits `0` when the
+expected finding is confirmed. See the
+[retry-after-successful-commit example](examples/retry_after_successful_commit/README.md).
+
 ## Quickstart
 
 You need Python 3.12+, [`uv`](https://docs.astral.sh/uv/), and access to either OpenRouter or an
