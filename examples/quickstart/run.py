@@ -214,12 +214,26 @@ def main(
         bool,
         typer.Option(help="Validate the complete plan without model or target calls."),
     ] = False,
+    sandbox_check: Annotated[
+        bool,
+        typer.Option(
+            "--sandbox-check",
+            help="Validate the local sandbox lifecycle without an API key or UL model calls.",
+        ),
+    ] = False,
 ) -> None:
-    try:
-        subprocess_environment = _subprocess_environment(dry_run=dry_run)
-    except ValueError as error:
-        typer.echo(str(error), err=True)
-        raise typer.Exit(code=2) from None
+    if dry_run and sandbox_check:
+        raise typer.BadParameter("--dry-run and --sandbox-check cannot be combined")
+    if sandbox_check:
+        subprocess_environment = {}
+        if "PYTHONPATH" in os.environ:
+            subprocess_environment["PYTHONPATH"] = os.environ["PYTHONPATH"]
+    else:
+        try:
+            subprocess_environment = _subprocess_environment(dry_run=dry_run)
+        except ValueError as error:
+            typer.echo(str(error), err=True)
+            raise typer.Exit(code=2) from None
 
     temporary_root = _PROJECT_DIRECTORY / "tmp"
     temporary_root.mkdir(exist_ok=True)
@@ -247,33 +261,49 @@ def main(
 
         if server_thread is not None:
             server_thread.start()
-        command = [
-            sys.executable,
-            "-m",
-            "ul_cli.main",
-            "dataset",
-            "evaluate",
-            str(_DATASET_PATH),
-            "--sandbox-config",
-            str(target_config_path),
-            "--invariants",
-            str(_INVARIANTS_PATH),
-            "--operator",
-            "input.surface.disfluency_repeat",
-            "--limit",
-            "1",
-            "--repetitions",
-            "3",
-            "--max-sandbox-api-calls",
-            "36",
-            "--output",
-            str(evidence_path),
-            "--allow-sandbox-network-egress",
-            "--confirm-isolated-sandbox",
-            "--allow-insecure-http",
-        ]
-        if dry_run:
-            command.append("--dry-run")
+        if sandbox_check:
+            command = [
+                sys.executable,
+                "-m",
+                "ul_cli.main",
+                "sandbox",
+                "check",
+                str(target_config_path),
+                "--probe",
+                "Pay AC-100.",
+                "--allow-sandbox-network-egress",
+                "--confirm-isolated-sandbox",
+                "--confirm-harmless-probe",
+                "--allow-insecure-http",
+            ]
+        else:
+            command = [
+                sys.executable,
+                "-m",
+                "ul_cli.main",
+                "dataset",
+                "evaluate",
+                str(_DATASET_PATH),
+                "--sandbox-config",
+                str(target_config_path),
+                "--invariants",
+                str(_INVARIANTS_PATH),
+                "--operator",
+                "input.surface.disfluency_repeat",
+                "--limit",
+                "1",
+                "--repetitions",
+                "3",
+                "--max-sandbox-api-calls",
+                "36",
+                "--output",
+                str(evidence_path),
+                "--allow-sandbox-network-egress",
+                "--confirm-isolated-sandbox",
+                "--allow-insecure-http",
+            ]
+            if dry_run:
+                command.append("--dry-run")
         completed_process = subprocess.run(
             command,
             cwd=_QUICKSTART_DIRECTORY,
@@ -299,6 +329,12 @@ def main(
         if completed_process.returncode != 0:
             raise typer.Exit(code=completed_process.returncode)
         typer.echo("Dry run complete. No model or target requests sent.")
+        return
+
+    if sandbox_check:
+        if completed_process.returncode != 0:
+            raise typer.Exit(code=completed_process.returncode)
+        typer.echo("Sandbox check complete. No API key or UL semantic-model calls used.")
         return
 
     if completed_process.returncode == 1 and _evidence_confirms_repeatable_wrong_invoice(

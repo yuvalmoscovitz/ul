@@ -9,6 +9,38 @@ from ul_core.models import ConversationTurn, ULModel
 
 StateObservationAuthority = Literal["sandbox_self_reported", "independent_observer"]
 TimeoutAfterCommitTriggerStatus = Literal["unknown", "not_fired", "fired"]
+SandboxLifecycleFailureCode = Literal[
+    "authentication_rejected",
+    "rate_limited",
+    "http_status",
+    "response_content_type",
+    "response_content_encoding",
+    "invalid_json",
+    "null_json",
+    "response_mapping",
+    "sandbox_identity",
+    "case_identity",
+    "turn_identity",
+    "reset_generation",
+    "reset_generation_reused",
+    "reset_not_clean",
+    "request_too_large",
+    "response_too_large",
+    "call_budget",
+    "request_timeout",
+    "connect_timeout",
+    "dns_resolution",
+    "tls_connection",
+    "connect_failed",
+    "response_timeout",
+    "write_timeout",
+    "pool_timeout",
+    "transport_protocol",
+    "transport_failed",
+    "sandbox_state_uncertain",
+    "sandbox_lifecycle_error",
+    "sandbox_cleanup_error",
+]
 
 
 class _StrictModel(ULModel):
@@ -157,14 +189,22 @@ class SandboxLifecycleEvidence(_StrictModel):
     terminal_status: Literal["succeeded", "failed", "timed_out", "cancelled"]
     completed_phases: tuple[str, ...] = ()
     failed_phase: str | None = Field(default=None, min_length=1, max_length=200)
+    failure_code: SandboxLifecycleFailureCode | None = None
+    failure_reason: str | None = Field(default=None, min_length=1, max_length=500)
     delivery: Literal["certain", "uncertain"]
     cleanup: Literal["succeeded", "failed", "not_attempted"]
+    cleanup_failure_code: SandboxLifecycleFailureCode | None = None
+    cleanup_failure_reason: str | None = Field(default=None, min_length=1, max_length=500)
     sandbox_state_uncertain: bool
 
     @model_validator(mode="after")
     def validate_terminal_status(self) -> Self:
-        if self.terminal_status == "succeeded" and self.failed_phase is not None:
-            raise ValueError("successful lifecycle evidence cannot name a failed phase")
+        if self.terminal_status == "succeeded" and (
+            self.failed_phase is not None
+            or self.failure_code is not None
+            or self.failure_reason is not None
+        ):
+            raise ValueError("successful lifecycle evidence cannot name a failure")
         if self.terminal_status == "succeeded" and (
             self.delivery != "certain"
             or self.cleanup != "succeeded"
@@ -173,10 +213,18 @@ class SandboxLifecycleEvidence(_StrictModel):
             raise ValueError("successful lifecycle evidence requires certain delivery and cleanup")
         if self.terminal_status != "succeeded" and self.failed_phase is None:
             raise ValueError("unsuccessful lifecycle evidence requires a failed phase")
+        if self.terminal_status != "succeeded" and (
+            self.failure_code is None or self.failure_reason is None
+        ):
+            raise ValueError("unsuccessful lifecycle evidence requires a failure code and reason")
         if self.delivery == "uncertain" and not self.sandbox_state_uncertain:
             raise ValueError("uncertain delivery must mark sandbox state uncertain")
         if self.cleanup == "failed" and not self.sandbox_state_uncertain:
             raise ValueError("failed cleanup must mark sandbox state uncertain")
+        if (self.cleanup == "failed") != (self.cleanup_failure_reason is not None):
+            raise ValueError("cleanup failure detail must match cleanup status")
+        if (self.cleanup_failure_code is None) != (self.cleanup_failure_reason is None):
+            raise ValueError("cleanup failure code and reason must be provided together")
         return self
 
 

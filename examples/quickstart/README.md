@@ -17,6 +17,15 @@ an OpenAI-compatible provider as shown in the [main README](../../README.md):
 uv run python -m examples.quickstart.run
 ```
 
+Validate the complete local sandbox lifecycle first, without an API key or UL semantic-model calls:
+
+```bash
+uv run python -m examples.quickstart.run --sandbox-check
+```
+
+This starts the same ephemeral isolated server, runs the fixed sandbox-only probe `Pay AC-100.`,
+prints the connection result, and removes its temporary connection configuration.
+
 The runner chooses a free localhost port and changes only the four lifecycle URLs from the
 checked-in `target.json`. The sandbox API mapping describes this exchange:
 

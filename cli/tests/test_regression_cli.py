@@ -430,7 +430,7 @@ def _write_target_config(path: Path, endpoint: str) -> None:
             {
                 "version": 3,
                 "sandbox_id": "test-sandbox",
-                "headers_from_env": {"X-Test-Token": "UL_REGRESSION_TEST_SECRET"},
+                "headers_from_env": {"X-Test-Token": "UL_SANDBOX_REGRESSION_TEST_SECRET"},
                 "reset": {
                     "url": f"{base_url}/reset",
                     "request_json_template": {"case_id": "{{case_id}}"},
@@ -566,7 +566,7 @@ def test_confirmed_finding_save_and_replay_real_loopback(
     defective_result_path = tmp_path / "defective-replay.json"
     fixed_result_path = tmp_path / "fixed-replay.json"
     _write_evidence(evidence)
-    monkeypatch.setenv("UL_REGRESSION_TEST_SECRET", TEST_SECRET)
+    monkeypatch.setenv("UL_SANDBOX_REGRESSION_TEST_SECRET", TEST_SECRET)
     monkeypatch.delenv("OPEN_ROUTER_API_KEY", raising=False)
 
     with _running_server() as (server, endpoint):
@@ -638,7 +638,7 @@ def test_invariant_violation_without_semantic_finding_saves_and_replays(
     defective_result_path = tmp_path / "defective-replay.json"
     fixed_result_path = tmp_path / "fixed-replay.json"
     invariant_finding_id = _write_invariant_only_evidence(evidence)
-    monkeypatch.setenv("UL_REGRESSION_TEST_SECRET", TEST_SECRET)
+    monkeypatch.setenv("UL_SANDBOX_REGRESSION_TEST_SECRET", TEST_SECRET)
     _confirm_finding(evidence, invariant_finding_id)
 
     with _running_server() as (server, endpoint):
@@ -726,7 +726,7 @@ def test_regression_run_monitors_saved_cases_against_current_black_box_target(
     fixed_result_path = tmp_path / "fixed-run.json"
     inconclusive_result_path = tmp_path / "inconclusive-run.json"
     _write_evidence(evidence)
-    monkeypatch.setenv("UL_REGRESSION_TEST_SECRET", TEST_SECRET)
+    monkeypatch.setenv("UL_SANDBOX_REGRESSION_TEST_SECRET", TEST_SECRET)
 
     with _running_server() as (server, endpoint):
         target_config = tmp_path / "target.json"
@@ -824,7 +824,7 @@ def test_regression_run_preflights_total_budget_before_secrets_output_or_network
         target_config = tmp_path / "target.json"
         _write_target_config(target_config, endpoint)
         _confirm_finding(evidence)
-        monkeypatch.setenv("UL_REGRESSION_TEST_SECRET", TEST_SECRET)
+        monkeypatch.setenv("UL_SANDBOX_REGRESSION_TEST_SECRET", TEST_SECRET)
         first_saved = runner.invoke(
             app,
             _save_arguments(evidence, target_config, first_case_path),
@@ -833,7 +833,7 @@ def test_regression_run_preflights_total_budget_before_secrets_output_or_network
         second_arguments[second_arguments.index(RULE_ID)] = SECOND_RULE_ID
         second_saved = runner.invoke(app, second_arguments)
         assert first_saved.exit_code == second_saved.exit_code == 0
-        monkeypatch.delenv("UL_REGRESSION_TEST_SECRET")
+        monkeypatch.delenv("UL_SANDBOX_REGRESSION_TEST_SECRET")
 
         run = runner.invoke(
             app,
@@ -946,7 +946,7 @@ def test_replay_rejects_untrusted_or_tampered_inputs_before_target_call(
     evidence = tmp_path / "evidence.jsonl"
     case_path = tmp_path / "case.json"
     _write_evidence(evidence)
-    monkeypatch.setenv("UL_REGRESSION_TEST_SECRET", TEST_SECRET)
+    monkeypatch.setenv("UL_SANDBOX_REGRESSION_TEST_SECRET", TEST_SECRET)
 
     with _running_server() as (server, endpoint):
         target_config = tmp_path / "target.json"
@@ -987,7 +987,7 @@ def test_replay_enforces_sandbox_call_budget_before_secret_resolution_or_output(
     _confirm_finding(evidence)
     saved = runner.invoke(app, _save_arguments(evidence, target_config, case_path))
     assert saved.exit_code == 0, saved.output
-    monkeypatch.delenv("UL_REGRESSION_TEST_SECRET", raising=False)
+    monkeypatch.delenv("UL_SANDBOX_REGRESSION_TEST_SECRET", raising=False)
     arguments = _replay_arguments(case_path, target_config, result_path)
     budget_index = arguments.index("--max-sandbox-api-calls") + 1
     arguments[budget_index] = "2"

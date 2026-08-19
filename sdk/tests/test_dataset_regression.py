@@ -87,7 +87,7 @@ def _case(
             {
                 "version": 3,
                 "sandbox_id": "test-sandbox",
-                "headers_from_env": {"Authorization": "TARGET_TOKEN"},
+                "headers_from_env": {"Authorization": "UL_SANDBOX_TARGET_TOKEN"},
                 "reset": {
                     "url": "http://127.0.0.1:8765/reset",
                     "generation_json_pointer": "/generation",

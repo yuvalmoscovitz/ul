@@ -272,7 +272,7 @@ jobs:
       - run: uv sync --locked
       - name: Run UL regressions
         env:
-          TARGET_TOKEN: ${{ secrets.TARGET_TOKEN }}
+          UL_SANDBOX_TARGET_TOKEN: ${{ secrets.TARGET_TOKEN }}
         run: uv run --frozen ul regression run regressions/ --sandbox-config sandbox.json --allow-sandbox-network-egress --confirm-isolated-sandbox --max-sandbox-api-calls 100 --output tmp/regression-run-${{ github.run_id }}.json
       - name: Upload UL evidence
         if: ${{ !cancelled() && vars.UL_UPLOAD_RAW_EVIDENCE == 'true' }}
@@ -371,6 +371,11 @@ Give UL the lifecycle endpoints of an isolated, non-production deployment of you
 
 ```bash
 uv run ul dataset init sandbox.json --url https://your-sandbox.example
+uv run ul sandbox check sandbox.json \
+  --probe "Describe your harmless sandbox-only check here" \
+  --allow-sandbox-network-egress \
+  --confirm-isolated-sandbox \
+  --confirm-harmless-probe
 uv run ul dataset evaluate your-data.jsonl --sandbox-config sandbox.json --dry-run
 ```
 
@@ -379,12 +384,35 @@ execute-turn, and snapshot lifecycle endpoints. Use `headers_from_env` in the sa
 credentials so secret values remain outside the configuration. Dry-run validates the production
 dataset and sandbox mapping without making external calls.
 
+Credential environment-variable names must use the dedicated `UL_SANDBOX_*` namespace. This keeps
+a sandbox configuration from selecting unrelated ambient process credentials.
+
+`ul sandbox check` makes no UL semantic-model calls. It runs the supplied non-sensitive probe through
+the configured reset, optional setup, initial snapshot, execute-turn, post-turn snapshot, and
+cleanup-reset lifecycle. It reports the exact failing phase, a safe diagnostic category,
+delivery certainty, cleanup status, and whether the sandbox must be quarantined. The probe,
+response, committed state, endpoint URLs, and credential values are never printed. Pass `--json`
+for a machine-readable safe summary. Exit `0` means the complete protocol check succeeded; exit
+`2` means the connection is not ready or the command/configuration is invalid.
+
+The check validates UL's protocol contract. It does not prove that the endpoint is isolated, that
+reset erased every backing store, or that the supplied probe is harmless. Those properties remain
+customer attestations. UL never retries an ambiguously delivered lifecycle mutation.
+The customer-managed agent behind the sandbox API may make its own model calls; UL does not control
+or count those calls.
+
+Try the complete bundled local path with no API key or UL semantic-model calls:
+
+```bash
+uv run python -m examples.quickstart.run --sandbox-check
+```
+
 Use a lifecycle configuration such as [`examples/stateful_target.json`](examples/stateful_target.json). The
 [quickstart sandbox](examples/quickstart/README.md) is a runnable example API. For every
 original or variation repetition, UL sends these same-origin POST requests in order:
 
 ```text
-reset → optional setup → execute_turn → snapshot → cleanup reset
+reset → optional setup → initial snapshot → execute_turn → snapshot → cleanup reset
 ```
 
 Each reset must return JSON containing a configured clean-state field and a generation string or

@@ -205,6 +205,8 @@ class _UncertainReplaySandbox(_ReplayTarget):
             lifecycle=SandboxLifecycleEvidence(
                 terminal_status="failed",
                 failed_phase="execute_turn",
+                failure_code="transport_failed",
+                failure_reason="sandbox API transport failed",
                 delivery="uncertain",
                 cleanup="succeeded",
                 sandbox_state_uncertain=True,
