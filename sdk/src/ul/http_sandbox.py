@@ -6,6 +6,8 @@ import json
 import math
 import os
 import re
+import socket
+import ssl
 import stat
 import sys
 from collections.abc import Mapping
@@ -63,11 +65,15 @@ _UNSAFE_HEADER_NAMES = {
 }
 
 
-class _TargetDeliveryUncertainError(RuntimeError):
+class _SandboxProtocolError(RuntimeError):
     pass
 
 
-class _SandboxIdentityMismatchError(RuntimeError):
+class _TargetDeliveryUncertainError(_SandboxProtocolError):
+    pass
+
+
+class _SandboxIdentityMismatchError(_SandboxProtocolError):
     pass
 
 
@@ -434,8 +440,10 @@ class JsonHttpSandboxConnection:
                 terminal_status="failed",
                 completed_phases=(),
                 failed_phase="blocked_state_uncertain",
+                failure_reason="sandbox state is uncertain after an earlier lifecycle failure",
                 delivery="uncertain",
                 cleanup="not_attempted",
+                cleanup_failure_reason=None,
                 sandbox_state_uncertain=True,
             )
         self._reserve_sandbox_api_calls(self.api_calls_for_case(case))
@@ -443,8 +451,10 @@ class JsonHttpSandboxConnection:
         completed_phase_names: list[str] = []
         lifecycle_started = False
         failed_phase: str | None = None
+        failure_reason: str | None = None
         cleanup_reset_failed = False
         event_cleanup_failed = False
+        cleanup_failure_reason: str | None = None
         delivery_uncertain = False
         current_phase = "reset"
         turn_observations: list[SandboxTurnEvidence] = []
@@ -550,16 +560,13 @@ class JsonHttpSandboxConnection:
                         raise AssertionError("observe operation returned an invalid status")
                     event_trigger_status = cast(TimeoutAfterCommitTriggerStatus, observed_status)
                     completed_phase_names.append(current_phase)
-        except _TargetDeliveryUncertainError:
+        except _TargetDeliveryUncertainError as error:
             failed_phase = current_phase
-            delivery_uncertain = current_phase in {
-                "setup",
-                "initial_snapshot",
-                "arm_timeout_after_commit",
-                "observe_timeout_after_commit",
-            } or (current_phase.startswith(("execute_turn", "snapshot")))
-        except _SandboxIdentityMismatchError:
+            failure_reason = str(error)
+            delivery_uncertain = True
+        except _SandboxIdentityMismatchError as error:
             failed_phase = current_phase
+            failure_reason = str(error)
             delivery_uncertain = True
         except asyncio.CancelledError:
             if current_phase in {
@@ -570,8 +577,12 @@ class JsonHttpSandboxConnection:
             } or current_phase.startswith(("execute_turn", "snapshot")):
                 delivery_uncertain = True
             raise
+        except _SandboxProtocolError as error:
+            failed_phase = current_phase
+            failure_reason = str(error)
         except RuntimeError:
             failed_phase = current_phase
+            failure_reason = "sandbox lifecycle failed"
         finally:
             if lifecycle_started:
                 try:
@@ -591,9 +602,16 @@ class JsonHttpSandboxConnection:
                             event_cleanup_failed = True
                             self._lifecycle_state_uncertain = True
                             cleanup_cancellation = error
+                        except _TargetDeliveryUncertainError as error:
+                            event_cleanup_failed = True
+                            cleanup_failure_reason = str(error)
+                            delivery_uncertain = True
+                        except _SandboxProtocolError as error:
+                            event_cleanup_failed = True
+                            cleanup_failure_reason = str(error)
                         except RuntimeError:
                             event_cleanup_failed = True
-                            self._lifecycle_state_uncertain = True
+                            cleanup_failure_reason = "sandbox event cleanup failed"
                 finally:
                     try:
                         await self._reset(config.reset, case.id)
@@ -604,8 +622,18 @@ class JsonHttpSandboxConnection:
                         cleanup_reset_failed = True
                         self._lifecycle_state_uncertain = True
                         cleanup_cancellation = cleanup_cancellation or error
+                    except _TargetDeliveryUncertainError as error:
+                        cleanup_reset_failed = True
+                        cleanup_failure_reason = cleanup_failure_reason or str(error)
+                        delivery_uncertain = True
+                    except _SandboxProtocolError as error:
+                        cleanup_reset_failed = True
+                        cleanup_failure_reason = cleanup_failure_reason or str(error)
                     except RuntimeError:
                         cleanup_reset_failed = True
+                        cleanup_failure_reason = (
+                            cleanup_failure_reason or "sandbox cleanup failed"
+                        )
             if cleanup_cancellation is not None:
                 raise cleanup_cancellation
         if failed_phase is not None or cleanup_reset_failed or event_cleanup_failed:
@@ -619,8 +647,10 @@ class JsonHttpSandboxConnection:
                     failed_phase
                     or ("cleanup_timeout_after_commit" if event_cleanup_failed else "cleanup_reset")
                 ),
+                failure_reason=failure_reason or cleanup_failure_reason,
                 delivery="uncertain" if delivery_uncertain else "certain",
                 cleanup=("failed" if cleanup_reset_failed or event_cleanup_failed else "succeeded"),
+                cleanup_failure_reason=cleanup_failure_reason,
                 sandbox_state_uncertain=self._lifecycle_state_uncertain,
                 event_armed=event_armed,
                 event_trigger_status=event_trigger_status,
@@ -637,8 +667,10 @@ class JsonHttpSandboxConnection:
             terminal_status="succeeded",
             completed_phases=tuple(completed_phase_names),
             failed_phase=None,
+            failure_reason=None,
             delivery="certain",
             cleanup="succeeded",
+            cleanup_failure_reason=None,
             sandbox_state_uncertain=False,
             event_armed=event_armed,
             event_trigger_status=event_trigger_status,
@@ -717,11 +749,11 @@ class JsonHttpSandboxConnection:
         )
         generation = _resolve_json_pointer(reset_response, config.generation_json_pointer)
         if isinstance(generation, bool) or not isinstance(generation, str | int):
-            raise RuntimeError("sandbox API reset generation is invalid")
+            raise _SandboxProtocolError("sandbox API reset generation is invalid")
         if isinstance(generation, str) and not generation:
-            raise RuntimeError("sandbox API reset generation is invalid")
+            raise _SandboxProtocolError("sandbox API reset generation is invalid")
         if generation == self._last_reset_generation:
-            raise RuntimeError("sandbox API reset generation did not change")
+            raise _SandboxProtocolError("sandbox API reset generation did not change")
         self._last_reset_generation = generation
         clean_state = _resolve_json_pointer(
             reset_response,
@@ -732,7 +764,7 @@ class JsonHttpSandboxConnection:
             type(clean_state) is not type(config.clean_state_value)
             or clean_state != config.clean_state_value
         ):
-            raise RuntimeError("sandbox API reset did not report clean state")
+            raise _SandboxProtocolError("sandbox API reset did not report clean state")
         return clean_state
 
     async def _snapshot(
@@ -794,8 +826,10 @@ class JsonHttpSandboxConnection:
         terminal_status: Literal["succeeded", "failed", "timed_out", "cancelled"],
         completed_phases: tuple[str, ...],
         failed_phase: str | None,
+        failure_reason: str | None,
         delivery: Literal["certain", "uncertain"],
         cleanup: Literal["succeeded", "failed", "not_attempted"],
+        cleanup_failure_reason: str | None,
         sandbox_state_uncertain: bool,
         event_armed: bool = False,
         event_trigger_status: TimeoutAfterCommitTriggerStatus = "unknown",
@@ -834,8 +868,10 @@ class JsonHttpSandboxConnection:
                 terminal_status=terminal_status,
                 completed_phases=completed_phases,
                 failed_phase=failed_phase,
+                failure_reason=failure_reason,
                 delivery=delivery,
                 cleanup=cleanup,
+                cleanup_failure_reason=cleanup_failure_reason,
                 sandbox_state_uncertain=sandbox_state_uncertain,
             ),
         )
@@ -886,7 +922,7 @@ class JsonHttpSandboxConnection:
             separators=(",", ":"),
         ).encode("utf-8")
         if len(request_body) > self._max_request_bytes:
-            raise RuntimeError("sandbox API request exceeds the size limit")
+            raise _SandboxProtocolError("sandbox API request exceeds the size limit")
         if consume_budget:
             self._reserve_sandbox_api_calls(1)
         try:
@@ -904,25 +940,43 @@ class JsonHttpSandboxConnection:
                     timeout=self._timeout_seconds,
                 ) as response:
                     if not 200 <= response.status_code < 300:
-                        raise RuntimeError("sandbox API returned a non-success status")
+                        raise _SandboxProtocolError(
+                            f"sandbox API returned HTTP {response.status_code}"
+                        )
                     if response_json_pointer is not None and not _is_json_content_type(
                         response.headers.get("content-type")
                     ):
-                        raise RuntimeError("sandbox API response must be JSON")
+                        raise _SandboxProtocolError("sandbox API response must be JSON")
                     content_encoding = response.headers.get("content-encoding")
                     if content_encoding is not None and content_encoding.casefold() != "identity":
-                        raise RuntimeError("sandbox API response must not use content encoding")
+                        raise _SandboxProtocolError(
+                            "sandbox API response must not use content encoding"
+                        )
                     response_body = await _read_bounded_response(response, self._max_response_bytes)
         except TimeoutError:
-            raise _TargetDeliveryUncertainError(
-                "sandbox API request delivery is uncertain"
-            ) from None
+            raise _TargetDeliveryUncertainError("sandbox API request timed out") from None
+        except httpx.ConnectTimeout:
+            raise _TargetDeliveryUncertainError("sandbox API connection timed out") from None
+        except httpx.ConnectError as error:
+            if _exception_chain_contains(error, ssl.SSLError):
+                reason = "sandbox API TLS connection failed"
+            elif _exception_chain_contains(error, socket.gaierror):
+                reason = "sandbox API DNS resolution failed"
+            else:
+                reason = "sandbox API connection failed"
+            raise _TargetDeliveryUncertainError(reason) from None
+        except httpx.ReadTimeout:
+            raise _TargetDeliveryUncertainError("sandbox API response timed out") from None
+        except httpx.WriteTimeout:
+            raise _TargetDeliveryUncertainError("sandbox API request write timed out") from None
+        except httpx.PoolTimeout:
+            raise _TargetDeliveryUncertainError("sandbox API connection pool timed out") from None
+        except httpx.RemoteProtocolError:
+            raise _TargetDeliveryUncertainError("sandbox API transport protocol failed") from None
         except RuntimeError:
             raise
         except httpx.HTTPError:
-            raise _TargetDeliveryUncertainError(
-                "sandbox API request delivery is uncertain"
-            ) from None
+            raise _TargetDeliveryUncertainError("sandbox API transport failed") from None
 
         if response_json_pointer is None:
             return None
@@ -934,16 +988,16 @@ class JsonHttpSandboxConnection:
             )
             _reject_deep_json(raw_output)
         except (UnicodeDecodeError, json.JSONDecodeError, RecursionError, ValueError):
-            raise RuntimeError("sandbox API returned invalid JSON") from None
+            raise _SandboxProtocolError("sandbox API returned invalid JSON") from None
         if raw_output is None:
-            raise RuntimeError("sandbox API returned null JSON")
+            raise _SandboxProtocolError("sandbox API returned null JSON")
         return _resolve_json_pointer(raw_output, response_json_pointer)
 
     def _reserve_sandbox_api_calls(self, sandbox_api_calls: int) -> None:
         if self._remaining_sandbox_api_calls is None:
             return
         if sandbox_api_calls > self._remaining_sandbox_api_calls:
-            raise RuntimeError("HTTP sandbox API call budget exhausted")
+            raise _SandboxProtocolError("HTTP sandbox API call budget exhausted")
         self._remaining_sandbox_api_calls -= sandbox_api_calls
 
 
@@ -1039,6 +1093,10 @@ def _validate_endpoint(endpoint: str, allow_insecure_http: bool) -> str:
         raise ValueError("endpoint must be a valid HTTP(S) URL")
     if parsed_endpoint.username is not None or parsed_endpoint.password is not None:
         raise ValueError("endpoint must not contain credentials")
+    try:
+        httpx.URL(endpoint)
+    except (httpx.InvalidURL, UnicodeError):
+        raise ValueError("endpoint must be a valid HTTP(S) URL") from None
     if "?" in endpoint or "#" in endpoint:
         raise ValueError("endpoint must not contain a query or fragment")
     if parsed_endpoint.scheme == "http" and not allow_insecure_http:
@@ -1096,6 +1154,17 @@ def _is_json_content_type(content_type: str | None) -> bool:
 
 def _reject_nonstandard_json_constant(value: str) -> Never:
     raise ValueError("nonstandard JSON constant")
+
+
+def _exception_chain_contains(error: BaseException, exception_type: type[BaseException]) -> bool:
+    current: BaseException | None = error
+    visited: set[int] = set()
+    while current is not None and id(current) not in visited:
+        if isinstance(current, exception_type):
+            return True
+        visited.add(id(current))
+        current = current.__cause__ or current.__context__
+    return False
 
 
 def _reject_duplicate_object_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
@@ -1341,21 +1410,21 @@ def _resolve_json_pointer(
     for token in _parse_json_pointer(pointer):
         if isinstance(selected, dict):
             if token not in selected:
-                raise RuntimeError("sandbox API response JSON pointer was not found")
+                raise _SandboxProtocolError("sandbox API response JSON pointer was not found")
             selected = selected[token]
         elif isinstance(selected, list):
             if token == "-" or not token.isascii() or not token.isdecimal():
-                raise RuntimeError("sandbox API response JSON pointer was not found")
+                raise _SandboxProtocolError("sandbox API response JSON pointer was not found")
             if len(token) > 1 and token.startswith("0"):
-                raise RuntimeError("sandbox API response JSON pointer was not found")
+                raise _SandboxProtocolError("sandbox API response JSON pointer was not found")
             index = int(token)
             if index >= len(selected):
-                raise RuntimeError("sandbox API response JSON pointer was not found")
+                raise _SandboxProtocolError("sandbox API response JSON pointer was not found")
             selected = selected[index]
         else:
-            raise RuntimeError("sandbox API response JSON pointer was not found")
+            raise _SandboxProtocolError("sandbox API response JSON pointer was not found")
     if selected is None and not allow_null:
-        raise RuntimeError("sandbox API response JSON pointer selected null")
+        raise _SandboxProtocolError("sandbox API response JSON pointer selected null")
     return selected
 
 
@@ -1364,12 +1433,12 @@ async def _read_bounded_response(response: httpx.Response, maximum_bytes: int) -
     if content_length is not None:
         try:
             if int(content_length) > maximum_bytes:
-                raise RuntimeError("sandbox API response exceeds the size limit")
+                raise _SandboxProtocolError("sandbox API response exceeds the size limit")
         except ValueError:
             pass
     response_body = bytearray()
     async for chunk in response.aiter_raw():
         response_body.extend(chunk)
         if len(response_body) > maximum_bytes:
-            raise RuntimeError("sandbox API response exceeds the size limit")
+            raise _SandboxProtocolError("sandbox API response exceeds the size limit")
     return bytes(response_body)

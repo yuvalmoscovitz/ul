@@ -191,7 +191,10 @@ def initialize_dataset_sandbox(
     console.print(f"Created private sandbox connection config: {sandbox_config}")
     console.print(
         "Next: adjust the lifecycle request bodies and response pointers, add any "
-        "headers_from_env, then run 'ul dataset evaluate DATASET --sandbox-config "
+        "headers_from_env, then validate the connection with 'ul sandbox check "
+        f"{sandbox_config} --probe PROBE --allow-sandbox-network-egress "
+        "--confirm-isolated-sandbox --confirm-harmless-probe'. After that, validate a "
+        "dataset plan with 'ul dataset evaluate DATASET --sandbox-config "
         f"{sandbox_config} --dry-run'."
     )
     console.print(

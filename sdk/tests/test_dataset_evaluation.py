@@ -405,6 +405,7 @@ class LifecycleFailingSandbox(DeterministicSandbox):
                 failed_phase="snapshot",
                 delivery="certain",
                 cleanup="failed",
+                cleanup_failure_reason="sandbox API reset did not report clean state",
                 sandbox_state_uncertain=True,
             ),
         )

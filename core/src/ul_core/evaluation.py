@@ -157,14 +157,18 @@ class SandboxLifecycleEvidence(_StrictModel):
     terminal_status: Literal["succeeded", "failed", "timed_out", "cancelled"]
     completed_phases: tuple[str, ...] = ()
     failed_phase: str | None = Field(default=None, min_length=1, max_length=200)
+    failure_reason: str | None = Field(default=None, min_length=1, max_length=500)
     delivery: Literal["certain", "uncertain"]
     cleanup: Literal["succeeded", "failed", "not_attempted"]
+    cleanup_failure_reason: str | None = Field(default=None, min_length=1, max_length=500)
     sandbox_state_uncertain: bool
 
     @model_validator(mode="after")
     def validate_terminal_status(self) -> Self:
-        if self.terminal_status == "succeeded" and self.failed_phase is not None:
-            raise ValueError("successful lifecycle evidence cannot name a failed phase")
+        if self.terminal_status == "succeeded" and (
+            self.failed_phase is not None or self.failure_reason is not None
+        ):
+            raise ValueError("successful lifecycle evidence cannot name a failure")
         if self.terminal_status == "succeeded" and (
             self.delivery != "certain"
             or self.cleanup != "succeeded"
@@ -177,6 +181,8 @@ class SandboxLifecycleEvidence(_StrictModel):
             raise ValueError("uncertain delivery must mark sandbox state uncertain")
         if self.cleanup == "failed" and not self.sandbox_state_uncertain:
             raise ValueError("failed cleanup must mark sandbox state uncertain")
+        if (self.cleanup == "failed") != (self.cleanup_failure_reason is not None):
+            raise ValueError("cleanup failure detail must match cleanup status")
         return self
 
 

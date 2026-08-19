@@ -152,6 +152,17 @@ def test_uncertain_delivery_requires_uncertain_sandbox_state() -> None:
         )
 
 
+def test_cleanup_failure_requires_safe_detail() -> None:
+    with pytest.raises(ValidationError, match="cleanup failure detail"):
+        SandboxLifecycleEvidence(
+            terminal_status="failed",
+            failed_phase="cleanup_reset",
+            delivery="certain",
+            cleanup="failed",
+            sandbox_state_uncertain=True,
+        )
+
+
 def test_successful_execution_evidence_is_explicit() -> None:
     evidence = ExecutionEvidence(
         case_id="case-1",
