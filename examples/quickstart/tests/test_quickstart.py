@@ -285,7 +285,7 @@ def _confirmed_evidence() -> dict[str, Any]:
         "current_baseline": {"observations": stable_observations},
         "cases": [
             {
-                "operator_id": "surface.disfluency_repeat",
+                "operator_id": "input.surface.disfluency_repeat",
                 "variation_accepted": True,
                 "status": "REPEATABLE DIFFERENCE — REVIEW",
                 "observations": stable_observations,
@@ -317,7 +317,7 @@ def _confirmed_evidence() -> dict[str, Any]:
             "variations": [
                 {
                     "arm": "variation",
-                    "operator_id": "surface.disfluency_repeat",
+                    "operator_id": "input.surface.disfluency_repeat",
                     "rules": [variation_rule],
                 }
             ],
@@ -476,7 +476,7 @@ def test_runner_accepts_only_the_exact_stable_wrong_invoice_finding(tmp_path: Pa
     changes: tuple[tuple[str, object], ...] = (
         ("status", "NO OBSERVED DIFFERENCE"),
         ("variation_accepted", False),
-        ("operator_id", "surface.rephrase"),
+        ("operator_id", "input.surface.rephrase"),
         ("findings", []),
         (
             "findings",

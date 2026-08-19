@@ -96,7 +96,7 @@ def _config(
         }
     if timeout_after_commit:
         raw["timeout_after_commit"] = {
-            "operator_id": "tool.timeout_after_commit",
+            "operator_id": "environment.tool.timeout_after_commit",
             "version": "1.0.0",
             "url": f"{base_url}/timeout-after-commit",
         }

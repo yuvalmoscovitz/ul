@@ -214,7 +214,7 @@ async def test_engine_rephrases_and_independently_validates_full_semantics() -> 
     assert len(result.candidates) == 1
     candidate = result.candidates[0]
     assert candidate.source_interaction_id == record.id
-    assert candidate.operator_id == "surface.rephrase"
+    assert candidate.operator_id == "input.surface.rephrase"
     assert candidate.passed
     assert candidate.expected_input_frame.outcomes == ()
     assert candidate.expected_input_frame.metadata == {}
@@ -461,22 +461,22 @@ async def test_builtin_operator_library_is_fixed_versioned_and_reviewable() -> N
     operators = builtin_dataset_augmentation_operators()
 
     assert tuple(operator.id for operator in operators) == (
-        "surface.rephrase",
-        "surface.typing_noise",
-        "surface.fragmented_syntax",
-        "surface.disfluency_repeat",
-        "style.terse",
-        "style.verbose",
-        "tone.frustrated",
-        "intent.self_correction",
+        "input.surface.rephrase",
+        "input.surface.typing_noise",
+        "input.surface.fragmented_syntax",
+        "input.surface.disfluency_repeat",
+        "input.style.terse",
+        "input.style.verbose",
+        "input.tone.frustrated",
+        "input.intent.self_correction",
     )
     assert {operator.version for operator in operators} == {"1.0.0"}
     assert [operator.id for operator in operators if operator.human_review_required] == [
-        "tone.frustrated",
-        "intent.self_correction",
+        "input.tone.frustrated",
+        "input.intent.self_correction",
     ]
     frustrated_instruction = next(
-        operator.instruction for operator in operators if operator.id == "tone.frustrated"
+        operator.instruction for operator in operators if operator.id == "input.tone.frustrated"
     )
     assert all(
         forbidden_invention in frustrated_instruction
@@ -494,20 +494,20 @@ async def test_builtin_operator_library_is_fixed_versioned_and_reviewable() -> N
 async def test_operator_change_contract_rejects_impossible_target_states() -> None:
     with pytest.raises(ValueError, match="target communication kind"):
         DatasetAugmentationOperator(
-            id="surface.rephrase",
+            id="input.surface.rephrase",
             instruction="Rephrase naturally.",
             allowed_change="surface_form_only",
             target_communication_kind="rephrase",
         )
     with pytest.raises(ValueError, match="target communication kind"):
         DatasetAugmentationOperator(
-            id="style.terse",
+            id="input.style.terse",
             instruction="Make it terse.",
             allowed_change="declared_communication_form",
         )
     with pytest.raises(ValueError, match="target communication kind"):
         DatasetAugmentationOperator(
-            id="intent.self_correction",
+            id="input.intent.self_correction",
             instruction="Add a correction.",
             allowed_change="structured_self_correction",
         )
@@ -523,7 +523,7 @@ async def test_self_correction_accepts_one_structured_superseded_value() -> None
     )
 
     result = await DatasetAugmentationEngine(model, model).augment(
-        (record,), operator_ids=("intent.self_correction",)
+        (record,), operator_ids=("input.intent.self_correction",)
     )
 
     candidate = result.candidates[0]
@@ -674,7 +674,7 @@ async def test_self_correction_rejects_malformed_semantic_structures(
     )
 
     result = await DatasetAugmentationEngine(model, model).augment(
-        (record,), operator_ids=("intent.self_correction",)
+        (record,), operator_ids=("input.intent.self_correction",)
     )
 
     assert not result.candidates[0].passed
@@ -700,7 +700,7 @@ async def test_self_correction_rejects_invalid_textual_footprint(
     )
 
     result = await DatasetAugmentationEngine(model, model).augment(
-        (record,), operator_ids=("intent.self_correction",)
+        (record,), operator_ids=("input.intent.self_correction",)
     )
 
     assert not result.candidates[0].passed
@@ -725,7 +725,7 @@ async def test_self_correction_never_uses_generic_equivalence_fallback() -> None
     verifier = DeterministicEquivalenceVerifier(assessment)
 
     result = await DatasetAugmentationEngine(model, model, verifier).augment(
-        (record,), operator_ids=("intent.self_correction",)
+        (record,), operator_ids=("input.intent.self_correction",)
     )
 
     assert not result.candidates[0].passed
@@ -782,7 +782,7 @@ async def test_self_correction_skips_ineligible_sources(ineligible_reason: str) 
     model = DeterministicSemanticModel({record.id: original_frame})
 
     result = await DatasetAugmentationEngine(model, model).augment(
-        (record,), operator_ids=("intent.self_correction",)
+        (record,), operator_ids=("input.intent.self_correction",)
     )
 
     assert result.candidates == ()
@@ -793,20 +793,20 @@ async def test_self_correction_skips_ineligible_sources(ineligible_reason: str) 
     ("operator_id", "target_kind", "realistic_output", "review_required"),
     [
         (
-            "surface.fragmented_syntax",
+            "input.surface.fragmented_syntax",
             "fragmented_syntax",
             "transfer 100 to alice. then balance",
             False,
         ),
-        ("style.terse", "terse", "send alice 100 then balance", False),
+        ("input.style.terse", "terse", "send alice 100 then balance", False),
         (
-            "style.verbose",
+            "input.style.verbose",
             "verbose",
             "hey could you transfer 100 to alice and then please let me know the balance",
             False,
         ),
         (
-            "tone.frustrated",
+            "input.tone.frustrated",
             "frustrated",
             "ugh transfer 100 to alice then tell me the balance",
             True,
@@ -865,7 +865,7 @@ async def test_behavior_operator_rejects_relations_touching_its_marker() -> None
     )
 
     result = await DatasetAugmentationEngine(model, model).augment(
-        (record,), operator_ids=("style.terse",)
+        (record,), operator_ids=("input.style.terse",)
     )
 
     assert not result.candidates[0].passed
@@ -896,7 +896,7 @@ async def test_behavior_operator_rejects_semantics_hidden_in_its_marker() -> Non
     )
 
     result = await DatasetAugmentationEngine(model, model).augment(
-        (record,), operator_ids=("tone.frustrated",)
+        (record,), operator_ids=("input.tone.frustrated",)
     )
 
     assert not result.candidates[0].passed
@@ -952,7 +952,7 @@ async def test_behavior_operator_rejects_changes_outside_its_contract(drift: str
     model = DeterministicSemanticModel({record.id: original_frame}, candidate_frame)
 
     result = await DatasetAugmentationEngine(model, model).augment(
-        (record,), operator_ids=("style.terse",)
+        (record,), operator_ids=("input.style.terse",)
     )
 
     assert not result.candidates[0].passed
@@ -974,7 +974,7 @@ async def test_rephrase_preserves_full_semantics() -> None:
     model = DeterministicSemanticModel({record.id: original_frame}, changed_communication)
 
     result = await DatasetAugmentationEngine(model, model).augment(
-        (record,), operator_ids=("surface.rephrase",)
+        (record,), operator_ids=("input.surface.rephrase",)
     )
 
     assert not result.candidates[0].passed
@@ -1018,7 +1018,7 @@ async def test_typing_noise_is_deterministic_protects_factors_and_needs_no_model
     model = DeterministicSemanticModel({record.id: original_frame}, reparsed_candidate)
 
     result = await DatasetAugmentationEngine(model, model).augment(
-        (record,), operator_ids=("surface.typing_noise",)
+        (record,), operator_ids=("input.surface.typing_noise",)
     )
 
     candidate = result.candidates[0]
@@ -1041,7 +1041,7 @@ async def test_word_repetition_is_deterministic_and_protects_factors() -> None:
     model = DeterministicSemanticModel({record.id: original_frame}, reparsed_candidate)
 
     result = await DatasetAugmentationEngine(model, model).augment(
-        (record,), operator_ids=("surface.disfluency_repeat",)
+        (record,), operator_ids=("input.surface.disfluency_repeat",)
     )
 
     candidate = result.candidates[0]
@@ -1123,7 +1123,7 @@ async def test_factor_evidence_does_not_protect_unrelated_words_in_its_span() ->
     model = DeterministicSemanticModel({record.id: original_frame}, candidate_frame)
 
     result = await DatasetAugmentationEngine(model, model).augment(
-        (record,), operator_ids=("surface.disfluency_repeat",)
+        (record,), operator_ids=("input.surface.disfluency_repeat",)
     )
 
     assert result.candidates[0].passed
@@ -1133,13 +1133,13 @@ async def test_factor_evidence_does_not_protect_unrelated_words_in_its_span() ->
 @pytest.mark.parametrize(
     ("operator_id", "rendered_output"),
     [
-        ("style.terse", "transfer 100 alice then balance"),
+        ("input.style.terse", "transfer 100 alice then balance"),
         (
-            "style.verbose",
+            "input.style.verbose",
             "hey could you transfer 100 to alice and after that tell me what the balance is",
         ),
         (
-            "surface.disfluency_repeat",
+            "input.surface.disfluency_repeat",
             "transfer transfer 100 to alice then tell me the balance",
         ),
     ],
@@ -1168,17 +1168,17 @@ async def test_measurable_behavior_does_not_depend_on_a_model_marker(
     ("operator_id", "rendered_output", "failure"),
     [
         (
-            "surface.rephrase",
+            "input.surface.rephrase",
             "transfer 100 to Alice then tell me the balance",
             "rendered input only changes case, spacing, or punctuation",
         ),
         (
-            "surface.fragmented_syntax",
+            "input.surface.fragmented_syntax",
             "Please transfer 100 to Alice and then report the balance",
             "reparsed frame does not contain required communication kind fragmented_syntax",
         ),
         (
-            "style.verbose",
+            "input.style.verbose",
             "please could you now transfer the amount of 100 to Alice and then when that is done "
             "could you also please tell me exactly what the current balance is for the account",
             "rendered input is not between 1.5 and 2 times the source length",
@@ -1206,7 +1206,13 @@ async def test_operator_footprints_reject_mislabeled_outputs(
 
 @pytest.mark.parametrize(
     "operator_ids",
-    [(), ("",), ("unknown",), ("style.terse", "style.terse")],
+    [
+        (),
+        ("",),
+        ("unknown",),
+        ("surface.rephrase",),
+        ("input.style.terse", "input.style.terse"),
+    ],
 )
 async def test_engine_rejects_invalid_operator_selection_before_model_calls(
     operator_ids: tuple[str, ...],
@@ -1249,7 +1255,7 @@ async def test_engine_keeps_and_rejects_duplicate_generated_inputs() -> None:
     )
 
     result = await DatasetAugmentationEngine(model, model).augment(
-        (record,), operator_ids=("surface.rephrase", "style.verbose")
+        (record,), operator_ids=("input.surface.rephrase", "input.style.verbose")
     )
 
     assert result.candidates[0].passed
@@ -1267,11 +1273,11 @@ async def test_engine_retains_invalid_candidate_and_continues_to_later_operators
         {record.id: original_frame},
         typing_frame,
         "transfer 100 to alice then tell me teh balance",
-        frozenset({"surface.rephrase"}),
+        frozenset({"input.surface.rephrase"}),
     )
 
     result = await DatasetAugmentationEngine(model, model).augment(
-        (record,), operator_ids=("surface.rephrase", "surface.typing_noise")
+        (record,), operator_ids=("input.surface.rephrase", "input.surface.typing_noise")
     )
 
     assert len(result.candidates) == 2
@@ -1280,7 +1286,7 @@ async def test_engine_retains_invalid_candidate_and_continues_to_later_operators
     assert invalid_candidate.renderer_metadata == {
         "model": "test/model",
         "seed": 42,
-        "transformation_prompts": prompt_provenance("augmentation.surface.rephrase"),
+        "transformation_prompts": prompt_provenance("augmentation.input.surface.rephrase"),
     }
     assert invalid_candidate.reparsed_input_frame is None
     assert invalid_candidate.failure_reasons == (

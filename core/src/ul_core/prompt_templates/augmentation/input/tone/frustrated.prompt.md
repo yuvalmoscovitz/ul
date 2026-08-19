@@ -1,5 +1,5 @@
 +++
-name = "augmentation.tone.frustrated"
+name = "augmentation.input.tone.frustrated"
 description = "Adds one mild expression of natural frustration."
 author = "UL"
 +++

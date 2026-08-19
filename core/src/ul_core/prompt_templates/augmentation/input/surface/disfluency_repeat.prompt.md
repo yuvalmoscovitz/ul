@@ -1,5 +1,5 @@
 +++
-name = "augmentation.surface.disfluency_repeat"
+name = "augmentation.input.surface.disfluency_repeat"
 description = "Introduces one immediate word repetition as a natural hesitation."
 author = "UL"
 +++

@@ -1,7 +1,7 @@
 {
   "schema_version": "1.0.0",
   "id": "retry-payment-after-lost-acknowledgement",
-  "operator_id": "tool.timeout_after_commit",
+  "operator_id": "environment.tool.timeout_after_commit",
   "operator_version": "1.0.0",
   "event_id": "lose-first-payment-acknowledgement",
   "action_id": "execute-payment",

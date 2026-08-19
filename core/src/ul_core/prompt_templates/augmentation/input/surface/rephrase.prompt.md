@@ -1,5 +1,5 @@
 +++
-name = "augmentation.surface.rephrase"
+name = "augmentation.input.surface.rephrase"
 description = "Rephrases an input without changing its semantic content."
 author = "UL"
 +++

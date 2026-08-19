@@ -205,7 +205,9 @@ class JsonHttpLifecycleExecuteTurnConfig(BaseModel):
 class JsonHttpTimeoutAfterCommitConfig(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
-    operator_id: Literal["tool.timeout_after_commit"] = "tool.timeout_after_commit"
+    operator_id: Literal["environment.tool.timeout_after_commit"] = (
+        "environment.tool.timeout_after_commit"
+    )
     version: Literal["1.0.0"] = "1.0.0"
     url: str
 
@@ -221,7 +223,7 @@ class _TimeoutAfterCommitControlResponse(BaseModel):
 
     sandbox_id: str = Field(min_length=1, max_length=500)
     case_id: str = Field(min_length=1, max_length=500)
-    operator_id: Literal["tool.timeout_after_commit"]
+    operator_id: Literal["environment.tool.timeout_after_commit"]
     operator_version: Literal["1.0.0"]
     event_id: str = Field(min_length=1, max_length=500)
     turn_id: str = Field(min_length=1, max_length=500)
@@ -404,7 +406,9 @@ class JsonHttpSandboxConnection:
         calls = json_http_sandbox_calls_per_conversation(self._config, len(case.turns))
         if case.timeout_after_commit_event is not None:
             if self._config.timeout_after_commit is None:
-                raise ValueError("sandbox does not support tool.timeout_after_commit@1.0.0")
+                raise ValueError(
+                    "sandbox does not support environment.tool.timeout_after_commit@1.0.0"
+                )
             calls += 3
         return calls
 
@@ -421,7 +425,7 @@ class JsonHttpSandboxConnection:
         event_request = case.timeout_after_commit_event
         event_config = config.timeout_after_commit
         if event_request is not None and event_config is None:
-            raise ValueError("sandbox does not support tool.timeout_after_commit@1.0.0")
+            raise ValueError("sandbox does not support environment.tool.timeout_after_commit@1.0.0")
         if self._lifecycle_state_uncertain:
             return self._execution_evidence(
                 case,

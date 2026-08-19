@@ -87,7 +87,8 @@ def _evidence_confirms_expected_finding(evidence_path: Path) -> bool:
     corrected_rules = result.corrected_invariant_rules
     return (
         result.status == "failed"
-        and result.case.operator_id == "event.correction_after_first_response"
+        and result.case.operator_id == "conversation.correction_after_first_response"
+        and result.case.operator_version == "1.0.0"
         and result.requested_repetitions == 3
         and result.first_response_divergence_turn_id == "corrected-request"
         and result.first_committed_state_divergence_turn_id == "corrected-request"

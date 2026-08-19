@@ -40,7 +40,9 @@ class _StrictModel(ULModel):
 class TimeoutAfterCommitCase(_StrictModel):
     schema_version: Literal["1.0.0"] = "1.0.0"
     id: str = Field(min_length=1, max_length=200)
-    operator_id: Literal["tool.timeout_after_commit"] = "tool.timeout_after_commit"
+    operator_id: Literal["environment.tool.timeout_after_commit"] = (
+        "environment.tool.timeout_after_commit"
+    )
     operator_version: Literal["1.0.0"] = "1.0.0"
     event_id: str = Field(min_length=1, max_length=500)
     action_id: str = Field(min_length=1, max_length=500)
@@ -134,7 +136,9 @@ class TimeoutAfterCommitStressResult(_StrictModel):
 
 
 class TimeoutAfterCommitStressPlan(_StrictModel):
-    operator_id: Literal["tool.timeout_after_commit"] = "tool.timeout_after_commit"
+    operator_id: Literal["environment.tool.timeout_after_commit"] = (
+        "environment.tool.timeout_after_commit"
+    )
     operator_version: Literal["1.0.0"] = "1.0.0"
     repetitions: int = Field(ge=1)
     target_calls_per_repetition: int = Field(ge=1)
@@ -151,7 +155,7 @@ def plan_timeout_after_commit_stress_test(
     _validate_run_inputs(repetitions, max_sandbox_api_calls)
     event_config = target_config.timeout_after_commit
     if event_config is None or event_config.version != case.operator_version:
-        raise ValueError("sandbox does not support tool.timeout_after_commit@1.0.0")
+        raise ValueError("sandbox does not support environment.tool.timeout_after_commit@1.0.0")
     target_calls_per_repetition = json_http_sandbox_calls_per_conversation(target_config, 1) + 3
     required_target_calls = repetitions * target_calls_per_repetition
     if required_target_calls > max_sandbox_api_calls:
@@ -185,7 +189,7 @@ async def run_timeout_after_commit_stress_test(
     if not sandbox.capabilities.supports_state_observation:
         raise ValueError("timeout-after-commit testing requires state observation support")
     if sandbox.capabilities.timeout_after_commit_version != case.operator_version:
-        raise ValueError("sandbox does not support tool.timeout_after_commit@1.0.0")
+        raise ValueError("sandbox does not support environment.tool.timeout_after_commit@1.0.0")
 
     planned_case = _evaluation_case(case, max_sandbox_api_calls, sandbox)
     target_calls_per_repetition = sandbox.api_calls_for_case(planned_case)

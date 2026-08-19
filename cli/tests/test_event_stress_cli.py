@@ -18,7 +18,8 @@ def _write_inputs(tmp_path: Path) -> tuple[Path, Path, Path]:
             {
                 "schema_version": "1.0.0",
                 "id": "invoice-correction",
-                "operator_id": "event.correction_after_first_response",
+                "operator_id": "conversation.correction_after_first_response",
+                "operator_version": "1.0.0",
                 "conversation": [
                     {"id": "initial", "role": "user", "content": "Pay AC-100."},
                     {
@@ -115,7 +116,7 @@ def test_correction_dry_run_reports_complete_plan_without_calls(tmp_path: Path) 
     )
 
     assert result.exit_code == 0, result.output
-    assert "event.correction_after_first_response" in result.output
+    assert "conversation.correction_after_first_response@1.0.0" in result.output
     assert "Target calls per paired repetition: 14" in result.output
     assert "Potential sandbox API calls: 42" in result.output
     assert "External calls: none" in result.output

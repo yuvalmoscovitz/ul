@@ -37,7 +37,7 @@ checked-in `target.json`. The sandbox API mapping describes this exchange:
 }
 ```
 
-UL applies `surface.disfluency_repeat`, replays the original and accepted variation three
+UL applies `input.surface.disfluency_repeat`, replays the original and accepted variation three
 times each, and compares their observed actions. The seeded agent mishandles a repeated word,
 changing the committed invoice from `AC-100` to `AC-101`, so a typical model-generated variation
 produces a stable 3/3 `changed action value` finding for review. This is deliberately a
@@ -59,7 +59,7 @@ shape with its private ephemeral sandbox configuration:
 uv run ul dataset evaluate examples/quickstart/dataset.jsonl \
   --sandbox-config tmp/quickstart-.../target.json \
   --invariants examples/quickstart/invariants.json \
-  --operator surface.disfluency_repeat \
+  --operator input.surface.disfluency_repeat \
   --limit 1 \
   --repetitions 3 \
   --max-sandbox-api-calls 36 \

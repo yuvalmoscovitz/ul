@@ -43,7 +43,9 @@ class ProductionSourcePage(_StrictModel):
 
 
 class TimeoutAfterCommitEventRequest(_StrictModel):
-    operator_id: Literal["tool.timeout_after_commit"] = "tool.timeout_after_commit"
+    operator_id: Literal["environment.tool.timeout_after_commit"] = (
+        "environment.tool.timeout_after_commit"
+    )
     operator_version: Literal["1.0.0"] = "1.0.0"
     event_id: str = Field(min_length=1, max_length=500)
     turn_id: str = Field(min_length=1, max_length=500)

@@ -286,7 +286,7 @@ class DatasetEvaluationRunner:
         self,
         source: InteractionRecord,
         *,
-        operator_ids: Iterable[str] = ("surface.rephrase",),
+        operator_ids: Iterable[str] = ("input.surface.rephrase",),
         repetitions: int = 3,
     ) -> DatasetEvaluationResult:
         if type(repetitions) is not int or repetitions < 1:

@@ -118,7 +118,7 @@ def _evidence_confirms_repeatable_wrong_invoice(evidence_path: Path) -> bool:
             return False
         finding_items = cast(list[object], findings)
         return (
-            case.get("operator_id") == "surface.disfluency_repeat"
+            case.get("operator_id") == "input.surface.disfluency_repeat"
             and case.get("variation_accepted") is True
             and case.get("status") == "REPEATABLE DIFFERENCE — REVIEW"
             and _observations_are_stable_three_of_three(case.get("observations"))
@@ -259,7 +259,7 @@ def main(
             "--invariants",
             str(_INVARIANTS_PATH),
             "--operator",
-            "surface.disfluency_repeat",
+            "input.surface.disfluency_repeat",
             "--limit",
             "1",
             "--repetitions",

@@ -194,7 +194,7 @@ def _evidence_record() -> dict[str, Any]:
         },
         "cases": [
             {
-                "operator_id": "surface.disfluency_repeat",
+                "operator_id": "input.surface.disfluency_repeat",
                 "operator_version": "1.0.0",
                 "augmented_input": "Pay pay AC-100.",
                 "status": "REPEATABLE DIFFERENCE — REVIEW",
@@ -232,7 +232,7 @@ def _evidence_record() -> dict[str, Any]:
             "variations": [
                 {
                     "arm": "variation",
-                    "operator_id": "surface.disfluency_repeat",
+                    "operator_id": "input.surface.disfluency_repeat",
                     "rules": [
                         _rule("violated", "AC-101", "AC-100"),
                         _amount_rule("violated"),
@@ -248,7 +248,7 @@ def _technical_details() -> dict[str, Any]:
     source_frame = SemanticFrame(interaction_id="quickstart-payment", extractor_version="test")
     candidate = DatasetAugmentationCandidate(
         source_interaction_id="quickstart-payment",
-        operator_id="surface.disfluency_repeat",
+        operator_id="input.surface.disfluency_repeat",
         operator_version="1.0.0",
         augmented_input="Pay pay AC-100.",
         expected_input_frame=source_frame,
@@ -301,7 +301,7 @@ def _technical_details() -> dict[str, Any]:
             DatasetEvaluationCase(
                 candidate=candidate,
                 verdict="no_divergence",
-                trial_set=trial_set("surface.disfluency_repeat", "AC-101", "12600"),
+                trial_set=trial_set("input.surface.disfluency_repeat", "AC-101", "12600"),
             ),
         ),
     )

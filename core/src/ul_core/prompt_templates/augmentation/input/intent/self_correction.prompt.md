@@ -1,5 +1,5 @@
 +++
-name = "augmentation.intent.self_correction"
+name = "augmentation.input.intent.self_correction"
 description = "Adds one explicit inline correction for a specified argument."
 author = "UL"
 +++

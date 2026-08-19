@@ -28,14 +28,14 @@ from ul_core.prompts import PromptManager, prompt_provenance
 _PROMPTS = PromptManager.instance()
 
 OperatorId = Literal[
-    "surface.rephrase",
-    "surface.typing_noise",
-    "surface.fragmented_syntax",
-    "surface.disfluency_repeat",
-    "style.terse",
-    "style.verbose",
-    "tone.frustrated",
-    "intent.self_correction",
+    "input.surface.rephrase",
+    "input.surface.typing_noise",
+    "input.surface.fragmented_syntax",
+    "input.surface.disfluency_repeat",
+    "input.style.terse",
+    "input.style.verbose",
+    "input.tone.frustrated",
+    "input.intent.self_correction",
 ]
 AllowedChange = Literal[
     "surface_form_only",
@@ -44,14 +44,14 @@ AllowedChange = Literal[
 ]
 
 _OPERATOR_PROMPT_NAMES: dict[OperatorId, str] = {
-    "surface.rephrase": "augmentation.surface.rephrase",
-    "surface.typing_noise": "augmentation.surface.typing_noise",
-    "surface.fragmented_syntax": "augmentation.surface.fragmented_syntax",
-    "surface.disfluency_repeat": "augmentation.surface.disfluency_repeat",
-    "style.terse": "augmentation.style.terse",
-    "style.verbose": "augmentation.style.verbose",
-    "tone.frustrated": "augmentation.tone.frustrated",
-    "intent.self_correction": "augmentation.intent.self_correction",
+    "input.surface.rephrase": "augmentation.input.surface.rephrase",
+    "input.surface.typing_noise": "augmentation.input.surface.typing_noise",
+    "input.surface.fragmented_syntax": "augmentation.input.surface.fragmented_syntax",
+    "input.surface.disfluency_repeat": "augmentation.input.surface.disfluency_repeat",
+    "input.style.terse": "augmentation.input.style.terse",
+    "input.style.verbose": "augmentation.input.style.verbose",
+    "input.tone.frustrated": "augmentation.input.tone.frustrated",
+    "input.intent.self_correction": "augmentation.input.intent.self_correction",
 }
 
 
@@ -79,52 +79,52 @@ class DatasetAugmentationOperator(ULModel):
 
 _BUILTIN_OPERATORS = (
     DatasetAugmentationOperator(
-        id="surface.rephrase",
-        instruction=_PROMPTS.get_prompt("augmentation.surface.rephrase"),
+        id="input.surface.rephrase",
+        instruction=_PROMPTS.get_prompt("augmentation.input.surface.rephrase"),
         allowed_change="surface_form_only",
     ),
     DatasetAugmentationOperator(
-        id="surface.typing_noise",
-        instruction=_PROMPTS.get_prompt("augmentation.surface.typing_noise"),
+        id="input.surface.typing_noise",
+        instruction=_PROMPTS.get_prompt("augmentation.input.surface.typing_noise"),
         allowed_change="declared_communication_form",
         target_communication_kind="typing_noise",
     ),
     DatasetAugmentationOperator(
-        id="surface.fragmented_syntax",
-        instruction=_PROMPTS.get_prompt("augmentation.surface.fragmented_syntax"),
+        id="input.surface.fragmented_syntax",
+        instruction=_PROMPTS.get_prompt("augmentation.input.surface.fragmented_syntax"),
         allowed_change="declared_communication_form",
         target_communication_kind="fragmented_syntax",
         target_marker_required=True,
     ),
     DatasetAugmentationOperator(
-        id="surface.disfluency_repeat",
-        instruction=_PROMPTS.get_prompt("augmentation.surface.disfluency_repeat"),
+        id="input.surface.disfluency_repeat",
+        instruction=_PROMPTS.get_prompt("augmentation.input.surface.disfluency_repeat"),
         allowed_change="declared_communication_form",
         target_communication_kind="repetition",
     ),
     DatasetAugmentationOperator(
-        id="style.terse",
-        instruction=_PROMPTS.get_prompt("augmentation.style.terse"),
+        id="input.style.terse",
+        instruction=_PROMPTS.get_prompt("augmentation.input.style.terse"),
         allowed_change="declared_communication_form",
         target_communication_kind="terse",
     ),
     DatasetAugmentationOperator(
-        id="style.verbose",
-        instruction=_PROMPTS.get_prompt("augmentation.style.verbose"),
+        id="input.style.verbose",
+        instruction=_PROMPTS.get_prompt("augmentation.input.style.verbose"),
         allowed_change="declared_communication_form",
         target_communication_kind="verbose",
     ),
     DatasetAugmentationOperator(
-        id="tone.frustrated",
-        instruction=_PROMPTS.get_prompt("augmentation.tone.frustrated"),
+        id="input.tone.frustrated",
+        instruction=_PROMPTS.get_prompt("augmentation.input.tone.frustrated"),
         allowed_change="declared_communication_form",
         target_communication_kind="frustrated",
         target_marker_required=True,
         human_review_required=True,
     ),
     DatasetAugmentationOperator(
-        id="intent.self_correction",
-        instruction=_PROMPTS.get_prompt("augmentation.intent.self_correction"),
+        id="input.intent.self_correction",
+        instruction=_PROMPTS.get_prompt("augmentation.input.intent.self_correction"),
         allowed_change="structured_self_correction",
         target_communication_kind="self_correction",
         target_marker_required=True,
@@ -140,7 +140,7 @@ def builtin_dataset_augmentation_operators() -> tuple[DatasetAugmentationOperato
 
 class DatasetAugmentationCandidate(ULModel):
     source_interaction_id: str = Field(min_length=1)
-    operator_id: OperatorId = "surface.rephrase"
+    operator_id: OperatorId = "input.surface.rephrase"
     operator_version: Literal["1.0.0"] = "1.0.0"
     allowed_change: AllowedChange = "surface_form_only"
     human_review_required: bool = False
@@ -177,7 +177,7 @@ class DatasetAugmentationEngine:
         records: Iterable[InteractionRecord],
         *,
         max_records: int = 25,
-        operator_ids: Iterable[str] = ("surface.rephrase",),
+        operator_ids: Iterable[str] = ("input.surface.rephrase",),
     ) -> DatasetAugmentationResult:
         selected_operators = _select_operators(operator_ids)
         if not 1 <= max_records <= self.maximum_records:
@@ -222,14 +222,14 @@ class DatasetAugmentationEngine:
                     )
                     if planned_provisional_quote is None:
                         continue
-                if operator.id == "surface.typing_noise":
+                if operator.id == "input.surface.typing_noise":
                     rendered_input = _add_typing_noise(record, expected_input_frame, operator)
-                elif operator.id == "surface.disfluency_repeat":
+                elif operator.id == "input.surface.disfluency_repeat":
                     rendered_input = _add_word_repetition(record, expected_input_frame, operator)
                 elif operator.allowed_change == "structured_self_correction":
                     transformation_prompt_names = (
                         _OPERATOR_PROMPT_NAMES[operator.id],
-                        "augmentation.intent.self_correction_argument",
+                        "augmentation.input.intent.self_correction_argument",
                     )
                     if selected_correction_factor is None:
                         raise AssertionError("self-correction requires a selected factor")
@@ -237,7 +237,7 @@ class DatasetAugmentationEngine:
                     if correction_quote is None:
                         raise AssertionError("selected correction factor requires a unique quote")
                     argument_instruction = _PROMPTS.get_prompt(
-                        "augmentation.intent.self_correction_argument",
+                        "augmentation.input.intent.self_correction_argument",
                         source_text=json.dumps(correction_quote, ensure_ascii=False),
                         temporary_text=json.dumps(planned_provisional_quote, ensure_ascii=False),
                     )
@@ -732,16 +732,18 @@ def _surface_footprint_reasons(
     source_word_count = len(re.findall(r"\w+", source_input, flags=re.UNICODE))
     augmented_words = re.findall(r"\w+", augmented_input, flags=re.UNICODE)
     augmented_word_count = len(augmented_words)
-    if operator_id == "surface.rephrase" and _word_key(source_input) == _word_key(augmented_input):
+    if operator_id == "input.surface.rephrase" and _word_key(source_input) == _word_key(
+        augmented_input
+    ):
         return ("rendered input only changes case, spacing, or punctuation",)
-    if operator_id == "style.terse" and augmented_word_count * 10 > source_word_count * 9:
+    if operator_id == "input.style.terse" and augmented_word_count * 10 > source_word_count * 9:
         return ("rendered input is not visibly shorter than the source",)
-    if operator_id == "style.verbose" and not (
+    if operator_id == "input.style.verbose" and not (
         source_word_count * 15 <= augmented_word_count * 10
         and augmented_word_count <= source_word_count * 2
     ):
         return ("rendered input is not between 1.5 and 2 times the source length",)
-    if operator_id == "surface.disfluency_repeat":
+    if operator_id == "input.surface.disfluency_repeat":
         source_repetition_count = sum(
             first.casefold() == second.casefold()
             for first, second in pairwise(re.findall(r"\w+", source_input, flags=re.UNICODE))

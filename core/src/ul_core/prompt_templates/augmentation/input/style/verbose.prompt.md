@@ -1,5 +1,5 @@
 +++
-name = "augmentation.style.verbose"
+name = "augmentation.input.style.verbose"
 description = "Rewrites an input in a visibly wordier everyday style."
 author = "UL"
 +++

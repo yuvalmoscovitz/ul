@@ -358,7 +358,7 @@ def run_correction_after_first_response(
         raise typer.BadParameter(str(error)) from None
 
     if dry_run:
-        typer.echo(f"Operator: {plan.operator_id}")
+        typer.echo(f"Operator: {plan.operator_id}@{plan.operator_version}")
         typer.echo("Ordered turns: initial request -> correction after first response")
         typer.echo(f"Repetitions: {plan.repetitions}")
         typer.echo(f"Target calls per paired repetition: {plan.target_calls_per_pair}")
