@@ -57,7 +57,9 @@ _OPERATOR_PROMPT_NAMES: dict[OperatorId, str] = {
 
 class DatasetAugmentationOperator(ULModel):
     id: OperatorId
-    version: Literal["1.0.0"] = "1.0.0"
+    version: str = Field(
+        default="1.0.0", pattern=r"^(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)$"
+    )
     instruction: str = Field(min_length=1)
     allowed_change: AllowedChange
     target_communication_kind: str | None = Field(default=None, min_length=1)
@@ -131,17 +133,37 @@ _BUILTIN_OPERATORS = (
         human_review_required=True,
     ),
 )
-_BUILTIN_OPERATORS_BY_ID = {operator.id: operator for operator in _BUILTIN_OPERATORS}
+_BUILTIN_OPERATORS_BY_REFERENCE = {
+    (operator.id, operator.version): operator for operator in _BUILTIN_OPERATORS
+}
 
 
 def builtin_dataset_augmentation_operators() -> tuple[DatasetAugmentationOperator, ...]:
     return _BUILTIN_OPERATORS
 
 
+def resolve_dataset_augmentation_operator(reference: str) -> DatasetAugmentationOperator:
+    if not reference or len(reference) > 251 or reference.count("@") > 1:
+        raise ValueError("unknown dataset augmentation reference")
+    operator_id, separator, version = reference.partition("@")
+    if separator:
+        operator = _BUILTIN_OPERATORS_BY_REFERENCE.get((operator_id, version))
+        if operator is None:
+            raise ValueError("unknown dataset augmentation reference")
+        return operator
+    matching = tuple(operator for operator in _BUILTIN_OPERATORS if operator.id == operator_id)
+    if not matching:
+        raise ValueError("unknown dataset augmentation reference")
+    return max(matching, key=lambda operator: _version_tuple(operator.version))
+
+
 class DatasetAugmentationCandidate(ULModel):
     source_interaction_id: str = Field(min_length=1)
     operator_id: OperatorId = "input.surface.rephrase"
-    operator_version: Literal["1.0.0"] = "1.0.0"
+    operator_version: str = Field(
+        default="1.0.0",
+        pattern=r"^(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)$",
+    )
     allowed_change: AllowedChange = "surface_form_only"
     human_review_required: bool = False
     augmented_input: str = Field(min_length=1)
@@ -937,19 +959,25 @@ def _canonical_semantics(frame: SemanticFrame) -> tuple[object, ...]:
 def _select_operators(
     operator_ids: Iterable[str],
 ) -> tuple[DatasetAugmentationOperator, ...]:
-    selected_ids = tuple(islice(operator_ids, len(_BUILTIN_OPERATORS) + 1))
-    if not selected_ids:
+    selected_references = tuple(islice(operator_ids, len(_BUILTIN_OPERATORS) + 1))
+    if not selected_references:
         raise ValueError("operator_ids must contain at least one operator")
-    if any(not operator_id for operator_id in selected_ids):
+    if any(not reference for reference in selected_references):
         raise ValueError("operator identifiers must not be empty")
-    if len(selected_ids) != len(set(selected_ids)):
-        raise ValueError("operator identifiers must be unique")
-    if len(selected_ids) > len(_BUILTIN_OPERATORS):
+    if len(selected_references) > len(_BUILTIN_OPERATORS):
         raise ValueError("operator count exceeds the built-in library")
-    unknown_ids = set(selected_ids) - _BUILTIN_OPERATORS_BY_ID.keys()
-    if unknown_ids:
-        raise ValueError(f"unknown operator identifiers: {sorted(unknown_ids)}")
-    return tuple(_BUILTIN_OPERATORS_BY_ID[operator_id] for operator_id in selected_ids)
+    selected_operators = tuple(
+        resolve_dataset_augmentation_operator(reference) for reference in selected_references
+    )
+    resolved_references = tuple((operator.id, operator.version) for operator in selected_operators)
+    if len(resolved_references) != len(set(resolved_references)):
+        raise ValueError("operator identifiers must be unique")
+    return selected_operators
+
+
+def _version_tuple(version: str) -> tuple[int, int, int]:
+    major, minor, patch = version.split(".")
+    return int(major), int(minor), int(patch)
 
 
 def _text_key(text: str) -> str:

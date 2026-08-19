@@ -4,6 +4,15 @@ from ul_core.augmentation import (
     AugmentationRegistry,
     builtin_augmentation_registry,
 )
+from ul_core.augmentation_catalog import (
+    AugmentationBinding,
+    AugmentationExecutionOwner,
+    AugmentationRef,
+    AugmentationRequirements,
+    BuiltinAugmentationCatalog,
+    BuiltinAugmentationSpec,
+    builtin_augmentation_catalog,
+)
 from ul_core.contracts import ProductionSource, SemanticEquivalenceVerifier
 from ul_core.coverage import (
     CoverageArchive,
@@ -44,7 +53,13 @@ from ul_core.prompts import PromptManager, PromptTemplateInfo
 
 __all__ = [
     "AugmentationApplication",
+    "AugmentationBinding",
+    "AugmentationExecutionOwner",
+    "AugmentationRef",
     "AugmentationRegistry",
+    "AugmentationRequirements",
+    "BuiltinAugmentationCatalog",
+    "BuiltinAugmentationSpec",
     "CampaignCaseResult",
     "CampaignResult",
     "CoverageArchive",
@@ -74,6 +89,7 @@ __all__ = [
     "TimeoutAfterCommitEventEvidence",
     "TimeoutAfterCommitEventRequest",
     "TimeoutAfterCommitTriggerStatus",
+    "builtin_augmentation_catalog",
     "builtin_augmentation_registry",
     "extract_semantic_coverage",
 ]

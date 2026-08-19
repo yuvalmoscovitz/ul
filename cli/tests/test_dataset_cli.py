@@ -1784,8 +1784,7 @@ def test_help_explains_dataset_sandbox_and_operator_contract() -> None:
     assert "Maximum customer" in normalized_help
     assert "sandbox API" in normalized_help
     assert "requests" in normalized_help
-    assert "operator. Run 'ul" in normalized_help
-    assert "operators' for" in normalized_help
+    assert "Discover operators: ul augmentations list --mode dataset_variation" in normalized_help
     assert "--sandbox-config" in normalized_help
     assert "configuration" in normalized_help
     help_text = " ".join(normalized_help.replace("│", "").split())
@@ -1806,7 +1805,7 @@ def test_help_explains_dataset_sandbox_and_operator_contract() -> None:
     assert "input.intent.self_correction" in operators.output
 
 
-def test_operator_list_is_fixed_and_self_correction_keeps_existing_call_accounting(
+def test_legacy_operator_list_delegates_to_catalog_and_keeps_existing_call_accounting(
     tmp_path: Path,
 ) -> None:
     operators = runner.invoke(root_app, ["dataset", "operators"])
@@ -1818,14 +1817,14 @@ def test_operator_list_is_fixed_and_self_correction_keeps_existing_call_accounti
         if line.startswith("- ")
     )
     assert listed_operator_ids == (
-        "input.surface.rephrase",
-        "input.surface.typing_noise",
-        "input.surface.fragmented_syntax",
-        "input.surface.disfluency_repeat",
-        "input.style.terse",
-        "input.style.verbose",
-        "input.tone.frustrated",
-        "input.intent.self_correction",
+        "input.intent.self_correction@1.0.0:",
+        "input.style.terse@1.0.0:",
+        "input.style.verbose@1.0.0:",
+        "input.surface.disfluency_repeat@1.0.0:",
+        "input.surface.fragmented_syntax@1.0.0:",
+        "input.surface.rephrase@1.0.0:",
+        "input.surface.typing_noise@1.0.0:",
+        "input.tone.frustrated@1.0.0:",
     )
 
     dataset = tmp_path / "interactions.jsonl"
@@ -1837,15 +1836,29 @@ def test_operator_list_is_fixed_and_self_correction_keeps_existing_call_accounti
             "evaluate",
             str(dataset),
             "--operator",
-            "input.intent.self_correction",
+            "input.intent.self_correction@1.0.0",
             "--dry-run",
         ],
     )
 
     assert dry_run.exit_code == 0, dry_run.output
-    assert "Operators: input.intent.self_correction" in dry_run.output
+    assert "Operators: input.intent.self_correction@1.0.0" in dry_run.output
     assert "Potential semantic model calls: up to 10" in dry_run.output
     assert "Potential sandbox API calls: up to 6" in dry_run.output
+
+    wrong_version = runner.invoke(
+        root_app,
+        [
+            "dataset",
+            "evaluate",
+            str(dataset),
+            "--operator",
+            "input.intent.self_correction@2.0.0",
+            "--dry-run",
+        ],
+    )
+    assert wrong_version.exit_code == 2
+    assert "unknown augmentation operator reference" in wrong_version.output
 
 
 def test_run_context_records_canonical_provider_identity() -> None:

@@ -1,6 +1,15 @@
 """Public Python SDK for UL."""
 
 from ul_core.augmentation import builtin_augmentation_registry
+from ul_core.augmentation_catalog import (
+    AugmentationBinding,
+    AugmentationExecutionOwner,
+    AugmentationRef,
+    AugmentationRequirements,
+    BuiltinAugmentationCatalog,
+    BuiltinAugmentationSpec,
+    builtin_augmentation_catalog,
+)
 from ul_core.contracts import (
     ProductionSource,
     SemanticEquivalenceVerifier,
@@ -49,6 +58,7 @@ from ul.dataset_augmentation import (
     DatasetAugmentationOperator,
     DatasetAugmentationResult,
     builtin_dataset_augmentation_operators,
+    resolve_dataset_augmentation_operator,
 )
 from ul.dataset_evaluation import (
     DatasetEvaluationBaseline,
@@ -177,6 +187,12 @@ from ul.trace_replay import (
 __all__ = [
     "Action",
     "ActionEffect",
+    "AugmentationBinding",
+    "AugmentationExecutionOwner",
+    "AugmentationRef",
+    "AugmentationRequirements",
+    "BuiltinAugmentationCatalog",
+    "BuiltinAugmentationSpec",
     "CorrectionAfterFirstResponseCase",
     "CorrectionDivergence",
     "CorrectionStressPlan",
@@ -289,6 +305,7 @@ __all__ = [
     "TraceReplayResult",
     "TraceReplayTrial",
     "UserInputRecord",
+    "builtin_augmentation_catalog",
     "builtin_augmentation_registry",
     "builtin_dataset_augmentation_operators",
     "create_dataset_regression_case",
@@ -316,6 +333,7 @@ __all__ = [
     "plan_trace_replay",
     "replay_dataset_regression",
     "replay_multi_turn_regression",
+    "resolve_dataset_augmentation_operator",
     "run_correction_stress_test",
     "run_dataset_regressions",
     "run_retry_after_successful_commit_stress_test",

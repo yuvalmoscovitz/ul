@@ -1212,6 +1212,7 @@ async def test_operator_footprints_reject_mislabeled_outputs(
         ("unknown",),
         ("surface.rephrase",),
         ("input.style.terse", "input.style.terse"),
+        ("input.style.terse", "input.style.terse@1.0.0"),
     ],
 )
 async def test_engine_rejects_invalid_operator_selection_before_model_calls(
@@ -1224,6 +1225,18 @@ async def test_engine_rejects_invalid_operator_selection_before_model_calls(
 
     assert model.deconstructed_records == []
     assert model.rendered_inputs == []
+
+
+async def test_engine_selects_an_exact_versioned_operator_reference() -> None:
+    model = DeterministicSemanticModel({})
+
+    result = await DatasetAugmentationEngine(model, model).augment(
+        (), operator_ids=("input.surface.rephrase@1.0.0",)
+    )
+
+    assert result.source_frames == ()
+    assert result.candidates == ()
+    assert model.deconstructed_records == []
 
 
 async def test_engine_preflights_candidate_limit_before_model_calls() -> None:
