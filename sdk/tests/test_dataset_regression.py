@@ -14,6 +14,7 @@ from ul.dataset_invariants import (
     JsonValueEqualsLiteralInvariant,
     JsonValueInAllowedSetInvariant,
     JsonValuesEqualInvariant,
+    NoNewEffectInvariant,
 )
 from ul.dataset_regression import (
     DatasetRegressionCase,
@@ -558,6 +559,40 @@ def test_run_uses_extended_schema_when_any_case_uses_extended_rules() -> None:
     serialized["schema_version"] = "1.0.0"
     with pytest.raises(ValidationError, match=r"only supports result schema 1\.0\.0"):
         DatasetRegressionRunResult.model_validate_json(json.dumps(serialized))
+
+
+def test_transition_rule_uses_regression_schema_1_2() -> None:
+    legacy_case = _case(repetitions=1)
+
+    transition_case = create_dataset_regression_case(
+        finding_id=FINDING_ID,
+        evidence_sha256="3" * 64,
+        review_id=REVIEW_ID,
+        interaction_id="transition-rule",
+        operator_id="context.pasted_block",
+        operator_version="1.0.0",
+        original_input="Original input.",
+        variation_input="Variation input.",
+        target_config=legacy_case.target.config,
+        source_suite_sha256=SUITE_SHA256,
+        observation_authority="committed_state_snapshot",
+        state_observation_authority="sandbox_self_reported",
+        selected_rules=(
+            NoNewEffectInvariant(
+                type="no_new_effect",
+                id="no-payment",
+                version="1.0.0",
+                description="No payment may be committed.",
+                severity="critical",
+                before_checkpoint="before_turn",
+                after_checkpoint="after_turn",
+                observation_pointer="/payments",
+            ),
+        ),
+        discovery_repetitions=1,
+    )
+
+    assert transition_case.schema_version == "1.2.0"
 
 
 def test_run_enforces_total_budget_and_unique_cases_before_execution() -> None:

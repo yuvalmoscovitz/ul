@@ -16,12 +16,16 @@ from ul.dataset_invariants import (
     DatasetInvariantRule,
     DatasetInvariantRuleEvaluation,
     DatasetInvariantRuleResult,
+    DatasetInvariantTransitionRuleEvaluation,
     DatasetInvariantValueEqualsRuleEvaluation,
     DatasetInvariantValueInSetRuleEvaluation,
+    ExactlyOneNewEffectInvariant,
     JsonArrayItemsUniqueByInvariant,
     JsonValueEqualsLiteralInvariant,
     JsonValueInAllowedSetInvariant,
     JsonValuesEqualInvariant,
+    NoNewEffectInvariant,
+    UnchangedBetweenCheckpointsInvariant,
 )
 from ul.dataset_regression import (
     DatasetRegressionCase,
@@ -632,6 +636,25 @@ def _invariant_rule_definition(rule: DatasetInvariantRuleResult) -> DatasetInvar
             severity=rule.severity,
             value_pointer=rule.value_pointer,
             allowed_values=rule.allowed_values,
+        )
+    if isinstance(rule, DatasetInvariantTransitionRuleEvaluation):
+        transition_rule_types = {
+            "no_new_effect": NoNewEffectInvariant,
+            "exactly_one_new_effect": ExactlyOneNewEffectInvariant,
+            "unchanged_between_checkpoints": UnchangedBetweenCheckpointsInvariant,
+        }
+        transition_rule_type = transition_rule_types[rule.rule_type]
+        return transition_rule_type.model_validate(
+            {
+                "type": rule.rule_type,
+                "id": rule.rule_id,
+                "version": rule.rule_version,
+                "description": rule.description,
+                "severity": rule.severity,
+                "before_checkpoint": rule.before_checkpoint,
+                "after_checkpoint": rule.after_checkpoint,
+                "observation_pointer": rule.observation_pointer,
+            }
         )
     return JsonArrayItemsUniqueByInvariant(
         type="json_array_items_unique_by",

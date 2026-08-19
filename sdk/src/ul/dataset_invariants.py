@@ -7,7 +7,7 @@ import re
 from collections.abc import Sequence
 from decimal import Decimal
 from pathlib import Path
-from typing import Annotated, Literal, Self, cast
+from typing import Annotated, Literal, Self, TypeGuard, cast
 
 from pydantic import ConfigDict, Field, JsonValue, ValidationError, field_validator, model_validator
 from ul_core.dataset import ObservedAgentOutput
@@ -78,6 +78,23 @@ ArrayUniqueTrialReasonCode = Literal[
     "key_value_not_scalar",
     "key_non_integer_number_not_supported",
     "key_value_exceeds_limit",
+]
+TransitionTrialReasonCode = Literal[
+    "no_new_effect",
+    "new_effect_observed",
+    "exactly_one_new_effect",
+    "unexpected_new_effect_count",
+    "value_unchanged",
+    "value_changed",
+    "before_checkpoint_missing",
+    "after_checkpoint_missing",
+    "before_pointer_missing",
+    "after_pointer_missing",
+    "before_value_not_array",
+    "after_value_not_array",
+    "effect_array_exceeds_limit",
+    "effect_history_rewritten",
+    "evaluation_work_limit_exceeded",
 ]
 AggregateReasonCode = Literal[
     "all_trials_satisfied",
@@ -190,17 +207,38 @@ class JsonArrayItemsUniqueByInvariant(_InvariantRule):
         return _validate_key_pointers(pointers)
 
 
+class _StateTransitionInvariant(_InvariantRule):
+    before_checkpoint: Literal["before_turn"]
+    after_checkpoint: Literal["after_turn"]
+    observation_pointer: str = Field(max_length=1_000, pattern=_JSON_POINTER_PATTERN)
+
+
+class NoNewEffectInvariant(_StateTransitionInvariant):
+    type: Literal["no_new_effect"]
+
+
+class ExactlyOneNewEffectInvariant(_StateTransitionInvariant):
+    type: Literal["exactly_one_new_effect"]
+
+
+class UnchangedBetweenCheckpointsInvariant(_StateTransitionInvariant):
+    type: Literal["unchanged_between_checkpoints"]
+
+
 DatasetInvariantRule = Annotated[
     JsonValuesEqualInvariant
     | JsonValueEqualsLiteralInvariant
     | JsonValueInAllowedSetInvariant
-    | JsonArrayItemsUniqueByInvariant,
+    | JsonArrayItemsUniqueByInvariant
+    | NoNewEffectInvariant
+    | ExactlyOneNewEffectInvariant
+    | UnchangedBetweenCheckpointsInvariant,
     Field(discriminator="type"),
 ]
 
 
 class DatasetInvariantSuite(_StrictModel):
-    schema_version: Literal["1.0.0", "1.1.0"]
+    schema_version: Literal["1.0.0", "1.1.0", "1.2.0"]
     observation_source: Literal["target_output"]
     observation_authority: ObservationAuthority
     rules: tuple[DatasetInvariantRule, ...] = Field(min_length=1, max_length=100)
@@ -219,6 +257,11 @@ class DatasetInvariantSuite(_StrictModel):
             not isinstance(rule, JsonValuesEqualInvariant) for rule in self.rules
         ):
             raise ValueError("invariant schema 1.0.0 supports only json_values_equal rules")
+        transition_rules = tuple(rule for rule in self.rules if _is_transition_rule(rule))
+        if transition_rules and self.schema_version != "1.2.0":
+            raise ValueError("state-transition rules require invariant schema 1.2.0")
+        if transition_rules and self.observation_authority != "committed_state_snapshot":
+            raise ValueError("state-transition rules require committed-state observation")
         return self
 
     @property
@@ -466,6 +509,68 @@ class DatasetInvariantArrayUniqueTrialEvaluation(_StrictModel):
         return self
 
 
+class DatasetInvariantTransitionTrialEvaluation(_StrictModel):
+    repetition: int = Field(ge=1)
+    status: InvariantStatus
+    reason_code: TransitionTrialReasonCode
+    before_checkpoint: Literal["before_turn"]
+    after_checkpoint: Literal["after_turn"]
+    observation_pointer: str = Field(max_length=1_000, pattern=_JSON_POINTER_PATTERN)
+    before_item_count: int | None = Field(default=None, ge=0)
+    after_item_count: int | None = Field(default=None, ge=0)
+    new_effect_count: int | None = Field(default=None, ge=0)
+
+    @model_validator(mode="after")
+    def validate_evaluation(self) -> Self:
+        expected_status_by_reason: dict[TransitionTrialReasonCode, InvariantStatus] = {
+            "no_new_effect": "satisfied",
+            "new_effect_observed": "violated",
+            "exactly_one_new_effect": "satisfied",
+            "unexpected_new_effect_count": "violated",
+            "value_unchanged": "satisfied",
+            "value_changed": "violated",
+            "before_checkpoint_missing": "not_evaluable",
+            "after_checkpoint_missing": "not_evaluable",
+            "before_pointer_missing": "not_evaluable",
+            "after_pointer_missing": "not_evaluable",
+            "before_value_not_array": "not_evaluable",
+            "after_value_not_array": "not_evaluable",
+            "effect_array_exceeds_limit": "not_evaluable",
+            "effect_history_rewritten": "not_evaluable",
+            "evaluation_work_limit_exceeded": "not_evaluable",
+        }
+        if self.status != expected_status_by_reason[self.reason_code]:
+            raise ValueError("trial invariant status must match its reason")
+        count_reasons = {
+            "no_new_effect",
+            "new_effect_observed",
+            "exactly_one_new_effect",
+            "unexpected_new_effect_count",
+        }
+        if self.reason_code in count_reasons:
+            before_item_count = self.before_item_count
+            after_item_count = self.after_item_count
+            new_effect_count = self.new_effect_count
+            if before_item_count is None or after_item_count is None or new_effect_count is None:
+                raise ValueError("evaluated effect transitions require item counts")
+            if new_effect_count != after_item_count - before_item_count:
+                raise ValueError("new-effect count must match the checkpoint item counts")
+        elif self.new_effect_count is not None:
+            raise ValueError("unevaluable transitions cannot report a new-effect count")
+        if self.reason_code in {
+            "value_unchanged",
+            "value_changed",
+            "before_checkpoint_missing",
+            "after_checkpoint_missing",
+            "before_pointer_missing",
+            "after_pointer_missing",
+            "before_value_not_array",
+            "after_value_not_array",
+        } and any(count is not None for count in (self.before_item_count, self.after_item_count)):
+            raise ValueError("transition evidence must match its reason")
+        return self
+
+
 class _DatasetInvariantRuleEvaluation(_StrictModel):
     rule_id: str = Field(pattern=_IDENTIFIER_PATTERN)
     rule_version: str = Field(pattern=_VERSION_PATTERN)
@@ -587,11 +692,66 @@ class DatasetInvariantArrayUniqueRuleEvaluation(_DatasetInvariantRuleEvaluation)
         return self
 
 
+class DatasetInvariantTransitionRuleEvaluation(_DatasetInvariantRuleEvaluation):
+    rule_type: Literal[
+        "no_new_effect",
+        "exactly_one_new_effect",
+        "unchanged_between_checkpoints",
+    ]
+    before_checkpoint: Literal["before_turn"]
+    after_checkpoint: Literal["after_turn"]
+    observation_pointer: str = Field(max_length=1_000, pattern=_JSON_POINTER_PATTERN)
+    trials: tuple[DatasetInvariantTransitionTrialEvaluation, ...] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def validate_aggregate(self) -> Self:
+        _validate_rule_aggregate(self.status, self.reason_code, self.trials)
+        expected_location = (
+            self.before_checkpoint,
+            self.after_checkpoint,
+            self.observation_pointer,
+        )
+        if any(
+            (trial.before_checkpoint, trial.after_checkpoint, trial.observation_pointer)
+            != expected_location
+            for trial in self.trials
+        ):
+            raise ValueError("all invariant trials must use the rule transition location")
+        rule_reasons = {
+            "no_new_effect": {"no_new_effect", "new_effect_observed"},
+            "exactly_one_new_effect": {
+                "exactly_one_new_effect",
+                "unexpected_new_effect_count",
+            },
+            "unchanged_between_checkpoints": {"value_unchanged", "value_changed"},
+        }
+        shared_reasons = {
+            "before_checkpoint_missing",
+            "after_checkpoint_missing",
+            "before_pointer_missing",
+            "after_pointer_missing",
+        }
+        effect_only_reasons = {
+            "before_value_not_array",
+            "after_value_not_array",
+            "effect_array_exceeds_limit",
+            "effect_history_rewritten",
+            "evaluation_work_limit_exceeded",
+        }
+        allowed_reasons = rule_reasons[self.rule_type] | shared_reasons
+        if self.rule_type != "unchanged_between_checkpoints":
+            allowed_reasons |= effect_only_reasons
+        if any(trial.reason_code not in allowed_reasons for trial in self.trials):
+            raise ValueError("transition trial reason must match its rule type")
+        return self
+
+
 DatasetInvariantRuleResult = Annotated[
     DatasetInvariantRuleEvaluation
     | DatasetInvariantValueEqualsRuleEvaluation
     | DatasetInvariantValueInSetRuleEvaluation
-    | DatasetInvariantArrayUniqueRuleEvaluation,
+    | DatasetInvariantArrayUniqueRuleEvaluation
+    | DatasetInvariantTransitionRuleEvaluation,
     Field(discriminator="rule_type"),
 ]
 
@@ -665,6 +825,9 @@ def load_dataset_invariant_suite(path: str | Path) -> DatasetInvariantSuite:
             "json_value_equals_literal",
             "json_value_in_allowed_set",
             "json_array_items_unique_by",
+            "no_new_effect",
+            "exactly_one_new_effect",
+            "unchanged_between_checkpoints",
         }
         reasons = [
             f"{'.'.join(str(part) for part in issue['loc'] if part not in rule_discriminators)}: "
@@ -717,6 +880,10 @@ def evaluate_dataset_invariant_rules(
 ) -> tuple[DatasetInvariantRuleResult, ...]:
     if not outputs:
         raise ValueError("invariant evaluation requires at least one target output")
+    if observation_authority != "committed_state_snapshot" and any(
+        _is_transition_rule(rule) for rule in rules
+    ):
+        raise ValueError("state-transition rules require committed-state observation")
     array_work_budget = _ArrayInvariantWorkBudget(_MAXIMUM_ARRAY_INVARIANT_WORK_UNITS)
     selected_outputs = _outputs_for_observation_authority(outputs, observation_authority)
     return tuple(
@@ -759,13 +926,33 @@ def _evaluate_rule(
     observation_authority: ObservationAuthority,
     array_work_budget: _ArrayInvariantWorkBudget,
 ) -> DatasetInvariantRuleResult:
+    outputs = tuple(trial.target_output for trial in trials)
+    if _is_transition_rule(rule):
+        outputs = tuple(_output_with_before_turn_checkpoint(trial) for trial in trials)
     return _evaluate_rule_from_outputs(
         rule,
         _outputs_for_observation_authority(
-            tuple(trial.target_output for trial in trials),
+            outputs,
             observation_authority,
         ),
         array_work_budget=array_work_budget,
+    )
+
+
+def _output_with_before_turn_checkpoint(
+    trial: DatasetEvaluationTrial,
+) -> ObservedAgentOutput | None:
+    output = trial.target_output
+    evidence = trial.execution_evidence
+    if output is None or evidence is None or evidence.initial_state is None:
+        return output
+    return output.model_copy(
+        update={
+            "metadata": {
+                **output.metadata,
+                "committed_state_before_turn": evidence.initial_state.value,
+            }
+        }
     )
 
 
@@ -782,7 +969,14 @@ def _outputs_for_observation_authority(
             or "committed_state_snapshot" not in output.metadata
             or output.metadata.get("state_observation_authority")
             not in {"sandbox_self_reported", "independent_observer"}
-            else ObservedAgentOutput(raw_output=output.metadata["committed_state_snapshot"])
+            else ObservedAgentOutput(
+                raw_output=output.metadata["committed_state_snapshot"],
+                metadata={
+                    "committed_state_before_turn": output.metadata["committed_state_before_turn"]
+                }
+                if "committed_state_before_turn" in output.metadata
+                else {},
+            )
             for output in outputs
         )
     raise ValueError("unsupported observation authority")
@@ -794,6 +988,15 @@ def _evaluate_rule_from_outputs(
     *,
     array_work_budget: _ArrayInvariantWorkBudget,
 ) -> DatasetInvariantRuleResult:
+    if isinstance(
+        rule,
+        (
+            NoNewEffectInvariant,
+            ExactlyOneNewEffectInvariant,
+            UnchangedBetweenCheckpointsInvariant,
+        ),
+    ):
+        return _evaluate_transition_rule(rule, outputs, array_work_budget=array_work_budget)
     if isinstance(rule, JsonValueEqualsLiteralInvariant):
         return _evaluate_value_equals_rule(rule, outputs)
     if isinstance(rule, JsonValueInAllowedSetInvariant):
@@ -814,6 +1017,135 @@ def _evaluate_rule_from_outputs(
         status=status,
         reason_code=reason_code,
         trials=trial_results,
+    )
+
+
+def _evaluate_transition_rule(
+    rule: NoNewEffectInvariant
+    | ExactlyOneNewEffectInvariant
+    | UnchangedBetweenCheckpointsInvariant,
+    outputs: tuple[ObservedAgentOutput | None, ...],
+    *,
+    array_work_budget: _ArrayInvariantWorkBudget,
+) -> DatasetInvariantTransitionRuleEvaluation:
+    trials = tuple(
+        _evaluate_transition_output(
+            rule,
+            output,
+            repetition,
+            array_work_budget=array_work_budget,
+        )
+        for repetition, output in enumerate(outputs, start=1)
+    )
+    status, reason_code = _aggregate_trial_statuses(trials)
+    return DatasetInvariantTransitionRuleEvaluation(
+        rule_type=rule.type,
+        rule_id=rule.id,
+        rule_version=rule.version,
+        description=rule.description,
+        severity=rule.severity,
+        before_checkpoint=rule.before_checkpoint,
+        after_checkpoint=rule.after_checkpoint,
+        observation_pointer=rule.observation_pointer,
+        status=status,
+        reason_code=reason_code,
+        trials=trials,
+    )
+
+
+def _evaluate_transition_output(
+    rule: NoNewEffectInvariant
+    | ExactlyOneNewEffectInvariant
+    | UnchangedBetweenCheckpointsInvariant,
+    output: ObservedAgentOutput | None,
+    repetition: int,
+    *,
+    array_work_budget: _ArrayInvariantWorkBudget,
+) -> DatasetInvariantTransitionTrialEvaluation:
+    def result(
+        status: InvariantStatus,
+        reason_code: TransitionTrialReasonCode,
+        *,
+        before_item_count: int | None = None,
+        after_item_count: int | None = None,
+        new_effect_count: int | None = None,
+    ) -> DatasetInvariantTransitionTrialEvaluation:
+        return DatasetInvariantTransitionTrialEvaluation(
+            repetition=repetition,
+            status=status,
+            reason_code=reason_code,
+            before_checkpoint=rule.before_checkpoint,
+            after_checkpoint=rule.after_checkpoint,
+            observation_pointer=rule.observation_pointer,
+            before_item_count=before_item_count,
+            after_item_count=after_item_count,
+            new_effect_count=new_effect_count,
+        )
+
+    if output is None:
+        return result("not_evaluable", "after_checkpoint_missing")
+    if "committed_state_before_turn" not in output.metadata:
+        return result("not_evaluable", "before_checkpoint_missing")
+    before_found, before_value = _resolve_json_pointer(
+        output.metadata["committed_state_before_turn"], rule.observation_pointer
+    )
+    if not before_found:
+        return result("not_evaluable", "before_pointer_missing")
+    after_found, after_value = _resolve_json_pointer(output.raw_output, rule.observation_pointer)
+    if not after_found:
+        return result("not_evaluable", "after_pointer_missing")
+    if isinstance(rule, UnchangedBetweenCheckpointsInvariant):
+        unchanged = _json_values_equal(before_value, after_value)
+        return result(
+            "satisfied" if unchanged else "violated",
+            "value_unchanged" if unchanged else "value_changed",
+        )
+    if not isinstance(before_value, list):
+        return result("not_evaluable", "before_value_not_array")
+    if not isinstance(after_value, list):
+        return result("not_evaluable", "after_value_not_array")
+    before_items = cast(list[JsonValue], before_value)
+    after_items = cast(list[JsonValue], after_value)
+    before_count = len(before_items)
+    after_count = len(after_items)
+    if max(before_count, after_count) > _MAXIMUM_ARRAY_ITEMS:
+        return result(
+            "not_evaluable",
+            "effect_array_exceeds_limit",
+            before_item_count=before_count,
+            after_item_count=after_count,
+        )
+    if not array_work_budget.consume(before_count + after_count):
+        return result(
+            "not_evaluable",
+            "evaluation_work_limit_exceeded",
+            before_item_count=before_count,
+            after_item_count=after_count,
+        )
+    if after_count < before_count or not all(
+        _json_values_equal(before_item, after_item)
+        for before_item, after_item in zip(before_items, after_items, strict=False)
+    ):
+        return result(
+            "not_evaluable",
+            "effect_history_rewritten",
+            before_item_count=before_count,
+            after_item_count=after_count,
+        )
+    new_effect_count = after_count - before_count
+    expected_new_effects = 0 if isinstance(rule, NoNewEffectInvariant) else 1
+    satisfied = new_effect_count == expected_new_effects
+    reason_code: TransitionTrialReasonCode
+    if isinstance(rule, NoNewEffectInvariant):
+        reason_code = "no_new_effect" if satisfied else "new_effect_observed"
+    else:
+        reason_code = "exactly_one_new_effect" if satisfied else "unexpected_new_effect_count"
+    return result(
+        "satisfied" if satisfied else "violated",
+        reason_code,
+        before_item_count=before_count,
+        after_item_count=after_count,
+        new_effect_count=new_effect_count,
     )
 
 
@@ -1213,6 +1545,7 @@ def _validate_rule_aggregate(
         | DatasetInvariantValueEqualsTrialEvaluation
         | DatasetInvariantValueInSetTrialEvaluation
         | DatasetInvariantArrayUniqueTrialEvaluation
+        | DatasetInvariantTransitionTrialEvaluation
     ],
 ) -> None:
     if tuple(trial.repetition for trial in trials) != tuple(range(1, len(trials) + 1)):
@@ -1228,6 +1561,7 @@ def _aggregate_trial_statuses(
         | DatasetInvariantValueEqualsTrialEvaluation
         | DatasetInvariantValueInSetTrialEvaluation
         | DatasetInvariantArrayUniqueTrialEvaluation
+        | DatasetInvariantTransitionTrialEvaluation
     ],
 ) -> tuple[InvariantStatus, AggregateReasonCode]:
     statuses = {trial.status for trial in trials}
@@ -1322,6 +1656,26 @@ def _json_scalars_equal(left: object, right: object) -> tuple[bool, bool]:
     return True, left == right
 
 
+def _json_values_equal(left: object, right: object) -> bool:
+    if _is_json_scalar(left) or _is_json_scalar(right):
+        comparable, equal = _json_scalars_equal(left, right)
+        return comparable and equal
+    if isinstance(left, list) and isinstance(right, list):
+        left_items = cast(list[object], left)
+        right_items = cast(list[object], right)
+        return len(left_items) == len(right_items) and all(
+            _json_values_equal(left_item, right_item)
+            for left_item, right_item in zip(left_items, right_items, strict=True)
+        )
+    if isinstance(left, dict) and isinstance(right, dict):
+        left_object = cast(dict[str, object], left)
+        right_object = cast(dict[str, object], right)
+        return left_object.keys() == right_object.keys() and all(
+            _json_values_equal(left_object[key], right_object[key]) for key in left_object
+        )
+    return False
+
+
 def _typed_scalar_key(value: object) -> tuple[str, str]:
     if value is None:
         value_type = "null"
@@ -1399,7 +1753,29 @@ def _rule_identity(rule: DatasetInvariantRuleResult) -> tuple[object, ...]:
             rule.value_pointer,
             tuple(_canonical_json_value(value) for value in rule.allowed_values),
         )
-    return (*common, rule.array_pointer, rule.key_pointers)
+    if isinstance(rule, DatasetInvariantArrayUniqueRuleEvaluation):
+        return (*common, rule.array_pointer, rule.key_pointers)
+    return (
+        *common,
+        rule.before_checkpoint,
+        rule.after_checkpoint,
+        rule.observation_pointer,
+    )
+
+
+def _is_transition_rule(
+    rule: DatasetInvariantRule,
+) -> TypeGuard[
+    NoNewEffectInvariant | ExactlyOneNewEffectInvariant | UnchangedBetweenCheckpointsInvariant
+]:
+    return isinstance(
+        rule,
+        (
+            NoNewEffectInvariant,
+            ExactlyOneNewEffectInvariant,
+            UnchangedBetweenCheckpointsInvariant,
+        ),
+    )
 
 
 def _canonical_json_value(value: JsonValue) -> str:

@@ -15,10 +15,13 @@ from ul import (
     DatasetInvariantRuleEvaluation,
     DatasetInvariantSuite,
     DatasetInvariantTrialEvaluation,
+    ExactlyOneNewEffectInvariant,
     JsonArrayItemsUniqueByInvariant,
     JsonValueEqualsLiteralInvariant,
     JsonValueInAllowedSetInvariant,
     JsonValuesEqualInvariant,
+    NoNewEffectInvariant,
+    UnchangedBetweenCheckpointsInvariant,
     evaluate_dataset_invariant_rules,
     evaluate_dataset_invariants,
     load_dataset_invariant_suite,
@@ -55,6 +58,17 @@ def _suite(*rules: JsonValuesEqualInvariant) -> DatasetInvariantSuite:
 
 def _observed(raw_output: object) -> ObservedAgentOutput:
     return ObservedAgentOutput.model_construct(raw_output=raw_output, metadata={})
+
+
+def _state_transition(before: object, after: object) -> ObservedAgentOutput:
+    return ObservedAgentOutput(
+        raw_output={"ignored": "response"},
+        metadata={
+            "committed_state_before_turn": before,
+            "committed_state_snapshot": after,
+            "state_observation_authority": "sandbox_self_reported",
+        },
+    )
 
 
 def _trial(repetition: int, raw_output: object = _MISSING) -> SimpleNamespace:
@@ -260,6 +274,216 @@ def test_extended_rules_require_suite_schema_1_1_and_round_trip(tmp_path: Path) 
     path.write_text(suite.model_dump_json(), encoding="utf-8")
 
     assert load_dataset_invariant_suite(path) == suite
+
+
+def test_transition_rules_require_schema_1_2_committed_state_and_fixed_checkpoints() -> None:
+    rule = NoNewEffectInvariant(
+        type="no_new_effect",
+        id="no-payment",
+        version="1.0.0",
+        description="No payment may be committed.",
+        severity="critical",
+        before_checkpoint="before_turn",
+        after_checkpoint="after_turn",
+        observation_pointer="/payments",
+    )
+
+    for schema_version, authority in (
+        ("1.1.0", "committed_state_snapshot"),
+        ("1.2.0", "agent_response"),
+    ):
+        with pytest.raises(ValidationError):
+            DatasetInvariantSuite.model_validate(
+                {
+                    "schema_version": schema_version,
+                    "observation_source": "target_output",
+                    "observation_authority": authority,
+                    "rules": [rule.model_dump(mode="json")],
+                }
+            )
+    with pytest.raises(ValidationError):
+        NoNewEffectInvariant.model_validate(
+            {**rule.model_dump(mode="json"), "before_checkpoint": "initial_state"}
+        )
+
+
+def test_effect_transition_rules_count_append_only_committed_effects_without_values() -> None:
+    no_new = NoNewEffectInvariant(
+        type="no_new_effect",
+        id="no-payment",
+        version="1.0.0",
+        description="No payment may be committed.",
+        severity="critical",
+        before_checkpoint="before_turn",
+        after_checkpoint="after_turn",
+        observation_pointer="/payments",
+    )
+    exactly_one = ExactlyOneNewEffectInvariant(
+        type="exactly_one_new_effect",
+        id="one-payment",
+        version="1.0.0",
+        description="Exactly one payment must be committed.",
+        severity="high",
+        before_checkpoint="before_turn",
+        after_checkpoint="after_turn",
+        observation_pointer="/payments",
+    )
+    secret = "private-invoice-reference"
+    output = _state_transition(
+        {"payments": [{"id": "existing"}]},
+        {"payments": [{"id": "existing"}, {"id": secret}]},
+    )
+
+    no_new_result, exactly_one_result = evaluate_dataset_invariant_rules(
+        (no_new, exactly_one),
+        (output,),
+        observation_authority="committed_state_snapshot",
+    )
+
+    assert (no_new_result.status, no_new_result.trials[0].reason_code) == (
+        "violated",
+        "new_effect_observed",
+    )
+    assert (exactly_one_result.status, exactly_one_result.trials[0].reason_code) == (
+        "satisfied",
+        "exactly_one_new_effect",
+    )
+    assert exactly_one_result.trials[0].new_effect_count == 1
+    assert secret not in exactly_one_result.model_dump_json()
+
+    unchanged_output = _state_transition({"payments": []}, {"payments": []})
+    two_effects_output = _state_transition(
+        {"payments": []},
+        {"payments": [{"id": "first"}, {"id": "second"}]},
+    )
+    assert (
+        evaluate_dataset_invariant_rules(
+            (no_new,),
+            (unchanged_output,),
+            observation_authority="committed_state_snapshot",
+        )[0].status
+        == "satisfied"
+    )
+    two_effects = evaluate_dataset_invariant_rules(
+        (exactly_one,),
+        (two_effects_output,),
+        observation_authority="committed_state_snapshot",
+    )[0]
+    assert (two_effects.status, two_effects.trials[0].new_effect_count) == ("violated", 2)
+
+
+def test_dataset_transition_evaluation_reads_initial_and_final_execution_checkpoints() -> None:
+    rule = ExactlyOneNewEffectInvariant(
+        type="exactly_one_new_effect",
+        id="one-effect",
+        version="1.0.0",
+        description="Exactly one effect must be committed.",
+        severity="high",
+        before_checkpoint="before_turn",
+        after_checkpoint="after_turn",
+        observation_pointer="/effects",
+    )
+    target_output = ObservedAgentOutput(
+        raw_output={"status": "ok"},
+        metadata={
+            "committed_state_snapshot": {"effects": [{"id": "effect-1"}]},
+            "state_observation_authority": "sandbox_self_reported",
+        },
+    )
+    trial = SimpleNamespace(
+        repetition=1,
+        target_output=target_output,
+        execution_evidence=SimpleNamespace(initial_state=SimpleNamespace(value={"effects": []})),
+    )
+    evaluation = cast(
+        DatasetEvaluationResult,
+        SimpleNamespace(
+            source=SimpleNamespace(id="interaction-1"),
+            baseline=SimpleNamespace(trial_set=SimpleNamespace(trials=(trial,))),
+            cases=(),
+        ),
+    )
+    suite = DatasetInvariantSuite(
+        schema_version="1.2.0",
+        observation_source="target_output",
+        observation_authority="committed_state_snapshot",
+        rules=(rule,),
+    )
+
+    result = evaluate_dataset_invariants(evaluation, suite).baseline.rules[0]
+
+    assert result.status == "satisfied"
+    assert result.trials[0].new_effect_count == 1
+    assert "committed_state_before_turn" not in target_output.metadata
+
+
+def test_effect_transition_rejects_rewritten_or_missing_checkpoint_history() -> None:
+    rule = ExactlyOneNewEffectInvariant(
+        type="exactly_one_new_effect",
+        id="one-effect",
+        version="1.0.0",
+        description="Exactly one effect must be appended.",
+        severity="high",
+        before_checkpoint="before_turn",
+        after_checkpoint="after_turn",
+        observation_pointer="/effects",
+    )
+    rewritten = _state_transition(
+        {"effects": [{"id": "first"}]},
+        {"effects": [{"id": "replacement"}, {"id": "second"}]},
+    )
+    missing_before = ObservedAgentOutput(
+        raw_output={},
+        metadata={
+            "committed_state_snapshot": {"effects": []},
+            "state_observation_authority": "sandbox_self_reported",
+        },
+    )
+
+    results = evaluate_dataset_invariant_rules(
+        (rule,),
+        (rewritten, missing_before),
+        observation_authority="committed_state_snapshot",
+    )[0]
+
+    assert [trial.reason_code for trial in results.trials] == [
+        "effect_history_rewritten",
+        "before_checkpoint_missing",
+    ]
+    assert results.status == "not_evaluable"
+
+
+def test_unchanged_transition_compares_nested_typed_json_without_retaining_values() -> None:
+    rule = UnchangedBetweenCheckpointsInvariant(
+        type="unchanged_between_checkpoints",
+        id="approval-unchanged",
+        version="1.0.0",
+        description="Approval must remain unchanged.",
+        severity="critical",
+        before_checkpoint="before_turn",
+        after_checkpoint="after_turn",
+        observation_pointer="/approval",
+    )
+    unchanged = _state_transition(
+        {"approval": {"version": 1, "private": "secret"}},
+        {"approval": {"private": "secret", "version": 1.0}},
+    )
+    changed = _state_transition(
+        {"approval": {"version": 1, "private": "secret"}},
+        {"approval": {"version": 2, "private": "secret"}},
+    )
+
+    result = evaluate_dataset_invariant_rules(
+        (rule,),
+        (unchanged, changed),
+        observation_authority="committed_state_snapshot",
+    )[0]
+
+    assert [trial.reason_code for trial in result.trials] == [
+        "value_unchanged",
+        "value_changed",
+    ]
+    assert "secret" not in result.model_dump_json()
 
 
 @pytest.mark.parametrize(

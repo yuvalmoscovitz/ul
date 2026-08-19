@@ -726,6 +726,8 @@ def _observations(
     if len(turns) != len(evaluation_case.turns) or len(turns) != len(evidence.turns):
         raise RuntimeError("sandbox returned an invalid number of turn observations")
     observations: list[CorrectionTurnObservation] = []
+    before_turn_state = evidence.initial_state.value if evidence.initial_state is not None else None
+    before_turn_state_present = evidence.initial_state is not None
     for turn, sandbox_turn, turn_evidence in zip(
         turns, evaluation_case.turns, evidence.turns, strict=True
     ):
@@ -739,6 +741,11 @@ def _observations(
                 metadata={
                     "committed_state_snapshot": turn_evidence.state_snapshot,
                     "state_observation_authority": turn_evidence.state_observation_authority,
+                    **(
+                        {"committed_state_before_turn": before_turn_state}
+                        if before_turn_state_present
+                        else {}
+                    ),
                 },
             )
         except ValidationError:
@@ -750,6 +757,8 @@ def _observations(
                 committed_state_snapshot=turn_evidence.state_snapshot,
             )
         )
+        before_turn_state = turn_evidence.state_snapshot
+        before_turn_state_present = True
     return tuple(observations)
 
 

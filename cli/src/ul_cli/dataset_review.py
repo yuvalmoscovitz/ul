@@ -26,15 +26,20 @@ from ul.dataset_invariants import (
     DatasetInvariantRuleEvaluation,
     DatasetInvariantRuleResult,
     DatasetInvariantSuite,
+    DatasetInvariantTransitionRuleEvaluation,
+    DatasetInvariantTransitionTrialEvaluation,
     DatasetInvariantTrialEvaluation,
     DatasetInvariantValueEqualsRuleEvaluation,
     DatasetInvariantValueEqualsTrialEvaluation,
     DatasetInvariantValueInSetRuleEvaluation,
     DatasetInvariantValueInSetTrialEvaluation,
+    ExactlyOneNewEffectInvariant,
     JsonArrayItemsUniqueByInvariant,
     JsonValueEqualsLiteralInvariant,
     JsonValueInAllowedSetInvariant,
     JsonValuesEqualInvariant,
+    NoNewEffectInvariant,
+    UnchangedBetweenCheckpointsInvariant,
     evaluate_dataset_invariants,
 )
 from ul.dataset_regression import dataset_regression_target_config_sha256
@@ -1072,10 +1077,22 @@ def _invariant_suite_from_evaluation(
     evaluation: DatasetInvariantEvaluation,
 ) -> DatasetInvariantSuite:
     rules = tuple(_invariant_rule_definition(rule) for rule in evaluation.baseline.rules)
-    schema_versions = (
-        ("1.0.0", "1.1.0")
+    schema_versions: tuple[Literal["1.0.0", "1.1.0", "1.2.0"], ...] = (
+        ("1.0.0", "1.1.0", "1.2.0")
         if all(isinstance(rule, JsonValuesEqualInvariant) for rule in rules)
-        else ("1.1.0",)
+        else ("1.2.0",)
+        if any(
+            isinstance(
+                rule,
+                (
+                    NoNewEffectInvariant,
+                    ExactlyOneNewEffectInvariant,
+                    UnchangedBetweenCheckpointsInvariant,
+                ),
+            )
+            for rule in rules
+        )
+        else ("1.1.0", "1.2.0")
     )
     for schema_version in schema_versions:
         suite = DatasetInvariantSuite(
@@ -1120,6 +1137,25 @@ def _invariant_rule_definition(rule: DatasetInvariantRuleResult) -> DatasetInvar
             severity=rule.severity,
             value_pointer=rule.value_pointer,
             allowed_values=rule.allowed_values,
+        )
+    if isinstance(rule, DatasetInvariantTransitionRuleEvaluation):
+        transition_rule_types = {
+            "no_new_effect": NoNewEffectInvariant,
+            "exactly_one_new_effect": ExactlyOneNewEffectInvariant,
+            "unchanged_between_checkpoints": UnchangedBetweenCheckpointsInvariant,
+        }
+        transition_rule_type = transition_rule_types[rule.rule_type]
+        return transition_rule_type.model_validate(
+            {
+                "type": rule.rule_type,
+                "id": rule.rule_id,
+                "version": rule.rule_version,
+                "description": rule.description,
+                "severity": rule.severity,
+                "before_checkpoint": rule.before_checkpoint,
+                "after_checkpoint": rule.after_checkpoint,
+                "observation_pointer": rule.observation_pointer,
+            }
         )
     return JsonArrayItemsUniqueByInvariant(
         type="json_array_items_unique_by",
@@ -1308,7 +1344,13 @@ def _sensitive_invariant_lines(
     variation_rule: DatasetInvariantRuleResult,
 ) -> Generator[str]:
     for arm_name, rule in (("Variation", variation_rule), ("Original", baseline_rule)):
-        if isinstance(rule, DatasetInvariantArrayUniqueRuleEvaluation):
+        if isinstance(
+            rule,
+            (
+                DatasetInvariantArrayUniqueRuleEvaluation,
+                DatasetInvariantTransitionRuleEvaluation,
+            ),
+        ):
             continue
         for trial in rule.trials:
             selected_values: dict[str, JsonValue] = {
@@ -1332,6 +1374,11 @@ def _sensitive_invariant_lines(
         yield (
             "Selected values unavailable: array uniqueness evidence intentionally retains "
             "indices and pointers only."
+        )
+    elif isinstance(variation_rule, DatasetInvariantTransitionRuleEvaluation):
+        yield (
+            "Selected values unavailable: state-transition evidence intentionally retains "
+            "counts and pointers only."
         )
 
 
@@ -1400,7 +1447,8 @@ def _invariant_trial_location(
     trial: DatasetInvariantTrialEvaluation
     | DatasetInvariantValueEqualsTrialEvaluation
     | DatasetInvariantValueInSetTrialEvaluation
-    | DatasetInvariantArrayUniqueTrialEvaluation,
+    | DatasetInvariantArrayUniqueTrialEvaluation
+    | DatasetInvariantTransitionTrialEvaluation,
 ) -> str:
     if isinstance(trial, DatasetInvariantTrialEvaluation):
         return f"left={trial.left_pointer}; right={trial.right_pointer}"
@@ -1409,6 +1457,14 @@ def _invariant_trial_location(
         (DatasetInvariantValueEqualsTrialEvaluation, DatasetInvariantValueInSetTrialEvaluation),
     ):
         return f"value={trial.value_pointer}"
+    if isinstance(trial, DatasetInvariantTransitionTrialEvaluation):
+        location = (
+            f"before={trial.before_checkpoint}; after={trial.after_checkpoint}; "
+            f"value={trial.observation_pointer}"
+        )
+        if trial.new_effect_count is not None:
+            location += f"; new_effects={trial.new_effect_count}"
+        return location
     location = (
         f"array={trial.array_pointer}; keys={','.join(trial.key_pointers)}; "
         f"items={trial.item_count}"

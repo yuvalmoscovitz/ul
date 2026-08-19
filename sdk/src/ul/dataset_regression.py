@@ -24,6 +24,7 @@ from ul.dataset_invariants import (
     DatasetInvariantRule,
     DatasetInvariantRuleEvaluation,
     DatasetInvariantRuleResult,
+    DatasetInvariantTransitionRuleEvaluation,
     JsonValuesEqualInvariant,
     ObservationAuthority,
     evaluate_dataset_invariant_rules,
@@ -42,6 +43,11 @@ _SHA256_PATTERN = r"^[0-9a-f]{64}$"
 _FINDING_ID_PATTERN = r"^ulf_v1_[0-9a-f]{64}$"
 _REVIEW_ID_PATTERN = r"^ulr_[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
 _CASE_ID_PATTERN = r"^ulrc_v1_[0-9a-f]{64}$"
+_TRANSITION_RULE_TYPES = {
+    "no_new_effect",
+    "exactly_one_new_effect",
+    "unchanged_between_checkpoints",
+}
 RegressionStatus = Literal["passed", "failed", "inconclusive"]
 RegressionExecutionStatus = Literal[
     "observed",
@@ -100,6 +106,12 @@ class DatasetRegressionInvariantSuite(_StrictModel):
         if len(rule_ids) != len(set(rule_ids)):
             raise ValueError("regression invariant rule identifiers must be unique")
         requires_state = self.observation_authority == "committed_state_snapshot"
+        if not requires_state and any(
+            rule.type in _TRANSITION_RULE_TYPES for rule in self.rules
+        ):
+            raise ValueError(
+                "state-transition regression rules require committed-state observation"
+            )
         if requires_state != (self.state_observation_authority is not None):
             raise ValueError("committed-state regressions must pin the state authority")
         if self.state_observation_authority == "independent_observer":
@@ -111,7 +123,7 @@ class DatasetRegressionInvariantSuite(_StrictModel):
 
 
 class DatasetRegressionCase(_StrictModel):
-    schema_version: Literal["1.0.0", "1.1.0"]
+    schema_version: Literal["1.0.0", "1.1.0", "1.2.0"]
     case_id: str = Field(pattern=_CASE_ID_PATTERN)
     lineage: DatasetRegressionLineage
     variation: DatasetRegressionVariation
@@ -125,6 +137,10 @@ class DatasetRegressionCase(_StrictModel):
             not isinstance(rule, JsonValuesEqualInvariant) for rule in self.invariant_suite.rules
         ):
             raise ValueError("regression schema 1.0.0 supports only json_values_equal rules")
+        if self.schema_version != "1.2.0" and any(
+            rule.type in _TRANSITION_RULE_TYPES for rule in self.invariant_suite.rules
+        ):
+            raise ValueError("state-transition regression rules require schema 1.2.0")
         if self.case_id != _case_id(self.model_dump(mode="json", exclude={"case_id"})):
             raise ValueError("regression case ID must match its canonical content")
         if len(self.model_dump_json().encode("utf-8")) > _MAXIMUM_CASE_BYTES:
@@ -154,7 +170,7 @@ class DatasetRegressionExecution(_StrictModel):
 
 
 class DatasetRegressionResult(_StrictModel):
-    schema_version: Literal["1.0.0", "1.1.0"] = "1.0.0"
+    schema_version: Literal["1.0.0", "1.1.0", "1.2.0"] = "1.0.0"
     case_id: str = Field(pattern=_CASE_ID_PATTERN)
     target_config_sha256: str = Field(pattern=_SHA256_PATTERN)
     source_suite_sha256: str = Field(pattern=_SHA256_PATTERN)
@@ -170,6 +186,10 @@ class DatasetRegressionResult(_StrictModel):
             not isinstance(rule, DatasetInvariantRuleEvaluation) for rule in self.rules
         ):
             raise ValueError("regression result schema 1.0.0 supports only json_values_equal rules")
+        if self.schema_version != "1.2.0" and any(
+            isinstance(rule, DatasetInvariantTransitionRuleEvaluation) for rule in self.rules
+        ):
+            raise ValueError("state-transition regression results require schema 1.2.0")
         if tuple(execution.repetition for execution in self.executions) != tuple(
             range(1, len(self.executions) + 1)
         ):
@@ -208,7 +228,7 @@ class DatasetRegressionRunCaseResult(_StrictModel):
 
 
 class DatasetRegressionRunResult(_StrictModel):
-    schema_version: Literal["1.0.0", "1.1.0"] = "1.0.0"
+    schema_version: Literal["1.0.0", "1.1.0", "1.2.0"] = "1.0.0"
     started_at: datetime
     completed_at: datetime
     target_config_sha256: str = Field(pattern=_SHA256_PATTERN)
@@ -225,6 +245,10 @@ class DatasetRegressionRunResult(_StrictModel):
             case.result.schema_version != "1.0.0" for case in self.cases
         ):
             raise ValueError("regression run schema 1.0.0 only supports result schema 1.0.0")
+        if self.schema_version == "1.1.0" and any(
+            case.result.schema_version == "1.2.0" for case in self.cases
+        ):
+            raise ValueError("regression run schema 1.1.0 does not support result schema 1.2.0")
         for timestamp in (self.started_at, self.completed_at):
             if timestamp.tzinfo is None or timestamp.utcoffset() != UTC.utcoffset(None):
                 raise ValueError("regression run timestamps must use UTC")
@@ -310,11 +334,12 @@ def create_dataset_regression_case(
         state_observer_id=state_observer_id,
         rules=selected_rules,
     )
-    schema_version: Literal["1.0.0", "1.1.0"] = (
-        "1.0.0"
-        if all(isinstance(rule, JsonValuesEqualInvariant) for rule in selected_rules)
-        else "1.1.0"
-    )
+    if any(rule.type in _TRANSITION_RULE_TYPES for rule in selected_rules):
+        schema_version: Literal["1.0.0", "1.1.0", "1.2.0"] = "1.2.0"
+    elif all(isinstance(rule, JsonValuesEqualInvariant) for rule in selected_rules):
+        schema_version = "1.0.0"
+    else:
+        schema_version = "1.1.0"
     serialized_content = cast(
         dict[str, JsonValue],
         {
@@ -613,7 +638,11 @@ async def run_dataset_regressions(
         status = "passed"
     return DatasetRegressionRunResult(
         schema_version=(
-            "1.1.0" if any(result.schema_version == "1.1.0" for result in results) else "1.0.0"
+            "1.2.0"
+            if any(result.schema_version == "1.2.0" for result in results)
+            else "1.1.0"
+            if any(result.schema_version == "1.1.0" for result in results)
+            else "1.0.0"
         ),
         started_at=started_at,
         completed_at=completed_at,

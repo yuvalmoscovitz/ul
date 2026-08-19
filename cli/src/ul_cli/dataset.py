@@ -39,6 +39,7 @@ from ul.dataset_invariants import (
     DatasetInvariantArrayUniqueTrialEvaluation,
     DatasetInvariantEvaluation,
     DatasetInvariantSuite,
+    DatasetInvariantTransitionTrialEvaluation,
     DatasetInvariantTrialEvaluation,
     DatasetInvariantValueEqualsTrialEvaluation,
     DatasetInvariantValueInSetTrialEvaluation,
@@ -1511,7 +1512,8 @@ def _invariant_trial_location(
     trial: DatasetInvariantTrialEvaluation
     | DatasetInvariantValueEqualsTrialEvaluation
     | DatasetInvariantValueInSetTrialEvaluation
-    | DatasetInvariantArrayUniqueTrialEvaluation,
+    | DatasetInvariantArrayUniqueTrialEvaluation
+    | DatasetInvariantTransitionTrialEvaluation,
 ) -> str:
     if isinstance(trial, DatasetInvariantTrialEvaluation):
         return f"left={trial.left_pointer}; right={trial.right_pointer}"
@@ -1520,6 +1522,14 @@ def _invariant_trial_location(
         (DatasetInvariantValueEqualsTrialEvaluation, DatasetInvariantValueInSetTrialEvaluation),
     ):
         return f"value={trial.value_pointer}"
+    if isinstance(trial, DatasetInvariantTransitionTrialEvaluation):
+        location = (
+            f"before={trial.before_checkpoint}; after={trial.after_checkpoint}; "
+            f"value={trial.observation_pointer}"
+        )
+        if trial.new_effect_count is not None:
+            location += f"; new_effects={trial.new_effect_count}"
+        return location
     location = (
         f"array={trial.array_pointer}; keys={','.join(trial.key_pointers)}; "
         f"items={trial.item_count}"

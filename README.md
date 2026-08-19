@@ -579,3 +579,32 @@ applies only within one declared target-output snapshot, not across independent 
 UL also applies a fixed work budget across array rules and trials for each interaction. If their
 combined item and pointer-processing work exceeds that budget, affected trials are `not_evaluable`
 rather than silently passing or consuming unbounded CPU time.
+
+Invariant schema `1.2.0` adds committed-state transition rules over each turn's fixed
+`before_turn` and `after_turn` checkpoints:
+
+```json
+{
+  "schema_version": "1.2.0",
+  "observation_source": "target_output",
+  "observation_authority": "committed_state_snapshot",
+  "rules": [
+    {
+      "type": "exactly_one_new_effect",
+      "id": "one-payment-per-turn",
+      "version": "1.0.0",
+      "description": "A successful request must append exactly one payment.",
+      "severity": "critical",
+      "before_checkpoint": "before_turn",
+      "after_checkpoint": "after_turn",
+      "observation_pointer": "/payments"
+    }
+  ]
+}
+```
+
+`no_new_effect` and `exactly_one_new_effect` treat the selected array as an append-only effect
+history. Removal, replacement, or reordering is `not_evaluable`, rather than being mistaken for a
+new-effect count. `unchanged_between_checkpoints` accepts the same checkpoint and pointer fields and
+compares any JSON value at that location. Transition evidence retains only pointers, item counts,
+and reason codes; selected state values are not copied into invariant results or normal reports.
