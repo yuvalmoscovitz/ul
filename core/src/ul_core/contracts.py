@@ -5,18 +5,16 @@ from typing import Protocol, runtime_checkable
 
 from ul_core.dataset import (
     InteractionRecord,
-    ObservedAgentOutput,
     RenderedUserInput,
     SemanticEquivalenceAssessment,
     SemanticFrame,
     UserInputRecord,
 )
-from ul_core.models import (
-    ExecutionResult,
-    MaterializedScenario,
-    OracleFinding,
-    SafetyEnvelope,
-    Scenario,
+from ul_core.evaluation import (
+    EvaluationCase,
+    ExecutionEvidence,
+    ProductionSourcePage,
+    SandboxCapabilities,
 )
 
 
@@ -66,40 +64,26 @@ class SemanticEquivalenceVerifier(Protocol):
 
 
 @runtime_checkable
-class DatasetTargetExecutor(Protocol):
-    @property
-    def safety_envelope(self) -> SafetyEnvelope: ...
-
-    @property
-    def fresh_state_per_execution(self) -> bool: ...
-
-    def execute(self, raw_input: str) -> Awaitable[ObservedAgentOutput]: ...
-
-
-@runtime_checkable
-class MultiTurnDatasetTargetExecutor(DatasetTargetExecutor, Protocol):
-    def target_calls_for_conversation(self, turn_count: int) -> int: ...
-
-    def execute_conversation(
-        self, raw_inputs: tuple[str, ...]
-    ) -> Awaitable[tuple[ObservedAgentOutput, ...]]: ...
-
-
-@runtime_checkable
-class ScenarioMaterializer(Protocol):
-    def materialize(self, scenario: Scenario) -> MaterializedScenario: ...
-
-
-@runtime_checkable
-class TargetExecutor(Protocol):
-    def execute(self, scenario: MaterializedScenario) -> Awaitable[ExecutionResult]: ...
-
-
-@runtime_checkable
-class OracleEvaluator(Protocol):
-    def evaluate(
+class ProductionSource(Protocol):
+    def read(
         self,
-        scenario: Scenario,
-        materialized_scenario: MaterializedScenario,
-        execution: ExecutionResult,
-    ) -> Awaitable[tuple[OracleFinding, ...]]: ...
+        checkpoint: str | None,
+        *,
+        limit: int,
+    ) -> Awaitable[ProductionSourcePage]: ...
+
+
+@runtime_checkable
+class SandboxExecutor(Protocol):
+    @property
+    def sandbox_id(self) -> str: ...
+
+    @property
+    def config_sha256(self) -> str: ...
+
+    @property
+    def capabilities(self) -> SandboxCapabilities: ...
+
+    def api_calls_for_case(self, case: EvaluationCase) -> int: ...
+
+    def execute(self, case: EvaluationCase) -> Awaitable[ExecutionEvidence]: ...

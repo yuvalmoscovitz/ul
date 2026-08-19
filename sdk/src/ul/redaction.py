@@ -17,20 +17,20 @@ from typing import Literal, Protocol, Self, cast
 
 from pydantic import ConfigDict, Field, JsonValue, SecretStr, model_validator
 from ul_core.contracts import (
-    DatasetTargetExecutor,
+    SandboxExecutor,
     SemanticDeconstructor,
     SemanticEquivalenceVerifier,
     SemanticRenderer,
 )
 from ul_core.dataset import (
     InteractionRecord,
-    ObservedAgentOutput,
     RenderedUserInput,
     SemanticEquivalenceAssessment,
     SemanticFrame,
     UserInputRecord,
 )
-from ul_core.models import SafetyEnvelope, ULModel
+from ul_core.evaluation import EvaluationCase, ExecutionEvidence, SandboxCapabilities
+from ul_core.models import ULModel
 
 if sys.platform == "win32":
     import msvcrt
@@ -546,38 +546,84 @@ class RedactedSemanticPipeline:
         except Exception:
             raise RedactionBoundaryError() from None
 
-    def wrap_target(self, target: DatasetTargetExecutor) -> RehydratingDatasetTarget:
-        return RehydratingDatasetTarget(target, self.engine)
+    def wrap_sandbox(self, sandbox: SandboxExecutor) -> RehydratingSandboxConnection:
+        return RehydratingSandboxConnection(sandbox, self.engine)
 
     def _metadata(self, metadata: dict[str, JsonValue]) -> dict[str, JsonValue]:
         return {**metadata, "redaction_policy_sha256": self.engine.policy.digest}
 
 
-class RehydratingDatasetTarget:
-    def __init__(self, target: DatasetTargetExecutor, engine: RedactionEngine) -> None:
-        self._target = target
+class RehydratingSandboxConnection:
+    def __init__(self, sandbox: SandboxExecutor, engine: RedactionEngine) -> None:
+        self._sandbox = sandbox
         self._engine = engine
 
     @property
-    def safety_envelope(self) -> SafetyEnvelope:
-        return self._target.safety_envelope
+    def capabilities(self) -> SandboxCapabilities:
+        return self._sandbox.capabilities
 
     @property
-    def fresh_state_per_execution(self) -> bool:
-        return self._target.fresh_state_per_execution
+    def sandbox_id(self) -> str:
+        return self._sandbox.sandbox_id
 
-    async def execute(self, raw_input: str) -> ObservedAgentOutput:
+    @property
+    def config_sha256(self) -> str:
+        return self._sandbox.config_sha256
+
+    def api_calls_for_case(self, case: EvaluationCase) -> int:
+        return self._sandbox.api_calls_for_case(case)
+
+    async def execute(self, case: EvaluationCase) -> ExecutionEvidence:
         try:
-            rehydrated_input = self._engine.store.rehydrate_text(raw_input)
+            rehydrated_case = case.model_copy(
+                update={
+                    "turns": tuple(
+                        turn.model_copy(
+                            update={"content": self._engine.store.rehydrate_text(turn.content)}
+                        )
+                        for turn in case.turns
+                    )
+                }
+            )
         except RedactionBoundaryError:
             raise
-        target_output = await self._target.execute(rehydrated_input)
-        protected_output = self._engine.transform(target_output.raw_output, location="output").value
-        protected_metadata = self._engine.transform(target_output.metadata, location="output").value
-        if not isinstance(protected_metadata, dict):
-            raise RedactionBoundaryError()
-        return target_output.model_copy(
-            update={"raw_output": protected_output, "metadata": protected_metadata}
+        evidence = await self._sandbox.execute(rehydrated_case)
+        protected_turns = tuple(
+            turn.model_copy(
+                update={
+                    "response": self._engine.transform(turn.response, location="output").value,
+                    "state_snapshot": (
+                        self._engine.transform(turn.state_snapshot, location="output").value
+                        if turn.state_snapshot is not None
+                        else None
+                    ),
+                }
+            )
+            for turn in evidence.turns
+        )
+        return evidence.model_copy(
+            update={
+                "initial_state": (
+                    evidence.initial_state.model_copy(
+                        update={
+                            "value": self._engine.transform(
+                                evidence.initial_state.value, location="output"
+                            ).value
+                        }
+                    )
+                    if evidence.initial_state is not None
+                    else None
+                ),
+                "turns": protected_turns,
+                "final_response": protected_turns[-1].response if protected_turns else None,
+                "final_state": (
+                    evidence.final_state.model_copy(
+                        update={"value": protected_turns[-1].state_snapshot}
+                    )
+                    if evidence.final_state is not None and protected_turns
+                    else None
+                ),
+            }
         )
 
 

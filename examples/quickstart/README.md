@@ -3,7 +3,7 @@
 This package is a complete but synthetic black-box evaluation:
 
 - `dataset.jsonl` contains one historical accounts-payable interaction.
-- `target.json` maps UL's reset, setup, execution, and committed-state snapshot calls to the local
+- `target.json` is the sandbox API mapping for reset, setup, execution, and committed-state snapshot calls to the local
   sandbox.
 - `invariants.json` declares that the committed invoice must match the requested invoice in the
   structured target result.
@@ -18,7 +18,7 @@ uv run python -m examples.quickstart.run
 ```
 
 The runner chooses a free localhost port and changes only the four lifecycle URLs from the
-checked-in `target.json`. The execution mapping describes this exchange:
+checked-in `target.json`. The sandbox API mapping describes this exchange:
 
 ```json
 {
@@ -44,7 +44,7 @@ produces a stable 3/3 `changed action value` finding for review. This is deliber
 behavioral finding, not a claim that UL established which response was correct.
 Separately, the customer rule is satisfied by all three original trials and violated by all
 three defective variation trials. That rule is a deterministic comparison of two declared JSON
-fields and requires no additional model or target calls.
+fields and requires no additional model or sandbox API calls.
 
 ## Inspect before calling anything
 
@@ -53,17 +53,17 @@ uv run python -m examples.quickstart.run --dry-run
 ```
 
 This sends zero requests. Internally, the live runner starts the server and invokes this CLI
-shape with its private ephemeral target configuration:
+shape with its private ephemeral sandbox configuration:
 
 ```bash
 uv run ul dataset evaluate examples/quickstart/dataset.jsonl \
-  --target-config tmp/quickstart-.../target.json \
+  --sandbox-config tmp/quickstart-.../target.json \
   --invariants examples/quickstart/invariants.json \
   --operator surface.disfluency_repeat \
   --limit 1 \
   --repetitions 3 \
-  --max-target-calls 30 \
-  --allow-target-network \
+  --max-sandbox-api-calls 36 \
+  --allow-sandbox-network-egress \
   --confirm-isolated-sandbox \
   --allow-insecure-http \
   --output tmp/quickstart-.../evidence.jsonl
@@ -97,7 +97,7 @@ review decision, use `ul dataset report PATH_TO_EVIDENCE.jsonl --show-sensitive-
 FINDING_ID`. The all-or-none bounded output is limited to that finding, may contain secrets or PII,
 and may be retained in terminal scrollback, CI output, or logs.
 
-The bundled runner stops its ephemeral server and deletes its temporary target configuration
+The bundled runner stops its ephemeral server and deletes its temporary sandbox configuration
 when it exits, so its evidence is intentionally not replayable afterward. In a customer workflow,
 keep a persistent sandbox configuration and use it to preserve a confirmed finding as an exact
 regression case:
@@ -105,16 +105,16 @@ regression case:
 ```bash
 uv run ul regression save PATH_TO_EVIDENCE.jsonl FINDING_ID \
   --rule committed-invoice-matches-request \
-  --target-config PATH_TO_TARGET.json \
+  --sandbox-config PATH_TO_TARGET.json \
   --output regressions/quickstart-wrong-invoice.json \
   --confirm-versioned-input
 
 uv run ul regression replay regressions/quickstart-wrong-invoice.json \
-  --target-config PATH_TO_TARGET.json \
-  --allow-target-network \
+  --sandbox-config PATH_TO_TARGET.json \
+  --allow-sandbox-network-egress \
   --confirm-isolated-sandbox \
   --allow-insecure-http \
-  --max-target-calls 15 \
+  --max-sandbox-api-calls 18 \
   --output tmp/quickstart-replay.json
 ```
 
@@ -122,15 +122,15 @@ When saving the invariant-violation finding itself, omit `--rule`; UL selects th
 by that finding automatically. Semantic findings continue to require an explicit `--rule`.
 
 Saving requires the explicit confirmation because the case contains the exact raw variation and
-literal target-template values, which may be sensitive. UL does not redact them automatically
-because that could alter the reproduced behavior. The embedded target configuration is declared
-by the customer when the case is created, not verified as the discovery target, and may contain
+literal sandbox-template values, which may be sensitive. UL does not redact them automatically
+because that could alter the reproduced behavior. The embedded sandbox configuration is declared
+by the customer when the case is created, not verified as the discovery sandbox, and may contain
 sensitive literal template values.
 It is never executed; replay requires a separately trusted configuration with the same digest.
-Complete replay evidence contains raw target outputs and may also be sensitive.
+Complete replay evidence contains raw sandbox responses and may also be sensitive.
 
-Replay performs the saved three trials directly against the target with no generation,
-equivalence, or other semantic-model calls. The seeded defective target violates the rule and
+Replay performs the saved three trials directly against the sandbox with no generation,
+equivalence, or other semantic-model calls. The seeded defective sandbox violates the rule and
 therefore exits `1`. A target that returns matching requested and committed invoice references in
 all three trials exits `0`. That outcome shows only that this saved customer rule held for this
 case; it is not proof that the implementation is correct or that every related failure is fixed.

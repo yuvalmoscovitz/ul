@@ -26,10 +26,10 @@ from ul.event_stress import (
     replay_multi_turn_regression,
     run_correction_stress_test,
 )
-from ul.http_target import (
-    JsonHttpDatasetTarget,
-    load_json_http_dataset_target_config,
-    validate_json_http_dataset_target_configuration,
+from ul.http_sandbox import (
+    JsonHttpSandboxConnection,
+    load_json_http_sandbox_config,
+    validate_json_http_sandbox_configuration,
 )
 from ul.trace_replay import (
     TraceReplayCase,
@@ -47,7 +47,7 @@ app = typer.Typer(help="Stress stateful agents with ordered conversation events.
 def replay_production_trace(
     bundle_path: Annotated[Path, typer.Argument(exists=True, dir_okay=False, readable=True)],
     target_config_path: Annotated[
-        Path, typer.Option("--target-config", exists=True, dir_okay=False, readable=True)
+        Path, typer.Option("--sandbox-config", exists=True, dir_okay=False, readable=True)
     ],
     case_id: Annotated[
         str | None,
@@ -57,20 +57,30 @@ def replay_production_trace(
         Path | None, typer.Option(help="New private JSON replay evidence file.")
     ] = None,
     repetitions: Annotated[int, typer.Option(min=1)] = 3,
-    max_target_calls: Annotated[int, typer.Option(min=1)] = 100,
-    allow_target_network: Annotated[bool, typer.Option()] = False,
-    confirm_isolated_sandbox: Annotated[bool, typer.Option()] = False,
-    allow_insecure_http: Annotated[bool, typer.Option()] = False,
+    max_target_calls: Annotated[int, typer.Option("--max-sandbox-api-calls", min=1)] = 100,
+    allow_target_network: Annotated[bool, typer.Option("--allow-sandbox-network-egress")] = False,
+    confirm_isolated_sandbox: Annotated[
+        bool,
+        typer.Option(
+            help=(
+                "Attest that the configured endpoint is a customer-managed, isolated "
+                "non-production sandbox. UL does not verify its isolation."
+            )
+        ),
+    ] = False,
+    allow_insecure_http: Annotated[
+        bool, typer.Option(help="Allow an HTTP sandbox API. Intended for local sandboxes.")
+    ] = False,
     dry_run: Annotated[
-        bool, typer.Option(help="Validate and show the replay plan without target calls.")
+        bool, typer.Option(help="Validate and show the replay plan without sandbox API calls.")
     ] = False,
 ) -> None:
-    """Replay a production trace conversation prefix in a clean target."""
+    """Replay a production trace conversation prefix in a clean sandbox."""
     try:
         bundle = load_trace_replay_bundle(bundle_path)
         case = select_trace_replay_case(bundle, case_id)
-        target_config = load_json_http_dataset_target_config(target_config_path)
-        validate_json_http_dataset_target_configuration(
+        target_config = load_json_http_sandbox_config(target_config_path)
+        validate_json_http_sandbox_configuration(
             target_config,
             sandbox_confirmed=confirm_isolated_sandbox or dry_run,
             allow_insecure_http=allow_insecure_http,
@@ -89,13 +99,14 @@ def replay_production_trace(
         typer.echo(f"Ordered user turns: {plan.replay_turn_count}")
         typer.echo(f"Repetitions: {plan.repetitions}")
         typer.echo(f"Target calls per repetition: {plan.target_calls_per_repetition}")
-        typer.echo(f"Potential target calls: {plan.required_target_calls}")
+        typer.echo(f"Potential sandbox API calls: {plan.required_target_calls}")
         typer.echo("Recorded content: not printed")
         typer.echo("External calls: none")
         return
     if not allow_target_network:
         raise typer.BadParameter(
-            "execution requires --allow-target-network", param_hint="--allow-target-network"
+            "execution requires --allow-sandbox-network-egress",
+            param_hint="--allow-sandbox-network-egress",
         )
     if not confirm_isolated_sandbox:
         raise typer.BadParameter(
@@ -112,11 +123,11 @@ def replay_production_trace(
         raise typer.BadParameter("output could not be created", param_hint="--output") from None
     try:
         with output_stream:
-            target = JsonHttpDatasetTarget.from_config(
+            target = JsonHttpSandboxConnection.from_config(
                 target_config,
                 sandbox_confirmed=True,
                 allow_insecure_http=allow_insecure_http,
-                max_target_calls=max_target_calls,
+                max_sandbox_api_calls=max_target_calls,
             )
             result = asyncio.run(
                 _run_trace_replay_and_close(
@@ -140,7 +151,7 @@ def replay_production_trace(
 def save_multi_turn_regression(
     case_path: Annotated[Path, typer.Argument(exists=True, dir_okay=False, readable=True)],
     target_config_path: Annotated[
-        Path, typer.Option("--target-config", exists=True, dir_okay=False, readable=True)
+        Path, typer.Option("--sandbox-config", exists=True, dir_okay=False, readable=True)
     ],
     invariants_path: Annotated[
         Path, typer.Option("--invariants", exists=True, dir_okay=False, readable=True)
@@ -163,7 +174,7 @@ def save_multi_turn_regression(
         raise typer.BadParameter("output already exists; UL will not overwrite it")
     try:
         case = load_correction_after_first_response_case(case_path)
-        target_config = load_json_http_dataset_target_config(target_config_path)
+        target_config = load_json_http_sandbox_config(target_config_path)
         invariant_suite = load_dataset_invariant_suite(invariants_path)
         regression = create_multi_turn_regression_case(
             stress_case=case,
@@ -187,27 +198,37 @@ def save_multi_turn_regression(
 def run_correction_after_first_response(
     case_path: Annotated[Path, typer.Argument(exists=True, dir_okay=False, readable=True)],
     target_config_path: Annotated[
-        Path, typer.Option("--target-config", exists=True, dir_okay=False, readable=True)
+        Path, typer.Option("--sandbox-config", exists=True, dir_okay=False, readable=True)
     ],
     invariants_path: Annotated[
         Path, typer.Option("--invariants", exists=True, dir_okay=False, readable=True)
     ],
     output: Annotated[Path | None, typer.Option(help="New private JSON evidence file.")] = None,
     repetitions: Annotated[int, typer.Option(min=1)] = 3,
-    max_target_calls: Annotated[int, typer.Option(min=1)] = 100,
-    allow_target_network: Annotated[bool, typer.Option()] = False,
-    confirm_isolated_sandbox: Annotated[bool, typer.Option()] = False,
-    allow_insecure_http: Annotated[bool, typer.Option()] = False,
+    max_target_calls: Annotated[int, typer.Option("--max-sandbox-api-calls", min=1)] = 100,
+    allow_target_network: Annotated[bool, typer.Option("--allow-sandbox-network-egress")] = False,
+    confirm_isolated_sandbox: Annotated[
+        bool,
+        typer.Option(
+            help=(
+                "Attest that the configured endpoint is a customer-managed, isolated "
+                "non-production sandbox. UL does not verify its isolation."
+            )
+        ),
+    ] = False,
+    allow_insecure_http: Annotated[
+        bool, typer.Option(help="Allow an HTTP sandbox API. Intended for local sandboxes.")
+    ] = False,
     dry_run: Annotated[
-        bool, typer.Option(help="Validate and show the complete plan without target calls.")
+        bool, typer.Option(help="Validate and show the complete plan without sandbox API calls.")
     ] = False,
 ) -> None:
     """Run the fixed correction-after-first-response event operator."""
     try:
         case = load_correction_after_first_response_case(case_path)
-        target_config = load_json_http_dataset_target_config(target_config_path)
+        target_config = load_json_http_sandbox_config(target_config_path)
         invariant_suite = load_dataset_invariant_suite(invariants_path)
-        validate_json_http_dataset_target_configuration(
+        validate_json_http_sandbox_configuration(
             target_config,
             sandbox_confirmed=confirm_isolated_sandbox or dry_run,
             allow_insecure_http=allow_insecure_http,
@@ -216,7 +237,7 @@ def run_correction_after_first_response(
             case,
             target_config,
             repetitions=repetitions,
-            max_target_calls=max_target_calls,
+            max_sandbox_api_calls=max_target_calls,
         )
     except (ValidationError, ValueError, RuntimeError) as error:
         raise typer.BadParameter(str(error)) from None
@@ -226,12 +247,13 @@ def run_correction_after_first_response(
         typer.echo("Ordered turns: initial request -> correction after first response")
         typer.echo(f"Repetitions: {plan.repetitions}")
         typer.echo(f"Target calls per paired repetition: {plan.target_calls_per_pair}")
-        typer.echo(f"Potential target calls: {plan.required_target_calls}")
+        typer.echo(f"Potential sandbox API calls: {plan.required_target_calls}")
         typer.echo("External calls: none")
         return
     if not allow_target_network:
         raise typer.BadParameter(
-            "execution requires --allow-target-network", param_hint="--allow-target-network"
+            "execution requires --allow-sandbox-network-egress",
+            param_hint="--allow-sandbox-network-egress",
         )
     if not confirm_isolated_sandbox:
         raise typer.BadParameter(
@@ -242,11 +264,11 @@ def run_correction_after_first_response(
         raise typer.BadParameter("execution requires --output", param_hint="--output")
     if output.exists():
         raise typer.BadParameter("output already exists; UL will not overwrite it")
-    target = JsonHttpDatasetTarget.from_config(
+    target = JsonHttpSandboxConnection.from_config(
         target_config,
         sandbox_confirmed=True,
         allow_insecure_http=allow_insecure_http,
-        max_target_calls=max_target_calls,
+        max_sandbox_api_calls=max_target_calls,
     )
     result = asyncio.run(
         _run_and_close(
@@ -270,39 +292,49 @@ def run_correction_after_first_response(
 def replay_saved_multi_turn_case(
     case_path: Annotated[Path, typer.Argument(exists=True, dir_okay=False, readable=True)],
     target_config_path: Annotated[
-        Path, typer.Option("--target-config", exists=True, dir_okay=False, readable=True)
+        Path, typer.Option("--sandbox-config", exists=True, dir_okay=False, readable=True)
     ],
     output: Annotated[Path, typer.Option(help="New private JSON replay evidence file.")],
-    max_target_calls: Annotated[int, typer.Option(min=1)] = 100,
-    allow_target_network: Annotated[bool, typer.Option()] = False,
-    confirm_isolated_sandbox: Annotated[bool, typer.Option()] = False,
-    allow_insecure_http: Annotated[bool, typer.Option()] = False,
+    max_target_calls: Annotated[int, typer.Option("--max-sandbox-api-calls", min=1)] = 100,
+    allow_target_network: Annotated[bool, typer.Option("--allow-sandbox-network-egress")] = False,
+    confirm_isolated_sandbox: Annotated[
+        bool,
+        typer.Option(
+            help=(
+                "Attest that the configured endpoint is a customer-managed, isolated "
+                "non-production sandbox. UL does not verify its isolation."
+            )
+        ),
+    ] = False,
+    allow_insecure_http: Annotated[
+        bool, typer.Option(help="Allow an HTTP sandbox API. Intended for local sandboxes.")
+    ] = False,
 ) -> None:
     """Replay a content-addressed multi-turn correction regression."""
     try:
         case = load_multi_turn_regression_case(case_path)
-        target_config = load_json_http_dataset_target_config(target_config_path)
+        target_config = load_json_http_sandbox_config(target_config_path)
         if dataset_regression_target_config_sha256(target_config) != case.target.config_sha256:
-            raise ValueError("trusted target config digest does not match the regression case")
+            raise ValueError("trusted sandbox config digest does not match the regression case")
         plan_correction_stress_test(
             case.stress_case,
             target_config,
             repetitions=case.repetitions,
-            max_target_calls=max_target_calls,
+            max_sandbox_api_calls=max_target_calls,
         )
     except (ValidationError, ValueError, RuntimeError) as error:
         raise typer.BadParameter(str(error)) from None
     if not allow_target_network or not confirm_isolated_sandbox:
         raise typer.BadParameter(
-            "replay requires --allow-target-network and --confirm-isolated-sandbox"
+            "replay requires --allow-sandbox-network-egress and --confirm-isolated-sandbox"
         )
     if output.exists():
         raise typer.BadParameter("output already exists; UL will not overwrite it")
-    target = JsonHttpDatasetTarget.from_config(
+    target = JsonHttpSandboxConnection.from_config(
         target_config,
         sandbox_confirmed=True,
         allow_insecure_http=allow_insecure_http,
-        max_target_calls=max_target_calls,
+        max_sandbox_api_calls=max_target_calls,
     )
     result = asyncio.run(
         _replay_and_close(
@@ -319,7 +351,7 @@ def replay_saved_multi_turn_case(
 
 async def _run_and_close(
     case: CorrectionAfterFirstResponseCase,
-    target: JsonHttpDatasetTarget,
+    target: JsonHttpSandboxConnection,
     *,
     invariant_rules: tuple[DatasetInvariantRule, ...],
     observation_authority: ObservationAuthority,
@@ -333,7 +365,7 @@ async def _run_and_close(
             invariant_rules=invariant_rules,
             observation_authority=observation_authority,
             repetitions=repetitions,
-            max_target_calls=max_target_calls,
+            max_sandbox_api_calls=max_target_calls,
             allow_network_egress=True,
         )
     finally:
@@ -342,7 +374,7 @@ async def _run_and_close(
 
 async def _run_trace_replay_and_close(
     case: TraceReplayCase,
-    target: JsonHttpDatasetTarget,
+    target: JsonHttpSandboxConnection,
     *,
     repetitions: int,
     max_target_calls: int,
@@ -361,13 +393,13 @@ async def _run_trace_replay_and_close(
 
 async def _replay_and_close(
     case: MultiTurnRegressionCase,
-    target: JsonHttpDatasetTarget,
+    target: JsonHttpSandboxConnection,
     *,
     max_target_calls: int,
 ) -> CorrectionStressResult:
     try:
         return await replay_multi_turn_regression(
-            case, target, max_target_calls=max_target_calls, allow_network_egress=True
+            case, target, max_sandbox_api_calls=max_target_calls, allow_network_egress=True
         )
     finally:
         await target.aclose()

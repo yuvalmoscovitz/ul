@@ -43,6 +43,7 @@ class _DefectiveAgentRequestHandler(BaseHTTPRequestHandler):
     state_lock = Lock()
     reset_generation = 0
     committed_action: dict[str, str] | None = None
+    sandbox_id = "quickstart-accounts-payable"
 
     def do_POST(self) -> None:
         if self.path not in {"/reset", "/setup", "/execute", "/snapshot"}:
@@ -80,32 +81,51 @@ class _DefectiveAgentRequestHandler(BaseHTTPRequestHandler):
             return
 
         if self.path == "/reset":
-            if request != {}:
+            if not _valid_case_request(request):
                 self._send_json(HTTPStatus.BAD_REQUEST, {"error": "invalid reset request"})
                 return
             with type(self).state_lock:
                 type(self).reset_generation += 1
                 type(self).committed_action = None
                 generation = type(self).reset_generation
-            self._send_json(HTTPStatus.OK, {"generation": generation, "clean": True})
+            self._send_json(
+                HTTPStatus.OK,
+                {
+                    "sandbox_id": self.sandbox_id,
+                    "case_id": _case_id_from_request(request),
+                    "generation": generation,
+                    "clean": True,
+                },
+            )
             return
         if self.path == "/setup":
-            if request != {"scenario": "accounts-payable"}:
+            if not _valid_case_request(request, scenario="accounts-payable"):
                 self._send_json(HTTPStatus.BAD_REQUEST, {"error": "invalid setup request"})
                 return
-            self._send_json(HTTPStatus.OK, {})
+            self._send_json(
+                HTTPStatus.OK,
+                {"sandbox_id": self.sandbox_id, "case_id": _case_id_from_request(request)},
+            )
             return
         if self.path == "/snapshot":
-            if request != {}:
+            if not _valid_case_request(request, requires_turn_id=True):
                 self._send_json(HTTPStatus.BAD_REQUEST, {"error": "invalid snapshot request"})
                 return
             with type(self).state_lock:
                 committed_action = type(self).committed_action
-            self._send_json(HTTPStatus.OK, {"state": committed_action})
+            self._send_json(
+                HTTPStatus.OK,
+                {
+                    "sandbox_id": self.sandbox_id,
+                    "case_id": _case_id_from_request(request),
+                    "turn_id": _turn_id_from_request(request),
+                    "state": committed_action,
+                },
+            )
             return
 
         try:
-            message = _validated_message(request)
+            message, case_id, turn_id = _validated_message(request)
         except ValueError:
             self._send_json(HTTPStatus.BAD_REQUEST, {"error": "invalid request"})
             return
@@ -120,7 +140,15 @@ class _DefectiveAgentRequestHandler(BaseHTTPRequestHandler):
         action = _payment_action(invoice_reference)
         with type(self).state_lock:
             type(self).committed_action = action
-        self._send_json(HTTPStatus.OK, {"result": action})
+        self._send_json(
+            HTTPStatus.OK,
+            {
+                "sandbox_id": self.sandbox_id,
+                "case_id": case_id,
+                "turn_id": turn_id,
+                "result": action,
+            },
+        )
 
     def _send_json(self, status: HTTPStatus, payload: dict[str, Any]) -> None:
         encoded_payload = json.dumps(payload, separators=(",", ":")).encode("utf-8")
@@ -136,12 +164,14 @@ class _DefectiveAgentRequestHandler(BaseHTTPRequestHandler):
         return
 
 
-def _validated_message(request: object) -> str:
+def _validated_message(request: object) -> tuple[str, str, str]:
     if type(request) is not dict:
         raise ValueError("invalid request shape")
     request_mapping = cast(dict[str, object], request)
-    if set(request_mapping) != {"request", "settings"}:
+    if set(request_mapping) != {"case_id", "turn_id", "request", "settings"}:
         raise ValueError("invalid request shape")
+    case_id = _validated_case_id(request_mapping["case_id"])
+    turn_id = _validated_turn_id(request_mapping["turn_id"])
     request_object = request_mapping["request"]
     settings_object = request_mapping["settings"]
     if type(request_object) is not dict:
@@ -156,7 +186,50 @@ def _validated_message(request: object) -> str:
     message = nested_request["message"]
     if type(message) is not str or not message.strip() or len(message) > 4_000:
         raise ValueError("invalid message")
-    return message
+    return message, case_id, turn_id
+
+
+def _valid_case_request(
+    request: object,
+    *,
+    scenario: str | None = None,
+    requires_turn_id: bool = False,
+) -> bool:
+    if type(request) is not dict:
+        return False
+    request_mapping = cast(dict[str, object], request)
+    expected_fields = {"case_id"} if scenario is None else {"case_id", "scenario"}
+    if requires_turn_id:
+        expected_fields.add("turn_id")
+    if set(request_mapping) != expected_fields or request_mapping.get("scenario") != scenario:
+        return False
+    try:
+        _validated_case_id(request_mapping["case_id"])
+        if requires_turn_id:
+            _validated_turn_id(request_mapping["turn_id"])
+    except ValueError:
+        return False
+    return True
+
+
+def _validated_case_id(value: object) -> str:
+    if type(value) is not str or not value.startswith("ul-case-") or len(value) != 40:
+        raise ValueError("invalid case ID")
+    return value
+
+
+def _validated_turn_id(value: object) -> str:
+    if type(value) is not str or not value.strip() or len(value) > 500:
+        raise ValueError("invalid turn ID")
+    return value
+
+
+def _case_id_from_request(request: object) -> str:
+    return cast(dict[str, str], request)["case_id"]
+
+
+def _turn_id_from_request(request: object) -> str:
+    return cast(dict[str, str], request)["turn_id"]
 
 
 def create_server() -> ThreadingHTTPServer:

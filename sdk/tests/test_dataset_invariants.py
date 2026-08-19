@@ -340,7 +340,10 @@ def test_committed_state_authority_uses_snapshot_not_execute_response() -> None:
     )
     output = ObservedAgentOutput(
         raw_output={"amount": 100},
-        metadata={"committed_state_snapshot": {"amount": 150}},
+        metadata={
+            "committed_state_snapshot": {"amount": 150},
+            "state_observation_authority": "sandbox_self_reported",
+        },
     )
 
     agent_response_result = evaluate_dataset_invariant_rules(

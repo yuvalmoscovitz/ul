@@ -14,10 +14,18 @@ from ul.event_stress import (
     replay_multi_turn_regression,
     run_correction_stress_test,
 )
-from ul.http_target import JsonHttpDatasetTargetConfig
+from ul.http_sandbox import JsonHttpSandboxConfig
 from ul_cli.event_stress import _print_result
 from ul_core.dataset import ObservedAgentOutput
-from ul_core.models import ConversationRole, ConversationTurn, SafetyEnvelope
+from ul_core.evaluation import (
+    EvaluationCase,
+    ExecutionEvidence,
+    SandboxCapabilities,
+    SandboxLifecycleEvidence,
+    SandboxStateEvidence,
+    SandboxTurnEvidence,
+)
+from ul_core.models import ConversationRole, ConversationTurn
 
 
 def _case() -> CorrectionAfterFirstResponseCase:
@@ -38,10 +46,11 @@ def _case() -> CorrectionAfterFirstResponseCase:
     )
 
 
-def _config() -> JsonHttpDatasetTargetConfig:
-    return JsonHttpDatasetTargetConfig.model_validate(
+def _config() -> JsonHttpSandboxConfig:
+    return JsonHttpSandboxConfig.model_validate(
         {
-            "version": 2,
+            "version": 3,
+            "sandbox_id": "test-sandbox",
             "reset": {
                 "url": "https://sandbox.example.test/reset",
                 "generation_json_pointer": "/generation",
@@ -51,9 +60,19 @@ def _config() -> JsonHttpDatasetTargetConfig:
             "setup": {"url": "https://sandbox.example.test/setup"},
             "execute_turn": {
                 "url": "https://sandbox.example.test/execute",
-                "request_json_template": {"input": "{{input}}"},
+                "request_json_template": {
+                    "case_id": "{{case_id}}",
+                    "turn_id": "{{turn_id}}",
+                    "input": "{{input}}",
+                },
             },
-            "snapshot": {"url": "https://sandbox.example.test/snapshot"},
+            "snapshot": {
+                "url": "https://sandbox.example.test/snapshot",
+                "request_json_template": {
+                    "case_id": "{{case_id}}",
+                    "turn_id": "{{turn_id}}",
+                },
+            },
         }
     )
 
@@ -71,24 +90,55 @@ def _invariant() -> JsonValuesEqualInvariant:
 
 
 class _DefectiveCorrectionTarget:
+    sandbox_id = "correction-test-sandbox"
+    config_sha256 = "0" * 64
+    capabilities = SandboxCapabilities(
+        supports_conversations=True,
+        supports_state_observation=True,
+        state_observation_authority="sandbox_self_reported",
+        cancellation_guarantee="guaranteed",
+    )
+
     def __init__(self) -> None:
         self.conversations: list[tuple[str, ...]] = []
-        self.safety_envelope = SafetyEnvelope(
-            description="isolated defective target",
-            isolated=True,
-            allows_network_egress=False,
-            allows_business_side_effects=False,
-        )
 
-    @property
-    def fresh_state_per_execution(self) -> bool:
-        return True
-
-    def target_calls_for_conversation(self, turn_count: int) -> int:
+    def api_calls_for_case(self, case: EvaluationCase) -> int:
+        turn_count = len(case.turns)
         return 3 + (2 * turn_count)
 
-    async def execute(self, raw_input: str) -> ObservedAgentOutput:
-        return (await self.execute_conversation((raw_input,)))[0]
+    async def execute(self, case: EvaluationCase) -> ExecutionEvidence:
+        outputs = await self.execute_conversation(tuple(turn.content for turn in case.turns))
+        final_output = outputs[-1]
+        return ExecutionEvidence(
+            case_id=case.id,
+            sandbox_id=self.sandbox_id,
+            sandbox_config_sha256=self.config_sha256,
+            initial_state=SandboxStateEvidence(
+                value={},
+                authority="sandbox_self_reported",
+            ),
+            turns=tuple(
+                SandboxTurnEvidence(
+                    turn_id=turn.id,
+                    response=output.raw_output,
+                    state_snapshot=output.metadata["committed_state_snapshot"],
+                    state_observation_authority="sandbox_self_reported",
+                )
+                for turn, output in zip(case.turns, outputs, strict=True)
+            ),
+            final_response=final_output.raw_output,
+            final_state=SandboxStateEvidence(
+                value=final_output.metadata["committed_state_snapshot"],
+                authority="sandbox_self_reported",
+            ),
+            lifecycle=SandboxLifecycleEvidence(
+                terminal_status="succeeded",
+                completed_phases=("execute", "cleanup"),
+                delivery="certain",
+                cleanup="succeeded",
+                sandbox_state_uncertain=False,
+            ),
+        )
 
     async def execute_conversation(
         self, raw_inputs: tuple[str, ...]
@@ -148,7 +198,8 @@ async def test_finds_repeatable_correction_failure_and_preserves_ordered_evidenc
         target,
         invariant_rules=(_invariant(),),
         repetitions=3,
-        max_target_calls=36,
+        max_sandbox_api_calls=36,
+        allow_network_egress=True,
     )
 
     assert result.status == "failed"
@@ -184,7 +235,8 @@ async def test_first_divergence_uses_conversation_order_and_flags_nondeterminism
         _NondeterministicCorrectionTarget(),
         invariant_rules=(_invariant(),),
         repetitions=2,
-        max_target_calls=24,
+        max_sandbox_api_calls=24,
+        allow_network_egress=True,
     )
 
     assert [
@@ -216,12 +268,12 @@ async def test_first_divergence_uses_conversation_order_and_flags_nondeterminism
 
 
 def test_dry_run_plan_enforces_complete_pair_budget_without_target_calls() -> None:
-    plan = plan_correction_stress_test(_case(), _config(), repetitions=2, max_target_calls=24)
+    plan = plan_correction_stress_test(_case(), _config(), repetitions=2, max_sandbox_api_calls=28)
 
-    assert plan.target_calls_per_pair == 12
-    assert plan.required_target_calls == 24
+    assert plan.target_calls_per_pair == 14
+    assert plan.required_target_calls == 28
     with pytest.raises(ValueError, match="authorized target call budget"):
-        plan_correction_stress_test(_case(), _config(), repetitions=2, max_target_calls=23)
+        plan_correction_stress_test(_case(), _config(), repetitions=2, max_sandbox_api_calls=27)
 
 
 def test_saved_multi_turn_regression_round_trips_and_replays(tmp_path: Path) -> None:
@@ -241,7 +293,8 @@ def test_saved_multi_turn_regression_round_trips_and_replays(tmp_path: Path) -> 
         replay_multi_turn_regression(
             loaded,
             _DefectiveCorrectionTarget(),
-            max_target_calls=24,
+            max_sandbox_api_calls=24,
+            allow_network_egress=True,
         )
     )
 

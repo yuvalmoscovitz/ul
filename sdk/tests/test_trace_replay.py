@@ -13,7 +13,14 @@ from ul.trace_replay import (
     run_trace_replay,
 )
 from ul_core.dataset import ObservedAgentOutput
-from ul_core.models import SafetyEnvelope
+from ul_core.evaluation import (
+    EvaluationCase,
+    ExecutionEvidence,
+    SandboxCapabilities,
+    SandboxLifecycleEvidence,
+    SandboxStateEvidence,
+    SandboxTurnEvidence,
+)
 
 
 def _attribute(key: str, value: str) -> dict[str, Any]:
@@ -90,26 +97,57 @@ def _trace_records(*, include_state: bool = True) -> tuple[Any, ...]:
 
 
 class _ReplayTarget:
+    sandbox_id = "trace-replay-test-sandbox"
+    config_sha256 = "0" * 64
+    capabilities = SandboxCapabilities(
+        supports_conversations=True,
+        supports_state_observation=True,
+        state_observation_authority="sandbox_self_reported",
+        cancellation_guarantee="guaranteed",
+    )
+
     def __init__(self, *, drift: bool = False, include_state: bool = True) -> None:
         self.drift = drift
         self.include_state = include_state
         self.conversations: list[tuple[str, ...]] = []
-        self.safety_envelope = SafetyEnvelope(
-            description="isolated trace replay target",
-            isolated=True,
-            allows_network_egress=False,
-            allows_business_side_effects=False,
-        )
 
-    @property
-    def fresh_state_per_execution(self) -> bool:
-        return True
-
-    def target_calls_for_conversation(self, turn_count: int) -> int:
+    def api_calls_for_case(self, case: EvaluationCase) -> int:
+        turn_count = len(case.turns)
         return 3 + (2 * turn_count)
 
-    async def execute(self, raw_input: str) -> ObservedAgentOutput:
-        return (await self.execute_conversation((raw_input,)))[0]
+    async def execute(self, case: EvaluationCase) -> ExecutionEvidence:
+        outputs = await self.execute_conversation(tuple(turn.content for turn in case.turns))
+        snapshots = tuple(output.metadata.get("committed_state_snapshot", {}) for output in outputs)
+        return ExecutionEvidence(
+            case_id=case.id,
+            sandbox_id=self.sandbox_id,
+            sandbox_config_sha256=self.config_sha256,
+            initial_state=SandboxStateEvidence(
+                value={},
+                authority="sandbox_self_reported",
+            ),
+            turns=tuple(
+                SandboxTurnEvidence(
+                    turn_id=turn.id,
+                    response=output.raw_output,
+                    state_snapshot=snapshot,
+                    state_observation_authority="sandbox_self_reported",
+                )
+                for turn, output, snapshot in zip(case.turns, outputs, snapshots, strict=True)
+            ),
+            final_response=outputs[-1].raw_output,
+            final_state=SandboxStateEvidence(
+                value=snapshots[-1],
+                authority="sandbox_self_reported",
+            ),
+            lifecycle=SandboxLifecycleEvidence(
+                terminal_status="succeeded",
+                completed_phases=("execute", "cleanup"),
+                delivery="certain",
+                cleanup="succeeded",
+                sandbox_state_uncertain=False,
+            ),
+        )
 
     async def execute_conversation(
         self, raw_inputs: tuple[str, ...]
@@ -151,6 +189,29 @@ class _ReplayTarget:
         return tuple(outputs)
 
 
+class _UncertainReplaySandbox(_ReplayTarget):
+    def __init__(self) -> None:
+        super().__init__()
+        self.execution_count = 0
+
+    async def execute(self, case: EvaluationCase) -> ExecutionEvidence:
+        self.execution_count += 1
+        if self.execution_count > 1:
+            raise AssertionError("uncertain sandbox must not be called again")
+        return ExecutionEvidence(
+            case_id=case.id,
+            sandbox_id=self.sandbox_id,
+            sandbox_config_sha256=self.config_sha256,
+            lifecycle=SandboxLifecycleEvidence(
+                terminal_status="failed",
+                failed_phase="execute_turn",
+                delivery="uncertain",
+                cleanup="succeeded",
+                sandbox_state_uncertain=True,
+            ),
+        )
+
+
 def test_materializes_one_replay_case_per_completed_user_turn() -> None:
     bundle = materialize_trace_replay_bundle(_trace_records())
 
@@ -176,11 +237,24 @@ async def test_replays_selected_conversation_prefix_and_reports_reproduction() -
     case = materialize_trace_replay_bundle(_trace_records()).cases[1]
     target = _ReplayTarget()
 
-    result = await run_trace_replay(case, target, repetitions=2, max_target_calls=14)
+    result = await run_trace_replay(
+        case, target, repetitions=2, max_target_calls=14, allow_network_egress=True
+    )
 
     assert result.status == "reproduced"
     assert result.response_match_count == 2
     assert result.state_match_count == 2
+    execution_evidence = result.trials[0].execution_evidence
+    assert execution_evidence is not None
+    assert execution_evidence.initial_state == SandboxStateEvidence(
+        value={},
+        authority="sandbox_self_reported",
+    )
+    assert execution_evidence.final_response == "Submitted AC-100."
+    assert execution_evidence.final_state == SandboxStateEvidence(
+        value={"invoice": "AC-100", "status": "submitted"},
+        authority="sandbox_self_reported",
+    )
     assert target.conversations == [
         ("Pay AC-100.", "Approve and submit it."),
         ("Pay AC-100.", "Approve and submit it."),
@@ -196,11 +270,27 @@ async def test_replay_reports_observed_drift_without_claiming_correctness() -> N
         _ReplayTarget(drift=True),
         repetitions=2,
         max_target_calls=14,
+        allow_network_egress=True,
     )
 
     assert result.status == "drifted"
     assert result.response_match_count == 0
     assert result.state_match_count == 0
+
+
+@pytest.mark.asyncio
+async def test_replay_stops_after_uncertain_sandbox_state() -> None:
+    case = materialize_trace_replay_bundle(_trace_records()).cases[1]
+    sandbox = _UncertainReplaySandbox()
+
+    result = await run_trace_replay(
+        case, sandbox, repetitions=3, max_target_calls=21, allow_network_egress=True
+    )
+
+    assert result.status == "inconclusive"
+    assert sandbox.execution_count == 1
+    assert result.trials[0].execution_evidence is not None
+    assert all(trial.inconclusive_reason is not None for trial in result.trials)
 
 
 @pytest.mark.asyncio
@@ -212,6 +302,7 @@ async def test_replay_without_recorded_state_compares_response_only() -> None:
         _ReplayTarget(include_state=False),
         repetitions=2,
         max_target_calls=14,
+        allow_network_egress=True,
     )
 
     assert result.status == "reproduced"

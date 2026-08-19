@@ -26,15 +26,12 @@ from ul import (
     DatasetTargetLifecycleFailure,
     InteractionRecord,
     LocalPseudonymStore,
-    PythonDatasetTarget,
     RedactedSemanticPipeline,
     RedactionEngine,
     builtin_dataset_augmentation_operators,
     create_semantic_model_deconstructor,
     load_dataset_semantic_settings,
-    load_python_dataset_target,
     load_redaction_policy,
-    validate_python_target_factory_reference,
 )
 from ul.dataset_invariants import (
     DatasetInvariantArrayUniqueTrialEvaluation,
@@ -46,13 +43,13 @@ from ul.dataset_invariants import (
     evaluate_dataset_invariants,
     load_dataset_invariant_suite,
 )
-from ul.http_target import (
-    JsonHttpDatasetTarget,
-    JsonHttpDatasetTargetConfig,
-    json_http_target_calls_per_execution,
-    json_http_target_config_urls,
-    load_json_http_dataset_target_config,
-    validate_json_http_dataset_target_configuration,
+from ul.http_sandbox import (
+    JsonHttpSandboxConfig,
+    JsonHttpSandboxConnection,
+    json_http_sandbox_calls_per_execution,
+    json_http_sandbox_config_urls,
+    load_json_http_sandbox_config,
+    validate_json_http_sandbox_configuration,
 )
 from ul_core.dataset import ObservedOutcome
 
@@ -83,7 +80,7 @@ app.command("review")(review_dataset_finding)
 _MAXIMUM_DATASET_BYTES = 10_000_000
 _MAXIMUM_DATASET_RECORDS = 100
 _MAXIMUM_EVIDENCE_BYTES = 128_000_000
-_DEFAULT_MAXIMUM_TARGET_CALLS = 100
+_DEFAULT_MAXIMUM_SANDBOX_API_CALLS = 100
 _REDACTION_KEY_ENVIRONMENT_VARIABLE = "UL_DATASET_REDACTION_KEY"
 _DATASET_OPERATORS = builtin_dataset_augmentation_operators()
 _DATASET_OPERATOR_IDS = tuple(operator.id for operator in _DATASET_OPERATORS)
@@ -114,78 +111,97 @@ class _DatasetInputError(ValueError):
 
 
 @app.command("init")
-def initialize_dataset_target(
-    target_config: Annotated[
+def initialize_dataset_sandbox(
+    sandbox_config: Annotated[
         Path,
         typer.Argument(
             dir_okay=False,
-            help="New JSON file describing the target request and response shape.",
+            help="New JSON file describing the customer-managed sandbox API.",
         ),
     ],
     url: Annotated[
         str,
-        typer.Option(help="Sandbox HTTP(S) endpoint that UL will evaluate."),
+        typer.Option(help="Base URL of the customer's isolated agent sandbox API."),
     ],
 ) -> None:
-    """Create a private starter configuration for a JSON HTTP target.
-
-    The generated template contains one complete {{input}} JSON value. A response
-    JSON Pointer such as /choices/0/message/content selects the observable result.
-    """
+    """Create a private connection config for a customer-managed agent sandbox API."""
     try:
         base_url = url.rstrip("/")
-        config = JsonHttpDatasetTargetConfig.model_validate(
+        config = JsonHttpSandboxConfig.model_validate(
             {
-                "version": 2,
+                "version": 3,
+                "sandbox_id": "replace-with-stable-sandbox-id",
                 "headers_from_env": {},
                 "reset": {
                     "url": f"{base_url}/reset",
-                    "request_json": {},
+                    "request_json_template": {"case_id": "{{case_id}}"},
+                    "case_id_json_pointer": "/case_id",
                     "generation_json_pointer": "/generation",
                     "clean_state_json_pointer": "/clean",
                     "clean_state_value": True,
+                    "sandbox_id_json_pointer": "/sandbox_id",
                 },
                 "setup": {
                     "url": f"{base_url}/setup",
-                    "request_json": {"fixture": "default"},
+                    "request_json_template": {
+                        "case_id": "{{case_id}}",
+                        "fixture": "default",
+                    },
+                    "case_id_json_pointer": "/case_id",
+                    "sandbox_id_json_pointer": "/sandbox_id",
                 },
                 "execute_turn": {
                     "url": f"{base_url}/execute",
-                    "request_json_template": {"input": "{{input}}"},
+                    "request_json_template": {
+                        "case_id": "{{case_id}}",
+                        "turn_id": "{{turn_id}}",
+                        "input": "{{input}}",
+                    },
                     "response_json_pointer": "/response",
+                    "case_id_json_pointer": "/case_id",
+                    "turn_id_json_pointer": "/turn_id",
+                    "sandbox_id_json_pointer": "/sandbox_id",
                 },
                 "snapshot": {
                     "url": f"{base_url}/snapshot",
-                    "request_json": {},
+                    "request_json_template": {
+                        "case_id": "{{case_id}}",
+                        "turn_id": "{{turn_id}}",
+                    },
                     "response_json_pointer": "/state",
+                    "case_id_json_pointer": "/case_id",
+                    "turn_id_json_pointer": "/turn_id",
+                    "sandbox_id_json_pointer": "/sandbox_id",
                 },
             }
         )
-        output_stream = _create_private_output(target_config)
+        output_stream = _create_private_output(sandbox_config)
     except (OSError, ValidationError, ValueError) as error:
         if isinstance(error, FileExistsError):
-            message = "target config already exists; UL will not overwrite it"
+            message = "sandbox config already exists; UL will not overwrite it"
         elif isinstance(error, OSError):
-            message = f"cannot create target config ({error.__class__.__name__})"
+            message = f"cannot create sandbox config ({error.__class__.__name__})"
         elif isinstance(error, ValidationError):
-            message = "target config is invalid"
+            message = "sandbox config is invalid"
         else:
             message = str(error)
-        raise typer.BadParameter(message, param_hint="TARGET_CONFIG") from None
+        raise typer.BadParameter(message, param_hint="SANDBOX_CONFIG") from None
 
     with output_stream:
         json.dump(config.model_dump(mode="json"), output_stream, indent=2)
         output_stream.write("\n")
 
-    console.print(f"Created private target config: {target_config}")
+    console.print(f"Created private sandbox connection config: {sandbox_config}")
     console.print(
         "Next: adjust the lifecycle request bodies and response pointers, add any "
-        "headers_from_env, then run 'ul dataset evaluate DATASET --target-config "
-        f"{target_config} --dry-run'."
+        "headers_from_env, then run 'ul dataset evaluate DATASET --sandbox-config "
+        f"{sandbox_config} --dry-run'."
     )
     console.print(
-        "Setup uses one static fixture for the target config. Keep exactly one complete "
-        "{{input}} value in execute_turn. headers_from_env maps HTTP header names to "
+        "Setup uses one static fixture for the sandbox. Keep exactly one complete "
+        "{{case_id}} value in every lifecycle request, {{turn_id}} in execute_turn and snapshot, "
+        "and one {{input}} value in execute_turn. "
+        "headers_from_env maps HTTP header names to "
         "environment-variable names; secret values stay outside this file."
     )
 
@@ -213,22 +229,14 @@ def evaluate_dataset(
             help='JSONL containing one {"id": ..., "input": ..., "output": ...} object per line.',
         ),
     ],
-    target_config: Annotated[
+    sandbox_config: Annotated[
         Path | None,
         typer.Option(
+            "--sandbox-config",
             exists=True,
             dir_okay=False,
             readable=True,
-            help="JSON target configuration created by 'ul dataset init'.",
-        ),
-    ] = None,
-    target_factory: Annotated[
-        str | None,
-        typer.Option(
-            help=(
-                "Trusted local Python factory in package.module:create_target form. "
-                "Mutually exclusive with --target-config."
-            ),
+            help="Connection to the customer's isolated agent sandbox API.",
         ),
     ] = None,
     output: Annotated[
@@ -259,27 +267,36 @@ def evaluate_dataset(
         int,
         typer.Option(
             min=1,
-            help="Fresh-state target executions per original input and accepted variation.",
+            help="Fresh-state sandbox executions per original input and accepted variation.",
         ),
     ] = 3,
-    max_target_calls: Annotated[
+    max_sandbox_api_calls: Annotated[
         int,
         typer.Option(
+            "--max-sandbox-api-calls",
             min=1,
-            help="Maximum target requests authorized for this evaluation.",
+            help="Maximum customer sandbox API requests authorized for this evaluation.",
         ),
-    ] = _DEFAULT_MAXIMUM_TARGET_CALLS,
-    allow_target_network: Annotated[
+    ] = _DEFAULT_MAXIMUM_SANDBOX_API_CALLS,
+    allow_sandbox_network_egress: Annotated[
         bool,
-        typer.Option(help="Allow network egress when the selected target declares it."),
+        typer.Option(
+            "--allow-sandbox-network-egress",
+            help="Allow UL to call the configured remote sandbox API.",
+        ),
     ] = False,
     confirm_isolated_sandbox: Annotated[
         bool,
-        typer.Option(help="Confirm the target cannot cause real business effects."),
+        typer.Option(
+            help=(
+                "Attest that the configured endpoint is a customer-managed, isolated "
+                "non-production sandbox. UL does not verify its isolation."
+            )
+        ),
     ] = False,
     allow_insecure_http: Annotated[
         bool,
-        typer.Option(help="Allow an HTTP target. Intended for local sandboxes."),
+        typer.Option(help="Allow an HTTP sandbox API. Intended for local sandboxes."),
     ] = False,
     dry_run: Annotated[
         bool,
@@ -318,11 +335,12 @@ def evaluate_dataset(
     higher-precedence controls. OpenRouter remains the default; set
     UL_DATASET_SEMANTIC_PROVIDER=openai-compatible for a customer-controlled endpoint.
 
-    HTTP target configurations run an explicit reset/setup/execute/snapshot lifecycle.
-    A trusted Python factory can instead return UL's DatasetTargetExecutor protocol.
+    UL calls only the configured customer-managed sandbox API through an explicit
+    reset/setup/execute/snapshot lifecycle. Production observations are passive source data and
+    cannot select or configure the execution destination.
 
-    Example: ul dataset evaluate interactions.jsonl --target-config target.json
-    --allow-target-network --confirm-isolated-sandbox
+    Example: ul dataset evaluate interactions.jsonl --sandbox-config sandbox.json
+    --allow-sandbox-network-egress --confirm-isolated-sandbox
     --output results.jsonl
     """
     if resume is not None:
@@ -334,10 +352,6 @@ def evaluate_dataset(
         if output is None:
             output = resume
     try:
-        if target_config is not None and target_factory is not None:
-            raise ValueError("--target-config and --target-factory are mutually exclusive")
-        if target_factory is not None:
-            validate_python_target_factory_reference(target_factory)
         records = _load_interaction_records(data)
         selected_operators = _validate_operator_ids(operator)
         invariant_suite = (
@@ -354,15 +368,15 @@ def evaluate_dataset(
             selected_records = _protect_interaction_records(selected_records, redaction_engine)
         all_selected_records = selected_records
         if not dry_run and resume is None:
-            if target_config is None and target_factory is None:
+            if sandbox_config is None:
                 raise typer.BadParameter(
-                    "execution requires --target-config or --target-factory",
-                    param_hint="--target-config",
+                    "execution requires --sandbox-config",
+                    param_hint="--sandbox-config",
                 )
-            if target_config is not None and not allow_target_network:
+            if not allow_sandbox_network_egress:
                 raise typer.BadParameter(
-                    "execution requires --allow-target-network",
-                    param_hint="--allow-target-network",
+                    "execution requires --allow-sandbox-network-egress",
+                    param_hint="--allow-sandbox-network-egress",
                 )
             if not confirm_isolated_sandbox:
                 raise typer.BadParameter(
@@ -370,21 +384,19 @@ def evaluate_dataset(
                     param_hint="--confirm-isolated-sandbox",
                 )
         loaded_target_config = (
-            load_json_http_dataset_target_config(target_config)
-            if target_config is not None
-            else None
+            load_json_http_sandbox_config(sandbox_config) if sandbox_config is not None else None
         )
         if loaded_target_config is not None:
-            validate_json_http_dataset_target_configuration(
+            validate_json_http_sandbox_configuration(
                 loaded_target_config,
                 sandbox_confirmed=confirm_isolated_sandbox or dry_run or resume is not None,
                 allow_insecure_http=allow_insecure_http,
             )
         normalized_target_config = loaded_target_config
-        if resume is not None and normalized_target_config is None and target_factory is None:
-            raise ValueError("--resume requires --target-config or --target-factory")
+        if resume is not None and normalized_target_config is None:
+            raise ValueError("--resume requires --sandbox-config")
         target_calls_per_execution = (
-            json_http_target_calls_per_execution(normalized_target_config)
+            json_http_sandbox_calls_per_execution(normalized_target_config)
             if normalized_target_config is not None
             else 1
         )
@@ -394,10 +406,10 @@ def evaluate_dataset(
             * (1 + len(selected_operators))
             * target_calls_per_execution
         )
-        if resume is None and initial_target_calls > max_target_calls:
+        if resume is None and initial_target_calls > max_sandbox_api_calls:
             raise ValueError(
-                f"selection would make up to {initial_target_calls} target calls, exceeding "
-                f"--max-target-calls {max_target_calls}; reduce --limit, --operator, or "
+                f"selection would make up to {initial_target_calls} sandbox API calls, exceeding "
+                f"--max-sandbox-api-calls {max_sandbox_api_calls}; reduce --limit, --operator, or "
                 "--repetitions, or explicitly raise the call budget"
             )
         if not dry_run and resume is None:
@@ -417,14 +429,13 @@ def evaluate_dataset(
                 repetitions=repetitions,
                 invariant_suite=invariant_suite,
                 target_config=normalized_target_config,
-                target_factory=target_factory,
                 settings=settings,
                 redaction_policy_sha256=(
                     redaction_engine.policy.digest if redaction_engine is not None else None
                 ),
                 redaction_coverage=redaction_coverage,
             )
-            if normalized_target_config is not None or target_factory is not None
+            if normalized_target_config is not None
             else None
         )
     except (_DatasetInputError, ValidationError, ValueError, RuntimeError) as error:
@@ -459,10 +470,11 @@ def evaluate_dataset(
         * (1 + len(selected_operators))
         * target_calls_per_execution
     )
-    if potential_target_calls > max_target_calls:
+    if potential_target_calls > max_sandbox_api_calls:
         raise typer.BadParameter(
-            f"remaining selection would make up to {potential_target_calls} target calls, "
-            f"exceeding --max-target-calls {max_target_calls}; reduce --limit, --operator, "
+            f"remaining selection would make up to {potential_target_calls} sandbox API calls, "
+            f"exceeding --max-sandbox-api-calls {max_sandbox_api_calls}; reduce --limit, "
+            "--operator, "
             "or --repetitions, or explicitly raise the call budget"
         )
 
@@ -472,18 +484,17 @@ def evaluate_dataset(
             selected_count=len(selected_records),
             skipped_count=skipped_count,
             operator_ids=selected_operators,
-            target_configured=target_config is not None or target_factory is not None,
+            target_configured=sandbox_config is not None,
             target_endpoint=(
-                json_http_target_config_urls(loaded_target_config)[0]
+                json_http_sandbox_config_urls(loaded_target_config)[0]
                 if loaded_target_config is not None
                 else None
             ),
             target_header_environment_variables=(
                 loaded_target_config.headers_from_env if loaded_target_config is not None else {}
             ),
-            target_factory=target_factory,
             repetitions=repetitions,
-            max_target_calls=max_target_calls,
+            max_sandbox_api_calls=max_sandbox_api_calls,
             target_calls_per_execution=target_calls_per_execution,
             invariant_suite=invariant_suite,
             output=output,
@@ -510,10 +521,10 @@ def evaluate_dataset(
             raise typer.Exit(code=1)
         raise typer.Exit(code=0)
 
-    if target_config is None and target_factory is None:
+    if sandbox_config is None:
         raise typer.BadParameter(
-            "execution requires --target-config or --target-factory",
-            param_hint="--target-config/--target-factory",
+            "execution requires --sandbox-config",
+            param_hint="--sandbox-config",
         )
     if not confirm_isolated_sandbox:
         raise typer.BadParameter(
@@ -546,40 +557,20 @@ def evaluate_dataset(
         )
 
     try:
-        if loaded_target_config is not None:
-            if not allow_target_network:
-                raise ValueError("HTTP targets require --allow-target-network")
-            target: JsonHttpDatasetTarget | PythonDatasetTarget = JsonHttpDatasetTarget.from_config(
-                loaded_target_config,
-                sandbox_confirmed=True,
-                allow_insecure_http=allow_insecure_http,
-                max_target_calls=max_target_calls,
-            )
-        else:
-            assert target_factory is not None
-            target = load_python_dataset_target(
-                target_factory,
-                max_target_calls=max_target_calls,
-            )
-            if not target.safety_envelope.isolated:
-                asyncio.run(target.aclose())
-                raise ValueError("Python dataset target must be isolated")
-            if target.safety_envelope.allows_business_side_effects:
-                asyncio.run(target.aclose())
-                raise ValueError("Python dataset target must not allow business side effects")
-            if not target.fresh_state_per_execution:
-                asyncio.run(target.aclose())
-                raise ValueError("Python dataset target must start fresh for every execution")
-            if target.safety_envelope.allows_network_egress and not allow_target_network:
-                asyncio.run(target.aclose())
-                raise ValueError("Python target network egress requires --allow-target-network")
+        assert loaded_target_config is not None
+        if not allow_sandbox_network_egress:
+            raise ValueError("sandbox execution requires --allow-sandbox-network-egress")
+        target = JsonHttpSandboxConnection.from_config(
+            loaded_target_config,
+            sandbox_confirmed=True,
+            allow_insecure_http=allow_insecure_http,
+            max_sandbox_api_calls=max_sandbox_api_calls,
+        )
     except ValueError as error:
         raise typer.BadParameter(
             str(error),
-            param_hint="--target-config" if target_config is not None else "--target-factory",
+            param_hint="--sandbox-config",
         ) from None
-    except RuntimeError as error:
-        raise typer.BadParameter(str(error), param_hint="--target-factory") from None
 
     try:
         if resume is None:
@@ -615,7 +606,7 @@ def evaluate_dataset(
                     target,
                     output_stream,
                     repetitions=repetitions,
-                    max_target_calls=max_target_calls,
+                    max_sandbox_api_calls=max_sandbox_api_calls,
                     planned_target_calls=(
                         (len(selected_records) + skipped_count)
                         * repetitions
@@ -635,7 +626,7 @@ def evaluate_dataset(
                     target,
                     output_stream,
                     repetitions=repetitions,
-                    max_target_calls=max_target_calls,
+                    max_sandbox_api_calls=max_sandbox_api_calls,
                     planned_target_calls=(
                         (len(selected_records) + skipped_count)
                         * repetitions
@@ -885,8 +876,7 @@ def _dataset_evidence_run_context(
     selected_operator_ids: tuple[str, ...],
     repetitions: int,
     invariant_suite: DatasetInvariantSuite | None,
-    target_config: JsonHttpDatasetTargetConfig | None,
-    target_factory: str | None = None,
+    target_config: JsonHttpSandboxConfig | None,
     settings: DatasetSemanticSettings,
     redaction_policy_sha256: str | None = None,
     redaction_coverage: tuple[DatasetEvidenceRedactionCoverage, ...] = (),
@@ -900,7 +890,6 @@ def _dataset_evidence_run_context(
         repetitions=repetitions,
         invariant_suite_sha256=(invariant_suite.sha256 if invariant_suite is not None else None),
         target_config=target_config,
-        target_factory=target_factory,
         semantic_settings=DatasetEvidenceSemanticSettings(
             provider=settings.semantic_provider_id,
             endpoint_sha256=settings.semantic_endpoint_sha256,
@@ -927,9 +916,8 @@ def _print_dataset_plan(
     target_configured: bool,
     target_endpoint: str | None,
     target_header_environment_variables: dict[str, str],
-    target_factory: str | None,
     repetitions: int,
-    max_target_calls: int,
+    max_sandbox_api_calls: int,
     target_calls_per_execution: int,
     invariant_suite: DatasetInvariantSuite | None,
     output: Path | None,
@@ -960,7 +948,7 @@ def _print_dataset_plan(
         console.print(f"Customer invariants: {len(invariant_suite.rules)} rule(s)")
         console.print(f"Declared observation authority: {invariant_suite.observation_authority}")
         console.print("Additional model calls for customer invariants: 0")
-        console.print("Additional target calls for customer invariants: 0")
+        console.print("Additional sandbox API calls for customer invariants: 0")
     console.print(f"Potential semantic model calls: up to {potential_model_calls}")
     console.print(
         f"Semantic provider: {semantic_provider_id} "
@@ -975,19 +963,21 @@ def _print_dataset_plan(
                 f"{len(coverage.matched_paths)} path(s)"
             )
     console.print(
-        f"Potential target calls: up to {potential_target_calls} "
-        f"(authorized maximum: {max_target_calls})"
+        f"Potential sandbox API calls: up to {potential_target_calls} "
+        f"(authorized maximum: {max_sandbox_api_calls})"
     )
     if target_calls_per_execution > 1:
         console.print(
             f"Lifecycle calls per execution: {target_calls_per_execution} "
             "(reset, optional setup, execute_turn, snapshot, cleanup reset)"
         )
-    console.print(f"Target: {'configured' if target_configured else 'not configured'}")
+    console.print(
+        f"Customer-managed sandbox API: {'configured' if target_configured else 'not configured'}"
+    )
     if output is not None:
         console.print(f"Evidence destination: {output}")
     if target_endpoint is not None:
-        console.print(f"Target endpoint: {target_endpoint}")
+        console.print(f"Sandbox API endpoint: {target_endpoint}")
         if target_header_environment_variables:
             mappings = ", ".join(
                 f"{header_name}={environment_variable}"
@@ -995,30 +985,23 @@ def _print_dataset_plan(
                     target_header_environment_variables.items()
                 )
             )
-            console.print(f"Target header environment mappings: {mappings}")
+            console.print(f"Sandbox API header environment mappings: {mappings}")
         else:
-            console.print("Target header environment mappings: none")
-    if target_factory is not None:
-        console.print(f"Target factory: {target_factory} (trusted local Python code)")
+            console.print("Sandbox API header environment mappings: none")
     console.print(
         "Semantic models receive historical inputs and outputs, generated variations, "
         "live control responses, and variation responses on execution."
     )
-    if target_factory is None:
-        console.print(
-            "Every execution invokes and validates the configured reset contract. Optional "
-            "setup uses one static fixture from the target config for the entire run."
-        )
-    else:
-        console.print(
-            "The trusted Python target must provide fresh isolated state for every execution."
-        )
+    console.print(
+        "Every test case invokes and validates the configured sandbox reset contract. Optional "
+        "setup uses one static fixture from the sandbox config for the entire run."
+    )
     console.print(
         "Target requests and semantic model calls may be billed separately. Repetitions only "
         "show observed behavioral consistency: they do not determine correctness, identify "
         "causality, or estimate a production failure rate."
     )
-    console.print("No model or target requests sent.")
+    console.print("No model or sandbox API requests sent.")
 
 
 def _create_private_output(path: Path) -> TextIO:
@@ -1133,11 +1116,11 @@ async def _evaluate_interaction_records(
     records: tuple[InteractionRecord, ...],
     operator_ids: tuple[str, ...],
     settings: DatasetSemanticSettings,
-    target: JsonHttpDatasetTarget | PythonDatasetTarget,
+    target: JsonHttpSandboxConnection,
     output_stream: TextIO,
     *,
     repetitions: int,
-    max_target_calls: int,
+    max_sandbox_api_calls: int,
     planned_target_calls: int,
     run_context: DatasetEvidenceRunContext | None = None,
     invariant_suite: DatasetInvariantSuite | None = None,
@@ -1153,7 +1136,7 @@ async def _evaluate_interaction_records(
             else deconstructor
         )
         evaluation_target = (
-            semantic_pipeline.wrap_target(target)
+            semantic_pipeline.wrap_sandbox(target)
             if isinstance(semantic_pipeline, RedactedSemanticPipeline)
             else target
         )
@@ -1185,7 +1168,7 @@ async def _evaluate_interaction_records(
                     _customer_evidence_record(
                         result,
                         repetitions=repetitions,
-                        max_target_calls=max_target_calls,
+                        max_sandbox_api_calls=max_sandbox_api_calls,
                         planned_target_calls=planned_target_calls,
                         run_context=run_context,
                         invariant_evaluation=invariant_evaluation,
@@ -1339,7 +1322,7 @@ def _customer_evidence_record(
     result: DatasetEvaluationResult,
     *,
     repetitions: int,
-    max_target_calls: int,
+    max_sandbox_api_calls: int,
     planned_target_calls: int,
     run_context: DatasetEvidenceRunContext | None = None,
     invariant_evaluation: DatasetInvariantEvaluation | None = None,
@@ -1385,7 +1368,7 @@ def _customer_evidence_record(
         "original_input": result.source.raw_input,
         "execution_plan": {
             "repetitions": repetitions,
-            "max_target_calls": max_target_calls,
+            "max_target_calls": max_sandbox_api_calls,
             "dataset_planned_target_calls": planned_target_calls,
         },
         "limitations": _BEHAVIORAL_LIMITATIONS,

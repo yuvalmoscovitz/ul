@@ -14,10 +14,10 @@ In another:
 
 ```bash
 uv run ul stress correction examples/multiturn_correction/case.json \
-  --target-config examples/multiturn_correction/target.json \
+  --sandbox-config examples/multiturn_correction/target.json \
   --invariants examples/multiturn_correction/invariants.json \
-  --allow-target-network --allow-insecure-http --confirm-isolated-sandbox \
-  --max-target-calls 36 --output tmp/multiturn-correction-evidence.json
+  --allow-sandbox-network-egress --allow-insecure-http --confirm-isolated-sandbox \
+  --max-sandbox-api-calls 42 --output tmp/multiturn-correction-evidence.json
 ```
 
 The expected exit code is `1`: all three repetitions preserve the correction turn and show

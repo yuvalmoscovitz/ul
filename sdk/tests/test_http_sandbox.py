@@ -1,0 +1,591 @@
+from __future__ import annotations
+
+import asyncio
+import json
+import os
+from collections.abc import AsyncIterator
+from pathlib import Path
+from typing import Any
+
+import httpx
+import pytest
+from pydantic import JsonValue, ValidationError
+from ul.http_sandbox import (
+    JsonHttpSandboxConfig,
+    JsonHttpSandboxConnection,
+    json_http_sandbox_calls_per_conversation,
+    load_json_http_sandbox_config,
+    validate_json_http_sandbox_configuration,
+)
+from ul_core.evaluation import EvaluationCase
+from ul_core.models import ConversationRole, ConversationTurn
+
+pytestmark = pytest.mark.asyncio
+
+
+class _StaticResponseStream(httpx.AsyncByteStream):
+    def __init__(self, body: bytes) -> None:
+        self._body = body
+
+    async def __aiter__(self) -> AsyncIterator[bytes]:
+        yield self._body
+
+
+def _raw_response(body: bytes, *, status_code: int = 200) -> httpx.Response:
+    return httpx.Response(
+        status_code,
+        stream=_StaticResponseStream(body),
+        headers={"content-type": "application/json"},
+    )
+
+
+def _config(
+    base_url: str = "https://sandbox.example.test",
+    *,
+    headers_from_env: dict[str, str] | None = None,
+    clean_state_value: JsonValue = True,
+    setup: bool = True,
+) -> JsonHttpSandboxConfig:
+    raw: dict[str, Any] = {
+        "version": 3,
+        "sandbox_id": "payments-test",
+        "headers_from_env": headers_from_env or {},
+        "reset": {
+            "url": f"{base_url}/reset",
+            "request_json_template": {"case_id": "{{case_id}}"},
+            "case_id_json_pointer": "/case_id",
+            "sandbox_id_json_pointer": "/sandbox_id",
+            "generation_json_pointer": "/generation",
+            "clean_state_json_pointer": "/clean",
+            "clean_state_value": clean_state_value,
+        },
+        "execute_turn": {
+            "url": f"{base_url}/execute",
+            "request_json_template": {
+                "case_id": "{{case_id}}",
+                "turn_id": "{{turn_id}}",
+                "input": "{{input}}",
+            },
+            "response_json_pointer": "/agent_response",
+            "case_id_json_pointer": "/case_id",
+            "turn_id_json_pointer": "/turn_id",
+            "sandbox_id_json_pointer": "/sandbox_id",
+        },
+        "snapshot": {
+            "url": f"{base_url}/snapshot",
+            "request_json_template": {
+                "case_id": "{{case_id}}",
+                "turn_id": "{{turn_id}}",
+            },
+            "response_json_pointer": "/state",
+            "case_id_json_pointer": "/case_id",
+            "turn_id_json_pointer": "/turn_id",
+            "sandbox_id_json_pointer": "/sandbox_id",
+        },
+    }
+    if setup:
+        raw["setup"] = {
+            "url": f"{base_url}/setup",
+            "request_json_template": {
+                "case_id": "{{case_id}}",
+                "starting_amount": 100,
+            },
+            "case_id_json_pointer": "/case_id",
+            "sandbox_id_json_pointer": "/sandbox_id",
+        }
+    return JsonHttpSandboxConfig.model_validate(raw)
+
+
+def _case(*inputs: str, max_calls: int = 20) -> EvaluationCase:
+    return EvaluationCase(
+        id="case-1",
+        turns=tuple(
+            ConversationTurn(
+                id=f"turn-{index}",
+                role=ConversationRole.USER,
+                content=content,
+            )
+            for index, content in enumerate(inputs, start=1)
+        ),
+        max_sandbox_api_calls=max_calls,
+        timeout_seconds=30,
+    )
+
+
+def _successful_handler() -> tuple[Any, list[tuple[str, dict[str, JsonValue]]]]:
+    requests: list[tuple[str, dict[str, JsonValue]]] = []
+    generation = 0
+    amount = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal amount, generation
+        body = json.loads(request.content)
+        requests.append((request.url.path, body))
+        if request.url.path == "/reset":
+            generation += 1
+            amount = 0
+            return _raw_response(
+                json.dumps(
+                    {
+                        "sandbox_id": "payments-test",
+                        "case_id": body["case_id"],
+                        "generation": generation,
+                        "clean": True,
+                    }
+                ).encode()
+            )
+        if request.url.path == "/setup":
+            amount = 100
+            return _raw_response(
+                json.dumps({"sandbox_id": "payments-test", "case_id": body["case_id"]}).encode()
+            )
+        if request.url.path == "/execute":
+            amount += 50
+            return _raw_response(
+                json.dumps(
+                    {
+                        "sandbox_id": "payments-test",
+                        "case_id": body["case_id"],
+                        "turn_id": body["turn_id"],
+                        "agent_response": {"input": body["input"]},
+                    }
+                ).encode()
+            )
+        return _raw_response(
+            json.dumps(
+                {
+                    "sandbox_id": "payments-test",
+                    "case_id": body["case_id"],
+                    "turn_id": body["turn_id"],
+                    "state": {"committed_amount": amount},
+                }
+            ).encode()
+        )
+
+    return handler, requests
+
+
+async def test_executes_remote_case_and_returns_explicit_evidence() -> None:
+    handler, requests = _successful_handler()
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        sandbox = JsonHttpSandboxConnection.from_config(
+            _config(), sandbox_confirmed=True, max_sandbox_api_calls=6, client=client
+        )
+        evidence = await sandbox.execute(_case("increase the amount", max_calls=6))
+
+    assert [path for path, _ in requests] == [
+        "/reset",
+        "/setup",
+        "/snapshot",
+        "/execute",
+        "/snapshot",
+        "/reset",
+    ]
+    assert {body["case_id"] for _, body in requests} == {"case-1"}
+    assert requests[2][1]["turn_id"] == "__ul_initial_state__"
+    assert requests[3][1]["turn_id"] == "turn-1"
+    assert requests[4][1]["turn_id"] == "turn-1"
+    assert evidence.lifecycle.terminal_status == "succeeded"
+    assert evidence.sandbox_id == "payments-test"
+    assert evidence.initial_state is not None
+    assert evidence.initial_state.value == {"committed_amount": 100}
+    assert evidence.turns[0].response == {"input": "increase the amount"}
+    assert evidence.turns[0].state_snapshot == {"committed_amount": 150}
+    assert evidence.turns[0].state_observation_authority == "sandbox_self_reported"
+
+
+async def test_preserves_state_within_case_and_resets_between_cases() -> None:
+    handler, requests = _successful_handler()
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        sandbox = JsonHttpSandboxConnection.from_config(
+            _config(), sandbox_confirmed=True, max_sandbox_api_calls=14, client=client
+        )
+        first = await sandbox.execute(_case("first", "correction", max_calls=8))
+        second = await sandbox.execute(
+            EvaluationCase(
+                id="case-2",
+                turns=(
+                    ConversationTurn(id="turn-1", role=ConversationRole.USER, content="new case"),
+                ),
+                max_sandbox_api_calls=6,
+                timeout_seconds=30,
+            )
+        )
+
+    assert [turn.state_snapshot for turn in first.turns] == [
+        {"committed_amount": 150},
+        {"committed_amount": 200},
+    ]
+    assert second.turns[0].state_snapshot == {"committed_amount": 150}
+    assert json_http_sandbox_calls_per_conversation(_config(), 2) == 8
+    assert [body["case_id"] for _, body in requests].count("case-2") == 6
+
+
+async def test_cleanup_failure_is_evidence_and_quarantines_connection() -> None:
+    resets = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal resets
+        body = json.loads(request.content)
+        if request.url.path == "/reset":
+            resets += 1
+            if resets == 2:
+                return httpx.Response(500)
+            return _raw_response(
+                json.dumps(
+                    {
+                        "sandbox_id": "payments-test",
+                        "case_id": body["case_id"],
+                        "generation": 1,
+                        "clean": True,
+                    }
+                ).encode()
+            )
+        if request.url.path == "/setup":
+            return _raw_response(
+                json.dumps({"sandbox_id": "payments-test", "case_id": body["case_id"]}).encode()
+            )
+        if request.url.path == "/execute":
+            return _raw_response(
+                json.dumps(
+                    {
+                        "sandbox_id": "payments-test",
+                        "case_id": body["case_id"],
+                        "turn_id": body["turn_id"],
+                        "agent_response": {"ok": True},
+                    }
+                ).encode()
+            )
+        return _raw_response(
+            json.dumps(
+                {
+                    "sandbox_id": "payments-test",
+                    "case_id": body["case_id"],
+                    "turn_id": body["turn_id"],
+                    "state": {},
+                }
+            ).encode()
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        sandbox = JsonHttpSandboxConnection.from_config(
+            _config(), sandbox_confirmed=True, max_sandbox_api_calls=10, client=client
+        )
+        failed = await sandbox.execute(_case("work", max_calls=6))
+        blocked = await sandbox.execute(_case("again", max_calls=6))
+
+    assert failed.lifecycle.cleanup == "failed"
+    assert failed.lifecycle.sandbox_state_uncertain is True
+    assert blocked.lifecycle.failed_phase == "blocked_state_uncertain"
+
+
+async def test_ambiguous_execute_delivery_stays_quarantined_after_cleanup() -> None:
+    requests: list[str] = []
+    generation = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal generation
+        requests.append(request.url.path)
+        body = json.loads(request.content)
+        if request.url.path == "/reset":
+            generation += 1
+            return _raw_response(
+                json.dumps(
+                    {
+                        "sandbox_id": "payments-test",
+                        "case_id": body["case_id"],
+                        "generation": generation,
+                        "clean": True,
+                    }
+                ).encode()
+            )
+        if request.url.path == "/setup":
+            return _raw_response(
+                json.dumps({"sandbox_id": "payments-test", "case_id": body["case_id"]}).encode()
+            )
+        if request.url.path == "/execute":
+            raise httpx.ReadTimeout("response lost after delivery", request=request)
+        if request.url.path == "/snapshot" and body["turn_id"] == "__ul_initial_state__":
+            return _raw_response(
+                json.dumps(
+                    {
+                        "sandbox_id": "payments-test",
+                        "case_id": body["case_id"],
+                        "turn_id": body["turn_id"],
+                        "state": {},
+                    }
+                ).encode()
+            )
+        raise AssertionError("snapshot must not follow uncertain execution")
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        sandbox = JsonHttpSandboxConnection.from_config(
+            _config(), sandbox_confirmed=True, max_sandbox_api_calls=10, client=client
+        )
+        failed = await sandbox.execute(_case("work", max_calls=6))
+        blocked = await sandbox.execute(_case("again", max_calls=6))
+
+    assert failed.lifecycle.delivery == "uncertain"
+    assert failed.lifecycle.sandbox_state_uncertain is True
+    assert blocked.lifecycle.failed_phase == "blocked_state_uncertain"
+    assert requests == ["/reset", "/setup", "/snapshot", "/execute", "/reset"]
+
+
+async def test_sandbox_identity_mismatch_stops_before_execute() -> None:
+    requests: list[str] = []
+    reset_calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal reset_calls
+        requests.append(request.url.path)
+        reset_calls += 1
+        return _raw_response(
+            json.dumps(
+                {"sandbox_id": "production", "generation": reset_calls, "clean": True}
+            ).encode()
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        sandbox = JsonHttpSandboxConnection.from_config(
+            _config(), sandbox_confirmed=True, max_sandbox_api_calls=6, client=client
+        )
+        evidence = await sandbox.execute(_case("work", max_calls=6))
+
+    assert evidence.lifecycle.failed_phase == "reset"
+    assert evidence.lifecycle.sandbox_state_uncertain is True
+    assert requests == ["/reset", "/reset"]
+
+
+@pytest.mark.parametrize(
+    ("wrong_field", "failed_phase"), (("case_id", "execute_turn"), ("turn_id", "execute_turn"))
+)
+async def test_stale_execute_response_is_rejected_and_quarantined(
+    wrong_field: str, failed_phase: str
+) -> None:
+    generation = 0
+
+    def stale_handler(request: httpx.Request) -> httpx.Response:
+        nonlocal generation
+        request_body = json.loads(request.content)
+        response_body: dict[str, JsonValue] = {
+            "sandbox_id": "payments-test",
+            "case_id": request_body["case_id"],
+        }
+        if request.url.path == "/reset":
+            generation += 1
+            response_body.update({"generation": generation, "clean": True})
+        elif request.url.path == "/execute":
+            response_body.update(
+                {"turn_id": request_body["turn_id"], "agent_response": {"ok": True}}
+            )
+            response_body[wrong_field] = "stale-identity"
+        elif request.url.path == "/snapshot":
+            response_body.update({"turn_id": request_body["turn_id"], "state": {}})
+        return _raw_response(json.dumps(response_body).encode())
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(stale_handler)) as client:
+        sandbox = JsonHttpSandboxConnection.from_config(
+            _config(), sandbox_confirmed=True, max_sandbox_api_calls=10, client=client
+        )
+        failed = await sandbox.execute(_case("work", max_calls=6))
+        blocked = await sandbox.execute(_case("again", max_calls=6))
+
+    assert failed.lifecycle.failed_phase == failed_phase
+    assert failed.lifecycle.delivery == "uncertain"
+    assert failed.lifecycle.sandbox_state_uncertain is True
+    assert blocked.lifecycle.failed_phase == "blocked_state_uncertain"
+
+
+async def test_reserves_complete_budget_before_network() -> None:
+    handler, requests = _successful_handler()
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        sandbox = JsonHttpSandboxConnection.from_config(
+            _config(), sandbox_confirmed=True, max_sandbox_api_calls=5, client=client
+        )
+        with pytest.raises(RuntimeError, match="API call budget exhausted"):
+            await sandbox.execute(_case("work", max_calls=6))
+    assert requests == []
+
+
+async def test_loader_and_headers_do_not_persist_credential(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("TEST_AGENT_TOKEN", "Bearer private-token")
+    config_path = tmp_path / "sandbox.json"
+    config_path.write_text(
+        _config(headers_from_env={"Authorization": "TEST_AGENT_TOKEN"}).model_dump_json(),
+        encoding="utf-8",
+    )
+    authorizations: list[str | None] = []
+    handler, _ = _successful_handler()
+
+    def recording_handler(request: httpx.Request) -> httpx.Response:
+        authorizations.append(request.headers.get("authorization"))
+        return handler(request)
+
+    config = load_json_http_sandbox_config(config_path)
+    async with httpx.AsyncClient(transport=httpx.MockTransport(recording_handler)) as client:
+        sandbox = JsonHttpSandboxConnection.from_config(
+            config, sandbox_confirmed=True, max_sandbox_api_calls=6, client=client
+        )
+        evidence = await sandbox.execute(_case("hello", max_calls=6))
+
+    assert authorizations == ["Bearer private-token"] * 6
+    assert "private-token" not in evidence.model_dump_json()
+    assert "private-token" not in config.model_dump_json()
+
+
+async def test_rejects_cross_origin_lifecycle() -> None:
+    raw = _config().model_dump(mode="json")
+    raw["snapshot"]["url"] = "https://other.example.test/snapshot"
+    with pytest.raises(ValidationError, match="same origin"):
+        JsonHttpSandboxConfig.model_validate(raw)
+
+
+@pytest.mark.parametrize(
+    "encoded_config",
+    (
+        b'{"version":3,"version":3}',
+        b'{"version":NaN}',
+        b"[" * 200 + b"0" + b"]" * 200,
+    ),
+)
+async def test_loader_rejects_adversarial_json(tmp_path: Path, encoded_config: bytes) -> None:
+    config_path = tmp_path / "sandbox.json"
+    config_path.write_bytes(encoded_config)
+    with pytest.raises(ValueError, match="invalid JSON"):
+        load_json_http_sandbox_config(config_path)
+
+
+async def test_loader_rejects_symlink_and_fifo(tmp_path: Path) -> None:
+    real_path = tmp_path / "real.json"
+    real_path.write_text("{}", encoding="utf-8")
+    symlink_path = tmp_path / "link.json"
+    symlink_path.symlink_to(real_path)
+    with pytest.raises(RuntimeError, match="could not be read"):
+        load_json_http_sandbox_config(symlink_path)
+
+    fifo_path = tmp_path / "config.fifo"
+    os.mkfifo(fifo_path)
+    with pytest.raises(RuntimeError, match="could not be read"):
+        load_json_http_sandbox_config(fifo_path)
+
+
+async def test_requires_confirmation_and_explicit_insecure_transport_opt_in() -> None:
+    with pytest.raises(ValueError, match="isolation attestation"):
+        JsonHttpSandboxConnection.from_config(_config(), sandbox_confirmed=False)
+    with pytest.raises(ValueError, match="insecure transport opt-in"):
+        JsonHttpSandboxConnection.from_config(
+            _config("http://sandbox.example.test"), sandbox_confirmed=True
+        )
+
+
+async def test_public_validation_resolves_headers(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("TEST_AGENT_TOKEN", "private-token")
+    assert validate_json_http_sandbox_configuration(
+        _config(headers_from_env={"Authorization": "TEST_AGENT_TOKEN"}),
+        sandbox_confirmed=True,
+    ) == {"Authorization": "private-token"}
+
+
+async def test_cancellation_during_execution_quarantines_connection() -> None:
+    execute_started = asyncio.Event()
+    never_complete = asyncio.Event()
+    generation = 0
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal generation
+        body = json.loads(request.content)
+        if request.url.path == "/reset":
+            generation += 1
+            return _raw_response(
+                json.dumps(
+                    {
+                        "sandbox_id": "payments-test",
+                        "case_id": body["case_id"],
+                        "generation": generation,
+                        "clean": True,
+                    }
+                ).encode()
+            )
+        if request.url.path == "/setup":
+            return _raw_response(
+                json.dumps({"sandbox_id": "payments-test", "case_id": body["case_id"]}).encode()
+            )
+        if request.url.path == "/execute":
+            execute_started.set()
+            await never_complete.wait()
+        return _raw_response(
+            json.dumps(
+                {
+                    "sandbox_id": "payments-test",
+                    "case_id": body["case_id"],
+                    "turn_id": body["turn_id"],
+                    "state": {},
+                }
+            ).encode()
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        sandbox = JsonHttpSandboxConnection.from_config(
+            _config(), sandbox_confirmed=True, max_sandbox_api_calls=10, client=client
+        )
+        task = asyncio.create_task(sandbox.execute(_case("work", max_calls=6)))
+        await execute_started.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        blocked = await sandbox.execute(_case("again", max_calls=6))
+
+    assert blocked.lifecycle.failed_phase == "blocked_state_uncertain"
+
+
+async def test_case_deadline_bounds_the_complete_lifecycle() -> None:
+    execute_started = asyncio.Event()
+    never_complete = asyncio.Event()
+    generation = 0
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal generation
+        body = json.loads(request.content)
+        if request.url.path == "/reset":
+            generation += 1
+            return _raw_response(
+                json.dumps(
+                    {
+                        "sandbox_id": "payments-test",
+                        "case_id": body["case_id"],
+                        "generation": generation,
+                        "clean": True,
+                    }
+                ).encode()
+            )
+        if request.url.path == "/setup":
+            return _raw_response(
+                json.dumps({"sandbox_id": "payments-test", "case_id": body["case_id"]}).encode()
+            )
+        if request.url.path == "/execute":
+            execute_started.set()
+            await never_complete.wait()
+        return _raw_response(
+            json.dumps(
+                {
+                    "sandbox_id": "payments-test",
+                    "case_id": body["case_id"],
+                    "turn_id": body["turn_id"],
+                    "state": {},
+                }
+            ).encode()
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        sandbox = JsonHttpSandboxConnection.from_config(
+            _config(), sandbox_confirmed=True, max_sandbox_api_calls=10, client=client
+        )
+        short_case = _case("work", max_calls=6).model_copy(update={"timeout_seconds": 0.01})
+        with pytest.raises(TimeoutError):
+            await sandbox.execute(short_case)
+        assert execute_started.is_set()
+        blocked = await sandbox.execute(_case("again", max_calls=6))
+
+    assert blocked.lifecycle.failed_phase == "blocked_state_uncertain"
