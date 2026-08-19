@@ -392,6 +392,17 @@ turns. For each repetition UL runs a fresh one-turn baseline, resets the sandbox
 initial turn and correction together in one lifecycle. It captures the agent response and a
 committed-state snapshot after both variation turns, then cleans up before the next pair.
 
+Try the complete deterministic example first. It requires no API key and, after dependencies are
+installed, makes no semantic-provider or non-loopback sandbox calls. It exits successfully only
+when it confirms the seeded critical business-rule violation:
+
+```bash
+uv run python -m examples.multiturn_correction.run
+```
+
+The runner retains private evidence under `tmp/`. Use the lower-level command below when connecting
+your own persistent sandbox.
+
 ```bash
 uv run ul stress correction examples/multiturn_correction/case.json \
   --sandbox-config examples/multiturn_correction/target.json \
@@ -401,8 +412,8 @@ uv run ul stress correction examples/multiturn_correction/case.json \
 ```
 
 Use `--dry-run` to validate the exact conversation, target, invariant suite, and physical call
-budget without making a request. With setup, one paired repetition uses 12 calls: five for the
-baseline and seven for the two-turn variation. Evidence identifies the first turn whose response
+budget without making a request. With setup, one paired repetition uses 14 calls: six for the
+baseline and eight for the two-turn variation. Evidence identifies the first turn whose response
 or committed state differs from the baseline and retains every ordered intermediate observation.
 The customer-declared invariant evaluates the final corrected state; UL does not infer whether a
 changed state is correct.

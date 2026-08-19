@@ -4,21 +4,18 @@ This deterministic sandbox accepts an invoice payment on the first turn, then ac
 ignores a corrected invoice on the second turn. UL preserves both responses and committed-state
 snapshots and reports the critical invariant violation.
 
-In one terminal:
+From the repository root, run:
 
 ```bash
-uv run python -m examples.multiturn_correction.defective_agent
+uv run python -m examples.multiturn_correction.run
 ```
 
-In another:
+The runner starts an ephemeral loopback-only sandbox, executes the real `ul stress correction`
+path three times, retains private evidence under `tmp/`, and stops the sandbox. It requires no API
+key and, after dependencies are installed, makes no semantic-provider or non-loopback sandbox
+calls.
 
-```bash
-uv run ul stress correction examples/multiturn_correction/case.json \
-  --sandbox-config examples/multiturn_correction/target.json \
-  --invariants examples/multiturn_correction/invariants.json \
-  --allow-sandbox-network-egress --allow-insecure-http --confirm-isolated-sandbox \
-  --max-sandbox-api-calls 42 --output tmp/multiturn-correction-evidence.json
-```
-
-The expected exit code is `1`: all three repetitions preserve the correction turn and show
+The wrapper exits `0` only when UL successfully demonstrates the seeded critical failure. The
+underlying `ul stress correction` command retains its normal exit contract: `1` means it found a
+rule violation. All three repetitions preserve the correction turn and show
 `committed_invoice=AC-100` while `requested_invoice=AC-101`.
