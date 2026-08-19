@@ -13,6 +13,18 @@ UL never executes augmentations against the production system it observed.
 UL reports observed differences for human review. It does not decide which behavior is
 correct, prove causality, or estimate a production failure rate.
 
+Inspect every built-in input, conversation, and environment augmentation through one catalog:
+
+```bash
+uv run ul augmentations list
+uv run ul augmentations show environment.tool.timeout_after_commit@1.0.0
+```
+
+The catalog states whether the SDK augmentation registry or a CLI owns each binding,
+and which model, sandbox, state, evaluator, and capability requirements apply.
+Catalog inspection is local and makes no model, sandbox, or network calls. Runtime commands retain
+their own explicit safety confirmations, budgets, lifecycle validation, and evidence contracts.
+
 ## Model-free first finding
 
 Run a deterministic, consequential failure locally without an API key or semantic-model calls:

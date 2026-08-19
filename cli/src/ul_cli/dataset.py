@@ -17,6 +17,7 @@ from rich.console import Console
 from rich.table import Table
 from ul import (
     DatasetAugmentationEngine,
+    DatasetAugmentationOperator,
     DatasetEvaluationCase,
     DatasetEvaluationFinding,
     DatasetEvaluationResult,
@@ -28,10 +29,10 @@ from ul import (
     LocalPseudonymStore,
     RedactedSemanticPipeline,
     RedactionEngine,
-    builtin_dataset_augmentation_operators,
     create_semantic_model_deconstructor,
     load_dataset_semantic_settings,
     load_redaction_policy,
+    resolve_dataset_augmentation_operator,
 )
 from ul.dataset_invariants import (
     DatasetInvariantArrayUniqueTrialEvaluation,
@@ -51,6 +52,7 @@ from ul.http_sandbox import (
     load_json_http_sandbox_config,
     validate_json_http_sandbox_configuration,
 )
+from ul_core.augmentation_catalog import builtin_augmentation_catalog
 from ul_core.dataset import ObservedOutcome
 
 from ul_cli.dataset_ingest import app as ingest_app
@@ -82,11 +84,6 @@ _MAXIMUM_DATASET_RECORDS = 100
 _MAXIMUM_EVIDENCE_BYTES = 128_000_000
 _DEFAULT_MAXIMUM_SANDBOX_API_CALLS = 100
 _REDACTION_KEY_ENVIRONMENT_VARIABLE = "UL_DATASET_REDACTION_KEY"
-_DATASET_OPERATORS = builtin_dataset_augmentation_operators()
-_DATASET_OPERATOR_IDS = tuple(operator.id for operator in _DATASET_OPERATORS)
-_DATASET_OPERATORS_BY_ID = {operator.id: operator for operator in _DATASET_OPERATORS}
-
-
 _CUSTOMER_STATUSES = {
     "augmentation_rejected": "VARIATION DISCARDED",
     "inconclusive": "COULDN'T DETERMINE",
@@ -208,14 +205,10 @@ def initialize_dataset_sandbox(
 
 @app.command("operators")
 def list_dataset_operators() -> None:
-    """List realistic-user transformations available for dataset evaluation."""
-    console.print("Dataset augmentation operators")
-    for operator in builtin_dataset_augmentation_operators():
-        review_note = "; human review required" if operator.human_review_required else ""
-        console.print(
-            f"- {operator.id} ({operator.version}): "
-            f"{operator.allowed_change.replace('_', ' ')}{review_note}"
-        )
+    """List the dataset subset of UL's unified augmentation catalog."""
+    console.print("Dataset augmentations (from 'ul augmentations list')")
+    for augmentation in builtin_augmentation_catalog().list(mode="dataset_variation"):
+        console.print(f"- {augmentation.ref.id}@{augmentation.ref.version}: {augmentation.summary}")
 
 
 @app.command("evaluate")
@@ -256,7 +249,10 @@ def evaluate_dataset(
         list[str] | None,
         typer.Option(
             "--operator",
-            help="Augmentation operator. Run 'ul dataset operators' for values; repeat as needed.",
+            help=(
+                "Augmentation ID. Run 'ul augmentations list --mode dataset_variation' "
+                "for values; repeat as needed."
+            ),
         ),
     ] = None,
     limit: Annotated[
@@ -342,6 +338,8 @@ def evaluate_dataset(
     Example: ul dataset evaluate interactions.jsonl --sandbox-config sandbox.json
     --allow-sandbox-network-egress --confirm-isolated-sandbox
     --output results.jsonl
+
+    Discover operators: ul augmentations list --mode dataset_variation
     """
     if resume is not None:
         if output is not None and output.resolve() != resume.resolve():
@@ -784,14 +782,26 @@ def _validate_model_input_bounds(
 
 
 def _validate_operator_ids(operator_ids: list[str] | None) -> tuple[str, ...]:
-    selected_ids = tuple(operator_ids or ["input.surface.rephrase"])
-    known_ids = set(_DATASET_OPERATOR_IDS)
-    unknown_ids = sorted(set(selected_ids) - known_ids)
-    if unknown_ids:
-        raise _DatasetInputError(f"unknown operator(s): {', '.join(unknown_ids)}")
-    if len(selected_ids) != len(set(selected_ids)):
+    selected_references = tuple(operator_ids or ["input.surface.rephrase"])
+    selected_operators: list[DatasetAugmentationOperator] = []
+    for reference in selected_references:
+        try:
+            operator = resolve_dataset_augmentation_operator(reference)
+        except ValueError:
+            raise _DatasetInputError("unknown augmentation operator reference") from None
+        selected_operators.append(operator)
+    resolved_references = tuple((operator.id, operator.version) for operator in selected_operators)
+    if len(resolved_references) != len(set(resolved_references)):
         raise _DatasetInputError("duplicate --operator values are not allowed")
-    return selected_ids
+    return tuple(
+        reference if "@" in reference else operator.id
+        for reference, operator in zip(selected_references, selected_operators, strict=True)
+    )
+
+
+def _dataset_operator_identity(reference: str) -> tuple[str, str]:
+    operator = resolve_dataset_augmentation_operator(reference)
+    return operator.id, operator.version
 
 
 def _load_redaction_engine(
@@ -884,8 +894,7 @@ def _dataset_evidence_run_context(
     return create_dataset_evidence_run_context(
         selected_records=selected_records,
         operators=tuple(
-            (operator_id, _DATASET_OPERATORS_BY_ID[operator_id].version)
-            for operator_id in selected_operator_ids
+            _dataset_operator_identity(reference) for reference in selected_operator_ids
         ),
         repetitions=repetitions,
         invariant_suite_sha256=(invariant_suite.sha256 if invariant_suite is not None else None),
