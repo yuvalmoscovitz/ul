@@ -21,6 +21,18 @@ uv tool install git+https://github.com/yuvalmoscovitz/ul.git
 
 If `uv` reports that its tool directory is not on `PATH`, run `uv tool update-shell`.
 
+## Try the demo
+
+Run the first no-key product experience:
+
+```bash
+ul demo
+```
+
+The demo uses a fully synthetic environment on `localhost`. It makes zero semantic-model calls
+and zero external-network calls, so no API key is required. It prints a finding and saves private
+evidence in UL's application data directory for review.
+
 ## Quickstart
 
 Create a JSONL dataset with one interaction per line:
