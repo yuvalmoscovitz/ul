@@ -43,6 +43,13 @@ from ul.sandbox import evaluation_case_from_inputs
 from ul_cli import dataset as main
 from ul_cli import dataset_review
 from ul_cli.main import app as root_app
+from ul_core.evaluation import (
+    ExecutionEvidence,
+    SandboxLifecycleEvidence,
+    SandboxResetEvidence,
+    SandboxStateEvidence,
+    SandboxTurnEvidence,
+)
 
 runner = CliRunner()
 _ANSI_ESCAPE_PATTERN = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
@@ -186,7 +193,7 @@ def _run_context(
         invariant_suite=cast(Any, invariant_suite),
         target_config=JsonHttpSandboxConfig.model_validate(
             {
-                "version": 3,
+                "version": 4,
                 "sandbox_id": "test-sandbox",
                 "reset": {
                     "url": "https://sandbox.example.test/reset",
@@ -223,7 +230,10 @@ def _run_context(
 
 def test_run_context_uses_current_pipeline() -> None:
     record = _evaluation_result("interaction-1").source
-    assert _run_context((record,)).pipeline_version == "1.1.0"
+    run_context = _run_context((record,))
+    assert run_context.pipeline_version == "1.1.0"
+    assert run_context.target.config.reset.reset_session is True
+    assert run_context.target.config.reset.reset_env is True
 
 
 def _write_target_config(
@@ -238,7 +248,7 @@ def _write_target_config(
     path.write_text(
         json.dumps(
             {
-                "version": 3,
+                "version": 4,
                 "sandbox_id": "test-sandbox",
                 "headers_from_env": headers_from_env or {},
                 "reset": {
@@ -291,7 +301,7 @@ def _write_stateful_target_config(path: Path) -> None:
     path.write_text(
         json.dumps(
             {
-                "version": 3,
+                "version": 4,
                 "sandbox_id": "test-sandbox",
                 "headers_from_env": {},
                 "reset": {
@@ -442,26 +452,19 @@ def test_init_creates_private_strict_starter_config(tmp_path: Path) -> None:
 
     assert result.exit_code == 0, result.output
     assert json.loads(target_config.read_text(encoding="utf-8")) == {
-        "version": 3,
+        "version": 4,
         "sandbox_id": "replace-with-stable-sandbox-id",
         "headers_from_env": {},
         "reset": {
             "url": "https://sandbox.example.test/reset",
             "request_json_template": {"case_id": "{{case_id}}"},
+            "reset_session": True,
+            "reset_env": True,
             "case_id_json_pointer": "/case_id",
             "sandbox_id_json_pointer": "/sandbox_id",
             "generation_json_pointer": "/generation",
             "clean_state_json_pointer": "/clean",
             "clean_state_value": True,
-        },
-        "setup": {
-            "url": "https://sandbox.example.test/setup",
-            "request_json_template": {
-                "case_id": "{{case_id}}",
-                "fixture": "default",
-            },
-            "case_id_json_pointer": "/case_id",
-            "sandbox_id_json_pointer": "/sandbox_id",
         },
         "execute_turn": {
             "url": "https://sandbox.example.test/execute",
@@ -485,8 +488,11 @@ def test_init_creates_private_strict_starter_config(tmp_path: Path) -> None:
         },
     }
     assert stat.S_IMODE(target_config.stat().st_mode) == 0o600
-    assert "lifecycle request bodies and response pointers" in result.output
+    assert "clean agent session" in result.output
+    assert "clean external" in result.output
     assert "headers_from_env" in result.output
+    assert '"reset_session":true,"reset_env":true' in result.output
+    assert '"generation":1,"clean":true' in result.output
     assert "--dry-run" in result.output
 
 
@@ -1020,6 +1026,45 @@ def test_transition_invariant_round_trips_evidence_and_reports_only_pointer_and_
     evaluation_result = _evaluation_result("interaction-1")
     baseline_trial = evaluation_result.baseline.trial_set.trials[0].model_copy(
         update={
+            "execution_evidence": ExecutionEvidence(
+                case_id="interaction-1",
+                sandbox_id="sandbox",
+                sandbox_config_sha256="0" * 64,
+                initial_state=SandboxStateEvidence(
+                    value={"payments": []}, authority="sandbox_self_reported"
+                ),
+                turns=(
+                    SandboxTurnEvidence(
+                        turn_id="turn-1",
+                        response={"ignored": True},
+                        state_snapshot={"payments": [{"id": secret}]},
+                        state_observation_authority="sandbox_self_reported",
+                    ),
+                ),
+                final_response={"ignored": True},
+                final_state=SandboxStateEvidence(
+                    value={"payments": [{"id": secret}]},
+                    authority="sandbox_self_reported",
+                ),
+                lifecycle=SandboxLifecycleEvidence(
+                    terminal_status="succeeded",
+                    delivery="certain",
+                    cleanup="succeeded",
+                    sandbox_state_uncertain=False,
+                    initial_reset=SandboxResetEvidence(
+                        reset_session_requested=True,
+                        reset_session_acknowledged=True,
+                        reset_env_requested=True,
+                        reset_env_acknowledged=True,
+                    ),
+                    cleanup_reset=SandboxResetEvidence(
+                        reset_session_requested=True,
+                        reset_session_acknowledged=True,
+                        reset_env_requested=True,
+                        reset_env_acknowledged=True,
+                    ),
+                ),
+            ),
             "target_output": ObservedAgentOutput(
                 raw_output={"ignored": True},
                 metadata={
@@ -1027,7 +1072,7 @@ def test_transition_invariant_round_trips_evidence_and_reports_only_pointer_and_
                     "committed_state_snapshot": {"payments": [{"id": secret}]},
                     "state_observation_authority": "sandbox_self_reported",
                 },
-            )
+            ),
         }
     )
     evaluation_result = evaluation_result.model_copy(
@@ -1230,7 +1275,7 @@ def test_target_config_dry_run_validates_environment_and_makes_no_calls(
     "payload",
     [
         {
-            "version": 3,
+            "version": 4,
             "sandbox_id": "test-sandbox",
             "unknown": True,
         },
@@ -1914,6 +1959,8 @@ def test_target_config_runs_nested_request_and_response_against_loopback(
                     "case_id": request["case_id"],
                     "generation": generation,
                     "clean": True,
+                    "reset_session": True,
+                    "reset_env": True,
                 }
             elif self.path == "/execute":
                 received_requests.append(request)
@@ -2170,7 +2217,7 @@ def test_run_context_records_canonical_provider_identity() -> None:
         invariant_suite=None,
         target_config=JsonHttpSandboxConfig.model_validate(
             {
-                "version": 3,
+                "version": 4,
                 "sandbox_id": "test-sandbox",
                 "reset": {
                     "url": "https://sandbox.example.test/reset",

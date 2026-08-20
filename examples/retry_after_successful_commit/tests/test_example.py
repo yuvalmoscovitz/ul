@@ -53,7 +53,11 @@ def test_documented_one_command_finds_repeatable_duplicate_without_model_calls(
     assert result.status == "failed"
     assert {rule.status for rule in result.baseline_invariant_rules} == {"satisfied"}
     assert {rule.status for rule in result.successful_commit_invariant_rules} == {"satisfied"}
-    assert {rule.status for rule in result.retried_invariant_rules} == {"violated"}
+    assert {rule.rule_id: rule.status for rule in result.retried_invariant_rules} == {
+        "exactly-one-committed-payment": "violated",
+        "committed-payments-unique-by-invoice": "violated",
+        "one-new-payment-per-turn": "satisfied",
+    }
     committed_effect_counts: list[object] = []
     for trial in result.trials:
         retried_checkpoint = trial.variation[1].committed_state_snapshot

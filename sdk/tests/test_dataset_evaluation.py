@@ -45,6 +45,7 @@ from ul_core.evaluation import (
     ExecutionEvidence,
     SandboxCapabilities,
     SandboxLifecycleEvidence,
+    SandboxResetEvidence,
     SandboxStateEvidence,
     SandboxTurnEvidence,
 )
@@ -351,6 +352,18 @@ class DeterministicSandbox:
             final_response=response,
             final_state=final_state,
             lifecycle=SandboxLifecycleEvidence(
+                initial_reset=SandboxResetEvidence(
+                    reset_session_requested=True,
+                    reset_session_acknowledged=True,
+                    reset_env_requested=True,
+                    reset_env_acknowledged=True,
+                ),
+                cleanup_reset=SandboxResetEvidence(
+                    reset_session_requested=True,
+                    reset_session_acknowledged=True,
+                    reset_env_requested=True,
+                    reset_env_acknowledged=True,
+                ),
                 terminal_status="succeeded",
                 completed_phases=("reset", "execute_turn", "cleanup_reset"),
                 delivery="certain",
@@ -404,6 +417,18 @@ class LifecycleFailingSandbox(DeterministicSandbox):
             sandbox_id=self.sandbox_id,
             sandbox_config_sha256=self.config_sha256,
             lifecycle=SandboxLifecycleEvidence(
+                initial_reset=SandboxResetEvidence(
+                    reset_session_requested=True,
+                    reset_session_acknowledged=True,
+                    reset_env_requested=True,
+                    reset_env_acknowledged=True,
+                ),
+                cleanup_reset=SandboxResetEvidence(
+                    reset_session_requested=True,
+                    reset_session_acknowledged=True,
+                    reset_env_requested=True,
+                    reset_env_acknowledged=True,
+                ),
                 terminal_status="failed",
                 completed_phases=("reset", "setup", "execute_turn"),
                 failed_phase="snapshot",

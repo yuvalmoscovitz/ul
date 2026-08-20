@@ -5,7 +5,6 @@ import json
 import math
 import re
 from collections.abc import Sequence
-from decimal import Decimal
 from pathlib import Path
 from typing import Annotated, Literal, Self, TypeGuard, cast
 
@@ -555,6 +554,19 @@ class DatasetInvariantTransitionTrialEvaluation(_StrictModel):
                 raise ValueError("evaluated effect transitions require item counts")
             if new_effect_count != after_item_count - before_item_count:
                 raise ValueError("new-effect count must match the checkpoint item counts")
+            expected_new_effect_counts: dict[TransitionTrialReasonCode, set[int]] = {
+                "no_new_effect": {0},
+                "exactly_one_new_effect": {1},
+            }
+            if (
+                self.reason_code in expected_new_effect_counts
+                and new_effect_count not in expected_new_effect_counts[self.reason_code]
+            ):
+                raise ValueError("new-effect count must match the transition reason")
+            if self.reason_code == "new_effect_observed" and new_effect_count == 0:
+                raise ValueError("new-effect count must match the transition reason")
+            if self.reason_code == "unexpected_new_effect_count" and new_effect_count == 1:
+                raise ValueError("new-effect count must match the transition reason")
         elif self.new_effect_count is not None:
             raise ValueError("unevaluable transitions cannot report a new-effect count")
         if self.reason_code in {
@@ -944,13 +956,22 @@ def _output_with_before_turn_checkpoint(
 ) -> ObservedAgentOutput | None:
     output = trial.target_output
     evidence = trial.execution_evidence
-    if output is None or evidence is None or evidence.initial_state is None:
-        return output
+    if (
+        output is None
+        or evidence is None
+        or evidence.lifecycle.terminal_status != "succeeded"
+        or evidence.initial_state is None
+        or evidence.final_state is None
+        or evidence.initial_state.authority != evidence.final_state.authority
+        or evidence.initial_state.observer_id != evidence.final_state.observer_id
+    ):
+        return None
     return output.model_copy(
         update={
             "metadata": {
-                **output.metadata,
                 "committed_state_before_turn": evidence.initial_state.value,
+                "committed_state_snapshot": evidence.final_state.value,
+                "state_observation_authority": evidence.final_state.authority,
             }
         }
     )
@@ -1670,7 +1691,7 @@ def _is_json_scalar(value: object) -> bool:
 
 def _json_scalars_equal(left: object, right: object) -> tuple[bool, bool]:
     if _is_json_number(left) and _is_json_number(right):
-        return True, Decimal(str(left)) == Decimal(str(right))
+        return True, left == right
     if type(left) is not type(right):
         return False, False
     return True, left == right

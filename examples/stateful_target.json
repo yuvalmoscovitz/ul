@@ -1,5 +1,5 @@
 {
-  "version": 3,
+  "version": 4,
   "sandbox_id": "replace-with-stable-sandbox-id",
   "headers_from_env": {
     "Authorization": "UL_SANDBOX_AUTHORIZATION"

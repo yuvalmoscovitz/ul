@@ -15,7 +15,7 @@ from ul.http_sandbox import (
     load_json_http_sandbox_config,
 )
 from ul.sandbox import evaluation_case_from_inputs, validate_execution_evidence
-from ul_core.evaluation import EvaluationCase, ExecutionEvidence
+from ul_core.evaluation import EvaluationCase, ExecutionEvidence, SandboxResetEvidence
 
 app = typer.Typer(help="Validate a customer-managed sandbox connection.")
 
@@ -245,6 +245,12 @@ def _print_success(
         else None,
         delivery=evidence.lifecycle.delivery,
         cleanup=evidence.lifecycle.cleanup,
+        initial_reset=evidence.lifecycle.initial_reset.model_dump(mode="json"),
+        cleanup_reset=(
+            evidence.lifecycle.cleanup_reset.model_dump(mode="json")
+            if evidence.lifecycle.cleanup_reset is not None
+            else None
+        ),
         sandbox_state_uncertain=evidence.lifecycle.sandbox_state_uncertain,
     )
     if output_json:
@@ -254,6 +260,9 @@ def _print_success(
     _print_safe(f"Sandbox: {evidence.sandbox_id}")
     _print_safe(f"Lifecycle: {' -> '.join(evidence.lifecycle.completed_phases)}")
     _print_safe(f"Sandbox API call budget: {sandbox_api_calls}")
+    _print_reset_receipt("Initial reset", evidence.lifecycle.initial_reset)
+    if evidence.lifecycle.cleanup_reset is not None:
+        _print_reset_receipt("Cleanup reset", evidence.lifecycle.cleanup_reset)
     _print_safe("Probe, response, and state: not printed")
     _print_safe("UL semantic-model calls: 0")
     _print_safe("Isolation and probe safety: customer-attested, not verified by UL")
@@ -280,6 +289,12 @@ def _print_failure(
         remediation=remediation,
         delivery=lifecycle.delivery,
         cleanup=lifecycle.cleanup,
+        initial_reset=lifecycle.initial_reset.model_dump(mode="json"),
+        cleanup_reset=(
+            lifecycle.cleanup_reset.model_dump(mode="json")
+            if lifecycle.cleanup_reset is not None
+            else None
+        ),
         cleanup_failure_code=lifecycle.cleanup_failure_code,
         cleanup_failure_reason=lifecycle.cleanup_failure_reason,
         sandbox_state_uncertain=lifecycle.sandbox_state_uncertain,
@@ -294,6 +309,9 @@ def _print_failure(
     _print_safe(f"Remediation: {remediation}")
     _print_safe(f"Delivery: {lifecycle.delivery}")
     _print_safe(f"Cleanup: {lifecycle.cleanup}")
+    _print_reset_receipt("Initial reset", lifecycle.initial_reset)
+    if lifecycle.cleanup_reset is not None:
+        _print_reset_receipt("Cleanup reset", lifecycle.cleanup_reset)
     if lifecycle.cleanup_failure_reason is not None:
         _print_safe(f"Cleanup reason: {lifecycle.cleanup_failure_reason}")
     _print_safe(
@@ -424,9 +442,11 @@ def _sandbox_check_result(
     cleanup_failure_code: str | None = None,
     cleanup_failure_reason: str | None = None,
     sandbox_state_uncertain: bool | None = None,
+    initial_reset: dict[str, object] | None = None,
+    cleanup_reset: dict[str, object] | None = None,
 ) -> dict[str, object]:
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "status": status,
         "sandbox_id": sandbox_id,
         "sandbox_config_sha256": sandbox_config_sha256,
@@ -442,9 +462,19 @@ def _sandbox_check_result(
         "cleanup_failure_code": cleanup_failure_code,
         "cleanup_failure_reason": cleanup_failure_reason,
         "sandbox_state_uncertain": sandbox_state_uncertain,
+        "initial_reset": initial_reset,
+        "cleanup_reset": cleanup_reset,
         "probe_and_observations": "not_printed",
         "ul_semantic_model_calls": 0,
     }
+
+
+def _print_reset_receipt(label: str, reset: SandboxResetEvidence) -> None:
+    _print_safe(
+        f"{label}: session requested={reset.reset_session_requested}, "
+        f"acknowledged={reset.reset_session_acknowledged}; environment "
+        f"requested={reset.reset_env_requested}, acknowledged={reset.reset_env_acknowledged}"
+    )
 
 
 def _remediation_for_code(code: str) -> str:
@@ -464,6 +494,12 @@ def _remediation_for_code(code: str) -> str:
         "turn_identity": "Echo the request turn_id unchanged in the response.",
         "reset_generation": "Return a non-empty string or integer reset generation.",
         "reset_generation_reused": "Return a new generation after every reset.",
+        "reset_session_not_acknowledged": (
+            "Return reset_session=true after clearing the agent conversation/session."
+        ),
+        "reset_env_not_acknowledged": (
+            "Return reset_env=true after restoring external sandbox state."
+        ),
         "reset_not_clean": (
             "Return the configured clean-state acknowledgement only after reset completes."
         ),

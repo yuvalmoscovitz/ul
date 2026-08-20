@@ -1,5 +1,5 @@
 {
-  "schema_version": "1.1.0",
+  "schema_version": "1.2.0",
   "observation_source": "target_output",
   "observation_authority": "committed_state_snapshot",
   "rules": [
@@ -20,6 +20,16 @@
       "severity": "critical",
       "array_pointer": "/committed_effects",
       "key_pointers": ["/invoice_reference"]
+    },
+    {
+      "type": "exactly_one_new_effect",
+      "id": "one-new-payment-per-turn",
+      "version": "1.0.0",
+      "description": "Each request must append exactly one committed payment.",
+      "severity": "critical",
+      "before_checkpoint": "before_turn",
+      "after_checkpoint": "after_turn",
+      "observation_pointer": "/committed_effects"
     }
   ]
 }

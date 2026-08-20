@@ -54,7 +54,13 @@ def _handler_for_state(state: _SandboxState) -> type[BaseHTTPRequestHandler]:
                     generation = state.reset()
                 self._send(
                     HTTPStatus.OK,
-                    {"case_id": request.get("case_id"), "generation": generation, "clean": True},
+                    {
+                        "case_id": request.get("case_id"),
+                        "generation": generation,
+                        "clean": True,
+                        "reset_session": request.get("reset_session") is True,
+                        "reset_env": request.get("reset_env") is True,
+                    },
                 )
                 return
             if self.path == "/setup":

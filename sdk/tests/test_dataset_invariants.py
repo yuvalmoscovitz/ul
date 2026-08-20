@@ -14,6 +14,7 @@ from ul import (
     DatasetInvariantEvaluation,
     DatasetInvariantRuleEvaluation,
     DatasetInvariantSuite,
+    DatasetInvariantTransitionTrialEvaluation,
     DatasetInvariantTrialEvaluation,
     ExactlyOneNewEffectInvariant,
     JsonArrayItemsUniqueByInvariant,
@@ -372,6 +373,61 @@ def test_effect_transition_rules_count_append_only_committed_effects_without_val
     assert (two_effects.status, two_effects.trials[0].new_effect_count) == ("violated", 2)
 
 
+@pytest.mark.parametrize(
+    ("reason_code", "new_effect_count"),
+    [
+        ("no_new_effect", 1),
+        ("new_effect_observed", 0),
+        ("exactly_one_new_effect", 2),
+        ("unexpected_new_effect_count", 1),
+    ],
+)
+def test_transition_evidence_rejects_counts_that_contradict_the_reason(
+    reason_code: str,
+    new_effect_count: int,
+) -> None:
+    with pytest.raises(ValidationError, match="transition reason"):
+        DatasetInvariantTransitionTrialEvaluation.model_validate(
+            {
+                "repetition": 1,
+                "status": (
+                    "satisfied"
+                    if reason_code in {"no_new_effect", "exactly_one_new_effect"}
+                    else "violated"
+                ),
+                "reason_code": reason_code,
+                "before_checkpoint": "before_turn",
+                "after_checkpoint": "after_turn",
+                "observation_pointer": "/effects",
+                "before_item_count": 0,
+                "after_item_count": new_effect_count,
+                "new_effect_count": new_effect_count,
+            }
+        )
+
+
+def test_unchanged_transition_compares_large_json_integers_without_crashing() -> None:
+    rule = UnchangedBetweenCheckpointsInvariant(
+        type="unchanged_between_checkpoints",
+        id="unchanged-counter",
+        version="1.0.0",
+        description="The counter must remain unchanged.",
+        severity="high",
+        before_checkpoint="before_turn",
+        after_checkpoint="after_turn",
+        observation_pointer="/counter",
+    )
+    large_integer = 10**5_000
+
+    result = evaluate_dataset_invariant_rules(
+        (rule,),
+        (_state_transition({"counter": large_integer}, {"counter": large_integer}),),
+        observation_authority="committed_state_snapshot",
+    )[0]
+
+    assert result.status in {"satisfied", "not_evaluable"}
+
+
 def test_dataset_transition_evaluation_reads_initial_and_final_execution_checkpoints() -> None:
     rule = ExactlyOneNewEffectInvariant(
         type="exactly_one_new_effect",
@@ -386,14 +442,26 @@ def test_dataset_transition_evaluation_reads_initial_and_final_execution_checkpo
     target_output = ObservedAgentOutput(
         raw_output={"status": "ok"},
         metadata={
-            "committed_state_snapshot": {"effects": [{"id": "effect-1"}]},
+            "committed_state_snapshot": {"effects": []},
             "state_observation_authority": "sandbox_self_reported",
         },
     )
     trial = SimpleNamespace(
         repetition=1,
         target_output=target_output,
-        execution_evidence=SimpleNamespace(initial_state=SimpleNamespace(value={"effects": []})),
+        execution_evidence=SimpleNamespace(
+            lifecycle=SimpleNamespace(terminal_status="succeeded"),
+            initial_state=SimpleNamespace(
+                value={"effects": []},
+                authority="sandbox_self_reported",
+                observer_id=None,
+            ),
+            final_state=SimpleNamespace(
+                value={"effects": [{"id": "effect-1"}]},
+                authority="sandbox_self_reported",
+                observer_id=None,
+            ),
+        ),
     )
     evaluation = cast(
         DatasetEvaluationResult,
@@ -415,6 +483,46 @@ def test_dataset_transition_evaluation_reads_initial_and_final_execution_checkpo
     assert result.status == "satisfied"
     assert result.trials[0].new_effect_count == 1
     assert "committed_state_before_turn" not in target_output.metadata
+
+
+def test_dataset_transition_evaluation_rejects_unbound_output_metadata() -> None:
+    rule = NoNewEffectInvariant(
+        type="no_new_effect",
+        id="no-effect",
+        version="1.0.0",
+        description="No effect may be committed.",
+        severity="critical",
+        before_checkpoint="before_turn",
+        after_checkpoint="after_turn",
+        observation_pointer="/effects",
+    )
+    target_output = ObservedAgentOutput(
+        raw_output={"status": "ok"},
+        metadata={
+            "committed_state_before_turn": {"effects": []},
+            "committed_state_snapshot": {"effects": []},
+            "state_observation_authority": "sandbox_self_reported",
+        },
+    )
+    trial = SimpleNamespace(repetition=1, target_output=target_output, execution_evidence=None)
+    evaluation = cast(
+        DatasetEvaluationResult,
+        SimpleNamespace(
+            source=SimpleNamespace(id="interaction-1"),
+            baseline=SimpleNamespace(trial_set=SimpleNamespace(trials=(trial,))),
+            cases=(),
+        ),
+    )
+    suite = DatasetInvariantSuite(
+        schema_version="1.2.0",
+        observation_source="target_output",
+        observation_authority="committed_state_snapshot",
+        rules=(rule,),
+    )
+
+    result = evaluate_dataset_invariants(evaluation, suite).baseline.rules[0]
+
+    assert result.status == "not_evaluable"
 
 
 def test_effect_transition_rejects_rewritten_or_missing_checkpoint_history() -> None:

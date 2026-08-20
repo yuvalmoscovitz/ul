@@ -116,7 +116,7 @@ class _OutcomeGroup(_StrictModel):
 
 
 class _LifecycleFailure(_StrictModel):
-    protocol_version: Literal[3]
+    protocol_version: Literal[4]
     failed_phase: str
     completed_phases: list[str]
     cleanup_reset_failed: bool
@@ -830,6 +830,14 @@ def _load_evidence(path: Path) -> list[_LoadedEvidenceRecord]:
     return records
 
 
+def is_reportable_dataset_evidence(path: Path) -> bool:
+    try:
+        _load_evidence(path)
+    except _ReviewInputError:
+        return False
+    return True
+
+
 def _load_reviews(path: Path) -> list[ReviewRecord]:
     try:
         descriptor = _open_regular_file(path, os.O_RDONLY)
@@ -1413,8 +1421,9 @@ def _sensitive_json_line(label: str, values: dict[str, JsonValue]) -> str:
 
 def _print_invariant_evaluation(evaluation: DatasetInvariantEvaluation) -> None:
     _print_plain(
-        "This invariant summary shows pointers only; selected reviewable-finding values require "
-        "--show-sensitive-values with --finding FINDING_ID."
+        "This invariant summary shows pointers and reason codes only. Retained values for "
+        "supported rule types require --show-sensitive-values with --finding FINDING_ID; "
+        "transition rules do not retain selected state values."
     )
     _print_plain(f"Interaction: {evaluation.interaction_id}")
     _print_plain(f"Declared observation authority: {evaluation.observation_authority}")
