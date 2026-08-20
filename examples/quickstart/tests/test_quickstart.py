@@ -253,7 +253,7 @@ def test_quickstart_target_contains_no_authentication_mapping() -> None:
     target = json.loads((_QUICKSTART_DIRECTORY / "target.json").read_text(encoding="utf-8"))
 
     assert target["headers_from_env"] == {}
-    assert target["version"] == 3
+    assert target["version"] == 4
     assert target["execute_turn"]["request_json_template"] == {
         "case_id": "{{case_id}}",
         "turn_id": "{{turn_id}}",

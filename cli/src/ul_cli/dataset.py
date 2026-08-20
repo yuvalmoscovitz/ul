@@ -135,7 +135,7 @@ def initialize_dataset_sandbox(
         base_url = url.rstrip("/")
         config = JsonHttpSandboxConfig.model_validate(
             {
-                "version": 3,
+                "version": 4,
                 "sandbox_id": "replace-with-stable-sandbox-id",
                 "headers_from_env": {},
                 "reset": {
@@ -147,15 +147,6 @@ def initialize_dataset_sandbox(
                     "generation_json_pointer": "/generation",
                     "clean_state_json_pointer": "/clean",
                     "clean_state_value": True,
-                    "sandbox_id_json_pointer": "/sandbox_id",
-                },
-                "setup": {
-                    "url": f"{base_url}/setup",
-                    "request_json_template": {
-                        "case_id": "{{case_id}}",
-                        "fixture": "default",
-                    },
-                    "case_id_json_pointer": "/case_id",
                     "sandbox_id_json_pointer": "/sandbox_id",
                 },
                 "execute_turn": {
@@ -201,7 +192,7 @@ def initialize_dataset_sandbox(
 
     console.print(f"Created private sandbox connection config: {sandbox_config}")
     console.print(
-        "Next: implement the generated reset, setup, execute, and snapshot endpoints. "
+        "Next: implement the generated reset, execute, and snapshot endpoints. "
         "The reset request already asks for a clean agent session and clean external "
         "environment. Add any headers_from_env, then validate the connection with "
         "'ul sandbox check "
@@ -212,8 +203,8 @@ def initialize_dataset_sandbox(
         f"{sandbox_config} --dry-run'."
     )
     console.print(
-        "Setup uses one static fixture for the sandbox. Keep exactly one complete "
-        "{{case_id}} value in every lifecycle request, {{turn_id}} in execute_turn and snapshot, "
+        "Keep exactly one complete {{case_id}} value in every lifecycle request, "
+        "{{turn_id}} in execute_turn and snapshot, "
         "and one {{input}} value in execute_turn. "
         "headers_from_env maps HTTP header names to "
         "dedicated UL_SANDBOX_* environment-variable names; secret values stay outside this file."

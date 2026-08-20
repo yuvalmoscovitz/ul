@@ -16,6 +16,7 @@ from ul_core.dataset import ObservedAgentOutput
 from ul_core.evaluation import (
     ExecutionEvidence,
     SandboxLifecycleEvidence,
+    SandboxResetEvidence,
     SandboxStateEvidence,
     SandboxTurnEvidence,
     TimeoutAfterCommitEventEvidence,
@@ -101,6 +102,18 @@ def _successful_trial(repetition: int) -> TimeoutAfterCommitStressTrial:
                 cleaned=True,
             ),
             lifecycle=SandboxLifecycleEvidence(
+                initial_reset=SandboxResetEvidence(
+                    reset_session_requested=True,
+                    reset_session_acknowledged=True,
+                    reset_env_requested=True,
+                    reset_env_acknowledged=True,
+                ),
+                cleanup_reset=SandboxResetEvidence(
+                    reset_session_requested=True,
+                    reset_session_acknowledged=True,
+                    reset_env_requested=True,
+                    reset_env_acknowledged=True,
+                ),
                 terminal_status="succeeded",
                 delivery="certain",
                 cleanup="succeeded",

@@ -376,6 +376,8 @@ to the 50 MB bundle limit. Keep them in governed local storage.
 
 ## Connect your customer-managed sandbox API
 
+The outcome is simple: every evaluation starts from a fresh conversation and clean test system.
+
 Give UL the lifecycle endpoints of an isolated, non-production deployment of your agent:
 
 ```bash
@@ -403,8 +405,15 @@ dataset and sandbox mapping without making external calls.
 restore external sandbox state such as test database rows, queues, files, and tool state. Return
 both requested acknowledgements as `true`, alongside the existing case, sandbox, generation, and
 clean-state fields. UL will not execute the case when a requested acknowledgement is missing or
-false. Both resets default to `true`; set one reset flag to `false` in the generated config only
-when that layer is genuinely stateless.
+false. Both resets default to `true`. Set `reset_session` to `false` only when every request already
+gets a new process or conversation. Set `reset_env` to `false` only when there is no database,
+file, queue, tool state, or persistent memory to restore.
+
+Minimum reset response:
+
+```json
+{"sandbox_id":"...","case_id":"...","generation":1,"clean":true,"reset_session":true,"reset_env":true}
+```
 
 Credential environment-variable names must use the dedicated `UL_SANDBOX_*` namespace. This keeps
 a sandbox configuration from selecting unrelated ambient process credentials.

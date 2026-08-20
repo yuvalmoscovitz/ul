@@ -439,7 +439,7 @@ def _write_target_config(path: Path, endpoint: str) -> None:
     path.write_text(
         json.dumps(
             {
-                "version": 3,
+                "version": 4,
                 "sandbox_id": "test-sandbox",
                 "headers_from_env": {"X-Test-Token": "UL_SANDBOX_REGRESSION_TEST_SECRET"},
                 "reset": {

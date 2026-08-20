@@ -32,6 +32,7 @@ from ul_core.evaluation import (
     SandboxCapabilities,
     SandboxLifecycleEvidence,
     SandboxLifecycleFailureCode,
+    SandboxResetEvidence,
     SandboxStateEvidence,
     SandboxTurnEvidence,
     TimeoutAfterCommitEventEvidence,
@@ -166,6 +167,14 @@ class JsonHttpLifecycleResetConfig(JsonHttpLifecycleCallConfig):
     clean_state_json_pointer: str
     clean_state_value: JsonValue
 
+    @field_validator("request_json_template", mode="before")
+    @classmethod
+    def validate_reset_request_json_template(cls, request_json: object) -> JsonValue:
+        validated = _validated_lifecycle_request_json_template(request_json)
+        if not isinstance(validated, dict):
+            raise ValueError("reset request_json_template must be a JSON object")
+        return validated
+
     @field_validator(
         "sandbox_id_json_pointer",
         "case_id_json_pointer",
@@ -274,7 +283,7 @@ class _TimeoutAfterCommitControlResponse(BaseModel):
 class JsonHttpSandboxConfig(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
-    version: Literal[3]
+    version: Literal[4]
     sandbox_id: str = Field(min_length=1, max_length=500)
     headers_from_env: dict[str, str] = Field(default_factory=dict)
     reset: JsonHttpLifecycleResetConfig
@@ -286,8 +295,8 @@ class JsonHttpSandboxConfig(BaseModel):
     @field_validator("version", mode="before")
     @classmethod
     def validate_version(cls, version: object) -> object:
-        if type(version) is not int or version != 3:
-            raise ValueError("version must be 3")
+        if type(version) is not int or version != 4:
+            raise ValueError("version must be 4")
         return version
 
     @field_validator("headers_from_env")
@@ -489,6 +498,8 @@ class JsonHttpSandboxConnection:
         initial_state: SandboxStateEvidence | None = None
         reset_session_acknowledged = False
         reset_env_acknowledged = False
+        cleanup_reset_session_acknowledged = False
+        cleanup_reset_env_acknowledged = False
         event_arm_attempted = False
         event_armed = False
         event_trigger_status: TimeoutAfterCommitTriggerStatus = "unknown"
@@ -645,7 +656,10 @@ class JsonHttpSandboxConnection:
                             delivery_uncertain = True
                 finally:
                     try:
-                        await self._reset(config.reset, case.id)
+                        (
+                            cleanup_reset_session_acknowledged,
+                            cleanup_reset_env_acknowledged,
+                        ) = await self._reset(config.reset, case.id)
                         completed_phase_names.append("cleanup_reset")
                         if not delivery_uncertain and not event_cleanup_failed:
                             self._lifecycle_state_uncertain = False
@@ -655,6 +669,8 @@ class JsonHttpSandboxConnection:
                         cleanup_cancellation = cleanup_cancellation or error
                     except _SandboxProtocolError as error:
                         cleanup_reset_failed = True
+                        cleanup_reset_session_acknowledged = error.reset_session_acknowledged
+                        cleanup_reset_env_acknowledged = error.reset_env_acknowledged
                         cleanup_failure_code = cleanup_failure_code or error.code
                         cleanup_failure_reason = cleanup_failure_reason or str(error)
                         delivery_uncertain = delivery_uncertain or error.delivery_uncertain
@@ -693,6 +709,8 @@ class JsonHttpSandboxConnection:
                 sandbox_state_uncertain=self._lifecycle_state_uncertain,
                 reset_session_acknowledged=reset_session_acknowledged,
                 reset_env_acknowledged=reset_env_acknowledged,
+                cleanup_reset_session_acknowledged=cleanup_reset_session_acknowledged,
+                cleanup_reset_env_acknowledged=cleanup_reset_env_acknowledged,
                 event_armed=event_armed,
                 event_trigger_status=event_trigger_status,
                 event_cleaned=event_cleaned,
@@ -717,6 +735,8 @@ class JsonHttpSandboxConnection:
             sandbox_state_uncertain=False,
             reset_session_acknowledged=reset_session_acknowledged,
             reset_env_acknowledged=reset_env_acknowledged,
+            cleanup_reset_session_acknowledged=cleanup_reset_session_acknowledged,
+            cleanup_reset_env_acknowledged=cleanup_reset_env_acknowledged,
             event_armed=event_armed,
             event_trigger_status=event_trigger_status,
             event_cleaned=event_cleaned,
@@ -947,6 +967,8 @@ class JsonHttpSandboxConnection:
         sandbox_state_uncertain: bool,
         reset_session_acknowledged: bool = False,
         reset_env_acknowledged: bool = False,
+        cleanup_reset_session_acknowledged: bool = False,
+        cleanup_reset_env_acknowledged: bool = False,
         event_armed: bool = False,
         event_trigger_status: TimeoutAfterCommitTriggerStatus = "unknown",
         event_cleaned: bool = False,
@@ -991,10 +1013,22 @@ class JsonHttpSandboxConnection:
                 cleanup_failure_code=cleanup_failure_code,
                 cleanup_failure_reason=cleanup_failure_reason,
                 sandbox_state_uncertain=sandbox_state_uncertain,
-                reset_session_requested=self._config.reset.reset_session,
-                reset_session_acknowledged=reset_session_acknowledged,
-                reset_env_requested=self._config.reset.reset_env,
-                reset_env_acknowledged=reset_env_acknowledged,
+                initial_reset=SandboxResetEvidence(
+                    reset_session_requested=self._config.reset.reset_session,
+                    reset_session_acknowledged=reset_session_acknowledged,
+                    reset_env_requested=self._config.reset.reset_env,
+                    reset_env_acknowledged=reset_env_acknowledged,
+                ),
+                cleanup_reset=(
+                    SandboxResetEvidence(
+                        reset_session_requested=self._config.reset.reset_session,
+                        reset_session_acknowledged=cleanup_reset_session_acknowledged,
+                        reset_env_requested=self._config.reset.reset_env,
+                        reset_env_acknowledged=cleanup_reset_env_acknowledged,
+                    )
+                    if cleanup != "not_attempted"
+                    else None
+                ),
             ),
         )
 

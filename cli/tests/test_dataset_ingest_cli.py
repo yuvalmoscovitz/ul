@@ -122,7 +122,7 @@ def _write_target_config(path: Path) -> None:
     path.write_text(
         json.dumps(
             {
-                "version": 3,
+                "version": 4,
                 "sandbox_id": "test-sandbox",
                 "reset": {
                     "url": "https://sandbox.example.test/reset",

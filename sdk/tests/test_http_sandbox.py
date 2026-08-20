@@ -50,7 +50,7 @@ def _config(
     timeout_after_commit: bool = False,
 ) -> JsonHttpSandboxConfig:
     raw: dict[str, Any] = {
-        "version": 3,
+        "version": 4,
         "sandbox_id": "payments-test",
         "headers_from_env": headers_from_env or {},
         "reset": {
@@ -188,6 +188,14 @@ def _successful_handler() -> tuple[Any, list[tuple[str, dict[str, JsonValue]]]]:
     return handler, requests
 
 
+async def test_reset_request_template_must_be_an_object_at_config_validation() -> None:
+    config = _config().model_dump(mode="json")
+    config["reset"]["request_json_template"] = ["{{case_id}}"]
+
+    with pytest.raises(ValidationError, match="must be a JSON object"):
+        JsonHttpSandboxConfig.model_validate(config)
+
+
 async def test_executes_remote_case_and_returns_explicit_evidence() -> None:
     handler, requests = _successful_handler()
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
@@ -214,10 +222,13 @@ async def test_executes_remote_case_and_returns_explicit_evidence() -> None:
     assert requests[3][1]["turn_id"] == "turn-1"
     assert requests[4][1]["turn_id"] == "turn-1"
     assert evidence.lifecycle.terminal_status == "succeeded"
-    assert evidence.lifecycle.reset_session_requested is True
-    assert evidence.lifecycle.reset_session_acknowledged is True
-    assert evidence.lifecycle.reset_env_requested is True
-    assert evidence.lifecycle.reset_env_acknowledged is True
+    assert evidence.lifecycle.initial_reset.reset_session_requested is True
+    assert evidence.lifecycle.initial_reset.reset_session_acknowledged is True
+    assert evidence.lifecycle.initial_reset.reset_env_requested is True
+    assert evidence.lifecycle.initial_reset.reset_env_acknowledged is True
+    assert evidence.lifecycle.cleanup_reset is not None
+    assert evidence.lifecycle.cleanup_reset.reset_session_acknowledged is True
+    assert evidence.lifecycle.cleanup_reset.reset_env_acknowledged is True
     assert evidence.sandbox_id == "payments-test"
     assert evidence.initial_state is not None
     assert evidence.initial_state.value == {"committed_amount": 100}
@@ -241,10 +252,10 @@ async def test_explicit_stateless_session_opt_out_is_requested_and_recorded() ->
         False,
         False,
     ]
-    assert evidence.lifecycle.reset_session_requested is False
-    assert evidence.lifecycle.reset_session_acknowledged is False
-    assert evidence.lifecycle.reset_env_requested is True
-    assert evidence.lifecycle.reset_env_acknowledged is True
+    assert evidence.lifecycle.initial_reset.reset_session_requested is False
+    assert evidence.lifecycle.initial_reset.reset_session_acknowledged is False
+    assert evidence.lifecycle.initial_reset.reset_env_requested is True
+    assert evidence.lifecycle.initial_reset.reset_env_acknowledged is True
 
 
 async def test_missing_requested_environment_reset_acknowledgement_blocks_execution() -> None:
@@ -277,8 +288,9 @@ async def test_missing_requested_environment_reset_acknowledgement_blocks_execut
     assert evidence.lifecycle.terminal_status == "failed"
     assert evidence.lifecycle.failed_phase == "reset"
     assert evidence.lifecycle.failure_code == "reset_env_not_acknowledged"
-    assert evidence.lifecycle.reset_env_requested is True
-    assert evidence.lifecycle.reset_env_acknowledged is False
+    assert evidence.lifecycle.initial_reset.reset_env_requested is True
+    assert evidence.lifecycle.initial_reset.reset_env_acknowledged is False
+    assert evidence.lifecycle.cleanup_reset is None
 
 
 async def test_timeout_after_commit_receipts_are_correlated_and_budgeted() -> None:

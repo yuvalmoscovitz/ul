@@ -33,6 +33,8 @@ _RESULT_KEYS = {
     "cleanup_failure_code",
     "cleanup_failure_reason",
     "sandbox_state_uncertain",
+    "initial_reset",
+    "cleanup_reset",
     "probe_and_observations",
     "ul_semantic_model_calls",
 }
@@ -136,7 +138,7 @@ def _write_config(tmp_path: Path, server: _SandboxServer) -> Path:
     config.write_text(
         json.dumps(
             {
-                "version": 3,
+                "version": 4,
                 "sandbox_id": "check-sandbox",
                 "headers_from_env": {},
                 "reset": {

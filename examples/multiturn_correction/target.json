@@ -1,5 +1,5 @@
 {
-  "version": 3,
+  "version": 4,
   "sandbox_id": "multiturn-correction-example",
   "headers_from_env": {},
   "reset": {

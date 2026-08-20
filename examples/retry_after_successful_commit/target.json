@@ -1,5 +1,5 @@
 {
-  "version": 3,
+  "version": 4,
   "sandbox_id": "retry-after-successful-commit-example",
   "headers_from_env": {},
   "reset": {

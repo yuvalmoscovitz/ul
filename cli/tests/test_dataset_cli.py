@@ -185,7 +185,7 @@ def _run_context(
         invariant_suite=cast(Any, invariant_suite),
         target_config=JsonHttpSandboxConfig.model_validate(
             {
-                "version": 3,
+                "version": 4,
                 "sandbox_id": "test-sandbox",
                 "reset": {
                     "url": "https://sandbox.example.test/reset",
@@ -240,7 +240,7 @@ def _write_target_config(
     path.write_text(
         json.dumps(
             {
-                "version": 3,
+                "version": 4,
                 "sandbox_id": "test-sandbox",
                 "headers_from_env": headers_from_env or {},
                 "reset": {
@@ -293,7 +293,7 @@ def _write_stateful_target_config(path: Path) -> None:
     path.write_text(
         json.dumps(
             {
-                "version": 3,
+                "version": 4,
                 "sandbox_id": "test-sandbox",
                 "headers_from_env": {},
                 "reset": {
@@ -444,7 +444,7 @@ def test_init_creates_private_strict_starter_config(tmp_path: Path) -> None:
 
     assert result.exit_code == 0, result.output
     assert json.loads(target_config.read_text(encoding="utf-8")) == {
-        "version": 3,
+        "version": 4,
         "sandbox_id": "replace-with-stable-sandbox-id",
         "headers_from_env": {},
         "reset": {
@@ -457,15 +457,6 @@ def test_init_creates_private_strict_starter_config(tmp_path: Path) -> None:
             "generation_json_pointer": "/generation",
             "clean_state_json_pointer": "/clean",
             "clean_state_value": True,
-        },
-        "setup": {
-            "url": "https://sandbox.example.test/setup",
-            "request_json_template": {
-                "case_id": "{{case_id}}",
-                "fixture": "default",
-            },
-            "case_id_json_pointer": "/case_id",
-            "sandbox_id_json_pointer": "/sandbox_id",
         },
         "execute_turn": {
             "url": "https://sandbox.example.test/execute",
@@ -1167,7 +1158,7 @@ def test_target_config_dry_run_validates_environment_and_makes_no_calls(
     "payload",
     [
         {
-            "version": 3,
+            "version": 4,
             "sandbox_id": "test-sandbox",
             "unknown": True,
         },
@@ -2109,7 +2100,7 @@ def test_run_context_records_canonical_provider_identity() -> None:
         invariant_suite=None,
         target_config=JsonHttpSandboxConfig.model_validate(
             {
-                "version": 3,
+                "version": 4,
                 "sandbox_id": "test-sandbox",
                 "reset": {
                     "url": "https://sandbox.example.test/reset",
