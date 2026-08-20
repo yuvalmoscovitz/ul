@@ -209,6 +209,11 @@ def initialize_dataset_sandbox(
         "headers_from_env maps HTTP header names to "
         "dedicated UL_SANDBOX_* environment-variable names; secret values stay outside this file."
     )
+    console.print('Reset request: {"case_id":"{{case_id}}","reset_session":true,"reset_env":true}')
+    console.print(
+        'Reset response: {"sandbox_id":"...","case_id":"{{case_id}}",'
+        '"generation":1,"clean":true,"reset_session":true,"reset_env":true}'
+    )
 
 
 @app.command("operators")

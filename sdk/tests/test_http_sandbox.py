@@ -720,6 +720,11 @@ async def test_null_snapshot_is_a_safe_protocol_failure() -> None:
     assert evidence.lifecycle.failure_code == "response_mapping"
     assert evidence.lifecycle.failure_reason == ("sandbox API response JSON pointer selected null")
     assert evidence.lifecycle.cleanup == "succeeded"
+    assert evidence.lifecycle.initial_reset.reset_session_acknowledged is True
+    assert evidence.lifecycle.initial_reset.reset_env_acknowledged is True
+    assert evidence.lifecycle.cleanup_reset is not None
+    assert evidence.lifecycle.cleanup_reset.reset_session_acknowledged is True
+    assert evidence.lifecycle.cleanup_reset.reset_env_acknowledged is True
     assert evidence.final_response is None
     assert [path for path, _ in requests][-1] == "/reset"
 

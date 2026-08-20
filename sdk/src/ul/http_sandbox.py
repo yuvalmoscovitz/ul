@@ -606,8 +606,9 @@ class JsonHttpSandboxConnection:
                     event_trigger_status = cast(TimeoutAfterCommitTriggerStatus, observed_status)
                     completed_phase_names.append(current_phase)
         except _SandboxProtocolError as error:
-            reset_session_acknowledged = error.reset_session_acknowledged
-            reset_env_acknowledged = error.reset_env_acknowledged
+            if current_phase == "reset":
+                reset_session_acknowledged = error.reset_session_acknowledged
+                reset_env_acknowledged = error.reset_env_acknowledged
             failed_phase = current_phase
             failure_code = error.code
             failure_reason = str(error)

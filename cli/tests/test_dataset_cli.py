@@ -483,6 +483,8 @@ def test_init_creates_private_strict_starter_config(tmp_path: Path) -> None:
     assert "clean agent session" in result.output
     assert "clean external" in result.output
     assert "headers_from_env" in result.output
+    assert '"reset_session":true,"reset_env":true' in result.output
+    assert '"generation":1,"clean":true' in result.output
     assert "--dry-run" in result.output
 
 
