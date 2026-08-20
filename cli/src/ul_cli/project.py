@@ -362,7 +362,7 @@ def run_project(
     ] = False,
 ) -> None:
     """Run the configured project, with optional one-run overrides."""
-    project_root, config = _load_project()
+    project_root, config = load_project()
     try:
         output = (
             _load_latest_evidence(project_root)
@@ -377,15 +377,15 @@ def run_project(
 
     try:
         evaluate_dataset(
-            data=_resolve_project_path(config.dataset, project_root),
-            environment_config=_resolve_project_path(config.environment_config, project_root),
+            data=resolve_project_path(config.dataset, project_root),
+            environment_config=resolve_project_path(config.environment_config, project_root),
             output=output,
             augmentations_output=None,
             no_save_augmentations=not (
                 config.save_augmentations if save_augmentations is None else save_augmentations
             ),
             invariants=(
-                _resolve_project_path(config.invariants, project_root)
+                resolve_project_path(config.invariants, project_root)
                 if config.invariants is not None
                 else None
             ),
@@ -403,12 +403,12 @@ def run_project(
             dry_run=dry_run,
             resume=output if resume else None,
             redaction_policy=(
-                _resolve_project_path(config.redaction_policy, project_root)
+                resolve_project_path(config.redaction_policy, project_root)
                 if config.redaction_policy is not None
                 else None
             ),
             redaction_state=(
-                _resolve_project_path(config.redaction_state, project_root)
+                resolve_project_path(config.redaction_state, project_root)
                 if config.redaction_state is not None
                 else None
             ),
@@ -444,7 +444,7 @@ def report_project(
     """Report findings from an explicit or latest run with evidence."""
     selected_evidence = evidence
     if selected_evidence is None:
-        project_root, _ = _load_project()
+        project_root, _ = load_project()
         try:
             selected_evidence = _load_latest_evidence(project_root)
         except (OSError, ValueError, ValidationError) as error:
@@ -459,7 +459,7 @@ def report_project(
     )
 
 
-def _load_project() -> tuple[Path, ProjectConfig]:
+def load_project() -> tuple[Path, ProjectConfig]:
     for candidate_root in (Path.cwd(), *Path.cwd().parents):
         config_path = candidate_root / _PROJECT_DIRECTORY / _PROJECT_CONFIG
         if not config_path.exists() and not config_path.is_symlink():
@@ -632,7 +632,7 @@ def _has_nonempty_evidence(evidence: Path) -> bool:
 def _load_latest_evidence(project_root: Path) -> Path:
     state_path = project_root / _PROJECT_DIRECTORY / _PROJECT_STATE
     state = ProjectState.model_validate(_read_private_json(state_path))
-    evidence = _resolve_project_path(state.latest_evidence, project_root)
+    evidence = resolve_project_path(state.latest_evidence, project_root)
     if _private_file_sha256(evidence) != state.latest_evidence_sha256:
         raise ValueError("latest evidence changed after it was recorded")
     return evidence
@@ -653,7 +653,7 @@ def _relative_project_path(path: Path, project_root: Path) -> str:
     return os.path.relpath(path.resolve(), project_root)
 
 
-def _resolve_project_path(path: str, project_root: Path) -> Path:
+def resolve_project_path(path: str, project_root: Path) -> Path:
     return Path(os.path.abspath(project_root / path))
 
 

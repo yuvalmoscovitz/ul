@@ -75,6 +75,17 @@ One-run overrides do not change the saved project:
 ul run --limit 3 --repetitions 3 --operator input.surface.rephrase
 ```
 
+Inspect which built-in augmentations the current project can run:
+
+```bash
+ul augmentations plan
+ul augmentations plan --json
+```
+
+The planner classifies every augmentation as ready, blocked, or manual and explains why. It checks
+local configuration only; it makes no model, environment, or network calls and does not prove that
+the configured services are reachable.
+
 ## How it works
 
 ```text
