@@ -58,8 +58,8 @@ ul init interactions.jsonl \
   --allow-sandbox-network-egress \
   --confirm-isolated-sandbox
 
-# Your sandbox needs reset, execute-turn, and snapshot endpoints. Match the generated
-# request bodies and response pointers to that API, then verify the adapter before model calls.
+# Your adapter must implement the generated reset, setup, execute-turn, and snapshot contract.
+# If you need a custom mapping, prepare it first and pass it with --sandbox-config instead.
 ul sandbox check .ul/sandbox.json \
   --probe "Return sandbox health only; do not take action." \
   --allow-sandbox-network-egress \
@@ -84,10 +84,12 @@ values for one run without changing the project configuration.
 If you already have a sandbox configuration, pass `--sandbox-config sandbox.json` to `ul init`
 instead of `--sandbox-url`. Provider credentials remain in environment variables and are never
 written to project files. The isolation and network flags are explicit one-time acknowledgments
-saved by `init` and bound to the sandbox origin; they are not repeated on every run. Changing the
-origin requires reinitializing and acknowledging the new sandbox. Use `ul run --resume` after an
+saved by `init` and bound to the complete sandbox configuration; they are not repeated on every
+run. Changing that configuration requires reinitializing and acknowledging the sandbox again. Use
+`ul run --resume` after an
 interrupted run. Projects that need provider redaction can save `--redaction-policy` and
-`--redaction-state` during init; use `--no-save-augmentations` when local retention is prohibited.
+`--redaction-state` during init; see the [policy schema and example](docs/privacy.md). Use
+`--no-save-augmentations` when local retention is prohibited.
 
 To run UL's bundled defective-agent example instead:
 

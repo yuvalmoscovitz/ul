@@ -85,6 +85,7 @@ def test_init_creates_private_project_and_generated_sandbox(
     config_path = tmp_path / ".ul" / "config.json"
     sandbox_path = tmp_path / ".ul" / "sandbox.json"
     config = json.loads(config_path.read_text(encoding="utf-8"))
+    sandbox_config_sha256 = config.pop("sandbox_config_sha256")
 
     assert config == {
         "schema_version": 1,
@@ -93,6 +94,7 @@ def test_init_creates_private_project_and_generated_sandbox(
         "sandbox_origin": "https://sandbox.example",
         "invariants": None,
         "redaction_policy": None,
+        "redaction_policy_sha256": None,
         "redaction_state": None,
         "save_augmentations": True,
         "operators": ["input.surface.rephrase"],
@@ -103,6 +105,7 @@ def test_init_creates_private_project_and_generated_sandbox(
         "confirm_isolated_sandbox": True,
         "allow_insecure_http": False,
     }
+    assert len(sandbox_config_sha256) == 64
     assert sandbox_path.is_file()
     assert (tmp_path / ".ul" / ".gitignore").read_text(encoding="utf-8") == "*\n"
     if hasattr(stat, "S_IMODE"):
@@ -207,7 +210,7 @@ def test_init_reuses_existing_sandbox_and_refuses_overwrite(
     assert "will not overwrite" in result.output
 
 
-def test_run_accepts_same_origin_sandbox_template_edits(
+def test_run_rejects_same_origin_sandbox_template_edits(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.chdir(tmp_path)
@@ -219,8 +222,8 @@ def test_run_accepts_same_origin_sandbox_template_edits(
 
     result = runner.invoke(app, ["run", "--dry-run"])
 
-    assert result.exit_code == 0, result.output
-    assert "No model or sandbox API requests sent." in result.output
+    assert result.exit_code == 2
+    assert "sandbox configuration changed since 'ul init'" in result.output
 
 
 def test_run_rejects_sandbox_origin_change(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -239,6 +242,53 @@ def test_run_rejects_sandbox_origin_change(tmp_path: Path, monkeypatch: pytest.M
     assert result.exit_code == 2
     assert "sandbox origin changed since 'ul init'" in result.output
     assert not (tmp_path / ".ul" / "state.json").exists()
+
+
+def test_failed_generated_sandbox_init_can_be_retried(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    dataset = tmp_path / "interactions.jsonl"
+    _write_dataset(dataset)
+    common_arguments = [
+        "init",
+        str(dataset),
+        "--allow-sandbox-network-egress",
+        "--confirm-isolated-sandbox",
+    ]
+
+    failed = runner.invoke(app, [*common_arguments, "--sandbox-url", "not-a-url"])
+    retried = runner.invoke(app, [*common_arguments, "--sandbox-url", "https://sandbox.example"])
+
+    assert failed.exit_code == 2
+    assert retried.exit_code == 0, retried.output
+
+
+def test_failed_init_does_not_delete_existing_sandbox_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    dataset = tmp_path / "interactions.jsonl"
+    _write_dataset(dataset)
+    project_directory = tmp_path / ".ul"
+    project_directory.mkdir(mode=0o700)
+    sandbox = project_directory / "sandbox.json"
+    _write_private_file(sandbox, "customer-owned\n")
+
+    result = runner.invoke(
+        app,
+        [
+            "init",
+            str(dataset),
+            "--sandbox-url",
+            "https://sandbox.example",
+            "--allow-sandbox-network-egress",
+            "--confirm-isolated-sandbox",
+        ],
+    )
+
+    assert result.exit_code == 2
+    assert sandbox.read_text(encoding="utf-8") == "customer-owned\n"
 
 
 def test_run_discovers_parent_project_and_applies_one_run_overrides(
@@ -320,6 +370,7 @@ def test_init_persists_redaction_and_retention_choices(
     )
     assert initialized.exit_code == 0, initialized.output
     received: dict[str, Any] = {}
+    real_evaluate_dataset = project.evaluate_dataset
 
     def fake_evaluate_dataset(**arguments: Any) -> None:
         received.update(arguments)
@@ -332,6 +383,17 @@ def test_init_persists_redaction_and_retention_choices(
     assert received["redaction_policy"] == policy
     assert received["redaction_state"] == state
     assert received["no_save_augmentations"] is True
+    assert len(received["expected_redaction_policy_sha256"]) == 64
+
+    policy_payload = json.loads(policy.read_text(encoding="utf-8"))
+    policy_payload["rules"][0]["literal"] = "never-matches"
+    policy.write_text(json.dumps(policy_payload), encoding="utf-8")
+    monkeypatch.setattr(project, "evaluate_dataset", real_evaluate_dataset)
+
+    changed_policy = runner.invoke(app, ["run", "--dry-run"], terminal_width=160)
+
+    assert changed_policy.exit_code == 2
+    assert "redaction policy changed since 'ul init'" in changed_policy.output
 
 
 def test_run_resumes_latest_reportable_evidence(
@@ -412,7 +474,25 @@ def test_run_does_not_record_empty_exit_two_evidence(
 
     assert result.exit_code == 2
     assert not (tmp_path / ".ul" / "state.json").exists()
-    assert "Next: ul report" not in result.output
+
+
+def test_run_records_evidence_before_keyboard_interrupt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    _initialize(tmp_path)
+
+    def interrupted_evaluation(**arguments: Any) -> None:
+        _write_private_file(arguments["output"], "{}\n")
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(project, "evaluate_dataset", interrupted_evaluation)
+
+    result = runner.invoke(app, ["run"])
+
+    assert result.exit_code != 0
+    assert (tmp_path / ".ul" / "state.json").is_file()
+    assert "Next: ul report" in result.output
 
 
 def test_report_uses_latest_evidence_and_explicit_path_wins(
@@ -466,10 +546,12 @@ def test_malformed_or_unknown_project_config_is_rejected(
 ) -> None:
     monkeypatch.chdir(tmp_path)
     project_directory = tmp_path / ".ul"
-    project_directory.mkdir()
+    project_directory.mkdir(mode=0o700)
+    (project_directory / "runs").mkdir(mode=0o700)
     sensitive_value = "private-project-config-value"
-    (project_directory / "config.json").write_text(
-        json.dumps({"schema_version": 1, "unknown": sensitive_value}), encoding="utf-8"
+    _write_private_file(
+        project_directory / "config.json",
+        json.dumps({"schema_version": 1, "unknown": sensitive_value}),
     )
 
     result = runner.invoke(app, ["run", "--dry-run"])

@@ -17,6 +17,7 @@ from rich.console import Console
 from ul import load_dataset_invariant_suite, load_redaction_policy
 from ul.http_sandbox import (
     JsonHttpSandboxConfig,
+    json_http_sandbox_config_sha256,
     json_http_sandbox_origin,
     load_json_http_sandbox_config,
 )
@@ -46,8 +47,10 @@ class ProjectConfig(_StrictModel):
     dataset: str = Field(min_length=1)
     sandbox_config: str = Field(min_length=1)
     sandbox_origin: str = Field(min_length=1)
+    sandbox_config_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     invariants: str | None = None
     redaction_policy: str | None = None
+    redaction_policy_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
     redaction_state: str | None = None
     save_augmentations: bool = True
     operators: tuple[str, ...] = Field(default=("input.surface.rephrase",), min_length=1)
@@ -103,16 +106,24 @@ def initialize_project(
     ] = None,
     redaction_policy: Annotated[
         Path | None,
-        typer.Option(exists=True, dir_okay=False, readable=True),
+        typer.Option(
+            exists=True,
+            dir_okay=False,
+            readable=True,
+            help="Provider redaction policy JSON; schema and example are in docs/privacy.md.",
+        ),
     ] = None,
     redaction_state: Annotated[
         Path | None,
         typer.Option(help="Private pseudonym mapping file used with --redaction-policy."),
     ] = None,
-    no_save_augmentations: Annotated[
+    save_augmentations: Annotated[
         bool,
-        typer.Option(help="Do not retain generated augmentation inputs beside run evidence."),
-    ] = False,
+        typer.Option(
+            "--save-augmentations/--no-save-augmentations",
+            help="Retain generated augmentations for safe resume.",
+        ),
+    ] = True,
     operator: Annotated[
         list[str] | None,
         typer.Option("--operator", help="Augmentation ID; repeat as needed."),
@@ -164,13 +175,14 @@ def initialize_project(
         raise typer.BadParameter(".ul/config.json already exists; UL will not overwrite it")
 
     loaded_sandbox_config: JsonHttpSandboxConfig | None = None
+    loaded_redaction_policy = None
     try:
         validate_interaction_dataset(dataset)
         selected_operators = validate_dataset_operator_ids(operator)
         if invariants is not None:
             load_dataset_invariant_suite(invariants)
         if redaction_policy is not None:
-            load_redaction_policy(redaction_policy)
+            loaded_redaction_policy = load_redaction_policy(redaction_policy)
         if sandbox_config is not None:
             loaded_sandbox_config = load_json_http_sandbox_config(sandbox_config)
     except ValidationError as error:
@@ -178,16 +190,22 @@ def initialize_project(
     except (OSError, RuntimeError, ValueError) as error:
         raise typer.BadParameter(str(error)) from None
 
+    project_directory_created = not project_directory.exists()
+    runs_directory = project_directory / "runs"
+    runs_directory_created = not runs_directory.exists()
+    ignore_file_created = False
+    generated_sandbox_path: Path | None = None
     try:
         _ensure_private_directory(project_directory)
-        runs_directory = project_directory / "runs"
         _ensure_private_directory(runs_directory)
         _create_private_text(project_directory / ".gitignore", "*\n")
+        ignore_file_created = True
 
         selected_sandbox_config = sandbox_config
         if sandbox_url is not None:
             selected_sandbox_config = project_directory / "sandbox.json"
             initialize_dataset_sandbox(selected_sandbox_config, sandbox_url, show_guidance=False)
+            generated_sandbox_path = selected_sandbox_config
         assert selected_sandbox_config is not None
         if loaded_sandbox_config is None:
             loaded_sandbox_config = load_json_http_sandbox_config(selected_sandbox_config)
@@ -196,6 +214,7 @@ def initialize_project(
             dataset=_relative_project_path(dataset, project_root),
             sandbox_config=_relative_project_path(selected_sandbox_config, project_root),
             sandbox_origin=json_http_sandbox_origin(loaded_sandbox_config),
+            sandbox_config_sha256=json_http_sandbox_config_sha256(loaded_sandbox_config),
             invariants=(
                 _relative_project_path(invariants, project_root) if invariants is not None else None
             ),
@@ -204,12 +223,15 @@ def initialize_project(
                 if redaction_policy is not None
                 else None
             ),
+            redaction_policy_sha256=(
+                loaded_redaction_policy.digest if loaded_redaction_policy is not None else None
+            ),
             redaction_state=(
                 _relative_project_path(redaction_state, project_root)
                 if redaction_state is not None
                 else None
             ),
-            save_augmentations=not no_save_augmentations,
+            save_augmentations=save_augmentations,
             operators=selected_operators,
             limit=limit,
             repetitions=repetitions,
@@ -219,17 +241,43 @@ def initialize_project(
             allow_insecure_http=allow_insecure_http,
         )
         _create_private_json(project_config_path, config.model_dump(mode="json"))
+    except typer.BadParameter:
+        _discard_incomplete_project(
+            project_directory,
+            runs_directory=runs_directory,
+            generated_sandbox_path=generated_sandbox_path,
+            project_directory_created=project_directory_created,
+            runs_directory_created=runs_directory_created,
+            ignore_file_created=ignore_file_created,
+        )
+        raise
     except ValidationError as error:
+        _discard_incomplete_project(
+            project_directory,
+            runs_directory=runs_directory,
+            generated_sandbox_path=generated_sandbox_path,
+            project_directory_created=project_directory_created,
+            runs_directory_created=runs_directory_created,
+            ignore_file_created=ignore_file_created,
+        )
         raise typer.BadParameter(
             f"cannot create UL project: {_format_validation_error(error)}"
         ) from None
     except (OSError, RuntimeError, ValueError) as error:
+        _discard_incomplete_project(
+            project_directory,
+            runs_directory=runs_directory,
+            generated_sandbox_path=generated_sandbox_path,
+            project_directory_created=project_directory_created,
+            runs_directory_created=runs_directory_created,
+            ignore_file_created=ignore_file_created,
+        )
         raise typer.BadParameter(f"cannot create UL project: {error}") from None
     console.print(f"Configured UL project: {project_config_path}")
     if sandbox_url is not None:
         console.print(
-            "Before running: review .ul/sandbox.json and match its lifecycle requests and "
-            "response pointers to your sandbox API."
+            "Before running: implement the reset, setup, execute-turn, and snapshot contract "
+            "generated in .ul/sandbox.json."
         )
         console.print("Then verify it with 'ul sandbox check .ul/sandbox.json --help'.")
     console.print("Next: set semantic-provider credentials and UL_LIVE=true, then run 'ul run'.")
@@ -249,10 +297,13 @@ def run_project(
         list[str] | None,
         typer.Option("--operator", help="Override configured augmentations; repeat as needed."),
     ] = None,
-    no_save_augmentations: Annotated[
-        bool,
-        typer.Option(help="Do not retain generated augmentations for this run."),
-    ] = False,
+    save_augmentations: Annotated[
+        bool | None,
+        typer.Option(
+            "--save-augmentations/--no-save-augmentations",
+            help="Override augmentation retention for this run.",
+        ),
+    ] = None,
     resume: Annotated[
         bool,
         typer.Option(help="Resume the latest run with evidence instead of starting a new run."),
@@ -278,7 +329,9 @@ def run_project(
             sandbox_config=_resolve_project_path(config.sandbox_config, project_root),
             output=output,
             augmentations_output=None,
-            no_save_augmentations=no_save_augmentations or not config.save_augmentations,
+            no_save_augmentations=not (
+                config.save_augmentations if save_augmentations is None else save_augmentations
+            ),
             invariants=(
                 _resolve_project_path(config.invariants, project_root)
                 if config.invariants is not None
@@ -308,10 +361,12 @@ def run_project(
                 else None
             ),
             expected_sandbox_origin=config.sandbox_origin,
+            expected_sandbox_config_sha256=config.sandbox_config_sha256,
+            expected_redaction_policy_sha256=config.redaction_policy_sha256,
             show_report_guidance=False,
         )
-    except typer.Exit as exit_error:
-        if exit_error.exit_code in {0, 1, 2} and _has_nonempty_evidence(output):
+    except BaseException:
+        if _has_nonempty_evidence(output):
             _save_latest_evidence(project_root, output)
             console.print("Next: ul report")
         raise
@@ -529,6 +584,29 @@ def _validate_private_directory(path: Path) -> None:
         raise OSError(f"{path} permissions must not allow group or other access")
     if hasattr(os, "getuid") and path_status.st_uid != os.getuid():
         raise OSError(f"{path} must be owned by the current user")
+
+
+def _discard_incomplete_project(
+    project_directory: Path,
+    *,
+    runs_directory: Path,
+    generated_sandbox_path: Path | None,
+    project_directory_created: bool,
+    runs_directory_created: bool,
+    ignore_file_created: bool,
+) -> None:
+    if generated_sandbox_path is not None:
+        with suppress(FileNotFoundError):
+            generated_sandbox_path.unlink()
+    if ignore_file_created:
+        with suppress(FileNotFoundError):
+            (project_directory / ".gitignore").unlink()
+    if runs_directory_created:
+        with suppress(OSError):
+            runs_directory.rmdir()
+    if project_directory_created:
+        with suppress(OSError):
+            project_directory.rmdir()
 
 
 def _reject_duplicate_json_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:

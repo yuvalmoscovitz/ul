@@ -49,6 +49,7 @@ from ul.http_sandbox import (
     JsonHttpSandboxConfig,
     JsonHttpSandboxConnection,
     json_http_sandbox_calls_per_execution,
+    json_http_sandbox_config_sha256,
     json_http_sandbox_config_urls,
     json_http_sandbox_origin,
     load_json_http_sandbox_config,
@@ -361,6 +362,14 @@ def evaluate_dataset(
         str | None,
         typer.Option(hidden=True),
     ] = None,
+    expected_sandbox_config_sha256: Annotated[
+        str | None,
+        typer.Option(hidden=True),
+    ] = None,
+    expected_redaction_policy_sha256: Annotated[
+        str | None,
+        typer.Option(hidden=True),
+    ] = None,
     show_report_guidance: Annotated[bool, typer.Option(hidden=True)] = True,
 ) -> None:
     """Explore behavioral differences against an isolated black-box agent.
@@ -417,6 +426,14 @@ def evaluate_dataset(
             redaction_state,
             state_required=not dry_run or resume is not None,
         )
+        if expected_redaction_policy_sha256 is not None and (
+            redaction_engine is None
+            or redaction_engine.policy.digest != expected_redaction_policy_sha256
+        ):
+            raise ValueError(
+                "redaction policy changed since 'ul init'; reinitialize the project before "
+                "sending data to the semantic provider"
+            )
         redaction_coverage = _redaction_coverage(selected_records, redaction_engine)
         if redaction_engine is not None and (not dry_run or resume is not None):
             selected_records = _protect_interaction_records(selected_records, redaction_engine)
@@ -447,6 +464,16 @@ def evaluate_dataset(
                 raise ValueError(
                     "sandbox origin changed since 'ul init'; reinitialize the project and repeat "
                     "the sandbox safety acknowledgements"
+                )
+        if expected_sandbox_config_sha256 is not None:
+            if loaded_target_config is None:
+                raise ValueError("saved sandbox configuration requires --sandbox-config")
+            if json_http_sandbox_config_sha256(loaded_target_config) != (
+                expected_sandbox_config_sha256
+            ):
+                raise ValueError(
+                    "sandbox configuration changed since 'ul init'; reinitialize the project "
+                    "and repeat the sandbox safety acknowledgements"
                 )
         if loaded_target_config is not None:
             validate_json_http_sandbox_configuration(
