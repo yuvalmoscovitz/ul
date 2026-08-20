@@ -25,6 +25,7 @@ _TARGET_TEMPLATE_PATH = _EXAMPLE_DIRECTORY / "target.json"
 _EXPECTED_RULE_IDS = {
     "exactly-one-committed-payment",
     "committed-payments-unique-by-invoice",
+    "one-new-payment-per-turn",
 }
 
 
@@ -93,9 +94,18 @@ def _evidence_confirms_repeatable_duplicate(evidence_path: Path) -> bool:
         and all(trial.inconclusive_reason is None for trial in result.trials)
         and all(rule.status == "satisfied" for rule in result.baseline_invariant_rules)
         and all(rule.status == "satisfied" for rule in result.successful_commit_invariant_rules)
-        and all(rule.status == "violated" for rule in result.retried_invariant_rules)
         and all(
-            len(rule.trials) == 3 and all(trial.status == "violated" for trial in rule.trials)
+            rule.status
+            == ("satisfied" if rule.rule_id == "one-new-payment-per-turn" else "violated")
+            for rule in result.retried_invariant_rules
+        )
+        and all(
+            len(rule.trials) == 3
+            and all(
+                trial.status
+                == ("satisfied" if rule.rule_id == "one-new-payment-per-turn" else "violated")
+                for trial in rule.trials
+            )
             for rule in result.retried_invariant_rules
         )
         and all(
@@ -196,6 +206,7 @@ def main(
             "second payment in all 3 repetitions."
         )
         typer.echo("Critical rules: exactly-once count and unique invoice effect both violated.")
+        typer.echo("Transition rule: each individual turn appended exactly one effect.")
         typer.echo("Semantic-model calls: none")
         typer.echo(f"Evidence: {evidence_path}")
         return

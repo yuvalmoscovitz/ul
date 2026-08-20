@@ -144,6 +144,34 @@ Project defaults are saved by `ul init`. Common options include:
 - `--allow-insecure-http` for an exact local HTTP sandbox.
 - `--limit`, `--repetitions`, `--operator`, and `--max-sandbox-api-calls` for run scope.
 
+### State-transition rules
+
+Invariant schema `1.2.0` can check what changed between the snapshots immediately before and after
+each agent turn:
+
+```json
+{
+  "schema_version": "1.2.0",
+  "observation_source": "target_output",
+  "observation_authority": "committed_state_snapshot",
+  "rules": [{
+    "type": "exactly_one_new_effect",
+    "id": "one-payment-per-turn",
+    "version": "1.0.0",
+    "description": "Each turn must append exactly one payment.",
+    "severity": "critical",
+    "before_checkpoint": "before_turn",
+    "after_checkpoint": "after_turn",
+    "observation_pointer": "/committed_effects"
+  }]
+}
+```
+
+Use `no_new_effect` when a turn must not append anything, or
+`unchanged_between_checkpoints` when a value must stay unchanged. Effect arrays must be append-only;
+rewrites, removals, and reordering are reported as not evaluable. See the runnable
+[retry-after-commit rules](examples/retry_after_successful_commit/invariants.json).
+
 See [Privacy and redaction](docs/privacy.md) for the policy schema and data-flow details.
 
 OpenRouter is the default semantic-model provider. For a customer-controlled OpenAI-compatible

@@ -111,24 +111,35 @@ def validate_execution_evidence(
 def observed_outputs_from_evidence(
     evidence: ExecutionEvidence,
 ) -> tuple[ObservedAgentOutput, ...]:
-    return tuple(
-        ObservedAgentOutput(
-            raw_output=turn.response,
-            metadata={
-                **(
-                    {"committed_state_snapshot": turn.state_snapshot}
-                    if turn.state_snapshot is not None
-                    else {}
-                ),
-                **(
-                    {"state_observation_authority": turn.state_observation_authority}
-                    if turn.state_observation_authority is not None
-                    else {}
-                ),
-            },
+    outputs: list[ObservedAgentOutput] = []
+    before_turn_state_present = evidence.initial_state is not None
+    before_turn_state = evidence.initial_state.value if evidence.initial_state is not None else None
+    for turn in evidence.turns:
+        outputs.append(
+            ObservedAgentOutput(
+                raw_output=turn.response,
+                metadata={
+                    **(
+                        {"committed_state_snapshot": turn.state_snapshot}
+                        if turn.state_snapshot is not None
+                        else {}
+                    ),
+                    **(
+                        {"state_observation_authority": turn.state_observation_authority}
+                        if turn.state_observation_authority is not None
+                        else {}
+                    ),
+                    **(
+                        {"committed_state_before_turn": before_turn_state}
+                        if before_turn_state_present
+                        else {}
+                    ),
+                },
+            )
         )
-        for turn in evidence.turns
-    )
+        before_turn_state_present = turn.state_snapshot is not None
+        before_turn_state = turn.state_snapshot
+    return tuple(outputs)
 
 
 def execution_evidence_requires_quarantine(evidence: ExecutionEvidence) -> bool:

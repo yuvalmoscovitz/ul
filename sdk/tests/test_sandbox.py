@@ -3,7 +3,11 @@ from __future__ import annotations
 from typing import Literal
 
 import pytest
-from ul.sandbox import execution_evidence_requires_quarantine, validate_execution_evidence
+from ul.sandbox import (
+    execution_evidence_requires_quarantine,
+    observed_outputs_from_evidence,
+    validate_execution_evidence,
+)
 from ul_core.evaluation import (
     EvaluationCase,
     ExecutionEvidence,
@@ -125,6 +129,35 @@ def test_required_state_observation_is_enforced() -> None:
 
     with pytest.raises(ValueError, match="required state observation"):
         validate_execution_evidence(case, _SandboxIdentity(), evidence)
+
+
+def test_observed_outputs_preserve_each_turns_before_and_after_state() -> None:
+    first_turn = _evidence().turns[0]
+    second_turn = SandboxTurnEvidence(
+        turn_id="turn-2",
+        response={"status": "retried"},
+        state_snapshot={"payments": ["payment-1", "payment-2"]},
+        state_observation_authority="sandbox_self_reported",
+    )
+    evidence = _evidence().model_copy(
+        update={
+            "turns": (first_turn, second_turn),
+            "final_response": second_turn.response,
+            "final_state": SandboxStateEvidence(
+                value=second_turn.state_snapshot,
+                authority="sandbox_self_reported",
+            ),
+        }
+    )
+
+    first_output, second_output = observed_outputs_from_evidence(evidence)
+
+    assert first_output.metadata["committed_state_before_turn"] == {"clean": True}
+    assert first_output.metadata["committed_state_snapshot"] == {"payments": []}
+    assert second_output.metadata["committed_state_before_turn"] == {"payments": []}
+    assert second_output.metadata["committed_state_snapshot"] == {
+        "payments": ["payment-1", "payment-2"]
+    }
 
 
 def test_incomplete_timeout_event_is_rejected_and_quarantined() -> None:

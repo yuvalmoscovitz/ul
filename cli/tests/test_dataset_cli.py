@@ -37,11 +37,19 @@ from ul.dataset_invariants import (
     DatasetInvariantRuleEvaluation,
     DatasetInvariantSuite,
     JsonValueEqualsLiteralInvariant,
+    NoNewEffectInvariant,
 )
 from ul.sandbox import evaluation_case_from_inputs
 from ul_cli import dataset as main
 from ul_cli import dataset_review
 from ul_cli.main import app as root_app
+from ul_core.evaluation import (
+    ExecutionEvidence,
+    SandboxLifecycleEvidence,
+    SandboxResetEvidence,
+    SandboxStateEvidence,
+    SandboxTurnEvidence,
+)
 
 runner = CliRunner()
 _ANSI_ESCAPE_PATTERN = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
@@ -992,6 +1000,113 @@ def test_extended_invariants_use_new_evidence_schema_and_hide_values_from_termin
     assert "value=/approval" in terminal_output
     assert "private-current-version" not in terminal_output
     assert "private-stale-version" not in terminal_output
+
+
+def test_transition_invariant_round_trips_evidence_and_reports_only_pointer_and_count(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    secret = "private-payment-reference"
+    suite = DatasetInvariantSuite(
+        schema_version="1.2.0",
+        observation_source="target_output",
+        observation_authority="committed_state_snapshot",
+        rules=(
+            NoNewEffectInvariant(
+                type="no_new_effect",
+                id="no-payment",
+                version="1.0.0",
+                description="No payment may be committed.",
+                severity="critical",
+                before_checkpoint="before_turn",
+                after_checkpoint="after_turn",
+                observation_pointer="/payments",
+            ),
+        ),
+    )
+    evaluation_result = _evaluation_result("interaction-1")
+    baseline_trial = evaluation_result.baseline.trial_set.trials[0].model_copy(
+        update={
+            "execution_evidence": ExecutionEvidence(
+                case_id="interaction-1",
+                sandbox_id="sandbox",
+                sandbox_config_sha256="0" * 64,
+                initial_state=SandboxStateEvidence(
+                    value={"payments": []}, authority="sandbox_self_reported"
+                ),
+                turns=(
+                    SandboxTurnEvidence(
+                        turn_id="turn-1",
+                        response={"ignored": True},
+                        state_snapshot={"payments": [{"id": secret}]},
+                        state_observation_authority="sandbox_self_reported",
+                    ),
+                ),
+                final_response={"ignored": True},
+                final_state=SandboxStateEvidence(
+                    value={"payments": [{"id": secret}]},
+                    authority="sandbox_self_reported",
+                ),
+                lifecycle=SandboxLifecycleEvidence(
+                    terminal_status="succeeded",
+                    delivery="certain",
+                    cleanup="succeeded",
+                    sandbox_state_uncertain=False,
+                    initial_reset=SandboxResetEvidence(
+                        reset_session_requested=True,
+                        reset_session_acknowledged=True,
+                        reset_env_requested=True,
+                        reset_env_acknowledged=True,
+                    ),
+                    cleanup_reset=SandboxResetEvidence(
+                        reset_session_requested=True,
+                        reset_session_acknowledged=True,
+                        reset_env_requested=True,
+                        reset_env_acknowledged=True,
+                    ),
+                ),
+            ),
+            "target_output": ObservedAgentOutput(
+                raw_output={"ignored": True},
+                metadata={
+                    "committed_state_before_turn": {"payments": []},
+                    "committed_state_snapshot": {"payments": [{"id": secret}]},
+                    "state_observation_authority": "sandbox_self_reported",
+                },
+            ),
+        }
+    )
+    evaluation_result = evaluation_result.model_copy(
+        update={
+            "baseline": evaluation_result.baseline.model_copy(
+                update={
+                    "trial_set": evaluation_result.baseline.trial_set.model_copy(
+                        update={"trials": (baseline_trial,)}
+                    )
+                }
+            )
+        }
+    )
+    invariant_evaluation = main.evaluate_dataset_invariants(evaluation_result, suite)
+    record = main._customer_evidence_record(
+        evaluation_result,
+        repetitions=1,
+        max_sandbox_api_calls=2,
+        planned_target_calls=2,
+        run_context=cast(Any, _run_context((evaluation_result.source,), invariant_suite=suite)),
+        invariant_evaluation=invariant_evaluation,
+    )
+
+    parsed = dataset_review._EvidenceRecord.model_validate_json(json.dumps(record))
+    main._print_invariant_results((invariant_evaluation,))
+    terminal_output = capsys.readouterr().out
+
+    assert parsed.invariant_evaluation is not None
+    assert parsed.invariant_evaluation.baseline.rules[0].status == "violated"
+    assert "before=before_turn; after=after_turn; value=/payments; new_effects=1" in (
+        terminal_output
+    )
+    assert secret not in json.dumps(parsed.invariant_evaluation.model_dump(mode="json"))
+    assert secret not in terminal_output
 
 
 def test_invalid_invariant_config_stops_before_settings_network_or_output(

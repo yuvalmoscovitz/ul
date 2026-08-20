@@ -39,6 +39,7 @@ from ul.dataset_invariants import (
     DatasetInvariantArrayUniqueTrialEvaluation,
     DatasetInvariantEvaluation,
     DatasetInvariantSuite,
+    DatasetInvariantTransitionTrialEvaluation,
     DatasetInvariantTrialEvaluation,
     DatasetInvariantValueEqualsTrialEvaluation,
     DatasetInvariantValueInSetTrialEvaluation,
@@ -1547,7 +1548,8 @@ def _print_invariant_results(
     _print_dataset_plain("")
     _print_dataset_plain("Customer invariant evaluation")
     _print_dataset_plain(
-        "Selected values remain in the private evidence file; terminal output shows pointers only."
+        "Terminal output shows pointers and reason codes only; transition rules do not retain "
+        "selected state values."
     )
     for evaluation in evaluations:
         _print_dataset_plain(f"Interaction: {evaluation.interaction_id}")
@@ -1582,7 +1584,8 @@ def _invariant_trial_location(
     trial: DatasetInvariantTrialEvaluation
     | DatasetInvariantValueEqualsTrialEvaluation
     | DatasetInvariantValueInSetTrialEvaluation
-    | DatasetInvariantArrayUniqueTrialEvaluation,
+    | DatasetInvariantArrayUniqueTrialEvaluation
+    | DatasetInvariantTransitionTrialEvaluation,
 ) -> str:
     if isinstance(trial, DatasetInvariantTrialEvaluation):
         return f"left={trial.left_pointer}; right={trial.right_pointer}"
@@ -1591,6 +1594,14 @@ def _invariant_trial_location(
         (DatasetInvariantValueEqualsTrialEvaluation, DatasetInvariantValueInSetTrialEvaluation),
     ):
         return f"value={trial.value_pointer}"
+    if isinstance(trial, DatasetInvariantTransitionTrialEvaluation):
+        location = (
+            f"before={trial.before_checkpoint}; after={trial.after_checkpoint}; "
+            f"value={trial.observation_pointer}"
+        )
+        if trial.new_effect_count is not None:
+            location += f"; new_effects={trial.new_effect_count}"
+        return location
     location = (
         f"array={trial.array_pointer}; keys={','.join(trial.key_pointers)}; "
         f"items={trial.item_count}"
