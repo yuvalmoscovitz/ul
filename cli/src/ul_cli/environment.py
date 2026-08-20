@@ -8,21 +8,25 @@ from pathlib import Path
 from typing import Annotated, Never
 
 import typer
-from ul.http_sandbox import (
-    JsonHttpSandboxConnection,
-    json_http_sandbox_calls_per_execution,
-    json_http_sandbox_config_sha256,
-    load_json_http_sandbox_config,
+from ul.environment import evaluation_case_from_inputs, validate_execution_evidence
+from ul.http_environment import (
+    JsonHttpEnvironmentConnection,
+    json_http_environment_calls_per_execution,
+    json_http_environment_config_sha256,
+    load_json_http_environment_config,
 )
-from ul.sandbox import evaluation_case_from_inputs, validate_execution_evidence
-from ul_core.evaluation import EvaluationCase, ExecutionEvidence, SandboxResetEvidence
+from ul_core.evaluation import EnvironmentResetEvidence, EvaluationCase, ExecutionEvidence
 
-app = typer.Typer(help="Validate a customer-managed sandbox connection.")
+app = typer.Typer(help="Validate a customer-managed environment connection.")
+TEST_ENVIRONMENT_CONFIRMATION_MESSAGE = (
+    "UL will call this environment, and the agent may change external state. Use an environment "
+    "intended for testing that you can reset. Re-run with --confirm-test-environment to continue."
+)
 
 
 @app.command("check")
-def check_sandbox(
-    sandbox_config: Annotated[
+def check_environment(
+    environment_config: Annotated[
         Path,
         typer.Argument(),
     ],
@@ -32,19 +36,19 @@ def check_sandbox(
             help="Non-sensitive input that the customer has verified cannot cause a real effect."
         ),
     ] = None,
-    allow_sandbox_network_egress: Annotated[
+    allow_environment_network: Annotated[
         bool,
         typer.Option(
-            "--allow-sandbox-network-egress",
-            help="Authorize configured sandbox API calls.",
+            "--allow-environment-network",
+            help="Authorize configured environment API calls.",
             rich_help_panel="Required safety flags",
         ),
     ] = False,
-    confirm_isolated_sandbox: Annotated[
+    confirm_test_environment: Annotated[
         bool,
         typer.Option(
-            "--confirm-isolated-sandbox",
-            help=("Attest the target is isolated and non-production. UL does not verify it."),
+            "--confirm-test-environment",
+            help="Confirm this environment is intended for testing and can be reset.",
             rich_help_panel="Required safety flags",
         ),
     ] = False,
@@ -60,7 +64,7 @@ def check_sandbox(
         bool,
         typer.Option(
             "--allow-insecure-http",
-            help="Allow an HTTP sandbox API. Intended for local sandboxes.",
+            help="Allow an HTTP environment API. Intended for local environments.",
         ),
     ] = False,
     request_timeout_seconds: Annotated[
@@ -69,7 +73,7 @@ def check_sandbox(
             "--timeout-seconds",
             min=0.1,
             max=60,
-            help="Timeout for each sandbox API request.",
+            help="Timeout for each environment API request.",
         ),
     ] = 10,
     output_json: Annotated[
@@ -79,7 +83,7 @@ def check_sandbox(
 ) -> None:
     """Run one probe through the complete lifecycle without UL semantic-model calls.
 
-    Requires --allow-sandbox-network-egress, --confirm-isolated-sandbox, and
+    Requires --allow-environment-network, --confirm-test-environment, and
     --confirm-harmless-probe.
     """
     if probe is None or not probe.strip():
@@ -109,31 +113,31 @@ def check_sandbox(
             param_hint="--probe",
         )
     try:
-        config = load_json_http_sandbox_config(sandbox_config)
+        config = load_json_http_environment_config(environment_config)
     except (ValueError, RuntimeError) as error:
         reason = _terminal_safe(str(error))
         _preflight_failure(
             output_json=output_json,
-            code="sandbox_config_invalid",
+            code="environment_config_invalid",
             reason=reason,
-            remediation="Correct the sandbox configuration and try again.",
-            param_hint="SANDBOX_CONFIG",
+            remediation="Correct the environment configuration and try again.",
+            param_hint="ENVIRONMENT_CONFIG",
         )
-    if not allow_sandbox_network_egress:
+    if not allow_environment_network:
         _preflight_failure(
             output_json=output_json,
-            code="sandbox_network_not_allowed",
-            reason="check requires --allow-sandbox-network-egress",
-            remediation="Explicitly authorize sandbox API calls for this check.",
-            param_hint="--allow-sandbox-network-egress",
+            code="environment_network_not_allowed",
+            reason="check requires --allow-environment-network",
+            remediation="Explicitly authorize environment API calls for this check.",
+            param_hint="--allow-environment-network",
         )
-    if not confirm_isolated_sandbox:
+    if not confirm_test_environment:
         _preflight_failure(
             output_json=output_json,
-            code="sandbox_isolation_not_attested",
-            reason="check requires --confirm-isolated-sandbox",
-            remediation="Verify the target is isolated and non-production, then attest it.",
-            param_hint="--confirm-isolated-sandbox",
+            code="test_environment_not_confirmed",
+            reason=TEST_ENVIRONMENT_CONFIRMATION_MESSAGE,
+            remediation="Confirm the environment before UL calls it.",
+            param_hint="--confirm-test-environment",
         )
     if not confirm_harmless_probe:
         _preflight_failure(
@@ -144,14 +148,14 @@ def check_sandbox(
             param_hint="--confirm-harmless-probe",
         )
 
-    sandbox_api_calls = json_http_sandbox_calls_per_execution(config)
+    environment_api_calls = json_http_environment_calls_per_execution(config)
     try:
-        sandbox = JsonHttpSandboxConnection.from_config(
+        environment = JsonHttpEnvironmentConnection.from_config(
             config,
-            sandbox_confirmed=True,
+            test_environment_confirmed=True,
             allow_insecure_http=allow_insecure_http,
             timeout_seconds=request_timeout_seconds,
-            max_sandbox_api_calls=sandbox_api_calls,
+            max_environment_api_calls=environment_api_calls,
         )
     except (ValueError, RuntimeError) as error:
         reason = _terminal_safe(str(error))
@@ -161,17 +165,17 @@ def check_sandbox(
                 "Set the configured credential environment variable to a valid non-empty "
                 "ASCII value."
             )
-            param_hint = "SANDBOX_CONFIG"
+            param_hint = "ENVIRONMENT_CONFIG"
         elif reason == "HTTP endpoints require explicit insecure transport opt-in":
             code = "insecure_http_not_allowed"
             remediation = (
-                "For an isolated local sandbox, pass --allow-insecure-http; otherwise use HTTPS."
+                "For a local environment, pass --allow-insecure-http; otherwise use HTTPS."
             )
             param_hint = "--allow-insecure-http"
         else:
-            code = "sandbox_config_invalid"
-            remediation = "Correct the sandbox configuration and try again."
-            param_hint = "SANDBOX_CONFIG"
+            code = "environment_config_invalid"
+            remediation = "Correct the environment configuration and try again."
+            param_hint = "ENVIRONMENT_CONFIG"
         _preflight_failure(
             output_json=output_json,
             code=code,
@@ -182,63 +186,63 @@ def check_sandbox(
     case = evaluation_case_from_inputs(
         case_id=f"ul-case-{uuid.uuid4().hex}",
         raw_inputs=(probe,),
-        max_sandbox_api_calls=sandbox_api_calls,
-        timeout_seconds=(sandbox_api_calls + 1) * request_timeout_seconds,
-        required_state_observation_authority="sandbox_self_reported",
+        max_environment_api_calls=environment_api_calls,
+        timeout_seconds=(environment_api_calls + 1) * request_timeout_seconds,
+        required_state_observation_authority="environment_self_reported",
     )
     try:
-        evidence = asyncio.run(_execute_and_close(sandbox, case))
+        evidence = asyncio.run(_execute_and_close(environment, case))
     except TimeoutError:
         _print_timeout_result(
-            config.sandbox_id,
-            json_http_sandbox_config_sha256(config),
-            sandbox_api_calls,
+            config.environment_id,
+            json_http_environment_config_sha256(config),
+            environment_api_calls,
             output_json=output_json,
         )
         raise typer.Exit(code=2) from None
     except Exception:
         _print_unexpected_execution_result(
-            config.sandbox_id,
-            json_http_sandbox_config_sha256(config),
-            sandbox_api_calls,
+            config.environment_id,
+            json_http_environment_config_sha256(config),
+            environment_api_calls,
             output_json=output_json,
         )
         raise typer.Exit(code=2) from None
     try:
-        validate_execution_evidence(case, sandbox, evidence)
+        validate_execution_evidence(case, environment, evidence)
     except ValueError:
         _print_invalid_evidence_result(
-            config.sandbox_id,
-            json_http_sandbox_config_sha256(config),
-            sandbox_api_calls,
+            config.environment_id,
+            json_http_environment_config_sha256(config),
+            environment_api_calls,
             output_json=output_json,
         )
         raise typer.Exit(code=2) from None
 
     if evidence.lifecycle.terminal_status == "succeeded":
-        _print_success(evidence, sandbox_api_calls, output_json=output_json)
+        _print_success(evidence, environment_api_calls, output_json=output_json)
         return
-    _print_failure(evidence, sandbox_api_calls, output_json=output_json)
+    _print_failure(evidence, environment_api_calls, output_json=output_json)
     raise typer.Exit(code=2)
 
 
 async def _execute_and_close(
-    sandbox: JsonHttpSandboxConnection, case: EvaluationCase
+    environment: JsonHttpEnvironmentConnection, case: EvaluationCase
 ) -> ExecutionEvidence:
     try:
-        return await sandbox.execute(case)
+        return await environment.execute(case)
     finally:
-        await sandbox.aclose()
+        await environment.aclose()
 
 
 def _print_success(
-    evidence: ExecutionEvidence, sandbox_api_calls: int, *, output_json: bool
+    evidence: ExecutionEvidence, environment_api_calls: int, *, output_json: bool
 ) -> None:
-    result = _sandbox_check_result(
+    result = _environment_check_result(
         status="ready",
-        sandbox_id=evidence.sandbox_id,
-        sandbox_config_sha256=evidence.sandbox_config_sha256,
-        sandbox_api_call_budget=sandbox_api_calls,
+        environment_id=evidence.environment_id,
+        environment_config_sha256=evidence.environment_config_sha256,
+        environment_api_call_budget=environment_api_calls,
         completed_phases=evidence.lifecycle.completed_phases,
         state_observation_authority=evidence.final_state.authority
         if evidence.final_state is not None
@@ -251,15 +255,15 @@ def _print_success(
             if evidence.lifecycle.cleanup_reset is not None
             else None
         ),
-        sandbox_state_uncertain=evidence.lifecycle.sandbox_state_uncertain,
+        environment_state_uncertain=evidence.lifecycle.environment_state_uncertain,
     )
     if output_json:
         _print_safe(json.dumps(result, sort_keys=True))
         return
-    _print_safe("Sandbox check: READY")
-    _print_safe(f"Sandbox: {evidence.sandbox_id}")
+    _print_safe("Environment check: READY")
+    _print_safe(f"Environment: {evidence.environment_id}")
     _print_safe(f"Lifecycle: {' -> '.join(evidence.lifecycle.completed_phases)}")
-    _print_safe(f"Sandbox API call budget: {sandbox_api_calls}")
+    _print_safe(f"Environment API call budget: {environment_api_calls}")
     _print_reset_receipt("Initial reset", evidence.lifecycle.initial_reset)
     if evidence.lifecycle.cleanup_reset is not None:
         _print_reset_receipt("Cleanup reset", evidence.lifecycle.cleanup_reset)
@@ -269,19 +273,19 @@ def _print_success(
 
 
 def _print_failure(
-    evidence: ExecutionEvidence, sandbox_api_calls: int, *, output_json: bool
+    evidence: ExecutionEvidence, environment_api_calls: int, *, output_json: bool
 ) -> None:
     lifecycle = evidence.lifecycle
-    reason = lifecycle.failure_reason or "sandbox lifecycle failed without a diagnostic reason"
+    reason = lifecycle.failure_reason or "environment lifecycle failed without a diagnostic reason"
     code = lifecycle.failure_code
     if code is None:
-        raise AssertionError("failed sandbox lifecycle requires a diagnostic code")
+        raise AssertionError("failed environment lifecycle requires a diagnostic code")
     remediation = _remediation_for_code(code)
-    result = _sandbox_check_result(
+    result = _environment_check_result(
         status="not_ready",
-        sandbox_id=evidence.sandbox_id,
-        sandbox_config_sha256=evidence.sandbox_config_sha256,
-        sandbox_api_call_budget=sandbox_api_calls,
+        environment_id=evidence.environment_id,
+        environment_config_sha256=evidence.environment_config_sha256,
+        environment_api_call_budget=environment_api_calls,
         completed_phases=lifecycle.completed_phases,
         failed_phase=lifecycle.failed_phase,
         error_code=code,
@@ -297,12 +301,12 @@ def _print_failure(
         ),
         cleanup_failure_code=lifecycle.cleanup_failure_code,
         cleanup_failure_reason=lifecycle.cleanup_failure_reason,
-        sandbox_state_uncertain=lifecycle.sandbox_state_uncertain,
+        environment_state_uncertain=lifecycle.environment_state_uncertain,
     )
     if output_json:
         _print_safe(json.dumps(result, sort_keys=True))
         return
-    _print_safe("Sandbox check: NOT READY")
+    _print_safe("Environment check: NOT READY")
     _print_safe(f"Failed phase: {lifecycle.failed_phase or 'unknown'}")
     _print_safe(f"Error: {code}")
     _print_safe(f"Reason: {reason}")
@@ -315,122 +319,130 @@ def _print_failure(
     if lifecycle.cleanup_failure_reason is not None:
         _print_safe(f"Cleanup reason: {lifecycle.cleanup_failure_reason}")
     _print_safe(
-        "Sandbox state: "
-        + ("UNCERTAIN — quarantine before reuse" if lifecycle.sandbox_state_uncertain else "clean")
+        "Environment state: "
+        + (
+            "UNCERTAIN — quarantine before reuse"
+            if lifecycle.environment_state_uncertain
+            else "clean"
+        )
     )
     _print_safe("Probe, response, and state: not printed")
     _print_safe("UL semantic-model calls: 0")
 
 
 def _print_timeout_result(
-    sandbox_id: str,
-    sandbox_config_sha256: str,
-    sandbox_api_calls: int,
+    environment_id: str,
+    environment_config_sha256: str,
+    environment_api_calls: int,
     *,
     output_json: bool,
 ) -> None:
-    result = _sandbox_check_result(
+    result = _environment_check_result(
         status="not_ready",
-        sandbox_id=sandbox_id,
-        sandbox_config_sha256=sandbox_config_sha256,
-        sandbox_api_call_budget=sandbox_api_calls,
+        environment_id=environment_id,
+        environment_config_sha256=environment_config_sha256,
+        environment_api_call_budget=environment_api_calls,
         failed_phase="lifecycle_deadline",
         error_code="lifecycle_timeout",
-        reason="complete sandbox lifecycle exceeded its deadline",
-        remediation="Inspect sandbox availability and quarantine it before reuse.",
+        reason="complete environment lifecycle exceeded its deadline",
+        remediation="Inspect environment availability and quarantine it before reuse.",
         delivery="uncertain",
         cleanup="unknown",
-        sandbox_state_uncertain=True,
+        environment_state_uncertain=True,
     )
     if output_json:
         _print_safe(json.dumps(result, sort_keys=True))
         return
-    _print_safe("Sandbox check: NOT READY")
+    _print_safe("Environment check: NOT READY")
     _print_safe("Failed phase: lifecycle_deadline")
     _print_safe("Error: lifecycle_timeout")
-    _print_safe("Reason: complete sandbox lifecycle exceeded its deadline")
+    _print_safe("Reason: complete environment lifecycle exceeded its deadline")
     _print_safe("Delivery: uncertain")
     _print_safe("Cleanup: unknown")
-    _print_safe("Sandbox state: UNCERTAIN — quarantine before reuse")
+    _print_safe("Environment state: UNCERTAIN — quarantine before reuse")
     _print_safe("Probe, response, and state: not printed")
     _print_safe("UL semantic-model calls: 0")
 
 
 def _print_invalid_evidence_result(
-    sandbox_id: str,
-    sandbox_config_sha256: str,
-    sandbox_api_calls: int,
+    environment_id: str,
+    environment_config_sha256: str,
+    environment_api_calls: int,
     *,
     output_json: bool,
 ) -> None:
-    result = _sandbox_check_result(
+    result = _environment_check_result(
         status="not_ready",
-        sandbox_id=sandbox_id,
-        sandbox_config_sha256=sandbox_config_sha256,
-        sandbox_api_call_budget=sandbox_api_calls,
+        environment_id=environment_id,
+        environment_config_sha256=environment_config_sha256,
+        environment_api_call_budget=environment_api_calls,
         failed_phase="evidence_validation",
         error_code="invalid_lifecycle_evidence",
-        reason="sandbox lifecycle evidence did not match the requested probe",
-        remediation="Verify sandbox, case, turn, and state-observer identity handling.",
+        reason="environment lifecycle evidence did not match the requested probe",
+        remediation="Verify environment, case, turn, and state-observer identity handling.",
         delivery="uncertain",
         cleanup="unknown",
-        sandbox_state_uncertain=True,
+        environment_state_uncertain=True,
     )
     if output_json:
         _print_safe(json.dumps(result, sort_keys=True))
         return
-    _print_safe("Sandbox check: NOT READY")
+    _print_safe("Environment check: NOT READY")
     _print_safe("Failed phase: evidence_validation")
     _print_safe("Error: invalid_lifecycle_evidence")
-    _print_safe("Reason: sandbox lifecycle evidence did not match the requested probe")
-    _print_safe("Remediation: Verify sandbox, case, turn, and state-observer identity handling.")
+    _print_safe("Reason: environment lifecycle evidence did not match the requested probe")
+    _print_safe(
+        "Remediation: Verify environment, case, turn, and state-observer identity handling."
+    )
     _print_safe("Probe, response, and state: not printed")
     _print_safe("UL semantic-model calls: 0")
 
 
 def _print_unexpected_execution_result(
-    sandbox_id: str,
-    sandbox_config_sha256: str,
-    sandbox_api_calls: int,
+    environment_id: str,
+    environment_config_sha256: str,
+    environment_api_calls: int,
     *,
     output_json: bool,
 ) -> None:
-    reason = "sandbox check failed before safe lifecycle evidence was available"
-    remediation = "Quarantine the sandbox before reuse and inspect its lifecycle implementation."
-    result = _sandbox_check_result(
+    reason = "environment check failed before safe lifecycle evidence was available"
+    remediation = (
+        "Quarantine the environment before reuse and inspect its lifecycle implementation."
+    )
+    result = _environment_check_result(
         status="not_ready",
-        sandbox_id=sandbox_id,
-        sandbox_config_sha256=sandbox_config_sha256,
-        sandbox_api_call_budget=sandbox_api_calls,
+        environment_id=environment_id,
+        environment_config_sha256=environment_config_sha256,
+        environment_api_call_budget=environment_api_calls,
         failed_phase="execution_boundary",
         error_code="unexpected_execution_error",
         reason=reason,
         remediation=remediation,
         delivery="uncertain",
         cleanup="unknown",
-        sandbox_state_uncertain=True,
+        environment_state_uncertain=True,
     )
     if output_json:
         _print_safe(json.dumps(result, sort_keys=True))
         return
-    _print_safe("Sandbox check: NOT READY")
+    _print_safe("Environment check: NOT READY")
     _print_safe("Failed phase: execution_boundary")
     _print_safe("Error: unexpected_execution_error")
     _print_safe(f"Reason: {reason}")
     _print_safe(f"Remediation: {remediation}")
     _print_safe("Delivery: uncertain")
     _print_safe("Cleanup: unknown")
-    _print_safe("Sandbox state: UNCERTAIN — quarantine before reuse")
+    _print_safe("Environment state: UNCERTAIN — quarantine before reuse")
     _print_safe("Probe, response, and state: not printed")
     _print_safe("UL semantic-model calls: 0")
 
 
-def _sandbox_check_result(
+def _environment_check_result(
     *,
     status: str,
-    sandbox_id: str | None = None,
-    sandbox_config_sha256: str | None = None,
-    sandbox_api_call_budget: int | None = None,
+    environment_id: str | None = None,
+    environment_config_sha256: str | None = None,
+    environment_api_call_budget: int | None = None,
     completed_phases: tuple[str, ...] = (),
     state_observation_authority: str | None = None,
     failed_phase: str | None = None,
@@ -441,16 +453,16 @@ def _sandbox_check_result(
     cleanup: str | None = None,
     cleanup_failure_code: str | None = None,
     cleanup_failure_reason: str | None = None,
-    sandbox_state_uncertain: bool | None = None,
+    environment_state_uncertain: bool | None = None,
     initial_reset: dict[str, object] | None = None,
     cleanup_reset: dict[str, object] | None = None,
 ) -> dict[str, object]:
     return {
         "schema_version": 2,
         "status": status,
-        "sandbox_id": sandbox_id,
-        "sandbox_config_sha256": sandbox_config_sha256,
-        "sandbox_api_call_budget": sandbox_api_call_budget,
+        "environment_id": environment_id,
+        "environment_config_sha256": environment_config_sha256,
+        "environment_api_call_budget": environment_api_call_budget,
         "completed_phases": list(completed_phases),
         "state_observation_authority": state_observation_authority,
         "failed_phase": failed_phase,
@@ -461,7 +473,7 @@ def _sandbox_check_result(
         "cleanup": cleanup,
         "cleanup_failure_code": cleanup_failure_code,
         "cleanup_failure_reason": cleanup_failure_reason,
-        "sandbox_state_uncertain": sandbox_state_uncertain,
+        "environment_state_uncertain": environment_state_uncertain,
         "initial_reset": initial_reset,
         "cleanup_reset": cleanup_reset,
         "probe_and_observations": "not_printed",
@@ -469,7 +481,7 @@ def _sandbox_check_result(
     }
 
 
-def _print_reset_receipt(label: str, reset: SandboxResetEvidence) -> None:
+def _print_reset_receipt(label: str, reset: EnvironmentResetEvidence) -> None:
     _print_safe(
         f"{label}: session requested={reset.reset_session_requested}, "
         f"acknowledged={reset.reset_session_acknowledged}; environment "
@@ -479,16 +491,16 @@ def _print_reset_receipt(label: str, reset: SandboxResetEvidence) -> None:
 
 def _remediation_for_code(code: str) -> str:
     return {
-        "authentication_rejected": "Verify sandbox credentials and permissions.",
-        "rate_limited": "Wait for sandbox capacity or adjust its request quota.",
-        "http_status": "Verify endpoint routing, request identity, and sandbox service logs.",
+        "authentication_rejected": "Verify environment credentials and permissions.",
+        "rate_limited": "Wait for environment capacity or adjust its request quota.",
+        "http_status": "Verify endpoint routing, request identity, and environment service logs.",
         "response_content_type": "Return application/json from this lifecycle endpoint.",
         "response_content_encoding": "Disable compressed lifecycle responses.",
         "invalid_json": "Return bounded, standards-compliant JSON without duplicate keys.",
         "null_json": "Return the configured lifecycle response object instead of null.",
         "response_mapping": "Correct the response JSON pointer for this lifecycle phase.",
-        "sandbox_identity": (
-            "Return the configured sandbox_id and the request case identity unchanged."
+        "environment_identity": (
+            "Return the configured environment_id and the request case identity unchanged."
         ),
         "case_identity": "Echo the request case_id unchanged in the response.",
         "turn_identity": "Echo the request turn_id unchanged in the response.",
@@ -498,40 +510,48 @@ def _remediation_for_code(code: str) -> str:
             "Return reset_session=true after clearing the agent conversation/session."
         ),
         "reset_env_not_acknowledged": (
-            "Return reset_env=true after restoring external sandbox state."
+            "Return reset_env=true after restoring external environment state."
         ),
         "reset_not_clean": (
             "Return the configured clean-state acknowledgement only after reset completes."
         ),
         "request_too_large": "Reduce the probe or configured request template size.",
         "response_too_large": "Reduce the lifecycle response size.",
-        "call_budget": "Increase the explicit sandbox API call budget.",
+        "call_budget": "Increase the explicit environment API call budget.",
         "request_timeout": (
-            "Inspect sandbox availability and state; do not retry an ambiguous mutation blindly."
+            "Inspect environment availability and state; do not retry an ambiguous mutation "
+            "blindly."
         ),
         "write_timeout": (
-            "Inspect sandbox availability and state; do not retry an ambiguous mutation blindly."
+            "Inspect environment availability and state; do not retry an ambiguous mutation "
+            "blindly."
         ),
         "response_timeout": (
-            "Inspect sandbox availability and state; do not retry an ambiguous mutation blindly."
+            "Inspect environment availability and state; do not retry an ambiguous mutation "
+            "blindly."
         ),
-        "connect_timeout": "Verify the sandbox address, firewall, and service availability.",
-        "pool_timeout": "Reduce local concurrency or increase sandbox connection capacity.",
-        "dns_resolution": "Verify the configured sandbox hostname and DNS availability.",
-        "tls_connection": "Verify the sandbox certificate, hostname, and trust configuration.",
+        "connect_timeout": "Verify the environment address, firewall, and service availability.",
+        "pool_timeout": "Reduce local concurrency or increase environment connection capacity.",
+        "dns_resolution": "Verify the configured environment hostname and DNS availability.",
+        "tls_connection": "Verify the environment certificate, hostname, and trust configuration.",
         "connect_failed": (
-            "Verify the sandbox address, DNS, TLS, firewall, and service availability."
+            "Verify the environment address, DNS, TLS, firewall, and service availability."
         ),
-        "transport_protocol": "Inspect the sandbox HTTP server and intermediary protocol handling.",
+        "transport_protocol": (
+            "Inspect the environment HTTP server and intermediary protocol handling."
+        ),
         "transport_failed": (
-            "Inspect transport health and sandbox state; do not retry an ambiguous execute blindly."
+            "Inspect transport health and environment state; do not retry an ambiguous execute "
+            "blindly."
         ),
-        "sandbox_state_uncertain": "Quarantine and independently reset the sandbox before reuse.",
-        "sandbox_lifecycle_error": (
-            "Quarantine the sandbox before reuse and inspect its lifecycle implementation."
+        "environment_state_uncertain": (
+            "Quarantine and independently reset the environment before reuse."
         ),
-        "sandbox_cleanup_error": (
-            "Quarantine the sandbox and independently restore clean state before reuse."
+        "environment_lifecycle_error": (
+            "Quarantine the environment before reuse and inspect its lifecycle implementation."
+        ),
+        "environment_cleanup_error": (
+            "Quarantine the environment and independently restore clean state before reuse."
         ),
     }.get(code, "Inspect the configured lifecycle contract for the failed phase.")
 
@@ -561,7 +581,7 @@ def _preflight_failure(
     if output_json:
         _print_safe(
             json.dumps(
-                _sandbox_check_result(
+                _environment_check_result(
                     status="not_ready",
                     failed_phase="preflight",
                     error_code=code,

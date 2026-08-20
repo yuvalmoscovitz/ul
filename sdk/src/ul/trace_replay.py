@@ -12,20 +12,23 @@ from pathlib import Path
 from typing import Literal, Self, cast
 
 from pydantic import ConfigDict, Field, JsonValue, ValidationError, field_validator, model_validator
-from ul_core.contracts import SandboxExecutor
+from ul_core.contracts import EnvironmentExecutor
 from ul_core.dataset import ObservedAgentOutput
 from ul_core.evaluation import ExecutionEvidence
 from ul_core.models import ConversationRole, ConversationTurn, ULModel
 
 from ul.dataset_evaluation import DatasetTargetLifecycleFailure
-from ul.http_sandbox import JsonHttpSandboxConfig, json_http_sandbox_calls_per_conversation
-from ul.otlp_ingest import OtlpInteractionRecord
-from ul.sandbox import (
+from ul.environment import (
     evaluation_case_from_inputs,
     execution_evidence_requires_quarantine,
     observed_outputs_from_evidence,
     validate_execution_evidence,
 )
+from ul.http_environment import (
+    JsonHttpEnvironmentConfig,
+    json_http_environment_calls_per_conversation,
+)
+from ul.otlp_ingest import OtlpInteractionRecord
 
 _MAXIMUM_BUNDLE_BYTES = 50_000_000
 _MAXIMUM_JSON_DEPTH = 100
@@ -173,7 +176,7 @@ class TraceReplayTrial(_StrictModel):
 
 
 class TraceReplayResult(_StrictModel):
-    schema_version: Literal["1.0.0"] = "1.0.0"
+    schema_version: Literal["1.1.0"] = "1.1.0"
     case: TraceReplayCase
     requested_repetitions: int = Field(ge=1)
     required_target_calls: int = Field(ge=1)
@@ -252,7 +255,7 @@ def select_trace_replay_case(
 
 def plan_trace_replay(
     case: TraceReplayCase,
-    target_config: JsonHttpSandboxConfig,
+    target_config: JsonHttpEnvironmentConfig,
     *,
     repetitions: int = 3,
     max_target_calls: int = 100,
@@ -261,7 +264,7 @@ def plan_trace_replay(
         raise ValueError("repetitions must be a positive integer")
     if type(max_target_calls) is not int or max_target_calls < 1:
         raise ValueError("max_target_calls must be a positive integer")
-    target_calls_per_repetition = json_http_sandbox_calls_per_conversation(
+    target_calls_per_repetition = json_http_environment_calls_per_conversation(
         target_config, len(case.replay_user_turns)
     )
     required_target_calls = repetitions * target_calls_per_repetition
@@ -279,7 +282,7 @@ def plan_trace_replay(
 
 async def run_trace_replay(
     case: TraceReplayCase,
-    sandbox: SandboxExecutor,
+    environment: EnvironmentExecutor,
     *,
     repetitions: int = 3,
     max_target_calls: int = 100,
@@ -290,24 +293,24 @@ async def run_trace_replay(
     if type(max_target_calls) is not int or max_target_calls < 1:
         raise ValueError("max_target_calls must be a positive integer")
     if not allow_network_egress:
-        raise ValueError("trace replay sandbox API access requires explicit network opt-in")
+        raise ValueError("trace replay environment API access requires explicit network opt-in")
     planned_case = evaluation_case_from_inputs(
         case_id=f"ul-case-{secrets.token_hex(16)}",
         raw_inputs=(turn.content for turn in case.replay_user_turns),
-        max_sandbox_api_calls=max_target_calls,
+        max_environment_api_calls=max_target_calls,
         timeout_seconds=30,
         required_state_observation_authority=(
-            sandbox.capabilities.state_observation_authority
+            environment.capabilities.state_observation_authority
             if case.recorded_state_snapshot_available
             else None
         ),
         required_state_observer_id=(
-            sandbox.capabilities.state_observer_id
+            environment.capabilities.state_observer_id
             if case.recorded_state_snapshot_available
             else None
         ),
     )
-    calls_per_repetition = sandbox.api_calls_for_case(planned_case)
+    calls_per_repetition = environment.api_calls_for_case(planned_case)
     if type(calls_per_repetition) is not int or calls_per_repetition < 1:
         raise ValueError("trace replay target returned an invalid physical call count")
     required_target_calls = repetitions * calls_per_repetition
@@ -316,14 +319,14 @@ async def run_trace_replay(
 
     raw_inputs = tuple(turn.content for turn in case.replay_user_turns)
     trials: list[TraceReplayTrial] = []
-    sandbox_state_uncertain = False
+    environment_state_uncertain = False
     for repetition in range(1, repetitions + 1):
-        if sandbox_state_uncertain:
+        if environment_state_uncertain:
             trials.append(
                 TraceReplayTrial(
                     repetition=repetition,
                     inconclusive_reason=(
-                        "sandbox not called because prior execution left state uncertain"
+                        "environment not called because prior execution left state uncertain"
                     ),
                 )
             )
@@ -333,41 +336,43 @@ async def run_trace_replay(
             evaluation_case = evaluation_case_from_inputs(
                 case_id=f"ul-case-{secrets.token_hex(16)}",
                 raw_inputs=raw_inputs,
-                max_sandbox_api_calls=calls_per_repetition,
+                max_environment_api_calls=calls_per_repetition,
                 timeout_seconds=30,
                 required_state_observation_authority=(
-                    sandbox.capabilities.state_observation_authority
+                    environment.capabilities.state_observation_authority
                     if case.recorded_state_snapshot_available
                     else None
                 ),
                 required_state_observer_id=(
-                    sandbox.capabilities.state_observer_id
+                    environment.capabilities.state_observer_id
                     if case.recorded_state_snapshot_available
                     else None
                 ),
             )
             async with asyncio.timeout(evaluation_case.timeout_seconds):
-                evidence = await sandbox.execute(evaluation_case)
-            validate_execution_evidence(evaluation_case, sandbox, evidence)
-            sandbox_state_uncertain = execution_evidence_requires_quarantine(evidence)
+                evidence = await environment.execute(evaluation_case)
+            validate_execution_evidence(evaluation_case, environment, evidence)
+            environment_state_uncertain = execution_evidence_requires_quarantine(evidence)
             if evidence.lifecycle.terminal_status != "succeeded":
                 trials.append(
                     TraceReplayTrial(
                         repetition=repetition,
                         execution_evidence=evidence,
-                        inconclusive_reason="sandbox lifecycle failed",
+                        inconclusive_reason="environment lifecycle failed",
                         lifecycle_failure=DatasetTargetLifecycleFailure(
                             failed_phase=evidence.lifecycle.failed_phase or "unknown",
                             completed_phases=evidence.lifecycle.completed_phases,
                             cleanup_reset_failed=evidence.lifecycle.cleanup == "failed",
-                            sandbox_state_may_remain=(evidence.lifecycle.sandbox_state_uncertain),
+                            environment_state_may_remain=(
+                                evidence.lifecycle.environment_state_uncertain
+                            ),
                         ),
                     )
                 )
                 continue
             outputs = observed_outputs_from_evidence(evidence)
             if len(outputs) != len(raw_inputs):
-                raise RuntimeError("sandbox returned an invalid number of turn observations")
+                raise RuntimeError("environment returned an invalid number of turn observations")
             final_output = outputs[-1]
             committed_state_present = "committed_state_snapshot" in final_output.metadata
             if case.recorded_state_snapshot_available and not committed_state_present:
@@ -389,11 +394,13 @@ async def run_trace_replay(
                 )
             )
         except TimeoutError:
-            sandbox_state_uncertain = sandbox.capabilities.cancellation_guarantee != "guaranteed"
+            environment_state_uncertain = (
+                environment.capabilities.cancellation_guarantee != "guaranteed"
+            )
             trials.append(
                 TraceReplayTrial(
                     repetition=repetition,
-                    inconclusive_reason="sandbox execution timed out",
+                    inconclusive_reason="environment execution timed out",
                 )
             )
         except RuntimeError:
@@ -401,7 +408,7 @@ async def run_trace_replay(
                 TraceReplayTrial(
                     repetition=repetition,
                     execution_evidence=evidence,
-                    inconclusive_reason="sandbox execution failed",
+                    inconclusive_reason="environment execution failed",
                 )
             )
 

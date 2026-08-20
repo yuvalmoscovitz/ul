@@ -19,7 +19,7 @@ _MODES: tuple[AugmentationMode, ...] = (
     "dataset_variation",
     "scenario_materialization",
     "conversation_stress",
-    "sandbox_fault",
+    "environment_fault",
 )
 _REFERENCE_PATTERN = re.compile(
     r"^[a-z][a-z0-9_]*(?:\.[a-z][a-z0-9_]*)+(?:@(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*))?$"
@@ -114,15 +114,15 @@ def show_augmentation(
             + _format_requirements(
                 requirements.required_source_features,
                 semantic_model=requirements.semantic_model,
-                sandbox=requirements.sandbox,
+                environment=requirements.environment,
                 conversations=requirements.conversations,
                 state_observation=requirements.state_observation,
                 customer_evaluator=requirements.customer_evaluator,
-                sandbox_capabilities=requirements.sandbox_capabilities,
+                environment_capabilities=requirements.environment_capabilities,
                 human_review=requirements.human_review,
             )
         )
-    typer.echo("Catalog inspection: 0 model calls, 0 sandbox calls, 0 network requests.")
+    typer.echo("Catalog inspection: 0 model calls, 0 environment calls, 0 network requests.")
     typer.echo("Execution safety and call cost are enforced by the selected command's planner.")
 
 
@@ -185,11 +185,11 @@ def _format_requirements(
     source_features: tuple[str, ...],
     *,
     semantic_model: bool,
-    sandbox: bool,
+    environment: bool,
     conversations: bool,
     state_observation: bool,
     customer_evaluator: bool,
-    sandbox_capabilities: tuple[str, ...],
+    environment_capabilities: tuple[str, ...],
     human_review: bool,
 ) -> str:
     values = [*source_features]
@@ -197,7 +197,7 @@ def _format_requirements(
         label
         for required, label in (
             (semantic_model, "semantic model"),
-            (sandbox, "isolated sandbox"),
+            (environment, "test environment"),
             (conversations, "conversation support"),
             (state_observation, "committed-state observation"),
             (customer_evaluator, "customer evaluator"),
@@ -205,5 +205,5 @@ def _format_requirements(
         )
         if required
     )
-    values.extend(f"sandbox capability {capability}" for capability in sandbox_capabilities)
+    values.extend(f"environment capability {capability}" for capability in environment_capabilities)
     return ", ".join(values) if values else "none"

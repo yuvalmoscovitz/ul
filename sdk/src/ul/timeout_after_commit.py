@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Literal, Self, cast
 
 from pydantic import ConfigDict, Field, JsonValue, ValidationError, model_validator
-from ul_core.contracts import SandboxExecutor
+from ul_core.contracts import EnvironmentExecutor
 from ul_core.dataset import ObservedAgentOutput
 from ul_core.evaluation import (
     EvaluationCase,
@@ -26,8 +26,11 @@ from ul.dataset_invariants import (
     ObservationAuthority,
     evaluate_dataset_invariant_rules,
 )
-from ul.http_sandbox import JsonHttpSandboxConfig, json_http_sandbox_calls_per_conversation
-from ul.sandbox import execution_evidence_requires_quarantine, validate_execution_evidence
+from ul.environment import execution_evidence_requires_quarantine, validate_execution_evidence
+from ul.http_environment import (
+    JsonHttpEnvironmentConfig,
+    json_http_environment_calls_per_conversation,
+)
 
 _MAXIMUM_CASE_BYTES = 1_000_000
 _MAXIMUM_JSON_DEPTH = 100
@@ -38,7 +41,7 @@ class _StrictModel(ULModel):
 
 
 class TimeoutAfterCommitCase(_StrictModel):
-    schema_version: Literal["1.0.0"] = "1.0.0"
+    schema_version: Literal["1.1.0"] = "1.1.0"
     id: str = Field(min_length=1, max_length=200)
     operator_id: Literal["environment.tool.timeout_after_commit"] = (
         "environment.tool.timeout_after_commit"
@@ -82,7 +85,7 @@ class TimeoutAfterCommitStressTrial(_StrictModel):
 
 
 class TimeoutAfterCommitStressResult(_StrictModel):
-    schema_version: Literal["1.0.0"] = "1.0.0"
+    schema_version: Literal["1.1.0"] = "1.1.0"
     case: TimeoutAfterCommitCase
     requested_repetitions: int = Field(ge=1)
     target_calls_per_repetition: int = Field(ge=1)
@@ -147,18 +150,18 @@ class TimeoutAfterCommitStressPlan(_StrictModel):
 
 def plan_timeout_after_commit_stress_test(
     case: TimeoutAfterCommitCase,
-    target_config: JsonHttpSandboxConfig,
+    target_config: JsonHttpEnvironmentConfig,
     *,
     repetitions: int = 3,
-    max_sandbox_api_calls: int = 100,
+    max_environment_api_calls: int = 100,
 ) -> TimeoutAfterCommitStressPlan:
-    _validate_run_inputs(repetitions, max_sandbox_api_calls)
+    _validate_run_inputs(repetitions, max_environment_api_calls)
     event_config = target_config.timeout_after_commit
     if event_config is None or event_config.version != case.operator_version:
-        raise ValueError("sandbox does not support environment.tool.timeout_after_commit@1.0.0")
-    target_calls_per_repetition = json_http_sandbox_calls_per_conversation(target_config, 1) + 3
+        raise ValueError("environment does not support environment.tool.timeout_after_commit@1.0.0")
+    target_calls_per_repetition = json_http_environment_calls_per_conversation(target_config, 1) + 3
     required_target_calls = repetitions * target_calls_per_repetition
-    if required_target_calls > max_sandbox_api_calls:
+    if required_target_calls > max_environment_api_calls:
         raise ValueError("timeout-after-commit test exceeds the authorized target call budget")
     return TimeoutAfterCommitStressPlan(
         repetitions=repetitions,
@@ -169,77 +172,81 @@ def plan_timeout_after_commit_stress_test(
 
 async def run_timeout_after_commit_stress_test(
     case: TimeoutAfterCommitCase,
-    sandbox: SandboxExecutor,
+    environment: EnvironmentExecutor,
     *,
     invariant_rules: tuple[DatasetInvariantRule, ...],
     observation_authority: ObservationAuthority = "committed_state_snapshot",
     repetitions: int = 3,
-    max_sandbox_api_calls: int = 100,
+    max_environment_api_calls: int = 100,
     allow_network_egress: bool = False,
 ) -> TimeoutAfterCommitStressResult:
-    _validate_run_inputs(repetitions, max_sandbox_api_calls)
+    _validate_run_inputs(repetitions, max_environment_api_calls)
     if not invariant_rules:
         raise ValueError("timeout-after-commit testing requires at least one invariant")
     if observation_authority != "committed_state_snapshot":
         raise ValueError("timeout-after-commit testing requires committed-state invariants")
     if not allow_network_egress:
-        raise ValueError("timeout-after-commit sandbox API access requires explicit network opt-in")
-    if not sandbox.capabilities.supports_conversations:
+        raise ValueError(
+            "timeout-after-commit environment API access requires explicit network opt-in"
+        )
+    if not environment.capabilities.supports_conversations:
         raise ValueError("timeout-after-commit testing requires conversation support")
-    if not sandbox.capabilities.supports_state_observation:
+    if not environment.capabilities.supports_state_observation:
         raise ValueError("timeout-after-commit testing requires state observation support")
-    if sandbox.capabilities.timeout_after_commit_version != case.operator_version:
-        raise ValueError("sandbox does not support environment.tool.timeout_after_commit@1.0.0")
+    if environment.capabilities.timeout_after_commit_version != case.operator_version:
+        raise ValueError("environment does not support environment.tool.timeout_after_commit@1.0.0")
 
-    planned_case = _evaluation_case(case, max_sandbox_api_calls, sandbox)
-    target_calls_per_repetition = sandbox.api_calls_for_case(planned_case)
+    planned_case = _evaluation_case(case, max_environment_api_calls, environment)
+    target_calls_per_repetition = environment.api_calls_for_case(planned_case)
     if type(target_calls_per_repetition) is not int or target_calls_per_repetition < 1:
-        raise ValueError("timeout-after-commit sandbox returned an invalid API call count")
+        raise ValueError("timeout-after-commit environment returned an invalid API call count")
     required_target_calls = repetitions * target_calls_per_repetition
-    if required_target_calls > max_sandbox_api_calls:
+    if required_target_calls > max_environment_api_calls:
         raise ValueError("timeout-after-commit test exceeds the authorized target call budget")
 
     trials: list[TimeoutAfterCommitStressTrial] = []
     final_outputs: list[ObservedAgentOutput | None] = []
-    sandbox_state_uncertain = False
+    environment_state_uncertain = False
     for repetition in range(1, repetitions + 1):
-        if sandbox_state_uncertain:
+        if environment_state_uncertain:
             final_outputs.append(None)
             trials.append(
                 TimeoutAfterCommitStressTrial(
                     repetition=repetition,
                     inconclusive_reason=(
-                        "sandbox not called because prior execution left state uncertain"
+                        "environment not called because prior execution left state uncertain"
                     ),
                 )
             )
             continue
         evidence: ExecutionEvidence | None = None
         try:
-            evaluation_case = _evaluation_case(case, target_calls_per_repetition, sandbox)
+            evaluation_case = _evaluation_case(case, target_calls_per_repetition, environment)
             async with asyncio.timeout(evaluation_case.timeout_seconds):
-                evidence = await sandbox.execute(evaluation_case)
-            validate_execution_evidence(evaluation_case, sandbox, evidence)
-            sandbox_state_uncertain = execution_evidence_requires_quarantine(evidence)
+                evidence = await environment.execute(evaluation_case)
+            validate_execution_evidence(evaluation_case, environment, evidence)
+            environment_state_uncertain = execution_evidence_requires_quarantine(evidence)
         except TimeoutError:
-            sandbox_state_uncertain = sandbox.capabilities.cancellation_guarantee != "guaranteed"
+            environment_state_uncertain = (
+                environment.capabilities.cancellation_guarantee != "guaranteed"
+            )
             final_outputs.append(None)
             trials.append(
                 TimeoutAfterCommitStressTrial(
                     repetition=repetition,
                     execution_evidence=evidence,
-                    inconclusive_reason="sandbox execution timed out",
+                    inconclusive_reason="environment execution timed out",
                 )
             )
             continue
         except (RuntimeError, ValueError):
-            sandbox_state_uncertain = True
+            environment_state_uncertain = True
             final_outputs.append(None)
             trials.append(
                 TimeoutAfterCommitStressTrial(
                     repetition=repetition,
                     execution_evidence=evidence,
-                    inconclusive_reason="sandbox execution or evidence validation failed",
+                    inconclusive_reason="environment execution or evidence validation failed",
                 )
             )
             continue
@@ -250,7 +257,7 @@ async def run_timeout_after_commit_stress_test(
                 TimeoutAfterCommitStressTrial(
                     repetition=repetition,
                     execution_evidence=evidence,
-                    inconclusive_reason="sandbox lifecycle failed",
+                    inconclusive_reason="environment lifecycle failed",
                     lifecycle_failure=_lifecycle_failure(evidence),
                 )
             )
@@ -292,7 +299,7 @@ async def run_timeout_after_commit_stress_test(
                 TimeoutAfterCommitStressTrial(
                     repetition=repetition,
                     execution_evidence=evidence,
-                    inconclusive_reason="sandbox omitted authoritative post-state evidence",
+                    inconclusive_reason="environment omitted authoritative post-state evidence",
                 )
             )
             continue
@@ -348,16 +355,16 @@ def load_timeout_after_commit_case(path: str | Path) -> TimeoutAfterCommitCase:
 
 def _evaluation_case(
     case: TimeoutAfterCommitCase,
-    max_sandbox_api_calls: int,
-    sandbox: SandboxExecutor,
+    max_environment_api_calls: int,
+    environment: EnvironmentExecutor,
 ) -> EvaluationCase:
     return EvaluationCase(
         id=f"ul-timeout-after-commit-{secrets.token_hex(16)}",
         turns=(case.turn,),
-        max_sandbox_api_calls=max_sandbox_api_calls,
+        max_environment_api_calls=max_environment_api_calls,
         timeout_seconds=30,
-        required_state_observation_authority=sandbox.capabilities.state_observation_authority,
-        required_state_observer_id=sandbox.capabilities.state_observer_id,
+        required_state_observation_authority=environment.capabilities.state_observation_authority,
+        required_state_observer_id=environment.capabilities.state_observer_id,
         timeout_after_commit_event=TimeoutAfterCommitEventRequest(
             event_id=case.event_id,
             turn_id=case.turn.id,
@@ -366,11 +373,11 @@ def _evaluation_case(
     )
 
 
-def _validate_run_inputs(repetitions: int, max_sandbox_api_calls: int) -> None:
+def _validate_run_inputs(repetitions: int, max_environment_api_calls: int) -> None:
     if type(repetitions) is not int or repetitions < 1:
         raise ValueError("repetitions must be a positive integer")
-    if type(max_sandbox_api_calls) is not int or max_sandbox_api_calls < 1:
-        raise ValueError("max_sandbox_api_calls must be a positive integer")
+    if type(max_environment_api_calls) is not int or max_environment_api_calls < 1:
+        raise ValueError("max_environment_api_calls must be a positive integer")
 
 
 def _timeout_after_commit_status(
@@ -396,7 +403,7 @@ def _lifecycle_failure(evidence: ExecutionEvidence) -> DatasetTargetLifecycleFai
         cleanup_reset_failed=(
             lifecycle.cleanup == "failed" and "cleanup_reset" not in lifecycle.completed_phases
         ),
-        sandbox_state_may_remain=lifecycle.sandbox_state_uncertain,
+        environment_state_may_remain=lifecycle.environment_state_uncertain,
     )
 
 

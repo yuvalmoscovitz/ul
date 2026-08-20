@@ -366,7 +366,7 @@ class _ReplayHandler(BaseHTTPRequestHandler):
             replay_server.generation += 1
             replay_server.committed_result = None
             response_payload: dict[str, Any] = {
-                "sandbox_id": "test-sandbox",
+                "environment_id": "test-environment",
                 "case_id": payload["case_id"],
                 "generation": replay_server.generation,
                 "clean": True,
@@ -386,14 +386,14 @@ class _ReplayHandler(BaseHTTPRequestHandler):
                 "requested_amount": "12500",
             }
             response_payload = {
-                "sandbox_id": "test-sandbox",
+                "environment_id": "test-environment",
                 "case_id": payload["case_id"],
                 "turn_id": payload["turn_id"],
                 "result": replay_server.committed_result,
             }
         elif self.path == "/snapshot":
             response_payload = {
-                "sandbox_id": "test-sandbox",
+                "environment_id": "test-environment",
                 "case_id": payload["case_id"],
                 "turn_id": payload["turn_id"],
                 "state": replay_server.committed_result,
@@ -439,9 +439,9 @@ def _write_target_config(path: Path, endpoint: str) -> None:
     path.write_text(
         json.dumps(
             {
-                "version": 4,
-                "sandbox_id": "test-sandbox",
-                "headers_from_env": {"X-Test-Token": "UL_SANDBOX_REGRESSION_TEST_SECRET"},
+                "version": 5,
+                "environment_id": "test-environment",
+                "headers_from_env": {"X-Test-Token": "UL_ENVIRONMENT_REGRESSION_TEST_SECRET"},
                 "reset": {
                     "url": f"{base_url}/reset",
                     "request_json_template": {"case_id": "{{case_id}}"},
@@ -456,7 +456,7 @@ def _write_target_config(path: Path, endpoint: str) -> None:
                         "case_id": "{{case_id}}",
                         "turn_id": "{{turn_id}}",
                         "request": {"message": "{{input}}"},
-                        "settings": {"mode": "sandbox"},
+                        "settings": {"mode": "environment"},
                     },
                     "response_json_pointer": "/result",
                     "case_id_json_pointer": "/case_id",
@@ -496,7 +496,7 @@ def _confirm_finding(evidence: Path, finding_id: str = FINDING_ID) -> None:
             "--reviewer",
             "payments-risk",
             "--reason",
-            "The sandbox committed payment for a different invoice.",
+            "The environment committed payment for a different invoice.",
         ],
     )
     assert review.exit_code == 0, review.output
@@ -518,7 +518,7 @@ def _save_arguments(
         "save",
         str(evidence),
         finding_id,
-        "--sandbox-config",
+        "--environment-config",
         str(target_config),
         "--output",
         str(case_path),
@@ -534,12 +534,12 @@ def _replay_arguments(case_path: Path, target_config: Path, result_path: Path) -
         "regression",
         "replay",
         str(case_path),
-        "--sandbox-config",
+        "--environment-config",
         str(target_config),
-        "--allow-sandbox-network-egress",
-        "--confirm-isolated-sandbox",
+        "--allow-environment-network",
+        "--confirm-test-environment",
         "--allow-insecure-http",
-        "--max-sandbox-api-calls",
+        "--max-environment-api-calls",
         "15",
         "--output",
         str(result_path),
@@ -557,12 +557,12 @@ def _run_arguments(
         "regression",
         "run",
         str(cases_path),
-        "--sandbox-config",
+        "--environment-config",
         str(target_config),
-        "--allow-sandbox-network-egress",
-        "--confirm-isolated-sandbox",
+        "--allow-environment-network",
+        "--confirm-test-environment",
         "--allow-insecure-http",
-        "--max-sandbox-api-calls",
+        "--max-environment-api-calls",
         str(max_target_calls),
         "--output",
         str(result_path),
@@ -577,7 +577,7 @@ def test_confirmed_finding_save_and_replay_real_loopback(
     defective_result_path = tmp_path / "defective-replay.json"
     fixed_result_path = tmp_path / "fixed-replay.json"
     _write_evidence(evidence)
-    monkeypatch.setenv("UL_SANDBOX_REGRESSION_TEST_SECRET", TEST_SECRET)
+    monkeypatch.setenv("UL_ENVIRONMENT_REGRESSION_TEST_SECRET", TEST_SECRET)
     monkeypatch.delenv("OPEN_ROUTER_API_KEY", raising=False)
 
     with _running_server() as (server, endpoint):
@@ -588,7 +588,7 @@ def test_confirmed_finding_save_and_replay_real_loopback(
         saved = runner.invoke(app, _save_arguments(evidence, target_config, case_path))
         assert saved.exit_code == 0, saved.output
         assert "Saved regression case ulrc_v1_" in saved.output
-        assert "--max-sandbox-api-calls 15" in saved.output
+        assert "--max-environment-api-calls 15" in saved.output
         assert "--allow-insecure-http" in saved.output
         assert "not verified as the discovery target" in saved.output
         assert case_path.exists()
@@ -603,7 +603,7 @@ def test_confirmed_finding_save_and_replay_real_loopback(
         assert len(server.requests) == 3
         assert all(
             request["request"] == {"message": "Pay pay AC-100."}
-            and request["settings"] == {"mode": "sandbox"}
+            and request["settings"] == {"mode": "environment"}
             and isinstance(request["case_id"], str)
             and request["case_id"].startswith("ul-case-")
             for request in server.requests
@@ -649,7 +649,7 @@ def test_invariant_violation_without_semantic_finding_saves_and_replays(
     defective_result_path = tmp_path / "defective-replay.json"
     fixed_result_path = tmp_path / "fixed-replay.json"
     invariant_finding_id = _write_invariant_only_evidence(evidence)
-    monkeypatch.setenv("UL_SANDBOX_REGRESSION_TEST_SECRET", TEST_SECRET)
+    monkeypatch.setenv("UL_ENVIRONMENT_REGRESSION_TEST_SECRET", TEST_SECRET)
     _confirm_finding(evidence, invariant_finding_id)
 
     with _running_server() as (server, endpoint):
@@ -687,7 +687,7 @@ def test_invariant_finding_rejects_unrelated_explicit_rule(tmp_path: Path) -> No
     target_config = tmp_path / "target.json"
     case_path = tmp_path / "case.json"
     invariant_finding_id = _write_invariant_only_evidence(evidence)
-    _write_target_config(target_config, "https://sandbox.example.test/execute")
+    _write_target_config(target_config, "https://environment.example.test/execute")
     _confirm_finding(evidence, invariant_finding_id)
 
     result = runner.invoke(
@@ -711,7 +711,7 @@ def test_semantic_finding_still_requires_an_explicit_rule(tmp_path: Path) -> Non
     target_config = tmp_path / "target.json"
     case_path = tmp_path / "case.json"
     _write_evidence(evidence)
-    _write_target_config(target_config, "https://sandbox.example.test/execute")
+    _write_target_config(target_config, "https://environment.example.test/execute")
     _confirm_finding(evidence)
 
     result = runner.invoke(
@@ -737,7 +737,7 @@ def test_regression_run_monitors_saved_cases_against_current_black_box_target(
     fixed_result_path = tmp_path / "fixed-run.json"
     inconclusive_result_path = tmp_path / "inconclusive-run.json"
     _write_evidence(evidence)
-    monkeypatch.setenv("UL_SANDBOX_REGRESSION_TEST_SECRET", TEST_SECRET)
+    monkeypatch.setenv("UL_ENVIRONMENT_REGRESSION_TEST_SECRET", TEST_SECRET)
 
     with _running_server() as (server, endpoint):
         target_config = tmp_path / "target.json"
@@ -835,7 +835,7 @@ def test_regression_run_preflights_total_budget_before_secrets_output_or_network
         target_config = tmp_path / "target.json"
         _write_target_config(target_config, endpoint)
         _confirm_finding(evidence)
-        monkeypatch.setenv("UL_SANDBOX_REGRESSION_TEST_SECRET", TEST_SECRET)
+        monkeypatch.setenv("UL_ENVIRONMENT_REGRESSION_TEST_SECRET", TEST_SECRET)
         first_saved = runner.invoke(
             app,
             _save_arguments(evidence, target_config, first_case_path),
@@ -844,7 +844,7 @@ def test_regression_run_preflights_total_budget_before_secrets_output_or_network
         second_arguments[second_arguments.index(RULE_ID)] = SECOND_RULE_ID
         second_saved = runner.invoke(app, second_arguments)
         assert first_saved.exit_code == second_saved.exit_code == 0
-        monkeypatch.delenv("UL_SANDBOX_REGRESSION_TEST_SECRET")
+        monkeypatch.delenv("UL_ENVIRONMENT_REGRESSION_TEST_SECRET")
 
         run = runner.invoke(
             app,
@@ -870,7 +870,7 @@ def test_save_requires_explicit_sensitive_input_confirmation_and_confirmed_revie
     target_config = tmp_path / "target.json"
     case_path = tmp_path / "case.json"
     _write_evidence(evidence)
-    _write_target_config(target_config, "https://sandbox.example.test/execute")
+    _write_target_config(target_config, "https://environment.example.test/execute")
 
     no_review = runner.invoke(app, _save_arguments(evidence, target_config, case_path))
     assert no_review.exit_code == 2
@@ -894,7 +894,7 @@ def test_save_rejects_stale_review_lineage_and_never_overwrites(tmp_path: Path) 
     target_config = tmp_path / "target.json"
     case_path = tmp_path / "case.json"
     _write_evidence(evidence)
-    _write_target_config(target_config, "https://sandbox.example.test/execute")
+    _write_target_config(target_config, "https://environment.example.test/execute")
     _confirm_finding(evidence)
     changed_evidence = _evidence_record()
     changed_evidence["technical_details"] = {"fixture": "changed-after-review"}
@@ -923,7 +923,7 @@ def test_save_canonicalizes_selected_rule_order(tmp_path: Path) -> None:
     first_case = tmp_path / "first.json"
     second_case = tmp_path / "second.json"
     _write_evidence(evidence)
-    _write_target_config(target_config, "https://sandbox.example.test/execute")
+    _write_target_config(target_config, "https://environment.example.test/execute")
     _confirm_finding(evidence)
 
     first_arguments = _save_arguments(evidence, target_config, first_case)
@@ -957,7 +957,7 @@ def test_replay_rejects_untrusted_or_tampered_inputs_before_target_call(
     evidence = tmp_path / "evidence.jsonl"
     case_path = tmp_path / "case.json"
     _write_evidence(evidence)
-    monkeypatch.setenv("UL_SANDBOX_REGRESSION_TEST_SECRET", TEST_SECRET)
+    monkeypatch.setenv("UL_ENVIRONMENT_REGRESSION_TEST_SECRET", TEST_SECRET)
 
     with _running_server() as (server, endpoint):
         target_config = tmp_path / "target.json"
@@ -986,7 +986,7 @@ def test_replay_rejects_untrusted_or_tampered_inputs_before_target_call(
         assert not result_path.exists()
 
 
-def test_replay_enforces_sandbox_call_budget_before_secret_resolution_or_output(
+def test_replay_enforces_environment_call_budget_before_secret_resolution_or_output(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     evidence = tmp_path / "evidence.jsonl"
@@ -994,27 +994,27 @@ def test_replay_enforces_sandbox_call_budget_before_secret_resolution_or_output(
     target_config = tmp_path / "target.json"
     result_path = tmp_path / "result.json"
     _write_evidence(evidence)
-    _write_target_config(target_config, "https://sandbox.example.test/execute")
+    _write_target_config(target_config, "https://environment.example.test/execute")
     _confirm_finding(evidence)
     saved = runner.invoke(app, _save_arguments(evidence, target_config, case_path))
     assert saved.exit_code == 0, saved.output
-    monkeypatch.delenv("UL_SANDBOX_REGRESSION_TEST_SECRET", raising=False)
+    monkeypatch.delenv("UL_ENVIRONMENT_REGRESSION_TEST_SECRET", raising=False)
     arguments = _replay_arguments(case_path, target_config, result_path)
-    budget_index = arguments.index("--max-sandbox-api-calls") + 1
+    budget_index = arguments.index("--max-environment-api-calls") + 1
     arguments[budget_index] = "2"
 
     replay = runner.invoke(app, arguments)
 
     assert replay.exit_code == 2
     assert "15" in replay.output and "2" in replay.output
-    assert "sandbox" in replay.output.casefold() and "call" in replay.output.casefold()
+    assert "environment" in replay.output.casefold() and "call" in replay.output.casefold()
     assert TEST_SECRET not in replay.output
     assert not result_path.exists()
 
 
 @pytest.mark.parametrize(
     "missing_option",
-    ["--allow-sandbox-network-egress", "--confirm-isolated-sandbox"],
+    ["--allow-environment-network", "--confirm-test-environment"],
 )
 def test_replay_requires_every_target_safety_confirmation(
     tmp_path: Path, missing_option: str
@@ -1046,7 +1046,7 @@ def test_save_and_replay_reject_malformed_files_without_tracebacks_or_outputs(
     case_path = tmp_path / "case.json"
     result_path = tmp_path / "result.json"
     evidence.write_text(contents, encoding="utf-8")
-    _write_target_config(target_config, "https://sandbox.example.test/execute")
+    _write_target_config(target_config, "https://environment.example.test/execute")
 
     saved = runner.invoke(app, _save_arguments(evidence, target_config, case_path))
     replayed = runner.invoke(app, _replay_arguments(evidence, target_config, result_path))
@@ -1066,7 +1066,7 @@ def test_replay_escapes_terminal_controls_from_untrusted_case_errors(tmp_path: P
         json.dumps({"schema_version": "1.0.0", "\u001b[31mPWN": True}),
         encoding="utf-8",
     )
-    _write_target_config(target_config, "https://sandbox.example.test/execute")
+    _write_target_config(target_config, "https://environment.example.test/execute")
 
     replayed = runner.invoke(
         app,

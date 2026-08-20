@@ -35,8 +35,8 @@ def _write_inputs(tmp_path: Path) -> tuple[Path, Path, Path]:
     target.write_text(
         json.dumps(
             {
-                "version": 4,
-                "sandbox_id": "test-sandbox",
+                "version": 5,
+                "environment_id": "test-environment",
                 "reset": {
                     "url": "http://127.0.0.1:8765/reset",
                     "request_json_template": {"case_id": "{{case_id}}"},
@@ -106,7 +106,7 @@ def test_correction_dry_run_reports_complete_plan_without_calls(tmp_path: Path) 
             "stress",
             "correction",
             str(case),
-            "--sandbox-config",
+            "--environment-config",
             str(target),
             "--invariants",
             str(invariants),
@@ -118,7 +118,7 @@ def test_correction_dry_run_reports_complete_plan_without_calls(tmp_path: Path) 
     assert result.exit_code == 0, result.output
     assert "conversation.correction_after_first_response@1.0.0" in result.output
     assert "Target calls per paired repetition: 14" in result.output
-    assert "Potential sandbox API calls: 42" in result.output
+    assert "Potential environment API calls: 42" in result.output
     assert "External calls: none" in result.output
 
 
@@ -132,7 +132,7 @@ def test_save_creates_replayable_multi_turn_case(tmp_path: Path) -> None:
             "stress",
             "save",
             str(case),
-            "--sandbox-config",
+            "--environment-config",
             str(target),
             "--invariants",
             str(invariants),

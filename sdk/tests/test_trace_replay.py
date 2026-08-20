@@ -14,13 +14,13 @@ from ul.trace_replay import (
 )
 from ul_core.dataset import ObservedAgentOutput
 from ul_core.evaluation import (
+    EnvironmentCapabilities,
+    EnvironmentLifecycleEvidence,
+    EnvironmentResetEvidence,
+    EnvironmentStateEvidence,
+    EnvironmentTurnEvidence,
     EvaluationCase,
     ExecutionEvidence,
-    SandboxCapabilities,
-    SandboxLifecycleEvidence,
-    SandboxResetEvidence,
-    SandboxStateEvidence,
-    SandboxTurnEvidence,
 )
 
 
@@ -98,12 +98,12 @@ def _trace_records(*, include_state: bool = True) -> tuple[Any, ...]:
 
 
 class _ReplayTarget:
-    sandbox_id = "trace-replay-test-sandbox"
+    environment_id = "trace-replay-test-environment"
     config_sha256 = "0" * 64
-    capabilities = SandboxCapabilities(
+    capabilities = EnvironmentCapabilities(
         supports_conversations=True,
         supports_state_observation=True,
-        state_observation_authority="sandbox_self_reported",
+        state_observation_authority="environment_self_reported",
         cancellation_guarantee="guaranteed",
     )
 
@@ -121,34 +121,34 @@ class _ReplayTarget:
         snapshots = tuple(output.metadata.get("committed_state_snapshot", {}) for output in outputs)
         return ExecutionEvidence(
             case_id=case.id,
-            sandbox_id=self.sandbox_id,
-            sandbox_config_sha256=self.config_sha256,
-            initial_state=SandboxStateEvidence(
+            environment_id=self.environment_id,
+            environment_config_sha256=self.config_sha256,
+            initial_state=EnvironmentStateEvidence(
                 value={},
-                authority="sandbox_self_reported",
+                authority="environment_self_reported",
             ),
             turns=tuple(
-                SandboxTurnEvidence(
+                EnvironmentTurnEvidence(
                     turn_id=turn.id,
                     response=output.raw_output,
                     state_snapshot=snapshot,
-                    state_observation_authority="sandbox_self_reported",
+                    state_observation_authority="environment_self_reported",
                 )
                 for turn, output, snapshot in zip(case.turns, outputs, snapshots, strict=True)
             ),
             final_response=outputs[-1].raw_output,
-            final_state=SandboxStateEvidence(
+            final_state=EnvironmentStateEvidence(
                 value=snapshots[-1],
-                authority="sandbox_self_reported",
+                authority="environment_self_reported",
             ),
-            lifecycle=SandboxLifecycleEvidence(
-                initial_reset=SandboxResetEvidence(
+            lifecycle=EnvironmentLifecycleEvidence(
+                initial_reset=EnvironmentResetEvidence(
                     reset_session_requested=True,
                     reset_session_acknowledged=True,
                     reset_env_requested=True,
                     reset_env_acknowledged=True,
                 ),
-                cleanup_reset=SandboxResetEvidence(
+                cleanup_reset=EnvironmentResetEvidence(
                     reset_session_requested=True,
                     reset_session_acknowledged=True,
                     reset_env_requested=True,
@@ -158,7 +158,7 @@ class _ReplayTarget:
                 completed_phases=("execute", "cleanup"),
                 delivery="certain",
                 cleanup="succeeded",
-                sandbox_state_uncertain=False,
+                environment_state_uncertain=False,
             ),
         )
 
@@ -202,7 +202,7 @@ class _ReplayTarget:
         return tuple(outputs)
 
 
-class _UncertainReplaySandbox(_ReplayTarget):
+class _UncertainReplayEnvironment(_ReplayTarget):
     def __init__(self) -> None:
         super().__init__()
         self.execution_count = 0
@@ -210,19 +210,19 @@ class _UncertainReplaySandbox(_ReplayTarget):
     async def execute(self, case: EvaluationCase) -> ExecutionEvidence:
         self.execution_count += 1
         if self.execution_count > 1:
-            raise AssertionError("uncertain sandbox must not be called again")
+            raise AssertionError("uncertain environment must not be called again")
         return ExecutionEvidence(
             case_id=case.id,
-            sandbox_id=self.sandbox_id,
-            sandbox_config_sha256=self.config_sha256,
-            lifecycle=SandboxLifecycleEvidence(
-                initial_reset=SandboxResetEvidence(
+            environment_id=self.environment_id,
+            environment_config_sha256=self.config_sha256,
+            lifecycle=EnvironmentLifecycleEvidence(
+                initial_reset=EnvironmentResetEvidence(
                     reset_session_requested=True,
                     reset_session_acknowledged=True,
                     reset_env_requested=True,
                     reset_env_acknowledged=True,
                 ),
-                cleanup_reset=SandboxResetEvidence(
+                cleanup_reset=EnvironmentResetEvidence(
                     reset_session_requested=True,
                     reset_session_acknowledged=True,
                     reset_env_requested=True,
@@ -231,10 +231,10 @@ class _UncertainReplaySandbox(_ReplayTarget):
                 terminal_status="failed",
                 failed_phase="execute_turn",
                 failure_code="transport_failed",
-                failure_reason="sandbox API transport failed",
+                failure_reason="environment API transport failed",
                 delivery="uncertain",
                 cleanup="succeeded",
-                sandbox_state_uncertain=True,
+                environment_state_uncertain=True,
             ),
         )
 
@@ -273,14 +273,14 @@ async def test_replays_selected_conversation_prefix_and_reports_reproduction() -
     assert result.state_match_count == 2
     execution_evidence = result.trials[0].execution_evidence
     assert execution_evidence is not None
-    assert execution_evidence.initial_state == SandboxStateEvidence(
+    assert execution_evidence.initial_state == EnvironmentStateEvidence(
         value={},
-        authority="sandbox_self_reported",
+        authority="environment_self_reported",
     )
     assert execution_evidence.final_response == "Submitted AC-100."
-    assert execution_evidence.final_state == SandboxStateEvidence(
+    assert execution_evidence.final_state == EnvironmentStateEvidence(
         value={"invoice": "AC-100", "status": "submitted"},
-        authority="sandbox_self_reported",
+        authority="environment_self_reported",
     )
     assert target.conversations == [
         ("Pay AC-100.", "Approve and submit it."),
@@ -306,16 +306,16 @@ async def test_replay_reports_observed_drift_without_claiming_correctness() -> N
 
 
 @pytest.mark.asyncio
-async def test_replay_stops_after_uncertain_sandbox_state() -> None:
+async def test_replay_stops_after_uncertain_environment_state() -> None:
     case = materialize_trace_replay_bundle(_trace_records()).cases[1]
-    sandbox = _UncertainReplaySandbox()
+    environment = _UncertainReplayEnvironment()
 
     result = await run_trace_replay(
-        case, sandbox, repetitions=3, max_target_calls=21, allow_network_egress=True
+        case, environment, repetitions=3, max_target_calls=21, allow_network_egress=True
     )
 
     assert result.status == "inconclusive"
-    assert sandbox.execution_count == 1
+    assert environment.execution_count == 1
     assert result.trials[0].execution_evidence is not None
     assert all(trial.inconclusive_reason is not None for trial in result.trials)
 

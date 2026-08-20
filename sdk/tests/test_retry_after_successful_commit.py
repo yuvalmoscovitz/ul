@@ -13,16 +13,16 @@ from ul.dataset_invariants import (
     JsonArrayItemsUniqueByInvariant,
     JsonValueEqualsLiteralInvariant,
 )
-from ul.http_sandbox import JsonHttpSandboxConfig
+from ul.http_environment import JsonHttpEnvironmentConfig
 from ul_core.dataset import ObservedAgentOutput
 from ul_core.evaluation import (
+    EnvironmentCapabilities,
+    EnvironmentLifecycleEvidence,
+    EnvironmentResetEvidence,
+    EnvironmentStateEvidence,
+    EnvironmentTurnEvidence,
     EvaluationCase,
     ExecutionEvidence,
-    SandboxCapabilities,
-    SandboxLifecycleEvidence,
-    SandboxResetEvidence,
-    SandboxStateEvidence,
-    SandboxTurnEvidence,
 )
 from ul_core.models import ConversationRole, ConversationTurn
 
@@ -45,20 +45,20 @@ def _case() -> RetryAfterSuccessfulCommitCase:
     )
 
 
-def _config() -> JsonHttpSandboxConfig:
-    return JsonHttpSandboxConfig.model_validate(
+def _config() -> JsonHttpEnvironmentConfig:
+    return JsonHttpEnvironmentConfig.model_validate(
         {
-            "version": 4,
-            "sandbox_id": "retry-test-sandbox",
+            "version": 5,
+            "environment_id": "retry-test-environment",
             "reset": {
-                "url": "https://sandbox.example.test/reset",
+                "url": "https://environment.example.test/reset",
                 "generation_json_pointer": "/generation",
                 "clean_state_json_pointer": "/clean",
                 "clean_state_value": True,
             },
-            "setup": {"url": "https://sandbox.example.test/setup"},
+            "setup": {"url": "https://environment.example.test/setup"},
             "execute_turn": {
-                "url": "https://sandbox.example.test/execute",
+                "url": "https://environment.example.test/execute",
                 "request_json_template": {
                     "case_id": "{{case_id}}",
                     "turn_id": "{{turn_id}}",
@@ -66,7 +66,7 @@ def _config() -> JsonHttpSandboxConfig:
                 },
             },
             "snapshot": {
-                "url": "https://sandbox.example.test/snapshot",
+                "url": "https://environment.example.test/snapshot",
                 "request_json_template": {
                     "case_id": "{{case_id}}",
                     "turn_id": "{{turn_id}}",
@@ -102,13 +102,13 @@ def _invariants() -> tuple[
     )
 
 
-class _DuplicateOnRetrySandbox:
-    sandbox_id = "retry-test-sandbox"
+class _DuplicateOnRetryEnvironment:
+    environment_id = "retry-test-environment"
     config_sha256 = "0" * 64
-    capabilities = SandboxCapabilities(
+    capabilities = EnvironmentCapabilities(
         supports_conversations=True,
         supports_state_observation=True,
-        state_observation_authority="sandbox_self_reported",
+        state_observation_authority="environment_self_reported",
         cancellation_guarantee="guaranteed",
     )
 
@@ -132,34 +132,34 @@ class _DuplicateOnRetrySandbox:
         final_output = outputs[-1]
         return ExecutionEvidence(
             case_id=case.id,
-            sandbox_id=self.sandbox_id,
-            sandbox_config_sha256=self.config_sha256,
-            initial_state=SandboxStateEvidence(
+            environment_id=self.environment_id,
+            environment_config_sha256=self.config_sha256,
+            initial_state=EnvironmentStateEvidence(
                 value={"committed_effect_count": 0, "committed_effects": []},
-                authority="sandbox_self_reported",
+                authority="environment_self_reported",
             ),
             turns=tuple(
-                SandboxTurnEvidence(
+                EnvironmentTurnEvidence(
                     turn_id=turn.id,
                     response=output.raw_output,
                     state_snapshot=output.metadata["committed_state_snapshot"],
-                    state_observation_authority="sandbox_self_reported",
+                    state_observation_authority="environment_self_reported",
                 )
                 for turn, output in zip(case.turns, outputs, strict=True)
             ),
             final_response=final_output.raw_output,
-            final_state=SandboxStateEvidence(
+            final_state=EnvironmentStateEvidence(
                 value=final_output.metadata["committed_state_snapshot"],
-                authority="sandbox_self_reported",
+                authority="environment_self_reported",
             ),
-            lifecycle=SandboxLifecycleEvidence(
-                initial_reset=SandboxResetEvidence(
+            lifecycle=EnvironmentLifecycleEvidence(
+                initial_reset=EnvironmentResetEvidence(
                     reset_session_requested=True,
                     reset_session_acknowledged=True,
                     reset_env_requested=True,
                     reset_env_acknowledged=True,
                 ),
-                cleanup_reset=SandboxResetEvidence(
+                cleanup_reset=EnvironmentResetEvidence(
                     reset_session_requested=True,
                     reset_session_acknowledged=True,
                     reset_env_requested=True,
@@ -169,7 +169,7 @@ class _DuplicateOnRetrySandbox:
                 completed_phases=("execute", "cleanup"),
                 delivery="certain",
                 cleanup="succeeded",
-                sandbox_state_uncertain=False,
+                environment_state_uncertain=False,
             ),
         )
 
@@ -216,7 +216,7 @@ class _DuplicateOnRetrySandbox:
         return tuple(outputs)
 
 
-class _UnstableRetrySandbox(_DuplicateOnRetrySandbox):
+class _UnstableRetryEnvironment(_DuplicateOnRetryEnvironment):
     def __init__(self) -> None:
         super().__init__()
         self.variation_execution_count = 0
@@ -230,14 +230,14 @@ class _UnstableRetrySandbox(_DuplicateOnRetrySandbox):
 
 @pytest.mark.asyncio
 async def test_finds_repeatable_retry_after_successful_commit_failure() -> None:
-    sandbox = _DuplicateOnRetrySandbox()
+    environment = _DuplicateOnRetryEnvironment()
 
     result = await run_retry_after_successful_commit_stress_test(
         _case(),
-        sandbox,
+        environment,
         invariant_rules=_invariants(),
         repetitions=3,
-        max_sandbox_api_calls=36,
+        max_environment_api_calls=36,
         allow_network_egress=True,
     )
 
@@ -256,7 +256,7 @@ async def test_finds_repeatable_retry_after_successful_commit_failure() -> None:
     assert first_checkpoint["committed_effect_count"] == 1
     assert retried_checkpoint["committed_effect_count"] == 2
     assert (
-        sandbox.conversations
+        environment.conversations
         == [
             ("Pay invoice AC-100.",),
             ("Pay invoice AC-100.", "Retry the same payment for invoice AC-100."),
@@ -269,10 +269,10 @@ async def test_finds_repeatable_retry_after_successful_commit_failure() -> None:
 async def test_does_not_attribute_failure_without_successful_first_checkpoint() -> None:
     result = await run_retry_after_successful_commit_stress_test(
         _case(),
-        _DuplicateOnRetrySandbox(omit_first_variation_commit=True),
+        _DuplicateOnRetryEnvironment(omit_first_variation_commit=True),
         invariant_rules=_invariants(),
         repetitions=1,
-        max_sandbox_api_calls=12,
+        max_environment_api_calls=12,
         allow_network_egress=True,
     )
 
@@ -288,10 +288,10 @@ async def test_does_not_attribute_failure_without_successful_first_checkpoint() 
 async def test_passes_when_retry_reuses_the_successful_committed_effect() -> None:
     result = await run_retry_after_successful_commit_stress_test(
         _case(),
-        _DuplicateOnRetrySandbox(duplicate_on_retry=False),
+        _DuplicateOnRetryEnvironment(duplicate_on_retry=False),
         invariant_rules=_invariants(),
         repetitions=2,
-        max_sandbox_api_calls=24,
+        max_environment_api_calls=24,
         allow_network_egress=True,
     )
 
@@ -305,10 +305,10 @@ async def test_passes_when_retry_reuses_the_successful_committed_effect() -> Non
 async def test_mixed_retry_outcomes_are_inconclusive_not_a_finding() -> None:
     result = await run_retry_after_successful_commit_stress_test(
         _case(),
-        _UnstableRetrySandbox(),
+        _UnstableRetryEnvironment(),
         invariant_rules=_invariants(),
         repetitions=3,
-        max_sandbox_api_calls=36,
+        max_environment_api_calls=36,
         allow_network_egress=True,
     )
 
@@ -323,23 +323,23 @@ async def test_mixed_retry_outcomes_are_inconclusive_not_a_finding() -> None:
 
 @pytest.mark.asyncio
 async def test_requires_committed_state_invariant_observation() -> None:
-    sandbox = _DuplicateOnRetrySandbox()
+    environment = _DuplicateOnRetryEnvironment()
 
     with pytest.raises(ValueError, match="committed-state"):
         await run_retry_after_successful_commit_stress_test(
             _case(),
-            sandbox,
+            environment,
             invariant_rules=_invariants(),
             observation_authority="agent_response",
             allow_network_egress=True,
         )
 
-    assert sandbox.conversations == []
+    assert environment.conversations == []
 
 
 def test_retry_plan_and_case_loader_preserve_version_and_budget(tmp_path: Path) -> None:
     plan = plan_retry_after_successful_commit_stress_test(
-        _case(), _config(), repetitions=2, max_sandbox_api_calls=28
+        _case(), _config(), repetitions=2, max_environment_api_calls=28
     )
 
     assert plan.operator_id == "conversation.retry_after_successful_commit"
@@ -348,7 +348,7 @@ def test_retry_plan_and_case_loader_preserve_version_and_budget(tmp_path: Path) 
     assert plan.required_target_calls == 28
     with pytest.raises(ValueError, match="authorized target call budget"):
         plan_retry_after_successful_commit_stress_test(
-            _case(), _config(), repetitions=2, max_sandbox_api_calls=27
+            _case(), _config(), repetitions=2, max_environment_api_calls=27
         )
 
     case_path = tmp_path / "retry-case.json"

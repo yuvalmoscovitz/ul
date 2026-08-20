@@ -14,11 +14,11 @@ from ul.timeout_after_commit import (
 )
 from ul_core.dataset import ObservedAgentOutput
 from ul_core.evaluation import (
+    EnvironmentLifecycleEvidence,
+    EnvironmentResetEvidence,
+    EnvironmentStateEvidence,
+    EnvironmentTurnEvidence,
     ExecutionEvidence,
-    SandboxLifecycleEvidence,
-    SandboxResetEvidence,
-    SandboxStateEvidence,
-    SandboxTurnEvidence,
     TimeoutAfterCommitEventEvidence,
 )
 from ul_core.models import ConversationRole, ConversationTurn
@@ -29,7 +29,7 @@ def _committed_count(count: int) -> ObservedAgentOutput:
         raw_output={},
         metadata={
             "committed_state_snapshot": {"matching_payment_count": count},
-            "state_observation_authority": "sandbox_self_reported",
+            "state_observation_authority": "environment_self_reported",
         },
     )
 
@@ -78,21 +78,23 @@ def _successful_trial(repetition: int) -> TimeoutAfterCommitStressTrial:
         repetition=repetition,
         execution_evidence=ExecutionEvidence(
             case_id=f"case-{repetition}",
-            sandbox_id="payment-sandbox",
-            sandbox_config_sha256="a" * 64,
-            initial_state=SandboxStateEvidence(
-                value={"matching_payment_count": 0}, authority="sandbox_self_reported"
+            environment_id="payment-environment",
+            environment_config_sha256="a" * 64,
+            initial_state=EnvironmentStateEvidence(
+                value={"matching_payment_count": 0}, authority="environment_self_reported"
             ),
             turns=(
-                SandboxTurnEvidence(
+                EnvironmentTurnEvidence(
                     turn_id="submit-payment",
                     response="Payment workflow completed.",
                     state_snapshot=final_state,
-                    state_observation_authority="sandbox_self_reported",
+                    state_observation_authority="environment_self_reported",
                 ),
             ),
             final_response="Payment workflow completed.",
-            final_state=SandboxStateEvidence(value=final_state, authority="sandbox_self_reported"),
+            final_state=EnvironmentStateEvidence(
+                value=final_state, authority="environment_self_reported"
+            ),
             timeout_after_commit_event=TimeoutAfterCommitEventEvidence(
                 event_id="lost-acknowledgement",
                 turn_id="submit-payment",
@@ -101,14 +103,14 @@ def _successful_trial(repetition: int) -> TimeoutAfterCommitStressTrial:
                 trigger_status="fired",
                 cleaned=True,
             ),
-            lifecycle=SandboxLifecycleEvidence(
-                initial_reset=SandboxResetEvidence(
+            lifecycle=EnvironmentLifecycleEvidence(
+                initial_reset=EnvironmentResetEvidence(
                     reset_session_requested=True,
                     reset_session_acknowledged=True,
                     reset_env_requested=True,
                     reset_env_acknowledged=True,
                 ),
-                cleanup_reset=SandboxResetEvidence(
+                cleanup_reset=EnvironmentResetEvidence(
                     reset_session_requested=True,
                     reset_session_acknowledged=True,
                     reset_env_requested=True,
@@ -117,7 +119,7 @@ def _successful_trial(repetition: int) -> TimeoutAfterCommitStressTrial:
                 terminal_status="succeeded",
                 delivery="certain",
                 cleanup="succeeded",
-                sandbox_state_uncertain=False,
+                environment_state_uncertain=False,
             ),
         ),
     )
@@ -150,7 +152,7 @@ def test_lifecycle_ambiguity_takes_precedence_over_a_violation() -> None:
         _successful_trial(1),
         TimeoutAfterCommitStressTrial(
             repetition=2,
-            inconclusive_reason="sandbox lifecycle failed",
+            inconclusive_reason="environment lifecycle failed",
         ),
     )
 

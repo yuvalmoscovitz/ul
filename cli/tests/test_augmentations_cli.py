@@ -36,7 +36,7 @@ def test_list_filters_by_scope_mode_and_runnability() -> None:
             "--scope",
             "environment",
             "--mode",
-            "sandbox_fault",
+            "environment_fault",
             "--cli-only",
             "--json",
         ],
@@ -53,7 +53,7 @@ def test_list_rejects_unknown_filters_and_allows_no_matches() -> None:
     invalid = CliRunner().invoke(app, ["augmentations", "list", "--scope", "unknown"])
     empty = CliRunner().invoke(
         app,
-        ["augmentations", "list", "--scope", "input", "--mode", "sandbox_fault"],
+        ["augmentations", "list", "--scope", "input", "--mode", "environment_fault"],
     )
 
     assert invalid.exit_code == 2
@@ -71,11 +71,11 @@ def test_show_reports_cli_fault_requirements() -> None:
     assert result.exit_code == 0
     assert "CLI execution available: yes" in result.output
     assert "Mode: scenario_materialization" in result.output
-    assert "Mode: sandbox_fault" in result.output
+    assert "Mode: environment_fault" in result.output
     assert "Execution owner: SDK augmentation registry" in result.output
     assert "Execution owner: stress CLI" in result.output
-    assert "sandbox capability environment.tool.timeout_after_commit@1.0.0" in result.output
-    assert "0 model calls, 0 sandbox calls, 0 network requests" in result.output
+    assert "environment capability environment.tool.timeout_after_commit@1.0.0" in result.output
+    assert "0 model calls, 0 environment calls, 0 network requests" in result.output
 
 
 def test_show_reports_materializer_only_without_false_execution_claim() -> None:
@@ -95,7 +95,7 @@ def test_show_reports_dataset_execution_requirements_without_requiring_invariant
 
     assert result.exit_code == 0
     assert "ul dataset evaluate --operator input.tone.frustrated@1.0.0" in result.output
-    assert "isolated sandbox" in result.output
+    assert "test environment" in result.output
     assert "committed-state observation" in result.output
     assert "semantic model" in result.output
     assert "customer evaluator" not in result.output

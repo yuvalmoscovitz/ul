@@ -9,7 +9,7 @@ import pytest
 from typer.testing import CliRunner
 from ul_cli.main import app
 
-from examples.timeout_after_commit.sandbox import create_server
+from examples.timeout_after_commit.environment import create_server
 
 _EXAMPLE_DIRECTORY = Path(__file__).parents[1]
 
@@ -56,7 +56,7 @@ def test_runnable_timeout_after_commit_variants(
             "event_id": "lose-first-payment-acknowledgement",
             "turn_id": "submit-payment",
             "action_id": "execute-payment",
-            "authority": "sandbox_self_reported",
+            "authority": "environment_self_reported",
             "requested": True,
             "armed": True,
             "trigger_status": "fired" if fire_event else "not_fired",
@@ -89,16 +89,16 @@ def _invoke(target_path: Path, evidence_path: Path):
             "stress",
             "timeout-after-commit",
             str(_EXAMPLE_DIRECTORY / "case.json"),
-            "--sandbox-config",
+            "--environment-config",
             str(target_path),
             "--invariants",
             str(_EXAMPLE_DIRECTORY / "invariants.json"),
             "--output",
             str(evidence_path),
-            "--allow-sandbox-network-egress",
+            "--allow-environment-network",
             "--allow-insecure-http",
-            "--confirm-isolated-sandbox",
-            "--max-sandbox-api-calls",
+            "--confirm-test-environment",
+            "--max-environment-api-calls",
             "27",
         ],
     )

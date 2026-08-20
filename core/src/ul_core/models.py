@@ -279,7 +279,7 @@ class Scenario(ULModel):
 
 
 class ExecutionMode(StrEnum):
-    SANDBOX = "sandbox"
+    CONTROLLED = "controlled"
     LIVE = "live"
 
 
@@ -295,16 +295,16 @@ class MaterializedScenario(ULModel):
     target_input: JsonValue
     environment: JsonValue
     expectations: JsonValue = None
-    execution_mode: ExecutionMode = ExecutionMode.SANDBOX
+    execution_mode: ExecutionMode = ExecutionMode.CONTROLLED
     safety_envelope: SafetyEnvelope
 
     @model_validator(mode="after")
     def validate_safety_envelope(self) -> Self:
-        if self.execution_mode == ExecutionMode.SANDBOX and (
+        if self.execution_mode == ExecutionMode.CONTROLLED and (
             not self.safety_envelope.isolated or self.safety_envelope.allows_business_side_effects
         ):
             raise ValueError(
-                "sandbox execution requires an isolated, business-side-effect-free envelope"
+                "controlled execution requires an isolated, business-side-effect-free envelope"
             )
         if (
             self.safety_envelope.allows_business_side_effects

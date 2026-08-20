@@ -3,32 +3,32 @@ from __future__ import annotations
 from typing import Literal
 
 import pytest
-from ul.sandbox import (
+from ul.environment import (
     execution_evidence_requires_quarantine,
     observed_outputs_from_evidence,
     validate_execution_evidence,
 )
 from ul_core.evaluation import (
+    EnvironmentCapabilities,
+    EnvironmentLifecycleEvidence,
+    EnvironmentResetEvidence,
+    EnvironmentStateEvidence,
+    EnvironmentTurnEvidence,
     EvaluationCase,
     ExecutionEvidence,
-    SandboxCapabilities,
-    SandboxLifecycleEvidence,
-    SandboxResetEvidence,
-    SandboxStateEvidence,
-    SandboxTurnEvidence,
     TimeoutAfterCommitEventEvidence,
     TimeoutAfterCommitEventRequest,
 )
 from ul_core.models import ConversationRole, ConversationTurn
 
 
-class _SandboxIdentity:
-    sandbox_id = "invoice-sandbox"
+class _EnvironmentIdentity:
+    environment_id = "invoice-environment"
     config_sha256 = "a" * 64
-    capabilities = SandboxCapabilities(
+    capabilities = EnvironmentCapabilities(
         supports_conversations=True,
         supports_state_observation=True,
-        state_observation_authority="sandbox_self_reported",
+        state_observation_authority="environment_self_reported",
         cancellation_guarantee="best_effort",
     )
 
@@ -36,7 +36,7 @@ class _SandboxIdentity:
         return len(case.turns) + 4
 
     async def execute(self, case: EvaluationCase) -> ExecutionEvidence:
-        raise AssertionError("identity-only test sandbox must not execute")
+        raise AssertionError("identity-only test environment must not execute")
 
 
 def _case() -> EvaluationCase:
@@ -45,7 +45,7 @@ def _case() -> EvaluationCase:
         turns=(
             ConversationTurn(id="turn-1", role=ConversationRole.USER, content="Pay invoice 42"),
         ),
-        max_sandbox_api_calls=5,
+        max_environment_api_calls=5,
         timeout_seconds=30,
     )
 
@@ -53,20 +53,22 @@ def _case() -> EvaluationCase:
 def _evidence(
     *,
     case_id: str = "case-1",
-    sandbox_id: str = "invoice-sandbox",
+    environment_id: str = "invoice-environment",
     config_sha256: str = "a" * 64,
     turn_id: str = "turn-1",
-    authority: Literal["sandbox_self_reported", "independent_observer"] = ("sandbox_self_reported"),
+    authority: Literal["environment_self_reported", "independent_observer"] = (
+        "environment_self_reported"
+    ),
 ) -> ExecutionEvidence:
     return ExecutionEvidence(
         case_id=case_id,
-        sandbox_id=sandbox_id,
-        sandbox_config_sha256=config_sha256,
-        initial_state=SandboxStateEvidence(
-            value={"clean": True}, authority="sandbox_self_reported"
+        environment_id=environment_id,
+        environment_config_sha256=config_sha256,
+        initial_state=EnvironmentStateEvidence(
+            value={"clean": True}, authority="environment_self_reported"
         ),
         turns=(
-            SandboxTurnEvidence(
+            EnvironmentTurnEvidence(
                 turn_id=turn_id,
                 response={"status": "ok"},
                 state_snapshot={"payments": []},
@@ -75,19 +77,19 @@ def _evidence(
             ),
         ),
         final_response={"status": "ok"},
-        final_state=SandboxStateEvidence(
+        final_state=EnvironmentStateEvidence(
             value={"payments": []},
             authority=authority,
             observer_id=("observer-1" if authority == "independent_observer" else None),
         ),
-        lifecycle=SandboxLifecycleEvidence(
-            initial_reset=SandboxResetEvidence(
+        lifecycle=EnvironmentLifecycleEvidence(
+            initial_reset=EnvironmentResetEvidence(
                 reset_session_requested=True,
                 reset_session_acknowledged=True,
                 reset_env_requested=True,
                 reset_env_acknowledged=True,
             ),
-            cleanup_reset=SandboxResetEvidence(
+            cleanup_reset=EnvironmentResetEvidence(
                 reset_session_requested=True,
                 reset_session_acknowledged=True,
                 reset_env_requested=True,
@@ -97,7 +99,7 @@ def _evidence(
             completed_phases=("reset", "execute_turn", "snapshot", "cleanup_reset"),
             delivery="certain",
             cleanup="succeeded",
-            sandbox_state_uncertain=False,
+            environment_state_uncertain=False,
         ),
     )
 
@@ -106,46 +108,46 @@ def _evidence(
     ("evidence", "message"),
     (
         (_evidence(case_id="other-case"), "requested case"),
-        (_evidence(sandbox_id="other-sandbox"), "evidence identity"),
+        (_evidence(environment_id="other-environment"), "evidence identity"),
         (_evidence(config_sha256="b" * 64), "evidence config"),
         (_evidence(turn_id="other-turn"), "evidence turns"),
         (_evidence(authority="independent_observer"), "authority"),
     ),
 )
-def test_execution_evidence_is_bound_to_case_and_sandbox(
+def test_execution_evidence_is_bound_to_case_and_environment(
     evidence: ExecutionEvidence, message: str
 ) -> None:
     with pytest.raises(ValueError, match=message):
-        validate_execution_evidence(_case(), _SandboxIdentity(), evidence)
+        validate_execution_evidence(_case(), _EnvironmentIdentity(), evidence)
 
 
 def test_required_state_observation_is_enforced() -> None:
     case = _case().model_copy(
-        update={"required_state_observation_authority": "sandbox_self_reported"}
+        update={"required_state_observation_authority": "environment_self_reported"}
     )
     evidence = _evidence().model_copy(
-        update={"turns": (SandboxTurnEvidence(turn_id="turn-1", response={"status": "ok"}),)}
+        update={"turns": (EnvironmentTurnEvidence(turn_id="turn-1", response={"status": "ok"}),)}
     )
 
     with pytest.raises(ValueError, match="required state observation"):
-        validate_execution_evidence(case, _SandboxIdentity(), evidence)
+        validate_execution_evidence(case, _EnvironmentIdentity(), evidence)
 
 
 def test_observed_outputs_preserve_each_turns_before_and_after_state() -> None:
     first_turn = _evidence().turns[0]
-    second_turn = SandboxTurnEvidence(
+    second_turn = EnvironmentTurnEvidence(
         turn_id="turn-2",
         response={"status": "retried"},
         state_snapshot={"payments": ["payment-1", "payment-2"]},
-        state_observation_authority="sandbox_self_reported",
+        state_observation_authority="environment_self_reported",
     )
     evidence = _evidence().model_copy(
         update={
             "turns": (first_turn, second_turn),
             "final_response": second_turn.response,
-            "final_state": SandboxStateEvidence(
+            "final_state": EnvironmentStateEvidence(
                 value=second_turn.state_snapshot,
-                authority="sandbox_self_reported",
+                authority="environment_self_reported",
             ),
         }
     )
@@ -170,8 +172,8 @@ def test_incomplete_timeout_event_is_rejected_and_quarantined() -> None:
             )
         }
     )
-    sandbox = _SandboxIdentity()
-    sandbox.capabilities = sandbox.capabilities.model_copy(
+    environment = _EnvironmentIdentity()
+    environment.capabilities = environment.capabilities.model_copy(
         update={"timeout_after_commit_version": "1.0.0"}
     )
     incomplete_event = TimeoutAfterCommitEventEvidence.model_construct(
@@ -185,13 +187,13 @@ def test_incomplete_timeout_event_is_rejected_and_quarantined() -> None:
     evidence = _evidence().model_copy(update={"timeout_after_commit_event": incomplete_event})
 
     with pytest.raises(ValueError, match="incomplete event lifecycle"):
-        validate_execution_evidence(case, sandbox, evidence)
+        validate_execution_evidence(case, environment, evidence)
     assert execution_evidence_requires_quarantine(evidence) is True
 
 
 def test_every_independent_state_observation_is_bound_to_the_declared_observer() -> None:
-    sandbox = _SandboxIdentity()
-    sandbox.capabilities = SandboxCapabilities(
+    environment = _EnvironmentIdentity()
+    environment.capabilities = EnvironmentCapabilities(
         supports_conversations=True,
         supports_state_observation=True,
         state_observation_authority="independent_observer",
@@ -204,29 +206,29 @@ def test_every_independent_state_observation_is_bound_to_the_declared_observer()
             ConversationTurn(id="turn-1", role=ConversationRole.USER, content="Start"),
             ConversationTurn(id="turn-2", role=ConversationRole.USER, content="Correct it"),
         ),
-        max_sandbox_api_calls=7,
+        max_environment_api_calls=7,
         timeout_seconds=30,
         required_state_observation_authority="independent_observer",
         required_state_observer_id="observer-1",
     )
     evidence = ExecutionEvidence(
         case_id="case-1",
-        sandbox_id="invoice-sandbox",
-        sandbox_config_sha256="a" * 64,
-        initial_state=SandboxStateEvidence(
+        environment_id="invoice-environment",
+        environment_config_sha256="a" * 64,
+        initial_state=EnvironmentStateEvidence(
             value={"payments": []},
             authority="independent_observer",
             observer_id="observer-1",
         ),
         turns=(
-            SandboxTurnEvidence(
+            EnvironmentTurnEvidence(
                 turn_id="turn-1",
                 response={"status": "started"},
                 state_snapshot={"payments": []},
                 state_observation_authority="independent_observer",
                 state_observer_id="observer-2",
             ),
-            SandboxTurnEvidence(
+            EnvironmentTurnEvidence(
                 turn_id="turn-2",
                 response={"status": "corrected"},
                 state_snapshot={"payments": ["42"]},
@@ -235,19 +237,19 @@ def test_every_independent_state_observation_is_bound_to_the_declared_observer()
             ),
         ),
         final_response={"status": "corrected"},
-        final_state=SandboxStateEvidence(
+        final_state=EnvironmentStateEvidence(
             value={"payments": ["42"]},
             authority="independent_observer",
             observer_id="observer-1",
         ),
-        lifecycle=SandboxLifecycleEvidence(
-            initial_reset=SandboxResetEvidence(
+        lifecycle=EnvironmentLifecycleEvidence(
+            initial_reset=EnvironmentResetEvidence(
                 reset_session_requested=True,
                 reset_session_acknowledged=True,
                 reset_env_requested=True,
                 reset_env_acknowledged=True,
             ),
-            cleanup_reset=SandboxResetEvidence(
+            cleanup_reset=EnvironmentResetEvidence(
                 reset_session_requested=True,
                 reset_session_acknowledged=True,
                 reset_env_requested=True,
@@ -264,9 +266,9 @@ def test_every_independent_state_observation_is_bound_to_the_declared_observer()
             ),
             delivery="certain",
             cleanup="succeeded",
-            sandbox_state_uncertain=False,
+            environment_state_uncertain=False,
         ),
     )
 
     with pytest.raises(ValueError, match="authority"):
-        validate_execution_evidence(case, sandbox, evidence)
+        validate_execution_evidence(case, environment, evidence)

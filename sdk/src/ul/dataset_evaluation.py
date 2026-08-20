@@ -13,7 +13,7 @@ from typing import Literal, Self
 
 from pydantic import ConfigDict, Field, JsonValue, model_validator
 from ul_core.contracts import (
-    SandboxExecutor,
+    EnvironmentExecutor,
     SemanticDeconstructor,
 )
 from ul_core.dataset import InteractionRecord, ObservedAgentOutput, ObservedOutcome, SemanticFrame
@@ -26,7 +26,7 @@ from ul.dataset_augmentation import (
     DatasetAugmentationResult,
     builtin_dataset_augmentation_operators,
 )
-from ul.sandbox import validate_execution_evidence
+from ul.environment import validate_execution_evidence
 
 FindingCategory = Literal[
     "duplicate_effect",
@@ -64,7 +64,7 @@ class DatasetTargetLifecycleFailure(_StrictULModel):
     failed_phase: str = Field(min_length=1)
     completed_phases: tuple[str, ...] = ()
     cleanup_reset_failed: bool
-    sandbox_state_may_remain: bool
+    environment_state_may_remain: bool
 
 
 class DatasetEvaluationTrial(_StrictULModel):
@@ -267,20 +267,20 @@ class DatasetEvaluationRunner:
         self,
         augmentation_engine: DatasetAugmentationEngine,
         deconstructor: SemanticDeconstructor,
-        sandbox: SandboxExecutor,
+        environment: EnvironmentExecutor,
         *,
         target_timeout_seconds: float = 30,
         allow_network_egress: bool = False,
     ) -> None:
         if not math.isfinite(target_timeout_seconds) or target_timeout_seconds <= 0:
             raise ValueError("target_timeout_seconds must be positive and finite")
-        if sandbox.capabilities.isolation != "customer_managed":
-            raise ValueError("dataset execution requires a customer-managed sandbox")
+        if environment.capabilities.isolation != "customer_managed":
+            raise ValueError("dataset execution requires a customer-managed environment")
         if not allow_network_egress:
-            raise ValueError("remote sandbox API access requires explicit network opt-in")
+            raise ValueError("remote environment API access requires explicit network opt-in")
         self._augmentation_engine = augmentation_engine
         self._deconstructor = deconstructor
-        self._sandbox = sandbox
+        self._environment = environment
         self._target_timeout_seconds = target_timeout_seconds
         self._target_state_uncertain = False
 
@@ -466,7 +466,7 @@ class DatasetEvaluationRunner:
                 repetition=repetition,
                 inconclusive_reasons=(
                     f"{subject} not executed because target state is uncertain; "
-                    "sandbox state may remain",
+                    "environment state may remain",
                 ),
             )
         try:
@@ -480,18 +480,18 @@ class DatasetEvaluationRunner:
                             content=raw_input,
                         ),
                     ),
-                    max_sandbox_api_calls=1,
+                    max_environment_api_calls=1,
                     timeout_seconds=self._target_timeout_seconds,
                 )
-                sandbox_api_calls = self._sandbox.api_calls_for_case(evaluation_case)
-                if type(sandbox_api_calls) is not int or sandbox_api_calls < 1:
-                    raise RuntimeError("sandbox returned an invalid API call count")
+                environment_api_calls = self._environment.api_calls_for_case(evaluation_case)
+                if type(environment_api_calls) is not int or environment_api_calls < 1:
+                    raise RuntimeError("environment returned an invalid API call count")
                 evaluation_case = evaluation_case.model_copy(
-                    update={"max_sandbox_api_calls": sandbox_api_calls}
+                    update={"max_environment_api_calls": environment_api_calls}
                 )
-                execution_evidence = await self._sandbox.execute(evaluation_case)
+                execution_evidence = await self._environment.execute(evaluation_case)
         except TimeoutError:
-            if self._sandbox.capabilities.cancellation_guarantee != "guaranteed":
+            if self._environment.capabilities.cancellation_guarantee != "guaranteed":
                 self._target_state_uncertain = True
             return DatasetEvaluationTrial(
                 repetition=repetition,
@@ -502,16 +502,16 @@ class DatasetEvaluationRunner:
                 repetition=repetition,
                 inconclusive_reasons=(f"{subject} execution failed",),
             )
-        validate_execution_evidence(evaluation_case, self._sandbox, execution_evidence)
+        validate_execution_evidence(evaluation_case, self._environment, execution_evidence)
         lifecycle = execution_evidence.lifecycle
         if lifecycle.terminal_status != "succeeded":
-            sandbox_state_may_remain = lifecycle.sandbox_state_uncertain
-            if sandbox_state_may_remain:
+            environment_state_may_remain = lifecycle.environment_state_uncertain
+            if environment_state_may_remain:
                 self._target_state_uncertain = True
             cleanup_reason = (
-                "; cleanup reset also failed; sandbox state may remain"
+                "; cleanup reset also failed; environment state may remain"
                 if lifecycle.cleanup == "failed" and lifecycle.failed_phase != "cleanup_reset"
-                else ("; sandbox state may remain" if sandbox_state_may_remain else "")
+                else ("; environment state may remain" if environment_state_may_remain else "")
             )
             return DatasetEvaluationTrial(
                 repetition=repetition,
@@ -522,12 +522,12 @@ class DatasetEvaluationRunner:
                     failed_phase=lifecycle.failed_phase or "unknown",
                     completed_phases=lifecycle.completed_phases,
                     cleanup_reset_failed=lifecycle.cleanup == "failed",
-                    sandbox_state_may_remain=sandbox_state_may_remain,
+                    environment_state_may_remain=environment_state_may_remain,
                 ),
                 execution_evidence=execution_evidence,
             )
         if len(execution_evidence.turns) != 1:
-            raise RuntimeError("sandbox returned invalid single-turn evidence")
+            raise RuntimeError("environment returned invalid single-turn evidence")
         turn_evidence = execution_evidence.turns[0]
         target_output = ObservedAgentOutput(
             raw_output=turn_evidence.response,

@@ -211,7 +211,7 @@ def _technical_details() -> dict[str, Any]:
                     raw_output={"message": "completed"},
                     metadata={
                         "committed_state_snapshot": committed_state_snapshot,
-                        "state_observation_authority": "sandbox_self_reported",
+                        "state_observation_authority": "environment_self_reported",
                     },
                 ),
                 observed_frame=SemanticFrame(
@@ -1038,7 +1038,7 @@ def test_report_and_review_make_no_model_or_network_calls(
 
     monkeypatch.setattr("ul_cli.dataset.load_dataset_semantic_settings", unexpected_call)
     monkeypatch.setattr("ul_cli.dataset.create_semantic_model_deconstructor", unexpected_call)
-    monkeypatch.setattr("ul_cli.dataset.JsonHttpSandboxConnection", unexpected_call)
+    monkeypatch.setattr("ul_cli.dataset.JsonHttpEnvironmentConnection", unexpected_call)
 
     report = runner.invoke(app, ["dataset", "report", str(evidence)])
     review = runner.invoke(app, _review_arguments(evidence))

@@ -1,12 +1,12 @@
 {
-  "version": 4,
-  "sandbox_id": "multiturn-correction-example",
+  "version": 5,
+  "environment_id": "multiturn-correction-example",
   "headers_from_env": {},
   "reset": {
     "url": "http://127.0.0.1:8765/reset",
     "request_json_template": {"case_id": "{{case_id}}"},
     "case_id_json_pointer": "/case_id",
-    "sandbox_id_json_pointer": "/sandbox_id",
+    "environment_id_json_pointer": "/environment_id",
     "generation_json_pointer": "/generation",
     "clean_state_json_pointer": "/clean",
     "clean_state_value": true
@@ -15,7 +15,7 @@
     "url": "http://127.0.0.1:8765/setup",
     "request_json_template": {"case_id": "{{case_id}}"},
     "case_id_json_pointer": "/case_id",
-    "sandbox_id_json_pointer": "/sandbox_id"
+    "environment_id_json_pointer": "/environment_id"
   },
   "execute_turn": {
     "url": "http://127.0.0.1:8765/execute",
@@ -23,7 +23,7 @@
     "response_json_pointer": "/response",
     "case_id_json_pointer": "/case_id",
     "turn_id_json_pointer": "/turn_id",
-    "sandbox_id_json_pointer": "/sandbox_id"
+    "environment_id_json_pointer": "/environment_id"
   },
   "snapshot": {
     "url": "http://127.0.0.1:8765/snapshot",
@@ -31,6 +31,6 @@
     "response_json_pointer": "/state",
     "case_id_json_pointer": "/case_id",
     "turn_id_json_pointer": "/turn_id",
-    "sandbox_id_json_pointer": "/sandbox_id"
+    "environment_id_json_pointer": "/environment_id"
   }
 }

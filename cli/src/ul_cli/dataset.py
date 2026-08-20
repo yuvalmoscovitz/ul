@@ -46,15 +46,15 @@ from ul.dataset_invariants import (
     evaluate_dataset_invariants,
     load_dataset_invariant_suite,
 )
-from ul.http_sandbox import (
-    JsonHttpSandboxConfig,
-    JsonHttpSandboxConnection,
-    json_http_sandbox_calls_per_execution,
-    json_http_sandbox_config_sha256,
-    json_http_sandbox_config_urls,
-    json_http_sandbox_origin,
-    load_json_http_sandbox_config,
-    validate_json_http_sandbox_configuration,
+from ul.http_environment import (
+    JsonHttpEnvironmentConfig,
+    JsonHttpEnvironmentConnection,
+    json_http_environment_calls_per_execution,
+    json_http_environment_config_sha256,
+    json_http_environment_config_urls,
+    json_http_environment_origin,
+    load_json_http_environment_config,
+    validate_json_http_environment_configuration,
 )
 from ul_core.augmentation_catalog import builtin_augmentation_catalog
 from ul_core.dataset import ObservedOutcome
@@ -78,6 +78,7 @@ from ul_cli.dataset_review import (
     review_dataset_finding,
     validate_dataset_resume_evidence,
 )
+from ul_cli.environment import TEST_ENVIRONMENT_CONFIRMATION_MESSAGE
 
 if sys.platform == "win32":
     import msvcrt
@@ -94,7 +95,7 @@ app.command("review")(review_dataset_finding)
 _MAXIMUM_DATASET_BYTES = 10_000_000
 _MAXIMUM_DATASET_RECORDS = 100
 _MAXIMUM_EVIDENCE_BYTES = 128_000_000
-_DEFAULT_MAXIMUM_SANDBOX_API_CALLS = 100
+_DEFAULT_MAXIMUM_ENVIRONMENT_API_CALLS = 100
 _REDACTION_KEY_ENVIRONMENT_VARIABLE = "UL_DATASET_REDACTION_KEY"
 _CUSTOMER_STATUSES = {
     "augmentation_rejected": "VARIATION DISCARDED",
@@ -120,27 +121,27 @@ class _DatasetInputError(ValueError):
 
 
 @app.command("init")
-def initialize_dataset_sandbox(
-    sandbox_config: Annotated[
+def initialize_dataset_environment(
+    environment_config: Annotated[
         Path,
         typer.Argument(
             dir_okay=False,
-            help="New JSON file describing the customer-managed sandbox API.",
+            help="New JSON file describing the customer-managed environment API.",
         ),
     ],
     url: Annotated[
         str,
-        typer.Option(help="Base URL of the customer's isolated agent sandbox API."),
+        typer.Option(help="Base URL of the customer's agent environment API."),
     ],
     show_guidance: Annotated[bool, typer.Option(hidden=True)] = True,
 ) -> None:
-    """Create a private connection config for a customer-managed agent sandbox API."""
+    """Create a private connection config for a customer-managed agent environment API."""
     try:
         base_url = url.rstrip("/")
-        config = JsonHttpSandboxConfig.model_validate(
+        config = JsonHttpEnvironmentConfig.model_validate(
             {
-                "version": 4,
-                "sandbox_id": "replace-with-stable-sandbox-id",
+                "version": 5,
+                "environment_id": "replace-with-stable-environment-id",
                 "headers_from_env": {},
                 "reset": {
                     "url": f"{base_url}/reset",
@@ -151,7 +152,7 @@ def initialize_dataset_sandbox(
                     "generation_json_pointer": "/generation",
                     "clean_state_json_pointer": "/clean",
                     "clean_state_value": True,
-                    "sandbox_id_json_pointer": "/sandbox_id",
+                    "environment_id_json_pointer": "/environment_id",
                 },
                 "execute_turn": {
                     "url": f"{base_url}/execute",
@@ -163,7 +164,7 @@ def initialize_dataset_sandbox(
                     "response_json_pointer": "/response",
                     "case_id_json_pointer": "/case_id",
                     "turn_id_json_pointer": "/turn_id",
-                    "sandbox_id_json_pointer": "/sandbox_id",
+                    "environment_id_json_pointer": "/environment_id",
                 },
                 "snapshot": {
                     "url": f"{base_url}/snapshot",
@@ -174,21 +175,21 @@ def initialize_dataset_sandbox(
                     "response_json_pointer": "/state",
                     "case_id_json_pointer": "/case_id",
                     "turn_id_json_pointer": "/turn_id",
-                    "sandbox_id_json_pointer": "/sandbox_id",
+                    "environment_id_json_pointer": "/environment_id",
                 },
             }
         )
-        output_stream = _create_private_output(sandbox_config)
+        output_stream = _create_private_output(environment_config)
     except (OSError, ValidationError, ValueError) as error:
         if isinstance(error, FileExistsError):
-            message = "sandbox config already exists; UL will not overwrite it"
+            message = "environment config already exists; UL will not overwrite it"
         elif isinstance(error, OSError):
-            message = f"cannot create sandbox config ({error.__class__.__name__})"
+            message = f"cannot create environment config ({error.__class__.__name__})"
         elif isinstance(error, ValidationError):
-            message = "sandbox config is invalid"
+            message = "environment config is invalid"
         else:
             message = str(error)
-        raise typer.BadParameter(message, param_hint="SANDBOX_CONFIG") from None
+        raise typer.BadParameter(message, param_hint="ENVIRONMENT_CONFIG") from None
 
     created_config_status = os.fstat(output_stream.fileno())
     try:
@@ -197,40 +198,41 @@ def initialize_dataset_sandbox(
             output_stream.write("\n")
     except BaseException:
         try:
-            current_config_status = sandbox_config.lstat()
+            current_config_status = environment_config.lstat()
         except FileNotFoundError:
             pass
         else:
             if not stat.S_ISLNK(current_config_status.st_mode) and os.path.samestat(
                 current_config_status, created_config_status
             ):
-                sandbox_config.unlink()
+                environment_config.unlink()
         raise
 
-    console.print(f"Created private sandbox connection config: {sandbox_config}")
+    console.print(f"Created private environment connection config: {environment_config}")
     if not show_guidance:
         return
     console.print(
         "Next: implement the generated reset, execute, and snapshot endpoints. "
         "The reset request already asks for a clean agent session and clean external "
         "environment. Add any headers_from_env, then validate the connection with "
-        "'ul sandbox check "
-        f'{sandbox_config} --probe "Return sandbox health only; do not take action." '
-        "--allow-sandbox-network-egress "
-        "--confirm-isolated-sandbox --confirm-harmless-probe'. After that, validate a "
-        "dataset plan with 'ul dataset evaluate DATASET --sandbox-config "
-        f"{sandbox_config} --dry-run'."
+        "'ul environment check "
+        f'{environment_config} --probe "Return environment health only; do not take action." '
+        "--allow-environment-network "
+        "--confirm-test-environment --confirm-harmless-probe'. After that, validate a "
+        "dataset plan with 'ul dataset evaluate DATASET --environment-config "
+        f"{environment_config} --dry-run'."
     )
     console.print(
         "Keep exactly one complete {{case_id}} value in every lifecycle request, "
         "{{turn_id}} in execute_turn and snapshot, "
         "and one {{input}} value in execute_turn. "
         "headers_from_env maps HTTP header names to "
-        "dedicated UL_SANDBOX_* environment-variable names; secret values stay outside this file."
+        "dedicated UL_ENVIRONMENT_* environment-variable names; secret values stay outside "
+        "this file."
     )
     console.print('Reset request: {"case_id":"{{case_id}}","reset_session":true,"reset_env":true}')
     console.print(
-        'Reset response: {"sandbox_id":"...","case_id":"{{case_id}}",'
+        'Reset response: {"environment_id":"...","case_id":"{{case_id}}",'
         '"generation":1,"clean":true,"reset_session":true,"reset_env":true}'
     )
 
@@ -254,14 +256,14 @@ def evaluate_dataset(
             help='JSONL containing one {"id": ..., "input": ..., "output": ...} object per line.',
         ),
     ],
-    sandbox_config: Annotated[
+    environment_config: Annotated[
         Path | None,
         typer.Option(
-            "--sandbox-config",
+            "--environment-config",
             exists=True,
             dir_okay=False,
             readable=True,
-            help="Connection to the customer's isolated agent sandbox API.",
+            help="Connection to the customer's agent environment API.",
         ),
     ] = None,
     output: Annotated[
@@ -312,36 +314,31 @@ def evaluate_dataset(
         int,
         typer.Option(
             min=1,
-            help="Fresh-state sandbox executions per original input and accepted variation.",
+            help="Fresh-state environment executions per original input and accepted variation.",
         ),
     ] = 3,
-    max_sandbox_api_calls: Annotated[
+    max_environment_api_calls: Annotated[
         int,
         typer.Option(
-            "--max-sandbox-api-calls",
+            "--max-environment-api-calls",
             min=1,
-            help="Maximum customer sandbox API requests authorized for this evaluation.",
+            help="Maximum customer environment API requests authorized for this evaluation.",
         ),
-    ] = _DEFAULT_MAXIMUM_SANDBOX_API_CALLS,
-    allow_sandbox_network_egress: Annotated[
+    ] = _DEFAULT_MAXIMUM_ENVIRONMENT_API_CALLS,
+    allow_environment_network: Annotated[
         bool,
         typer.Option(
-            "--allow-sandbox-network-egress",
-            help="Allow UL to call the configured remote sandbox API.",
+            "--allow-environment-network",
+            help="Allow UL to call the configured remote environment API.",
         ),
     ] = False,
-    confirm_isolated_sandbox: Annotated[
+    confirm_test_environment: Annotated[
         bool,
-        typer.Option(
-            help=(
-                "Attest that the configured endpoint is a customer-managed, isolated "
-                "non-production sandbox. UL does not verify its isolation."
-            )
-        ),
+        typer.Option(help=("Confirm the environment is intended for testing and can be reset.")),
     ] = False,
     allow_insecure_http: Annotated[
         bool,
-        typer.Option(help="Allow an HTTP sandbox API. Intended for local sandboxes."),
+        typer.Option(help="Allow an HTTP environment API. Intended for local environments."),
     ] = False,
     dry_run: Annotated[
         bool,
@@ -372,11 +369,11 @@ def evaluate_dataset(
         Path | None,
         typer.Option(help="Private local reversible pseudonym mapping state."),
     ] = None,
-    expected_sandbox_origin: Annotated[
+    expected_environment_origin: Annotated[
         str | None,
         typer.Option(hidden=True),
     ] = None,
-    expected_sandbox_config_sha256: Annotated[
+    expected_environment_config_sha256: Annotated[
         str | None,
         typer.Option(hidden=True),
     ] = None,
@@ -386,19 +383,19 @@ def evaluate_dataset(
     ] = None,
     show_report_guidance: Annotated[bool, typer.Option(hidden=True)] = True,
 ) -> None:
-    """Explore behavioral differences against an isolated black-box agent.
+    """Explore behavioral differences against a black-box agent.
 
     UL_LIVE=true enables billed semantic-model calls and external processing together.
     UL_DATASET_LIVE_CALLS and UL_DATASET_ALLOW_EXTERNAL_DATA_PROCESSING remain separate,
     higher-precedence controls. OpenRouter remains the default; set
     UL_DATASET_SEMANTIC_PROVIDER=openai-compatible for a customer-controlled endpoint.
 
-    UL calls only the configured customer-managed sandbox API through an explicit
+    UL calls only the configured customer-managed environment API through an explicit
     reset/setup/execute/snapshot lifecycle. Production observations are passive source data and
     cannot select or configure the execution destination.
 
-    Example: ul dataset evaluate interactions.jsonl --sandbox-config sandbox.json
-    --allow-sandbox-network-egress --confirm-isolated-sandbox
+    Example: ul dataset evaluate interactions.jsonl --environment-config environment.json
+    --allow-environment-network --confirm-test-environment
     --output results.jsonl
 
     Discover operators: ul augmentations list --mode dataset_variation
@@ -453,53 +450,57 @@ def evaluate_dataset(
             selected_records = _protect_interaction_records(selected_records, redaction_engine)
         all_selected_records = selected_records
         if not dry_run and resume is None:
-            if sandbox_config is None:
+            if environment_config is None:
                 raise typer.BadParameter(
-                    "execution requires --sandbox-config",
-                    param_hint="--sandbox-config",
+                    "execution requires --environment-config",
+                    param_hint="--environment-config",
                 )
-            if not allow_sandbox_network_egress:
+            if not allow_environment_network:
                 raise typer.BadParameter(
-                    "execution requires --allow-sandbox-network-egress",
-                    param_hint="--allow-sandbox-network-egress",
+                    "execution requires --allow-environment-network",
+                    param_hint="--allow-environment-network",
                 )
-            if not confirm_isolated_sandbox:
+            if not confirm_test_environment:
                 raise typer.BadParameter(
-                    "execution requires --confirm-isolated-sandbox",
-                    param_hint="--confirm-isolated-sandbox",
+                    TEST_ENVIRONMENT_CONFIRMATION_MESSAGE,
+                    param_hint="--confirm-test-environment",
                 )
         loaded_target_config = (
-            load_json_http_sandbox_config(sandbox_config) if sandbox_config is not None else None
+            load_json_http_environment_config(environment_config)
+            if environment_config is not None
+            else None
         )
-        if expected_sandbox_origin is not None:
+        if expected_environment_origin is not None:
             if loaded_target_config is None:
-                raise ValueError("saved sandbox origin requires --sandbox-config")
-            if json_http_sandbox_origin(loaded_target_config) != expected_sandbox_origin:
+                raise ValueError("saved environment origin requires --environment-config")
+            if json_http_environment_origin(loaded_target_config) != expected_environment_origin:
                 raise ValueError(
-                    "sandbox origin changed since 'ul init'; reinitialize the project and repeat "
-                    "the sandbox safety acknowledgements"
+                    "environment origin changed since 'ul init'; reinitialize the project and "
+                    "repeat the environment safety acknowledgements"
                 )
-        if expected_sandbox_config_sha256 is not None:
+        if expected_environment_config_sha256 is not None:
             if loaded_target_config is None:
-                raise ValueError("saved sandbox configuration requires --sandbox-config")
-            if json_http_sandbox_config_sha256(loaded_target_config) != (
-                expected_sandbox_config_sha256
+                raise ValueError("saved environment configuration requires --environment-config")
+            if json_http_environment_config_sha256(loaded_target_config) != (
+                expected_environment_config_sha256
             ):
                 raise ValueError(
-                    "sandbox configuration changed since 'ul init'; reinitialize the project "
-                    "and repeat the sandbox safety acknowledgements"
+                    "environment configuration changed since 'ul init'; reinitialize the project "
+                    "and repeat the environment safety acknowledgements"
                 )
         if loaded_target_config is not None:
-            validate_json_http_sandbox_configuration(
+            validate_json_http_environment_configuration(
                 loaded_target_config,
-                sandbox_confirmed=confirm_isolated_sandbox or dry_run or resume is not None,
+                test_environment_confirmed=confirm_test_environment
+                or dry_run
+                or resume is not None,
                 allow_insecure_http=allow_insecure_http,
             )
         normalized_target_config = loaded_target_config
         if resume is not None and normalized_target_config is None:
-            raise ValueError("--resume requires --sandbox-config")
+            raise ValueError("--resume requires --environment-config")
         target_calls_per_execution = (
-            json_http_sandbox_calls_per_execution(normalized_target_config)
+            json_http_environment_calls_per_execution(normalized_target_config)
             if normalized_target_config is not None
             else 1
         )
@@ -509,11 +510,11 @@ def evaluate_dataset(
             * (1 + len(selected_operators))
             * target_calls_per_execution
         )
-        if resume is None and initial_target_calls > max_sandbox_api_calls:
+        if resume is None and initial_target_calls > max_environment_api_calls:
             raise ValueError(
-                f"selection would make up to {initial_target_calls} sandbox API calls, exceeding "
-                f"--max-sandbox-api-calls {max_sandbox_api_calls}; reduce --limit, --operator, or "
-                "--repetitions, or explicitly raise the call budget"
+                f"selection would make up to {initial_target_calls} environment API calls, "
+                f"exceeding --max-environment-api-calls {max_environment_api_calls}; reduce "
+                "--limit, --operator, or --repetitions, or explicitly raise the call budget"
             )
         if not dry_run and resume is None:
             if output is None:
@@ -616,10 +617,10 @@ def evaluate_dataset(
         * (1 + len(selected_operators))
         * target_calls_per_execution
     )
-    if potential_target_calls > max_sandbox_api_calls:
+    if potential_target_calls > max_environment_api_calls:
         raise typer.BadParameter(
-            f"remaining selection would make up to {potential_target_calls} sandbox API calls, "
-            f"exceeding --max-sandbox-api-calls {max_sandbox_api_calls}; reduce --limit, "
+            f"remaining selection would make up to {potential_target_calls} environment API calls, "
+            f"exceeding --max-environment-api-calls {max_environment_api_calls}; reduce --limit, "
             "--operator, "
             "or --repetitions, or explicitly raise the call budget"
         )
@@ -630,9 +631,9 @@ def evaluate_dataset(
             selected_count=len(selected_records),
             skipped_count=skipped_count,
             operator_ids=selected_operators,
-            target_configured=sandbox_config is not None,
+            target_configured=environment_config is not None,
             target_endpoint=(
-                json_http_sandbox_config_urls(loaded_target_config)[0]
+                json_http_environment_config_urls(loaded_target_config)[0]
                 if loaded_target_config is not None
                 else None
             ),
@@ -640,7 +641,7 @@ def evaluate_dataset(
                 loaded_target_config.headers_from_env if loaded_target_config is not None else {}
             ),
             repetitions=repetitions,
-            max_sandbox_api_calls=max_sandbox_api_calls,
+            max_environment_api_calls=max_environment_api_calls,
             target_calls_per_execution=target_calls_per_execution,
             invariant_suite=invariant_suite,
             output=output,
@@ -696,15 +697,15 @@ def evaluate_dataset(
             raise typer.Exit(code=1)
         raise typer.Exit(code=0)
 
-    if sandbox_config is None:
+    if environment_config is None:
         raise typer.BadParameter(
-            "execution requires --sandbox-config",
-            param_hint="--sandbox-config",
+            "execution requires --environment-config",
+            param_hint="--environment-config",
         )
-    if not confirm_isolated_sandbox:
+    if not confirm_test_environment:
         raise typer.BadParameter(
-            "execution requires --confirm-isolated-sandbox",
-            param_hint="--confirm-isolated-sandbox",
+            TEST_ENVIRONMENT_CONFIRMATION_MESSAGE,
+            param_hint="--confirm-test-environment",
         )
     if output is None:
         raise typer.BadParameter("execution requires --output", param_hint="--output")
@@ -733,18 +734,18 @@ def evaluate_dataset(
 
     try:
         assert loaded_target_config is not None
-        if not allow_sandbox_network_egress:
-            raise ValueError("sandbox execution requires --allow-sandbox-network-egress")
-        target = JsonHttpSandboxConnection.from_config(
+        if not allow_environment_network:
+            raise ValueError("environment execution requires --allow-environment-network")
+        target = JsonHttpEnvironmentConnection.from_config(
             loaded_target_config,
-            sandbox_confirmed=True,
+            test_environment_confirmed=True,
             allow_insecure_http=allow_insecure_http,
-            max_sandbox_api_calls=max_sandbox_api_calls,
+            max_environment_api_calls=max_environment_api_calls,
         )
     except ValueError as error:
         raise typer.BadParameter(
             str(error),
-            param_hint="--sandbox-config",
+            param_hint="--environment-config",
         ) from None
 
     augmentation_ledger: DatasetAugmentationLedger | None = None
@@ -824,7 +825,7 @@ def evaluate_dataset(
                     target,
                     output_stream,
                     repetitions=repetitions,
-                    max_sandbox_api_calls=max_sandbox_api_calls,
+                    max_environment_api_calls=max_environment_api_calls,
                     planned_target_calls=(
                         (len(selected_records) + skipped_count)
                         * repetitions
@@ -846,7 +847,7 @@ def evaluate_dataset(
                     target,
                     output_stream,
                     repetitions=repetitions,
-                    max_sandbox_api_calls=max_sandbox_api_calls,
+                    max_environment_api_calls=max_environment_api_calls,
                     planned_target_calls=(
                         (len(selected_records) + skipped_count)
                         * repetitions
@@ -1134,7 +1135,7 @@ def _dataset_evidence_run_context(
     selected_operator_ids: tuple[str, ...],
     repetitions: int,
     invariant_suite: DatasetInvariantSuite | None,
-    target_config: JsonHttpSandboxConfig | None,
+    target_config: JsonHttpEnvironmentConfig | None,
     settings: DatasetSemanticSettings,
     redaction_policy_sha256: str | None = None,
     redaction_coverage: tuple[DatasetEvidenceRedactionCoverage, ...] = (),
@@ -1174,7 +1175,7 @@ def _print_dataset_plan(
     target_endpoint: str | None,
     target_header_environment_variables: dict[str, str],
     repetitions: int,
-    max_sandbox_api_calls: int,
+    max_environment_api_calls: int,
     target_calls_per_execution: int,
     invariant_suite: DatasetInvariantSuite | None,
     output: Path | None,
@@ -1206,7 +1207,7 @@ def _print_dataset_plan(
         console.print(f"Customer invariants: {len(invariant_suite.rules)} rule(s)")
         console.print(f"Declared observation authority: {invariant_suite.observation_authority}")
         console.print("Additional model calls for customer invariants: 0")
-        console.print("Additional sandbox API calls for customer invariants: 0")
+        console.print("Additional environment API calls for customer invariants: 0")
     console.print(f"Potential semantic model calls: up to {potential_model_calls}")
     console.print(
         f"Semantic provider: {semantic_provider_id} "
@@ -1221,17 +1222,16 @@ def _print_dataset_plan(
                 f"{len(coverage.matched_paths)} path(s)"
             )
     console.print(
-        f"Potential sandbox API calls: up to {potential_target_calls} "
-        f"(authorized maximum: {max_sandbox_api_calls})"
+        f"Potential environment API calls: up to {potential_target_calls} "
+        f"(authorized maximum: {max_environment_api_calls})"
     )
     if target_calls_per_execution > 1:
         console.print(
             f"Lifecycle calls per execution: {target_calls_per_execution} "
             "(reset, optional setup, execute_turn, snapshot, cleanup reset)"
         )
-    console.print(
-        f"Customer-managed sandbox API: {'configured' if target_configured else 'not configured'}"
-    )
+    target_status = "configured" if target_configured else "not configured"
+    console.print(f"Customer-managed environment API: {target_status}")
     if output is not None:
         console.print(f"Evidence destination: {output}")
     if augmentations_output is None:
@@ -1245,7 +1245,7 @@ def _print_dataset_plan(
             "not encrypted or automatically redacted; retain it only under your data policy."
         )
     if target_endpoint is not None:
-        console.print(f"Sandbox API endpoint: {target_endpoint}")
+        console.print(f"Environment API endpoint: {target_endpoint}")
         if target_header_environment_variables:
             mappings = ", ".join(
                 f"{header_name}={environment_variable}"
@@ -1253,23 +1253,23 @@ def _print_dataset_plan(
                     target_header_environment_variables.items()
                 )
             )
-            console.print(f"Sandbox API header environment mappings: {mappings}")
+            console.print(f"Environment API header environment mappings: {mappings}")
         else:
-            console.print("Sandbox API header environment mappings: none")
+            console.print("Environment API header environment mappings: none")
     console.print(
         "Semantic models receive historical inputs and outputs, generated variations, "
         "live control responses, and variation responses on execution."
     )
     console.print(
-        "Every test case invokes and validates the configured sandbox reset contract. Optional "
-        "setup uses one static fixture from the sandbox config for the entire run."
+        "Every test case invokes and validates the configured environment reset contract. Optional "
+        "setup uses one static fixture from the environment config for the entire run."
     )
     console.print(
         "Target requests and semantic model calls may be billed separately. Repetitions only "
         "show observed behavioral consistency: they do not determine correctness, identify "
         "causality, or estimate a production failure rate."
     )
-    console.print("No model or sandbox API requests sent.")
+    console.print("No model or environment API requests sent.")
 
 
 def _default_augmentations_output(evidence_output: Path) -> Path:
@@ -1391,11 +1391,11 @@ async def _evaluate_interaction_records(
     records: tuple[InteractionRecord, ...],
     operator_ids: tuple[str, ...],
     settings: DatasetSemanticSettings,
-    target: JsonHttpSandboxConnection,
+    target: JsonHttpEnvironmentConnection,
     output_stream: TextIO,
     *,
     repetitions: int,
-    max_sandbox_api_calls: int,
+    max_environment_api_calls: int,
     planned_target_calls: int,
     run_context: DatasetEvidenceRunContext | None = None,
     augmentation_ledger: DatasetAugmentationLedger | None = None,
@@ -1413,7 +1413,7 @@ async def _evaluate_interaction_records(
             else deconstructor
         )
         evaluation_target = (
-            semantic_pipeline.wrap_sandbox(target)
+            semantic_pipeline.wrap_environment(target)
             if isinstance(semantic_pipeline, RedactedSemanticPipeline)
             else target
         )
@@ -1461,7 +1461,7 @@ async def _evaluate_interaction_records(
                     _customer_evidence_record(
                         result,
                         repetitions=repetitions,
-                        max_sandbox_api_calls=max_sandbox_api_calls,
+                        max_environment_api_calls=max_environment_api_calls,
                         planned_target_calls=planned_target_calls,
                         run_context=run_context,
                         invariant_evaluation=invariant_evaluation,
@@ -1630,7 +1630,7 @@ def _customer_evidence_record(
     result: DatasetEvaluationResult,
     *,
     repetitions: int,
-    max_sandbox_api_calls: int,
+    max_environment_api_calls: int,
     planned_target_calls: int,
     run_context: DatasetEvidenceRunContext | None = None,
     invariant_evaluation: DatasetInvariantEvaluation | None = None,
@@ -1664,10 +1664,8 @@ def _customer_evidence_record(
     )
     if uses_extended_invariants and run_context is None:
         raise ValueError("extended invariant evidence requires a resumable run context")
-    if uses_extended_invariants:
-        evidence_schema_version = "1.6.0"
-    elif run_context is not None:
-        evidence_schema_version = "1.5.0"
+    if uses_extended_invariants or run_context is not None:
+        evidence_schema_version = "1.7.0"
     else:
         evidence_schema_version = "1.4.0"
     evidence: dict[str, JsonValue] = {
@@ -1676,7 +1674,7 @@ def _customer_evidence_record(
         "original_input": result.source.raw_input,
         "execution_plan": {
             "repetitions": repetitions,
-            "max_target_calls": max_sandbox_api_calls,
+            "max_target_calls": max_environment_api_calls,
             "dataset_planned_target_calls": planned_target_calls,
         },
         "limitations": _BEHAVIORAL_LIMITATIONS,

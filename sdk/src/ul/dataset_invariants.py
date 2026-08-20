@@ -989,7 +989,7 @@ def _outputs_for_observation_authority(
             if output is None
             or "committed_state_snapshot" not in output.metadata
             or output.metadata.get("state_observation_authority")
-            not in {"sandbox_self_reported", "independent_observer"}
+            not in {"environment_self_reported", "independent_observer"}
             else ObservedAgentOutput(
                 raw_output=output.metadata["committed_state_snapshot"],
                 metadata={

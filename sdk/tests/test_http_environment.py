@@ -12,12 +12,12 @@ from typing import Any
 import httpx
 import pytest
 from pydantic import JsonValue, ValidationError
-from ul.http_sandbox import (
-    JsonHttpSandboxConfig,
-    JsonHttpSandboxConnection,
-    json_http_sandbox_calls_per_conversation,
-    load_json_http_sandbox_config,
-    validate_json_http_sandbox_configuration,
+from ul.http_environment import (
+    JsonHttpEnvironmentConfig,
+    JsonHttpEnvironmentConnection,
+    json_http_environment_calls_per_conversation,
+    load_json_http_environment_config,
+    validate_json_http_environment_configuration,
 )
 from ul_core.evaluation import EvaluationCase, TimeoutAfterCommitEventRequest
 from ul_core.models import ConversationRole, ConversationTurn
@@ -42,22 +42,22 @@ def _raw_response(body: bytes, *, status_code: int = 200) -> httpx.Response:
 
 
 def _config(
-    base_url: str = "https://sandbox.example.test",
+    base_url: str = "https://environment.example.test",
     *,
     headers_from_env: dict[str, str] | None = None,
     clean_state_value: JsonValue = True,
     setup: bool = True,
     timeout_after_commit: bool = False,
-) -> JsonHttpSandboxConfig:
+) -> JsonHttpEnvironmentConfig:
     raw: dict[str, Any] = {
-        "version": 4,
-        "sandbox_id": "payments-test",
+        "version": 5,
+        "environment_id": "payments-test",
         "headers_from_env": headers_from_env or {},
         "reset": {
             "url": f"{base_url}/reset",
             "request_json_template": {"case_id": "{{case_id}}"},
             "case_id_json_pointer": "/case_id",
-            "sandbox_id_json_pointer": "/sandbox_id",
+            "environment_id_json_pointer": "/environment_id",
             "generation_json_pointer": "/generation",
             "clean_state_json_pointer": "/clean",
             "clean_state_value": clean_state_value,
@@ -72,7 +72,7 @@ def _config(
             "response_json_pointer": "/agent_response",
             "case_id_json_pointer": "/case_id",
             "turn_id_json_pointer": "/turn_id",
-            "sandbox_id_json_pointer": "/sandbox_id",
+            "environment_id_json_pointer": "/environment_id",
         },
         "snapshot": {
             "url": f"{base_url}/snapshot",
@@ -83,7 +83,7 @@ def _config(
             "response_json_pointer": "/state",
             "case_id_json_pointer": "/case_id",
             "turn_id_json_pointer": "/turn_id",
-            "sandbox_id_json_pointer": "/sandbox_id",
+            "environment_id_json_pointer": "/environment_id",
         },
     }
     if setup:
@@ -94,7 +94,7 @@ def _config(
                 "starting_amount": 100,
             },
             "case_id_json_pointer": "/case_id",
-            "sandbox_id_json_pointer": "/sandbox_id",
+            "environment_id_json_pointer": "/environment_id",
         }
     if timeout_after_commit:
         raw["timeout_after_commit"] = {
@@ -102,7 +102,7 @@ def _config(
             "version": "1.0.0",
             "url": f"{base_url}/timeout-after-commit",
         }
-    return JsonHttpSandboxConfig.model_validate(raw)
+    return JsonHttpEnvironmentConfig.model_validate(raw)
 
 
 def _case(*inputs: str, max_calls: int = 20) -> EvaluationCase:
@@ -116,7 +116,7 @@ def _case(*inputs: str, max_calls: int = 20) -> EvaluationCase:
             )
             for index, content in enumerate(inputs, start=1)
         ),
-        max_sandbox_api_calls=max_calls,
+        max_environment_api_calls=max_calls,
         timeout_seconds=30,
     )
 
@@ -148,7 +148,7 @@ def _successful_handler() -> tuple[Any, list[tuple[str, dict[str, JsonValue]]]]:
             return _raw_response(
                 json.dumps(
                     {
-                        "sandbox_id": "payments-test",
+                        "environment_id": "payments-test",
                         "case_id": body["case_id"],
                         "generation": generation,
                         "clean": True,
@@ -160,14 +160,14 @@ def _successful_handler() -> tuple[Any, list[tuple[str, dict[str, JsonValue]]]]:
         if request.url.path == "/setup":
             amount = 100
             return _raw_response(
-                json.dumps({"sandbox_id": "payments-test", "case_id": body["case_id"]}).encode()
+                json.dumps({"environment_id": "payments-test", "case_id": body["case_id"]}).encode()
             )
         if request.url.path == "/execute":
             amount += 50
             return _raw_response(
                 json.dumps(
                     {
-                        "sandbox_id": "payments-test",
+                        "environment_id": "payments-test",
                         "case_id": body["case_id"],
                         "turn_id": body["turn_id"],
                         "agent_response": {"input": body["input"]},
@@ -177,7 +177,7 @@ def _successful_handler() -> tuple[Any, list[tuple[str, dict[str, JsonValue]]]]:
         return _raw_response(
             json.dumps(
                 {
-                    "sandbox_id": "payments-test",
+                    "environment_id": "payments-test",
                     "case_id": body["case_id"],
                     "turn_id": body["turn_id"],
                     "state": {"committed_amount": amount},
@@ -193,16 +193,16 @@ async def test_reset_request_template_must_be_an_object_at_config_validation() -
     config["reset"]["request_json_template"] = ["{{case_id}}"]
 
     with pytest.raises(ValidationError, match="must be a JSON object"):
-        JsonHttpSandboxConfig.model_validate(config)
+        JsonHttpEnvironmentConfig.model_validate(config)
 
 
 async def test_executes_remote_case_and_returns_explicit_evidence() -> None:
     handler, requests = _successful_handler()
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
-        sandbox = JsonHttpSandboxConnection.from_config(
-            _config(), sandbox_confirmed=True, max_sandbox_api_calls=6, client=client
+        environment = JsonHttpEnvironmentConnection.from_config(
+            _config(), test_environment_confirmed=True, max_environment_api_calls=6, client=client
         )
-        evidence = await sandbox.execute(_case("increase the amount", max_calls=6))
+        evidence = await environment.execute(_case("increase the amount", max_calls=6))
 
     assert [path for path, _ in requests] == [
         "/reset",
@@ -229,12 +229,12 @@ async def test_executes_remote_case_and_returns_explicit_evidence() -> None:
     assert evidence.lifecycle.cleanup_reset is not None
     assert evidence.lifecycle.cleanup_reset.reset_session_acknowledged is True
     assert evidence.lifecycle.cleanup_reset.reset_env_acknowledged is True
-    assert evidence.sandbox_id == "payments-test"
+    assert evidence.environment_id == "payments-test"
     assert evidence.initial_state is not None
     assert evidence.initial_state.value == {"committed_amount": 100}
     assert evidence.turns[0].response == {"input": "increase the amount"}
     assert evidence.turns[0].state_snapshot == {"committed_amount": 150}
-    assert evidence.turns[0].state_observation_authority == "sandbox_self_reported"
+    assert evidence.turns[0].state_observation_authority == "environment_self_reported"
 
 
 async def test_explicit_stateless_session_opt_out_is_requested_and_recorded() -> None:
@@ -243,10 +243,10 @@ async def test_explicit_stateless_session_opt_out_is_requested_and_recorded() ->
         update={"reset": _config().reset.model_copy(update={"reset_session": False})}
     )
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
-        sandbox = JsonHttpSandboxConnection.from_config(
-            config, sandbox_confirmed=True, max_sandbox_api_calls=6, client=client
+        environment = JsonHttpEnvironmentConnection.from_config(
+            config, test_environment_confirmed=True, max_environment_api_calls=6, client=client
         )
-        evidence = await sandbox.execute(_case("increase the amount", max_calls=6))
+        evidence = await environment.execute(_case("increase the amount", max_calls=6))
 
     assert [body["reset_session"] for path, body in requests if path == "/reset"] == [
         False,
@@ -269,7 +269,7 @@ async def test_missing_requested_environment_reset_acknowledgement_blocks_execut
         return _raw_response(
             json.dumps(
                 {
-                    "sandbox_id": "payments-test",
+                    "environment_id": "payments-test",
                     "case_id": request_body["case_id"],
                     "generation": 1,
                     "clean": True,
@@ -279,10 +279,10 @@ async def test_missing_requested_environment_reset_acknowledgement_blocks_execut
         )
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(missing_acknowledgement)) as client:
-        sandbox = JsonHttpSandboxConnection.from_config(
-            _config(), sandbox_confirmed=True, max_sandbox_api_calls=6, client=client
+        environment = JsonHttpEnvironmentConnection.from_config(
+            _config(), test_environment_confirmed=True, max_environment_api_calls=6, client=client
         )
-        evidence = await sandbox.execute(_case("increase the amount", max_calls=6))
+        evidence = await environment.execute(_case("increase the amount", max_calls=6))
 
     assert [path for path, _ in requests] == ["/reset"]
     assert evidence.lifecycle.terminal_status == "failed"
@@ -304,15 +304,15 @@ async def test_timeout_after_commit_receipts_are_correlated_and_budgeted() -> No
         return _raw_response(json.dumps({**body, "status": status}).encode())
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(event_handler)) as client:
-        sandbox = JsonHttpSandboxConnection.from_config(
+        environment = JsonHttpEnvironmentConnection.from_config(
             _config(timeout_after_commit=True),
-            sandbox_confirmed=True,
-            max_sandbox_api_calls=9,
+            test_environment_confirmed=True,
+            max_environment_api_calls=9,
             client=client,
         )
-        evidence = await sandbox.execute(_timeout_after_commit_case())
+        evidence = await environment.execute(_timeout_after_commit_case())
 
-    assert sandbox.api_calls_for_case(_timeout_after_commit_case()) == 9
+    assert environment.api_calls_for_case(_timeout_after_commit_case()) == 9
     assert evidence.lifecycle.terminal_status == "succeeded"
     event = evidence.timeout_after_commit_event
     assert event is not None
@@ -325,14 +325,14 @@ async def test_timeout_after_commit_receipts_are_correlated_and_budgeted() -> No
 async def test_timeout_after_commit_reserves_control_calls_before_network() -> None:
     handler, requests = _successful_handler()
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
-        sandbox = JsonHttpSandboxConnection.from_config(
+        environment = JsonHttpEnvironmentConnection.from_config(
             _config(timeout_after_commit=True),
-            sandbox_confirmed=True,
-            max_sandbox_api_calls=8,
+            test_environment_confirmed=True,
+            max_environment_api_calls=8,
             client=client,
         )
         with pytest.raises(RuntimeError, match="API call budget exhausted"):
-            await sandbox.execute(_timeout_after_commit_case())
+            await environment.execute(_timeout_after_commit_case())
 
     assert requests == []
 
@@ -356,18 +356,18 @@ async def test_stale_timeout_after_commit_receipt_fails_and_cleans_by_event_iden
         return _raw_response(json.dumps(response).encode())
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(stale_event_handler)) as client:
-        sandbox = JsonHttpSandboxConnection.from_config(
+        environment = JsonHttpEnvironmentConnection.from_config(
             _config(timeout_after_commit=True),
-            sandbox_confirmed=True,
-            max_sandbox_api_calls=9,
+            test_environment_confirmed=True,
+            max_environment_api_calls=9,
             client=client,
         )
-        evidence = await sandbox.execute(_timeout_after_commit_case())
+        evidence = await environment.execute(_timeout_after_commit_case())
 
     assert operations == ["arm", "observe", "clean"]
     assert evidence.lifecycle.failed_phase == "observe_timeout_after_commit"
     assert evidence.lifecycle.delivery == "uncertain"
-    assert evidence.lifecycle.sandbox_state_uncertain is True
+    assert evidence.lifecycle.environment_state_uncertain is True
     event = evidence.timeout_after_commit_event
     assert event is not None
     assert event.armed is True
@@ -393,38 +393,38 @@ async def test_timeout_event_cleanup_cancellation_still_attempts_reset_and_quara
     async with httpx.AsyncClient(
         transport=httpx.MockTransport(cancelled_cleanup_handler)
     ) as client:
-        sandbox = JsonHttpSandboxConnection.from_config(
+        environment = JsonHttpEnvironmentConnection.from_config(
             _config(timeout_after_commit=True),
-            sandbox_confirmed=True,
-            max_sandbox_api_calls=9,
+            test_environment_confirmed=True,
+            max_environment_api_calls=9,
             client=client,
         )
         with pytest.raises(asyncio.CancelledError):
-            await sandbox.execute(_timeout_after_commit_case())
+            await environment.execute(_timeout_after_commit_case())
         request_count_after_cancellation = len(requests)
-        blocked = await sandbox.execute(_timeout_after_commit_case())
+        blocked = await environment.execute(_timeout_after_commit_case())
 
     assert operations == ["arm", "observe", "clean"]
     assert [path for path, _ in requests][-1] == "/reset"
     assert len(requests) == request_count_after_cancellation
     assert blocked.lifecycle.failed_phase == "blocked_state_uncertain"
-    assert blocked.lifecycle.sandbox_state_uncertain is True
+    assert blocked.lifecycle.environment_state_uncertain is True
 
 
 async def test_preserves_state_within_case_and_resets_between_cases() -> None:
     handler, requests = _successful_handler()
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
-        sandbox = JsonHttpSandboxConnection.from_config(
-            _config(), sandbox_confirmed=True, max_sandbox_api_calls=14, client=client
+        environment = JsonHttpEnvironmentConnection.from_config(
+            _config(), test_environment_confirmed=True, max_environment_api_calls=14, client=client
         )
-        first = await sandbox.execute(_case("first", "correction", max_calls=8))
-        second = await sandbox.execute(
+        first = await environment.execute(_case("first", "correction", max_calls=8))
+        second = await environment.execute(
             EvaluationCase(
                 id="case-2",
                 turns=(
                     ConversationTurn(id="turn-1", role=ConversationRole.USER, content="new case"),
                 ),
-                max_sandbox_api_calls=6,
+                max_environment_api_calls=6,
                 timeout_seconds=30,
             )
         )
@@ -434,7 +434,7 @@ async def test_preserves_state_within_case_and_resets_between_cases() -> None:
         {"committed_amount": 200},
     ]
     assert second.turns[0].state_snapshot == {"committed_amount": 150}
-    assert json_http_sandbox_calls_per_conversation(_config(), 2) == 8
+    assert json_http_environment_calls_per_conversation(_config(), 2) == 8
     assert [body["case_id"] for _, body in requests].count("case-2") == 6
 
 
@@ -451,7 +451,7 @@ async def test_cleanup_failure_is_evidence_and_quarantines_connection() -> None:
             return _raw_response(
                 json.dumps(
                     {
-                        "sandbox_id": "payments-test",
+                        "environment_id": "payments-test",
                         "case_id": body["case_id"],
                         "generation": 1,
                         "clean": True,
@@ -462,13 +462,13 @@ async def test_cleanup_failure_is_evidence_and_quarantines_connection() -> None:
             )
         if request.url.path == "/setup":
             return _raw_response(
-                json.dumps({"sandbox_id": "payments-test", "case_id": body["case_id"]}).encode()
+                json.dumps({"environment_id": "payments-test", "case_id": body["case_id"]}).encode()
             )
         if request.url.path == "/execute":
             return _raw_response(
                 json.dumps(
                     {
-                        "sandbox_id": "payments-test",
+                        "environment_id": "payments-test",
                         "case_id": body["case_id"],
                         "turn_id": body["turn_id"],
                         "agent_response": {"ok": True},
@@ -478,7 +478,7 @@ async def test_cleanup_failure_is_evidence_and_quarantines_connection() -> None:
         return _raw_response(
             json.dumps(
                 {
-                    "sandbox_id": "payments-test",
+                    "environment_id": "payments-test",
                     "case_id": body["case_id"],
                     "turn_id": body["turn_id"],
                     "state": {},
@@ -487,14 +487,14 @@ async def test_cleanup_failure_is_evidence_and_quarantines_connection() -> None:
         )
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
-        sandbox = JsonHttpSandboxConnection.from_config(
-            _config(), sandbox_confirmed=True, max_sandbox_api_calls=10, client=client
+        environment = JsonHttpEnvironmentConnection.from_config(
+            _config(), test_environment_confirmed=True, max_environment_api_calls=10, client=client
         )
-        failed = await sandbox.execute(_case("work", max_calls=6))
-        blocked = await sandbox.execute(_case("again", max_calls=6))
+        failed = await environment.execute(_case("work", max_calls=6))
+        blocked = await environment.execute(_case("again", max_calls=6))
 
     assert failed.lifecycle.cleanup == "failed"
-    assert failed.lifecycle.sandbox_state_uncertain is True
+    assert failed.lifecycle.environment_state_uncertain is True
     assert blocked.lifecycle.failed_phase == "blocked_state_uncertain"
 
 
@@ -511,7 +511,7 @@ async def test_ambiguous_execute_delivery_stays_quarantined_after_cleanup() -> N
             return _raw_response(
                 json.dumps(
                     {
-                        "sandbox_id": "payments-test",
+                        "environment_id": "payments-test",
                         "case_id": body["case_id"],
                         "generation": generation,
                         "clean": True,
@@ -522,7 +522,7 @@ async def test_ambiguous_execute_delivery_stays_quarantined_after_cleanup() -> N
             )
         if request.url.path == "/setup":
             return _raw_response(
-                json.dumps({"sandbox_id": "payments-test", "case_id": body["case_id"]}).encode()
+                json.dumps({"environment_id": "payments-test", "case_id": body["case_id"]}).encode()
             )
         if request.url.path == "/execute":
             raise httpx.ReadTimeout("response lost after delivery", request=request)
@@ -530,7 +530,7 @@ async def test_ambiguous_execute_delivery_stays_quarantined_after_cleanup() -> N
             return _raw_response(
                 json.dumps(
                     {
-                        "sandbox_id": "payments-test",
+                        "environment_id": "payments-test",
                         "case_id": body["case_id"],
                         "turn_id": body["turn_id"],
                         "state": {},
@@ -540,16 +540,16 @@ async def test_ambiguous_execute_delivery_stays_quarantined_after_cleanup() -> N
         raise AssertionError("snapshot must not follow uncertain execution")
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
-        sandbox = JsonHttpSandboxConnection.from_config(
-            _config(), sandbox_confirmed=True, max_sandbox_api_calls=10, client=client
+        environment = JsonHttpEnvironmentConnection.from_config(
+            _config(), test_environment_confirmed=True, max_environment_api_calls=10, client=client
         )
-        failed = await sandbox.execute(_case("work", max_calls=6))
-        blocked = await sandbox.execute(_case("again", max_calls=6))
+        failed = await environment.execute(_case("work", max_calls=6))
+        blocked = await environment.execute(_case("again", max_calls=6))
 
     assert failed.lifecycle.delivery == "uncertain"
     assert failed.lifecycle.failure_code == "response_timeout"
-    assert failed.lifecycle.failure_reason == "sandbox API response timed out"
-    assert failed.lifecycle.sandbox_state_uncertain is True
+    assert failed.lifecycle.failure_reason == "environment API response timed out"
+    assert failed.lifecycle.environment_state_uncertain is True
     assert blocked.lifecycle.failed_phase == "blocked_state_uncertain"
     assert requests == ["/reset", "/setup", "/snapshot", "/execute", "/reset"]
 
@@ -557,8 +557,8 @@ async def test_ambiguous_execute_delivery_stays_quarantined_after_cleanup() -> N
 @pytest.mark.parametrize(
     ("cause", "expected_code", "expected_reason"),
     (
-        (socket.gaierror(), "dns_resolution", "sandbox API DNS resolution failed"),
-        (ssl.SSLError(), "tls_connection", "sandbox API TLS connection failed"),
+        (socket.gaierror(), "dns_resolution", "environment API DNS resolution failed"),
+        (ssl.SSLError(), "tls_connection", "environment API TLS connection failed"),
     ),
 )
 async def test_connect_failures_retain_safe_category(
@@ -572,15 +572,15 @@ async def test_connect_failures_retain_safe_category(
         return successful_handler(request)
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
-        sandbox = JsonHttpSandboxConnection.from_config(
-            _config(), sandbox_confirmed=True, max_sandbox_api_calls=6, client=client
+        environment = JsonHttpEnvironmentConnection.from_config(
+            _config(), test_environment_confirmed=True, max_environment_api_calls=6, client=client
         )
-        evidence = await sandbox.execute(_case("work", max_calls=6))
+        evidence = await environment.execute(_case("work", max_calls=6))
 
     assert evidence.lifecycle.failure_code == expected_code
     assert evidence.lifecycle.failure_reason == expected_reason
     assert evidence.lifecycle.delivery == "certain"
-    assert evidence.lifecycle.sandbox_state_uncertain is False
+    assert evidence.lifecycle.environment_state_uncertain is False
     assert "private detail" not in evidence.model_dump_json()
 
 
@@ -606,16 +606,16 @@ async def test_pre_delivery_initial_reset_failure_does_not_quarantine_or_cleanup
         raise httpx.ConnectError("private detail", request=request) from socket.gaierror()
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
-        sandbox = JsonHttpSandboxConnection.from_config(
-            _config(), sandbox_confirmed=True, max_sandbox_api_calls=6, client=client
+        environment = JsonHttpEnvironmentConnection.from_config(
+            _config(), test_environment_confirmed=True, max_environment_api_calls=6, client=client
         )
-        evidence = await sandbox.execute(_case("work", max_calls=6))
+        evidence = await environment.execute(_case("work", max_calls=6))
 
     assert evidence.lifecycle.failed_phase == "reset"
     assert evidence.lifecycle.failure_code == expected_code
     assert evidence.lifecycle.delivery == "certain"
     assert evidence.lifecycle.cleanup == "not_attempted"
-    assert evidence.lifecycle.sandbox_state_uncertain is False
+    assert evidence.lifecycle.environment_state_uncertain is False
     assert requests == ["/reset"]
 
 
@@ -627,16 +627,16 @@ async def test_ambiguous_initial_reset_is_not_retried_as_cleanup() -> None:
         raise httpx.ReadTimeout("private detail", request=request)
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
-        sandbox = JsonHttpSandboxConnection.from_config(
-            _config(), sandbox_confirmed=True, max_sandbox_api_calls=6, client=client
+        environment = JsonHttpEnvironmentConnection.from_config(
+            _config(), test_environment_confirmed=True, max_environment_api_calls=6, client=client
         )
-        evidence = await sandbox.execute(_case("work", max_calls=6))
+        evidence = await environment.execute(_case("work", max_calls=6))
 
     assert evidence.lifecycle.failed_phase == "reset"
     assert evidence.lifecycle.failure_code == "response_timeout"
     assert evidence.lifecycle.delivery == "uncertain"
     assert evidence.lifecycle.cleanup == "not_attempted"
-    assert evidence.lifecycle.sandbox_state_uncertain is True
+    assert evidence.lifecycle.environment_state_uncertain is True
     assert requests == ["/reset"]
 
 
@@ -649,17 +649,17 @@ async def test_unexpected_initial_reset_error_is_redacted_and_not_retried() -> N
         raise ValueError(secret)
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
-        sandbox = JsonHttpSandboxConnection.from_config(
-            _config(), sandbox_confirmed=True, max_sandbox_api_calls=6, client=client
+        environment = JsonHttpEnvironmentConnection.from_config(
+            _config(), test_environment_confirmed=True, max_environment_api_calls=6, client=client
         )
-        evidence = await sandbox.execute(_case("work", max_calls=6))
-        blocked = await sandbox.execute(_case("again", max_calls=6))
+        evidence = await environment.execute(_case("work", max_calls=6))
+        blocked = await environment.execute(_case("again", max_calls=6))
 
     assert evidence.lifecycle.failed_phase == "reset"
-    assert evidence.lifecycle.failure_code == "sandbox_lifecycle_error"
+    assert evidence.lifecycle.failure_code == "environment_lifecycle_error"
     assert evidence.lifecycle.delivery == "uncertain"
     assert evidence.lifecycle.cleanup == "not_attempted"
-    assert evidence.lifecycle.sandbox_state_uncertain is True
+    assert evidence.lifecycle.environment_state_uncertain is True
     assert secret not in evidence.model_dump_json()
     assert blocked.lifecycle.failed_phase == "blocked_state_uncertain"
     assert requests == ["/reset"]
@@ -673,20 +673,20 @@ async def test_oversized_initial_reset_request_is_known_not_delivered() -> None:
         raise AssertionError("oversized request must not reach the transport")
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
-        sandbox = JsonHttpSandboxConnection.from_config(
+        environment = JsonHttpEnvironmentConnection.from_config(
             _config(),
-            sandbox_confirmed=True,
+            test_environment_confirmed=True,
             max_request_bytes=1,
-            max_sandbox_api_calls=12,
+            max_environment_api_calls=12,
             client=client,
         )
-        first = await sandbox.execute(_case("work", max_calls=6))
-        second = await sandbox.execute(_case("again", max_calls=6))
+        first = await environment.execute(_case("work", max_calls=6))
+        second = await environment.execute(_case("again", max_calls=6))
 
     assert first.lifecycle.failure_code == "request_too_large"
     assert first.lifecycle.delivery == "certain"
     assert first.lifecycle.cleanup == "not_attempted"
-    assert first.lifecycle.sandbox_state_uncertain is False
+    assert first.lifecycle.environment_state_uncertain is False
     assert second.lifecycle.failed_phase == "reset"
     assert requests == []
 
@@ -701,7 +701,7 @@ async def test_null_snapshot_is_a_safe_protocol_failure() -> None:
             return _raw_response(
                 json.dumps(
                     {
-                        "sandbox_id": "payments-test",
+                        "environment_id": "payments-test",
                         "case_id": body["case_id"],
                         "turn_id": body["turn_id"],
                         "state": None,
@@ -711,14 +711,16 @@ async def test_null_snapshot_is_a_safe_protocol_failure() -> None:
         return successful_handler(request)
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
-        sandbox = JsonHttpSandboxConnection.from_config(
-            _config(), sandbox_confirmed=True, max_sandbox_api_calls=6, client=client
+        environment = JsonHttpEnvironmentConnection.from_config(
+            _config(), test_environment_confirmed=True, max_environment_api_calls=6, client=client
         )
-        evidence = await sandbox.execute(_case("work", max_calls=6))
+        evidence = await environment.execute(_case("work", max_calls=6))
 
     assert evidence.lifecycle.failed_phase == "snapshot"
     assert evidence.lifecycle.failure_code == "response_mapping"
-    assert evidence.lifecycle.failure_reason == ("sandbox API response JSON pointer selected null")
+    assert evidence.lifecycle.failure_reason == (
+        "environment API response JSON pointer selected null"
+    )
     assert evidence.lifecycle.cleanup == "succeeded"
     assert evidence.lifecycle.initial_reset.reset_session_acknowledged is True
     assert evidence.lifecycle.initial_reset.reset_env_acknowledged is True
@@ -742,16 +744,16 @@ async def test_ambiguous_cleanup_reset_marks_delivery_uncertain() -> None:
         return successful_handler(request)
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
-        sandbox = JsonHttpSandboxConnection.from_config(
-            _config(), sandbox_confirmed=True, max_sandbox_api_calls=6, client=client
+        environment = JsonHttpEnvironmentConnection.from_config(
+            _config(), test_environment_confirmed=True, max_environment_api_calls=6, client=client
         )
-        evidence = await sandbox.execute(_case("work", max_calls=6))
+        evidence = await environment.execute(_case("work", max_calls=6))
 
     assert evidence.lifecycle.failed_phase == "cleanup_reset"
     assert evidence.lifecycle.delivery == "uncertain"
-    assert evidence.lifecycle.cleanup_failure_reason == "sandbox API response timed out"
+    assert evidence.lifecycle.cleanup_failure_reason == "environment API response timed out"
     assert evidence.lifecycle.cleanup_failure_code == "response_timeout"
-    assert evidence.lifecycle.sandbox_state_uncertain is True
+    assert evidence.lifecycle.environment_state_uncertain is True
 
 
 async def test_unexpected_runtime_error_detail_is_not_persisted() -> None:
@@ -764,22 +766,22 @@ async def test_unexpected_runtime_error_detail_is_not_persisted() -> None:
         return successful_handler(request)
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
-        sandbox = JsonHttpSandboxConnection.from_config(
-            _config(), sandbox_confirmed=True, max_sandbox_api_calls=6, client=client
+        environment = JsonHttpEnvironmentConnection.from_config(
+            _config(), test_environment_confirmed=True, max_environment_api_calls=6, client=client
         )
-        evidence = await sandbox.execute(_case("work", max_calls=6))
-        blocked = await sandbox.execute(_case("again", max_calls=6))
+        evidence = await environment.execute(_case("work", max_calls=6))
+        blocked = await environment.execute(_case("again", max_calls=6))
 
     assert evidence.lifecycle.failed_phase == "execute_turn"
-    assert evidence.lifecycle.failure_code == "sandbox_lifecycle_error"
-    assert evidence.lifecycle.failure_reason == "sandbox lifecycle failed"
+    assert evidence.lifecycle.failure_code == "environment_lifecycle_error"
+    assert evidence.lifecycle.failure_reason == "environment lifecycle failed"
     assert evidence.lifecycle.delivery == "uncertain"
-    assert evidence.lifecycle.sandbox_state_uncertain is True
+    assert evidence.lifecycle.environment_state_uncertain is True
     assert blocked.lifecycle.failed_phase == "blocked_state_uncertain"
     assert secret not in evidence.model_dump_json()
 
 
-async def test_sandbox_identity_mismatch_stops_before_execute() -> None:
+async def test_environment_identity_mismatch_stops_before_execute() -> None:
     requests: list[str] = []
     reset_calls = 0
 
@@ -790,7 +792,7 @@ async def test_sandbox_identity_mismatch_stops_before_execute() -> None:
         return _raw_response(
             json.dumps(
                 {
-                    "sandbox_id": "production",
+                    "environment_id": "production",
                     "generation": reset_calls,
                     "clean": True,
                     "reset_session": True,
@@ -800,16 +802,16 @@ async def test_sandbox_identity_mismatch_stops_before_execute() -> None:
         )
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
-        sandbox = JsonHttpSandboxConnection.from_config(
-            _config(), sandbox_confirmed=True, max_sandbox_api_calls=6, client=client
+        environment = JsonHttpEnvironmentConnection.from_config(
+            _config(), test_environment_confirmed=True, max_environment_api_calls=6, client=client
         )
-        evidence = await sandbox.execute(_case("work", max_calls=6))
+        evidence = await environment.execute(_case("work", max_calls=6))
 
     assert evidence.lifecycle.failed_phase == "reset"
     assert evidence.lifecycle.failure_reason == (
-        "HTTP sandbox identity did not match its configuration"
+        "HTTP environment identity did not match its configuration"
     )
-    assert evidence.lifecycle.sandbox_state_uncertain is True
+    assert evidence.lifecycle.environment_state_uncertain is True
     assert evidence.lifecycle.cleanup == "not_attempted"
     assert requests == ["/reset"]
 
@@ -826,7 +828,7 @@ async def test_stale_execute_response_is_rejected_and_quarantined(
         nonlocal generation
         request_body = json.loads(request.content)
         response_body: dict[str, JsonValue] = {
-            "sandbox_id": "payments-test",
+            "environment_id": "payments-test",
             "case_id": request_body["case_id"],
         }
         if request.url.path == "/reset":
@@ -849,37 +851,37 @@ async def test_stale_execute_response_is_rejected_and_quarantined(
         return _raw_response(json.dumps(response_body).encode())
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(stale_handler)) as client:
-        sandbox = JsonHttpSandboxConnection.from_config(
-            _config(), sandbox_confirmed=True, max_sandbox_api_calls=10, client=client
+        environment = JsonHttpEnvironmentConnection.from_config(
+            _config(), test_environment_confirmed=True, max_environment_api_calls=10, client=client
         )
-        failed = await sandbox.execute(_case("work", max_calls=6))
-        blocked = await sandbox.execute(_case("again", max_calls=6))
+        failed = await environment.execute(_case("work", max_calls=6))
+        blocked = await environment.execute(_case("again", max_calls=6))
 
     assert failed.lifecycle.failed_phase == failed_phase
     assert failed.lifecycle.delivery == "uncertain"
-    assert failed.lifecycle.sandbox_state_uncertain is True
+    assert failed.lifecycle.environment_state_uncertain is True
     assert blocked.lifecycle.failed_phase == "blocked_state_uncertain"
 
 
 async def test_reserves_complete_budget_before_network() -> None:
     handler, requests = _successful_handler()
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
-        sandbox = JsonHttpSandboxConnection.from_config(
-            _config(), sandbox_confirmed=True, max_sandbox_api_calls=5, client=client
+        environment = JsonHttpEnvironmentConnection.from_config(
+            _config(), test_environment_confirmed=True, max_environment_api_calls=5, client=client
         )
         with pytest.raises(RuntimeError, match="API call budget exhausted"):
-            await sandbox.execute(_case("work", max_calls=6))
+            await environment.execute(_case("work", max_calls=6))
     assert requests == []
 
 
 async def test_loader_and_headers_do_not_persist_credential(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setenv("UL_SANDBOX_TEST_AGENT_TOKEN", "Bearer private-token")
-    config_path = tmp_path / "sandbox.json"
+    monkeypatch.setenv("UL_ENVIRONMENT_TEST_AGENT_TOKEN", "Bearer private-token")
+    config_path = tmp_path / "environment.json"
     config_path.write_text(
         _config(
-            headers_from_env={"Authorization": "UL_SANDBOX_TEST_AGENT_TOKEN"}
+            headers_from_env={"Authorization": "UL_ENVIRONMENT_TEST_AGENT_TOKEN"}
         ).model_dump_json(),
         encoding="utf-8",
     )
@@ -890,12 +892,12 @@ async def test_loader_and_headers_do_not_persist_credential(
         authorizations.append(request.headers.get("authorization"))
         return handler(request)
 
-    config = load_json_http_sandbox_config(config_path)
+    config = load_json_http_environment_config(config_path)
     async with httpx.AsyncClient(transport=httpx.MockTransport(recording_handler)) as client:
-        sandbox = JsonHttpSandboxConnection.from_config(
-            config, sandbox_confirmed=True, max_sandbox_api_calls=6, client=client
+        environment = JsonHttpEnvironmentConnection.from_config(
+            config, test_environment_confirmed=True, max_environment_api_calls=6, client=client
         )
-        evidence = await sandbox.execute(_case("hello", max_calls=6))
+        evidence = await environment.execute(_case("hello", max_calls=6))
 
     assert authorizations == ["Bearer private-token"] * 6
     assert "private-token" not in evidence.model_dump_json()
@@ -906,26 +908,26 @@ async def test_rejects_non_ascii_header_value_before_network(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     secret = "Bearer s\N{LATIN SMALL LETTER E WITH ACUTE}cret"
-    monkeypatch.setenv("UL_SANDBOX_TEST_AGENT_TOKEN", secret)
+    monkeypatch.setenv("UL_ENVIRONMENT_TEST_AGENT_TOKEN", secret)
 
     with pytest.raises(
-        RuntimeError, match="sandbox API header environment variable is invalid"
+        RuntimeError, match="environment API header environment variable is invalid"
     ) as error:
-        JsonHttpSandboxConnection.from_config(
-            _config(headers_from_env={"Authorization": "UL_SANDBOX_TEST_AGENT_TOKEN"}),
-            sandbox_confirmed=True,
+        JsonHttpEnvironmentConnection.from_config(
+            _config(headers_from_env={"Authorization": "UL_ENVIRONMENT_TEST_AGENT_TOKEN"}),
+            test_environment_confirmed=True,
         )
 
     assert secret not in str(error.value)
 
 
-async def test_rejects_header_credentials_outside_sandbox_namespace(
+async def test_rejects_header_credentials_outside_environment_namespace(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     secret = "ambient-cloud-secret"
     monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", secret)
 
-    with pytest.raises(ValidationError, match="UL_SANDBOX_ namespace") as error:
+    with pytest.raises(ValidationError, match="UL_ENVIRONMENT_ namespace") as error:
         _config(headers_from_env={"Authorization": "AWS_SECRET_ACCESS_KEY"})
 
     assert secret not in str(error.value)
@@ -935,7 +937,7 @@ async def test_rejects_cross_origin_lifecycle() -> None:
     raw = _config().model_dump(mode="json")
     raw["snapshot"]["url"] = "https://other.example.test/snapshot"
     with pytest.raises(ValidationError, match="same origin"):
-        JsonHttpSandboxConfig.model_validate(raw)
+        JsonHttpEnvironmentConfig.model_validate(raw)
 
 
 async def test_rejects_endpoint_http_client_cannot_parse() -> None:
@@ -943,7 +945,7 @@ async def test_rejects_endpoint_http_client_cannot_parse() -> None:
     for lifecycle_name in ("reset", "setup", "execute_turn", "snapshot"):
         raw[lifecycle_name]["url"] = "https://é_foo.example/reset"
     with pytest.raises(ValidationError, match="valid HTTP"):
-        JsonHttpSandboxConfig.model_validate(raw)
+        JsonHttpEnvironmentConfig.model_validate(raw)
 
 
 @pytest.mark.parametrize(
@@ -955,10 +957,10 @@ async def test_rejects_endpoint_http_client_cannot_parse() -> None:
     ),
 )
 async def test_loader_rejects_adversarial_json(tmp_path: Path, encoded_config: bytes) -> None:
-    config_path = tmp_path / "sandbox.json"
+    config_path = tmp_path / "environment.json"
     config_path.write_bytes(encoded_config)
     with pytest.raises(ValueError, match="invalid JSON"):
-        load_json_http_sandbox_config(config_path)
+        load_json_http_environment_config(config_path)
 
 
 async def test_loader_rejects_symlink_and_fifo(tmp_path: Path) -> None:
@@ -967,28 +969,28 @@ async def test_loader_rejects_symlink_and_fifo(tmp_path: Path) -> None:
     symlink_path = tmp_path / "link.json"
     symlink_path.symlink_to(real_path)
     with pytest.raises(RuntimeError, match="could not be read"):
-        load_json_http_sandbox_config(symlink_path)
+        load_json_http_environment_config(symlink_path)
 
     fifo_path = tmp_path / "config.fifo"
     os.mkfifo(fifo_path)
     with pytest.raises(RuntimeError, match="could not be read"):
-        load_json_http_sandbox_config(fifo_path)
+        load_json_http_environment_config(fifo_path)
 
 
 async def test_requires_confirmation_and_explicit_insecure_transport_opt_in() -> None:
-    with pytest.raises(ValueError, match="isolation attestation"):
-        JsonHttpSandboxConnection.from_config(_config(), sandbox_confirmed=False)
+    with pytest.raises(ValueError, match="test-environment confirmation"):
+        JsonHttpEnvironmentConnection.from_config(_config(), test_environment_confirmed=False)
     with pytest.raises(ValueError, match="insecure transport opt-in"):
-        JsonHttpSandboxConnection.from_config(
-            _config("http://sandbox.example.test"), sandbox_confirmed=True
+        JsonHttpEnvironmentConnection.from_config(
+            _config("http://environment.example.test"), test_environment_confirmed=True
         )
 
 
 async def test_public_validation_resolves_headers(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("UL_SANDBOX_TEST_AGENT_TOKEN", "private-token")
-    assert validate_json_http_sandbox_configuration(
-        _config(headers_from_env={"Authorization": "UL_SANDBOX_TEST_AGENT_TOKEN"}),
-        sandbox_confirmed=True,
+    monkeypatch.setenv("UL_ENVIRONMENT_TEST_AGENT_TOKEN", "private-token")
+    assert validate_json_http_environment_configuration(
+        _config(headers_from_env={"Authorization": "UL_ENVIRONMENT_TEST_AGENT_TOKEN"}),
+        test_environment_confirmed=True,
     ) == {"Authorization": "private-token"}
 
 
@@ -1005,7 +1007,7 @@ async def test_cancellation_during_execution_quarantines_connection() -> None:
             return _raw_response(
                 json.dumps(
                     {
-                        "sandbox_id": "payments-test",
+                        "environment_id": "payments-test",
                         "case_id": body["case_id"],
                         "generation": generation,
                         "clean": True,
@@ -1016,7 +1018,7 @@ async def test_cancellation_during_execution_quarantines_connection() -> None:
             )
         if request.url.path == "/setup":
             return _raw_response(
-                json.dumps({"sandbox_id": "payments-test", "case_id": body["case_id"]}).encode()
+                json.dumps({"environment_id": "payments-test", "case_id": body["case_id"]}).encode()
             )
         if request.url.path == "/execute":
             execute_started.set()
@@ -1024,7 +1026,7 @@ async def test_cancellation_during_execution_quarantines_connection() -> None:
         return _raw_response(
             json.dumps(
                 {
-                    "sandbox_id": "payments-test",
+                    "environment_id": "payments-test",
                     "case_id": body["case_id"],
                     "turn_id": body["turn_id"],
                     "state": {},
@@ -1033,15 +1035,15 @@ async def test_cancellation_during_execution_quarantines_connection() -> None:
         )
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
-        sandbox = JsonHttpSandboxConnection.from_config(
-            _config(), sandbox_confirmed=True, max_sandbox_api_calls=10, client=client
+        environment = JsonHttpEnvironmentConnection.from_config(
+            _config(), test_environment_confirmed=True, max_environment_api_calls=10, client=client
         )
-        task = asyncio.create_task(sandbox.execute(_case("work", max_calls=6)))
+        task = asyncio.create_task(environment.execute(_case("work", max_calls=6)))
         await execute_started.wait()
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await task
-        blocked = await sandbox.execute(_case("again", max_calls=6))
+        blocked = await environment.execute(_case("again", max_calls=6))
 
     assert blocked.lifecycle.failed_phase == "blocked_state_uncertain"
 
@@ -1059,7 +1061,7 @@ async def test_case_deadline_bounds_the_complete_lifecycle() -> None:
             return _raw_response(
                 json.dumps(
                     {
-                        "sandbox_id": "payments-test",
+                        "environment_id": "payments-test",
                         "case_id": body["case_id"],
                         "generation": generation,
                         "clean": True,
@@ -1070,7 +1072,7 @@ async def test_case_deadline_bounds_the_complete_lifecycle() -> None:
             )
         if request.url.path == "/setup":
             return _raw_response(
-                json.dumps({"sandbox_id": "payments-test", "case_id": body["case_id"]}).encode()
+                json.dumps({"environment_id": "payments-test", "case_id": body["case_id"]}).encode()
             )
         if request.url.path == "/execute":
             execute_started.set()
@@ -1078,7 +1080,7 @@ async def test_case_deadline_bounds_the_complete_lifecycle() -> None:
         return _raw_response(
             json.dumps(
                 {
-                    "sandbox_id": "payments-test",
+                    "environment_id": "payments-test",
                     "case_id": body["case_id"],
                     "turn_id": body["turn_id"],
                     "state": {},
@@ -1087,13 +1089,13 @@ async def test_case_deadline_bounds_the_complete_lifecycle() -> None:
         )
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
-        sandbox = JsonHttpSandboxConnection.from_config(
-            _config(), sandbox_confirmed=True, max_sandbox_api_calls=10, client=client
+        environment = JsonHttpEnvironmentConnection.from_config(
+            _config(), test_environment_confirmed=True, max_environment_api_calls=10, client=client
         )
         short_case = _case("work", max_calls=6).model_copy(update={"timeout_seconds": 0.01})
         with pytest.raises(TimeoutError):
-            await sandbox.execute(short_case)
+            await environment.execute(short_case)
         assert execute_started.is_set()
-        blocked = await sandbox.execute(_case("again", max_calls=6))
+        blocked = await environment.execute(_case("again", max_calls=6))
 
     assert blocked.lifecycle.failed_phase == "blocked_state_uncertain"

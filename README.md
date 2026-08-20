@@ -3,7 +3,7 @@
 [![CI](https://github.com/yuvalmoscovitz/ul/actions/workflows/ci.yml/badge.svg)](https://github.com/yuvalmoscovitz/ul/actions/workflows/ci.yml)
 
 UL finds consequential failures in high-risk AI agents. It takes recorded interactions, creates
-realistic variations, runs them against an isolated customer-owned sandbox, and produces evidence
+realistic variations, runs them against a customer-provided environment, and produces evidence
 for human review.
 
 UL does not test production systems, decide which behavior is correct, prove causality, or estimate
@@ -33,23 +33,23 @@ Configure UL once:
 
 ```bash
 ul init interactions.jsonl \
-  --sandbox-url https://your-sandbox.example \
-  --allow-sandbox-network-egress \
-  --confirm-isolated-sandbox
+  --environment-url https://your-environment.example \
+  --allow-environment-network \
+  --confirm-test-environment
 ```
 
-The generated `.ul/sandbox.json` defines the adapter contract. Your isolated sandbox must implement
+The generated `.ul/environment.json` defines the adapter contract. Your environment must implement
 its reset, execute-turn, and snapshot requests. Reset asks separately for a fresh agent session and
 a clean external environment; both are required by default. If you already have a custom mapping, use
-`--sandbox-config sandbox.json` instead of `--sandbox-url`.
+`--environment-config environment.json` instead of `--environment-url`.
 
 Verify the adapter before spending money on model calls:
 
 ```bash
-ul sandbox check .ul/sandbox.json \
-  --probe "Return sandbox health only; do not take action." \
-  --allow-sandbox-network-egress \
-  --confirm-isolated-sandbox \
+ul environment check .ul/environment.json \
+  --probe "Return environment health only; do not take action." \
+  --allow-environment-network \
+  --confirm-test-environment \
   --confirm-harmless-probe
 
 ul run --dry-run
@@ -80,7 +80,7 @@ ul run --limit 3 --repetitions 3 --operator input.surface.rephrase
 ```text
 recorded interaction
   → realistic input variation
-  → fresh sandbox runs for original and variation
+  → fresh environment runs for original and variation
   → comparison of responses and committed state
   → evidence for human review
   → confirmed regression case
@@ -92,12 +92,12 @@ Every repetition uses this lifecycle:
 reset → optional setup → initial snapshot → execute turn → snapshot → cleanup reset
 ```
 
-UL only calls the configured customer-owned sandbox. The sandbox is responsible for isolation,
+UL only calls the configured customer-owned environment. The environment is responsible for isolation,
 deterministic reset, and preventing real business effects.
 
 ## Review and regressions
 
-`ul report` is offline. It makes no model or sandbox calls.
+`ul report` is offline. It makes no model or environment calls.
 
 ```bash
 ul report
@@ -122,15 +122,15 @@ Save a confirmed finding as a regression:
 ```bash
 ul regression save EVIDENCE.jsonl FINDING_ID \
   --rule RULE_ID \
-  --sandbox-config .ul/sandbox.json \
+  --environment-config .ul/environment.json \
   --output regressions/finding.json \
   --confirm-versioned-input
 
 ul regression run regressions \
-  --sandbox-config .ul/sandbox.json \
-  --allow-sandbox-network-egress \
-  --confirm-isolated-sandbox \
-  --max-sandbox-api-calls 100 \
+  --environment-config .ul/environment.json \
+  --allow-environment-network \
+  --confirm-test-environment \
+  --max-environment-api-calls 100 \
   --output regression-results.jsonl
 ```
 
@@ -141,8 +141,8 @@ Project defaults are saved by `ul init`. Common options include:
 - `--invariants invariants.json` for deterministic customer rules.
 - `--redaction-policy redaction.json --redaction-state STATE` for provider-boundary redaction.
 - `--no-save-augmentations` when local augmentation retention is prohibited.
-- `--allow-insecure-http` for an exact local HTTP sandbox.
-- `--limit`, `--repetitions`, `--operator`, and `--max-sandbox-api-calls` for run scope.
+- `--allow-insecure-http` for an exact local HTTP environment.
+- `--limit`, `--repetitions`, `--operator`, and `--max-environment-api-calls` for run scope.
 
 ### State-transition rules
 
@@ -186,7 +186,7 @@ export UL_LIVE=true
 ```
 
 Secrets belong in environment variables or a secret manager, never in datasets or configuration
-files. Sandbox header mappings may reference only dedicated `UL_SANDBOX_*` environment variables.
+files. Environment header mappings may reference only dedicated `UL_ENVIRONMENT_*` environment variables.
 
 ## Traces and stateful stress
 
@@ -204,7 +204,7 @@ ul dataset ingest otlp traces.json \
   --replay-output trace-replay.json
 
 ul stress trace trace-replay.json \
-  --sandbox-config .ul/sandbox.json \
+  --environment-config .ul/environment.json \
   --case-id CASE_ID \
   --dry-run
 ```

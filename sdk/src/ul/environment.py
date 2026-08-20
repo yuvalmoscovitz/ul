@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 
-from ul_core.contracts import SandboxExecutor
+from ul_core.contracts import EnvironmentExecutor
 from ul_core.dataset import ObservedAgentOutput
 from ul_core.evaluation import EvaluationCase, ExecutionEvidence, StateObservationAuthority
 from ul_core.models import ConversationRole, ConversationTurn
@@ -12,7 +12,7 @@ def evaluation_case_from_inputs(
     *,
     case_id: str,
     raw_inputs: Iterable[str],
-    max_sandbox_api_calls: int,
+    max_environment_api_calls: int,
     timeout_seconds: float,
     required_state_observation_authority: StateObservationAuthority | None = None,
     required_state_observer_id: str | None = None,
@@ -27,7 +27,7 @@ def evaluation_case_from_inputs(
             )
             for index, raw_input in enumerate(raw_inputs, start=1)
         ),
-        max_sandbox_api_calls=max_sandbox_api_calls,
+        max_environment_api_calls=max_environment_api_calls,
         timeout_seconds=timeout_seconds,
         required_state_observation_authority=required_state_observation_authority,
         required_state_observer_id=required_state_observer_id,
@@ -36,19 +36,19 @@ def evaluation_case_from_inputs(
 
 def validate_execution_evidence(
     case: EvaluationCase,
-    sandbox: SandboxExecutor,
+    environment: EnvironmentExecutor,
     evidence: ExecutionEvidence,
 ) -> None:
     if evidence.case_id != case.id:
-        raise ValueError("sandbox evidence does not match the requested case")
-    if evidence.sandbox_id != sandbox.sandbox_id:
-        raise ValueError("sandbox evidence identity does not match the connection")
-    if evidence.sandbox_config_sha256 != sandbox.config_sha256:
-        raise ValueError("sandbox evidence config does not match the connection")
+        raise ValueError("environment evidence does not match the requested case")
+    if evidence.environment_id != environment.environment_id:
+        raise ValueError("environment evidence identity does not match the connection")
+    if evidence.environment_config_sha256 != environment.config_sha256:
+        raise ValueError("environment evidence config does not match the connection")
     requested_event = case.timeout_after_commit_event
     event_evidence = evidence.timeout_after_commit_event
     if (requested_event is None) != (event_evidence is None):
-        raise ValueError("sandbox event evidence does not match the requested case")
+        raise ValueError("environment event evidence does not match the requested case")
     if requested_event is not None and event_evidence is not None:
         if (
             event_evidence.operator_id,
@@ -63,49 +63,54 @@ def validate_execution_evidence(
             requested_event.turn_id,
             requested_event.action_id,
         ):
-            raise ValueError("sandbox event evidence does not match the requested event")
-        if sandbox.capabilities.timeout_after_commit_version != requested_event.operator_version:
-            raise ValueError("sandbox event evidence does not match its advertised capability")
+            raise ValueError("environment event evidence does not match the requested event")
+        if (
+            environment.capabilities.timeout_after_commit_version
+            != requested_event.operator_version
+        ):
+            raise ValueError("environment event evidence does not match its advertised capability")
         if evidence.lifecycle.terminal_status == "succeeded" and (
             not event_evidence.armed
             or event_evidence.trigger_status == "unknown"
             or not event_evidence.cleaned
         ):
-            raise ValueError("successful sandbox evidence contains an incomplete event lifecycle")
+            raise ValueError(
+                "successful environment evidence contains an incomplete event lifecycle"
+            )
     expected_turn_ids = tuple(turn.id for turn in case.turns)
     evidence_turn_ids = tuple(turn.turn_id for turn in evidence.turns)
     if evidence.lifecycle.terminal_status == "succeeded" and evidence_turn_ids != expected_turn_ids:
-        raise ValueError("sandbox evidence turns do not match the requested case")
+        raise ValueError("environment evidence turns do not match the requested case")
     if any(turn_id not in expected_turn_ids for turn_id in evidence_turn_ids):
-        raise ValueError("sandbox evidence contains a turn outside the requested case")
+        raise ValueError("environment evidence contains a turn outside the requested case")
     if case.required_state_observation_authority is not None and (
         evidence.lifecycle.terminal_status == "succeeded"
         and any(turn.state_snapshot is None for turn in evidence.turns)
     ):
-        raise ValueError("sandbox evidence omitted a required state observation")
+        raise ValueError("environment evidence omitted a required state observation")
     if (
         case.required_state_observation_authority is not None
-        and sandbox.capabilities.state_observation_authority
+        and environment.capabilities.state_observation_authority
         != case.required_state_observation_authority
     ):
-        raise ValueError("sandbox state authority does not match the evaluation case")
+        raise ValueError("environment state authority does not match the evaluation case")
     if (
         case.required_state_observer_id is not None
-        and sandbox.capabilities.state_observer_id != case.required_state_observer_id
+        and environment.capabilities.state_observer_id != case.required_state_observer_id
     ):
-        raise ValueError("sandbox state observer does not match the evaluation case")
+        raise ValueError("environment state observer does not match the evaluation case")
     for state_evidence in (evidence.initial_state, evidence.final_state):
         if state_evidence is not None and (
-            state_evidence.authority != sandbox.capabilities.state_observation_authority
-            or state_evidence.observer_id != sandbox.capabilities.state_observer_id
+            state_evidence.authority != environment.capabilities.state_observation_authority
+            or state_evidence.observer_id != environment.capabilities.state_observer_id
         ):
-            raise ValueError("sandbox state evidence authority does not match its capabilities")
+            raise ValueError("environment state evidence authority does not match its capabilities")
     for turn in evidence.turns:
         if turn.state_snapshot is not None and (
-            turn.state_observation_authority != sandbox.capabilities.state_observation_authority
-            or turn.state_observer_id != sandbox.capabilities.state_observer_id
+            turn.state_observation_authority != environment.capabilities.state_observation_authority
+            or turn.state_observer_id != environment.capabilities.state_observer_id
         ):
-            raise ValueError("sandbox state evidence authority does not match its capabilities")
+            raise ValueError("environment state evidence authority does not match its capabilities")
 
 
 def observed_outputs_from_evidence(
@@ -147,7 +152,7 @@ def execution_evidence_requires_quarantine(evidence: ExecutionEvidence) -> bool:
     return (
         lifecycle.delivery == "uncertain"
         or lifecycle.cleanup == "failed"
-        or lifecycle.sandbox_state_uncertain
+        or lifecycle.environment_state_uncertain
         or (
             evidence.timeout_after_commit_event is not None
             and evidence.timeout_after_commit_event.armed

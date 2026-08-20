@@ -11,7 +11,7 @@ from typing import Any
 import pytest
 from rich.text import Text
 from typer.testing import CliRunner
-from ul.http_sandbox import JsonHttpSandboxConnection
+from ul.http_environment import JsonHttpEnvironmentConnection
 from ul_cli.main import app
 
 runner = CliRunner()
@@ -19,9 +19,9 @@ runner = CliRunner()
 _RESULT_KEYS = {
     "schema_version",
     "status",
-    "sandbox_id",
-    "sandbox_config_sha256",
-    "sandbox_api_call_budget",
+    "environment_id",
+    "environment_config_sha256",
+    "environment_api_call_budget",
     "completed_phases",
     "state_observation_authority",
     "failed_phase",
@@ -32,7 +32,7 @@ _RESULT_KEYS = {
     "cleanup",
     "cleanup_failure_code",
     "cleanup_failure_reason",
-    "sandbox_state_uncertain",
+    "environment_state_uncertain",
     "initial_reset",
     "cleanup_reset",
     "probe_and_observations",
@@ -44,7 +44,7 @@ def _plain(output: str) -> str:
     return Text.from_ansi(output).plain
 
 
-class _SandboxServer(ThreadingHTTPServer):
+class _EnvironmentServer(ThreadingHTTPServer):
     requests: list[tuple[str, dict[str, Any]]]
     generation: int
     execute_content_type: str
@@ -54,25 +54,25 @@ class _SandboxServer(ThreadingHTTPServer):
 
 
 @contextmanager
-def _sandbox_server(
+def _environment_server(
     *,
     execute_content_type: str = "application/json",
     execute_status: int = 200,
     cleanup_generation_changes: bool = True,
     reset_env_acknowledged: bool = True,
-) -> Iterator[_SandboxServer]:
+) -> Iterator[_EnvironmentServer]:
     class Handler(BaseHTTPRequestHandler):
         def do_POST(self) -> None:
             content_length = int(self.headers["Content-Length"])
             request_body = json.loads(self.rfile.read(content_length))
             server = self.server
-            assert isinstance(server, _SandboxServer)
+            assert isinstance(server, _EnvironmentServer)
             server.requests.append((self.path, request_body))
             if self.path == "/reset":
                 if server.generation == 0 or server.cleanup_generation_changes:
                     server.generation += 1
                 response = {
-                    "sandbox_id": "check-sandbox",
+                    "environment_id": "check-environment",
                     "case_id": request_body["case_id"],
                     "generation": server.generation,
                     "clean": True,
@@ -81,19 +81,19 @@ def _sandbox_server(
                 }
             elif self.path == "/setup":
                 response = {
-                    "sandbox_id": "check-sandbox",
+                    "environment_id": "check-environment",
                     "case_id": request_body["case_id"],
                 }
             elif self.path == "/execute":
                 response = {
-                    "sandbox_id": "check-sandbox",
+                    "environment_id": "check-environment",
                     "case_id": request_body["case_id"],
                     "turn_id": request_body["turn_id"],
                     "response": {"private_response": "not for terminal"},
                 }
             elif self.path == "/snapshot":
                 response = {
-                    "sandbox_id": "check-sandbox",
+                    "environment_id": "check-environment",
                     "case_id": request_body["case_id"],
                     "turn_id": request_body["turn_id"],
                     "state": {"private_state": "not for terminal"},
@@ -115,7 +115,7 @@ def _sandbox_server(
         def log_message(self, format: str, *args: object) -> None:
             return
 
-    server = _SandboxServer(("127.0.0.1", 0), Handler)
+    server = _EnvironmentServer(("127.0.0.1", 0), Handler)
     server.requests = []
     server.generation = 0
     server.execute_content_type = execute_content_type
@@ -132,19 +132,19 @@ def _sandbox_server(
         server.server_close()
 
 
-def _write_config(tmp_path: Path, server: _SandboxServer) -> Path:
+def _write_config(tmp_path: Path, server: _EnvironmentServer) -> Path:
     base_url = f"http://127.0.0.1:{server.server_port}"
-    config = tmp_path / "sandbox.json"
+    config = tmp_path / "environment.json"
     config.write_text(
         json.dumps(
             {
-                "version": 4,
-                "sandbox_id": "check-sandbox",
+                "version": 5,
+                "environment_id": "check-environment",
                 "headers_from_env": {},
                 "reset": {
                     "url": f"{base_url}/reset",
                     "request_json_template": {"case_id": "{{case_id}}"},
-                    "sandbox_id_json_pointer": "/sandbox_id",
+                    "environment_id_json_pointer": "/environment_id",
                     "case_id_json_pointer": "/case_id",
                     "generation_json_pointer": "/generation",
                     "clean_state_json_pointer": "/clean",
@@ -153,7 +153,7 @@ def _write_config(tmp_path: Path, server: _SandboxServer) -> Path:
                 "setup": {
                     "url": f"{base_url}/setup",
                     "request_json_template": {"case_id": "{{case_id}}"},
-                    "sandbox_id_json_pointer": "/sandbox_id",
+                    "environment_id_json_pointer": "/environment_id",
                     "case_id_json_pointer": "/case_id",
                 },
                 "execute_turn": {
@@ -164,7 +164,7 @@ def _write_config(tmp_path: Path, server: _SandboxServer) -> Path:
                         "input": "{{input}}",
                     },
                     "response_json_pointer": "/response",
-                    "sandbox_id_json_pointer": "/sandbox_id",
+                    "environment_id_json_pointer": "/environment_id",
                     "case_id_json_pointer": "/case_id",
                     "turn_id_json_pointer": "/turn_id",
                 },
@@ -175,7 +175,7 @@ def _write_config(tmp_path: Path, server: _SandboxServer) -> Path:
                         "turn_id": "{{turn_id}}",
                     },
                     "response_json_pointer": "/state",
-                    "sandbox_id_json_pointer": "/sandbox_id",
+                    "environment_id_json_pointer": "/environment_id",
                     "case_id_json_pointer": "/case_id",
                     "turn_id_json_pointer": "/turn_id",
                 },
@@ -188,13 +188,13 @@ def _write_config(tmp_path: Path, server: _SandboxServer) -> Path:
 
 def _check_arguments(config: Path, *, output_json: bool = False) -> list[str]:
     arguments = [
-        "sandbox",
+        "environment",
         "check",
         str(config),
         "--probe",
         "connection check only",
-        "--allow-sandbox-network-egress",
-        "--confirm-isolated-sandbox",
+        "--allow-environment-network",
+        "--confirm-test-environment",
         "--confirm-harmless-probe",
         "--allow-insecure-http",
     ]
@@ -204,7 +204,7 @@ def _check_arguments(config: Path, *, output_json: bool = False) -> list[str]:
 
 
 def test_check_runs_complete_model_free_lifecycle(tmp_path: Path) -> None:
-    with _sandbox_server() as server:
+    with _environment_server() as server:
         config = _write_config(tmp_path, server)
         result = runner.invoke(app, _check_arguments(config, output_json=True))
 
@@ -212,7 +212,7 @@ def test_check_runs_complete_model_free_lifecycle(tmp_path: Path) -> None:
     summary = json.loads(result.output)
     assert set(summary) == _RESULT_KEYS
     assert summary["status"] == "ready"
-    assert summary["sandbox_api_call_budget"] == 6
+    assert summary["environment_api_call_budget"] == 6
     assert summary["ul_semantic_model_calls"] == 0
     assert summary["probe_and_observations"] == "not_printed"
     assert "connection check only" not in result.output
@@ -235,7 +235,7 @@ def test_check_runs_complete_model_free_lifecycle(tmp_path: Path) -> None:
 
 
 def test_check_reports_precise_phase_and_protocol_error(tmp_path: Path) -> None:
-    with _sandbox_server(execute_content_type="text/plain") as server:
+    with _environment_server(execute_content_type="text/plain") as server:
         config = _write_config(tmp_path, server)
         result = runner.invoke(app, _check_arguments(config, output_json=True))
 
@@ -259,7 +259,7 @@ def test_check_reports_precise_phase_and_protocol_error(tmp_path: Path) -> None:
 def test_check_blocks_execution_when_environment_reset_is_not_acknowledged(
     tmp_path: Path,
 ) -> None:
-    with _sandbox_server(reset_env_acknowledged=False) as server:
+    with _environment_server(reset_env_acknowledged=False) as server:
         config = _write_config(tmp_path, server)
         result = runner.invoke(app, _check_arguments(config, output_json=True))
 
@@ -271,7 +271,7 @@ def test_check_blocks_execution_when_environment_reset_is_not_acknowledged(
 
 
 def test_check_reports_authentication_rejection(tmp_path: Path) -> None:
-    with _sandbox_server(execute_status=401) as server:
+    with _environment_server(execute_status=401) as server:
         config = _write_config(tmp_path, server)
         result = runner.invoke(app, _check_arguments(config, output_json=True))
 
@@ -279,12 +279,12 @@ def test_check_reports_authentication_rejection(tmp_path: Path) -> None:
     summary = json.loads(result.output)
     assert summary["failed_phase"] == "execute_turn"
     assert summary["error_code"] == "authentication_rejected"
-    assert summary["reason"] == "sandbox API returned HTTP 401"
+    assert summary["reason"] == "environment API returned HTTP 401"
     assert summary["cleanup"] == "succeeded"
 
 
 def test_check_reports_cleanup_failure_and_uncertain_state(tmp_path: Path) -> None:
-    with _sandbox_server(cleanup_generation_changes=False) as server:
+    with _environment_server(cleanup_generation_changes=False) as server:
         config = _write_config(tmp_path, server)
         result = runner.invoke(app, _check_arguments(config, output_json=True))
 
@@ -293,11 +293,11 @@ def test_check_reports_cleanup_failure_and_uncertain_state(tmp_path: Path) -> No
     assert summary["failed_phase"] == "cleanup_reset"
     assert summary["error_code"] == "reset_generation_reused"
     assert summary["cleanup"] == "failed"
-    assert summary["sandbox_state_uncertain"] is True
+    assert summary["environment_state_uncertain"] is True
 
 
 def test_check_without_setup_uses_five_calls(tmp_path: Path) -> None:
-    with _sandbox_server() as server:
+    with _environment_server() as server:
         config = _write_config(tmp_path, server)
         raw_config = json.loads(config.read_text(encoding="utf-8"))
         raw_config["setup"] = None
@@ -305,7 +305,7 @@ def test_check_without_setup_uses_five_calls(tmp_path: Path) -> None:
         result = runner.invoke(app, _check_arguments(config, output_json=True))
 
     assert result.exit_code == 0, result.output
-    assert json.loads(result.output)["sandbox_api_call_budget"] == 5
+    assert json.loads(result.output)["environment_api_call_budget"] == 5
     assert [path for path, _ in server.requests] == [
         "/reset",
         "/snapshot",
@@ -318,11 +318,11 @@ def test_check_without_setup_uses_five_calls(tmp_path: Path) -> None:
 def test_check_reports_missing_credential_before_network(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.delenv("UL_SANDBOX_CHECK_TOKEN", raising=False)
-    with _sandbox_server() as server:
+    monkeypatch.delenv("UL_ENVIRONMENT_CHECK_TOKEN", raising=False)
+    with _environment_server() as server:
         config = _write_config(tmp_path, server)
         raw_config = json.loads(config.read_text(encoding="utf-8"))
-        raw_config["headers_from_env"] = {"Authorization": "UL_SANDBOX_CHECK_TOKEN"}
+        raw_config["headers_from_env"] = {"Authorization": "UL_ENVIRONMENT_CHECK_TOKEN"}
         config.write_text(json.dumps(raw_config), encoding="utf-8")
         result = runner.invoke(app, _check_arguments(config, output_json=True))
 
@@ -331,7 +331,7 @@ def test_check_reports_missing_credential_before_network(
     assert set(summary) == _RESULT_KEYS
     assert summary["failed_phase"] == "preflight"
     assert summary["error_code"] == "credential_configuration"
-    assert summary["reason"] == "sandbox API header environment variable is not set"
+    assert summary["reason"] == "environment API header environment variable is not set"
     assert server.requests == []
 
 
@@ -339,11 +339,11 @@ def test_check_rejects_non_ascii_credential_before_network(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     secret = "Bearer s\N{LATIN SMALL LETTER E WITH ACUTE}cret"
-    monkeypatch.setenv("UL_SANDBOX_CHECK_TOKEN", secret)
-    with _sandbox_server() as server:
+    monkeypatch.setenv("UL_ENVIRONMENT_CHECK_TOKEN", secret)
+    with _environment_server() as server:
         config = _write_config(tmp_path, server)
         raw_config = json.loads(config.read_text(encoding="utf-8"))
-        raw_config["headers_from_env"] = {"Authorization": "UL_SANDBOX_CHECK_TOKEN"}
+        raw_config["headers_from_env"] = {"Authorization": "UL_ENVIRONMENT_CHECK_TOKEN"}
         config.write_text(json.dumps(raw_config), encoding="utf-8")
         result = runner.invoke(app, _check_arguments(config, output_json=True))
 
@@ -351,14 +351,14 @@ def test_check_rejects_non_ascii_credential_before_network(
     summary = json.loads(result.output)
     assert set(summary) == _RESULT_KEYS
     assert summary["error_code"] == "credential_configuration"
-    assert summary["reason"] == "sandbox API header environment variable is invalid"
+    assert summary["reason"] == "environment API header environment variable is invalid"
     assert secret not in result.output
     assert "Traceback" not in result.output
     assert server.requests == []
 
 
 def test_check_explains_insecure_local_transport_opt_in(tmp_path: Path) -> None:
-    with _sandbox_server() as server:
+    with _environment_server() as server:
         config = _write_config(tmp_path, server)
         arguments = _check_arguments(config, output_json=True)
         arguments.remove("--allow-insecure-http")
@@ -374,12 +374,12 @@ def test_check_explains_insecure_local_transport_opt_in(tmp_path: Path) -> None:
 def test_check_returns_safe_json_for_unexpected_execution_error(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    async def fail_without_evidence(self: JsonHttpSandboxConnection, case: object) -> object:
+    async def fail_without_evidence(self: JsonHttpEnvironmentConnection, case: object) -> object:
         del self, case
         raise ValueError("private execution detail")
 
-    monkeypatch.setattr(JsonHttpSandboxConnection, "execute", fail_without_evidence)
-    with _sandbox_server() as server:
+    monkeypatch.setattr(JsonHttpEnvironmentConnection, "execute", fail_without_evidence)
+    with _environment_server() as server:
         config = _write_config(tmp_path, server)
         result = runner.invoke(app, _check_arguments(config, output_json=True))
 
@@ -388,13 +388,13 @@ def test_check_returns_safe_json_for_unexpected_execution_error(
     assert set(summary) == _RESULT_KEYS
     assert summary["error_code"] == "unexpected_execution_error"
     assert summary["delivery"] == "uncertain"
-    assert summary["sandbox_state_uncertain"] is True
+    assert summary["environment_state_uncertain"] is True
     assert "private execution detail" not in result.output
     assert "Traceback" not in result.output
 
 
 def test_check_reports_invalid_config_as_safe_json(tmp_path: Path) -> None:
-    config = tmp_path / "sandbox.json"
+    config = tmp_path / "environment.json"
     config.write_text("{", encoding="utf-8")
 
     result = runner.invoke(app, _check_arguments(config, output_json=True))
@@ -402,12 +402,12 @@ def test_check_reports_invalid_config_as_safe_json(tmp_path: Path) -> None:
     assert result.exit_code == 2
     summary = json.loads(result.output)
     assert summary["failed_phase"] == "preflight"
-    assert summary["error_code"] == "sandbox_config_invalid"
-    assert summary["reason"] == "sandbox API config contains invalid JSON"
+    assert summary["error_code"] == "environment_config_invalid"
+    assert summary["reason"] == "environment API config contains invalid JSON"
 
 
 def test_check_rejects_non_utf8_probe_before_network(tmp_path: Path) -> None:
-    with _sandbox_server() as server:
+    with _environment_server() as server:
         config = _write_config(tmp_path, server)
         arguments = _check_arguments(config, output_json=True)
         arguments[arguments.index("--probe") + 1] = "\ud800"
@@ -423,7 +423,7 @@ def test_check_rejects_non_utf8_probe_before_network(tmp_path: Path) -> None:
 
 
 def test_check_sanitizes_config_errors_for_terminal(tmp_path: Path) -> None:
-    config = tmp_path / "sandbox.json"
+    config = tmp_path / "environment.json"
     config.write_text(json.dumps({"evil\u001bfield": True}), encoding="utf-8")
 
     result = runner.invoke(app, _check_arguments(config))
@@ -435,20 +435,20 @@ def test_check_sanitizes_config_errors_for_terminal(tmp_path: Path) -> None:
 
 
 def test_check_requires_explicit_safety_opt_ins_before_network(tmp_path: Path) -> None:
-    with _sandbox_server() as server:
+    with _environment_server() as server:
         config = _write_config(tmp_path, server)
         result = runner.invoke(
             app,
-            ["sandbox", "check", str(config), "--probe", "connection check only"],
+            ["environment", "check", str(config), "--probe", "connection check only"],
         )
 
     assert result.exit_code == 2
-    assert "--allow-sandbox-network-egress" in _plain(result.output)
+    assert "--allow-environment-network" in _plain(result.output)
     assert server.requests == []
 
 
 def test_check_help_states_scope_and_limits() -> None:
-    result = runner.invoke(app, ["sandbox", "check", "--help"], terminal_width=80)
+    result = runner.invoke(app, ["environment", "check", "--help"], terminal_width=160)
 
     assert result.exit_code == 0
     plain_output = _plain(result.output)
@@ -457,8 +457,8 @@ def test_check_help_states_scope_and_limits() -> None:
     assert "Attest" in plain_output
     required_safety_panel = plain_output.split("Required safety flags", 1)[1]
     for option in (
-        "--allow-sandbox-network-egress",
-        "--confirm-isolated-sandbox",
+        "--allow-environment-network",
+        "--confirm-test-environment",
         "--confirm-harmless-probe",
     ):
         assert option in required_safety_panel

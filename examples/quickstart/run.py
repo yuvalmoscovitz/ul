@@ -214,17 +214,17 @@ def main(
         bool,
         typer.Option(help="Validate the complete plan without model or target calls."),
     ] = False,
-    sandbox_check: Annotated[
+    environment_check: Annotated[
         bool,
         typer.Option(
-            "--sandbox-check",
-            help="Validate the local sandbox lifecycle without an API key or UL model calls.",
+            "--environment-check",
+            help="Validate the local environment lifecycle without an API key or UL model calls.",
         ),
     ] = False,
 ) -> None:
-    if dry_run and sandbox_check:
-        raise typer.BadParameter("--dry-run and --sandbox-check cannot be combined")
-    if sandbox_check:
+    if dry_run and environment_check:
+        raise typer.BadParameter("--dry-run and --environment-check cannot be combined")
+    if environment_check:
         subprocess_environment = {}
         if "PYTHONPATH" in os.environ:
             subprocess_environment["PYTHONPATH"] = os.environ["PYTHONPATH"]
@@ -261,18 +261,18 @@ def main(
 
         if server_thread is not None:
             server_thread.start()
-        if sandbox_check:
+        if environment_check:
             command = [
                 sys.executable,
                 "-m",
                 "ul_cli.main",
-                "sandbox",
+                "environment",
                 "check",
                 str(target_config_path),
                 "--probe",
                 "Pay AC-100.",
-                "--allow-sandbox-network-egress",
-                "--confirm-isolated-sandbox",
+                "--allow-environment-network",
+                "--confirm-test-environment",
                 "--confirm-harmless-probe",
                 "--allow-insecure-http",
             ]
@@ -284,7 +284,7 @@ def main(
                 "dataset",
                 "evaluate",
                 str(_DATASET_PATH),
-                "--sandbox-config",
+                "--environment-config",
                 str(target_config_path),
                 "--invariants",
                 str(_INVARIANTS_PATH),
@@ -294,12 +294,12 @@ def main(
                 "1",
                 "--repetitions",
                 "3",
-                "--max-sandbox-api-calls",
+                "--max-environment-api-calls",
                 "36",
                 "--output",
                 str(evidence_path),
-                "--allow-sandbox-network-egress",
-                "--confirm-isolated-sandbox",
+                "--allow-environment-network",
+                "--confirm-test-environment",
                 "--allow-insecure-http",
             ]
             if dry_run:
@@ -331,10 +331,10 @@ def main(
         typer.echo("Dry run complete. No model or target requests sent.")
         return
 
-    if sandbox_check:
+    if environment_check:
         if completed_process.returncode != 0:
             raise typer.Exit(code=completed_process.returncode)
-        typer.echo("Sandbox check complete. No API key or UL semantic-model calls used.")
+        typer.echo("Environment check complete. No API key or UL semantic-model calls used.")
         return
 
     if completed_process.returncode == 1 and _evidence_confirms_repeatable_wrong_invoice(

@@ -162,7 +162,7 @@ def main(
             "stress",
             "retry-after-successful-commit",
             str(_CASE_PATH),
-            "--sandbox-config",
+            "--environment-config",
             str(target_config_path),
             "--invariants",
             str(_INVARIANTS_PATH),
@@ -170,11 +170,11 @@ def main(
             str(evidence_path),
             "--repetitions",
             "3",
-            "--max-sandbox-api-calls",
+            "--max-environment-api-calls",
             "42",
-            "--allow-sandbox-network-egress",
+            "--allow-environment-network",
             "--allow-insecure-http",
-            "--confirm-isolated-sandbox",
+            "--confirm-test-environment",
         ]
         completed_process = subprocess.run(
             command,

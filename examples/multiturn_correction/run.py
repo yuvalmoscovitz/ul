@@ -142,16 +142,16 @@ def main() -> None:
                 "stress",
                 "correction",
                 str(_CASE_PATH),
-                "--sandbox-config",
+                "--environment-config",
                 str(target_config_path),
                 "--invariants",
                 str(_INVARIANTS_PATH),
                 "--output",
                 str(evidence_path),
-                "--allow-sandbox-network-egress",
+                "--allow-environment-network",
                 "--allow-insecure-http",
-                "--confirm-isolated-sandbox",
-                "--max-sandbox-api-calls",
+                "--confirm-test-environment",
+                "--max-environment-api-calls",
                 "42",
             ],
             cwd=_PROJECT_DIRECTORY,
@@ -185,7 +185,7 @@ def main() -> None:
         )
         typer.echo(f"Evidence: {evidence_path.resolve()}")
         typer.echo(
-            "No API key or UL semantic-model calls used. Sandbox traffic stayed on loopback."
+            "No API key or UL semantic-model calls used. Environment traffic stayed on loopback."
         )
         return
 

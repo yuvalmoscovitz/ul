@@ -14,17 +14,17 @@ from ul.event_stress import (
     replay_multi_turn_regression,
     run_correction_stress_test,
 )
-from ul.http_sandbox import JsonHttpSandboxConfig
+from ul.http_environment import JsonHttpEnvironmentConfig
 from ul_cli.event_stress import _print_result
 from ul_core.dataset import ObservedAgentOutput
 from ul_core.evaluation import (
+    EnvironmentCapabilities,
+    EnvironmentLifecycleEvidence,
+    EnvironmentResetEvidence,
+    EnvironmentStateEvidence,
+    EnvironmentTurnEvidence,
     EvaluationCase,
     ExecutionEvidence,
-    SandboxCapabilities,
-    SandboxLifecycleEvidence,
-    SandboxResetEvidence,
-    SandboxStateEvidence,
-    SandboxTurnEvidence,
 )
 from ul_core.models import ConversationRole, ConversationTurn
 
@@ -47,20 +47,20 @@ def _case() -> CorrectionAfterFirstResponseCase:
     )
 
 
-def _config() -> JsonHttpSandboxConfig:
-    return JsonHttpSandboxConfig.model_validate(
+def _config() -> JsonHttpEnvironmentConfig:
+    return JsonHttpEnvironmentConfig.model_validate(
         {
-            "version": 4,
-            "sandbox_id": "test-sandbox",
+            "version": 5,
+            "environment_id": "test-environment",
             "reset": {
-                "url": "https://sandbox.example.test/reset",
+                "url": "https://environment.example.test/reset",
                 "generation_json_pointer": "/generation",
                 "clean_state_json_pointer": "/clean",
                 "clean_state_value": True,
             },
-            "setup": {"url": "https://sandbox.example.test/setup"},
+            "setup": {"url": "https://environment.example.test/setup"},
             "execute_turn": {
-                "url": "https://sandbox.example.test/execute",
+                "url": "https://environment.example.test/execute",
                 "request_json_template": {
                     "case_id": "{{case_id}}",
                     "turn_id": "{{turn_id}}",
@@ -68,7 +68,7 @@ def _config() -> JsonHttpSandboxConfig:
                 },
             },
             "snapshot": {
-                "url": "https://sandbox.example.test/snapshot",
+                "url": "https://environment.example.test/snapshot",
                 "request_json_template": {
                     "case_id": "{{case_id}}",
                     "turn_id": "{{turn_id}}",
@@ -91,12 +91,12 @@ def _invariant() -> JsonValuesEqualInvariant:
 
 
 class _DefectiveCorrectionTarget:
-    sandbox_id = "correction-test-sandbox"
+    environment_id = "correction-test-environment"
     config_sha256 = "0" * 64
-    capabilities = SandboxCapabilities(
+    capabilities = EnvironmentCapabilities(
         supports_conversations=True,
         supports_state_observation=True,
-        state_observation_authority="sandbox_self_reported",
+        state_observation_authority="environment_self_reported",
         cancellation_guarantee="guaranteed",
     )
 
@@ -112,34 +112,34 @@ class _DefectiveCorrectionTarget:
         final_output = outputs[-1]
         return ExecutionEvidence(
             case_id=case.id,
-            sandbox_id=self.sandbox_id,
-            sandbox_config_sha256=self.config_sha256,
-            initial_state=SandboxStateEvidence(
+            environment_id=self.environment_id,
+            environment_config_sha256=self.config_sha256,
+            initial_state=EnvironmentStateEvidence(
                 value={},
-                authority="sandbox_self_reported",
+                authority="environment_self_reported",
             ),
             turns=tuple(
-                SandboxTurnEvidence(
+                EnvironmentTurnEvidence(
                     turn_id=turn.id,
                     response=output.raw_output,
                     state_snapshot=output.metadata["committed_state_snapshot"],
-                    state_observation_authority="sandbox_self_reported",
+                    state_observation_authority="environment_self_reported",
                 )
                 for turn, output in zip(case.turns, outputs, strict=True)
             ),
             final_response=final_output.raw_output,
-            final_state=SandboxStateEvidence(
+            final_state=EnvironmentStateEvidence(
                 value=final_output.metadata["committed_state_snapshot"],
-                authority="sandbox_self_reported",
+                authority="environment_self_reported",
             ),
-            lifecycle=SandboxLifecycleEvidence(
-                initial_reset=SandboxResetEvidence(
+            lifecycle=EnvironmentLifecycleEvidence(
+                initial_reset=EnvironmentResetEvidence(
                     reset_session_requested=True,
                     reset_session_acknowledged=True,
                     reset_env_requested=True,
                     reset_env_acknowledged=True,
                 ),
-                cleanup_reset=SandboxResetEvidence(
+                cleanup_reset=EnvironmentResetEvidence(
                     reset_session_requested=True,
                     reset_session_acknowledged=True,
                     reset_env_requested=True,
@@ -149,7 +149,7 @@ class _DefectiveCorrectionTarget:
                 completed_phases=("execute", "cleanup"),
                 delivery="certain",
                 cleanup="succeeded",
-                sandbox_state_uncertain=False,
+                environment_state_uncertain=False,
             ),
         )
 
@@ -211,7 +211,7 @@ async def test_finds_repeatable_correction_failure_and_preserves_ordered_evidenc
         target,
         invariant_rules=(_invariant(),),
         repetitions=3,
-        max_sandbox_api_calls=36,
+        max_environment_api_calls=36,
         allow_network_egress=True,
     )
 
@@ -250,7 +250,7 @@ async def test_first_divergence_uses_conversation_order_and_flags_nondeterminism
         _NondeterministicCorrectionTarget(),
         invariant_rules=(_invariant(),),
         repetitions=2,
-        max_sandbox_api_calls=24,
+        max_environment_api_calls=24,
         allow_network_egress=True,
     )
 
@@ -283,14 +283,16 @@ async def test_first_divergence_uses_conversation_order_and_flags_nondeterminism
 
 
 def test_dry_run_plan_enforces_complete_pair_budget_without_target_calls() -> None:
-    plan = plan_correction_stress_test(_case(), _config(), repetitions=2, max_sandbox_api_calls=28)
+    plan = plan_correction_stress_test(
+        _case(), _config(), repetitions=2, max_environment_api_calls=28
+    )
 
     assert plan.operator_id == "conversation.correction_after_first_response"
     assert plan.operator_version == "1.0.0"
     assert plan.target_calls_per_pair == 14
     assert plan.required_target_calls == 28
     with pytest.raises(ValueError, match="authorized target call budget"):
-        plan_correction_stress_test(_case(), _config(), repetitions=2, max_sandbox_api_calls=27)
+        plan_correction_stress_test(_case(), _config(), repetitions=2, max_environment_api_calls=27)
 
 
 def test_saved_multi_turn_regression_round_trips_and_replays(tmp_path: Path) -> None:
@@ -310,7 +312,7 @@ def test_saved_multi_turn_regression_round_trips_and_replays(tmp_path: Path) -> 
         replay_multi_turn_regression(
             loaded,
             _DefectiveCorrectionTarget(),
-            max_sandbox_api_calls=24,
+            max_environment_api_calls=24,
             allow_network_egress=True,
         )
     )

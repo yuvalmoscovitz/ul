@@ -13,7 +13,7 @@ _MAXIMUM_REQUEST_BYTES = 1_000_000
 
 
 @dataclass
-class _SandboxState:
+class _EnvironmentState:
     retry_mode: RetryMode
     fire_event: bool
     lock: Lock = field(default_factory=Lock)
@@ -36,12 +36,12 @@ class _SandboxState:
 
 
 class TimeoutAfterCommitServer(ThreadingHTTPServer):
-    state: _SandboxState
+    state: _EnvironmentState
 
 
-def _handler_for_state(state: _SandboxState) -> type[BaseHTTPRequestHandler]:
+def _handler_for_state(state: _EnvironmentState) -> type[BaseHTTPRequestHandler]:
     class TimeoutAfterCommitHandler(BaseHTTPRequestHandler):
-        sandbox_id = "timeout-after-commit-example"
+        environment_id = "timeout-after-commit-example"
 
         def do_POST(self) -> None:
             with state.lock:
@@ -111,7 +111,7 @@ def _handler_for_state(state: _SandboxState) -> type[BaseHTTPRequestHandler]:
 
         def _control_event(self, request: dict[str, object]) -> None:
             expected_keys = {
-                "sandbox_id",
+                "environment_id",
                 "case_id",
                 "operator_id",
                 "operator_version",
@@ -127,7 +127,7 @@ def _handler_for_state(state: _SandboxState) -> type[BaseHTTPRequestHandler]:
                 return
             identity = cast(dict[str, str], {key: request[key] for key in expected_keys})
             if (
-                identity["sandbox_id"] != self.sandbox_id
+                identity["environment_id"] != self.environment_id
                 or identity["operator_id"] != "environment.tool.timeout_after_commit"
                 or identity["operator_version"] != "1.0.0"
                 or identity["action_id"] != "execute-payment"
@@ -184,7 +184,7 @@ def _handler_for_state(state: _SandboxState) -> type[BaseHTTPRequestHandler]:
 
         def _send(self, status: HTTPStatus, payload: dict[str, object]) -> None:
             body = json.dumps(
-                {**payload, "sandbox_id": self.sandbox_id}, separators=(",", ":")
+                {**payload, "environment_id": self.environment_id}, separators=(",", ":")
             ).encode()
             self.send_response(status)
             self.send_header("Content-Type", "application/json")
@@ -205,7 +205,7 @@ def create_server(
     retry_mode: RetryMode = "defective",
     fire_event: bool = True,
 ) -> TimeoutAfterCommitServer:
-    state = _SandboxState(retry_mode=retry_mode, fire_event=fire_event)
+    state = _EnvironmentState(retry_mode=retry_mode, fire_event=fire_event)
     server = TimeoutAfterCommitServer(("127.0.0.1", port), _handler_for_state(state))
     server.state = state
     return server

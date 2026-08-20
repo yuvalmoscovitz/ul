@@ -67,7 +67,7 @@ def _state_transition(before: object, after: object) -> ObservedAgentOutput:
         metadata={
             "committed_state_before_turn": before,
             "committed_state_snapshot": after,
-            "state_observation_authority": "sandbox_self_reported",
+            "state_observation_authority": "environment_self_reported",
         },
     )
 
@@ -443,7 +443,7 @@ def test_dataset_transition_evaluation_reads_initial_and_final_execution_checkpo
         raw_output={"status": "ok"},
         metadata={
             "committed_state_snapshot": {"effects": []},
-            "state_observation_authority": "sandbox_self_reported",
+            "state_observation_authority": "environment_self_reported",
         },
     )
     trial = SimpleNamespace(
@@ -453,12 +453,12 @@ def test_dataset_transition_evaluation_reads_initial_and_final_execution_checkpo
             lifecycle=SimpleNamespace(terminal_status="succeeded"),
             initial_state=SimpleNamespace(
                 value={"effects": []},
-                authority="sandbox_self_reported",
+                authority="environment_self_reported",
                 observer_id=None,
             ),
             final_state=SimpleNamespace(
                 value={"effects": [{"id": "effect-1"}]},
-                authority="sandbox_self_reported",
+                authority="environment_self_reported",
                 observer_id=None,
             ),
         ),
@@ -501,7 +501,7 @@ def test_dataset_transition_evaluation_rejects_unbound_output_metadata() -> None
         metadata={
             "committed_state_before_turn": {"effects": []},
             "committed_state_snapshot": {"effects": []},
-            "state_observation_authority": "sandbox_self_reported",
+            "state_observation_authority": "environment_self_reported",
         },
     )
     trial = SimpleNamespace(repetition=1, target_output=target_output, execution_evidence=None)
@@ -544,7 +544,7 @@ def test_effect_transition_rejects_rewritten_or_missing_checkpoint_history() -> 
         raw_output={},
         metadata={
             "committed_state_snapshot": {"effects": []},
-            "state_observation_authority": "sandbox_self_reported",
+            "state_observation_authority": "environment_self_reported",
         },
     )
 
@@ -765,7 +765,7 @@ def test_committed_state_authority_uses_snapshot_not_execute_response() -> None:
         raw_output={"amount": 100},
         metadata={
             "committed_state_snapshot": {"amount": 150},
-            "state_observation_authority": "sandbox_self_reported",
+            "state_observation_authority": "environment_self_reported",
         },
     )
 

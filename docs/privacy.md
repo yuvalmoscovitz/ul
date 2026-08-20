@@ -51,12 +51,12 @@ boundary = RedactedSemanticPipeline(
 
 coverage = boundary.dry_run(source_record)
 protected_source = boundary.protect_record(source_record)
-protected_sandbox = boundary.wrap_sandbox(sandbox_connection)
+protected_environment = boundary.wrap_environment(environment_connection)
 ```
 
 Pass `boundary` as the deconstructor, renderer, and equivalence verifier, pass
-`protected_sandbox` to `DatasetEvaluationRunner`, and run the protected source record. All semantic
-calls use placeholders, including repeated calls. The customer-managed sandbox API receives the
+`protected_environment` to `DatasetEvaluationRunner`, and run the protected source record. All semantic
+calls use placeholders, including repeated calls. The customer-managed environment API receives the
 rehydrated input just before execution. Persisted results contain placeholders and a policy digest,
 never the mapping.
 
@@ -101,8 +101,8 @@ export UL_DATASET_REDACTION_KEY="$(your-secret-manager read ul-redaction-key)"
 ul dataset evaluate interactions.jsonl \
   --redaction-policy redaction.json \
   --redaction-state .ul-private/pseudonyms.json \
-  --sandbox-config sandbox.json \
-  --allow-sandbox-network-egress --confirm-isolated-sandbox \
+  --environment-config environment.json \
+  --allow-environment-network --confirm-test-environment \
   --output evidence.jsonl
 ```
 
@@ -112,9 +112,9 @@ or writing mapping state. Execution and resume also require `--redaction-state` 
 digest and aggregate input/output coverage, never the key, selected values, state path, or mapping.
 
 Dataset execution saves generated augmentations by default beside the evidence file as
-`NAME.augmentations.jsonl`. This private ledger is written before sandbox execution and reused on
+`NAME.augmentations.jsonl`. This private ledger is written before environment execution and reused on
 resume. It contains the effective raw or pseudonymized interaction plus derived semantic data; it
-does not serialize configured semantic/sandbox authentication values or reversible pseudonym
+does not serialize configured semantic/environment authentication values or reversible pseudonym
 mappings. Raw interaction text may itself contain secrets when redaction is absent or incomplete.
 Mode `0600` limits filesystem access on Unix but does not encrypt or redact the contents. Use `--augmentations-output` to place
 it in an approved retention location, or `--no-save-augmentations` when policy prohibits local

@@ -37,12 +37,12 @@ def test_timeout_is_one_catalog_entry_with_two_typed_bindings() -> None:
     assert timeout.scope == "environment"
     assert tuple(binding.mode for binding in timeout.bindings) == (
         "scenario_materialization",
-        "sandbox_fault",
+        "environment_fault",
     )
     assert timeout.bindings[0].cli_available is False
     assert timeout.bindings[0].execution_owner == "augmentation_registry"
     assert timeout.bindings[1].command == "ul stress timeout-after-commit"
-    assert timeout.bindings[1].requirements.sandbox_capabilities == (
+    assert timeout.bindings[1].requirements.environment_capabilities == (
         "environment.tool.timeout_after_commit@1.0.0",
     )
 
@@ -66,7 +66,7 @@ def test_dataset_augmentation_declares_actual_execution_requirements() -> None:
     )
 
     assert requirements.semantic_model is True
-    assert requirements.sandbox is True
+    assert requirements.environment is True
     assert requirements.state_observation is True
     assert requirements.customer_evaluator is False
 
@@ -106,22 +106,22 @@ def test_augmentation_reference_requires_canonical_bounded_values(
         AugmentationRef.model_validate(reference)
 
 
-def test_requirements_reject_capabilities_without_a_sandbox() -> None:
-    with pytest.raises(ValidationError, match="capabilities require a sandbox"):
-        AugmentationRequirements(sandbox_capabilities=("tool.timeout@1.0.0",))
+def test_requirements_reject_capabilities_without_a_environment() -> None:
+    with pytest.raises(ValidationError, match="capabilities require a environment"):
+        AugmentationRequirements(environment_capabilities=("tool.timeout@1.0.0",))
 
 
-def test_binding_rejects_owner_mode_mismatch_and_unsafe_sandbox_fault() -> None:
+def test_binding_rejects_owner_mode_mismatch_and_unsafe_environment_fault() -> None:
     with pytest.raises(ValidationError, match="mode and execution owner"):
         AugmentationBinding(
-            mode="sandbox_fault",
+            mode="environment_fault",
             stages=("execution",),
             execution_owner="dataset_cli",
             command="ul dataset evaluate",
         )
-    with pytest.raises(ValidationError, match="require a sandbox capability"):
+    with pytest.raises(ValidationError, match="require a environment capability"):
         AugmentationBinding(
-            mode="sandbox_fault",
+            mode="environment_fault",
             stages=("execution",),
             execution_owner="stress_cli",
             command="ul stress timeout-after-commit",
@@ -141,7 +141,8 @@ def test_mode_and_cli_filters_apply_to_the_same_binding() -> None:
 
     assert catalog.list(mode="scenario_materialization", cli_only=True) == ()
     assert tuple(
-        augmentation.ref.id for augmentation in catalog.list(mode="sandbox_fault", cli_only=True)
+        augmentation.ref.id
+        for augmentation in catalog.list(mode="environment_fault", cli_only=True)
     ) == ("environment.tool.timeout_after_commit",)
 
 

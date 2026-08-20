@@ -15,20 +15,21 @@ import typer
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 from rich.console import Console
 from ul import load_dataset_invariant_suite, load_redaction_policy
-from ul.http_sandbox import (
-    JsonHttpSandboxConfig,
-    json_http_sandbox_config_sha256,
-    json_http_sandbox_origin,
-    load_json_http_sandbox_config,
+from ul.http_environment import (
+    JsonHttpEnvironmentConfig,
+    json_http_environment_config_sha256,
+    json_http_environment_origin,
+    load_json_http_environment_config,
 )
 
 from ul_cli.dataset import (
     evaluate_dataset,
-    initialize_dataset_sandbox,
+    initialize_dataset_environment,
     validate_dataset_operator_ids,
     validate_interaction_dataset,
 )
 from ul_cli.dataset_review import is_reportable_dataset_evidence, report_dataset_evidence
+from ul_cli.environment import TEST_ENVIRONMENT_CONFIRMATION_MESSAGE
 
 console = Console()
 
@@ -43,11 +44,11 @@ class _StrictModel(BaseModel):
 
 
 class ProjectConfig(_StrictModel):
-    schema_version: Literal[1] = 1
+    schema_version: Literal[2] = 2
     dataset: str = Field(min_length=1)
-    sandbox_config: str = Field(min_length=1)
-    sandbox_origin: str = Field(min_length=1)
-    sandbox_config_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    environment_config: str = Field(min_length=1)
+    environment_origin: str = Field(min_length=1)
+    environment_config_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     invariants: str | None = None
     redaction_policy: str | None = None
     redaction_policy_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
@@ -56,9 +57,9 @@ class ProjectConfig(_StrictModel):
     operators: tuple[str, ...] = Field(default=("input.surface.rephrase",), min_length=1)
     limit: int = Field(default=3, ge=1, le=100)
     repetitions: int = Field(default=3, ge=1)
-    max_sandbox_api_calls: int = Field(default=120, ge=1)
-    allow_sandbox_network_egress: bool
-    confirm_isolated_sandbox: bool
+    max_environment_api_calls: int = Field(default=120, ge=1)
+    allow_environment_network: bool
+    confirm_test_environment: bool
     allow_insecure_http: bool = False
 
     @field_validator("operators", mode="before")
@@ -99,21 +100,21 @@ def initialize_project(
             help="Historical interaction dataset JSONL.",
         ),
     ],
-    sandbox_config: Annotated[
+    environment_config: Annotated[
         Path | None,
         typer.Option(
-            "--sandbox-config",
+            "--environment-config",
             exists=True,
             dir_okay=False,
             readable=True,
-            help="Existing customer-managed sandbox connection config.",
+            help="Existing customer-managed environment connection config.",
         ),
     ] = None,
-    sandbox_url: Annotated[
+    environment_url: Annotated[
         str | None,
         typer.Option(
-            "--sandbox-url",
-            help="Create .ul/sandbox.json for this sandbox API base URL.",
+            "--environment-url",
+            help="Create .ul/environment.json for this environment API base URL.",
         ),
     ] = None,
     invariants: Annotated[
@@ -146,38 +147,40 @@ def initialize_project(
     ] = None,
     limit: Annotated[int, typer.Option(min=1, max=100)] = 3,
     repetitions: Annotated[int, typer.Option(min=1)] = 3,
-    max_sandbox_api_calls: Annotated[int, typer.Option("--max-sandbox-api-calls", min=1)] = 120,
-    allow_sandbox_network_egress: Annotated[
+    max_environment_api_calls: Annotated[
+        int, typer.Option("--max-environment-api-calls", min=1)
+    ] = 120,
+    allow_environment_network: Annotated[
         bool,
         typer.Option(
-            "--allow-sandbox-network-egress",
-            help="Save permission for UL runs to call this sandbox API.",
+            "--allow-environment-network",
+            help="Save permission for UL runs to call this environment API.",
         ),
     ] = False,
-    confirm_isolated_sandbox: Annotated[
+    confirm_test_environment: Annotated[
         bool,
         typer.Option(
-            "--confirm-isolated-sandbox",
-            help="Attest once that the endpoint is an isolated non-production sandbox.",
+            "--confirm-test-environment",
+            help="Confirm this environment is intended for testing and can be reset.",
         ),
     ] = False,
     allow_insecure_http: Annotated[
         bool,
-        typer.Option(help="Allow a local HTTP sandbox API."),
+        typer.Option(help="Allow a local HTTP environment API."),
     ] = False,
 ) -> None:
     """Configure this project once for `ul run` and `ul report`."""
-    if (sandbox_config is None) == (sandbox_url is None):
-        raise typer.BadParameter("provide exactly one of --sandbox-config or --sandbox-url")
-    if not allow_sandbox_network_egress:
+    if (environment_config is None) == (environment_url is None):
+        raise typer.BadParameter("provide exactly one of --environment-config or --environment-url")
+    if not allow_environment_network:
         raise typer.BadParameter(
-            "initialization requires --allow-sandbox-network-egress",
-            param_hint="--allow-sandbox-network-egress",
+            "initialization requires --allow-environment-network",
+            param_hint="--allow-environment-network",
         )
-    if not confirm_isolated_sandbox:
+    if not confirm_test_environment:
         raise typer.BadParameter(
-            "initialization requires --confirm-isolated-sandbox",
-            param_hint="--confirm-isolated-sandbox",
+            TEST_ENVIRONMENT_CONFIRMATION_MESSAGE,
+            param_hint="--confirm-test-environment",
         )
     if (redaction_policy is None) != (redaction_state is None):
         raise typer.BadParameter(
@@ -190,7 +193,7 @@ def initialize_project(
     if project_config_path.exists():
         raise typer.BadParameter(".ul/config.json already exists; UL will not overwrite it")
 
-    loaded_sandbox_config: JsonHttpSandboxConfig | None = None
+    loaded_environment_config: JsonHttpEnvironmentConfig | None = None
     loaded_redaction_policy = None
     try:
         validate_interaction_dataset(dataset)
@@ -199,8 +202,8 @@ def initialize_project(
             load_dataset_invariant_suite(invariants)
         if redaction_policy is not None:
             loaded_redaction_policy = load_redaction_policy(redaction_policy)
-        if sandbox_config is not None:
-            loaded_sandbox_config = load_json_http_sandbox_config(sandbox_config)
+        if environment_config is not None:
+            loaded_environment_config = load_json_http_environment_config(environment_config)
     except ValidationError as error:
         raise typer.BadParameter(_format_validation_error(error)) from None
     except (OSError, RuntimeError, ValueError) as error:
@@ -210,7 +213,7 @@ def initialize_project(
     runs_directory = project_directory / "runs"
     runs_directory_created = not runs_directory.exists()
     ignore_file_created = False
-    generated_sandbox_path: Path | None = None
+    generated_environment_path: Path | None = None
     project_directory_status: os.stat_result | None = None
     project_directory_descriptor: int | None = None
     try:
@@ -221,20 +224,26 @@ def initialize_project(
         _create_private_text(project_directory / ".gitignore", "*\n")
         ignore_file_created = True
 
-        selected_sandbox_config = sandbox_config
-        if sandbox_url is not None:
-            selected_sandbox_config = project_directory / "sandbox.json"
-            initialize_dataset_sandbox(selected_sandbox_config, sandbox_url, show_guidance=False)
-            generated_sandbox_path = selected_sandbox_config
-        assert selected_sandbox_config is not None
-        if loaded_sandbox_config is None:
-            loaded_sandbox_config = load_json_http_sandbox_config(selected_sandbox_config)
+        selected_environment_config = environment_config
+        if environment_url is not None:
+            selected_environment_config = project_directory / "environment.json"
+            initialize_dataset_environment(
+                selected_environment_config, environment_url, show_guidance=False
+            )
+            generated_environment_path = selected_environment_config
+        assert selected_environment_config is not None
+        if loaded_environment_config is None:
+            loaded_environment_config = load_json_http_environment_config(
+                selected_environment_config
+            )
 
         config = ProjectConfig(
             dataset=_relative_project_path(dataset, project_root),
-            sandbox_config=_relative_project_path(selected_sandbox_config, project_root),
-            sandbox_origin=json_http_sandbox_origin(loaded_sandbox_config),
-            sandbox_config_sha256=json_http_sandbox_config_sha256(loaded_sandbox_config),
+            environment_config=_relative_project_path(selected_environment_config, project_root),
+            environment_origin=json_http_environment_origin(loaded_environment_config),
+            environment_config_sha256=json_http_environment_config_sha256(
+                loaded_environment_config
+            ),
             invariants=(
                 _relative_project_path(invariants, project_root) if invariants is not None else None
             ),
@@ -255,9 +264,9 @@ def initialize_project(
             operators=selected_operators,
             limit=limit,
             repetitions=repetitions,
-            max_sandbox_api_calls=max_sandbox_api_calls,
-            allow_sandbox_network_egress=allow_sandbox_network_egress,
-            confirm_isolated_sandbox=confirm_isolated_sandbox,
+            max_environment_api_calls=max_environment_api_calls,
+            allow_environment_network=allow_environment_network,
+            confirm_test_environment=confirm_test_environment,
             allow_insecure_http=allow_insecure_http,
         )
         _create_private_json(project_config_path, config.model_dump(mode="json"))
@@ -265,7 +274,7 @@ def initialize_project(
         _discard_incomplete_project(
             project_directory,
             runs_directory=runs_directory,
-            generated_sandbox_path=generated_sandbox_path,
+            generated_environment_path=generated_environment_path,
             project_directory_created=project_directory_created,
             runs_directory_created=runs_directory_created,
             ignore_file_created=ignore_file_created,
@@ -278,7 +287,7 @@ def initialize_project(
         _discard_incomplete_project(
             project_directory,
             runs_directory=runs_directory,
-            generated_sandbox_path=generated_sandbox_path,
+            generated_environment_path=generated_environment_path,
             project_directory_created=project_directory_created,
             runs_directory_created=runs_directory_created,
             ignore_file_created=ignore_file_created,
@@ -293,7 +302,7 @@ def initialize_project(
         _discard_incomplete_project(
             project_directory,
             runs_directory=runs_directory,
-            generated_sandbox_path=generated_sandbox_path,
+            generated_environment_path=generated_environment_path,
             project_directory_created=project_directory_created,
             runs_directory_created=runs_directory_created,
             ignore_file_created=ignore_file_created,
@@ -306,7 +315,7 @@ def initialize_project(
         _discard_incomplete_project(
             project_directory,
             runs_directory=runs_directory,
-            generated_sandbox_path=generated_sandbox_path,
+            generated_environment_path=generated_environment_path,
             project_directory_created=project_directory_created,
             runs_directory_created=runs_directory_created,
             ignore_file_created=ignore_file_created,
@@ -317,12 +326,12 @@ def initialize_project(
         raise
     _close_descriptor(project_directory_descriptor)
     console.print(f"Configured UL project: {project_config_path}")
-    if sandbox_url is not None:
+    if environment_url is not None:
         console.print(
             "Before running: implement the reset, execute-turn, and snapshot contract "
-            "generated in .ul/sandbox.json."
+            "generated in .ul/environment.json."
         )
-        console.print("Then verify it with 'ul sandbox check .ul/sandbox.json --help'.")
+        console.print("Then verify it with 'ul environment check .ul/environment.json --help'.")
     console.print("Next: set semantic-provider credentials and UL_LIVE=true, then run 'ul run'.")
 
 
@@ -333,8 +342,8 @@ def run_project(
     ] = False,
     limit: Annotated[int | None, typer.Option(min=1, max=100)] = None,
     repetitions: Annotated[int | None, typer.Option(min=1)] = None,
-    max_sandbox_api_calls: Annotated[
-        int | None, typer.Option("--max-sandbox-api-calls", min=1)
+    max_environment_api_calls: Annotated[
+        int | None, typer.Option("--max-environment-api-calls", min=1)
     ] = None,
     operator: Annotated[
         list[str] | None,
@@ -369,7 +378,7 @@ def run_project(
     try:
         evaluate_dataset(
             data=_resolve_project_path(config.dataset, project_root),
-            sandbox_config=_resolve_project_path(config.sandbox_config, project_root),
+            environment_config=_resolve_project_path(config.environment_config, project_root),
             output=output,
             augmentations_output=None,
             no_save_augmentations=not (
@@ -383,13 +392,13 @@ def run_project(
             operator=selected_operators,
             limit=limit if limit is not None else config.limit,
             repetitions=repetitions if repetitions is not None else config.repetitions,
-            max_sandbox_api_calls=(
-                max_sandbox_api_calls
-                if max_sandbox_api_calls is not None
-                else config.max_sandbox_api_calls
+            max_environment_api_calls=(
+                max_environment_api_calls
+                if max_environment_api_calls is not None
+                else config.max_environment_api_calls
             ),
-            allow_sandbox_network_egress=config.allow_sandbox_network_egress,
-            confirm_isolated_sandbox=config.confirm_isolated_sandbox,
+            allow_environment_network=config.allow_environment_network,
+            confirm_test_environment=config.confirm_test_environment,
             allow_insecure_http=config.allow_insecure_http,
             dry_run=dry_run,
             resume=output if resume else None,
@@ -403,8 +412,8 @@ def run_project(
                 if config.redaction_state is not None
                 else None
             ),
-            expected_sandbox_origin=config.sandbox_origin,
-            expected_sandbox_config_sha256=config.sandbox_config_sha256,
+            expected_environment_origin=config.environment_origin,
+            expected_environment_config_sha256=config.environment_config_sha256,
             expected_redaction_policy_sha256=config.redaction_policy_sha256,
             show_report_guidance=False,
         )
@@ -726,7 +735,7 @@ def _discard_incomplete_project(
     project_directory: Path,
     *,
     runs_directory: Path,
-    generated_sandbox_path: Path | None,
+    generated_environment_path: Path | None,
     project_directory_created: bool,
     runs_directory_created: bool,
     ignore_file_created: bool,
@@ -740,9 +749,9 @@ def _discard_incomplete_project(
             _require_same_path(project_directory, project_directory_status)
         except (FileNotFoundError, OSError):
             return
-        if generated_sandbox_path is not None:
+        if generated_environment_path is not None:
             with suppress(FileNotFoundError):
-                generated_sandbox_path.unlink()
+                generated_environment_path.unlink()
         if ignore_file_created:
             with suppress(FileNotFoundError):
                 (project_directory / ".gitignore").unlink()
@@ -753,9 +762,9 @@ def _discard_incomplete_project(
             with suppress(OSError):
                 project_directory.rmdir()
         return
-    if generated_sandbox_path is not None:
+    if generated_environment_path is not None:
         with suppress(FileNotFoundError):
-            os.unlink(generated_sandbox_path.name, dir_fd=project_directory_descriptor)
+            os.unlink(generated_environment_path.name, dir_fd=project_directory_descriptor)
     if ignore_file_created:
         with suppress(FileNotFoundError):
             os.unlink(".gitignore", dir_fd=project_directory_descriptor)

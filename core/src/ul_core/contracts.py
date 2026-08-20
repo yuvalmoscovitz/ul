@@ -11,10 +11,10 @@ from ul_core.dataset import (
     UserInputRecord,
 )
 from ul_core.evaluation import (
+    EnvironmentCapabilities,
     EvaluationCase,
     ExecutionEvidence,
     ProductionSourcePage,
-    SandboxCapabilities,
 )
 
 
@@ -74,15 +74,15 @@ class ProductionSource(Protocol):
 
 
 @runtime_checkable
-class SandboxExecutor(Protocol):
+class EnvironmentExecutor(Protocol):
     @property
-    def sandbox_id(self) -> str: ...
+    def environment_id(self) -> str: ...
 
     @property
     def config_sha256(self) -> str: ...
 
     @property
-    def capabilities(self) -> SandboxCapabilities: ...
+    def capabilities(self) -> EnvironmentCapabilities: ...
 
     def api_calls_for_case(self, case: EvaluationCase) -> int: ...
 
