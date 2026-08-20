@@ -28,7 +28,6 @@ from ul import (
     JsonHttpSandboxConfig,
     ObservedAgentOutput,
     OpenAICompatibleDatasetSettings,
-    SandboxSetupFixture,
     SemanticFrame,
 )
 from ul.dataset_augmentation import DatasetAugmentationCandidate
@@ -226,24 +225,6 @@ def test_run_context_uses_current_pipeline() -> None:
     assert _run_context((record,)).pipeline_version == "1.1.0"
 
 
-def test_run_context_binds_per_record_setup_digests_without_values() -> None:
-    secret = "fixture-secret-value"
-    first = _evaluation_result("interaction-1").source.model_copy(
-        update={"sandbox_setup": SandboxSetupFixture.from_payload({"secret": secret})}
-    )
-    second = first.model_copy(
-        update={"sandbox_setup": SandboxSetupFixture.from_payload({"secret": "changed"})}
-    )
-
-    first_context = _run_context((first,))
-    second_context = _run_context((second,))
-
-    assert first_context.sandbox_setups[0].interaction_id == first.id
-    assert first_context.sandbox_setups[0].sha256 == first.sandbox_setup.sha256
-    assert secret not in first_context.model_dump_json()
-    assert first_context.context_sha256 != second_context.context_sha256
-
-
 def _write_target_config(
     path: Path,
     *,
@@ -305,7 +286,7 @@ def _write_target_config(
     )
 
 
-def _write_stateful_target_config(path: Path, *, per_record_setup: bool = False) -> None:
+def _write_stateful_target_config(path: Path) -> None:
     path.write_text(
         json.dumps(
             {
@@ -324,7 +305,7 @@ def _write_stateful_target_config(path: Path, *, per_record_setup: bool = False)
                     "url": "https://sandbox.example.test/setup",
                     "request_json_template": {
                         "case_id": "{{case_id}}",
-                        "seed": ("{{sandbox_setup}}" if per_record_setup else "standard"),
+                        "seed": "standard",
                     },
                     "case_id_json_pointer": "/case_id",
                 },
@@ -926,74 +907,6 @@ def test_stateful_target_dry_run_counts_physical_lifecycle_calls(
         "Every test case invokes and validates the configured sandbox reset contract"
         in " ".join(result.output.split())
     )
-
-
-def test_per_record_setup_dry_run_reports_only_fixture_count(tmp_path: Path) -> None:
-    dataset = tmp_path / "interactions.jsonl"
-    target_config = tmp_path / "target.json"
-    record = {
-        **_record(),
-        "sandbox_setup": {
-            "account": "AC-100",
-            "private_token": "fixture-secret-value",
-        },
-    }
-    _write_dataset(dataset, [record])
-    _write_stateful_target_config(target_config, per_record_setup=True)
-
-    result = runner.invoke(
-        root_app,
-        [
-            "dataset",
-            "evaluate",
-            str(dataset),
-            "--sandbox-config",
-            str(target_config),
-            "--dry-run",
-        ],
-    )
-
-    assert result.exit_code == 0, result.output
-    assert "Per-record sandbox setup: 1 fixture(s); values hidden" in result.output
-    assert "fixture-secret-value" not in result.output
-    assert "AC-100" not in result.output
-
-
-@pytest.mark.parametrize(
-    ("include_fixture", "per_record_setup", "expected_error"),
-    [
-        (True, False, "does not contain {{sandbox_setup}}"),
-        (False, True, "every selected record must contain sandbox_setup"),
-    ],
-)
-def test_per_record_setup_dry_run_rejects_config_record_mismatch(
-    tmp_path: Path,
-    include_fixture: bool,
-    per_record_setup: bool,
-    expected_error: str,
-) -> None:
-    dataset = tmp_path / "interactions.jsonl"
-    target_config = tmp_path / "target.json"
-    record = _record()
-    if include_fixture:
-        record["sandbox_setup"] = {"account": "AC-100"}
-    _write_dataset(dataset, [record])
-    _write_stateful_target_config(target_config, per_record_setup=per_record_setup)
-
-    result = runner.invoke(
-        root_app,
-        [
-            "dataset",
-            "evaluate",
-            str(dataset),
-            "--sandbox-config",
-            str(target_config),
-            "--dry-run",
-        ],
-    )
-
-    assert result.exit_code != 0
-    assert expected_error in result.output
 
 
 def test_invariant_dry_run_reports_rules_authority_and_no_extra_calls(

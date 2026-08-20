@@ -5,7 +5,6 @@ from typing import Literal, Self
 
 from pydantic import ConfigDict, Field, JsonValue, model_validator
 
-from ul_core.dataset import SandboxSetupFixture
 from ul_core.models import ConversationTurn, ULModel
 
 StateObservationAuthority = Literal["sandbox_self_reported", "independent_observer"]
@@ -107,7 +106,6 @@ class EvaluationCase(_StrictModel):
     timeout_seconds: float = Field(gt=0)
     required_state_observation_authority: StateObservationAuthority | None = None
     required_state_observer_id: str | None = Field(default=None, min_length=1, max_length=500)
-    sandbox_setup: SandboxSetupFixture | None = None
     timeout_after_commit_event: TimeoutAfterCommitEventRequest | None = None
 
     @model_validator(mode="after")
@@ -235,7 +233,6 @@ class ExecutionEvidence(_StrictModel):
     case_id: str = Field(min_length=1, max_length=500)
     sandbox_id: str = Field(min_length=1, max_length=500)
     sandbox_config_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
-    sandbox_setup_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
     initial_state: SandboxStateEvidence | None = None
     turns: tuple[SandboxTurnEvidence, ...] = ()
     final_response: JsonValue | None = None

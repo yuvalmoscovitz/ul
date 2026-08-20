@@ -19,7 +19,6 @@ from ul.http_sandbox import (
     load_json_http_sandbox_config,
     validate_json_http_sandbox_configuration,
 )
-from ul_core.dataset import SandboxSetupFixture
 from ul_core.evaluation import EvaluationCase, TimeoutAfterCommitEventRequest
 from ul_core.models import ConversationRole, ConversationTurn
 
@@ -214,99 +213,6 @@ async def test_executes_remote_case_and_returns_explicit_evidence() -> None:
     assert evidence.turns[0].response == {"input": "increase the amount"}
     assert evidence.turns[0].state_snapshot == {"committed_amount": 150}
     assert evidence.turns[0].state_observation_authority == "sandbox_self_reported"
-
-
-async def test_substitutes_per_record_setup_and_binds_its_digest_to_evidence() -> None:
-    fixture = SandboxSetupFixture.from_payload(
-        {"account": {"id": "AC-100", "available": 150}, "approval": True}
-    )
-    config = _config()
-    assert config.setup is not None
-    config = config.model_copy(
-        update={
-            "setup": config.setup.model_copy(
-                update={
-                    "request_json_template": {
-                        "case_id": "{{case_id}}",
-                        "fixture": "{{sandbox_setup}}",
-                    }
-                }
-            )
-        }
-    )
-    handler, requests = _successful_handler()
-    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
-        sandbox = JsonHttpSandboxConnection.from_config(
-            config, sandbox_confirmed=True, max_sandbox_api_calls=6, client=client
-        )
-        evidence = await sandbox.execute(
-            _case("increase the amount", max_calls=6).model_copy(update={"sandbox_setup": fixture})
-        )
-
-    assert requests[1][0] == "/setup"
-    assert requests[1][1]["fixture"] == fixture.payload
-    assert evidence.sandbox_setup_sha256 == fixture.sha256
-
-
-async def test_per_record_setup_requires_an_exact_template_case_match() -> None:
-    fixture = SandboxSetupFixture.from_payload({"account": "AC-100"})
-    static_sandbox = JsonHttpSandboxConnection.from_config(
-        _config(), sandbox_confirmed=True, client=httpx.AsyncClient()
-    )
-    per_record_config = _config()
-    assert per_record_config.setup is not None
-    per_record_config = per_record_config.model_copy(
-        update={
-            "setup": per_record_config.setup.model_copy(
-                update={
-                    "request_json_template": {
-                        "case_id": "{{case_id}}",
-                        "fixture": "{{sandbox_setup}}",
-                    }
-                }
-            )
-        }
-    )
-    per_record_sandbox = JsonHttpSandboxConnection.from_config(
-        per_record_config, sandbox_confirmed=True, client=httpx.AsyncClient()
-    )
-    try:
-        with pytest.raises(ValueError, match="does not contain"):
-            static_sandbox.api_calls_for_case(
-                _case("pay").model_copy(update={"sandbox_setup": fixture})
-            )
-        with pytest.raises(ValueError, match="requires a sandbox setup fixture"):
-            per_record_sandbox.api_calls_for_case(_case("pay"))
-    finally:
-        await static_sandbox.aclose()
-        await per_record_sandbox.aclose()
-
-
-async def test_per_record_setup_rejects_payload_mutation_after_hashing() -> None:
-    fixture = SandboxSetupFixture.from_payload({"account": "AC-100"})
-    fixture.payload["account"] = "mutated"
-    config = _config()
-    assert config.setup is not None
-    config = config.model_copy(
-        update={
-            "setup": config.setup.model_copy(
-                update={
-                    "request_json_template": {
-                        "case_id": "{{case_id}}",
-                        "fixture": "{{sandbox_setup}}",
-                    }
-                }
-            )
-        }
-    )
-    sandbox = JsonHttpSandboxConnection.from_config(
-        config, sandbox_confirmed=True, client=httpx.AsyncClient()
-    )
-    try:
-        with pytest.raises(ValueError, match="digest must match"):
-            sandbox.api_calls_for_case(_case("pay").model_copy(update={"sandbox_setup": fixture}))
-    finally:
-        await sandbox.aclose()
 
 
 async def test_timeout_after_commit_receipts_are_correlated_and_budgeted() -> None:

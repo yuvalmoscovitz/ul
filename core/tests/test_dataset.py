@@ -11,7 +11,6 @@ from ul_core.dataset import (
     ObservedOutcome,
     RenderedUserInput,
     RequestUnit,
-    SandboxSetupFixture,
     SemanticFactor,
     SemanticFrame,
     SemanticRelation,
@@ -48,40 +47,6 @@ def test_observed_agent_output_preserves_replay_metadata() -> None:
 
     with pytest.raises(ValidationError, match="require an output"):
         ObservedAgentOutput(raw_output=None)
-
-
-def test_sandbox_setup_fixture_is_bounded_and_digest_bound() -> None:
-    payload = {"account": {"id": "AC-100", "balance": 50}, "approvals": ["risk"]}
-    fixture = SandboxSetupFixture.from_payload(payload)
-    same_fixture = SandboxSetupFixture.from_payload(
-        {"approvals": ["risk"], "account": {"balance": 50, "id": "AC-100"}}
-    )
-
-    assert fixture.sha256 == same_fixture.sha256
-    assert SandboxSetupFixture.model_validate_json(fixture.model_dump_json()) == fixture
-    payload["account"] = {"id": "mutated"}
-    assert fixture.payload["account"] == {"balance": 50, "id": "AC-100"}
-
-    with pytest.raises(ValueError, match="JSON object"):
-        SandboxSetupFixture.from_payload(["not", "an", "object"])
-    with pytest.raises(ValueError, match="UTF-8 bytes"):
-        SandboxSetupFixture.from_payload({"value": "x" * 65_536})
-    with pytest.raises(ValidationError, match="digest must match"):
-        SandboxSetupFixture(payload={"account": "AC-100"}, sha256="0" * 64)
-
-
-def test_sandbox_setup_fixture_rejects_excessive_nesting_and_values() -> None:
-    deeply_nested: dict[str, object] = {}
-    current = deeply_nested
-    for _ in range(21):
-        child: dict[str, object] = {}
-        current["child"] = child
-        current = child
-
-    with pytest.raises(ValueError, match="nesting limit"):
-        SandboxSetupFixture.from_payload(deeply_nested)
-    with pytest.raises(ValueError, match="too many values"):
-        SandboxSetupFixture.from_payload({"values": list(range(1_000))})
 
 
 def test_mixed_action_and_answer_frame_round_trips() -> None:

@@ -30,7 +30,6 @@ from ul import (
     LocalPseudonymStore,
     RedactedSemanticPipeline,
     RedactionEngine,
-    SandboxSetupFixture,
     create_semantic_model_deconstructor,
     load_dataset_semantic_settings,
     load_redaction_policy,
@@ -51,7 +50,6 @@ from ul.http_sandbox import (
     JsonHttpSandboxConnection,
     json_http_sandbox_calls_per_execution,
     json_http_sandbox_config_urls,
-    json_http_sandbox_uses_per_record_setup,
     load_json_http_sandbox_config,
     validate_json_http_sandbox_configuration,
 )
@@ -210,9 +208,7 @@ def initialize_dataset_sandbox(
         f"{sandbox_config} --dry-run'."
     )
     console.print(
-        "Setup defaults to one static fixture. Replace its value with one complete "
-        "{{sandbox_setup}} leaf to consume explicit inline sandbox_setup objects from every "
-        "selected dataset record. Keep exactly one complete "
+        "Setup uses one static fixture for the sandbox. Keep exactly one complete "
         "{{case_id}} value in every lifecycle request, {{turn_id}} in execute_turn and snapshot, "
         "and one {{input}} value in execute_turn. "
         "headers_from_env maps HTTP header names to "
@@ -442,8 +438,6 @@ def evaluate_dataset(
                 allow_insecure_http=allow_insecure_http,
             )
         normalized_target_config = loaded_target_config
-        if normalized_target_config is not None:
-            _validate_sandbox_setup_mapping(selected_records, normalized_target_config)
         if resume is not None and normalized_target_config is None:
             raise ValueError("--resume requires --sandbox-config")
         target_calls_per_execution = (
@@ -599,9 +593,6 @@ def evaluate_dataset(
                 redaction_engine.policy.digest if redaction_engine is not None else None
             ),
             redaction_coverage=redaction_coverage,
-            sandbox_setup_count=sum(
-                record.sandbox_setup is not None for record in selected_records
-            ),
         )
         return
 
@@ -892,44 +883,34 @@ def _load_interaction_records(path: Path) -> tuple[InteractionRecord, ...]:
         if not isinstance(untyped_payload, dict):
             raise _DatasetInputError(f"{dataset_name} line {line_number}: record must be an object")
         payload = cast(dict[str, JsonValue], untyped_payload)
-        required_fields = {"id", "input", "output"}
-        allowed_fields = {*required_fields, "sandbox_setup"}
+        expected_fields = {"id", "input", "output"}
         payload_fields = set(payload)
-        if not required_fields <= payload_fields or not payload_fields <= allowed_fields:
-            missing_fields = sorted(required_fields - payload_fields)
-            unknown_fields = sorted(payload_fields - allowed_fields)
+        if payload_fields != expected_fields:
+            missing_fields = sorted(expected_fields - payload_fields)
+            unknown_fields = sorted(payload_fields - expected_fields)
             details: list[str] = []
             if missing_fields:
                 details.append(f"missing {', '.join(missing_fields)}")
             if unknown_fields:
                 details.append("unknown field(s)")
             raise _DatasetInputError(
-                f"{dataset_name} line {line_number}: expected id, input, output, and optional "
-                "sandbox_setup "
+                f"{dataset_name} line {line_number}: expected exactly id, input, output "
                 f"({'; '.join(details)})"
             )
         try:
-            sandbox_setup = (
-                SandboxSetupFixture.from_payload(payload["sandbox_setup"])
-                if "sandbox_setup" in payload
-                else None
-            )
             record = InteractionRecord.model_validate(
                 {
                     "id": payload["id"],
                     "raw_input": payload["input"],
                     "raw_observed_output": payload["output"],
-                    "sandbox_setup": sandbox_setup,
                 }
             )
         except ValidationError as error:
             invalid_fields = sorted(
                 {
-                    {
-                        "raw_input": "input",
-                        "raw_observed_output": "output",
-                        "sandbox_setup": "sandbox_setup",
-                    }.get(str(item["loc"][0]), str(item["loc"][0]))
+                    {"raw_input": "input", "raw_observed_output": "output"}.get(
+                        str(item["loc"][0]), str(item["loc"][0])
+                    )
                     for item in error.errors(include_input=False)
                     if item["loc"]
                 }
@@ -938,10 +919,6 @@ def _load_interaction_records(path: Path) -> tuple[InteractionRecord, ...]:
             raise _DatasetInputError(
                 f"{dataset_name} line {line_number}: invalid {field_summary}"
             ) from None
-        except ValueError as error:
-            raise _DatasetInputError(
-                f"{dataset_name} line {line_number}: invalid sandbox_setup ({error})"
-            ) from None
         if record.id in known_ids:
             raise _DatasetInputError(f"{dataset_name} line {line_number}: duplicate id")
         known_ids.add(record.id)
@@ -949,23 +926,6 @@ def _load_interaction_records(path: Path) -> tuple[InteractionRecord, ...]:
     if not records:
         raise _DatasetInputError(f"{dataset_name}: dataset contains no records")
     return tuple(records)
-
-
-def _validate_sandbox_setup_mapping(
-    records: tuple[InteractionRecord, ...], config: JsonHttpSandboxConfig
-) -> None:
-    fixture_count = sum(record.sandbox_setup is not None for record in records)
-    uses_per_record_setup = json_http_sandbox_uses_per_record_setup(config)
-    if fixture_count and not uses_per_record_setup:
-        raise ValueError(
-            "selected records contain sandbox_setup but the sandbox setup "
-            "request_json_template does not contain {{sandbox_setup}}"
-        )
-    if uses_per_record_setup and fixture_count != len(records):
-        raise ValueError(
-            "sandbox setup request_json_template uses {{sandbox_setup}}, so every selected "
-            "record must contain sandbox_setup"
-        )
 
 
 def _reject_nonstandard_json_constant(value: str) -> None:
@@ -1154,7 +1114,6 @@ def _print_dataset_plan(
     semantic_endpoint_sha256: str,
     redaction_policy_sha256: str | None,
     redaction_coverage: tuple[DatasetEvidenceRedactionCoverage, ...],
-    sandbox_setup_count: int,
 ) -> None:
     potential_target_calls = (
         selected_count * repetitions * (1 + len(operator_ids)) * target_calls_per_execution
@@ -1172,7 +1131,6 @@ def _print_dataset_plan(
         console.print(f"Selected interactions: {selected_count}")
     console.print(f"Operators: {', '.join(operator_ids)}")
     console.print(f"Repetitions: {repetitions} per original and accepted variation")
-    console.print(f"Per-record sandbox setup: {sandbox_setup_count} fixture(s); values hidden")
     if invariant_suite is None:
         console.print("Customer invariants: none")
     else:
@@ -1234,9 +1192,8 @@ def _print_dataset_plan(
         "live control responses, and variation responses on execution."
     )
     console.print(
-        "Every test case invokes and validates the configured sandbox reset contract. Setup "
-        "uses either the static sandbox-config payload or the selected record's explicit inline "
-        "fixture."
+        "Every test case invokes and validates the configured sandbox reset contract. Optional "
+        "setup uses one static fixture from the sandbox config for the entire run."
     )
     console.print(
         "Target requests and semantic model calls may be billed separately. Repetitions only "

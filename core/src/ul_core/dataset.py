@@ -1,10 +1,7 @@
 from __future__ import annotations
 
-import hashlib
-import json
-import math
 import re
-from typing import Literal, Self, cast
+from typing import Literal, Self
 
 from pydantic import ConfigDict, Field, JsonValue, model_validator
 
@@ -13,38 +10,6 @@ from ul_core.models import ULModel
 
 class _StrictULModel(ULModel):
     model_config = ConfigDict(strict=True)
-
-
-_MAXIMUM_SANDBOX_SETUP_BYTES = 65_536
-_MAXIMUM_SANDBOX_SETUP_DEPTH = 20
-_MAXIMUM_SANDBOX_SETUP_VALUES = 1_000
-
-
-class SandboxSetupFixture(_StrictULModel):
-    payload: dict[str, JsonValue]
-    sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
-
-    @classmethod
-    def from_payload(cls, payload: object) -> Self:
-        validated_payload = _validate_sandbox_setup_payload(payload)
-        copied_payload = cast(
-            dict[str, JsonValue],
-            json.loads(_canonical_sandbox_setup(validated_payload)),
-        )
-        return cls(
-            payload=copied_payload,
-            sha256=_sandbox_setup_sha256(copied_payload),
-        )
-
-    @model_validator(mode="after")
-    def validate_digest(self) -> Self:
-        self.verify_digest()
-        return self
-
-    def verify_digest(self) -> None:
-        _validate_sandbox_setup_payload(self.payload)
-        if self.sha256 != _sandbox_setup_sha256(self.payload):
-            raise ValueError("sandbox setup fixture digest must match its payload")
 
 
 class UserInputRecord(_StrictULModel):
@@ -56,67 +21,12 @@ class UserInputRecord(_StrictULModel):
 
 class InteractionRecord(UserInputRecord):
     raw_observed_output: JsonValue
-    sandbox_setup: SandboxSetupFixture | None = None
 
     @model_validator(mode="after")
     def validate_observed_output(self) -> Self:
         if self.raw_observed_output is None:
             raise ValueError("interaction records require an observed output")
         return self
-
-
-def _validate_sandbox_setup_payload(payload: object) -> dict[str, JsonValue]:
-    if not isinstance(payload, dict):
-        raise ValueError("sandbox setup fixture must be a JSON object")
-    values_to_visit: list[tuple[object, int]] = [(payload, 0)]
-    value_count = 0
-    while values_to_visit:
-        value, depth = values_to_visit.pop()
-        if depth > _MAXIMUM_SANDBOX_SETUP_DEPTH:
-            raise ValueError("sandbox setup fixture exceeds the nesting limit")
-        value_count += 1
-        if value_count > _MAXIMUM_SANDBOX_SETUP_VALUES:
-            raise ValueError("sandbox setup fixture contains too many values")
-        if value is None or isinstance(value, bool | int | str):
-            continue
-        if isinstance(value, float):
-            if not math.isfinite(value):
-                raise ValueError("sandbox setup fixture must contain standard JSON values")
-            continue
-        if isinstance(value, list):
-            values_to_visit.extend((item, depth + 1) for item in cast(list[object], value))
-            continue
-        if isinstance(value, dict):
-            object_value = cast(dict[object, object], value)
-            if not all(isinstance(key, str) for key in object_value):
-                raise ValueError("sandbox setup fixture object keys must be strings")
-            values_to_visit.extend((item, depth + 1) for item in object_value.values())
-            continue
-        raise ValueError("sandbox setup fixture must contain JSON values")
-    validated_payload = cast(dict[str, JsonValue], payload)
-    try:
-        encoded_payload = _canonical_sandbox_setup(validated_payload)
-    except (TypeError, ValueError):
-        raise ValueError("sandbox setup fixture must contain standard JSON values") from None
-    if len(encoded_payload) > _MAXIMUM_SANDBOX_SETUP_BYTES:
-        raise ValueError(
-            f"sandbox setup fixture exceeds {_MAXIMUM_SANDBOX_SETUP_BYTES} UTF-8 bytes"
-        )
-    return validated_payload
-
-
-def _canonical_sandbox_setup(payload: dict[str, JsonValue]) -> bytes:
-    return json.dumps(
-        payload,
-        ensure_ascii=False,
-        allow_nan=False,
-        sort_keys=True,
-        separators=(",", ":"),
-    ).encode("utf-8")
-
-
-def _sandbox_setup_sha256(payload: dict[str, JsonValue]) -> str:
-    return hashlib.sha256(_canonical_sandbox_setup(payload)).hexdigest()
 
 
 class RenderedUserInput(_StrictULModel):

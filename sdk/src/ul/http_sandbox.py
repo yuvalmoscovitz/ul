@@ -44,7 +44,6 @@ _SANDBOX_ENVIRONMENT_VARIABLE_PATTERN = re.compile(r"UL_SANDBOX_[A-Z][A-Z0-9_]*"
 _INPUT_PLACEHOLDER = "{{input}}"
 _CASE_ID_PLACEHOLDER = "{{case_id}}"
 _TURN_ID_PLACEHOLDER = "{{turn_id}}"
-_SANDBOX_SETUP_PLACEHOLDER = "{{sandbox_setup}}"
 _INITIAL_STATE_TURN_ID = "__ul_initial_state__"
 _MAXIMUM_CONFIG_BYTES = 1_000_000
 _MAXIMUM_HEADER_COUNT = 32
@@ -146,11 +145,6 @@ class JsonHttpLifecycleObservationConfig(JsonHttpLifecycleCallConfig):
 class JsonHttpLifecycleMutationConfig(JsonHttpLifecycleCallConfig):
     sandbox_id_json_pointer: str = "/sandbox_id"
     case_id_json_pointer: str = "/case_id"
-
-    @field_validator("request_json_template", mode="before")
-    @classmethod
-    def validate_request_json_template(cls, request_json: object) -> JsonValue:
-        return _validated_setup_request_json_template(request_json)
 
     @field_validator("sandbox_id_json_pointer", "case_id_json_pointer")
     @classmethod
@@ -431,7 +425,6 @@ class JsonHttpSandboxConnection:
             await self._client.aclose()
 
     def api_calls_for_case(self, case: EvaluationCase) -> int:
-        _validate_case_sandbox_setup(self._config, case)
         calls = json_http_sandbox_calls_per_conversation(self._config, len(case.turns))
         if case.timeout_after_commit_event is not None:
             if self._config.timeout_after_commit is None:
@@ -502,11 +495,7 @@ class JsonHttpSandboxConnection:
                 setup_response = await self._post_for_json(
                     config.setup.url,
                     _replace_request_placeholders(
-                        config.setup.request_json_template,
-                        case_id=case.id,
-                        sandbox_setup=(
-                            case.sandbox_setup.payload if case.sandbox_setup is not None else None
-                        ),
+                        config.setup.request_json_template, case_id=case.id
                     ),
                     "",
                     consume_budget=False,
@@ -908,9 +897,6 @@ class JsonHttpSandboxConnection:
             case_id=case.id,
             sandbox_id=self._config.sandbox_id,
             sandbox_config_sha256=self._config_sha256,
-            sandbox_setup_sha256=(
-                case.sandbox_setup.sha256 if case.sandbox_setup is not None else None
-            ),
             initial_state=initial_state,
             turns=turns,
             final_response=turns[-1].response if turns else None,
@@ -1138,13 +1124,6 @@ def json_http_sandbox_calls_per_execution(
     config: JsonHttpSandboxConfig,
 ) -> int:
     return json_http_sandbox_calls_per_conversation(config, 1)
-
-
-def json_http_sandbox_uses_per_record_setup(config: JsonHttpSandboxConfig) -> bool:
-    return (
-        config.setup is not None
-        and _count_placeholder(config.setup.request_json_template, _SANDBOX_SETUP_PLACEHOLDER) == 1
-    )
 
 
 def json_http_sandbox_config_sha256(config: JsonHttpSandboxConfig) -> str:
@@ -1390,9 +1369,6 @@ def _validated_template(template: object, *, name: str) -> tuple[JsonValue, dict
         _INPUT_PLACEHOLDER: _count_placeholder(validated_template, _INPUT_PLACEHOLDER),
         _CASE_ID_PLACEHOLDER: _count_placeholder(validated_template, _CASE_ID_PLACEHOLDER),
         _TURN_ID_PLACEHOLDER: _count_placeholder(validated_template, _TURN_ID_PLACEHOLDER),
-        _SANDBOX_SETUP_PLACEHOLDER: _count_placeholder(
-            validated_template, _SANDBOX_SETUP_PLACEHOLDER
-        ),
     }
 
 
@@ -1416,26 +1392,10 @@ def _validated_lifecycle_request_json_template(template: object) -> JsonValue:
         counts[_INPUT_PLACEHOLDER]
         or counts[_CASE_ID_PLACEHOLDER] != 1
         or counts[_TURN_ID_PLACEHOLDER]
-        or counts[_SANDBOX_SETUP_PLACEHOLDER]
     ):
         raise ValueError(
             "lifecycle request_json_template must contain exactly one {{case_id}} leaf "
             "and no {{input}} leaf"
-        )
-    return validated
-
-
-def _validated_setup_request_json_template(template: object) -> JsonValue:
-    validated, counts = _validated_template(template, name="request_json_template")
-    if (
-        counts[_INPUT_PLACEHOLDER]
-        or counts[_CASE_ID_PLACEHOLDER] != 1
-        or counts[_TURN_ID_PLACEHOLDER]
-        or counts[_SANDBOX_SETUP_PLACEHOLDER] > 1
-    ):
-        raise ValueError(
-            "setup request_json_template must contain exactly one {{case_id}} leaf, at most "
-            "one {{sandbox_setup}} leaf, and no {{input}} or {{turn_id}} leaf"
         )
     return validated
 
@@ -1446,7 +1406,6 @@ def _validated_turn_observation_request_json_template(template: object) -> JsonV
         counts[_INPUT_PLACEHOLDER]
         or counts[_CASE_ID_PLACEHOLDER] != 1
         or counts[_TURN_ID_PLACEHOLDER] != 1
-        or counts[_SANDBOX_SETUP_PLACEHOLDER]
     ):
         raise ValueError(
             "snapshot request_json_template must contain exactly one {{case_id}} and "
@@ -1495,7 +1454,6 @@ def _replace_request_placeholders(
     case_id: str,
     turn_id: str | None = None,
     raw_input: str | None = None,
-    sandbox_setup: dict[str, JsonValue] | None = None,
 ) -> JsonValue:
     if template == _INPUT_PLACEHOLDER:
         if raw_input is None:
@@ -1507,48 +1465,21 @@ def _replace_request_placeholders(
         if turn_id is None:
             raise AssertionError("turn ID placeholder requires a turn ID")
         return turn_id
-    if template == _SANDBOX_SETUP_PLACEHOLDER:
-        if sandbox_setup is None:
-            raise AssertionError("sandbox setup placeholder requires a fixture")
-        return sandbox_setup
     if isinstance(template, list):
         return [
             _replace_request_placeholders(
-                item,
-                case_id=case_id,
-                turn_id=turn_id,
-                raw_input=raw_input,
-                sandbox_setup=sandbox_setup,
+                item, case_id=case_id, turn_id=turn_id, raw_input=raw_input
             )
             for item in template
         ]
     if isinstance(template, dict):
         return {
             key: _replace_request_placeholders(
-                value,
-                case_id=case_id,
-                turn_id=turn_id,
-                raw_input=raw_input,
-                sandbox_setup=sandbox_setup,
+                value, case_id=case_id, turn_id=turn_id, raw_input=raw_input
             )
             for key, value in template.items()
         }
     return template
-
-
-def _validate_case_sandbox_setup(config: JsonHttpSandboxConfig, case: EvaluationCase) -> None:
-    if case.sandbox_setup is not None:
-        case.sandbox_setup.verify_digest()
-    uses_per_record_setup = json_http_sandbox_uses_per_record_setup(config)
-    if case.sandbox_setup is not None and not uses_per_record_setup:
-        raise ValueError(
-            "evaluation case has a sandbox setup fixture but setup request_json_template does "
-            "not contain {{sandbox_setup}}"
-        )
-    if case.sandbox_setup is None and uses_per_record_setup:
-        raise ValueError(
-            "setup request_json_template requires a sandbox setup fixture for every case"
-        )
 
 
 def _parse_json_pointer(pointer: str) -> tuple[str, ...]:

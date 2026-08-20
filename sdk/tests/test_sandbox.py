@@ -4,7 +4,6 @@ from typing import Literal
 
 import pytest
 from ul.sandbox import execution_evidence_requires_quarantine, validate_execution_evidence
-from ul_core.dataset import SandboxSetupFixture
 from ul_core.evaluation import (
     EvaluationCase,
     ExecutionEvidence,
@@ -113,26 +112,6 @@ def test_required_state_observation_is_enforced() -> None:
 
     with pytest.raises(ValueError, match="required state observation"):
         validate_execution_evidence(case, _SandboxIdentity(), evidence)
-
-
-def test_execution_evidence_is_bound_to_the_requested_setup_fixture() -> None:
-    fixture = SandboxSetupFixture.from_payload({"invoice": "AC-100"})
-    case = _case().model_copy(update={"sandbox_setup": fixture})
-
-    with pytest.raises(ValueError, match="setup fixture"):
-        validate_execution_evidence(case, _SandboxIdentity(), _evidence())
-    with pytest.raises(ValueError, match="setup fixture"):
-        validate_execution_evidence(
-            case,
-            _SandboxIdentity(),
-            _evidence().model_copy(update={"sandbox_setup_sha256": "b" * 64}),
-        )
-
-    validate_execution_evidence(
-        case,
-        _SandboxIdentity(),
-        _evidence().model_copy(update={"sandbox_setup_sha256": fixture.sha256}),
-    )
 
 
 def test_incomplete_timeout_event_is_rejected_and_quarantined() -> None:

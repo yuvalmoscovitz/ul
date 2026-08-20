@@ -482,7 +482,6 @@ class DatasetEvaluationRunner:
                     ),
                     max_sandbox_api_calls=1,
                     timeout_seconds=self._target_timeout_seconds,
-                    sandbox_setup=source.sandbox_setup,
                 )
                 sandbox_api_calls = self._sandbox.api_calls_for_case(evaluation_case)
                 if type(sandbox_api_calls) is not int or sandbox_api_calls < 1:
