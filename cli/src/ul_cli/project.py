@@ -12,7 +12,7 @@ from typing import Annotated, Literal, Never, cast
 from uuid import uuid4
 
 import typer
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 from rich.console import Console
 from ul import load_dataset_invariant_suite, load_redaction_policy
 from ul.http_sandbox import (
@@ -65,6 +65,22 @@ class ProjectConfig(_StrictModel):
     @classmethod
     def parse_json_operators(cls, value: object) -> object:
         return tuple(cast(list[object], value)) if isinstance(value, list) else value
+
+    @model_validator(mode="after")
+    def validate_redaction_binding(self) -> ProjectConfig:
+        redaction_values = (
+            self.redaction_policy,
+            self.redaction_policy_sha256,
+            self.redaction_state,
+        )
+        if any(value is not None for value in redaction_values) and not all(
+            value is not None for value in redaction_values
+        ):
+            raise ValueError(
+                "redaction_policy, redaction_policy_sha256, and redaction_state must be "
+                "configured together"
+            )
+        return self
 
 
 class ProjectState(_StrictModel):

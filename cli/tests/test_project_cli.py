@@ -563,6 +563,57 @@ def test_malformed_or_unknown_project_config_is_rejected(
     assert "input_value" not in result.output
 
 
+def test_project_config_cannot_disable_saved_redaction_binding(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    dataset = tmp_path / "interactions.jsonl"
+    _write_dataset(dataset)
+    policy = tmp_path / "redaction.json"
+    policy.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "rules": [
+                    {
+                        "name": "account",
+                        "locations": ["input"],
+                        "selector": "$text",
+                        "literal": "Alice",
+                        "action": "pseudonymize",
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    initialized = runner.invoke(
+        app,
+        [
+            "init",
+            str(dataset),
+            "--sandbox-url",
+            "https://sandbox.example",
+            "--allow-sandbox-network-egress",
+            "--confirm-isolated-sandbox",
+            "--redaction-policy",
+            str(policy),
+            "--redaction-state",
+            str(tmp_path / "redaction-state.json"),
+        ],
+    )
+    assert initialized.exit_code == 0, initialized.output
+    config_path = tmp_path / ".ul" / "config.json"
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    del config["redaction_policy_sha256"]
+    _write_private_file(config_path, json.dumps(config))
+
+    result = runner.invoke(app, ["run", "--dry-run"], terminal_width=160)
+
+    assert result.exit_code == 2
+    assert "redaction_policy_sha256" in result.output
+
+
 def test_deep_project_config_is_rejected_without_a_traceback(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
