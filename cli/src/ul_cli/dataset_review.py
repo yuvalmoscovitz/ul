@@ -111,7 +111,7 @@ class _OutcomeGroup(_StrictModel):
 
 
 class _LifecycleFailure(_StrictModel):
-    protocol_version: Literal[3]
+    protocol_version: Literal[4]
     failed_phase: str
     completed_phases: list[str]
     cleanup_reset_failed: bool

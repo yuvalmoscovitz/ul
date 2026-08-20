@@ -18,6 +18,7 @@ from ul_core.evaluation import (
     ExecutionEvidence,
     SandboxCapabilities,
     SandboxLifecycleEvidence,
+    SandboxResetEvidence,
     SandboxStateEvidence,
     SandboxTurnEvidence,
 )
@@ -141,6 +142,18 @@ class _ReplayTarget:
                 authority="sandbox_self_reported",
             ),
             lifecycle=SandboxLifecycleEvidence(
+                initial_reset=SandboxResetEvidence(
+                    reset_session_requested=True,
+                    reset_session_acknowledged=True,
+                    reset_env_requested=True,
+                    reset_env_acknowledged=True,
+                ),
+                cleanup_reset=SandboxResetEvidence(
+                    reset_session_requested=True,
+                    reset_session_acknowledged=True,
+                    reset_env_requested=True,
+                    reset_env_acknowledged=True,
+                ),
                 terminal_status="succeeded",
                 completed_phases=("execute", "cleanup"),
                 delivery="certain",
@@ -203,6 +216,18 @@ class _UncertainReplaySandbox(_ReplayTarget):
             sandbox_id=self.sandbox_id,
             sandbox_config_sha256=self.config_sha256,
             lifecycle=SandboxLifecycleEvidence(
+                initial_reset=SandboxResetEvidence(
+                    reset_session_requested=True,
+                    reset_session_acknowledged=True,
+                    reset_env_requested=True,
+                    reset_env_acknowledged=True,
+                ),
+                cleanup_reset=SandboxResetEvidence(
+                    reset_session_requested=True,
+                    reset_session_acknowledged=True,
+                    reset_env_requested=True,
+                    reset_env_acknowledged=True,
+                ),
                 terminal_status="failed",
                 failed_phase="execute_turn",
                 failure_code="transport_failed",

@@ -23,6 +23,8 @@ SandboxLifecycleFailureCode = Literal[
     "turn_identity",
     "reset_generation",
     "reset_generation_reused",
+    "reset_session_not_acknowledged",
+    "reset_env_not_acknowledged",
     "reset_not_clean",
     "request_too_large",
     "response_too_large",
@@ -196,9 +198,31 @@ class SandboxLifecycleEvidence(_StrictModel):
     cleanup_failure_code: SandboxLifecycleFailureCode | None = None
     cleanup_failure_reason: str | None = Field(default=None, min_length=1, max_length=500)
     sandbox_state_uncertain: bool
+    initial_reset: SandboxResetEvidence
+    cleanup_reset: SandboxResetEvidence | None
 
     @model_validator(mode="after")
     def validate_terminal_status(self) -> Self:
+        if (self.cleanup == "not_attempted") != (self.cleanup_reset is None):
+            raise ValueError("cleanup reset receipt must match whether cleanup was attempted")
+        if (
+            self.cleanup == "succeeded"
+            and self.cleanup_reset is not None
+            and (
+                self.cleanup_reset.reset_session_requested
+                != self.cleanup_reset.reset_session_acknowledged
+                or self.cleanup_reset.reset_env_requested
+                != self.cleanup_reset.reset_env_acknowledged
+            )
+        ):
+            raise ValueError("successful cleanup requires every requested reset")
+        if self.terminal_status == "succeeded" and any(
+            receipt.reset_session_requested != receipt.reset_session_acknowledged
+            or receipt.reset_env_requested != receipt.reset_env_acknowledged
+            for receipt in (self.initial_reset, self.cleanup_reset)
+            if receipt is not None
+        ):
+            raise ValueError("successful lifecycle evidence requires every requested reset")
         if self.terminal_status == "succeeded" and (
             self.failed_phase is not None
             or self.failure_code is not None
@@ -228,8 +252,23 @@ class SandboxLifecycleEvidence(_StrictModel):
         return self
 
 
+class SandboxResetEvidence(_StrictModel):
+    reset_session_requested: bool
+    reset_session_acknowledged: bool
+    reset_env_requested: bool
+    reset_env_acknowledged: bool
+
+    @model_validator(mode="after")
+    def validate_acknowledgements(self) -> Self:
+        if self.reset_session_acknowledged and not self.reset_session_requested:
+            raise ValueError("session reset cannot be acknowledged when it was not requested")
+        if self.reset_env_acknowledged and not self.reset_env_requested:
+            raise ValueError("environment reset cannot be acknowledged when it was not requested")
+        return self
+
+
 class ExecutionEvidence(_StrictModel):
-    schema_version: Literal["1.0.0"] = "1.0.0"
+    schema_version: Literal["1.1.0"] = "1.1.0"
     case_id: str = Field(min_length=1, max_length=500)
     sandbox_id: str = Field(min_length=1, max_length=500)
     sandbox_config_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")

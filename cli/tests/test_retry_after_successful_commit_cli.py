@@ -35,7 +35,7 @@ def _write_inputs(tmp_path: Path, *, observation_authority: str) -> tuple[Path, 
     target_path.write_text(
         json.dumps(
             {
-                "version": 3,
+                "version": 4,
                 "sandbox_id": "retry-test-sandbox",
                 "reset": {
                     "url": "http://127.0.0.1:8765/reset",

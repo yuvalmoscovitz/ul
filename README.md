@@ -39,7 +39,8 @@ ul init interactions.jsonl \
 ```
 
 The generated `.ul/sandbox.json` defines the adapter contract. Your isolated sandbox must implement
-its reset, setup, execute-turn, and snapshot requests. If you already have a custom mapping, use
+its reset, execute-turn, and snapshot requests. Reset asks separately for a fresh agent session and
+a clean external environment; both are required by default. If you already have a custom mapping, use
 `--sandbox-config sandbox.json` instead of `--sandbox-url`.
 
 Verify the adapter before spending money on model calls:

@@ -81,7 +81,7 @@ class _DefectiveAgentRequestHandler(BaseHTTPRequestHandler):
             return
 
         if self.path == "/reset":
-            if not _valid_case_request(request):
+            if not _valid_case_request(request, requires_reset_flags=True):
                 self._send_json(HTTPStatus.BAD_REQUEST, {"error": "invalid reset request"})
                 return
             with type(self).state_lock:
@@ -95,6 +95,8 @@ class _DefectiveAgentRequestHandler(BaseHTTPRequestHandler):
                     "case_id": _case_id_from_request(request),
                     "generation": generation,
                     "clean": True,
+                    "reset_session": request.get("reset_session") is True,
+                    "reset_env": request.get("reset_env") is True,
                 },
             )
             return
@@ -194,6 +196,7 @@ def _valid_case_request(
     *,
     scenario: str | None = None,
     requires_turn_id: bool = False,
+    requires_reset_flags: bool = False,
 ) -> bool:
     if type(request) is not dict:
         return False
@@ -201,12 +204,19 @@ def _valid_case_request(
     expected_fields = {"case_id"} if scenario is None else {"case_id", "scenario"}
     if requires_turn_id:
         expected_fields.add("turn_id")
+    if requires_reset_flags:
+        expected_fields.update({"reset_session", "reset_env"})
     if set(request_mapping) != expected_fields or request_mapping.get("scenario") != scenario:
         return False
     try:
         _validated_case_id(request_mapping["case_id"])
         if requires_turn_id:
             _validated_turn_id(request_mapping["turn_id"])
+        if requires_reset_flags and (
+            type(request_mapping["reset_session"]) is not bool
+            or type(request_mapping["reset_env"]) is not bool
+        ):
+            raise ValueError("invalid reset flags")
     except ValueError:
         return False
     return True

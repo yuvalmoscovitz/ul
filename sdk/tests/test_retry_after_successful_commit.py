@@ -20,6 +20,7 @@ from ul_core.evaluation import (
     ExecutionEvidence,
     SandboxCapabilities,
     SandboxLifecycleEvidence,
+    SandboxResetEvidence,
     SandboxStateEvidence,
     SandboxTurnEvidence,
 )
@@ -47,7 +48,7 @@ def _case() -> RetryAfterSuccessfulCommitCase:
 def _config() -> JsonHttpSandboxConfig:
     return JsonHttpSandboxConfig.model_validate(
         {
-            "version": 3,
+            "version": 4,
             "sandbox_id": "retry-test-sandbox",
             "reset": {
                 "url": "https://sandbox.example.test/reset",
@@ -152,6 +153,18 @@ class _DuplicateOnRetrySandbox:
                 authority="sandbox_self_reported",
             ),
             lifecycle=SandboxLifecycleEvidence(
+                initial_reset=SandboxResetEvidence(
+                    reset_session_requested=True,
+                    reset_session_acknowledged=True,
+                    reset_env_requested=True,
+                    reset_env_acknowledged=True,
+                ),
+                cleanup_reset=SandboxResetEvidence(
+                    reset_session_requested=True,
+                    reset_session_acknowledged=True,
+                    reset_env_requested=True,
+                    reset_env_acknowledged=True,
+                ),
                 terminal_status="succeeded",
                 completed_phases=("execute", "cleanup"),
                 delivery="certain",

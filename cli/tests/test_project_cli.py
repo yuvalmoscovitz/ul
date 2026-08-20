@@ -155,7 +155,7 @@ def test_init_defaults_fit_generated_sandbox_call_budget(
 
     assert dry_run.exit_code == 0, dry_run.output
     assert "Selected interactions: 3" in dry_run.output
-    assert "Potential sandbox API calls: up to 108 (authorized maximum: 120)" in dry_run.output
+    assert "Potential sandbox API calls: up to 90 (authorized maximum: 120)" in dry_run.output
 
 
 @pytest.mark.parametrize(
@@ -233,7 +233,7 @@ def test_run_rejects_sandbox_origin_change(tmp_path: Path, monkeypatch: pytest.M
     _initialize(tmp_path)
     sandbox_path = tmp_path / ".ul" / "sandbox.json"
     sandbox_config = json.loads(sandbox_path.read_text(encoding="utf-8"))
-    for operation in ("reset", "setup", "execute_turn", "snapshot"):
+    for operation in ("reset", "execute_turn", "snapshot"):
         sandbox_config[operation]["url"] = sandbox_config[operation]["url"].replace(
             "sandbox.example", "other.example"
         )

@@ -370,6 +370,8 @@ class _ReplayHandler(BaseHTTPRequestHandler):
                 "case_id": payload["case_id"],
                 "generation": replay_server.generation,
                 "clean": True,
+                "reset_session": True,
+                "reset_env": True,
             }
         elif self.path == "/execute":
             replay_server.requests.append(cast(dict[str, Any], payload))
@@ -437,7 +439,7 @@ def _write_target_config(path: Path, endpoint: str) -> None:
     path.write_text(
         json.dumps(
             {
-                "version": 3,
+                "version": 4,
                 "sandbox_id": "test-sandbox",
                 "headers_from_env": {"X-Test-Token": "UL_SANDBOX_REGRESSION_TEST_SECRET"},
                 "reset": {

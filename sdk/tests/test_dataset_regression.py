@@ -36,6 +36,7 @@ from ul_core.evaluation import (
     ExecutionEvidence,
     SandboxCapabilities,
     SandboxLifecycleEvidence,
+    SandboxResetEvidence,
     SandboxStateEvidence,
     SandboxTurnEvidence,
 )
@@ -85,7 +86,7 @@ def _case(
         variation_input=variation_input,
         target_config=JsonHttpSandboxConfig.model_validate(
             {
-                "version": 3,
+                "version": 4,
                 "sandbox_id": "test-sandbox",
                 "headers_from_env": {"Authorization": "UL_SANDBOX_TARGET_TOKEN"},
                 "reset": {
@@ -132,7 +133,7 @@ def _stateful_case(*, repetitions: int = 3) -> DatasetRegressionCase:
         variation_input="Pay invoice AC-101 instead of AC-100.",
         target_config=JsonHttpSandboxConfig.model_validate(
             {
-                "version": 3,
+                "version": 4,
                 "sandbox_id": "test-sandbox",
                 "reset": {
                     "url": "https://sandbox.example.test/reset",
@@ -215,6 +216,18 @@ class _Target:
             final_response=outcome.raw_output,
             final_state=SandboxStateEvidence(value=snapshot, authority="sandbox_self_reported"),
             lifecycle=SandboxLifecycleEvidence(
+                initial_reset=SandboxResetEvidence(
+                    reset_session_requested=True,
+                    reset_session_acknowledged=True,
+                    reset_env_requested=True,
+                    reset_env_acknowledged=True,
+                ),
+                cleanup_reset=SandboxResetEvidence(
+                    reset_session_requested=True,
+                    reset_session_acknowledged=True,
+                    reset_env_requested=True,
+                    reset_env_acknowledged=True,
+                ),
                 terminal_status="succeeded",
                 completed_phases=("execute", "cleanup"),
                 delivery="certain",

@@ -319,7 +319,7 @@ def initialize_project(
     console.print(f"Configured UL project: {project_config_path}")
     if sandbox_url is not None:
         console.print(
-            "Before running: implement the reset, setup, execute-turn, and snapshot contract "
+            "Before running: implement the reset, execute-turn, and snapshot contract "
             "generated in .ul/sandbox.json."
         )
         console.print("Then verify it with 'ul sandbox check .ul/sandbox.json --help'.")

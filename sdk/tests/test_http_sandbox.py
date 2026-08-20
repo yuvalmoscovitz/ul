@@ -50,7 +50,7 @@ def _config(
     timeout_after_commit: bool = False,
 ) -> JsonHttpSandboxConfig:
     raw: dict[str, Any] = {
-        "version": 3,
+        "version": 4,
         "sandbox_id": "payments-test",
         "headers_from_env": headers_from_env or {},
         "reset": {
@@ -152,6 +152,8 @@ def _successful_handler() -> tuple[Any, list[tuple[str, dict[str, JsonValue]]]]:
                         "case_id": body["case_id"],
                         "generation": generation,
                         "clean": True,
+                        "reset_session": body["reset_session"],
+                        "reset_env": body["reset_env"],
                     }
                 ).encode()
             )
@@ -186,6 +188,14 @@ def _successful_handler() -> tuple[Any, list[tuple[str, dict[str, JsonValue]]]]:
     return handler, requests
 
 
+async def test_reset_request_template_must_be_an_object_at_config_validation() -> None:
+    config = _config().model_dump(mode="json")
+    config["reset"]["request_json_template"] = ["{{case_id}}"]
+
+    with pytest.raises(ValidationError, match="must be a JSON object"):
+        JsonHttpSandboxConfig.model_validate(config)
+
+
 async def test_executes_remote_case_and_returns_explicit_evidence() -> None:
     handler, requests = _successful_handler()
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
@@ -203,16 +213,84 @@ async def test_executes_remote_case_and_returns_explicit_evidence() -> None:
         "/reset",
     ]
     assert {body["case_id"] for _, body in requests} == {"case-1"}
+    reset_requests = [body for path, body in requests if path == "/reset"]
+    assert reset_requests == [
+        {"case_id": "case-1", "reset_session": True, "reset_env": True},
+        {"case_id": "case-1", "reset_session": True, "reset_env": True},
+    ]
     assert requests[2][1]["turn_id"] == "__ul_initial_state__"
     assert requests[3][1]["turn_id"] == "turn-1"
     assert requests[4][1]["turn_id"] == "turn-1"
     assert evidence.lifecycle.terminal_status == "succeeded"
+    assert evidence.lifecycle.initial_reset.reset_session_requested is True
+    assert evidence.lifecycle.initial_reset.reset_session_acknowledged is True
+    assert evidence.lifecycle.initial_reset.reset_env_requested is True
+    assert evidence.lifecycle.initial_reset.reset_env_acknowledged is True
+    assert evidence.lifecycle.cleanup_reset is not None
+    assert evidence.lifecycle.cleanup_reset.reset_session_acknowledged is True
+    assert evidence.lifecycle.cleanup_reset.reset_env_acknowledged is True
     assert evidence.sandbox_id == "payments-test"
     assert evidence.initial_state is not None
     assert evidence.initial_state.value == {"committed_amount": 100}
     assert evidence.turns[0].response == {"input": "increase the amount"}
     assert evidence.turns[0].state_snapshot == {"committed_amount": 150}
     assert evidence.turns[0].state_observation_authority == "sandbox_self_reported"
+
+
+async def test_explicit_stateless_session_opt_out_is_requested_and_recorded() -> None:
+    handler, requests = _successful_handler()
+    config = _config().model_copy(
+        update={"reset": _config().reset.model_copy(update={"reset_session": False})}
+    )
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        sandbox = JsonHttpSandboxConnection.from_config(
+            config, sandbox_confirmed=True, max_sandbox_api_calls=6, client=client
+        )
+        evidence = await sandbox.execute(_case("increase the amount", max_calls=6))
+
+    assert [body["reset_session"] for path, body in requests if path == "/reset"] == [
+        False,
+        False,
+    ]
+    assert evidence.lifecycle.initial_reset.reset_session_requested is False
+    assert evidence.lifecycle.initial_reset.reset_session_acknowledged is False
+    assert evidence.lifecycle.initial_reset.reset_env_requested is True
+    assert evidence.lifecycle.initial_reset.reset_env_acknowledged is True
+
+
+async def test_missing_requested_environment_reset_acknowledgement_blocks_execution() -> None:
+    handler, requests = _successful_handler()
+
+    def missing_acknowledgement(request: httpx.Request) -> httpx.Response:
+        response = handler(request)
+        if request.url.path != "/reset":
+            return response
+        request_body = json.loads(request.content)
+        return _raw_response(
+            json.dumps(
+                {
+                    "sandbox_id": "payments-test",
+                    "case_id": request_body["case_id"],
+                    "generation": 1,
+                    "clean": True,
+                    "reset_session": True,
+                }
+            ).encode()
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(missing_acknowledgement)) as client:
+        sandbox = JsonHttpSandboxConnection.from_config(
+            _config(), sandbox_confirmed=True, max_sandbox_api_calls=6, client=client
+        )
+        evidence = await sandbox.execute(_case("increase the amount", max_calls=6))
+
+    assert [path for path, _ in requests] == ["/reset"]
+    assert evidence.lifecycle.terminal_status == "failed"
+    assert evidence.lifecycle.failed_phase == "reset"
+    assert evidence.lifecycle.failure_code == "reset_env_not_acknowledged"
+    assert evidence.lifecycle.initial_reset.reset_env_requested is True
+    assert evidence.lifecycle.initial_reset.reset_env_acknowledged is False
+    assert evidence.lifecycle.cleanup_reset is None
 
 
 async def test_timeout_after_commit_receipts_are_correlated_and_budgeted() -> None:
@@ -377,6 +455,8 @@ async def test_cleanup_failure_is_evidence_and_quarantines_connection() -> None:
                         "case_id": body["case_id"],
                         "generation": 1,
                         "clean": True,
+                        "reset_session": True,
+                        "reset_env": True,
                     }
                 ).encode()
             )
@@ -435,6 +515,8 @@ async def test_ambiguous_execute_delivery_stays_quarantined_after_cleanup() -> N
                         "case_id": body["case_id"],
                         "generation": generation,
                         "clean": True,
+                        "reset_session": True,
+                        "reset_env": True,
                     }
                 ).encode()
             )
@@ -638,6 +720,11 @@ async def test_null_snapshot_is_a_safe_protocol_failure() -> None:
     assert evidence.lifecycle.failure_code == "response_mapping"
     assert evidence.lifecycle.failure_reason == ("sandbox API response JSON pointer selected null")
     assert evidence.lifecycle.cleanup == "succeeded"
+    assert evidence.lifecycle.initial_reset.reset_session_acknowledged is True
+    assert evidence.lifecycle.initial_reset.reset_env_acknowledged is True
+    assert evidence.lifecycle.cleanup_reset is not None
+    assert evidence.lifecycle.cleanup_reset.reset_session_acknowledged is True
+    assert evidence.lifecycle.cleanup_reset.reset_env_acknowledged is True
     assert evidence.final_response is None
     assert [path for path, _ in requests][-1] == "/reset"
 
@@ -702,7 +789,13 @@ async def test_sandbox_identity_mismatch_stops_before_execute() -> None:
         reset_calls += 1
         return _raw_response(
             json.dumps(
-                {"sandbox_id": "production", "generation": reset_calls, "clean": True}
+                {
+                    "sandbox_id": "production",
+                    "generation": reset_calls,
+                    "clean": True,
+                    "reset_session": True,
+                    "reset_env": True,
+                }
             ).encode()
         )
 
@@ -738,7 +831,14 @@ async def test_stale_execute_response_is_rejected_and_quarantined(
         }
         if request.url.path == "/reset":
             generation += 1
-            response_body.update({"generation": generation, "clean": True})
+            response_body.update(
+                {
+                    "generation": generation,
+                    "clean": True,
+                    "reset_session": True,
+                    "reset_env": True,
+                }
+            )
         elif request.url.path == "/execute":
             response_body.update(
                 {"turn_id": request_body["turn_id"], "agent_response": {"ok": True}}
@@ -909,6 +1009,8 @@ async def test_cancellation_during_execution_quarantines_connection() -> None:
                         "case_id": body["case_id"],
                         "generation": generation,
                         "clean": True,
+                        "reset_session": True,
+                        "reset_env": True,
                     }
                 ).encode()
             )
@@ -961,6 +1063,8 @@ async def test_case_deadline_bounds_the_complete_lifecycle() -> None:
                         "case_id": body["case_id"],
                         "generation": generation,
                         "clean": True,
+                        "reset_session": True,
+                        "reset_env": True,
                     }
                 ).encode()
             )

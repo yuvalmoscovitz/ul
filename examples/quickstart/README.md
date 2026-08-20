@@ -10,6 +10,11 @@ This package is a complete but synthetic black-box evaluation:
 - `defective_agent.py` is a resettable local HTTP sandbox with one seeded parsing defect.
 - `run.py` starts that sandbox and runs UL.
 
+Before every original or variation trial, UL asks the sandbox to clear both the agent session and
+the external test environment. The quickstart `POST /reset` accepts
+`{"case_id":"...","reset_session":true,"reset_env":true}` and acknowledges each requested reset.
+The session reset clears conversation memory; the environment reset restores test business state.
+
 Run from the repository root after installing dependencies and configuring either OpenRouter or
 an OpenAI-compatible provider as shown in the [main README](../../README.md):
 

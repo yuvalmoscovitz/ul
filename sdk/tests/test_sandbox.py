@@ -9,6 +9,7 @@ from ul_core.evaluation import (
     ExecutionEvidence,
     SandboxCapabilities,
     SandboxLifecycleEvidence,
+    SandboxResetEvidence,
     SandboxStateEvidence,
     SandboxTurnEvidence,
     TimeoutAfterCommitEventEvidence,
@@ -76,6 +77,18 @@ def _evidence(
             observer_id=("observer-1" if authority == "independent_observer" else None),
         ),
         lifecycle=SandboxLifecycleEvidence(
+            initial_reset=SandboxResetEvidence(
+                reset_session_requested=True,
+                reset_session_acknowledged=True,
+                reset_env_requested=True,
+                reset_env_acknowledged=True,
+            ),
+            cleanup_reset=SandboxResetEvidence(
+                reset_session_requested=True,
+                reset_session_acknowledged=True,
+                reset_env_requested=True,
+                reset_env_acknowledged=True,
+            ),
             terminal_status="succeeded",
             completed_phases=("reset", "execute_turn", "snapshot", "cleanup_reset"),
             delivery="certain",
@@ -195,6 +208,18 @@ def test_every_independent_state_observation_is_bound_to_the_declared_observer()
             observer_id="observer-1",
         ),
         lifecycle=SandboxLifecycleEvidence(
+            initial_reset=SandboxResetEvidence(
+                reset_session_requested=True,
+                reset_session_acknowledged=True,
+                reset_env_requested=True,
+                reset_env_acknowledged=True,
+            ),
+            cleanup_reset=SandboxResetEvidence(
+                reset_session_requested=True,
+                reset_session_acknowledged=True,
+                reset_env_requested=True,
+                reset_env_acknowledged=True,
+            ),
             terminal_status="succeeded",
             completed_phases=(
                 "reset",
