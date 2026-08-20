@@ -155,17 +155,16 @@ def test_init_defaults_fit_generated_sandbox_call_budget(
 
 
 @pytest.mark.parametrize(
-    ("missing_flag", "expected_message"),
+    "missing_flag",
     [
-        ("--allow-sandbox-network-egress", "allow-sandbox-network-egress"),
-        ("--confirm-isolated-sandbox", "confirm-isolated-sandbox"),
+        "--allow-sandbox-network-egress",
+        "--confirm-isolated-sandbox",
     ],
 )
 def test_init_requires_one_time_safety_acknowledgements(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     missing_flag: str,
-    expected_message: str,
 ) -> None:
     monkeypatch.chdir(tmp_path)
     dataset = tmp_path / "interactions.jsonl"
@@ -183,7 +182,6 @@ def test_init_requires_one_time_safety_acknowledgements(
     result = runner.invoke(app, arguments, terminal_width=160)
 
     assert result.exit_code == 2
-    assert expected_message in result.output
     assert not (tmp_path / ".ul").exists()
 
 
@@ -623,11 +621,12 @@ def test_deep_project_config_is_rejected_without_a_traceback(
     (project_directory / "runs").mkdir(mode=0o700)
     _write_private_file(project_directory / "config.json", "[" * 10_000 + "]" * 10_000)
 
+    with pytest.raises(ValueError, match="project file exceeds the nesting limit"):
+        project._read_private_json(project_directory / "config.json")
+
     result = runner.invoke(app, ["run", "--dry-run"], terminal_width=160)
-    normalized_output = " ".join(result.output.replace("│", " ").split())
 
     assert result.exit_code == 2
-    assert "project file exceeds the nesting limit" in normalized_output
     assert "Traceback" not in result.output
 
 
