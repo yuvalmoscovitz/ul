@@ -129,6 +129,7 @@ def initialize_dataset_sandbox(
         str,
         typer.Option(help="Base URL of the customer's isolated agent sandbox API."),
     ],
+    show_guidance: Annotated[bool, typer.Option(hidden=True)] = True,
 ) -> None:
     """Create a private connection config for a customer-managed agent sandbox API."""
     try:
@@ -198,6 +199,8 @@ def initialize_dataset_sandbox(
         output_stream.write("\n")
 
     console.print(f"Created private sandbox connection config: {sandbox_config}")
+    if not show_guidance:
+        return
     console.print(
         "Next: adjust the lifecycle request bodies and response pointers, add any "
         "headers_from_env, then validate the connection with 'ul sandbox check "
@@ -353,6 +356,7 @@ def evaluate_dataset(
         Path | None,
         typer.Option(help="Private local reversible pseudonym mapping state."),
     ] = None,
+    show_report_guidance: Annotated[bool, typer.Option(hidden=True)] = True,
 ) -> None:
     """Explore behavioral differences against an isolated black-box agent.
 
@@ -828,6 +832,7 @@ def evaluate_dataset(
         output,
         augmentations_output=augmentations_output,
         invariant_evaluations=tuple(invariant_evaluations),
+        show_report_guidance=show_report_guidance,
     )
     prior_invariant_evaluations = (
         resume_evidence.invariant_evaluations if resume_evidence is not None else ()
@@ -928,6 +933,11 @@ def _load_interaction_records(path: Path) -> tuple[InteractionRecord, ...]:
     return tuple(records)
 
 
+def validate_interaction_dataset(path: Path) -> None:
+    """Validate a dataset without executing or retaining its records."""
+    _load_interaction_records(path)
+
+
 def _reject_nonstandard_json_constant(value: str) -> None:
     raise ValueError(f"nonstandard JSON constant: {value}")
 
@@ -976,6 +986,11 @@ def _validate_operator_ids(operator_ids: list[str] | None) -> tuple[str, ...]:
         reference if "@" in reference else operator.id
         for reference, operator in zip(selected_references, selected_operators, strict=True)
     )
+
+
+def validate_dataset_operator_ids(operator_ids: list[str] | None) -> tuple[str, ...]:
+    """Resolve and validate dataset augmentation operator references."""
+    return _validate_operator_ids(operator_ids)
 
 
 def _dataset_operator_identity(reference: str) -> tuple[str, str]:
@@ -1412,6 +1427,7 @@ def _print_dataset_results(
     *,
     augmentations_output: Path | None = None,
     invariant_evaluations: tuple[DatasetInvariantEvaluation, ...] = (),
+    show_report_guidance: bool = True,
 ) -> None:
     table = Table(title="Dataset evaluation")
     table.add_column("Case", style="cyan")
@@ -1447,7 +1463,8 @@ def _print_dataset_results(
     console.print(f"Complete evidence: {output}")
     if augmentations_output is not None:
         _print_dataset_plain(f"Saved augmentations: {augmentations_output}")
-    console.print(f"Next: ul dataset report {output}")
+    if show_report_guidance:
+        console.print(f"Next: ul dataset report {output}")
 
 
 def _result_needs_review(result: DatasetEvaluationResult) -> bool:

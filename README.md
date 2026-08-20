@@ -45,6 +45,36 @@ expected finding is confirmed. See the
 You need Python 3.12+, [`uv`](https://docs.astral.sh/uv/), and access to either OpenRouter or an
 OpenAI-compatible semantic-model endpoint.
 
+For your own agent, configure the project once and then use three top-level commands:
+
+```bash
+uv run ul init interactions.jsonl \
+  --sandbox-url https://your-sandbox.example \
+  --allow-sandbox-network-egress \
+  --confirm-isolated-sandbox
+
+# Review .ul/sandbox.json once so its request bodies and response pointers match your API.
+export OPEN_ROUTER_API_KEY=YOUR_SECRET_FROM_A_SECRET_MANAGER
+export UL_LIVE=true
+
+uv run ul run
+uv run ul report
+```
+
+`ul init` validates the dataset and saves project settings under `.ul/`. After that, `ul run`
+finds the project from the current directory or a parent, creates a new evidence file, and remembers
+the latest completed run. `ul report` opens that run without another path argument or any model or
+sandbox calls. Use `ul run --dry-run` to validate the saved plan without external calls. Options
+such as `--limit`, `--repetitions`, `--operator`, and `--max-sandbox-api-calls` override the saved
+values for one run without changing the project configuration.
+
+If you already have a sandbox configuration, pass `--sandbox-config sandbox.json` to `ul init`
+instead of `--sandbox-url`. Provider credentials remain in environment variables and are never
+written to project files. The isolation and network flags are explicit one-time acknowledgments
+saved by `init`; they are not repeated on every run.
+
+To run UL's bundled defective-agent example instead:
+
 ```bash
 git clone https://github.com/yuvalmoscovitz/ul.git
 cd ul
@@ -376,16 +406,21 @@ to the 50 MB bundle limit. Keep them in governed local storage.
 
 ## Connect your customer-managed sandbox API
 
-Give UL the lifecycle endpoints of an isolated, non-production deployment of your agent:
+Give UL the base URL of an isolated, non-production deployment of your agent:
 
 ```bash
-uv run ul dataset init sandbox.json --url https://your-sandbox.example
-uv run ul sandbox check sandbox.json \
+uv run ul init your-data.jsonl \
+  --sandbox-url https://your-sandbox.example \
+  --allow-sandbox-network-egress \
+  --confirm-isolated-sandbox
+
+# Adjust the generated lifecycle mapping once, then verify it.
+uv run ul sandbox check .ul/sandbox.json \
   --probe "Describe your harmless sandbox-only check here" \
   --allow-sandbox-network-egress \
   --confirm-isolated-sandbox \
   --confirm-harmless-probe
-uv run ul dataset evaluate your-data.jsonl --sandbox-config sandbox.json --dry-run
+uv run ul run --dry-run
 ```
 
 The customer builds and operates this sandbox; UL only calls its API. It must expose reset,
@@ -395,6 +430,10 @@ dataset and sandbox mapping without making external calls.
 
 Credential environment-variable names must use the dedicated `UL_SANDBOX_*` namespace. This keeps
 a sandbox configuration from selecting unrelated ambient process credentials.
+
+Once the check and dry-run succeed, set the semantic-provider environment variables and use only
+`ul run` followed by `ul report`. The `ul dataset ...` commands remain available when automation
+needs every input and output path specified explicitly.
 
 `ul sandbox check` makes no UL semantic-model calls. It runs the supplied non-sensitive probe through
 the configured reset, optional setup, initial snapshot, execute-turn, post-turn snapshot, and
