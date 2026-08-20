@@ -12,7 +12,6 @@ from typing import Annotated, TextIO
 
 import typer
 from pydantic import ValidationError
-from ul import DatasetEvaluationResult
 from ul.dataset_invariants import (
     DatasetInvariantRule,
     DatasetInvariantRuleEvaluation,
@@ -97,8 +96,8 @@ def save_dataset_regression(
             "--confirm-versioned-input",
             help=(
                 "Confirm the exact raw input, literal sandbox-template values, and selected "
-                "customer-rule definitions plus any per-record sandbox setup fixture, which may "
-                "be sensitive and are not auto-redacted, are appropriate to store and version."
+                "customer-rule definitions, which may be sensitive and are not auto-redacted, "
+                "are appropriate to store and version."
             ),
         ),
     ] = False,
@@ -107,9 +106,8 @@ def save_dataset_regression(
     if not confirm_versioned_input:
         raise typer.BadParameter(
             "saving requires confirmation that the exact raw input and literal sandbox-template "
-            "values plus selected customer-rule definitions and any per-record sandbox setup "
-            "fixture may be sensitive, are not auto-redacted, and are appropriate to store and "
-            "version",
+            "values plus selected customer-rule definitions may be sensitive, are not "
+            "auto-redacted, and are appropriate to store and version",
             param_hint="--confirm-versioned-input",
         )
     if rules is not None and len(rules) != len(set(rules)):
@@ -150,10 +148,9 @@ def save_dataset_regression(
 
     _print_safe(f"Saved regression case {case.case_id}: {output}")
     _print_safe(
-        "The case stores the exact raw input and any per-record sandbox setup fixture, which may "
-        "be sensitive and are not auto-redacted, plus selected customer-rule definitions and the "
-        "declared observation authority. Rule literals, allowed sets, fixture values, and literal "
-        "request-template values are copied unredacted. "
+        "The case stores the exact raw input, which may be sensitive and is not auto-redacted, "
+        "plus selected customer-rule definitions and the declared observation authority. Rule "
+        "literals, allowed sets, and literal request-template values are copied unredacted. "
         "Header authentication remains environment-backed. "
         "The embedded sandbox config is customer-declared at case creation, is not verified as "
         "the discovery target, and is never executed by replay."
@@ -582,11 +579,6 @@ def _build_regression_case(
         selected_rules.append(baseline_definition)
 
     trusted_target_config = load_json_http_sandbox_config(target_config_path)
-    technical_result = DatasetEvaluationResult.model_validate_json(
-        json.dumps(loaded_record.evidence.technical_details)
-    )
-    if technical_result.source.id != loaded_record.evidence.interaction_id:
-        raise ValueError("finding technical source does not match its evidence interaction")
     return create_dataset_regression_case(
         finding_id=finding_id,
         evidence_sha256=loaded_record.sha256,
@@ -606,7 +598,6 @@ def _build_regression_case(
         ),
         selected_rules=tuple(selected_rules),
         discovery_repetitions=loaded_record.evidence.execution_plan.repetitions,
-        sandbox_setup=technical_result.source.sandbox_setup,
     )
 
 

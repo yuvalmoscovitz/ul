@@ -23,7 +23,6 @@ from ul import (
     DatasetEvaluationTrialSet,
     InteractionRecord,
     ObservedAgentOutput,
-    SandboxSetupFixture,
     SemanticFrame,
 )
 from ul.dataset_augmentation import DatasetAugmentationCandidate
@@ -150,7 +149,7 @@ def _amount_rule(status: str) -> dict[str, Any]:
     return rule
 
 
-def _evidence_record(*, sandbox_setup: dict[str, Any] | None = None) -> dict[str, Any]:
+def _evidence_record() -> dict[str, Any]:
     original_effect = _effect("AC-100")
     changed_effect = _effect("AC-101")
     suite = DatasetInvariantSuite(
@@ -241,11 +240,11 @@ def _evidence_record(*, sandbox_setup: dict[str, Any] | None = None) -> dict[str
                 }
             ],
         },
-        "technical_details": _technical_details(sandbox_setup=sandbox_setup),
+        "technical_details": _technical_details(),
     }
 
 
-def _technical_details(*, sandbox_setup: dict[str, Any] | None = None) -> dict[str, Any]:
+def _technical_details() -> dict[str, Any]:
     source_frame = SemanticFrame(interaction_id="quickstart-payment", extractor_version="test")
     candidate = DatasetAugmentationCandidate(
         source_interaction_id="quickstart-payment",
@@ -285,19 +284,21 @@ def _technical_details(*, sandbox_setup: dict[str, Any] | None = None) -> dict[s
             ),
         )
 
-    source = InteractionRecord(
-        id="quickstart-payment",
-        raw_input="Pay AC-100.",
-        raw_observed_output={},
-        sandbox_setup=(
-            SandboxSetupFixture.from_payload(sandbox_setup) if sandbox_setup is not None else None
-        ),
-    )
     result = DatasetEvaluationResult(
-        source=source,
+        source=InteractionRecord(
+            id="quickstart-payment",
+            raw_input="Pay AC-100.",
+            raw_observed_output={},
+        ),
         augmentation=DatasetAugmentationResult(
             operator_references=({"id": candidate.operator_id, "version": "1.0.0"},),
-            source_records=(source,),
+            source_records=(
+                InteractionRecord(
+                    id="quickstart-payment",
+                    raw_input="Pay AC-100.",
+                    raw_observed_output={},
+                ),
+            ),
             source_frames=(source_frame,),
             candidates=(candidate,),
         ),
@@ -316,14 +317,9 @@ def _technical_details(*, sandbox_setup: dict[str, Any] | None = None) -> dict[s
     return result.model_dump(mode="json")
 
 
-def _write_evidence(path: Path, *, sandbox_setup: dict[str, Any] | None = None) -> None:
+def _write_evidence(path: Path) -> None:
     path.write_text(
-        json.dumps(
-            _evidence_record(sandbox_setup=sandbox_setup),
-            ensure_ascii=False,
-            separators=(",", ":"),
-        )
-        + "\n",
+        json.dumps(_evidence_record(), ensure_ascii=False, separators=(",", ":")) + "\n",
         encoding="utf-8",
     )
 
@@ -354,7 +350,6 @@ class _ReplayServer(ThreadingHTTPServer):
     authorization_headers: list[str | None]
     generation: int
     committed_result: dict[str, Any] | None
-    setup_fixtures: list[dict[str, Any]]
 
 
 class _ReplayHandler(BaseHTTPRequestHandler):
@@ -375,12 +370,6 @@ class _ReplayHandler(BaseHTTPRequestHandler):
                 "case_id": payload["case_id"],
                 "generation": replay_server.generation,
                 "clean": True,
-            }
-        elif self.path == "/setup":
-            replay_server.setup_fixtures.append(cast(dict[str, Any], payload["fixture"]))
-            response_payload = {
-                "sandbox_id": "test-sandbox",
-                "case_id": payload["case_id"],
             }
         elif self.path == "/execute":
             replay_server.requests.append(cast(dict[str, Any], payload))
@@ -431,7 +420,6 @@ def _running_server() -> Generator[tuple[_ReplayServer, str]]:
     server.authorization_headers = []
     server.generation = 0
     server.committed_result = None
-    server.setup_fixtures = []
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     host, port = cast(tuple[str, int], server.server_address)
@@ -444,7 +432,7 @@ def _running_server() -> Generator[tuple[_ReplayServer, str]]:
     assert not thread.is_alive()
 
 
-def _write_target_config(path: Path, endpoint: str, *, per_record_setup: bool = False) -> None:
+def _write_target_config(path: Path, endpoint: str) -> None:
     base_url = endpoint.removesuffix("/execute")
     path.write_text(
         json.dumps(
@@ -460,21 +448,6 @@ def _write_target_config(path: Path, endpoint: str, *, per_record_setup: bool = 
                     "clean_state_json_pointer": "/clean",
                     "clean_state_value": True,
                 },
-                **(
-                    {
-                        "setup": {
-                            "url": f"{base_url}/setup",
-                            "request_json_template": {
-                                "case_id": "{{case_id}}",
-                                "fixture": "{{sandbox_setup}}",
-                            },
-                            "case_id_json_pointer": "/case_id",
-                            "sandbox_id_json_pointer": "/sandbox_id",
-                        }
-                    }
-                    if per_record_setup
-                    else {}
-                ),
                 "execute_turn": {
                     "url": endpoint,
                     "request_json_template": {
@@ -554,9 +527,7 @@ def _save_arguments(
     return arguments
 
 
-def _replay_arguments(
-    case_path: Path, target_config: Path, result_path: Path, *, max_target_calls: int = 15
-) -> list[str]:
+def _replay_arguments(case_path: Path, target_config: Path, result_path: Path) -> list[str]:
     return [
         "regression",
         "replay",
@@ -567,7 +538,7 @@ def _replay_arguments(
         "--confirm-isolated-sandbox",
         "--allow-insecure-http",
         "--max-sandbox-api-calls",
-        str(max_target_calls),
+        "15",
         "--output",
         str(result_path),
     ]
@@ -603,34 +574,27 @@ def test_confirmed_finding_save_and_replay_real_loopback(
     case_path = tmp_path / "wrong-invoice.regression.json"
     defective_result_path = tmp_path / "defective-replay.json"
     fixed_result_path = tmp_path / "fixed-replay.json"
-    sandbox_setup = {
-        "invoices": [{"id": "AC-100", "status": "approved"}],
-        "fixture_secret": "customer-authored-fixture-secret",
-    }
-    _write_evidence(evidence, sandbox_setup=sandbox_setup)
+    _write_evidence(evidence)
     monkeypatch.setenv("UL_SANDBOX_REGRESSION_TEST_SECRET", TEST_SECRET)
     monkeypatch.delenv("OPEN_ROUTER_API_KEY", raising=False)
 
     with _running_server() as (server, endpoint):
         target_config = tmp_path / "target.json"
-        _write_target_config(target_config, endpoint, per_record_setup=True)
+        _write_target_config(target_config, endpoint)
         _confirm_finding(evidence)
 
         saved = runner.invoke(app, _save_arguments(evidence, target_config, case_path))
         assert saved.exit_code == 0, saved.output
         assert "Saved regression case ulrc_v1_" in saved.output
-        assert "--max-sandbox-api-calls 18" in saved.output
+        assert "--max-sandbox-api-calls 15" in saved.output
         assert "--allow-insecure-http" in saved.output
         assert "not verified as the discovery target" in saved.output
         assert case_path.exists()
         assert TEST_SECRET not in saved.output
         assert TEST_SECRET not in case_path.read_text(encoding="utf-8")
-        saved_case = json.loads(case_path.read_text(encoding="utf-8"))
-        assert saved_case["sandbox_setup"]["payload"] == sandbox_setup
 
         defective = runner.invoke(
-            app,
-            _replay_arguments(case_path, target_config, defective_result_path, max_target_calls=18),
+            app, _replay_arguments(case_path, target_config, defective_result_path)
         )
         assert defective.exit_code == 1, defective.output
         assert ": failed" in defective.output
@@ -645,10 +609,7 @@ def test_confirmed_finding_save_and_replay_real_loopback(
         assert server.authorization_headers == [TEST_SECRET] * 3
 
         server.fixed = True
-        fixed = runner.invoke(
-            app,
-            _replay_arguments(case_path, target_config, fixed_result_path, max_target_calls=18),
-        )
+        fixed = runner.invoke(app, _replay_arguments(case_path, target_config, fixed_result_path))
         assert fixed.exit_code == 0, fixed.output
         assert ": passed" in fixed.output
         assert len(server.requests) == 6
@@ -665,17 +626,12 @@ def test_confirmed_finding_save_and_replay_real_loopback(
             and request["turn_id"] == f"{request['case_id']}:turn-1"
             for request in server.requests[3:]
         )
-        assert server.setup_fixtures == [sandbox_setup] * 6
 
     for artifact in (case_path, defective_result_path, fixed_result_path):
         serialized = artifact.read_text(encoding="utf-8")
         assert TEST_SECRET not in serialized
         if os.name != "nt":
             assert stat.S_IMODE(artifact.stat().st_mode) == 0o600
-    assert "customer-authored-fixture-secret" in case_path.read_text(encoding="utf-8")
-    assert "customer-authored-fixture-secret" not in defective_result_path.read_text(
-        encoding="utf-8"
-    )
     defective_result = json.loads(defective_result_path.read_text(encoding="utf-8"))
     fixed_result = json.loads(fixed_result_path.read_text(encoding="utf-8"))
     assert defective_result["status"] == "failed"

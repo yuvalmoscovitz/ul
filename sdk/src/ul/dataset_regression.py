@@ -15,7 +15,7 @@ from typing import Literal, Self, cast
 
 from pydantic import ConfigDict, Field, JsonValue, ValidationError, field_validator, model_validator
 from ul_core.contracts import SandboxExecutor
-from ul_core.dataset import ObservedAgentOutput, SandboxSetupFixture
+from ul_core.dataset import ObservedAgentOutput
 from ul_core.evaluation import EvaluationCase, ExecutionEvidence, StateObservationAuthority
 from ul_core.models import ULModel
 
@@ -118,7 +118,6 @@ class DatasetRegressionCase(_StrictModel):
     target: DatasetRegressionTargetSnapshot
     invariant_suite: DatasetRegressionInvariantSuite
     discovery_repetitions: int = Field(ge=1)
-    sandbox_setup: SandboxSetupFixture | None = None
 
     @model_validator(mode="after")
     def validate_case_id(self) -> Self:
@@ -126,10 +125,7 @@ class DatasetRegressionCase(_StrictModel):
             not isinstance(rule, JsonValuesEqualInvariant) for rule in self.invariant_suite.rules
         ):
             raise ValueError("regression schema 1.0.0 supports only json_values_equal rules")
-        case_content = self.model_dump(mode="json", exclude={"case_id"})
-        if self.sandbox_setup is None:
-            case_content.pop("sandbox_setup")
-        if self.case_id != _case_id(case_content):
+        if self.case_id != _case_id(self.model_dump(mode="json", exclude={"case_id"})):
             raise ValueError("regression case ID must match its canonical content")
         if len(self.model_dump_json().encode("utf-8")) > _MAXIMUM_CASE_BYTES:
             raise ValueError("regression case exceeds the size limit")
@@ -288,10 +284,7 @@ def create_dataset_regression_case(
     state_observer_id: str | None = None,
     selected_rules: tuple[DatasetInvariantRule, ...],
     discovery_repetitions: int,
-    sandbox_setup: SandboxSetupFixture | None = None,
 ) -> DatasetRegressionCase:
-    if sandbox_setup is not None:
-        sandbox_setup.verify_digest()
     target = DatasetRegressionTargetSnapshot(
         provenance="declared_at_case_creation",
         config=target_config,
@@ -333,8 +326,6 @@ def create_dataset_regression_case(
             "discovery_repetitions": discovery_repetitions,
         },
     )
-    if sandbox_setup is not None:
-        serialized_content["sandbox_setup"] = sandbox_setup.model_dump(mode="json")
     return DatasetRegressionCase(
         schema_version=schema_version,
         case_id=_case_id(serialized_content),
@@ -343,7 +334,6 @@ def create_dataset_regression_case(
         target=target,
         invariant_suite=invariant_suite,
         discovery_repetitions=discovery_repetitions,
-        sandbox_setup=sandbox_setup,
     )
 
 
@@ -647,7 +637,7 @@ def _regression_evaluation_case(
     max_sandbox_api_calls: int,
     timeout_seconds: float,
 ) -> EvaluationCase:
-    evaluation_case = evaluation_case_from_inputs(
+    return evaluation_case_from_inputs(
         case_id=f"ul-case-{secrets.token_hex(16)}",
         raw_inputs=(case.variation.variation_input,),
         max_sandbox_api_calls=max_sandbox_api_calls,
@@ -655,7 +645,6 @@ def _regression_evaluation_case(
         required_state_observation_authority=(case.invariant_suite.state_observation_authority),
         required_state_observer_id=case.invariant_suite.state_observer_id,
     )
-    return evaluation_case.model_copy(update={"sandbox_setup": case.sandbox_setup})
 
 
 def _validate_regression_run_label(label: object) -> str:
