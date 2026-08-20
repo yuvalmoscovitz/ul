@@ -49,7 +49,9 @@ from ul.http_sandbox import (
     JsonHttpSandboxConfig,
     JsonHttpSandboxConnection,
     json_http_sandbox_calls_per_execution,
+    json_http_sandbox_config_sha256,
     json_http_sandbox_config_urls,
+    json_http_sandbox_origin,
     load_json_http_sandbox_config,
     validate_json_http_sandbox_configuration,
 )
@@ -129,6 +131,7 @@ def initialize_dataset_sandbox(
         str,
         typer.Option(help="Base URL of the customer's isolated agent sandbox API."),
     ],
+    show_guidance: Annotated[bool, typer.Option(hidden=True)] = True,
 ) -> None:
     """Create a private connection config for a customer-managed agent sandbox API."""
     try:
@@ -186,11 +189,26 @@ def initialize_dataset_sandbox(
             message = str(error)
         raise typer.BadParameter(message, param_hint="SANDBOX_CONFIG") from None
 
-    with output_stream:
-        json.dump(config.model_dump(mode="json", exclude_none=True), output_stream, indent=2)
-        output_stream.write("\n")
+    created_config_status = os.fstat(output_stream.fileno())
+    try:
+        with output_stream:
+            json.dump(config.model_dump(mode="json", exclude_none=True), output_stream, indent=2)
+            output_stream.write("\n")
+    except BaseException:
+        try:
+            current_config_status = sandbox_config.lstat()
+        except FileNotFoundError:
+            pass
+        else:
+            if not stat.S_ISLNK(current_config_status.st_mode) and os.path.samestat(
+                current_config_status, created_config_status
+            ):
+                sandbox_config.unlink()
+        raise
 
     console.print(f"Created private sandbox connection config: {sandbox_config}")
+    if not show_guidance:
+        return
     console.print(
         "Next: implement the generated reset, execute, and snapshot endpoints. "
         "The reset request already asks for a clean agent session and clean external "
@@ -353,6 +371,19 @@ def evaluate_dataset(
         Path | None,
         typer.Option(help="Private local reversible pseudonym mapping state."),
     ] = None,
+    expected_sandbox_origin: Annotated[
+        str | None,
+        typer.Option(hidden=True),
+    ] = None,
+    expected_sandbox_config_sha256: Annotated[
+        str | None,
+        typer.Option(hidden=True),
+    ] = None,
+    expected_redaction_policy_sha256: Annotated[
+        str | None,
+        typer.Option(hidden=True),
+    ] = None,
+    show_report_guidance: Annotated[bool, typer.Option(hidden=True)] = True,
 ) -> None:
     """Explore behavioral differences against an isolated black-box agent.
 
@@ -408,6 +439,14 @@ def evaluate_dataset(
             redaction_state,
             state_required=not dry_run or resume is not None,
         )
+        if expected_redaction_policy_sha256 is not None and (
+            redaction_engine is None
+            or redaction_engine.policy.digest != expected_redaction_policy_sha256
+        ):
+            raise ValueError(
+                "redaction policy changed since 'ul init'; reinitialize the project before "
+                "sending data to the semantic provider"
+            )
         redaction_coverage = _redaction_coverage(selected_records, redaction_engine)
         if redaction_engine is not None and (not dry_run or resume is not None):
             selected_records = _protect_interaction_records(selected_records, redaction_engine)
@@ -431,6 +470,24 @@ def evaluate_dataset(
         loaded_target_config = (
             load_json_http_sandbox_config(sandbox_config) if sandbox_config is not None else None
         )
+        if expected_sandbox_origin is not None:
+            if loaded_target_config is None:
+                raise ValueError("saved sandbox origin requires --sandbox-config")
+            if json_http_sandbox_origin(loaded_target_config) != expected_sandbox_origin:
+                raise ValueError(
+                    "sandbox origin changed since 'ul init'; reinitialize the project and repeat "
+                    "the sandbox safety acknowledgements"
+                )
+        if expected_sandbox_config_sha256 is not None:
+            if loaded_target_config is None:
+                raise ValueError("saved sandbox configuration requires --sandbox-config")
+            if json_http_sandbox_config_sha256(loaded_target_config) != (
+                expected_sandbox_config_sha256
+            ):
+                raise ValueError(
+                    "sandbox configuration changed since 'ul init'; reinitialize the project "
+                    "and repeat the sandbox safety acknowledgements"
+                )
         if loaded_target_config is not None:
             validate_json_http_sandbox_configuration(
                 loaded_target_config,
@@ -828,6 +885,7 @@ def evaluate_dataset(
         output,
         augmentations_output=augmentations_output,
         invariant_evaluations=tuple(invariant_evaluations),
+        show_report_guidance=show_report_guidance,
     )
     prior_invariant_evaluations = (
         resume_evidence.invariant_evaluations if resume_evidence is not None else ()
@@ -928,6 +986,11 @@ def _load_interaction_records(path: Path) -> tuple[InteractionRecord, ...]:
     return tuple(records)
 
 
+def validate_interaction_dataset(path: Path) -> None:
+    """Validate a dataset without executing or retaining its records."""
+    _load_interaction_records(path)
+
+
 def _reject_nonstandard_json_constant(value: str) -> None:
     raise ValueError(f"nonstandard JSON constant: {value}")
 
@@ -976,6 +1039,11 @@ def _validate_operator_ids(operator_ids: list[str] | None) -> tuple[str, ...]:
         reference if "@" in reference else operator.id
         for reference, operator in zip(selected_references, selected_operators, strict=True)
     )
+
+
+def validate_dataset_operator_ids(operator_ids: list[str] | None) -> tuple[str, ...]:
+    """Resolve and validate dataset augmentation operator references."""
+    return _validate_operator_ids(operator_ids)
 
 
 def _dataset_operator_identity(reference: str) -> tuple[str, str]:
@@ -1211,7 +1279,8 @@ def _default_augmentations_output(evidence_output: Path) -> Path:
 
 def _create_private_output(path: Path) -> TextIO:
     descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    os.fchmod(descriptor, 0o600)
+    if sys.platform != "win32":
+        os.fchmod(descriptor, 0o600)
     return os.fdopen(descriptor, "w", encoding="utf-8")
 
 
@@ -1412,6 +1481,7 @@ def _print_dataset_results(
     *,
     augmentations_output: Path | None = None,
     invariant_evaluations: tuple[DatasetInvariantEvaluation, ...] = (),
+    show_report_guidance: bool = True,
 ) -> None:
     table = Table(title="Dataset evaluation")
     table.add_column("Case", style="cyan")
@@ -1447,7 +1517,8 @@ def _print_dataset_results(
     console.print(f"Complete evidence: {output}")
     if augmentations_output is not None:
         _print_dataset_plain(f"Saved augmentations: {augmentations_output}")
-    console.print(f"Next: ul dataset report {output}")
+    if show_report_guidance:
+        console.print(f"Next: ul dataset report {output}")
 
 
 def _result_needs_review(result: DatasetEvaluationResult) -> bool:
