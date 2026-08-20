@@ -8,7 +8,7 @@ from typing import ClassVar, cast
 
 
 class DefectiveCorrectionHandler(BaseHTTPRequestHandler):
-    sandbox_id: ClassVar[str] = "multiturn-correction-example"
+    environment_id: ClassVar[str] = "multiturn-correction-example"
     state_lock: ClassVar[Lock] = Lock()
     generation: ClassVar[int] = 0
     committed_invoice: ClassVar[str | None] = None
@@ -79,7 +79,7 @@ class DefectiveCorrectionHandler(BaseHTTPRequestHandler):
 
     def _send(self, status: HTTPStatus, payload: dict[str, object]) -> None:
         body = json.dumps(
-            {**payload, "sandbox_id": self.sandbox_id}, separators=(",", ":")
+            {**payload, "environment_id": self.environment_id}, separators=(",", ":")
         ).encode()
         self.send_response(status)
         self.send_header("Content-Type", "application/json")

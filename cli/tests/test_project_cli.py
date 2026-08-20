@@ -50,10 +50,10 @@ def _initialize(tmp_path: Path, *extra_arguments: str) -> Path:
         [
             "init",
             str(dataset),
-            "--sandbox-url",
-            "https://sandbox.example",
-            "--allow-sandbox-network-egress",
-            "--confirm-isolated-sandbox",
+            "--environment-url",
+            "https://environment.example",
+            "--allow-environment-network",
+            "--confirm-test-environment",
             *extra_arguments,
         ],
     )
@@ -70,7 +70,7 @@ def test_root_help_exposes_simple_workflow() -> None:
     assert "report" in result.output
 
 
-def test_init_creates_private_project_and_generated_sandbox(
+def test_init_creates_private_project_and_generated_environment(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.chdir(tmp_path)
@@ -82,20 +82,20 @@ def test_init_creates_private_project_and_generated_sandbox(
         "1",
         "--repetitions",
         "2",
-        "--max-sandbox-api-calls",
+        "--max-environment-api-calls",
         "12",
     )
 
     config_path = tmp_path / ".ul" / "config.json"
-    sandbox_path = tmp_path / ".ul" / "sandbox.json"
+    environment_path = tmp_path / ".ul" / "environment.json"
     config = json.loads(config_path.read_text(encoding="utf-8"))
-    sandbox_config_sha256 = config.pop("sandbox_config_sha256")
+    environment_config_sha256 = config.pop("environment_config_sha256")
 
     assert config == {
-        "schema_version": 1,
+        "schema_version": 2,
         "dataset": dataset.name,
-        "sandbox_config": ".ul/sandbox.json",
-        "sandbox_origin": "https://sandbox.example",
+        "environment_config": ".ul/environment.json",
+        "environment_origin": "https://environment.example",
         "invariants": None,
         "redaction_policy": None,
         "redaction_policy_sha256": None,
@@ -104,22 +104,22 @@ def test_init_creates_private_project_and_generated_sandbox(
         "operators": ["input.surface.rephrase"],
         "limit": 1,
         "repetitions": 2,
-        "max_sandbox_api_calls": 12,
-        "allow_sandbox_network_egress": True,
-        "confirm_isolated_sandbox": True,
+        "max_environment_api_calls": 12,
+        "allow_environment_network": True,
+        "confirm_test_environment": True,
         "allow_insecure_http": False,
     }
-    assert len(sandbox_config_sha256) == 64
-    assert sandbox_path.is_file()
+    assert len(environment_config_sha256) == 64
+    assert environment_path.is_file()
     assert (tmp_path / ".ul" / ".gitignore").read_text(encoding="utf-8") == "*\n"
     if hasattr(stat, "S_IMODE"):
         assert stat.S_IMODE(config_path.stat().st_mode) == 0o600
-        assert stat.S_IMODE(sandbox_path.stat().st_mode) == 0o600
+        assert stat.S_IMODE(environment_path.stat().st_mode) == 0o600
         assert stat.S_IMODE((tmp_path / ".ul").stat().st_mode) == 0o700
         assert stat.S_IMODE((tmp_path / ".ul" / "runs").stat().st_mode) == 0o700
 
 
-def test_init_defaults_fit_generated_sandbox_call_budget(
+def test_init_defaults_fit_generated_environment_call_budget(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.chdir(tmp_path)
@@ -143,10 +143,10 @@ def test_init_defaults_fit_generated_sandbox_call_budget(
         [
             "init",
             str(dataset),
-            "--sandbox-url",
-            "https://sandbox.example",
-            "--allow-sandbox-network-egress",
-            "--confirm-isolated-sandbox",
+            "--environment-url",
+            "https://environment.example",
+            "--allow-environment-network",
+            "--confirm-test-environment",
         ],
     )
     assert result.exit_code == 0, result.output
@@ -155,14 +155,14 @@ def test_init_defaults_fit_generated_sandbox_call_budget(
 
     assert dry_run.exit_code == 0, dry_run.output
     assert "Selected interactions: 3" in dry_run.output
-    assert "Potential sandbox API calls: up to 90 (authorized maximum: 120)" in dry_run.output
+    assert "Potential environment API calls: up to 90 (authorized maximum: 120)" in dry_run.output
 
 
 @pytest.mark.parametrize(
     "missing_flag",
     [
-        "--allow-sandbox-network-egress",
-        "--confirm-isolated-sandbox",
+        "--allow-environment-network",
+        "--confirm-test-environment",
     ],
 )
 def test_init_requires_one_time_safety_acknowledgements(
@@ -176,35 +176,38 @@ def test_init_requires_one_time_safety_acknowledgements(
     arguments = [
         "init",
         str(dataset),
-        "--sandbox-url",
-        "https://sandbox.example",
-        "--allow-sandbox-network-egress",
-        "--confirm-isolated-sandbox",
+        "--environment-url",
+        "https://environment.example",
+        "--allow-environment-network",
+        "--confirm-test-environment",
     ]
     arguments.remove(missing_flag)
 
     result = runner.invoke(app, arguments, terminal_width=160)
 
     assert result.exit_code == 2
+    if missing_flag == "--confirm-test-environment":
+        normalized_output = " ".join(result.output.split())
+        assert "the agent may change external state" in normalized_output
     assert not (tmp_path / ".ul").exists()
 
 
-def test_init_reuses_existing_sandbox_and_refuses_overwrite(
+def test_init_reuses_existing_environment_and_refuses_overwrite(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.chdir(tmp_path)
     dataset = _initialize(tmp_path)
-    sandbox = tmp_path / ".ul" / "sandbox.json"
+    environment = tmp_path / ".ul" / "environment.json"
 
     result = runner.invoke(
         app,
         [
             "init",
             str(dataset),
-            "--sandbox-config",
-            str(sandbox),
-            "--allow-sandbox-network-egress",
-            "--confirm-isolated-sandbox",
+            "--environment-config",
+            str(environment),
+            "--allow-environment-network",
+            "--confirm-test-environment",
         ],
     )
 
@@ -212,41 +215,43 @@ def test_init_reuses_existing_sandbox_and_refuses_overwrite(
     assert "will not overwrite" in result.output
 
 
-def test_run_rejects_same_origin_sandbox_template_edits(
+def test_run_rejects_same_origin_environment_template_edits(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.chdir(tmp_path)
     _initialize(tmp_path)
-    sandbox_path = tmp_path / ".ul" / "sandbox.json"
-    sandbox_config = json.loads(sandbox_path.read_text(encoding="utf-8"))
-    sandbox_config["reset"]["request_json_template"]["fixture"] = "customer-fixture"
-    sandbox_path.write_text(json.dumps(sandbox_config), encoding="utf-8")
+    environment_path = tmp_path / ".ul" / "environment.json"
+    environment_config = json.loads(environment_path.read_text(encoding="utf-8"))
+    environment_config["reset"]["request_json_template"]["fixture"] = "customer-fixture"
+    environment_path.write_text(json.dumps(environment_config), encoding="utf-8")
 
     result = runner.invoke(app, ["run", "--dry-run"])
 
     assert result.exit_code == 2
-    assert "sandbox configuration changed since 'ul init'" in result.output
+    assert "environment configuration changed since 'ul init'" in result.output
 
 
-def test_run_rejects_sandbox_origin_change(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_run_rejects_environment_origin_change(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     monkeypatch.chdir(tmp_path)
     _initialize(tmp_path)
-    sandbox_path = tmp_path / ".ul" / "sandbox.json"
-    sandbox_config = json.loads(sandbox_path.read_text(encoding="utf-8"))
+    environment_path = tmp_path / ".ul" / "environment.json"
+    environment_config = json.loads(environment_path.read_text(encoding="utf-8"))
     for operation in ("reset", "execute_turn", "snapshot"):
-        sandbox_config[operation]["url"] = sandbox_config[operation]["url"].replace(
-            "sandbox.example", "other.example"
+        environment_config[operation]["url"] = environment_config[operation]["url"].replace(
+            "environment.example", "other.example"
         )
-    sandbox_path.write_text(json.dumps(sandbox_config), encoding="utf-8")
+    environment_path.write_text(json.dumps(environment_config), encoding="utf-8")
 
     result = runner.invoke(app, ["run", "--dry-run"], terminal_width=160)
 
     assert result.exit_code == 2
-    assert "sandbox origin changed since 'ul init'" in result.output
+    assert "environment origin changed since 'ul init'" in result.output
     assert not (tmp_path / ".ul" / "state.json").exists()
 
 
-def test_failed_generated_sandbox_init_can_be_retried(
+def test_failed_generated_environment_init_can_be_retried(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.chdir(tmp_path)
@@ -255,18 +260,20 @@ def test_failed_generated_sandbox_init_can_be_retried(
     common_arguments = [
         "init",
         str(dataset),
-        "--allow-sandbox-network-egress",
-        "--confirm-isolated-sandbox",
+        "--allow-environment-network",
+        "--confirm-test-environment",
     ]
 
-    failed = runner.invoke(app, [*common_arguments, "--sandbox-url", "not-a-url"])
-    retried = runner.invoke(app, [*common_arguments, "--sandbox-url", "https://sandbox.example"])
+    failed = runner.invoke(app, [*common_arguments, "--environment-url", "not-a-url"])
+    retried = runner.invoke(
+        app, [*common_arguments, "--environment-url", "https://environment.example"]
+    )
 
     assert failed.exit_code == 2
     assert retried.exit_code == 0, retried.output
 
 
-def test_failed_init_does_not_delete_existing_sandbox_file(
+def test_failed_init_does_not_delete_existing_environment_file(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.chdir(tmp_path)
@@ -274,23 +281,23 @@ def test_failed_init_does_not_delete_existing_sandbox_file(
     _write_dataset(dataset)
     project_directory = tmp_path / ".ul"
     project_directory.mkdir(mode=0o700)
-    sandbox = project_directory / "sandbox.json"
-    _write_private_file(sandbox, "customer-owned\n")
+    environment = project_directory / "environment.json"
+    _write_private_file(environment, "customer-owned\n")
 
     result = runner.invoke(
         app,
         [
             "init",
             str(dataset),
-            "--sandbox-url",
-            "https://sandbox.example",
-            "--allow-sandbox-network-egress",
-            "--confirm-isolated-sandbox",
+            "--environment-url",
+            "https://environment.example",
+            "--allow-environment-network",
+            "--confirm-test-environment",
         ],
     )
 
     assert result.exit_code == 2
-    assert sandbox.read_text(encoding="utf-8") == "customer-owned\n"
+    assert environment.read_text(encoding="utf-8") == "customer-owned\n"
 
 
 def test_interrupted_init_removes_only_owned_scaffolding(
@@ -300,20 +307,20 @@ def test_interrupted_init_removes_only_owned_scaffolding(
     dataset = tmp_path / "interactions.jsonl"
     _write_dataset(dataset)
 
-    def interrupt_sandbox_creation(*arguments: Any, **keywords: Any) -> None:
+    def interrupt_environment_creation(*arguments: Any, **keywords: Any) -> None:
         raise KeyboardInterrupt
 
-    monkeypatch.setattr(project, "initialize_dataset_sandbox", interrupt_sandbox_creation)
+    monkeypatch.setattr(project, "initialize_dataset_environment", interrupt_environment_creation)
 
     result = runner.invoke(
         app,
         [
             "init",
             str(dataset),
-            "--sandbox-url",
-            "https://sandbox.example",
-            "--allow-sandbox-network-egress",
-            "--confirm-isolated-sandbox",
+            "--environment-url",
+            "https://environment.example",
+            "--allow-environment-network",
+            "--confirm-test-environment",
         ],
     )
 
@@ -345,13 +352,13 @@ def test_run_discovers_parent_project_and_applies_one_run_overrides(
 
     assert result.exit_code == 0, result.output
     assert received["data"] == dataset
-    assert received["sandbox_config"] == tmp_path / ".ul" / "sandbox.json"
+    assert received["environment_config"] == tmp_path / ".ul" / "environment.json"
     assert received["limit"] == 1
     assert received["repetitions"] == 4
     assert received["operator"] == ["input.surface.rephrase"]
-    assert received["allow_sandbox_network_egress"] is True
-    assert received["confirm_isolated_sandbox"] is True
-    assert received["expected_sandbox_origin"] == "https://sandbox.example"
+    assert received["allow_environment_network"] is True
+    assert received["confirm_test_environment"] is True
+    assert received["expected_environment_origin"] == "https://environment.example"
     state = json.loads((tmp_path / ".ul" / "state.json").read_text(encoding="utf-8"))
     assert state["latest_evidence"].startswith(".ul/runs/")
     assert (tmp_path / state["latest_evidence"]).is_file()
@@ -388,10 +395,10 @@ def test_init_persists_redaction_and_retention_choices(
         [
             "init",
             str(dataset),
-            "--sandbox-url",
-            "https://sandbox.example",
-            "--allow-sandbox-network-egress",
-            "--confirm-isolated-sandbox",
+            "--environment-url",
+            "https://environment.example",
+            "--allow-environment-network",
+            "--confirm-test-environment",
             "--redaction-policy",
             str(policy),
             "--redaction-state",
@@ -626,7 +633,7 @@ def test_malformed_or_unknown_project_config_is_rejected(
     sensitive_value = "private-project-config-value"
     _write_private_file(
         project_directory / "config.json",
-        json.dumps({"schema_version": 1, "unknown": sensitive_value}),
+        json.dumps({"schema_version": 2, "unknown": sensitive_value}),
     )
 
     result = runner.invoke(app, ["run", "--dry-run"])
@@ -667,10 +674,10 @@ def test_project_config_cannot_disable_saved_redaction_binding(
         [
             "init",
             str(dataset),
-            "--sandbox-url",
-            "https://sandbox.example",
-            "--allow-sandbox-network-egress",
-            "--confirm-isolated-sandbox",
+            "--environment-url",
+            "https://environment.example",
+            "--allow-environment-network",
+            "--confirm-test-environment",
             "--redaction-policy",
             str(policy),
             "--redaction-state",
@@ -749,6 +756,6 @@ def test_real_dry_run_uses_saved_configuration_without_network_or_models(
     result = runner.invoke(app, ["run", "--dry-run"])
 
     assert result.exit_code == 0, result.output
-    assert "No model or sandbox API requests sent." in result.output
+    assert "No model or environment API requests sent." in result.output
     assert "Selected interactions: 1" in result.output
     assert not (tmp_path / ".ul" / "state.json").exists()

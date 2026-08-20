@@ -246,12 +246,13 @@ def ingest_otlp_traces(
     if output is not None:
         _print_safe(
             "Next: create a target config with "
-            "'ul dataset init target.json --url https://your-sandbox', "
-            f"then run 'ul dataset evaluate {output} --sandbox-config target.json --dry-run'."
+            "'ul dataset init target.json --url https://your-environment', "
+            f"then run 'ul dataset evaluate {output} --environment-config target.json --dry-run'."
         )
     if replay_output is not None:
         _print_safe(
-            f"Next: run 'ul stress trace {replay_output} --sandbox-config target.json --dry-run'."
+            f"Next: run 'ul stress trace {replay_output} "
+            "--environment-config target.json --dry-run'."
         )
 
 

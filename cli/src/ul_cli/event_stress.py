@@ -31,10 +31,10 @@ from ul.event_stress import (
     run_correction_stress_test,
     run_retry_after_successful_commit_stress_test,
 )
-from ul.http_sandbox import (
-    JsonHttpSandboxConnection,
-    load_json_http_sandbox_config,
-    validate_json_http_sandbox_configuration,
+from ul.http_environment import (
+    JsonHttpEnvironmentConnection,
+    load_json_http_environment_config,
+    validate_json_http_environment_configuration,
 )
 from ul.timeout_after_commit import (
     TimeoutAfterCommitCase,
@@ -52,6 +52,8 @@ from ul.trace_replay import (
     select_trace_replay_case,
 )
 
+from ul_cli.environment import TEST_ENVIRONMENT_CONFIRMATION_MESSAGE
+
 app = typer.Typer(help="Stress stateful agents with ordered conversation events.")
 
 
@@ -59,48 +61,44 @@ app = typer.Typer(help="Stress stateful agents with ordered conversation events.
 def run_timeout_after_commit(
     case_path: Annotated[Path, typer.Argument(exists=True, dir_okay=False, readable=True)],
     target_config_path: Annotated[
-        Path, typer.Option("--sandbox-config", exists=True, dir_okay=False, readable=True)
+        Path, typer.Option("--environment-config", exists=True, dir_okay=False, readable=True)
     ],
     invariants_path: Annotated[
         Path, typer.Option("--invariants", exists=True, dir_okay=False, readable=True)
     ],
     output: Annotated[Path | None, typer.Option(help="New private JSON evidence file.")] = None,
     repetitions: Annotated[int, typer.Option(min=1)] = 3,
-    max_target_calls: Annotated[int, typer.Option("--max-sandbox-api-calls", min=1)] = 100,
-    allow_target_network: Annotated[bool, typer.Option("--allow-sandbox-network-egress")] = False,
-    confirm_isolated_sandbox: Annotated[
+    max_target_calls: Annotated[int, typer.Option("--max-environment-api-calls", min=1)] = 100,
+    allow_target_network: Annotated[bool, typer.Option("--allow-environment-network")] = False,
+    confirm_test_environment: Annotated[
         bool,
-        typer.Option(
-            help=(
-                "Attest that the configured endpoint is a customer-managed, isolated "
-                "non-production sandbox. UL does not verify its isolation."
-            )
-        ),
+        typer.Option(help=("Confirm the environment is intended for testing and can be reset.")),
     ] = False,
     allow_insecure_http: Annotated[
-        bool, typer.Option(help="Allow an HTTP sandbox API. Intended for local sandboxes.")
+        bool, typer.Option(help="Allow an HTTP environment API. Intended for local environments.")
     ] = False,
     dry_run: Annotated[
-        bool, typer.Option(help="Validate and show the complete plan without sandbox API calls.")
+        bool,
+        typer.Option(help="Validate and show the complete plan without environment API calls."),
     ] = False,
 ) -> None:
     """Inject one versioned lost acknowledgement after a committed tool write."""
     try:
         case = load_timeout_after_commit_case(case_path)
-        target_config = load_json_http_sandbox_config(target_config_path)
+        target_config = load_json_http_environment_config(target_config_path)
         invariant_suite = load_dataset_invariant_suite(invariants_path)
         if invariant_suite.observation_authority != "committed_state_snapshot":
             raise ValueError("timeout-after-commit testing requires committed-state invariants")
-        validate_json_http_sandbox_configuration(
+        validate_json_http_environment_configuration(
             target_config,
-            sandbox_confirmed=confirm_isolated_sandbox or dry_run,
+            test_environment_confirmed=confirm_test_environment or dry_run,
             allow_insecure_http=allow_insecure_http,
         )
         plan = plan_timeout_after_commit_stress_test(
             case,
             target_config,
             repetitions=repetitions,
-            max_sandbox_api_calls=max_target_calls,
+            max_environment_api_calls=max_target_calls,
         )
     except (ValidationError, ValueError, RuntimeError) as error:
         raise typer.BadParameter(str(error)) from None
@@ -109,18 +107,18 @@ def run_timeout_after_commit(
         typer.echo(f"Operator: {plan.operator_id}@{plan.operator_version}")
         typer.echo(f"Repetitions: {plan.repetitions}")
         typer.echo(f"Target calls per repetition: {plan.target_calls_per_repetition}")
-        typer.echo(f"Potential sandbox API calls: {plan.required_target_calls}")
+        typer.echo(f"Potential environment API calls: {plan.required_target_calls}")
         typer.echo("External calls: none")
         return
     if not allow_target_network:
         raise typer.BadParameter(
-            "execution requires --allow-sandbox-network-egress",
-            param_hint="--allow-sandbox-network-egress",
+            "execution requires --allow-environment-network",
+            param_hint="--allow-environment-network",
         )
-    if not confirm_isolated_sandbox:
+    if not confirm_test_environment:
         raise typer.BadParameter(
-            "execution requires --confirm-isolated-sandbox",
-            param_hint="--confirm-isolated-sandbox",
+            TEST_ENVIRONMENT_CONFIRMATION_MESSAGE,
+            param_hint="--confirm-test-environment",
         )
     if output is None:
         raise typer.BadParameter("execution requires --output", param_hint="--output")
@@ -132,11 +130,11 @@ def run_timeout_after_commit(
         raise typer.BadParameter("output could not be created", param_hint="--output") from None
     try:
         with output_stream:
-            target = JsonHttpSandboxConnection.from_config(
+            target = JsonHttpEnvironmentConnection.from_config(
                 target_config,
-                sandbox_confirmed=True,
+                test_environment_confirmed=True,
                 allow_insecure_http=allow_insecure_http,
-                max_sandbox_api_calls=max_target_calls,
+                max_environment_api_calls=max_target_calls,
             )
             result = asyncio.run(
                 _run_timeout_after_commit_and_close(
@@ -162,7 +160,7 @@ def run_timeout_after_commit(
 def replay_production_trace(
     bundle_path: Annotated[Path, typer.Argument(exists=True, dir_okay=False, readable=True)],
     target_config_path: Annotated[
-        Path, typer.Option("--sandbox-config", exists=True, dir_okay=False, readable=True)
+        Path, typer.Option("--environment-config", exists=True, dir_okay=False, readable=True)
     ],
     case_id: Annotated[
         str | None,
@@ -172,32 +170,27 @@ def replay_production_trace(
         Path | None, typer.Option(help="New private JSON replay evidence file.")
     ] = None,
     repetitions: Annotated[int, typer.Option(min=1)] = 3,
-    max_target_calls: Annotated[int, typer.Option("--max-sandbox-api-calls", min=1)] = 100,
-    allow_target_network: Annotated[bool, typer.Option("--allow-sandbox-network-egress")] = False,
-    confirm_isolated_sandbox: Annotated[
+    max_target_calls: Annotated[int, typer.Option("--max-environment-api-calls", min=1)] = 100,
+    allow_target_network: Annotated[bool, typer.Option("--allow-environment-network")] = False,
+    confirm_test_environment: Annotated[
         bool,
-        typer.Option(
-            help=(
-                "Attest that the configured endpoint is a customer-managed, isolated "
-                "non-production sandbox. UL does not verify its isolation."
-            )
-        ),
+        typer.Option(help=("Confirm the environment is intended for testing and can be reset.")),
     ] = False,
     allow_insecure_http: Annotated[
-        bool, typer.Option(help="Allow an HTTP sandbox API. Intended for local sandboxes.")
+        bool, typer.Option(help="Allow an HTTP environment API. Intended for local environments.")
     ] = False,
     dry_run: Annotated[
-        bool, typer.Option(help="Validate and show the replay plan without sandbox API calls.")
+        bool, typer.Option(help="Validate and show the replay plan without environment API calls.")
     ] = False,
 ) -> None:
-    """Replay a production trace conversation prefix in a clean sandbox."""
+    """Replay a production trace conversation prefix in a clean environment."""
     try:
         bundle = load_trace_replay_bundle(bundle_path)
         case = select_trace_replay_case(bundle, case_id)
-        target_config = load_json_http_sandbox_config(target_config_path)
-        validate_json_http_sandbox_configuration(
+        target_config = load_json_http_environment_config(target_config_path)
+        validate_json_http_environment_configuration(
             target_config,
-            sandbox_confirmed=confirm_isolated_sandbox or dry_run,
+            test_environment_confirmed=confirm_test_environment or dry_run,
             allow_insecure_http=allow_insecure_http,
         )
         plan = plan_trace_replay(
@@ -214,19 +207,19 @@ def replay_production_trace(
         typer.echo(f"Ordered user turns: {plan.replay_turn_count}")
         typer.echo(f"Repetitions: {plan.repetitions}")
         typer.echo(f"Target calls per repetition: {plan.target_calls_per_repetition}")
-        typer.echo(f"Potential sandbox API calls: {plan.required_target_calls}")
+        typer.echo(f"Potential environment API calls: {plan.required_target_calls}")
         typer.echo("Recorded content: not printed")
         typer.echo("External calls: none")
         return
     if not allow_target_network:
         raise typer.BadParameter(
-            "execution requires --allow-sandbox-network-egress",
-            param_hint="--allow-sandbox-network-egress",
+            "execution requires --allow-environment-network",
+            param_hint="--allow-environment-network",
         )
-    if not confirm_isolated_sandbox:
+    if not confirm_test_environment:
         raise typer.BadParameter(
-            "execution requires --confirm-isolated-sandbox",
-            param_hint="--confirm-isolated-sandbox",
+            TEST_ENVIRONMENT_CONFIRMATION_MESSAGE,
+            param_hint="--confirm-test-environment",
         )
     if output is None:
         raise typer.BadParameter("execution requires --output", param_hint="--output")
@@ -238,11 +231,11 @@ def replay_production_trace(
         raise typer.BadParameter("output could not be created", param_hint="--output") from None
     try:
         with output_stream:
-            target = JsonHttpSandboxConnection.from_config(
+            target = JsonHttpEnvironmentConnection.from_config(
                 target_config,
-                sandbox_confirmed=True,
+                test_environment_confirmed=True,
                 allow_insecure_http=allow_insecure_http,
-                max_sandbox_api_calls=max_target_calls,
+                max_environment_api_calls=max_target_calls,
             )
             result = asyncio.run(
                 _run_trace_replay_and_close(
@@ -266,7 +259,7 @@ def replay_production_trace(
 def save_multi_turn_regression(
     case_path: Annotated[Path, typer.Argument(exists=True, dir_okay=False, readable=True)],
     target_config_path: Annotated[
-        Path, typer.Option("--sandbox-config", exists=True, dir_okay=False, readable=True)
+        Path, typer.Option("--environment-config", exists=True, dir_okay=False, readable=True)
     ],
     invariants_path: Annotated[
         Path, typer.Option("--invariants", exists=True, dir_okay=False, readable=True)
@@ -289,7 +282,7 @@ def save_multi_turn_regression(
         raise typer.BadParameter("output already exists; UL will not overwrite it")
     try:
         case = load_correction_after_first_response_case(case_path)
-        target_config = load_json_http_sandbox_config(target_config_path)
+        target_config = load_json_http_environment_config(target_config_path)
         invariant_suite = load_dataset_invariant_suite(invariants_path)
         regression = create_multi_turn_regression_case(
             stress_case=case,
@@ -313,46 +306,42 @@ def save_multi_turn_regression(
 def run_correction_after_first_response(
     case_path: Annotated[Path, typer.Argument(exists=True, dir_okay=False, readable=True)],
     target_config_path: Annotated[
-        Path, typer.Option("--sandbox-config", exists=True, dir_okay=False, readable=True)
+        Path, typer.Option("--environment-config", exists=True, dir_okay=False, readable=True)
     ],
     invariants_path: Annotated[
         Path, typer.Option("--invariants", exists=True, dir_okay=False, readable=True)
     ],
     output: Annotated[Path | None, typer.Option(help="New private JSON evidence file.")] = None,
     repetitions: Annotated[int, typer.Option(min=1)] = 3,
-    max_target_calls: Annotated[int, typer.Option("--max-sandbox-api-calls", min=1)] = 100,
-    allow_target_network: Annotated[bool, typer.Option("--allow-sandbox-network-egress")] = False,
-    confirm_isolated_sandbox: Annotated[
+    max_target_calls: Annotated[int, typer.Option("--max-environment-api-calls", min=1)] = 100,
+    allow_target_network: Annotated[bool, typer.Option("--allow-environment-network")] = False,
+    confirm_test_environment: Annotated[
         bool,
-        typer.Option(
-            help=(
-                "Attest that the configured endpoint is a customer-managed, isolated "
-                "non-production sandbox. UL does not verify its isolation."
-            )
-        ),
+        typer.Option(help=("Confirm the environment is intended for testing and can be reset.")),
     ] = False,
     allow_insecure_http: Annotated[
-        bool, typer.Option(help="Allow an HTTP sandbox API. Intended for local sandboxes.")
+        bool, typer.Option(help="Allow an HTTP environment API. Intended for local environments.")
     ] = False,
     dry_run: Annotated[
-        bool, typer.Option(help="Validate and show the complete plan without sandbox API calls.")
+        bool,
+        typer.Option(help="Validate and show the complete plan without environment API calls."),
     ] = False,
 ) -> None:
     """Run the fixed correction-after-first-response event operator."""
     try:
         case = load_correction_after_first_response_case(case_path)
-        target_config = load_json_http_sandbox_config(target_config_path)
+        target_config = load_json_http_environment_config(target_config_path)
         invariant_suite = load_dataset_invariant_suite(invariants_path)
-        validate_json_http_sandbox_configuration(
+        validate_json_http_environment_configuration(
             target_config,
-            sandbox_confirmed=confirm_isolated_sandbox or dry_run,
+            test_environment_confirmed=confirm_test_environment or dry_run,
             allow_insecure_http=allow_insecure_http,
         )
         plan = plan_correction_stress_test(
             case,
             target_config,
             repetitions=repetitions,
-            max_sandbox_api_calls=max_target_calls,
+            max_environment_api_calls=max_target_calls,
         )
     except (ValidationError, ValueError, RuntimeError) as error:
         raise typer.BadParameter(str(error)) from None
@@ -362,28 +351,28 @@ def run_correction_after_first_response(
         typer.echo("Ordered turns: initial request -> correction after first response")
         typer.echo(f"Repetitions: {plan.repetitions}")
         typer.echo(f"Target calls per paired repetition: {plan.target_calls_per_pair}")
-        typer.echo(f"Potential sandbox API calls: {plan.required_target_calls}")
+        typer.echo(f"Potential environment API calls: {plan.required_target_calls}")
         typer.echo("External calls: none")
         return
     if not allow_target_network:
         raise typer.BadParameter(
-            "execution requires --allow-sandbox-network-egress",
-            param_hint="--allow-sandbox-network-egress",
+            "execution requires --allow-environment-network",
+            param_hint="--allow-environment-network",
         )
-    if not confirm_isolated_sandbox:
+    if not confirm_test_environment:
         raise typer.BadParameter(
-            "execution requires --confirm-isolated-sandbox",
-            param_hint="--confirm-isolated-sandbox",
+            TEST_ENVIRONMENT_CONFIRMATION_MESSAGE,
+            param_hint="--confirm-test-environment",
         )
     if output is None:
         raise typer.BadParameter("execution requires --output", param_hint="--output")
     if output.exists():
         raise typer.BadParameter("output already exists; UL will not overwrite it")
-    target = JsonHttpSandboxConnection.from_config(
+    target = JsonHttpEnvironmentConnection.from_config(
         target_config,
-        sandbox_confirmed=True,
+        test_environment_confirmed=True,
         allow_insecure_http=allow_insecure_http,
-        max_sandbox_api_calls=max_target_calls,
+        max_environment_api_calls=max_target_calls,
     )
     result = asyncio.run(
         _run_and_close(
@@ -407,48 +396,44 @@ def run_correction_after_first_response(
 def run_retry_after_successful_commit(
     case_path: Annotated[Path, typer.Argument(exists=True, dir_okay=False, readable=True)],
     target_config_path: Annotated[
-        Path, typer.Option("--sandbox-config", exists=True, dir_okay=False, readable=True)
+        Path, typer.Option("--environment-config", exists=True, dir_okay=False, readable=True)
     ],
     invariants_path: Annotated[
         Path, typer.Option("--invariants", exists=True, dir_okay=False, readable=True)
     ],
     output: Annotated[Path | None, typer.Option(help="New private JSON evidence file.")] = None,
     repetitions: Annotated[int, typer.Option(min=1)] = 3,
-    max_target_calls: Annotated[int, typer.Option("--max-sandbox-api-calls", min=1)] = 100,
-    allow_target_network: Annotated[bool, typer.Option("--allow-sandbox-network-egress")] = False,
-    confirm_isolated_sandbox: Annotated[
+    max_target_calls: Annotated[int, typer.Option("--max-environment-api-calls", min=1)] = 100,
+    allow_target_network: Annotated[bool, typer.Option("--allow-environment-network")] = False,
+    confirm_test_environment: Annotated[
         bool,
-        typer.Option(
-            help=(
-                "Attest that the configured endpoint is a customer-managed, isolated "
-                "non-production sandbox. UL does not verify its isolation."
-            )
-        ),
+        typer.Option(help=("Confirm the environment is intended for testing and can be reset.")),
     ] = False,
     allow_insecure_http: Annotated[
-        bool, typer.Option(help="Allow an HTTP sandbox API. Intended for local sandboxes.")
+        bool, typer.Option(help="Allow an HTTP environment API. Intended for local environments.")
     ] = False,
     dry_run: Annotated[
-        bool, typer.Option(help="Validate and show the complete plan without sandbox API calls.")
+        bool,
+        typer.Option(help="Validate and show the complete plan without environment API calls."),
     ] = False,
 ) -> None:
     """Retry an operation only after its first committed-state checkpoint succeeds."""
     try:
         case = load_retry_after_successful_commit_case(case_path)
-        target_config = load_json_http_sandbox_config(target_config_path)
+        target_config = load_json_http_environment_config(target_config_path)
         invariant_suite = load_dataset_invariant_suite(invariants_path)
         if invariant_suite.observation_authority != "committed_state_snapshot":
             raise ValueError("retry stress testing requires committed-state invariant observation")
-        validate_json_http_sandbox_configuration(
+        validate_json_http_environment_configuration(
             target_config,
-            sandbox_confirmed=confirm_isolated_sandbox or dry_run,
+            test_environment_confirmed=confirm_test_environment or dry_run,
             allow_insecure_http=allow_insecure_http,
         )
         plan = plan_retry_after_successful_commit_stress_test(
             case,
             target_config,
             repetitions=repetitions,
-            max_sandbox_api_calls=max_target_calls,
+            max_environment_api_calls=max_target_calls,
         )
     except (ValidationError, ValueError, RuntimeError) as error:
         raise typer.BadParameter(str(error)) from None
@@ -458,28 +443,28 @@ def run_retry_after_successful_commit(
         typer.echo("Ordered turns: initial committed operation -> explicit retry")
         typer.echo(f"Repetitions: {plan.repetitions}")
         typer.echo(f"Target calls per paired repetition: {plan.target_calls_per_pair}")
-        typer.echo(f"Potential sandbox API calls: {plan.required_target_calls}")
+        typer.echo(f"Potential environment API calls: {plan.required_target_calls}")
         typer.echo("External calls: none")
         return
     if not allow_target_network:
         raise typer.BadParameter(
-            "execution requires --allow-sandbox-network-egress",
-            param_hint="--allow-sandbox-network-egress",
+            "execution requires --allow-environment-network",
+            param_hint="--allow-environment-network",
         )
-    if not confirm_isolated_sandbox:
+    if not confirm_test_environment:
         raise typer.BadParameter(
-            "execution requires --confirm-isolated-sandbox",
-            param_hint="--confirm-isolated-sandbox",
+            TEST_ENVIRONMENT_CONFIRMATION_MESSAGE,
+            param_hint="--confirm-test-environment",
         )
     if output is None:
         raise typer.BadParameter("execution requires --output", param_hint="--output")
     if output.exists():
         raise typer.BadParameter("output already exists; UL will not overwrite it")
-    target = JsonHttpSandboxConnection.from_config(
+    target = JsonHttpEnvironmentConnection.from_config(
         target_config,
-        sandbox_confirmed=True,
+        test_environment_confirmed=True,
         allow_insecure_http=allow_insecure_http,
-        max_sandbox_api_calls=max_target_calls,
+        max_environment_api_calls=max_target_calls,
     )
     result = asyncio.run(
         _run_retry_and_close(
@@ -503,49 +488,44 @@ def run_retry_after_successful_commit(
 def replay_saved_multi_turn_case(
     case_path: Annotated[Path, typer.Argument(exists=True, dir_okay=False, readable=True)],
     target_config_path: Annotated[
-        Path, typer.Option("--sandbox-config", exists=True, dir_okay=False, readable=True)
+        Path, typer.Option("--environment-config", exists=True, dir_okay=False, readable=True)
     ],
     output: Annotated[Path, typer.Option(help="New private JSON replay evidence file.")],
-    max_target_calls: Annotated[int, typer.Option("--max-sandbox-api-calls", min=1)] = 100,
-    allow_target_network: Annotated[bool, typer.Option("--allow-sandbox-network-egress")] = False,
-    confirm_isolated_sandbox: Annotated[
+    max_target_calls: Annotated[int, typer.Option("--max-environment-api-calls", min=1)] = 100,
+    allow_target_network: Annotated[bool, typer.Option("--allow-environment-network")] = False,
+    confirm_test_environment: Annotated[
         bool,
-        typer.Option(
-            help=(
-                "Attest that the configured endpoint is a customer-managed, isolated "
-                "non-production sandbox. UL does not verify its isolation."
-            )
-        ),
+        typer.Option(help=("Confirm the environment is intended for testing and can be reset.")),
     ] = False,
     allow_insecure_http: Annotated[
-        bool, typer.Option(help="Allow an HTTP sandbox API. Intended for local sandboxes.")
+        bool, typer.Option(help="Allow an HTTP environment API. Intended for local environments.")
     ] = False,
 ) -> None:
     """Replay a content-addressed multi-turn correction regression."""
     try:
         case = load_multi_turn_regression_case(case_path)
-        target_config = load_json_http_sandbox_config(target_config_path)
+        target_config = load_json_http_environment_config(target_config_path)
         if dataset_regression_target_config_sha256(target_config) != case.target.config_sha256:
-            raise ValueError("trusted sandbox config digest does not match the regression case")
+            raise ValueError("trusted environment config digest does not match the regression case")
         plan_correction_stress_test(
             case.stress_case,
             target_config,
             repetitions=case.repetitions,
-            max_sandbox_api_calls=max_target_calls,
+            max_environment_api_calls=max_target_calls,
         )
     except (ValidationError, ValueError, RuntimeError) as error:
         raise typer.BadParameter(str(error)) from None
-    if not allow_target_network or not confirm_isolated_sandbox:
+    if not allow_target_network or not confirm_test_environment:
         raise typer.BadParameter(
-            "replay requires --allow-sandbox-network-egress and --confirm-isolated-sandbox"
+            "replay requires --allow-environment-network and --confirm-test-environment"
         )
     if output.exists():
         raise typer.BadParameter("output already exists; UL will not overwrite it")
-    target = JsonHttpSandboxConnection.from_config(
+    target = JsonHttpEnvironmentConnection.from_config(
         target_config,
-        sandbox_confirmed=True,
+        test_environment_confirmed=True,
         allow_insecure_http=allow_insecure_http,
-        max_sandbox_api_calls=max_target_calls,
+        max_environment_api_calls=max_target_calls,
     )
     result = asyncio.run(
         _replay_and_close(
@@ -562,7 +542,7 @@ def replay_saved_multi_turn_case(
 
 async def _run_and_close(
     case: CorrectionAfterFirstResponseCase,
-    target: JsonHttpSandboxConnection,
+    target: JsonHttpEnvironmentConnection,
     *,
     invariant_rules: tuple[DatasetInvariantRule, ...],
     observation_authority: ObservationAuthority,
@@ -576,7 +556,7 @@ async def _run_and_close(
             invariant_rules=invariant_rules,
             observation_authority=observation_authority,
             repetitions=repetitions,
-            max_sandbox_api_calls=max_target_calls,
+            max_environment_api_calls=max_target_calls,
             allow_network_egress=True,
         )
     finally:
@@ -585,7 +565,7 @@ async def _run_and_close(
 
 async def _run_retry_and_close(
     case: RetryAfterSuccessfulCommitCase,
-    target: JsonHttpSandboxConnection,
+    target: JsonHttpEnvironmentConnection,
     *,
     invariant_rules: tuple[DatasetInvariantRule, ...],
     observation_authority: ObservationAuthority,
@@ -599,7 +579,7 @@ async def _run_retry_and_close(
             invariant_rules=invariant_rules,
             observation_authority=observation_authority,
             repetitions=repetitions,
-            max_sandbox_api_calls=max_target_calls,
+            max_environment_api_calls=max_target_calls,
             allow_network_egress=True,
         )
     finally:
@@ -608,7 +588,7 @@ async def _run_retry_and_close(
 
 async def _run_timeout_after_commit_and_close(
     case: TimeoutAfterCommitCase,
-    target: JsonHttpSandboxConnection,
+    target: JsonHttpEnvironmentConnection,
     *,
     invariant_rules: tuple[DatasetInvariantRule, ...],
     observation_authority: ObservationAuthority,
@@ -622,7 +602,7 @@ async def _run_timeout_after_commit_and_close(
             invariant_rules=invariant_rules,
             observation_authority=observation_authority,
             repetitions=repetitions,
-            max_sandbox_api_calls=max_target_calls,
+            max_environment_api_calls=max_target_calls,
             allow_network_egress=True,
         )
     finally:
@@ -631,7 +611,7 @@ async def _run_timeout_after_commit_and_close(
 
 async def _run_trace_replay_and_close(
     case: TraceReplayCase,
-    target: JsonHttpSandboxConnection,
+    target: JsonHttpEnvironmentConnection,
     *,
     repetitions: int,
     max_target_calls: int,
@@ -650,13 +630,13 @@ async def _run_trace_replay_and_close(
 
 async def _replay_and_close(
     case: MultiTurnRegressionCase,
-    target: JsonHttpSandboxConnection,
+    target: JsonHttpEnvironmentConnection,
     *,
     max_target_calls: int,
 ) -> CorrectionStressResult:
     try:
         return await replay_multi_turn_regression(
-            case, target, max_sandbox_api_calls=max_target_calls, allow_network_egress=True
+            case, target, max_environment_api_calls=max_target_calls, allow_network_egress=True
         )
     finally:
         await target.aclose()

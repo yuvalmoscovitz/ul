@@ -27,21 +27,21 @@ from pydantic import (
     model_validator,
 )
 from ul_core.evaluation import (
+    EnvironmentCapabilities,
+    EnvironmentLifecycleEvidence,
+    EnvironmentLifecycleFailureCode,
+    EnvironmentResetEvidence,
+    EnvironmentStateEvidence,
+    EnvironmentTurnEvidence,
     EvaluationCase,
     ExecutionEvidence,
-    SandboxCapabilities,
-    SandboxLifecycleEvidence,
-    SandboxLifecycleFailureCode,
-    SandboxResetEvidence,
-    SandboxStateEvidence,
-    SandboxTurnEvidence,
     TimeoutAfterCommitEventEvidence,
     TimeoutAfterCommitEventRequest,
     TimeoutAfterCommitTriggerStatus,
 )
 
 _HEADER_NAME_PATTERN = re.compile(r"[!#$%&'*+.^_`|~0-9A-Za-z-]+")
-_SANDBOX_ENVIRONMENT_VARIABLE_PATTERN = re.compile(r"UL_SANDBOX_[A-Z][A-Z0-9_]*")
+_ENVIRONMENT_VARIABLE_PATTERN = re.compile(r"UL_ENVIRONMENT_[A-Z][A-Z0-9_]*")
 _INPUT_PLACEHOLDER = "{{input}}"
 _CASE_ID_PLACEHOLDER = "{{case_id}}"
 _TURN_ID_PLACEHOLDER = "{{turn_id}}"
@@ -67,10 +67,10 @@ _UNSAFE_HEADER_NAMES = {
 }
 
 
-class _SandboxProtocolError(RuntimeError):
+class _EnvironmentProtocolError(RuntimeError):
     def __init__(
         self,
-        code: SandboxLifecycleFailureCode,
+        code: EnvironmentLifecycleFailureCode,
         reason: str,
         *,
         delivery_uncertain: bool = False,
@@ -78,23 +78,23 @@ class _SandboxProtocolError(RuntimeError):
         reset_env_acknowledged: bool = False,
     ) -> None:
         super().__init__(reason)
-        self.code: SandboxLifecycleFailureCode = code
+        self.code: EnvironmentLifecycleFailureCode = code
         self.delivery_uncertain: bool = delivery_uncertain
         self.reset_session_acknowledged = reset_session_acknowledged
         self.reset_env_acknowledged = reset_env_acknowledged
 
 
-class _TargetDeliveryUncertainError(_SandboxProtocolError):
-    def __init__(self, code: SandboxLifecycleFailureCode, reason: str) -> None:
+class _TargetDeliveryUncertainError(_EnvironmentProtocolError):
+    def __init__(self, code: EnvironmentLifecycleFailureCode, reason: str) -> None:
         super().__init__(code, reason, delivery_uncertain=True)
 
 
-class _TargetNotDeliveredError(_SandboxProtocolError):
+class _TargetNotDeliveredError(_EnvironmentProtocolError):
     pass
 
 
-class _SandboxIdentityMismatchError(_SandboxProtocolError):
-    def __init__(self, code: SandboxLifecycleFailureCode, reason: str) -> None:
+class _EnvironmentIdentityMismatchError(_EnvironmentProtocolError):
+    def __init__(self, code: EnvironmentLifecycleFailureCode, reason: str) -> None:
         super().__init__(code, reason, delivery_uncertain=True)
 
 
@@ -126,7 +126,7 @@ class JsonHttpLifecycleObservationConfig(JsonHttpLifecycleCallConfig):
         }
     )
     response_json_pointer: str = ""
-    sandbox_id_json_pointer: str = "/sandbox_id"
+    environment_id_json_pointer: str = "/environment_id"
     case_id_json_pointer: str = "/case_id"
     turn_id_json_pointer: str = "/turn_id"
 
@@ -137,7 +137,7 @@ class JsonHttpLifecycleObservationConfig(JsonHttpLifecycleCallConfig):
 
     @field_validator(
         "response_json_pointer",
-        "sandbox_id_json_pointer",
+        "environment_id_json_pointer",
         "case_id_json_pointer",
         "turn_id_json_pointer",
     )
@@ -148,12 +148,12 @@ class JsonHttpLifecycleObservationConfig(JsonHttpLifecycleCallConfig):
 
 
 class JsonHttpLifecycleMutationConfig(JsonHttpLifecycleCallConfig):
-    sandbox_id_json_pointer: str = "/sandbox_id"
+    environment_id_json_pointer: str = "/environment_id"
     case_id_json_pointer: str = "/case_id"
 
-    @field_validator("sandbox_id_json_pointer", "case_id_json_pointer")
+    @field_validator("environment_id_json_pointer", "case_id_json_pointer")
     @classmethod
-    def validate_sandbox_id_json_pointer(cls, pointer: str) -> str:
+    def validate_environment_id_json_pointer(cls, pointer: str) -> str:
         _parse_json_pointer(pointer)
         return pointer
 
@@ -161,7 +161,7 @@ class JsonHttpLifecycleMutationConfig(JsonHttpLifecycleCallConfig):
 class JsonHttpLifecycleResetConfig(JsonHttpLifecycleCallConfig):
     reset_session: bool = True
     reset_env: bool = True
-    sandbox_id_json_pointer: str = "/sandbox_id"
+    environment_id_json_pointer: str = "/environment_id"
     case_id_json_pointer: str = "/case_id"
     generation_json_pointer: str
     clean_state_json_pointer: str
@@ -176,7 +176,7 @@ class JsonHttpLifecycleResetConfig(JsonHttpLifecycleCallConfig):
         return validated
 
     @field_validator(
-        "sandbox_id_json_pointer",
+        "environment_id_json_pointer",
         "case_id_json_pointer",
         "generation_json_pointer",
         "clean_state_json_pointer",
@@ -196,7 +196,7 @@ class JsonHttpLifecycleResetConfig(JsonHttpLifecycleCallConfig):
     @model_validator(mode="after")
     def validate_distinct_pointers(self) -> Self:
         pointers = {
-            self.sandbox_id_json_pointer,
+            self.environment_id_json_pointer,
             self.case_id_json_pointer,
             self.generation_json_pointer,
             self.clean_state_json_pointer,
@@ -212,7 +212,7 @@ class JsonHttpLifecycleExecuteTurnConfig(BaseModel):
     url: str
     request_json_template: JsonValue
     response_json_pointer: str = ""
-    sandbox_id_json_pointer: str = "/sandbox_id"
+    environment_id_json_pointer: str = "/environment_id"
     case_id_json_pointer: str = "/case_id"
     turn_id_json_pointer: str = "/turn_id"
 
@@ -229,7 +229,7 @@ class JsonHttpLifecycleExecuteTurnConfig(BaseModel):
 
     @field_validator(
         "response_json_pointer",
-        "sandbox_id_json_pointer",
+        "environment_id_json_pointer",
         "case_id_json_pointer",
         "turn_id_json_pointer",
     )
@@ -258,7 +258,7 @@ class JsonHttpTimeoutAfterCommitConfig(BaseModel):
 class _TimeoutAfterCommitControlResponse(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
-    sandbox_id: str = Field(min_length=1, max_length=500)
+    environment_id: str = Field(min_length=1, max_length=500)
     case_id: str = Field(min_length=1, max_length=500)
     operator_id: Literal["environment.tool.timeout_after_commit"]
     operator_version: Literal["1.0.0"]
@@ -280,11 +280,11 @@ class _TimeoutAfterCommitControlResponse(BaseModel):
         return self
 
 
-class JsonHttpSandboxConfig(BaseModel):
+class JsonHttpEnvironmentConfig(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
-    version: Literal[4]
-    sandbox_id: str = Field(min_length=1, max_length=500)
+    version: Literal[5]
+    environment_id: str = Field(min_length=1, max_length=500)
     headers_from_env: dict[str, str] = Field(default_factory=dict)
     reset: JsonHttpLifecycleResetConfig
     setup: JsonHttpLifecycleMutationConfig | None = None
@@ -295,8 +295,8 @@ class JsonHttpSandboxConfig(BaseModel):
     @field_validator("version", mode="before")
     @classmethod
     def validate_version(cls, version: object) -> object:
-        if type(version) is not int or version != 4:
-            raise ValueError("version must be 4")
+        if type(version) is not int or version != 5:
+            raise ValueError("version must be 5")
         return version
 
     @field_validator("headers_from_env")
@@ -306,19 +306,19 @@ class JsonHttpSandboxConfig(BaseModel):
 
     @model_validator(mode="after")
     def validate_same_origin(self) -> Self:
-        origins = {_endpoint_origin(url) for url in json_http_sandbox_config_urls(self)}
+        origins = {_endpoint_origin(url) for url in json_http_environment_config_urls(self)}
         if len(origins) != 1:
             raise ValueError("all lifecycle endpoints must use the same origin")
         return self
 
 
-def load_json_http_sandbox_config(path: str | Path) -> JsonHttpSandboxConfig:
+def load_json_http_environment_config(path: str | Path) -> JsonHttpEnvironmentConfig:
     try:
         encoded_config = _read_bounded_regular_file(Path(path), maximum_bytes=_MAXIMUM_CONFIG_BYTES)
     except OSError:
-        raise RuntimeError("sandbox API config could not be read") from None
+        raise RuntimeError("environment API config could not be read") from None
     if len(encoded_config) > _MAXIMUM_CONFIG_BYTES:
-        raise ValueError("sandbox API config exceeds the size limit")
+        raise ValueError("environment API config exceeds the size limit")
     try:
         decoded_config = encoded_config.decode("utf-8")
         raw_config = json.loads(
@@ -328,11 +328,11 @@ def load_json_http_sandbox_config(path: str | Path) -> JsonHttpSandboxConfig:
         )
         _reject_deep_json(raw_config)
     except (UnicodeDecodeError, json.JSONDecodeError, RecursionError, ValueError):
-        raise ValueError("sandbox API config contains invalid JSON") from None
+        raise ValueError("environment API config contains invalid JSON") from None
     try:
-        return JsonHttpSandboxConfig.model_validate(raw_config)
+        return JsonHttpEnvironmentConfig.model_validate(raw_config)
     except RecursionError:
-        raise ValueError("sandbox API config is invalid") from None
+        raise ValueError("environment API config is invalid") from None
     except ValidationError as error:
         validation_reasons: list[str] = []
         for issue in error.errors(include_url=False, include_context=False, include_input=False):
@@ -340,30 +340,30 @@ def load_json_http_sandbox_config(path: str | Path) -> JsonHttpSandboxConfig:
             message = str(issue["msg"]).removeprefix("Value error, ")
             validation_reasons.append(f"{field_path}: {message}")
         raise ValueError(
-            f"sandbox API config is invalid: {'; '.join(validation_reasons)}"
+            f"environment API config is invalid: {'; '.join(validation_reasons)}"
         ) from None
 
 
-class JsonHttpSandboxConnection:
+class JsonHttpEnvironmentConnection:
     def __init__(
         self,
-        config: JsonHttpSandboxConfig,
+        config: JsonHttpEnvironmentConfig,
         *,
-        sandbox_confirmed: bool,
+        test_environment_confirmed: bool,
         allow_insecure_http: bool = False,
         timeout_seconds: float = 30,
         max_request_bytes: int = 1_000_000,
         max_response_bytes: int = 1_000_000,
-        max_sandbox_api_calls: int | None = None,
+        max_environment_api_calls: int | None = None,
         client: httpx.AsyncClient | None = None,
     ) -> None:
-        if max_sandbox_api_calls is not None and (
-            isinstance(max_sandbox_api_calls, bool) or max_sandbox_api_calls <= 0
+        if max_environment_api_calls is not None and (
+            isinstance(max_environment_api_calls, bool) or max_environment_api_calls <= 0
         ):
-            raise ValueError("max_sandbox_api_calls must be positive")
-        self._headers = validate_json_http_sandbox_configuration(
+            raise ValueError("max_environment_api_calls must be positive")
+        self._headers = validate_json_http_environment_configuration(
             config,
-            sandbox_confirmed=sandbox_confirmed,
+            test_environment_confirmed=test_environment_confirmed,
             allow_insecure_http=allow_insecure_http,
             timeout_seconds=timeout_seconds,
             max_request_bytes=max_request_bytes,
@@ -372,18 +372,18 @@ class JsonHttpSandboxConnection:
         self._timeout_seconds = timeout_seconds
         self._max_request_bytes = max_request_bytes
         self._max_response_bytes = max_response_bytes
-        self._remaining_sandbox_api_calls = max_sandbox_api_calls
+        self._remaining_environment_api_calls = max_environment_api_calls
         self._config = config
-        self._config_sha256 = json_http_sandbox_config_sha256(config)
+        self._config_sha256 = json_http_environment_config_sha256(config)
         self._lifecycle_lock = asyncio.Lock()
         self._last_reset_generation: str | int | None = None
         self._lifecycle_state_uncertain = False
         self._owns_client = client is None
         self._client = client or httpx.AsyncClient(follow_redirects=False, trust_env=False)
-        self.capabilities = SandboxCapabilities(
+        self.capabilities = EnvironmentCapabilities(
             supports_conversations=True,
             supports_state_observation=True,
-            state_observation_authority="sandbox_self_reported",
+            state_observation_authority="environment_self_reported",
             cancellation_guarantee="best_effort",
             timeout_after_commit_version=(
                 config.timeout_after_commit.version
@@ -393,8 +393,8 @@ class JsonHttpSandboxConnection:
         )
 
     @property
-    def sandbox_id(self) -> str:
-        return self._config.sandbox_id
+    def environment_id(self) -> str:
+        return self._config.environment_id
 
     @property
     def config_sha256(self) -> str:
@@ -403,28 +403,28 @@ class JsonHttpSandboxConnection:
     @classmethod
     def from_config(
         cls,
-        config: JsonHttpSandboxConfig,
+        config: JsonHttpEnvironmentConfig,
         *,
-        sandbox_confirmed: bool,
+        test_environment_confirmed: bool,
         allow_insecure_http: bool = False,
         timeout_seconds: float = 30,
         max_request_bytes: int = 1_000_000,
         max_response_bytes: int = 1_000_000,
-        max_sandbox_api_calls: int | None = None,
+        max_environment_api_calls: int | None = None,
         client: httpx.AsyncClient | None = None,
-    ) -> JsonHttpSandboxConnection:
+    ) -> JsonHttpEnvironmentConnection:
         return cls(
             config,
-            sandbox_confirmed=sandbox_confirmed,
+            test_environment_confirmed=test_environment_confirmed,
             allow_insecure_http=allow_insecure_http,
             timeout_seconds=timeout_seconds,
             max_request_bytes=max_request_bytes,
             max_response_bytes=max_response_bytes,
-            max_sandbox_api_calls=max_sandbox_api_calls,
+            max_environment_api_calls=max_environment_api_calls,
             client=client,
         )
 
-    async def __aenter__(self) -> JsonHttpSandboxConnection:
+    async def __aenter__(self) -> JsonHttpEnvironmentConnection:
         return self
 
     async def __aexit__(
@@ -440,19 +440,19 @@ class JsonHttpSandboxConnection:
             await self._client.aclose()
 
     def api_calls_for_case(self, case: EvaluationCase) -> int:
-        calls = json_http_sandbox_calls_per_conversation(self._config, len(case.turns))
+        calls = json_http_environment_calls_per_conversation(self._config, len(case.turns))
         if case.timeout_after_commit_event is not None:
             if self._config.timeout_after_commit is None:
                 raise ValueError(
-                    "sandbox does not support environment.tool.timeout_after_commit@1.0.0"
+                    "environment does not support environment.tool.timeout_after_commit@1.0.0"
                 )
             calls += 3
         return calls
 
     async def execute(self, case: EvaluationCase) -> ExecutionEvidence:
         required_calls = self.api_calls_for_case(case)
-        if required_calls > case.max_sandbox_api_calls:
-            raise ValueError("evaluation case exceeds its sandbox API call budget")
+        if required_calls > case.max_environment_api_calls:
+            raise ValueError("evaluation case exceeds its environment API call budget")
         async with self._lifecycle_lock:
             async with asyncio.timeout(case.timeout_seconds):
                 return await self._execute_stateful(case)
@@ -462,7 +462,9 @@ class JsonHttpSandboxConnection:
         event_request = case.timeout_after_commit_event
         event_config = config.timeout_after_commit
         if event_request is not None and event_config is None:
-            raise ValueError("sandbox does not support environment.tool.timeout_after_commit@1.0.0")
+            raise ValueError(
+                "environment does not support environment.tool.timeout_after_commit@1.0.0"
+            )
         if self._lifecycle_state_uncertain:
             return self._execution_evidence(
                 case,
@@ -471,31 +473,31 @@ class JsonHttpSandboxConnection:
                 terminal_status="failed",
                 completed_phases=(),
                 failed_phase="blocked_state_uncertain",
-                failure_code="sandbox_state_uncertain",
-                failure_reason="sandbox state is uncertain after an earlier lifecycle failure",
+                failure_code="environment_state_uncertain",
+                failure_reason="environment state is uncertain after an earlier lifecycle failure",
                 delivery="uncertain",
                 cleanup="not_attempted",
                 cleanup_failure_code=None,
                 cleanup_failure_reason=None,
-                sandbox_state_uncertain=True,
+                environment_state_uncertain=True,
             )
-        self._reserve_sandbox_api_calls(self.api_calls_for_case(case))
+        self._reserve_environment_api_calls(self.api_calls_for_case(case))
         self._lifecycle_state_uncertain = True
         completed_phase_names: list[str] = []
         lifecycle_started = False
         failed_phase: str | None = None
-        failure_code: SandboxLifecycleFailureCode | None = None
+        failure_code: EnvironmentLifecycleFailureCode | None = None
         failure_reason: str | None = None
         cleanup_attempted = False
         cleanup_reset_failed = False
         event_cleanup_failed = False
-        cleanup_failure_code: SandboxLifecycleFailureCode | None = None
+        cleanup_failure_code: EnvironmentLifecycleFailureCode | None = None
         cleanup_failure_reason: str | None = None
         delivery_uncertain = False
         reset_not_delivered = False
         current_phase = "reset"
-        turn_observations: list[SandboxTurnEvidence] = []
-        initial_state: SandboxStateEvidence | None = None
+        turn_observations: list[EnvironmentTurnEvidence] = []
+        initial_state: EnvironmentStateEvidence | None = None
         reset_session_acknowledged = False
         reset_env_acknowledged = False
         cleanup_reset_session_acknowledged = False
@@ -523,20 +525,20 @@ class JsonHttpSandboxConnection:
                 )
                 self._validate_response_identity(
                     setup_response,
-                    sandbox_id_pointer=config.setup.sandbox_id_json_pointer,
+                    environment_id_pointer=config.setup.environment_id_json_pointer,
                     case_id_pointer=config.setup.case_id_json_pointer,
                     case_id=case.id,
                 )
                 completed_phase_names.append("setup")
             current_phase = "initial_snapshot"
-            initial_state = SandboxStateEvidence(
+            initial_state = EnvironmentStateEvidence(
                 value=await self._snapshot(
                     config.snapshot,
                     case.id,
                     _INITIAL_STATE_TURN_ID,
                     allow_null=True,
                 ),
-                authority="sandbox_self_reported",
+                authority="environment_self_reported",
             )
             completed_phase_names.append(current_phase)
             for turn_index, turn in enumerate(case.turns, start=1):
@@ -569,7 +571,7 @@ class JsonHttpSandboxConnection:
                 )
                 self._validate_response_identity(
                     execute_payload,
-                    sandbox_id_pointer=config.execute_turn.sandbox_id_json_pointer,
+                    environment_id_pointer=config.execute_turn.environment_id_json_pointer,
                     case_id_pointer=config.execute_turn.case_id_json_pointer,
                     case_id=case.id,
                     turn_id_pointer=config.execute_turn.turn_id_json_pointer,
@@ -584,11 +586,11 @@ class JsonHttpSandboxConnection:
                 state_snapshot = await self._snapshot(config.snapshot, case.id, turn.id)
                 completed_phase_names.append(current_phase)
                 turn_observations.append(
-                    SandboxTurnEvidence(
+                    EnvironmentTurnEvidence(
                         turn_id=turn.id,
                         response=execute_response,
                         state_snapshot=state_snapshot,
-                        state_observation_authority="sandbox_self_reported",
+                        state_observation_authority="environment_self_reported",
                     )
                 )
                 if event_request is not None and event_request.turn_id == turn.id:
@@ -605,7 +607,7 @@ class JsonHttpSandboxConnection:
                         raise AssertionError("observe operation returned an invalid status")
                     event_trigger_status = cast(TimeoutAfterCommitTriggerStatus, observed_status)
                     completed_phase_names.append(current_phase)
-        except _SandboxProtocolError as error:
+        except _EnvironmentProtocolError as error:
             if current_phase == "reset":
                 reset_session_acknowledged = error.reset_session_acknowledged
                 reset_env_acknowledged = error.reset_env_acknowledged
@@ -622,8 +624,8 @@ class JsonHttpSandboxConnection:
             raise
         except Exception:
             failed_phase = current_phase
-            failure_code = "sandbox_lifecycle_error"
-            failure_reason = "sandbox lifecycle failed"
+            failure_code = "environment_lifecycle_error"
+            failure_reason = "environment lifecycle failed"
             delivery_uncertain = True
         finally:
             if lifecycle_started and failed_phase != "reset":
@@ -645,15 +647,15 @@ class JsonHttpSandboxConnection:
                             event_cleanup_failed = True
                             self._lifecycle_state_uncertain = True
                             cleanup_cancellation = error
-                        except _SandboxProtocolError as error:
+                        except _EnvironmentProtocolError as error:
                             event_cleanup_failed = True
                             cleanup_failure_code = error.code
                             cleanup_failure_reason = str(error)
                             delivery_uncertain = delivery_uncertain or error.delivery_uncertain
                         except Exception:
                             event_cleanup_failed = True
-                            cleanup_failure_code = "sandbox_cleanup_error"
-                            cleanup_failure_reason = "sandbox event cleanup failed"
+                            cleanup_failure_code = "environment_cleanup_error"
+                            cleanup_failure_reason = "environment event cleanup failed"
                             delivery_uncertain = True
                 finally:
                     try:
@@ -668,7 +670,7 @@ class JsonHttpSandboxConnection:
                         cleanup_reset_failed = True
                         self._lifecycle_state_uncertain = True
                         cleanup_cancellation = cleanup_cancellation or error
-                    except _SandboxProtocolError as error:
+                    except _EnvironmentProtocolError as error:
                         cleanup_reset_failed = True
                         cleanup_reset_session_acknowledged = error.reset_session_acknowledged
                         cleanup_reset_env_acknowledged = error.reset_env_acknowledged
@@ -677,8 +679,10 @@ class JsonHttpSandboxConnection:
                         delivery_uncertain = delivery_uncertain or error.delivery_uncertain
                     except Exception:
                         cleanup_reset_failed = True
-                        cleanup_failure_code = cleanup_failure_code or "sandbox_cleanup_error"
-                        cleanup_failure_reason = cleanup_failure_reason or "sandbox cleanup failed"
+                        cleanup_failure_code = cleanup_failure_code or "environment_cleanup_error"
+                        cleanup_failure_reason = (
+                            cleanup_failure_reason or "environment cleanup failed"
+                        )
                         delivery_uncertain = True
             if cleanup_cancellation is not None:
                 raise cleanup_cancellation
@@ -707,7 +711,7 @@ class JsonHttpSandboxConnection:
                 ),
                 cleanup_failure_code=cleanup_failure_code,
                 cleanup_failure_reason=cleanup_failure_reason,
-                sandbox_state_uncertain=self._lifecycle_state_uncertain,
+                environment_state_uncertain=self._lifecycle_state_uncertain,
                 reset_session_acknowledged=reset_session_acknowledged,
                 reset_env_acknowledged=reset_env_acknowledged,
                 cleanup_reset_session_acknowledged=cleanup_reset_session_acknowledged,
@@ -733,7 +737,7 @@ class JsonHttpSandboxConnection:
             cleanup="succeeded",
             cleanup_failure_code=None,
             cleanup_failure_reason=None,
-            sandbox_state_uncertain=False,
+            environment_state_uncertain=False,
             reset_session_acknowledged=reset_session_acknowledged,
             reset_env_acknowledged=reset_env_acknowledged,
             cleanup_reset_session_acknowledged=cleanup_reset_session_acknowledged,
@@ -754,7 +758,7 @@ class JsonHttpSandboxConnection:
         payload = await self._post_for_json(
             config.url,
             {
-                "sandbox_id": self._config.sandbox_id,
+                "environment_id": self._config.environment_id,
                 "case_id": case_id,
                 "operator_id": event.operator_id,
                 "operator_version": event.operator_version,
@@ -770,12 +774,12 @@ class JsonHttpSandboxConnection:
             response = _TimeoutAfterCommitControlResponse.model_validate(payload)
         except ValidationError:
             self._lifecycle_state_uncertain = True
-            raise _SandboxIdentityMismatchError(
+            raise _EnvironmentIdentityMismatchError(
                 "response_mapping",
                 "timeout-after-commit control response is invalid",
             ) from None
         expected_identity = (
-            self._config.sandbox_id,
+            self._config.environment_id,
             case_id,
             event.operator_id,
             event.operator_version,
@@ -785,7 +789,7 @@ class JsonHttpSandboxConnection:
             operation,
         )
         response_identity = (
-            response.sandbox_id,
+            response.environment_id,
             response.case_id,
             response.operator_id,
             response.operator_version,
@@ -796,8 +800,8 @@ class JsonHttpSandboxConnection:
         )
         if response_identity != expected_identity:
             self._lifecycle_state_uncertain = True
-            raise _SandboxIdentityMismatchError(
-                "sandbox_identity",
+            raise _EnvironmentIdentityMismatchError(
+                "environment_identity",
                 "timeout-after-commit control response did not match its request",
             )
         return response.status
@@ -805,8 +809,8 @@ class JsonHttpSandboxConnection:
     async def _reset(self, config: JsonHttpLifecycleResetConfig, case_id: str) -> tuple[bool, bool]:
         request_body = _replace_request_placeholders(config.request_json_template, case_id=case_id)
         if not isinstance(request_body, dict):
-            raise _SandboxProtocolError(
-                "response_mapping", "sandbox API reset request template must be a JSON object"
+            raise _EnvironmentProtocolError(
+                "response_mapping", "environment API reset request template must be a JSON object"
             )
         request_body = {
             **request_body,
@@ -821,7 +825,7 @@ class JsonHttpSandboxConnection:
         )
         self._validate_response_identity(
             reset_response,
-            sandbox_id_pointer=config.sandbox_id_json_pointer,
+            environment_id_pointer=config.environment_id_json_pointer,
             case_id_pointer=config.case_id_json_pointer,
             case_id=case_id,
         )
@@ -830,17 +834,17 @@ class JsonHttpSandboxConnection:
             config.generation_json_pointer,
         )
         if isinstance(generation, bool) or not isinstance(generation, str | int):
-            raise _SandboxProtocolError(
-                "reset_generation", "sandbox API reset generation is invalid"
+            raise _EnvironmentProtocolError(
+                "reset_generation", "environment API reset generation is invalid"
             )
         if isinstance(generation, str) and not generation:
-            raise _SandboxProtocolError(
-                "reset_generation", "sandbox API reset generation is invalid"
+            raise _EnvironmentProtocolError(
+                "reset_generation", "environment API reset generation is invalid"
             )
         if generation == self._last_reset_generation:
-            raise _SandboxProtocolError(
+            raise _EnvironmentProtocolError(
                 "reset_generation_reused",
-                "sandbox API reset generation did not change",
+                "environment API reset generation did not change",
                 delivery_uncertain=True,
             )
         self._last_reset_generation = generation
@@ -850,12 +854,12 @@ class JsonHttpSandboxConnection:
                 reset_session_acknowledged = (
                     _resolve_json_pointer(reset_response, "/reset_session") is True
                 )
-            except _SandboxProtocolError:
+            except _EnvironmentProtocolError:
                 reset_session_acknowledged = False
             if not reset_session_acknowledged:
-                raise _SandboxProtocolError(
+                raise _EnvironmentProtocolError(
                     "reset_session_not_acknowledged",
-                    "sandbox API did not acknowledge the requested session reset",
+                    "environment API did not acknowledge the requested session reset",
                     delivery_uncertain=True,
                     reset_session_acknowledged=False,
                 )
@@ -863,12 +867,12 @@ class JsonHttpSandboxConnection:
         if config.reset_env:
             try:
                 reset_env_acknowledged = _resolve_json_pointer(reset_response, "/reset_env") is True
-            except _SandboxProtocolError:
+            except _EnvironmentProtocolError:
                 reset_env_acknowledged = False
             if not reset_env_acknowledged:
-                raise _SandboxProtocolError(
+                raise _EnvironmentProtocolError(
                     "reset_env_not_acknowledged",
-                    "sandbox API did not acknowledge the requested environment reset",
+                    "environment API did not acknowledge the requested environment reset",
                     delivery_uncertain=True,
                     reset_session_acknowledged=reset_session_acknowledged,
                     reset_env_acknowledged=False,
@@ -882,9 +886,9 @@ class JsonHttpSandboxConnection:
             type(clean_state) is not type(config.clean_state_value)
             or clean_state != config.clean_state_value
         ):
-            raise _SandboxProtocolError(
+            raise _EnvironmentProtocolError(
                 "reset_not_clean",
-                "sandbox API reset did not report clean state",
+                "environment API reset did not report clean state",
                 delivery_uncertain=True,
                 reset_session_acknowledged=reset_session_acknowledged,
                 reset_env_acknowledged=reset_env_acknowledged,
@@ -909,7 +913,7 @@ class JsonHttpSandboxConnection:
         )
         self._validate_response_identity(
             response,
-            sandbox_id_pointer=config.sandbox_id_json_pointer,
+            environment_id_pointer=config.environment_id_json_pointer,
             case_id_pointer=config.case_id_json_pointer,
             case_id=case_id,
             turn_id_pointer=config.turn_id_json_pointer,
@@ -925,47 +929,47 @@ class JsonHttpSandboxConnection:
         self,
         response: JsonValue,
         *,
-        sandbox_id_pointer: str,
+        environment_id_pointer: str,
         case_id_pointer: str,
         case_id: str,
         turn_id_pointer: str | None = None,
         turn_id: str | None = None,
     ) -> None:
-        sandbox_id = _resolve_json_pointer(response, sandbox_id_pointer)
-        if sandbox_id != self._config.sandbox_id:
+        environment_id = _resolve_json_pointer(response, environment_id_pointer)
+        if environment_id != self._config.environment_id:
             self._lifecycle_state_uncertain = True
-            raise _SandboxIdentityMismatchError(
-                "sandbox_identity", "HTTP sandbox identity did not match its configuration"
+            raise _EnvironmentIdentityMismatchError(
+                "environment_identity", "HTTP environment identity did not match its configuration"
             )
         if _resolve_json_pointer(response, case_id_pointer) != case_id:
             self._lifecycle_state_uncertain = True
-            raise _SandboxIdentityMismatchError(
-                "case_identity", "HTTP sandbox response did not match its case"
+            raise _EnvironmentIdentityMismatchError(
+                "case_identity", "HTTP environment response did not match its case"
             )
         if turn_id_pointer is not None and (
             turn_id is None or _resolve_json_pointer(response, turn_id_pointer) != turn_id
         ):
             self._lifecycle_state_uncertain = True
-            raise _SandboxIdentityMismatchError(
-                "turn_identity", "HTTP sandbox response did not match its turn"
+            raise _EnvironmentIdentityMismatchError(
+                "turn_identity", "HTTP environment response did not match its turn"
             )
 
     def _execution_evidence(
         self,
         case: EvaluationCase,
-        turns: tuple[SandboxTurnEvidence, ...],
+        turns: tuple[EnvironmentTurnEvidence, ...],
         *,
-        initial_state: SandboxStateEvidence | None,
+        initial_state: EnvironmentStateEvidence | None,
         terminal_status: Literal["succeeded", "failed", "timed_out", "cancelled"],
         completed_phases: tuple[str, ...],
         failed_phase: str | None,
-        failure_code: SandboxLifecycleFailureCode | None,
+        failure_code: EnvironmentLifecycleFailureCode | None,
         failure_reason: str | None,
         delivery: Literal["certain", "uncertain"],
         cleanup: Literal["succeeded", "failed", "not_attempted"],
-        cleanup_failure_code: SandboxLifecycleFailureCode | None,
+        cleanup_failure_code: EnvironmentLifecycleFailureCode | None,
         cleanup_failure_reason: str | None,
-        sandbox_state_uncertain: bool,
+        environment_state_uncertain: bool,
         reset_session_acknowledged: bool = False,
         reset_env_acknowledged: bool = False,
         cleanup_reset_session_acknowledged: bool = False,
@@ -977,13 +981,13 @@ class JsonHttpSandboxConnection:
         event_request = case.timeout_after_commit_event
         return ExecutionEvidence(
             case_id=case.id,
-            sandbox_id=self._config.sandbox_id,
-            sandbox_config_sha256=self._config_sha256,
+            environment_id=self._config.environment_id,
+            environment_config_sha256=self._config_sha256,
             initial_state=initial_state,
             turns=turns,
             final_response=turns[-1].response if turns else None,
             final_state=(
-                SandboxStateEvidence(
+                EnvironmentStateEvidence(
                     value=turns[-1].state_snapshot,
                     authority=turns[-1].state_observation_authority,
                     observer_id=turns[-1].state_observer_id,
@@ -1003,7 +1007,7 @@ class JsonHttpSandboxConnection:
                 if event_request is not None
                 else None
             ),
-            lifecycle=SandboxLifecycleEvidence(
+            lifecycle=EnvironmentLifecycleEvidence(
                 terminal_status=terminal_status,
                 completed_phases=completed_phases,
                 failed_phase=failed_phase,
@@ -1013,15 +1017,15 @@ class JsonHttpSandboxConnection:
                 cleanup=cleanup,
                 cleanup_failure_code=cleanup_failure_code,
                 cleanup_failure_reason=cleanup_failure_reason,
-                sandbox_state_uncertain=sandbox_state_uncertain,
-                initial_reset=SandboxResetEvidence(
+                environment_state_uncertain=environment_state_uncertain,
+                initial_reset=EnvironmentResetEvidence(
                     reset_session_requested=self._config.reset.reset_session,
                     reset_session_acknowledged=reset_session_acknowledged,
                     reset_env_requested=self._config.reset.reset_env,
                     reset_env_acknowledged=reset_env_acknowledged,
                 ),
                 cleanup_reset=(
-                    SandboxResetEvidence(
+                    EnvironmentResetEvidence(
                         reset_session_requested=self._config.reset.reset_session,
                         reset_session_acknowledged=cleanup_reset_session_acknowledged,
                         reset_env_requested=self._config.reset.reset_env,
@@ -1080,10 +1084,10 @@ class JsonHttpSandboxConnection:
         ).encode("utf-8")
         if len(request_body) > self._max_request_bytes:
             raise _TargetNotDeliveredError(
-                "request_too_large", "sandbox API request exceeds the size limit"
+                "request_too_large", "environment API request exceeds the size limit"
             )
         if consume_budget:
-            self._reserve_sandbox_api_calls(1)
+            self._reserve_environment_api_calls(1)
         try:
             async with asyncio.timeout(self._timeout_seconds):
                 async with self._client.stream(
@@ -1099,39 +1103,39 @@ class JsonHttpSandboxConnection:
                     timeout=self._timeout_seconds,
                 ) as response:
                     if not 200 <= response.status_code < 300:
-                        raise _SandboxProtocolError(
+                        raise _EnvironmentProtocolError(
                             _http_status_failure_code(response.status_code),
-                            f"sandbox API returned HTTP {response.status_code}",
+                            f"environment API returned HTTP {response.status_code}",
                         )
                     if response_json_pointer is not None and not _is_json_content_type(
                         response.headers.get("content-type")
                     ):
-                        raise _SandboxProtocolError(
+                        raise _EnvironmentProtocolError(
                             "response_content_type",
-                            "sandbox API response must be JSON",
+                            "environment API response must be JSON",
                         )
                     content_encoding = response.headers.get("content-encoding")
                     if content_encoding is not None and content_encoding.casefold() != "identity":
-                        raise _SandboxProtocolError(
+                        raise _EnvironmentProtocolError(
                             "response_content_encoding",
-                            "sandbox API response must not use content encoding",
+                            "environment API response must not use content encoding",
                         )
                     response_body = await _read_bounded_response(response, self._max_response_bytes)
         except TimeoutError:
             raise _TargetDeliveryUncertainError(
-                "request_timeout", "sandbox API request timed out"
+                "request_timeout", "environment API request timed out"
             ) from None
         except httpx.ConnectTimeout:
             raise _TargetNotDeliveredError(
-                "connect_timeout", "sandbox API connection timed out"
+                "connect_timeout", "environment API connection timed out"
             ) from None
         except httpx.ConnectError as error:
             if _exception_chain_contains(error, ssl.SSLError):
-                reason = "sandbox API TLS connection failed"
+                reason = "environment API TLS connection failed"
             elif _exception_chain_contains(error, socket.gaierror):
-                reason = "sandbox API DNS resolution failed"
+                reason = "environment API DNS resolution failed"
             else:
-                reason = "sandbox API connection failed"
+                reason = "environment API connection failed"
             code = (
                 "tls_connection"
                 if "TLS" in reason
@@ -1142,25 +1146,25 @@ class JsonHttpSandboxConnection:
             raise _TargetNotDeliveredError(code, reason) from None
         except httpx.ReadTimeout:
             raise _TargetDeliveryUncertainError(
-                "response_timeout", "sandbox API response timed out"
+                "response_timeout", "environment API response timed out"
             ) from None
         except httpx.WriteTimeout:
             raise _TargetDeliveryUncertainError(
-                "write_timeout", "sandbox API request write timed out"
+                "write_timeout", "environment API request write timed out"
             ) from None
         except httpx.PoolTimeout:
             raise _TargetNotDeliveredError(
-                "pool_timeout", "sandbox API connection pool timed out"
+                "pool_timeout", "environment API connection pool timed out"
             ) from None
         except httpx.RemoteProtocolError:
             raise _TargetDeliveryUncertainError(
-                "transport_protocol", "sandbox API transport protocol failed"
+                "transport_protocol", "environment API transport protocol failed"
             ) from None
         except RuntimeError:
             raise
         except httpx.HTTPError:
             raise _TargetDeliveryUncertainError(
-                "transport_failed", "sandbox API transport failed"
+                "transport_failed", "environment API transport failed"
             ) from None
 
         if response_json_pointer is None:
@@ -1173,37 +1177,39 @@ class JsonHttpSandboxConnection:
             )
             _reject_deep_json(raw_output)
         except (UnicodeDecodeError, json.JSONDecodeError, RecursionError, ValueError):
-            raise _SandboxProtocolError(
+            raise _EnvironmentProtocolError(
                 "invalid_json",
-                "sandbox API returned invalid JSON",
+                "environment API returned invalid JSON",
             ) from None
         if raw_output is None:
-            raise _SandboxProtocolError(
+            raise _EnvironmentProtocolError(
                 "null_json",
-                "sandbox API returned null JSON",
+                "environment API returned null JSON",
             )
         return _resolve_json_pointer(raw_output, response_json_pointer)
 
-    def _reserve_sandbox_api_calls(self, sandbox_api_calls: int) -> None:
-        if self._remaining_sandbox_api_calls is None:
+    def _reserve_environment_api_calls(self, environment_api_calls: int) -> None:
+        if self._remaining_environment_api_calls is None:
             return
-        if sandbox_api_calls > self._remaining_sandbox_api_calls:
-            raise _SandboxProtocolError("call_budget", "HTTP sandbox API call budget exhausted")
-        self._remaining_sandbox_api_calls -= sandbox_api_calls
+        if environment_api_calls > self._remaining_environment_api_calls:
+            raise _EnvironmentProtocolError(
+                "call_budget", "HTTP environment API call budget exhausted"
+            )
+        self._remaining_environment_api_calls -= environment_api_calls
 
 
-def validate_json_http_sandbox_configuration(
-    config: JsonHttpSandboxConfig,
+def validate_json_http_environment_configuration(
+    config: JsonHttpEnvironmentConfig,
     *,
-    sandbox_confirmed: bool,
+    test_environment_confirmed: bool,
     allow_insecure_http: bool = False,
     timeout_seconds: float = 30,
     max_request_bytes: int = 1_000_000,
     max_response_bytes: int = 1_000_000,
 ) -> dict[str, str]:
-    if sandbox_confirmed is not True:
-        raise ValueError("sandbox API access requires explicit isolation attestation")
-    for endpoint in json_http_sandbox_config_urls(config):
+    if test_environment_confirmed is not True:
+        raise ValueError("environment API access requires explicit test-environment confirmation")
+    for endpoint in json_http_environment_config_urls(config):
         _validate_endpoint(endpoint, allow_insecure_http)
     if (
         isinstance(timeout_seconds, bool)
@@ -1218,13 +1224,13 @@ def validate_json_http_sandbox_configuration(
     return _headers_from_environment(config.headers_from_env)
 
 
-def json_http_sandbox_calls_per_execution(
-    config: JsonHttpSandboxConfig,
+def json_http_environment_calls_per_execution(
+    config: JsonHttpEnvironmentConfig,
 ) -> int:
-    return json_http_sandbox_calls_per_conversation(config, 1)
+    return json_http_environment_calls_per_conversation(config, 1)
 
 
-def json_http_sandbox_config_sha256(config: JsonHttpSandboxConfig) -> str:
+def json_http_environment_config_sha256(config: JsonHttpEnvironmentConfig) -> str:
     canonical_config = json.dumps(
         config.model_dump(mode="json", exclude_none=True),
         ensure_ascii=True,
@@ -1234,8 +1240,8 @@ def json_http_sandbox_config_sha256(config: JsonHttpSandboxConfig) -> str:
     return hashlib.sha256(canonical_config).hexdigest()
 
 
-def json_http_sandbox_calls_per_conversation(
-    config: JsonHttpSandboxConfig,
+def json_http_environment_calls_per_conversation(
+    config: JsonHttpEnvironmentConfig,
     turn_count: int,
 ) -> int:
     if type(turn_count) is not int or turn_count < 1:
@@ -1247,8 +1253,8 @@ def _conversation_phase_name(phase: str, turn_index: int, turn_count: int) -> st
     return phase if turn_count == 1 else f"{phase}:{turn_index}"
 
 
-def json_http_sandbox_config_urls(
-    config: JsonHttpSandboxConfig,
+def json_http_environment_config_urls(
+    config: JsonHttpEnvironmentConfig,
 ) -> tuple[str, ...]:
     return (
         config.reset.url,
@@ -1259,8 +1265,8 @@ def json_http_sandbox_config_urls(
     )
 
 
-def json_http_sandbox_origin(config: JsonHttpSandboxConfig) -> str:
-    scheme, hostname, port = _endpoint_origin(json_http_sandbox_config_urls(config)[0])
+def json_http_environment_origin(config: JsonHttpEnvironmentConfig) -> str:
+    scheme, hostname, port = _endpoint_origin(json_http_environment_config_urls(config)[0])
     formatted_hostname = f"[{hostname}]" if ":" in hostname else hostname
     default_port = 443 if scheme == "https" else 80
     port_suffix = "" if port == default_port else f":{port}"
@@ -1318,8 +1324,10 @@ def _validate_header_environment_variables(
             or normalized_name in normalized_names
         ):
             raise ValueError("header_environment_variables contains an unsafe header name")
-        if _SANDBOX_ENVIRONMENT_VARIABLE_PATTERN.fullmatch(environment_variable) is None:
-            raise ValueError("header environment variable names must use the UL_SANDBOX_ namespace")
+        if _ENVIRONMENT_VARIABLE_PATTERN.fullmatch(environment_variable) is None:
+            raise ValueError(
+                "header environment variable names must use the UL_ENVIRONMENT_ namespace"
+            )
         normalized_names.add(normalized_name)
         validated[header_name] = environment_variable
     return validated
@@ -1331,19 +1339,19 @@ def _headers_from_environment(header_environment_variables: Mapping[str, str]) -
     for header_name, environment_variable in header_environment_variables.items():
         value = os.environ.get(environment_variable)
         if value is None or not value.strip():
-            raise RuntimeError("sandbox API header environment variable is not set")
+            raise RuntimeError("environment API header environment variable is not set")
         try:
             encoded_value = value.encode("ascii")
         except UnicodeEncodeError:
-            raise RuntimeError("sandbox API header environment variable is invalid") from None
+            raise RuntimeError("environment API header environment variable is invalid") from None
         if any(byte < 32 or byte == 127 for byte in encoded_value):
-            raise RuntimeError("sandbox API header environment variable is invalid")
+            raise RuntimeError("environment API header environment variable is invalid")
         encoded_value_bytes = len(encoded_value)
         if encoded_value_bytes > _MAXIMUM_HEADER_VALUE_BYTES:
-            raise RuntimeError("sandbox API header environment variable is too large")
+            raise RuntimeError("environment API header environment variable is too large")
         total_header_bytes += len(header_name.encode("ascii")) + encoded_value_bytes
         if total_header_bytes > _MAXIMUM_TOTAL_HEADER_BYTES:
-            raise RuntimeError("sandbox API headers exceed the size limit")
+            raise RuntimeError("environment API headers exceed the size limit")
         headers[header_name] = value
     return headers
 
@@ -1355,7 +1363,7 @@ def _is_json_content_type(content_type: str | None) -> bool:
     return media_type == "application/json" or media_type.endswith("+json")
 
 
-def _http_status_failure_code(status_code: int) -> SandboxLifecycleFailureCode:
+def _http_status_failure_code(status_code: int) -> EnvironmentLifecycleFailureCode:
     if status_code in {401, 403}:
         return "authentication_rejected"
     if status_code == 429:
@@ -1621,32 +1629,32 @@ def _resolve_json_pointer(
     for token in _parse_json_pointer(pointer):
         if isinstance(selected, dict):
             if token not in selected:
-                raise _SandboxProtocolError(
-                    "response_mapping", "sandbox API response JSON pointer was not found"
+                raise _EnvironmentProtocolError(
+                    "response_mapping", "environment API response JSON pointer was not found"
                 )
             selected = selected[token]
         elif isinstance(selected, list):
             if token == "-" or not token.isascii() or not token.isdecimal():
-                raise _SandboxProtocolError(
-                    "response_mapping", "sandbox API response JSON pointer was not found"
+                raise _EnvironmentProtocolError(
+                    "response_mapping", "environment API response JSON pointer was not found"
                 )
             if len(token) > 1 and token.startswith("0"):
-                raise _SandboxProtocolError(
-                    "response_mapping", "sandbox API response JSON pointer was not found"
+                raise _EnvironmentProtocolError(
+                    "response_mapping", "environment API response JSON pointer was not found"
                 )
             index = int(token)
             if index >= len(selected):
-                raise _SandboxProtocolError(
-                    "response_mapping", "sandbox API response JSON pointer was not found"
+                raise _EnvironmentProtocolError(
+                    "response_mapping", "environment API response JSON pointer was not found"
                 )
             selected = selected[index]
         else:
-            raise _SandboxProtocolError(
-                "response_mapping", "sandbox API response JSON pointer was not found"
+            raise _EnvironmentProtocolError(
+                "response_mapping", "environment API response JSON pointer was not found"
             )
     if selected is None and not allow_null:
-        raise _SandboxProtocolError(
-            "response_mapping", "sandbox API response JSON pointer selected null"
+        raise _EnvironmentProtocolError(
+            "response_mapping", "environment API response JSON pointer selected null"
         )
     return selected
 
@@ -1656,8 +1664,8 @@ async def _read_bounded_response(response: httpx.Response, maximum_bytes: int) -
     if content_length is not None:
         try:
             if int(content_length) > maximum_bytes:
-                raise _SandboxProtocolError(
-                    "response_too_large", "sandbox API response exceeds the size limit"
+                raise _EnvironmentProtocolError(
+                    "response_too_large", "environment API response exceeds the size limit"
                 )
         except ValueError:
             pass
@@ -1665,7 +1673,7 @@ async def _read_bounded_response(response: httpx.Response, maximum_bytes: int) -
     async for chunk in response.aiter_raw():
         response_body.extend(chunk)
         if len(response_body) > maximum_bytes:
-            raise _SandboxProtocolError(
-                "response_too_large", "sandbox API response exceeds the size limit"
+            raise _EnvironmentProtocolError(
+                "response_too_large", "environment API response exceeds the size limit"
             )
     return bytes(response_body)

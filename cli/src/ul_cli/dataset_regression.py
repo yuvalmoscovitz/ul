@@ -36,17 +36,18 @@ from ul.dataset_regression import (
     replay_dataset_regression,
     run_dataset_regressions,
 )
-from ul.http_sandbox import (
-    JsonHttpSandboxConfig,
-    JsonHttpSandboxConnection,
-    json_http_sandbox_calls_per_execution,
-    json_http_sandbox_config_urls,
-    load_json_http_sandbox_config,
+from ul.http_environment import (
+    JsonHttpEnvironmentConfig,
+    JsonHttpEnvironmentConnection,
+    json_http_environment_calls_per_execution,
+    json_http_environment_config_urls,
+    load_json_http_environment_config,
 )
 
 from ul_cli.dataset_review import (
     load_confirmed_dataset_finding,
 )
+from ul_cli.environment import TEST_ENVIRONMENT_CONFIRMATION_MESSAGE
 
 app = typer.Typer(help="Save and replay confirmed dataset findings.")
 
@@ -69,7 +70,7 @@ def save_dataset_regression(
     target_config: Annotated[
         Path,
         typer.Option(
-            "--sandbox-config",
+            "--environment-config",
             exists=True,
             dir_okay=False,
             readable=True,
@@ -99,7 +100,7 @@ def save_dataset_regression(
         typer.Option(
             "--confirm-versioned-input",
             help=(
-                "Confirm the exact raw input, literal sandbox-template values, and selected "
+                "Confirm the exact raw input, literal environment-template values, and selected "
                 "customer-rule definitions, which may be sensitive and are not auto-redacted, "
                 "are appropriate to store and version."
             ),
@@ -109,8 +110,9 @@ def save_dataset_regression(
     """Create a portable case from a confirmed semantic or invariant finding."""
     if not confirm_versioned_input:
         raise typer.BadParameter(
-            "saving requires confirmation that the exact raw input and literal sandbox-template "
-            "values plus selected customer-rule definitions may be sensitive, are not "
+            "saving requires confirmation that the exact raw input and literal "
+            "environment-template values plus selected customer-rule definitions may be sensitive, "
+            "are not "
             "auto-redacted, and are appropriate to store and version",
             param_hint="--confirm-versioned-input",
         )
@@ -156,25 +158,25 @@ def save_dataset_regression(
         "plus selected customer-rule definitions and the declared observation authority. Rule "
         "literals, allowed sets, and literal request-template values are copied unredacted. "
         "Header authentication remains environment-backed. "
-        "The embedded sandbox config is customer-declared at case creation, is not verified as "
+        "The embedded environment config is customer-declared at case creation, is not verified as "
         "the discovery target, and is never executed by replay."
     )
     insecure_http_option = (
         " --allow-insecure-http"
         if any(
             url.casefold().startswith("http:")
-            for url in json_http_sandbox_config_urls(case.target.config)
+            for url in json_http_environment_config_urls(case.target.config)
         )
         else ""
     )
-    target_calls = case.discovery_repetitions * json_http_sandbox_calls_per_execution(
+    target_calls = case.discovery_repetitions * json_http_environment_calls_per_execution(
         case.target.config
     )
     _print_safe(
         "Replay: ul regression replay "
-        f"{shlex.quote(str(output))} --sandbox-config {shlex.quote(str(target_config))} "
-        "--allow-sandbox-network-egress --confirm-isolated-sandbox"
-        f" --max-sandbox-api-calls {target_calls}{insecure_http_option} "
+        f"{shlex.quote(str(output))} --environment-config {shlex.quote(str(target_config))} "
+        "--allow-environment-network --confirm-test-environment"
+        f" --max-environment-api-calls {target_calls}{insecure_http_option} "
         "--output replay.json"
     )
 
@@ -193,11 +195,11 @@ def replay_saved_dataset_regression(
     target_config: Annotated[
         Path,
         typer.Option(
-            "--sandbox-config",
+            "--environment-config",
             exists=True,
             dir_okay=False,
             readable=True,
-            help="Separately trusted sandbox API config whose digest must match the case.",
+            help="Separately trusted environment API config whose digest must match the case.",
         ),
     ],
     output: Annotated[
@@ -207,60 +209,55 @@ def replay_saved_dataset_regression(
     allow_target_network: Annotated[
         bool,
         typer.Option(
-            "--allow-sandbox-network-egress",
-            help="Allow requests to the configured sandbox endpoint.",
+            "--allow-environment-network",
+            help="Allow requests to the configured environment endpoint.",
         ),
     ] = False,
-    confirm_isolated_sandbox: Annotated[
+    confirm_test_environment: Annotated[
         bool,
-        typer.Option(
-            help=(
-                "Attest that the configured endpoint is a customer-managed, isolated "
-                "non-production sandbox. UL does not verify its isolation."
-            )
-        ),
+        typer.Option(help=("Confirm the environment is intended for testing and can be reset.")),
     ] = False,
     allow_insecure_http: Annotated[
-        bool, typer.Option(help="Allow an HTTP sandbox API. Intended for local sandboxes.")
+        bool, typer.Option(help="Allow an HTTP environment API. Intended for local environments.")
     ] = False,
     max_target_calls: Annotated[
         int,
         typer.Option(
-            "--max-sandbox-api-calls",
+            "--max-environment-api-calls",
             min=1,
-            help="Maximum sandbox API requests authorized for this replay.",
+            help="Maximum environment API requests authorized for this replay.",
         ),
     ] = 100,
 ) -> None:
     """Replay the exact saved variation without semantic-model calls."""
     try:
         regression_case = load_dataset_regression_case(case_path)
-        trusted_target_config = load_json_http_sandbox_config(target_config)
+        trusted_target_config = load_json_http_environment_config(target_config)
         if _target_config_sha256(trusted_target_config) != regression_case.target.config_sha256:
-            raise ValueError("trusted sandbox config digest does not match the regression case")
+            raise ValueError("trusted environment config digest does not match the regression case")
     except (ValidationError, ValueError, RuntimeError) as error:
         raise typer.BadParameter(_terminal_safe(str(error))) from None
 
     requested_target_calls = (
         regression_case.discovery_repetitions
-        * json_http_sandbox_calls_per_execution(trusted_target_config)
+        * json_http_environment_calls_per_execution(trusted_target_config)
     )
     if requested_target_calls > max_target_calls:
         raise typer.BadParameter(
-            f"case requires {requested_target_calls} sandbox API calls, exceeding "
-            f"--max-sandbox-api-calls {max_target_calls}; explicitly raise the call budget",
-            param_hint="--max-sandbox-api-calls",
+            f"case requires {requested_target_calls} environment API calls, exceeding "
+            f"--max-environment-api-calls {max_target_calls}; explicitly raise the call budget",
+            param_hint="--max-environment-api-calls",
         )
 
     if not allow_target_network:
         raise typer.BadParameter(
-            "replay requires --allow-sandbox-network-egress",
-            param_hint="--allow-sandbox-network-egress",
+            "replay requires --allow-environment-network",
+            param_hint="--allow-environment-network",
         )
-    if not confirm_isolated_sandbox:
+    if not confirm_test_environment:
         raise typer.BadParameter(
-            "replay requires --confirm-isolated-sandbox",
-            param_hint="--confirm-isolated-sandbox",
+            TEST_ENVIRONMENT_CONFIRMATION_MESSAGE,
+            param_hint="--confirm-test-environment",
         )
     if output.exists():
         raise typer.BadParameter(
@@ -268,15 +265,15 @@ def replay_saved_dataset_regression(
         )
 
     try:
-        target = JsonHttpSandboxConnection.from_config(
+        target = JsonHttpEnvironmentConnection.from_config(
             trusted_target_config,
-            sandbox_confirmed=True,
+            test_environment_confirmed=True,
             allow_insecure_http=allow_insecure_http,
-            max_sandbox_api_calls=max_target_calls,
+            max_environment_api_calls=max_target_calls,
         )
     except (ValueError, RuntimeError) as error:
         raise typer.BadParameter(
-            _terminal_safe(str(error)), param_hint="--sandbox-config"
+            _terminal_safe(str(error)), param_hint="--environment-config"
         ) from None
     try:
         output_stream = _create_private_output(output)
@@ -329,11 +326,11 @@ def run_saved_dataset_regressions(
     target_config: Annotated[
         Path,
         typer.Option(
-            "--sandbox-config",
+            "--environment-config",
             exists=True,
             dir_okay=False,
             readable=True,
-            help="Separately trusted sandbox API config whose digest must match every case.",
+            help="Separately trusted environment API config whose digest must match every case.",
         ),
     ],
     output: Annotated[
@@ -343,64 +340,59 @@ def run_saved_dataset_regressions(
     allow_target_network: Annotated[
         bool,
         typer.Option(
-            "--allow-sandbox-network-egress",
-            help="Allow requests to the configured sandbox endpoint.",
+            "--allow-environment-network",
+            help="Allow requests to the configured environment endpoint.",
         ),
     ] = False,
-    confirm_isolated_sandbox: Annotated[
+    confirm_test_environment: Annotated[
         bool,
-        typer.Option(
-            help=(
-                "Attest that the configured endpoint is a customer-managed, isolated "
-                "non-production sandbox. UL does not verify its isolation."
-            )
-        ),
+        typer.Option(help=("Confirm the environment is intended for testing and can be reset.")),
     ] = False,
     allow_insecure_http: Annotated[
-        bool, typer.Option(help="Allow an HTTP sandbox API. Intended for local sandboxes.")
+        bool, typer.Option(help="Allow an HTTP environment API. Intended for local environments.")
     ] = False,
     max_target_calls: Annotated[
         int,
         typer.Option(
-            "--max-sandbox-api-calls",
+            "--max-environment-api-calls",
             min=1,
-            help="Maximum total sandbox API requests authorized for this run.",
+            help="Maximum total environment API requests authorized for this run.",
         ),
     ] = 100,
 ) -> None:
-    """Replay saved regressions against the current black-box sandbox."""
+    """Replay saved regressions against the current black-box environment."""
     try:
         case_labels, regression_cases = _load_regression_cases(cases_path)
-        trusted_target_config = load_json_http_sandbox_config(target_config)
+        trusted_target_config = load_json_http_environment_config(target_config)
         trusted_target_config_sha256 = _target_config_sha256(trusted_target_config)
         for regression_case in regression_cases:
             if regression_case.target.config_sha256 != trusted_target_config_sha256:
                 raise ValueError(
-                    f"case {regression_case.case_id} sandbox config digest does not match "
-                    "the trusted sandbox config"
+                    f"case {regression_case.case_id} environment config digest does not match "
+                    "the trusted environment config"
                 )
         requested_target_calls = sum(
             regression_case.discovery_repetitions
-            * json_http_sandbox_calls_per_execution(regression_case.target.config)
+            * json_http_environment_calls_per_execution(regression_case.target.config)
             for regression_case in regression_cases
         )
         if requested_target_calls > max_target_calls:
             raise ValueError(
-                f"run requires {requested_target_calls} sandbox API calls, exceeding "
-                f"--max-sandbox-api-calls {max_target_calls}; explicitly raise the call budget"
+                f"run requires {requested_target_calls} environment API calls, exceeding "
+                f"--max-environment-api-calls {max_target_calls}; explicitly raise the call budget"
             )
     except (ValidationError, ValueError, RuntimeError) as error:
         raise typer.BadParameter(_terminal_safe(str(error))) from None
 
     if not allow_target_network:
         raise typer.BadParameter(
-            "regression run requires --allow-sandbox-network-egress",
-            param_hint="--allow-sandbox-network-egress",
+            "regression run requires --allow-environment-network",
+            param_hint="--allow-environment-network",
         )
-    if not confirm_isolated_sandbox:
+    if not confirm_test_environment:
         raise typer.BadParameter(
-            "regression run requires --confirm-isolated-sandbox",
-            param_hint="--confirm-isolated-sandbox",
+            TEST_ENVIRONMENT_CONFIRMATION_MESSAGE,
+            param_hint="--confirm-test-environment",
         )
     if output.exists():
         raise typer.BadParameter(
@@ -408,15 +400,15 @@ def run_saved_dataset_regressions(
         )
 
     try:
-        target = JsonHttpSandboxConnection.from_config(
+        target = JsonHttpEnvironmentConnection.from_config(
             trusted_target_config,
-            sandbox_confirmed=True,
+            test_environment_confirmed=True,
             allow_insecure_http=allow_insecure_http,
-            max_sandbox_api_calls=max_target_calls,
+            max_environment_api_calls=max_target_calls,
         )
     except (ValueError, RuntimeError) as error:
         raise typer.BadParameter(
-            _terminal_safe(str(error)), param_hint="--sandbox-config"
+            _terminal_safe(str(error)), param_hint="--environment-config"
         ) from None
     try:
         output_stream = _create_private_output(output)
@@ -476,7 +468,7 @@ def run_saved_dataset_regressions(
 
 async def _run_regressions_and_close(
     regression_cases: tuple[DatasetRegressionCase, ...],
-    target: JsonHttpSandboxConnection,
+    target: JsonHttpEnvironmentConnection,
     *,
     case_labels: tuple[str, ...],
     max_target_calls: int,
@@ -582,7 +574,7 @@ def _build_regression_case(
             raise ValueError(f"rule {rule_id!r} uses inconsistent definitions")
         selected_rules.append(baseline_definition)
 
-    trusted_target_config = load_json_http_sandbox_config(target_config_path)
+    trusted_target_config = load_json_http_environment_config(target_config_path)
     return create_dataset_regression_case(
         finding_id=finding_id,
         evidence_sha256=loaded_record.sha256,
@@ -596,7 +588,7 @@ def _build_regression_case(
         source_suite_sha256=evaluation.suite_sha256,
         observation_authority=evaluation.observation_authority,
         state_observation_authority=(
-            "sandbox_self_reported"
+            "environment_self_reported"
             if evaluation.observation_authority == "committed_state_snapshot"
             else None
         ),
@@ -667,7 +659,7 @@ def _invariant_rule_definition(rule: DatasetInvariantRuleResult) -> DatasetInvar
     )
 
 
-def _target_config_sha256(config: JsonHttpSandboxConfig) -> str:
+def _target_config_sha256(config: JsonHttpEnvironmentConfig) -> str:
     return dataset_regression_target_config_sha256(config)
 
 

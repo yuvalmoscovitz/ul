@@ -7,9 +7,9 @@ from pydantic import ConfigDict, Field, JsonValue, model_validator
 
 from ul_core.models import ConversationTurn, ULModel
 
-StateObservationAuthority = Literal["sandbox_self_reported", "independent_observer"]
+StateObservationAuthority = Literal["environment_self_reported", "independent_observer"]
 TimeoutAfterCommitTriggerStatus = Literal["unknown", "not_fired", "fired"]
-SandboxLifecycleFailureCode = Literal[
+EnvironmentLifecycleFailureCode = Literal[
     "authentication_rejected",
     "rate_limited",
     "http_status",
@@ -18,7 +18,7 @@ SandboxLifecycleFailureCode = Literal[
     "invalid_json",
     "null_json",
     "response_mapping",
-    "sandbox_identity",
+    "environment_identity",
     "case_identity",
     "turn_identity",
     "reset_generation",
@@ -39,9 +39,9 @@ SandboxLifecycleFailureCode = Literal[
     "pool_timeout",
     "transport_protocol",
     "transport_failed",
-    "sandbox_state_uncertain",
-    "sandbox_lifecycle_error",
-    "sandbox_cleanup_error",
+    "environment_state_uncertain",
+    "environment_lifecycle_error",
+    "environment_cleanup_error",
 ]
 
 
@@ -87,7 +87,7 @@ class TimeoutAfterCommitEventRequest(_StrictModel):
 
 
 class TimeoutAfterCommitEventEvidence(TimeoutAfterCommitEventRequest):
-    authority: Literal["sandbox_self_reported"] = "sandbox_self_reported"
+    authority: Literal["environment_self_reported"] = "environment_self_reported"
     requested: Literal[True] = True
     armed: bool
     trigger_status: TimeoutAfterCommitTriggerStatus
@@ -101,10 +101,10 @@ class TimeoutAfterCommitEventEvidence(TimeoutAfterCommitEventRequest):
 
 
 class EvaluationCase(_StrictModel):
-    schema_version: Literal["1.0.0"] = "1.0.0"
+    schema_version: Literal["1.1.0"] = "1.1.0"
     id: str = Field(min_length=1, max_length=500)
     turns: tuple[ConversationTurn, ...] = Field(min_length=1)
-    max_sandbox_api_calls: int = Field(ge=1)
+    max_environment_api_calls: int = Field(ge=1)
     timeout_seconds: float = Field(gt=0)
     required_state_observation_authority: StateObservationAuthority | None = None
     required_state_observer_id: str | None = Field(default=None, min_length=1, max_length=500)
@@ -130,7 +130,7 @@ class EvaluationCase(_StrictModel):
         return self
 
 
-class SandboxCapabilities(_StrictModel):
+class EnvironmentCapabilities(_StrictModel):
     isolation: Literal["customer_managed"] = "customer_managed"
     supports_conversations: bool
     supports_state_observation: bool
@@ -153,7 +153,7 @@ class SandboxCapabilities(_StrictModel):
         return self
 
 
-class SandboxTurnEvidence(_StrictModel):
+class EnvironmentTurnEvidence(_StrictModel):
     turn_id: str = Field(min_length=1, max_length=500)
     response: JsonValue
     state_snapshot: JsonValue | None = None
@@ -172,7 +172,7 @@ class SandboxTurnEvidence(_StrictModel):
         return self
 
 
-class SandboxStateEvidence(_StrictModel):
+class EnvironmentStateEvidence(_StrictModel):
     value: JsonValue
     authority: StateObservationAuthority
     observer_id: str | None = Field(default=None, min_length=1, max_length=500)
@@ -187,19 +187,19 @@ class SandboxStateEvidence(_StrictModel):
         return self
 
 
-class SandboxLifecycleEvidence(_StrictModel):
+class EnvironmentLifecycleEvidence(_StrictModel):
     terminal_status: Literal["succeeded", "failed", "timed_out", "cancelled"]
     completed_phases: tuple[str, ...] = ()
     failed_phase: str | None = Field(default=None, min_length=1, max_length=200)
-    failure_code: SandboxLifecycleFailureCode | None = None
+    failure_code: EnvironmentLifecycleFailureCode | None = None
     failure_reason: str | None = Field(default=None, min_length=1, max_length=500)
     delivery: Literal["certain", "uncertain"]
     cleanup: Literal["succeeded", "failed", "not_attempted"]
-    cleanup_failure_code: SandboxLifecycleFailureCode | None = None
+    cleanup_failure_code: EnvironmentLifecycleFailureCode | None = None
     cleanup_failure_reason: str | None = Field(default=None, min_length=1, max_length=500)
-    sandbox_state_uncertain: bool
-    initial_reset: SandboxResetEvidence
-    cleanup_reset: SandboxResetEvidence | None
+    environment_state_uncertain: bool
+    initial_reset: EnvironmentResetEvidence
+    cleanup_reset: EnvironmentResetEvidence | None
 
     @model_validator(mode="after")
     def validate_terminal_status(self) -> Self:
@@ -232,7 +232,7 @@ class SandboxLifecycleEvidence(_StrictModel):
         if self.terminal_status == "succeeded" and (
             self.delivery != "certain"
             or self.cleanup != "succeeded"
-            or self.sandbox_state_uncertain
+            or self.environment_state_uncertain
         ):
             raise ValueError("successful lifecycle evidence requires certain delivery and cleanup")
         if self.terminal_status != "succeeded" and self.failed_phase is None:
@@ -241,10 +241,10 @@ class SandboxLifecycleEvidence(_StrictModel):
             self.failure_code is None or self.failure_reason is None
         ):
             raise ValueError("unsuccessful lifecycle evidence requires a failure code and reason")
-        if self.delivery == "uncertain" and not self.sandbox_state_uncertain:
-            raise ValueError("uncertain delivery must mark sandbox state uncertain")
-        if self.cleanup == "failed" and not self.sandbox_state_uncertain:
-            raise ValueError("failed cleanup must mark sandbox state uncertain")
+        if self.delivery == "uncertain" and not self.environment_state_uncertain:
+            raise ValueError("uncertain delivery must mark environment state uncertain")
+        if self.cleanup == "failed" and not self.environment_state_uncertain:
+            raise ValueError("failed cleanup must mark environment state uncertain")
         if (self.cleanup == "failed") != (self.cleanup_failure_reason is not None):
             raise ValueError("cleanup failure detail must match cleanup status")
         if (self.cleanup_failure_code is None) != (self.cleanup_failure_reason is None):
@@ -252,7 +252,7 @@ class SandboxLifecycleEvidence(_StrictModel):
         return self
 
 
-class SandboxResetEvidence(_StrictModel):
+class EnvironmentResetEvidence(_StrictModel):
     reset_session_requested: bool
     reset_session_acknowledged: bool
     reset_env_requested: bool
@@ -268,16 +268,16 @@ class SandboxResetEvidence(_StrictModel):
 
 
 class ExecutionEvidence(_StrictModel):
-    schema_version: Literal["1.1.0"] = "1.1.0"
+    schema_version: Literal["1.2.0"] = "1.2.0"
     case_id: str = Field(min_length=1, max_length=500)
-    sandbox_id: str = Field(min_length=1, max_length=500)
-    sandbox_config_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
-    initial_state: SandboxStateEvidence | None = None
-    turns: tuple[SandboxTurnEvidence, ...] = ()
+    environment_id: str = Field(min_length=1, max_length=500)
+    environment_config_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    initial_state: EnvironmentStateEvidence | None = None
+    turns: tuple[EnvironmentTurnEvidence, ...] = ()
     final_response: JsonValue | None = None
-    final_state: SandboxStateEvidence | None = None
+    final_state: EnvironmentStateEvidence | None = None
     timeout_after_commit_event: TimeoutAfterCommitEventEvidence | None = None
-    lifecycle: SandboxLifecycleEvidence
+    lifecycle: EnvironmentLifecycleEvidence
 
     @model_validator(mode="after")
     def validate_successful_evidence(self) -> Self:

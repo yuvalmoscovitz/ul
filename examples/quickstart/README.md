@@ -3,14 +3,14 @@
 This package is a complete but synthetic black-box evaluation:
 
 - `dataset.jsonl` contains one historical accounts-payable interaction.
-- `target.json` is the sandbox API mapping for reset, setup, execution, and committed-state snapshot calls to the local
-  sandbox.
+- `target.json` is the environment API mapping for reset, setup, execution, and committed-state snapshot calls to the local
+  environment.
 - `invariants.json` declares that the committed invoice must match the requested invoice in the
   structured target result.
-- `defective_agent.py` is a resettable local HTTP sandbox with one seeded parsing defect.
-- `run.py` starts that sandbox and runs UL.
+- `defective_agent.py` is a resettable local HTTP environment with one seeded parsing defect.
+- `run.py` starts that environment and runs UL.
 
-Before every original or variation trial, UL asks the sandbox to clear both the agent session and
+Before every original or variation trial, UL asks the environment to clear both the agent session and
 the external test environment. The quickstart `POST /reset` accepts
 `{"case_id":"...","reset_session":true,"reset_env":true}` and acknowledges each requested reset.
 The session reset clears conversation memory; the environment reset restores test business state.
@@ -22,22 +22,22 @@ an OpenAI-compatible provider as shown in the [main README](../../README.md):
 uv run python -m examples.quickstart.run
 ```
 
-Validate the complete local sandbox lifecycle first, without an API key or UL semantic-model calls:
+Validate the complete local environment lifecycle first, without an API key or UL semantic-model calls:
 
 ```bash
-uv run python -m examples.quickstart.run --sandbox-check
+uv run python -m examples.quickstart.run --environment-check
 ```
 
-This starts the same ephemeral isolated server, runs the fixed sandbox-only probe `Pay AC-100.`,
+This starts the same ephemeral isolated server, runs the fixed environment-only probe `Pay AC-100.`,
 prints the connection result, and removes its temporary connection configuration.
 
 The runner chooses a free localhost port and changes only the four lifecycle URLs from the
-checked-in `target.json`. The sandbox API mapping describes this exchange:
+checked-in `target.json`. The environment API mapping describes this exchange:
 
 ```json
 {
   "request": {"message": "Pay AC-100."},
-  "settings": {"mode": "sandbox"}
+  "settings": {"mode": "environment"}
 }
 ```
 
@@ -58,7 +58,7 @@ produces a stable 3/3 `changed action value` finding for review. This is deliber
 behavioral finding, not a claim that UL established which response was correct.
 Separately, the customer rule is satisfied by all three original trials and violated by all
 three defective variation trials. That rule is a deterministic comparison of two declared JSON
-fields and requires no additional model or sandbox API calls.
+fields and requires no additional model or environment API calls.
 
 ## Inspect before calling anything
 
@@ -67,18 +67,18 @@ uv run python -m examples.quickstart.run --dry-run
 ```
 
 This sends zero requests. Internally, the live runner starts the server and invokes this CLI
-shape with its private ephemeral sandbox configuration:
+shape with its private ephemeral environment configuration:
 
 ```bash
 uv run ul dataset evaluate examples/quickstart/dataset.jsonl \
-  --sandbox-config tmp/quickstart-.../target.json \
+  --environment-config tmp/quickstart-.../target.json \
   --invariants examples/quickstart/invariants.json \
   --operator input.surface.disfluency_repeat \
   --limit 1 \
   --repetitions 3 \
-  --max-sandbox-api-calls 36 \
-  --allow-sandbox-network-egress \
-  --confirm-isolated-sandbox \
+  --max-environment-api-calls 36 \
+  --allow-environment-network \
+  --confirm-test-environment \
   --allow-insecure-http \
   --output tmp/quickstart-.../evidence.jsonl
 ```
@@ -111,24 +111,24 @@ review decision, use `ul dataset report PATH_TO_EVIDENCE.jsonl --show-sensitive-
 FINDING_ID`. The all-or-none bounded output is limited to that finding, may contain secrets or PII,
 and may be retained in terminal scrollback, CI output, or logs.
 
-The bundled runner stops its ephemeral server and deletes its temporary sandbox configuration
+The bundled runner stops its ephemeral server and deletes its temporary environment configuration
 when it exits, so its evidence is intentionally not replayable afterward. In a customer workflow,
-keep a persistent sandbox configuration and use it to preserve a confirmed finding as an exact
+keep a persistent environment configuration and use it to preserve a confirmed finding as an exact
 regression case:
 
 ```bash
 uv run ul regression save PATH_TO_EVIDENCE.jsonl FINDING_ID \
   --rule committed-invoice-matches-request \
-  --sandbox-config PATH_TO_TARGET.json \
+  --environment-config PATH_TO_TARGET.json \
   --output regressions/quickstart-wrong-invoice.json \
   --confirm-versioned-input
 
 uv run ul regression replay regressions/quickstart-wrong-invoice.json \
-  --sandbox-config PATH_TO_TARGET.json \
-  --allow-sandbox-network-egress \
-  --confirm-isolated-sandbox \
+  --environment-config PATH_TO_TARGET.json \
+  --allow-environment-network \
+  --confirm-test-environment \
   --allow-insecure-http \
-  --max-sandbox-api-calls 18 \
+  --max-environment-api-calls 18 \
   --output tmp/quickstart-replay.json
 ```
 
@@ -136,15 +136,15 @@ When saving the invariant-violation finding itself, omit `--rule`; UL selects th
 by that finding automatically. Semantic findings continue to require an explicit `--rule`.
 
 Saving requires the explicit confirmation because the case contains the exact raw variation and
-literal sandbox-template values, which may be sensitive. UL does not redact them automatically
-because that could alter the reproduced behavior. The embedded sandbox configuration is declared
-by the customer when the case is created, not verified as the discovery sandbox, and may contain
+literal environment-template values, which may be sensitive. UL does not redact them automatically
+because that could alter the reproduced behavior. The embedded environment configuration is declared
+by the customer when the case is created, not verified as the discovery environment, and may contain
 sensitive literal template values.
 It is never executed; replay requires a separately trusted configuration with the same digest.
-Complete replay evidence contains raw sandbox responses and may also be sensitive.
+Complete replay evidence contains raw environment responses and may also be sensitive.
 
-Replay performs the saved three trials directly against the sandbox with no generation,
-equivalence, or other semantic-model calls. The seeded defective sandbox violates the rule and
+Replay performs the saved three trials directly against the environment with no generation,
+equivalence, or other semantic-model calls. The seeded defective environment violates the rule and
 therefore exits `1`. A target that returns matching requested and committed invoice references in
 all three trials exits `0`. That outcome shows only that this saved customer rule held for this
 case; it is not proof that the implementation is correct or that every related failure is fixed.
@@ -155,8 +155,8 @@ The example is intentionally small and deterministic on the target side. With Op
 variation generation, validation, and behavioral comparison explicitly request `x-ai/grok-4.6`;
 an OpenAI-compatible provider uses its configured models. Model behavior may still vary, so the
 finding is not guaranteed. The invariant result applies only to configured fields returned by the
-sandbox's separate committed-state snapshot endpoint. UL validates the reset acknowledgement
-contract but cannot independently prove that the sandbox erased every state store. Satisfying the
+environment's separate committed-state snapshot endpoint. UL validates the reset acknowledgement
+contract but cannot independently prove that the environment erased every state store. Satisfying the
 rule does not establish overall correctness or safety.
 The behavioral result is evidence for human review, not a causal proof or production-rate
 estimate. Do not point the command at a production system or any endpoint that can cause business

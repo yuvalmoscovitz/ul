@@ -11,7 +11,7 @@ AugmentationMode = Literal[
     "dataset_variation",
     "scenario_materialization",
     "conversation_stress",
-    "sandbox_fault",
+    "environment_fault",
 ]
 AugmentationStage = Literal["materialization", "execution", "evaluation"]
 AugmentationExecutionOwner = Literal["dataset_cli", "augmentation_registry", "stress_cli"]
@@ -32,23 +32,23 @@ class AugmentationRef(_CatalogModel):
 class AugmentationRequirements(_CatalogModel):
     required_source_features: tuple[str, ...] = ()
     semantic_model: bool = False
-    sandbox: bool = False
+    environment: bool = False
     conversations: bool = False
     state_observation: bool = False
     customer_evaluator: bool = False
-    sandbox_capabilities: tuple[str, ...] = ()
+    environment_capabilities: tuple[str, ...] = ()
     human_review: bool = False
 
     @model_validator(mode="after")
     def validate_requirements(self) -> Self:
-        if self.sandbox_capabilities and not self.sandbox:
-            raise ValueError("sandbox capabilities require a sandbox")
-        if (self.conversations or self.state_observation) and not self.sandbox:
-            raise ValueError("sandbox execution requirements require a sandbox")
+        if self.environment_capabilities and not self.environment:
+            raise ValueError("environment capabilities require a environment")
+        if (self.conversations or self.state_observation) and not self.environment:
+            raise ValueError("environment execution requirements require a environment")
         if len(self.required_source_features) != len(set(self.required_source_features)):
             raise ValueError("required source features must be unique")
-        if len(self.sandbox_capabilities) != len(set(self.sandbox_capabilities)):
-            raise ValueError("sandbox capabilities must be unique")
+        if len(self.environment_capabilities) != len(set(self.environment_capabilities)):
+            raise ValueError("environment capabilities must be unique")
         return self
 
 
@@ -65,7 +65,7 @@ class AugmentationBinding(_CatalogModel):
             "dataset_variation": "dataset_cli",
             "scenario_materialization": "augmentation_registry",
             "conversation_stress": "stress_cli",
-            "sandbox_fault": "stress_cli",
+            "environment_fault": "stress_cli",
         }
         if self.execution_owner != expected_owner[self.mode]:
             raise ValueError("augmentation mode and execution owner do not match")
@@ -75,10 +75,10 @@ class AugmentationBinding(_CatalogModel):
             raise ValueError("CLI-owned augmentation bindings require a command")
         if len(self.stages) != len(set(self.stages)):
             raise ValueError("augmentation binding stages must be unique")
-        if self.mode == "sandbox_fault" and (
-            not self.requirements.sandbox or not self.requirements.sandbox_capabilities
+        if self.mode == "environment_fault" and (
+            not self.requirements.environment or not self.requirements.environment_capabilities
         ):
-            raise ValueError("sandbox fault bindings require a sandbox capability")
+            raise ValueError("environment fault bindings require a environment capability")
         return self
 
     @property
@@ -204,7 +204,7 @@ def _dataset_spec(
                 requirements=AugmentationRequirements(
                     required_source_features=("production interaction",),
                     semantic_model=True,
-                    sandbox=True,
+                    environment=True,
                     state_observation=True,
                     human_review=human_review,
                 ),
@@ -275,7 +275,7 @@ _BUILTIN_AUGMENTATION_SPECS = (
                 command="ul stress correction",
                 requirements=AugmentationRequirements(
                     required_source_features=("two ordered user turns",),
-                    sandbox=True,
+                    environment=True,
                     conversations=True,
                     state_observation=True,
                     customer_evaluator=True,
@@ -324,16 +324,16 @@ _BUILTIN_AUGMENTATION_SPECS = (
                 requirements=AugmentationRequirements(required_source_features=("action.write",)),
             ),
             _binding(
-                "sandbox_fault",
+                "environment_fault",
                 ("execution", "evaluation"),
                 execution_owner="stress_cli",
                 command="ul stress timeout-after-commit",
                 requirements=AugmentationRequirements(
-                    sandbox=True,
+                    environment=True,
                     conversations=True,
                     state_observation=True,
                     customer_evaluator=True,
-                    sandbox_capabilities=("environment.tool.timeout_after_commit@1.0.0",),
+                    environment_capabilities=("environment.tool.timeout_after_commit@1.0.0",),
                 ),
             ),
         ),
@@ -356,7 +356,7 @@ _BUILTIN_AUGMENTATION_SPECS = (
                 command="ul stress retry-after-successful-commit",
                 requirements=AugmentationRequirements(
                     required_source_features=("two ordered user turns",),
-                    sandbox=True,
+                    environment=True,
                     conversations=True,
                     state_observation=True,
                     customer_evaluator=True,

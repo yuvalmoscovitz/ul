@@ -1,1 +1,1 @@
-"""Deterministic timeout-after-commit sandbox example."""
+"""Deterministic timeout-after-commit environment example."""

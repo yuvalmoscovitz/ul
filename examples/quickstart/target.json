@@ -1,12 +1,12 @@
 {
-  "version": 4,
-  "sandbox_id": "quickstart-accounts-payable",
+  "version": 5,
+  "environment_id": "quickstart-accounts-payable",
   "headers_from_env": {},
   "reset": {
     "url": "http://127.0.0.1:8765/reset",
     "request_json_template": {"case_id": "{{case_id}}"},
     "case_id_json_pointer": "/case_id",
-    "sandbox_id_json_pointer": "/sandbox_id",
+    "environment_id_json_pointer": "/environment_id",
     "generation_json_pointer": "/generation",
     "clean_state_json_pointer": "/clean",
     "clean_state_value": true
@@ -18,7 +18,7 @@
       "scenario": "accounts-payable"
     },
     "case_id_json_pointer": "/case_id",
-    "sandbox_id_json_pointer": "/sandbox_id"
+    "environment_id_json_pointer": "/environment_id"
   },
   "execute_turn": {
     "url": "http://127.0.0.1:8765/execute",
@@ -29,13 +29,13 @@
       "case_id": "{{case_id}}",
       "turn_id": "{{turn_id}}",
       "settings": {
-        "mode": "sandbox"
+        "mode": "environment"
       }
     },
     "response_json_pointer": "/result",
     "case_id_json_pointer": "/case_id",
     "turn_id_json_pointer": "/turn_id",
-    "sandbox_id_json_pointer": "/sandbox_id"
+    "environment_id_json_pointer": "/environment_id"
   },
   "snapshot": {
     "url": "http://127.0.0.1:8765/snapshot",
@@ -43,6 +43,6 @@
     "response_json_pointer": "/state",
     "case_id_json_pointer": "/case_id",
     "turn_id_json_pointer": "/turn_id",
-    "sandbox_id_json_pointer": "/sandbox_id"
+    "environment_id_json_pointer": "/environment_id"
   }
 }

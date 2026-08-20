@@ -25,7 +25,7 @@ from ul import (
     DatasetEvaluationTrial,
     DatasetEvaluationTrialSet,
     InteractionRecord,
-    JsonHttpSandboxConfig,
+    JsonHttpEnvironmentConfig,
     ObservedAgentOutput,
     OpenAICompatibleDatasetSettings,
     SemanticFrame,
@@ -39,16 +39,16 @@ from ul.dataset_invariants import (
     JsonValueEqualsLiteralInvariant,
     NoNewEffectInvariant,
 )
-from ul.sandbox import evaluation_case_from_inputs
+from ul.environment import evaluation_case_from_inputs
 from ul_cli import dataset as main
 from ul_cli import dataset_review
 from ul_cli.main import app as root_app
 from ul_core.evaluation import (
+    EnvironmentLifecycleEvidence,
+    EnvironmentResetEvidence,
+    EnvironmentStateEvidence,
+    EnvironmentTurnEvidence,
     ExecutionEvidence,
-    SandboxLifecycleEvidence,
-    SandboxResetEvidence,
-    SandboxStateEvidence,
-    SandboxTurnEvidence,
 )
 
 runner = CliRunner()
@@ -191,12 +191,12 @@ def _run_context(
         selected_operator_ids=("input.surface.rephrase",),
         repetitions=1,
         invariant_suite=cast(Any, invariant_suite),
-        target_config=JsonHttpSandboxConfig.model_validate(
+        target_config=JsonHttpEnvironmentConfig.model_validate(
             {
-                "version": 4,
-                "sandbox_id": "test-sandbox",
+                "version": 5,
+                "environment_id": "test-environment",
                 "reset": {
-                    "url": "https://sandbox.example.test/reset",
+                    "url": "https://environment.example.test/reset",
                     "request_json_template": {"case_id": "{{case_id}}"},
                     "case_id_json_pointer": "/case_id",
                     "generation_json_pointer": "/generation",
@@ -204,7 +204,7 @@ def _run_context(
                     "clean_state_value": True,
                 },
                 "execute_turn": {
-                    "url": "https://sandbox.example.test/execute",
+                    "url": "https://environment.example.test/execute",
                     "request_json_template": {
                         "case_id": "{{case_id}}",
                         "turn_id": "{{turn_id}}",
@@ -214,7 +214,7 @@ def _run_context(
                     "turn_id_json_pointer": "/turn_id",
                 },
                 "snapshot": {
-                    "url": "https://sandbox.example.test/snapshot",
+                    "url": "https://environment.example.test/snapshot",
                     "request_json_template": {
                         "case_id": "{{case_id}}",
                         "turn_id": "{{turn_id}}",
@@ -231,7 +231,7 @@ def _run_context(
 def test_run_context_uses_current_pipeline() -> None:
     record = _evaluation_result("interaction-1").source
     run_context = _run_context((record,))
-    assert run_context.pipeline_version == "1.1.0"
+    assert run_context.pipeline_version == "1.2.0"
     assert run_context.target.config.reset.reset_session is True
     assert run_context.target.config.reset.reset_env is True
 
@@ -239,7 +239,7 @@ def test_run_context_uses_current_pipeline() -> None:
 def _write_target_config(
     path: Path,
     *,
-    url: str = "https://sandbox.example.test/execute",
+    url: str = "https://environment.example.test/execute",
     headers_from_env: dict[str, str] | None = None,
     request_json_template: object | None = None,
     response_json_pointer: str = "",
@@ -248,8 +248,8 @@ def _write_target_config(
     path.write_text(
         json.dumps(
             {
-                "version": 4,
-                "sandbox_id": "test-sandbox",
+                "version": 5,
+                "environment_id": "test-environment",
                 "headers_from_env": headers_from_env or {},
                 "reset": {
                     "url": f"{base_url}/reset",
@@ -301,11 +301,11 @@ def _write_stateful_target_config(path: Path) -> None:
     path.write_text(
         json.dumps(
             {
-                "version": 4,
-                "sandbox_id": "test-sandbox",
+                "version": 5,
+                "environment_id": "test-environment",
                 "headers_from_env": {},
                 "reset": {
-                    "url": "https://sandbox.example.test/reset",
+                    "url": "https://environment.example.test/reset",
                     "request_json_template": {"case_id": "{{case_id}}"},
                     "case_id_json_pointer": "/case_id",
                     "generation_json_pointer": "/generation",
@@ -313,7 +313,7 @@ def _write_stateful_target_config(path: Path) -> None:
                     "clean_state_value": True,
                 },
                 "setup": {
-                    "url": "https://sandbox.example.test/setup",
+                    "url": "https://environment.example.test/setup",
                     "request_json_template": {
                         "case_id": "{{case_id}}",
                         "seed": "standard",
@@ -321,7 +321,7 @@ def _write_stateful_target_config(path: Path) -> None:
                     "case_id_json_pointer": "/case_id",
                 },
                 "execute_turn": {
-                    "url": "https://sandbox.example.test/execute",
+                    "url": "https://environment.example.test/execute",
                     "request_json_template": {
                         "case_id": "{{case_id}}",
                         "turn_id": "{{turn_id}}",
@@ -332,7 +332,7 @@ def _write_stateful_target_config(path: Path) -> None:
                     "turn_id_json_pointer": "/turn_id",
                 },
                 "snapshot": {
-                    "url": "https://sandbox.example.test/snapshot",
+                    "url": "https://environment.example.test/snapshot",
                     "request_json_template": {
                         "case_id": "{{case_id}}",
                         "turn_id": "{{turn_id}}",
@@ -446,28 +446,28 @@ def test_init_creates_private_strict_starter_config(tmp_path: Path) -> None:
             "init",
             str(target_config),
             "--url",
-            "https://sandbox.example.test",
+            "https://environment.example.test",
         ],
     )
 
     assert result.exit_code == 0, result.output
     assert json.loads(target_config.read_text(encoding="utf-8")) == {
-        "version": 4,
-        "sandbox_id": "replace-with-stable-sandbox-id",
+        "version": 5,
+        "environment_id": "replace-with-stable-environment-id",
         "headers_from_env": {},
         "reset": {
-            "url": "https://sandbox.example.test/reset",
+            "url": "https://environment.example.test/reset",
             "request_json_template": {"case_id": "{{case_id}}"},
             "reset_session": True,
             "reset_env": True,
             "case_id_json_pointer": "/case_id",
-            "sandbox_id_json_pointer": "/sandbox_id",
+            "environment_id_json_pointer": "/environment_id",
             "generation_json_pointer": "/generation",
             "clean_state_json_pointer": "/clean",
             "clean_state_value": True,
         },
         "execute_turn": {
-            "url": "https://sandbox.example.test/execute",
+            "url": "https://environment.example.test/execute",
             "request_json_template": {
                 "case_id": "{{case_id}}",
                 "turn_id": "{{turn_id}}",
@@ -476,15 +476,15 @@ def test_init_creates_private_strict_starter_config(tmp_path: Path) -> None:
             "response_json_pointer": "/response",
             "case_id_json_pointer": "/case_id",
             "turn_id_json_pointer": "/turn_id",
-            "sandbox_id_json_pointer": "/sandbox_id",
+            "environment_id_json_pointer": "/environment_id",
         },
         "snapshot": {
-            "url": "https://sandbox.example.test/snapshot",
+            "url": "https://environment.example.test/snapshot",
             "request_json_template": {"case_id": "{{case_id}}", "turn_id": "{{turn_id}}"},
             "response_json_pointer": "/state",
             "case_id_json_pointer": "/case_id",
             "turn_id_json_pointer": "/turn_id",
-            "sandbox_id_json_pointer": "/sandbox_id",
+            "environment_id_json_pointer": "/environment_id",
         },
     }
     assert stat.S_IMODE(target_config.stat().st_mode) == 0o600
@@ -515,7 +515,7 @@ def test_init_refuses_invalid_url_and_existing_file(tmp_path: Path) -> None:
             "init",
             str(existing_config),
             "--url",
-            "https://sandbox.example.test/execute",
+            "https://environment.example.test/execute",
         ],
     )
 
@@ -575,7 +575,7 @@ def test_dry_run_validates_and_makes_no_external_calls(
         raise AssertionError("dry-run constructed a target client")
 
     monkeypatch.setattr(main, "create_semantic_model_deconstructor", unexpected_deconstructor)
-    monkeypatch.setattr(main.JsonHttpSandboxConnection, "from_config", unexpected_target)
+    monkeypatch.setattr(main.JsonHttpEnvironmentConnection, "from_config", unexpected_target)
     result = runner.invoke(
         root_app,
         [
@@ -586,7 +586,7 @@ def test_dry_run_validates_and_makes_no_external_calls(
             "input.surface.disfluency_repeat",
             "--limit",
             "1",
-            "--sandbox-config",
+            "--environment-config",
             str(target_config),
             "--dry-run",
         ],
@@ -597,19 +597,19 @@ def test_dry_run_validates_and_makes_no_external_calls(
     assert "Selected interactions: 1" in result.output
     assert "Repetitions: 3 per original and accepted variation" in result.output
     assert "Potential semantic model calls: up to 10" in result.output
-    assert "Potential sandbox API calls: up to 30" in result.output
+    assert "Potential environment API calls: up to 30" in result.output
     assert "authorized maximum: 100" in result.output
     assert "Semantic models receive historical inputs and outputs" in result.output
     assert "generated variations" in result.output
     assert "live control responses" in result.output
     assert (
-        "Every test case invokes and validates the configured sandbox reset contract"
+        "Every test case invokes and validates the configured environment reset contract"
         in result.output
     )
     assert "do not determine correctness" in result.output
     assert "identify causality" in result.output
     assert "estimate a production failure rate" in result.output
-    assert "No model or sandbox API requests sent." in result.output
+    assert "No model or environment API requests sent." in result.output
     assert "Transfer 100" not in result.output
 
 
@@ -806,7 +806,7 @@ def test_openai_compatible_dry_run_reports_provider_without_making_calls(
     assert result.exit_code == 0, result.output
     assert "Semantic provider: openai-compatible (endpoint sha256: cbff7260a780)" in result.output
     assert "http://localhost:8000/v1" not in result.output
-    assert "No model or sandbox API requests sent." in result.output
+    assert "No model or environment API requests sent." in result.output
 
 
 def test_openai_compatible_cli_hides_rejected_base_url_secrets(
@@ -859,7 +859,7 @@ def test_openai_compatible_execution_allows_an_unauthenticated_endpoint(
     async def fake_evaluate(*args: object, **kwargs: object) -> tuple[object, ...]:
         return ()
 
-    monkeypatch.setattr(main, "JsonHttpSandboxConnection", FakeTarget)
+    monkeypatch.setattr(main, "JsonHttpEnvironmentConnection", FakeTarget)
     monkeypatch.setattr(main, "_evaluate_interaction_records", fake_evaluate)
 
     result = runner.invoke(
@@ -868,10 +868,10 @@ def test_openai_compatible_execution_allows_an_unauthenticated_endpoint(
             "dataset",
             "evaluate",
             str(dataset),
-            "--sandbox-config",
+            "--environment-config",
             str(target_config),
-            "--allow-sandbox-network-egress",
-            "--confirm-isolated-sandbox",
+            "--allow-environment-network",
+            "--confirm-test-environment",
             "--output",
             str(output),
         ],
@@ -895,23 +895,23 @@ def test_stateful_target_dry_run_counts_physical_lifecycle_calls(
             "dataset",
             "evaluate",
             str(dataset),
-            "--sandbox-config",
+            "--environment-config",
             str(target_config),
             "--repetitions",
             "2",
-            "--max-sandbox-api-calls",
+            "--max-environment-api-calls",
             "24",
             "--dry-run",
         ],
     )
 
     assert result.exit_code == 0, result.output
-    assert "Potential sandbox API calls: up to 24 (authorized maximum: 24)" in " ".join(
+    assert "Potential environment API calls: up to 24 (authorized maximum: 24)" in " ".join(
         result.output.split()
     )
     assert "Lifecycle calls per execution: 6" in result.output
     assert (
-        "Every test case invokes and validates the configured sandbox reset contract"
+        "Every test case invokes and validates the configured environment reset contract"
         in " ".join(result.output.split())
     )
 
@@ -940,9 +940,9 @@ def test_invariant_dry_run_reports_rules_authority_and_no_extra_calls(
     assert "Customer invariants: 1 rule(s)" in result.output
     assert "Declared observation authority: committed_state_snapshot" in result.output
     assert "Additional model calls for customer invariants: 0" in result.output
-    assert "Additional sandbox API calls for customer invariants: 0" in result.output
+    assert "Additional environment API calls for customer invariants: 0" in result.output
     assert "Potential semantic model calls: up to 10" in result.output
-    assert "Potential sandbox API calls: up to 6" in result.output
+    assert "Potential environment API calls: up to 6" in result.output
 
 
 def test_extended_invariants_use_new_evidence_schema_and_hide_values_from_terminal(
@@ -987,7 +987,7 @@ def test_extended_invariants_use_new_evidence_schema_and_hide_values_from_termin
     record = main._customer_evidence_record(
         evaluation_result,
         repetitions=1,
-        max_sandbox_api_calls=2,
+        max_environment_api_calls=2,
         planned_target_calls=2,
         run_context=cast(Any, run_context),
         invariant_evaluation=invariant_evaluation,
@@ -996,7 +996,7 @@ def test_extended_invariants_use_new_evidence_schema_and_hide_values_from_termin
     main._print_invariant_results((invariant_evaluation,))
     terminal_output = capsys.readouterr().out
 
-    assert parsed.schema_version == "1.6.0"
+    assert parsed.schema_version == "1.7.0"
     assert "value=/approval" in terminal_output
     assert "private-current-version" not in terminal_output
     assert "private-stale-version" not in terminal_output
@@ -1028,36 +1028,36 @@ def test_transition_invariant_round_trips_evidence_and_reports_only_pointer_and_
         update={
             "execution_evidence": ExecutionEvidence(
                 case_id="interaction-1",
-                sandbox_id="sandbox",
-                sandbox_config_sha256="0" * 64,
-                initial_state=SandboxStateEvidence(
-                    value={"payments": []}, authority="sandbox_self_reported"
+                environment_id="environment",
+                environment_config_sha256="0" * 64,
+                initial_state=EnvironmentStateEvidence(
+                    value={"payments": []}, authority="environment_self_reported"
                 ),
                 turns=(
-                    SandboxTurnEvidence(
+                    EnvironmentTurnEvidence(
                         turn_id="turn-1",
                         response={"ignored": True},
                         state_snapshot={"payments": [{"id": secret}]},
-                        state_observation_authority="sandbox_self_reported",
+                        state_observation_authority="environment_self_reported",
                     ),
                 ),
                 final_response={"ignored": True},
-                final_state=SandboxStateEvidence(
+                final_state=EnvironmentStateEvidence(
                     value={"payments": [{"id": secret}]},
-                    authority="sandbox_self_reported",
+                    authority="environment_self_reported",
                 ),
-                lifecycle=SandboxLifecycleEvidence(
+                lifecycle=EnvironmentLifecycleEvidence(
                     terminal_status="succeeded",
                     delivery="certain",
                     cleanup="succeeded",
-                    sandbox_state_uncertain=False,
-                    initial_reset=SandboxResetEvidence(
+                    environment_state_uncertain=False,
+                    initial_reset=EnvironmentResetEvidence(
                         reset_session_requested=True,
                         reset_session_acknowledged=True,
                         reset_env_requested=True,
                         reset_env_acknowledged=True,
                     ),
-                    cleanup_reset=SandboxResetEvidence(
+                    cleanup_reset=EnvironmentResetEvidence(
                         reset_session_requested=True,
                         reset_session_acknowledged=True,
                         reset_env_requested=True,
@@ -1070,7 +1070,7 @@ def test_transition_invariant_round_trips_evidence_and_reports_only_pointer_and_
                 metadata={
                     "committed_state_before_turn": {"payments": []},
                     "committed_state_snapshot": {"payments": [{"id": secret}]},
-                    "state_observation_authority": "sandbox_self_reported",
+                    "state_observation_authority": "environment_self_reported",
                 },
             ),
         }
@@ -1090,7 +1090,7 @@ def test_transition_invariant_round_trips_evidence_and_reports_only_pointer_and_
     record = main._customer_evidence_record(
         evaluation_result,
         repetitions=1,
-        max_sandbox_api_calls=2,
+        max_environment_api_calls=2,
         planned_target_calls=2,
         run_context=cast(Any, _run_context((evaluation_result.source,), invariant_suite=suite)),
         invariant_evaluation=invariant_evaluation,
@@ -1201,7 +1201,7 @@ def test_invariant_evaluation_reuses_results_without_extra_runner_calls(
                 cast(Any, AsyncContext()),
                 output_stream,
                 repetitions=1,
-                max_sandbox_api_calls=2,
+                max_environment_api_calls=2,
                 planned_target_calls=2,
                 invariant_suite=suite,
                 invariant_evaluations=stored_evaluations,
@@ -1225,11 +1225,11 @@ def test_target_config_dry_run_validates_environment_and_makes_no_calls(
     _write_dataset(dataset, [_record()])
     _write_target_config(
         target_config,
-        headers_from_env={"Authorization": "UL_SANDBOX_TOKEN"},
+        headers_from_env={"Authorization": "UL_ENVIRONMENT_TOKEN"},
         request_json_template={"request": {"message": "{{input}}"}},
         response_json_pointer="/result",
     )
-    monkeypatch.setenv("UL_SANDBOX_TOKEN", "Bearer test-token")
+    monkeypatch.setenv("UL_ENVIRONMENT_TOKEN", "Bearer test-token")
 
     def unexpected_deconstructor(*args: object, **kwargs: object) -> None:
         raise AssertionError("dry-run constructed a semantic model client")
@@ -1241,26 +1241,26 @@ def test_target_config_dry_run_validates_environment_and_makes_no_calls(
             "dataset",
             "evaluate",
             str(dataset),
-            "--sandbox-config",
+            "--environment-config",
             str(target_config),
             "--dry-run",
         ],
     )
 
     assert result.exit_code == 0, result.output
-    assert "Customer-managed sandbox API: configured" in result.output
-    assert "Authorization=UL_SANDBOX_TOKEN" in result.output
+    assert "Customer-managed environment API: configured" in result.output
+    assert "Authorization=UL_ENVIRONMENT_TOKEN" in result.output
     assert "Bearer test-token" not in result.output
-    assert "No model or sandbox API requests sent" in result.output
+    assert "No model or environment API requests sent" in result.output
 
-    monkeypatch.delenv("UL_SANDBOX_TOKEN")
+    monkeypatch.delenv("UL_ENVIRONMENT_TOKEN")
     missing_environment = runner.invoke(
         root_app,
         [
             "dataset",
             "evaluate",
             str(dataset),
-            "--sandbox-config",
+            "--environment-config",
             str(target_config),
             "--dry-run",
         ],
@@ -1268,36 +1268,36 @@ def test_target_config_dry_run_validates_environment_and_makes_no_calls(
 
     assert missing_environment.exit_code != 0
     assert "environment variable is not set" in missing_environment.output
-    assert "No model or sandbox API requests sent" not in missing_environment.output
+    assert "No model or environment API requests sent" not in missing_environment.output
 
 
 @pytest.mark.parametrize(
     "payload",
     [
         {
-            "version": 4,
-            "sandbox_id": "test-sandbox",
+            "version": 5,
+            "environment_id": "test-environment",
             "unknown": True,
         },
         {
-            **JsonHttpSandboxConfig.model_validate(
+            **JsonHttpEnvironmentConfig.model_validate(
                 json.loads(
                     (Path(__file__).parents[2] / "examples/stateful_target.json").read_text()
                 )
             ).model_dump(mode="json"),
             "execute_turn": {
-                "url": "https://sandbox.example.test/execute",
+                "url": "https://environment.example.test/execute",
                 "request_json_template": {"input": "missing marker"},
             },
         },
         {
-            **JsonHttpSandboxConfig.model_validate(
+            **JsonHttpEnvironmentConfig.model_validate(
                 json.loads(
                     (Path(__file__).parents[2] / "examples/stateful_target.json").read_text()
                 )
             ).model_dump(mode="json"),
             "snapshot": {
-                "url": "https://sandbox.example.test/snapshot",
+                "url": "https://environment.example.test/snapshot",
                 "response_json_pointer": "not-a-pointer",
             },
         },
@@ -1315,14 +1315,14 @@ def test_dry_run_rejects_invalid_target_config(tmp_path: Path, payload: dict[str
             "dataset",
             "evaluate",
             str(dataset),
-            "--sandbox-config",
+            "--environment-config",
             str(target_config),
             "--dry-run",
         ],
     )
 
     assert result.exit_code != 0
-    assert "No model or sandbox API requests sent" not in result.output
+    assert "No model or environment API requests sent" not in result.output
 
 
 @pytest.mark.parametrize(
@@ -1457,7 +1457,7 @@ def test_preflight_enforces_record_and_target_call_bounds(
     )
 
     assert maximum_calls.exit_code == 0, maximum_calls.output
-    assert "Potential sandbox API calls: up to 96" in maximum_calls.output
+    assert "Potential environment API calls: up to 96" in maximum_calls.output
 
     too_many_calls = runner.invoke(
         root_app,
@@ -1475,8 +1475,8 @@ def test_preflight_enforces_record_and_target_call_bounds(
 
     assert too_many_calls.exit_code != 0
     normalized_output = " ".join(_ANSI_ESCAPE_PATTERN.sub("", too_many_calls.output).split())
-    assert "would make up to 102 sandbox API calls" in normalized_output
-    assert "--max-sandbox-api-calls 100" in normalized_output
+    assert "would make up to 102 environment API calls" in normalized_output
+    assert "--max-environment-api-calls 100" in normalized_output
 
 
 def test_repetition_budget_is_explicit_and_checked_before_external_setup(
@@ -1505,7 +1505,7 @@ def test_repetition_budget_is_explicit_and_checked_before_external_setup(
     assert huge_plan.exit_code != 0
     normalized_output = " ".join(_ANSI_ESCAPE_PATTERN.sub("", huge_plan.output).split())
     assert "would make up to" in normalized_output
-    assert "--max-sandbox-api-calls" in normalized_output
+    assert "--max-environment-api-calls" in normalized_output
     assert "call budget" in normalized_output
 
     monkeypatch.setattr(
@@ -1521,14 +1521,14 @@ def test_repetition_budget_is_explicit_and_checked_before_external_setup(
             str(dataset),
             "--repetitions",
             "51",
-            "--max-sandbox-api-calls",
+            "--max-environment-api-calls",
             "102",
             "--dry-run",
         ],
     )
 
     assert exact_budget.exit_code == 0, exact_budget.output
-    assert "Potential sandbox API calls: up to 102 (authorized maximum: 102)" in " ".join(
+    assert "Potential environment API calls: up to 102 (authorized maximum: 102)" in " ".join(
         exact_budget.output.split()
     )
 
@@ -1538,8 +1538,8 @@ def test_repetition_budget_is_explicit_and_checked_before_external_setup(
     (
         ("--repetitions", "0"),
         ("--repetitions", "-1"),
-        ("--max-sandbox-api-calls", "0"),
-        ("--max-sandbox-api-calls", "-1"),
+        ("--max-environment-api-calls", "0"),
+        ("--max-environment-api-calls", "-1"),
     ),
 )
 def test_repetition_and_call_budget_must_be_positive(
@@ -1565,10 +1565,10 @@ def test_default_limit_and_repetitions_fit_the_default_call_budget(tmp_path: Pat
 
     assert result.exit_code == 0, result.output
     assert "Selected interactions: 10" in result.output
-    assert "Potential sandbox API calls: up to 60" in result.output
+    assert "Potential environment API calls: up to 60" in result.output
 
 
-def test_execution_requires_config_network_confirmation_sandbox_and_output(
+def test_execution_requires_config_network_confirmation_environment_and_output(
     tmp_path: Path,
 ) -> None:
     dataset = tmp_path / "interactions.jsonl"
@@ -1577,18 +1577,18 @@ def test_execution_requires_config_network_confirmation_sandbox_and_output(
     _write_target_config(target_config)
 
     option_stages = [
-        ([], "--sandbox-config"),
-        (["--sandbox-config", str(target_config)], "--allow-sandbox-network-egress"),
+        ([], "--environment-config"),
+        (["--environment-config", str(target_config)], "--allow-environment-network"),
         (
-            ["--sandbox-config", str(target_config), "--allow-sandbox-network-egress"],
-            "--confirm-isolated-sandbox",
+            ["--environment-config", str(target_config), "--allow-environment-network"],
+            "--confirm-test-environment",
         ),
         (
             [
-                "--sandbox-config",
+                "--environment-config",
                 str(target_config),
-                "--allow-sandbox-network-egress",
-                "--confirm-isolated-sandbox",
+                "--allow-environment-network",
+                "--confirm-test-environment",
             ],
             "execution requires --output",
         ),
@@ -1620,10 +1620,10 @@ def test_execution_refuses_to_overwrite_output_before_model_setup(
             "dataset",
             "evaluate",
             str(dataset),
-            "--sandbox-config",
+            "--environment-config",
             str(target_config),
-            "--allow-sandbox-network-egress",
-            "--confirm-isolated-sandbox",
+            "--allow-environment-network",
+            "--confirm-test-environment",
             "--output",
             str(output),
         ],
@@ -1655,10 +1655,10 @@ def test_execution_refuses_default_augmentations_collision_before_model_setup(
             "dataset",
             "evaluate",
             str(dataset),
-            "--sandbox-config",
+            "--environment-config",
             str(target_config),
-            "--allow-sandbox-network-egress",
-            "--confirm-isolated-sandbox",
+            "--allow-environment-network",
+            "--confirm-test-environment",
             "--output",
             str(evidence),
         ],
@@ -1691,7 +1691,7 @@ def test_invalid_custom_augmentations_path_does_not_strand_evidence(
             return None
 
     monkeypatch.setattr(main, "load_dataset_semantic_settings", _settings)
-    monkeypatch.setattr(main, "JsonHttpSandboxConnection", FakeTarget)
+    monkeypatch.setattr(main, "JsonHttpEnvironmentConnection", FakeTarget)
 
     result = runner.invoke(
         root_app,
@@ -1699,10 +1699,10 @@ def test_invalid_custom_augmentations_path_does_not_strand_evidence(
             "dataset",
             "evaluate",
             str(dataset),
-            "--sandbox-config",
+            "--environment-config",
             str(target_config),
-            "--allow-sandbox-network-egress",
-            "--confirm-isolated-sandbox",
+            "--allow-environment-network",
+            "--confirm-test-environment",
             "--output",
             str(evidence),
             "--augmentations-output",
@@ -1729,9 +1729,9 @@ def test_execution_rejects_missing_header_secret_before_model_or_output(
     _write_dataset(dataset, [_record()])
     _write_target_config(
         target_config,
-        headers_from_env={"Authorization": "UL_SANDBOX_MISSING_TOKEN"},
+        headers_from_env={"Authorization": "UL_ENVIRONMENT_MISSING_TOKEN"},
     )
-    monkeypatch.delenv("UL_SANDBOX_MISSING_TOKEN", raising=False)
+    monkeypatch.delenv("UL_ENVIRONMENT_MISSING_TOKEN", raising=False)
     monkeypatch.setattr(
         main,
         "load_dataset_semantic_settings",
@@ -1748,10 +1748,10 @@ def test_execution_rejects_missing_header_secret_before_model_or_output(
             "dataset",
             "evaluate",
             str(dataset),
-            "--sandbox-config",
+            "--environment-config",
             str(target_config),
-            "--allow-sandbox-network-egress",
-            "--confirm-isolated-sandbox",
+            "--allow-environment-network",
+            "--confirm-test-environment",
             "--output",
             str(output),
         ],
@@ -1773,9 +1773,9 @@ def test_execution_creates_private_explicit_output(
 
     class FakeTarget:
         @classmethod
-        def from_config(cls, config: JsonHttpSandboxConfig, **options: object) -> FakeTarget:
+        def from_config(cls, config: JsonHttpEnvironmentConfig, **options: object) -> FakeTarget:
             assert config.execute_turn.url == "http://127.0.0.1:8765/execute"
-            assert options["sandbox_confirmed"] is True
+            assert options["test_environment_confirmed"] is True
             return cls()
 
     async def fake_evaluate(
@@ -1786,7 +1786,7 @@ def test_execution_creates_private_explicit_output(
         output_stream: Any,
         *,
         repetitions: int,
-        max_sandbox_api_calls: int,
+        max_environment_api_calls: int,
         planned_target_calls: int,
         run_context: object,
         augmentation_ledger: object,
@@ -1798,7 +1798,7 @@ def test_execution_creates_private_explicit_output(
         captured_records.extend(record.id for record in records)
         assert operator_ids == ("input.surface.disfluency_repeat",)
         assert repetitions == 3
-        assert max_sandbox_api_calls == 100
+        assert max_environment_api_calls == 100
         assert planned_target_calls == 30
         output_stream.write('{"saved":true}\n')
         output_stream.flush()
@@ -1809,7 +1809,7 @@ def test_execution_creates_private_explicit_output(
         "load_dataset_semantic_settings",
         _settings,
     )
-    monkeypatch.setattr(main, "JsonHttpSandboxConnection", FakeTarget)
+    monkeypatch.setattr(main, "JsonHttpEnvironmentConnection", FakeTarget)
     monkeypatch.setattr(main, "_evaluate_interaction_records", fake_evaluate)
     result = runner.invoke(
         root_app,
@@ -1819,11 +1819,11 @@ def test_execution_creates_private_explicit_output(
             str(dataset),
             "--operator",
             "input.surface.disfluency_repeat",
-            "--sandbox-config",
+            "--environment-config",
             str(target_config),
             "--allow-insecure-http",
-            "--allow-sandbox-network-egress",
-            "--confirm-isolated-sandbox",
+            "--allow-environment-network",
+            "--confirm-test-environment",
             "--output",
             str(output),
         ],
@@ -1885,7 +1885,7 @@ def test_execution_wires_redaction_into_records_pipeline_and_run_context(
         output_stream: Any,
         *,
         repetitions: int,
-        max_sandbox_api_calls: int,
+        max_environment_api_calls: int,
         planned_target_calls: int,
         run_context: object,
         augmentation_ledger: object,
@@ -1894,7 +1894,7 @@ def test_execution_wires_redaction_into_records_pipeline_and_run_context(
     ) -> tuple[object, ...]:
         del (
             repetitions,
-            max_sandbox_api_calls,
+            max_environment_api_calls,
             planned_target_calls,
             augmentation_ledger,
             saved_augmentations,
@@ -1909,7 +1909,7 @@ def test_execution_wires_redaction_into_records_pipeline_and_run_context(
         return ()
 
     monkeypatch.setattr(main, "load_dataset_semantic_settings", _settings)
-    monkeypatch.setattr(main, "JsonHttpSandboxConnection", FakeTarget)
+    monkeypatch.setattr(main, "JsonHttpEnvironmentConnection", FakeTarget)
     monkeypatch.setattr(main, "_evaluate_interaction_records", fake_evaluate)
 
     result = runner.invoke(
@@ -1918,11 +1918,11 @@ def test_execution_wires_redaction_into_records_pipeline_and_run_context(
             "dataset",
             "evaluate",
             str(dataset),
-            "--sandbox-config",
+            "--environment-config",
             str(target_config),
             "--allow-insecure-http",
-            "--allow-sandbox-network-egress",
-            "--confirm-isolated-sandbox",
+            "--allow-environment-network",
+            "--confirm-test-environment",
             "--output",
             str(output),
             "--redaction-policy",
@@ -1955,7 +1955,7 @@ def test_target_config_runs_nested_request_and_response_against_loopback(
                 generation += 1
                 committed_state = {"envelope": {"agent": {"actions": []}}}
                 response_value: object = {
-                    "sandbox_id": "test-sandbox",
+                    "environment_id": "test-environment",
                     "case_id": request["case_id"],
                     "generation": generation,
                     "clean": True,
@@ -1972,14 +1972,14 @@ def test_target_config_runs_nested_request_and_response_against_loopback(
                     }
                 }
                 response_value = {
-                    "sandbox_id": "test-sandbox",
+                    "environment_id": "test-environment",
                     "case_id": request["case_id"],
                     "turn_id": request["turn_id"],
                     **cast(dict[str, object], committed_state),
                 }
             elif self.path == "/snapshot":
                 response_value = {
-                    "sandbox_id": "test-sandbox",
+                    "environment_id": "test-environment",
                     "case_id": request["case_id"],
                     "turn_id": request["turn_id"],
                     "state": committed_state,
@@ -2001,7 +2001,7 @@ def test_target_config_runs_nested_request_and_response_against_loopback(
     try:
         server = ThreadingHTTPServer(("127.0.0.1", 0), TargetHandler)
     except PermissionError:
-        pytest.skip("the test sandbox does not allow binding a loopback server")
+        pytest.skip("the test environment does not allow binding a loopback server")
     server_thread = threading.Thread(target=server.serve_forever)
     server_thread.start()
     try:
@@ -2032,7 +2032,7 @@ def test_target_config_runs_nested_request_and_response_against_loopback(
             output_stream: Any,
             *,
             repetitions: int,
-            max_sandbox_api_calls: int,
+            max_environment_api_calls: int,
             planned_target_calls: int,
             run_context: object,
             augmentation_ledger: object,
@@ -2043,7 +2043,7 @@ def test_target_config_runs_nested_request_and_response_against_loopback(
                 operator_ids,
                 settings,
                 repetitions,
-                max_sandbox_api_calls,
+                max_environment_api_calls,
                 planned_target_calls,
                 run_context,
                 augmentation_ledger,
@@ -2054,7 +2054,7 @@ def test_target_config_runs_nested_request_and_response_against_loopback(
                 case = evaluation_case_from_inputs(
                     case_id="ul-case-00000000000000000000000000000000",
                     raw_inputs=(records[0].raw_input,),
-                    max_sandbox_api_calls=5,
+                    max_environment_api_calls=5,
                     timeout_seconds=30,
                 )
                 evidence = await target.execute(case)
@@ -2075,11 +2075,11 @@ def test_target_config_runs_nested_request_and_response_against_loopback(
                 "dataset",
                 "evaluate",
                 str(dataset),
-                "--sandbox-config",
+                "--environment-config",
                 str(target_config),
                 "--allow-insecure-http",
-                "--allow-sandbox-network-egress",
-                "--confirm-isolated-sandbox",
+                "--allow-environment-network",
+                "--confirm-test-environment",
                 "--output",
                 str(output),
             ],
@@ -2105,7 +2105,7 @@ def test_target_config_runs_nested_request_and_response_against_loopback(
     assert output.read_text(encoding="utf-8") == '{"saved":true}\n'
 
 
-def test_help_explains_dataset_sandbox_and_operator_contract() -> None:
+def test_help_explains_dataset_environment_and_operator_contract() -> None:
     result = runner.invoke(root_app, ["dataset", "evaluate", "--help"])
 
     assert result.exit_code == 0, result.output
@@ -2119,21 +2119,21 @@ def test_help_explains_dataset_sandbox_and_operator_contract() -> None:
     assert "executions" in normalized_help
     assert "target executions" not in normalized_help
     assert "Maximum customer" in normalized_help
-    assert "sandbox API" in normalized_help
+    assert "environment API" in normalized_help
     assert "requests" in normalized_help
     assert "Discover operators: ul augmentations list --mode dataset_variation" in normalized_help
-    assert "--sandbox-config" in normalized_help
+    assert "--environment-config" in normalized_help
     assert "configuration" in normalized_help
     help_text = " ".join(normalized_help.replace("│", "").split())
-    assert "customer's isolated agent sandbox API" in help_text
+    assert "customer's agent environment API" in help_text
 
     init_help = runner.invoke(root_app, ["dataset", "init", "--help"])
     assert init_help.exit_code == 0, init_help.output
     normalized_init_help = " ".join(_ANSI_ESCAPE_PATTERN.sub("", init_help.output).split())
-    assert "sandbox_config" in normalized_init_help
+    assert "environment_config" in normalized_init_help
     assert "--url" in normalized_init_help
     assert "private connection config" in normalized_init_help
-    assert "customer-managed sandbox API" in normalized_init_help
+    assert "customer-managed environment API" in normalized_init_help
 
     operators = runner.invoke(root_app, ["dataset", "operators"])
     assert operators.exit_code == 0, operators.output
@@ -2181,7 +2181,7 @@ def test_legacy_operator_list_delegates_to_catalog_and_keeps_existing_call_accou
     assert dry_run.exit_code == 0, dry_run.output
     assert "Operators: input.intent.self_correction@1.0.0" in dry_run.output
     assert "Potential semantic model calls: up to 10" in dry_run.output
-    assert "Potential sandbox API calls: up to 6" in dry_run.output
+    assert "Potential environment API calls: up to 6" in dry_run.output
 
     wrong_version = runner.invoke(
         root_app,
@@ -2215,18 +2215,18 @@ def test_run_context_records_canonical_provider_identity() -> None:
         selected_operator_ids=("input.surface.rephrase",),
         repetitions=1,
         invariant_suite=None,
-        target_config=JsonHttpSandboxConfig.model_validate(
+        target_config=JsonHttpEnvironmentConfig.model_validate(
             {
-                "version": 4,
-                "sandbox_id": "test-sandbox",
+                "version": 5,
+                "environment_id": "test-environment",
                 "reset": {
-                    "url": "https://sandbox.example.test/reset",
+                    "url": "https://environment.example.test/reset",
                     "generation_json_pointer": "/generation",
                     "clean_state_json_pointer": "/clean",
                     "clean_state_value": True,
                 },
                 "execute_turn": {
-                    "url": "https://sandbox.example.test/execute",
+                    "url": "https://environment.example.test/execute",
                     "request_json_template": {
                         "case_id": "{{case_id}}",
                         "turn_id": "{{turn_id}}",
@@ -2234,7 +2234,7 @@ def test_run_context_records_canonical_provider_identity() -> None:
                     },
                 },
                 "snapshot": {
-                    "url": "https://sandbox.example.test/snapshot",
+                    "url": "https://environment.example.test/snapshot",
                     "request_json_template": {
                         "case_id": "{{case_id}}",
                         "turn_id": "{{turn_id}}",
@@ -2297,7 +2297,7 @@ def test_resume_skips_already_processed_interaction_ids(
             main._customer_evidence_record(
                 evaluation_results[0],
                 repetitions=1,
-                max_sandbox_api_calls=4,
+                max_environment_api_calls=4,
                 planned_target_calls=4,
                 run_context=cast(Any, run_context),
             )
@@ -2310,7 +2310,7 @@ def test_resume_skips_already_processed_interaction_ids(
 
     class FakeTarget:
         @classmethod
-        def from_config(cls, config: JsonHttpSandboxConfig, **options: object) -> FakeTarget:
+        def from_config(cls, config: JsonHttpEnvironmentConfig, **options: object) -> FakeTarget:
             return cls()
 
     async def fake_evaluate(
@@ -2321,7 +2321,7 @@ def test_resume_skips_already_processed_interaction_ids(
         output_stream: Any,
         *,
         repetitions: int,
-        max_sandbox_api_calls: int,
+        max_environment_api_calls: int,
         planned_target_calls: int,
         run_context: object,
         augmentation_ledger: object,
@@ -2332,7 +2332,7 @@ def test_resume_skips_already_processed_interaction_ids(
             operator_ids,
             settings,
             target,
-            max_sandbox_api_calls,
+            max_environment_api_calls,
             planned_target_calls,
             augmentation_ledger,
         )
@@ -2349,7 +2349,7 @@ def test_resume_skips_already_processed_interaction_ids(
                 main._customer_evidence_record(
                     evaluation_results[1],
                     repetitions=1,
-                    max_sandbox_api_calls=4,
+                    max_environment_api_calls=4,
                     planned_target_calls=4,
                     run_context=cast(Any, run_context),
                 )
@@ -2364,16 +2364,16 @@ def test_resume_skips_already_processed_interaction_ids(
         "load_dataset_semantic_settings",
         _settings,
     )
-    monkeypatch.setattr(main, "JsonHttpSandboxConnection", FakeTarget)
+    monkeypatch.setattr(main, "JsonHttpEnvironmentConnection", FakeTarget)
     monkeypatch.setattr(main, "_evaluate_interaction_records", fake_evaluate)
     command = [
         "dataset",
         "evaluate",
         str(dataset),
-        "--sandbox-config",
+        "--environment-config",
         str(target_config),
-        "--allow-sandbox-network-egress",
-        "--confirm-isolated-sandbox",
+        "--allow-environment-network",
+        "--confirm-test-environment",
         "--repetitions",
         "1",
         "--resume",
@@ -2419,7 +2419,7 @@ def test_resume_dry_run_rejects_ledger_that_disagrees_with_completed_evidence(
             main._customer_evidence_record(
                 evaluation_result,
                 repetitions=1,
-                max_sandbox_api_calls=2,
+                max_environment_api_calls=2,
                 planned_target_calls=2,
                 run_context=cast(Any, run_context),
             )
@@ -2463,7 +2463,7 @@ def test_resume_dry_run_rejects_ledger_that_disagrees_with_completed_evidence(
             "dataset",
             "evaluate",
             str(dataset),
-            "--sandbox-config",
+            "--environment-config",
             str(target_config),
             "--repetitions",
             "1",
@@ -2492,7 +2492,7 @@ def test_resume_exits_early_when_all_records_already_processed(
             main._customer_evidence_record(
                 evaluation_result,
                 repetitions=1,
-                max_sandbox_api_calls=2,
+                max_environment_api_calls=2,
                 planned_target_calls=2,
                 run_context=cast(Any, run_context),
             )
@@ -2508,10 +2508,10 @@ def test_resume_exits_early_when_all_records_already_processed(
             "dataset",
             "evaluate",
             str(dataset),
-            "--sandbox-config",
+            "--environment-config",
             str(target_config),
-            "--allow-sandbox-network-egress",
-            "--confirm-isolated-sandbox",
+            "--allow-environment-network",
+            "--confirm-test-environment",
             "--repetitions",
             "1",
             "--resume",
@@ -2539,7 +2539,7 @@ def test_all_complete_resume_preserves_prior_review_finding_exit_code(
             main._customer_evidence_record(
                 evaluation_result,
                 repetitions=1,
-                max_sandbox_api_calls=2,
+                max_environment_api_calls=2,
                 planned_target_calls=2,
                 run_context=cast(Any, run_context),
             )
@@ -2555,7 +2555,7 @@ def test_all_complete_resume_preserves_prior_review_finding_exit_code(
             "dataset",
             "evaluate",
             str(dataset),
-            "--sandbox-config",
+            "--environment-config",
             str(target_config),
             "--repetitions",
             "1",
@@ -2599,7 +2599,7 @@ def test_all_complete_resume_preserves_prior_invariant_exit_code(
                 metadata=(
                     {
                         "committed_state_snapshot": baseline_output,
-                        "state_observation_authority": "sandbox_self_reported",
+                        "state_observation_authority": "environment_self_reported",
                     }
                     if invariant_status == "violated"
                     else {}
@@ -2632,7 +2632,7 @@ def test_all_complete_resume_preserves_prior_invariant_exit_code(
             main._customer_evidence_record(
                 evaluation_result,
                 repetitions=1,
-                max_sandbox_api_calls=2,
+                max_environment_api_calls=2,
                 planned_target_calls=2,
                 run_context=cast(Any, run_context),
                 invariant_evaluation=invariant_evaluation,
@@ -2649,7 +2649,7 @@ def test_all_complete_resume_preserves_prior_invariant_exit_code(
             "dataset",
             "evaluate",
             str(dataset),
-            "--sandbox-config",
+            "--environment-config",
             str(target_config),
             "--invariants",
             str(invariant_path),
@@ -2683,7 +2683,7 @@ def test_resume_rejects_forged_invariant_outcome(tmp_path: Path) -> None:
             main._customer_evidence_record(
                 evaluation_result,
                 repetitions=1,
-                max_sandbox_api_calls=2,
+                max_environment_api_calls=2,
                 planned_target_calls=2,
                 run_context=cast(Any, run_context),
                 invariant_evaluation=_invariant_evaluation(
@@ -2703,7 +2703,7 @@ def test_resume_rejects_forged_invariant_outcome(tmp_path: Path) -> None:
             "dataset",
             "evaluate",
             str(dataset),
-            "--sandbox-config",
+            "--environment-config",
             str(target_config),
             "--invariants",
             str(invariant_path),
@@ -2723,13 +2723,13 @@ def test_resume_snapshot_detects_same_summary_content_change() -> None:
     evaluation_result = _evaluation_result("interaction-1")
     run_context = _run_context((evaluation_result.source,))
 
-    def validated_snapshot(max_sandbox_api_calls: int) -> main.DatasetResumeEvidence:
+    def validated_snapshot(max_environment_api_calls: int) -> main.DatasetResumeEvidence:
         raw_evidence = (
             json.dumps(
                 main._customer_evidence_record(
                     evaluation_result,
                     repetitions=1,
-                    max_sandbox_api_calls=max_sandbox_api_calls,
+                    max_environment_api_calls=max_environment_api_calls,
                     planned_target_calls=2,
                     run_context=cast(Any, run_context),
                 )
@@ -2810,7 +2810,7 @@ def test_resume_accepts_extended_invariant_evidence_schema() -> None:
             main._customer_evidence_record(
                 evaluation_result,
                 repetitions=1,
-                max_sandbox_api_calls=2,
+                max_environment_api_calls=2,
                 planned_target_calls=2,
                 run_context=cast(Any, run_context),
                 invariant_evaluation=invariant_evaluation,
@@ -2848,7 +2848,7 @@ def test_resume_rejects_legacy_unbound_evidence(tmp_path: Path) -> None:
             "dataset",
             "evaluate",
             str(dataset),
-            "--sandbox-config",
+            "--environment-config",
             str(target_config),
             "--repetitions",
             "1",
@@ -2875,7 +2875,7 @@ def test_resume_rejects_changed_evaluation_plan(tmp_path: Path) -> None:
             main._customer_evidence_record(
                 evaluation_result,
                 repetitions=1,
-                max_sandbox_api_calls=2,
+                max_environment_api_calls=2,
                 planned_target_calls=2,
                 run_context=cast(Any, run_context),
             )
@@ -2890,7 +2890,7 @@ def test_resume_rejects_changed_evaluation_plan(tmp_path: Path) -> None:
             "dataset",
             "evaluate",
             str(dataset),
-            "--sandbox-config",
+            "--environment-config",
             str(target_config),
             "--operator",
             "input.tone.frustrated",
@@ -2919,7 +2919,7 @@ def test_resume_rejects_evidence_without_terminal_newline(tmp_path: Path) -> Non
             main._customer_evidence_record(
                 evaluation_result,
                 repetitions=1,
-                max_sandbox_api_calls=2,
+                max_environment_api_calls=2,
                 planned_target_calls=2,
                 run_context=cast(Any, run_context),
             )
@@ -2933,7 +2933,7 @@ def test_resume_rejects_evidence_without_terminal_newline(tmp_path: Path) -> Non
             "dataset",
             "evaluate",
             str(dataset),
-            "--sandbox-config",
+            "--environment-config",
             str(target_config),
             "--repetitions",
             "1",
@@ -2964,7 +2964,7 @@ def test_resume_dry_run_accepts_read_only_evidence(
             main._customer_evidence_record(
                 evaluation_result,
                 repetitions=1,
-                max_sandbox_api_calls=2,
+                max_environment_api_calls=2,
                 planned_target_calls=2,
                 run_context=cast(Any, run_context),
             )
@@ -2981,7 +2981,7 @@ def test_resume_dry_run_accepts_read_only_evidence(
             "dataset",
             "evaluate",
             str(dataset),
-            "--sandbox-config",
+            "--environment-config",
             str(target_config),
             "--repetitions",
             "1",
@@ -3018,10 +3018,10 @@ def test_resume_rejects_mismatched_output_path(
             "dataset",
             "evaluate",
             str(dataset),
-            "--sandbox-config",
+            "--environment-config",
             str(target_config),
-            "--allow-sandbox-network-egress",
-            "--confirm-isolated-sandbox",
+            "--allow-environment-network",
+            "--confirm-test-environment",
             "--resume",
             str(evidence),
             "--output",
@@ -3114,7 +3114,7 @@ def test_customer_evidence_keeps_summary_and_nested_technical_details() -> None:
     evidence = main._customer_evidence_record(
         result,
         repetitions=3,
-        max_sandbox_api_calls=100,
+        max_environment_api_calls=100,
         planned_target_calls=6,
     )
 
@@ -3173,7 +3173,7 @@ def test_customer_evidence_keeps_invariants_separate_from_behavioral_findings() 
     evidence = main._customer_evidence_record(
         result,
         repetitions=1,
-        max_sandbox_api_calls=2,
+        max_environment_api_calls=2,
         planned_target_calls=2,
         invariant_evaluation=invariant_evaluation,
     )
@@ -3444,7 +3444,7 @@ def test_duplicate_semantic_findings_get_stable_unique_reportable_ids(tmp_path: 
     evidence = main._customer_evidence_record(
         result,
         repetitions=3,
-        max_sandbox_api_calls=6,
+        max_environment_api_calls=6,
         planned_target_calls=6,
     )
     evidence_path = tmp_path / "evidence.jsonl"

@@ -122,10 +122,10 @@ def _write_target_config(path: Path) -> None:
     path.write_text(
         json.dumps(
             {
-                "version": 4,
-                "sandbox_id": "test-sandbox",
+                "version": 5,
+                "environment_id": "test-environment",
                 "reset": {
-                    "url": "https://sandbox.example.test/reset",
+                    "url": "https://environment.example.test/reset",
                     "request_json_template": {"case_id": "{{case_id}}"},
                     "case_id_json_pointer": "/case_id",
                     "generation_json_pointer": "/generation",
@@ -133,12 +133,12 @@ def _write_target_config(path: Path) -> None:
                     "clean_state_value": True,
                 },
                 "setup": {
-                    "url": "https://sandbox.example.test/setup",
+                    "url": "https://environment.example.test/setup",
                     "request_json_template": {"case_id": "{{case_id}}"},
                     "case_id_json_pointer": "/case_id",
                 },
                 "execute_turn": {
-                    "url": "https://sandbox.example.test/execute",
+                    "url": "https://environment.example.test/execute",
                     "request_json_template": {
                         "case_id": "{{case_id}}",
                         "turn_id": "{{turn_id}}",
@@ -148,7 +148,7 @@ def _write_target_config(path: Path) -> None:
                     "turn_id_json_pointer": "/turn_id",
                 },
                 "snapshot": {
-                    "url": "https://sandbox.example.test/snapshot",
+                    "url": "https://environment.example.test/snapshot",
                     "request_json_template": {
                         "case_id": "{{case_id}}",
                         "turn_id": "{{turn_id}}",
@@ -273,7 +273,7 @@ def test_trace_native_materializes_private_replay_bundle_and_dry_run_plan(
             "stress",
             "trace",
             str(replay_output),
-            "--sandbox-config",
+            "--environment-config",
             str(target_config),
             "--dry-run",
         ],
@@ -345,7 +345,7 @@ def test_trace_replay_output_reservation_failure_makes_no_target_calls(
     def reject_output(_path: Path) -> object:
         raise OSError("simulated output failure")
 
-    monkeypatch.setattr(event_stress, "JsonHttpSandboxConnection", _TargetMustNotBeConstructed)
+    monkeypatch.setattr(event_stress, "JsonHttpEnvironmentConnection", _TargetMustNotBeConstructed)
     monkeypatch.setattr(event_stress, "_create_private_output", reject_output)
 
     result = runner.invoke(
@@ -354,10 +354,10 @@ def test_trace_replay_output_reservation_failure_makes_no_target_calls(
             "stress",
             "trace",
             str(replay_bundle),
-            "--sandbox-config",
+            "--environment-config",
             str(target_config),
-            "--allow-sandbox-network-egress",
-            "--confirm-isolated-sandbox",
+            "--allow-environment-network",
+            "--confirm-test-environment",
             "--output",
             str(output),
         ],

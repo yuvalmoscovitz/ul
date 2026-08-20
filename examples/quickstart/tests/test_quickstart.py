@@ -18,8 +18,8 @@ import pytest
 import typer
 from typer.testing import CliRunner
 from ul.dataset_invariants import JsonValuesEqualInvariant, load_dataset_invariant_suite
-from ul.http_sandbox import JsonHttpSandboxConfig, JsonHttpSandboxConnection
-from ul.sandbox import evaluation_case_from_inputs
+from ul.environment import evaluation_case_from_inputs
+from ul.http_environment import JsonHttpEnvironmentConfig, JsonHttpEnvironmentConnection
 from ul_cli.main import app
 
 from examples.quickstart import run as quickstart
@@ -31,7 +31,7 @@ _VALID_REQUEST = {
     "case_id": "ul-case-00000000000000000000000000000000",
     "turn_id": "ul-case-00000000000000000000000000000000:turn-1",
     "request": {"message": "Pay AC-100."},
-    "settings": {"mode": "sandbox"},
+    "settings": {"mode": "environment"},
 }
 
 
@@ -57,7 +57,7 @@ def _post(base_url: str, payload: object, **kwargs: Any) -> httpx.Response:
 def _actions(response: httpx.Response) -> list[dict[str, object]]:
     assert response.status_code == 200, response.text
     response_payload = cast(dict[str, Any], response.json())
-    assert set(response_payload) == {"sandbox_id", "case_id", "turn_id", "result"}
+    assert set(response_payload) == {"environment_id", "case_id", "turn_id", "result"}
     result = response_payload["result"]
     assert isinstance(result, dict)
     return [cast(dict[str, object], result)]
@@ -73,7 +73,7 @@ def test_server_reproduces_the_seeded_wrong_invoice() -> None:
                     "case_id": "ul-case-00000000000000000000000000000000",
                     "turn_id": "ul-case-00000000000000000000000000000000:turn-1",
                     "request": {"message": "Pay pay AC-100."},
-                    "settings": {"mode": "sandbox"},
+                    "settings": {"mode": "environment"},
                 },
             )
         )
@@ -110,7 +110,7 @@ def test_server_starts_every_request_from_identical_fresh_state() -> None:
                         "case_id": "ul-case-00000000000000000000000000000000",
                         "turn_id": "ul-case-00000000000000000000000000000000:turn-1",
                         "request": {"message": "Pay pay AC-100."},
-                        "settings": {"mode": "sandbox"},
+                        "settings": {"mode": "environment"},
                     },
                 )
             )
@@ -124,17 +124,17 @@ def test_server_starts_every_request_from_identical_fresh_state() -> None:
 @pytest.mark.asyncio
 async def test_stateful_target_adapter_resets_executes_and_snapshots() -> None:
     with _running_server() as (base_url, _server):
-        config = JsonHttpSandboxConfig.model_validate(quickstart.load_target_template(base_url))
-        async with JsonHttpSandboxConnection.from_config(
+        config = JsonHttpEnvironmentConfig.model_validate(quickstart.load_target_template(base_url))
+        async with JsonHttpEnvironmentConnection.from_config(
             config,
-            sandbox_confirmed=True,
+            test_environment_confirmed=True,
             allow_insecure_http=True,
-            max_sandbox_api_calls=6,
+            max_environment_api_calls=6,
         ) as target:
             case = evaluation_case_from_inputs(
                 case_id="ul-case-00000000000000000000000000000000",
                 raw_inputs=("Pay AC-100.",),
-                max_sandbox_api_calls=6,
+                max_environment_api_calls=6,
                 timeout_seconds=30,
             )
             output = await target.execute(case)
@@ -153,7 +153,7 @@ async def test_stateful_target_adapter_resets_executes_and_snapshots() -> None:
     )
 
 
-def test_sandbox_check_runs_against_the_bundled_quickstart(tmp_path: Path) -> None:
+def test_environment_check_runs_against_the_bundled_quickstart(tmp_path: Path) -> None:
     probe = "Pay AC-100."
     with _running_server() as (base_url, _server):
         target_path = tmp_path / "target.json"
@@ -163,13 +163,13 @@ def test_sandbox_check_runs_against_the_bundled_quickstart(tmp_path: Path) -> No
         result = CliRunner().invoke(
             app,
             [
-                "sandbox",
+                "environment",
                 "check",
                 str(target_path),
                 "--probe",
                 probe,
-                "--allow-sandbox-network-egress",
-                "--confirm-isolated-sandbox",
+                "--allow-environment-network",
+                "--confirm-test-environment",
                 "--confirm-harmless-probe",
                 "--allow-insecure-http",
                 "--json",
@@ -179,8 +179,8 @@ def test_sandbox_check_runs_against_the_bundled_quickstart(tmp_path: Path) -> No
     assert result.exit_code == 0, result.output
     summary = json.loads(result.output)
     assert summary["status"] == "ready"
-    assert summary["sandbox_id"] == "quickstart-accounts-payable"
-    assert summary["sandbox_api_call_budget"] == 6
+    assert summary["environment_id"] == "quickstart-accounts-payable"
+    assert summary["environment_api_call_budget"] == 6
     assert summary["completed_phases"] == [
         "reset",
         "setup",
@@ -189,7 +189,7 @@ def test_sandbox_check_runs_against_the_bundled_quickstart(tmp_path: Path) -> No
         "snapshot",
         "cleanup_reset",
     ]
-    assert summary["state_observation_authority"] == "sandbox_self_reported"
+    assert summary["state_observation_authority"] == "environment_self_reported"
     assert summary["ul_semantic_model_calls"] == 0
     assert probe not in result.output
     assert "payment_committed" not in result.output
@@ -234,7 +234,7 @@ def test_server_rejects_oversized_and_invalid_values() -> None:
             base_url,
             {
                 "request": {"message": "x" * 100_001},
-                "settings": {"mode": "sandbox"},
+                "settings": {"mode": "environment"},
             },
         )
         wrong_mode = _post(
@@ -253,12 +253,12 @@ def test_quickstart_target_contains_no_authentication_mapping() -> None:
     target = json.loads((_QUICKSTART_DIRECTORY / "target.json").read_text(encoding="utf-8"))
 
     assert target["headers_from_env"] == {}
-    assert target["version"] == 4
+    assert target["version"] == 5
     assert target["execute_turn"]["request_json_template"] == {
         "case_id": "{{case_id}}",
         "turn_id": "{{turn_id}}",
         "request": {"message": "{{input}}"},
-        "settings": {"mode": "sandbox"},
+        "settings": {"mode": "environment"},
     }
     assert target["execute_turn"]["response_json_pointer"] == "/result"
     assert target["snapshot"]["response_json_pointer"] == "/state"
@@ -405,7 +405,7 @@ def test_runner_uses_safe_argv_minimal_environment_private_artifacts_and_cleans_
             "UL_DATASET_RENDER_MODEL": "x-ai/grok-4.6",
             "UL_DATASET_EQUIVALENCE_MODEL": "x-ai/grok-4.6",
         }
-        target_config_path = Path(command[command.index("--sandbox-config") + 1])
+        target_config_path = Path(command[command.index("--environment-config") + 1])
         assert Path(command[command.index("--invariants") + 1]) == (
             _QUICKSTART_DIRECTORY / "invariants.json"
         )
@@ -636,7 +636,7 @@ def test_dry_run_is_a_real_subprocess_and_needs_no_api_key(tmp_path: Path) -> No
     assert "OPEN_ROUTER_API_KEY" not in environment
 
 
-def test_sandbox_check_is_a_real_subprocess_and_needs_no_api_key() -> None:
+def test_environment_check_is_a_real_subprocess_and_needs_no_api_key() -> None:
     environment = {
         "PATH": os.environ["PATH"],
         "PYTHONPATH": os.pathsep.join(
@@ -649,7 +649,7 @@ def test_sandbox_check_is_a_real_subprocess_and_needs_no_api_key() -> None:
     }
 
     completed = subprocess.run(
-        [sys.executable, "-m", "examples.quickstart.run", "--sandbox-check"],
+        [sys.executable, "-m", "examples.quickstart.run", "--environment-check"],
         cwd=_PROJECT_ROOT,
         env=environment,
         capture_output=True,
@@ -660,7 +660,7 @@ def test_sandbox_check_is_a_real_subprocess_and_needs_no_api_key() -> None:
     )
 
     assert completed.returncode == 0, completed.stdout + completed.stderr
-    assert "Sandbox check: READY" in completed.stdout
+    assert "Environment check: READY" in completed.stdout
     assert "No API key or UL semantic-model calls used." in completed.stdout
     assert "OPEN_ROUTER_API_KEY" not in environment
 

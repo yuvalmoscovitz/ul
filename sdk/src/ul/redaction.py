@@ -17,7 +17,7 @@ from typing import Literal, Protocol, Self, cast
 
 from pydantic import ConfigDict, Field, JsonValue, SecretStr, model_validator
 from ul_core.contracts import (
-    SandboxExecutor,
+    EnvironmentExecutor,
     SemanticDeconstructor,
     SemanticEquivalenceVerifier,
     SemanticRenderer,
@@ -29,7 +29,7 @@ from ul_core.dataset import (
     SemanticFrame,
     UserInputRecord,
 )
-from ul_core.evaluation import EvaluationCase, ExecutionEvidence, SandboxCapabilities
+from ul_core.evaluation import EnvironmentCapabilities, EvaluationCase, ExecutionEvidence
 from ul_core.models import ULModel
 
 if sys.platform == "win32":
@@ -546,32 +546,34 @@ class RedactedSemanticPipeline:
         except Exception:
             raise RedactionBoundaryError() from None
 
-    def wrap_sandbox(self, sandbox: SandboxExecutor) -> RehydratingSandboxConnection:
-        return RehydratingSandboxConnection(sandbox, self.engine)
+    def wrap_environment(
+        self, environment: EnvironmentExecutor
+    ) -> RehydratingEnvironmentConnection:
+        return RehydratingEnvironmentConnection(environment, self.engine)
 
     def _metadata(self, metadata: dict[str, JsonValue]) -> dict[str, JsonValue]:
         return {**metadata, "redaction_policy_sha256": self.engine.policy.digest}
 
 
-class RehydratingSandboxConnection:
-    def __init__(self, sandbox: SandboxExecutor, engine: RedactionEngine) -> None:
-        self._sandbox = sandbox
+class RehydratingEnvironmentConnection:
+    def __init__(self, environment: EnvironmentExecutor, engine: RedactionEngine) -> None:
+        self._environment = environment
         self._engine = engine
 
     @property
-    def capabilities(self) -> SandboxCapabilities:
-        return self._sandbox.capabilities
+    def capabilities(self) -> EnvironmentCapabilities:
+        return self._environment.capabilities
 
     @property
-    def sandbox_id(self) -> str:
-        return self._sandbox.sandbox_id
+    def environment_id(self) -> str:
+        return self._environment.environment_id
 
     @property
     def config_sha256(self) -> str:
-        return self._sandbox.config_sha256
+        return self._environment.config_sha256
 
     def api_calls_for_case(self, case: EvaluationCase) -> int:
-        return self._sandbox.api_calls_for_case(case)
+        return self._environment.api_calls_for_case(case)
 
     async def execute(self, case: EvaluationCase) -> ExecutionEvidence:
         try:
@@ -587,7 +589,7 @@ class RehydratingSandboxConnection:
             )
         except RedactionBoundaryError:
             raise
-        evidence = await self._sandbox.execute(rehydrated_case)
+        evidence = await self._environment.execute(rehydrated_case)
         protected_turns = tuple(
             turn.model_copy(
                 update={

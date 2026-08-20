@@ -35,8 +35,8 @@ def _write_inputs(tmp_path: Path, *, observation_authority: str) -> tuple[Path, 
     target_path.write_text(
         json.dumps(
             {
-                "version": 4,
-                "sandbox_id": "retry-test-sandbox",
+                "version": 5,
+                "environment_id": "retry-test-environment",
                 "reset": {
                     "url": "http://127.0.0.1:8765/reset",
                     "generation_json_pointer": "/generation",
@@ -98,7 +98,7 @@ def test_retry_dry_run_reports_versioned_complete_plan_without_calls(tmp_path: P
             "stress",
             "retry-after-successful-commit",
             str(case_path),
-            "--sandbox-config",
+            "--environment-config",
             str(target_path),
             "--invariants",
             str(invariants_path),
@@ -111,7 +111,7 @@ def test_retry_dry_run_reports_versioned_complete_plan_without_calls(tmp_path: P
     assert "conversation.retry_after_successful_commit@1.0.0" in result.output
     assert "initial committed operation -> explicit retry" in result.output
     assert "Target calls per paired repetition: 14" in result.output
-    assert "Potential sandbox API calls: 42" in result.output
+    assert "Potential environment API calls: 42" in result.output
     assert "External calls: none" in result.output
 
 
@@ -126,12 +126,12 @@ def test_retry_rejects_agent_response_rules_before_network_calls(tmp_path: Path)
             "stress",
             "retry-after-successful-commit",
             str(case_path),
-            "--sandbox-config",
+            "--environment-config",
             str(target_path),
             "--invariants",
             str(invariants_path),
-            "--allow-sandbox-network-egress",
-            "--confirm-isolated-sandbox",
+            "--allow-environment-network",
+            "--confirm-test-environment",
             "--allow-insecure-http",
             "--output",
             str(tmp_path / "evidence.json"),

@@ -21,13 +21,13 @@ from ul_core.dataset import (
     UserInputRecord,
 )
 from ul_core.evaluation import (
+    EnvironmentCapabilities,
+    EnvironmentLifecycleEvidence,
+    EnvironmentResetEvidence,
+    EnvironmentStateEvidence,
+    EnvironmentTurnEvidence,
     EvaluationCase,
     ExecutionEvidence,
-    SandboxCapabilities,
-    SandboxLifecycleEvidence,
-    SandboxResetEvidence,
-    SandboxStateEvidence,
-    SandboxTurnEvidence,
 )
 
 from examples.accounts_payable.dataset_target import (
@@ -50,12 +50,12 @@ class _SingleTurnTestAgent(Protocol):
 
 
 class _RecordingDatasetTarget:
-    sandbox_id = "accounts-payable-test-sandbox"
+    environment_id = "accounts-payable-test-environment"
     config_sha256 = "0" * 64
-    capabilities = SandboxCapabilities(
+    capabilities = EnvironmentCapabilities(
         supports_conversations=True,
         supports_state_observation=True,
-        state_observation_authority="sandbox_self_reported",
+        state_observation_authority="environment_self_reported",
         cancellation_guarantee="guaranteed",
     )
 
@@ -67,37 +67,37 @@ class _RecordingDatasetTarget:
         return len(case.turns)
 
     async def execute(self, case: EvaluationCase) -> ExecutionEvidence:
-        turns: list[SandboxTurnEvidence] = []
+        turns: list[EnvironmentTurnEvidence] = []
         for turn in case.turns:
             self.raw_inputs.append(turn.content)
             output = await self._target.execute(turn.content)
             turns.append(
-                SandboxTurnEvidence(
+                EnvironmentTurnEvidence(
                     turn_id=turn.id,
                     response=output.raw_output,
                     state_snapshot=output.raw_output,
-                    state_observation_authority="sandbox_self_reported",
+                    state_observation_authority="environment_self_reported",
                 )
             )
         return ExecutionEvidence(
             case_id=case.id,
-            sandbox_id=self.sandbox_id,
-            sandbox_config_sha256=self.config_sha256,
-            initial_state=SandboxStateEvidence(value={}, authority="sandbox_self_reported"),
+            environment_id=self.environment_id,
+            environment_config_sha256=self.config_sha256,
+            initial_state=EnvironmentStateEvidence(value={}, authority="environment_self_reported"),
             turns=tuple(turns),
             final_response=turns[-1].response,
-            final_state=SandboxStateEvidence(
+            final_state=EnvironmentStateEvidence(
                 value=turns[-1].state_snapshot,
-                authority="sandbox_self_reported",
+                authority="environment_self_reported",
             ),
-            lifecycle=SandboxLifecycleEvidence(
-                initial_reset=SandboxResetEvidence(
+            lifecycle=EnvironmentLifecycleEvidence(
+                initial_reset=EnvironmentResetEvidence(
                     reset_session_requested=True,
                     reset_session_acknowledged=True,
                     reset_env_requested=True,
                     reset_env_acknowledged=True,
                 ),
-                cleanup_reset=SandboxResetEvidence(
+                cleanup_reset=EnvironmentResetEvidence(
                     reset_session_requested=True,
                     reset_session_acknowledged=True,
                     reset_env_requested=True,
@@ -107,7 +107,7 @@ class _RecordingDatasetTarget:
                 completed_phases=("execute", "cleanup"),
                 delivery="certain",
                 cleanup="succeeded",
-                sandbox_state_uncertain=False,
+                environment_state_uncertain=False,
             ),
         )
 

@@ -43,7 +43,7 @@ class _DefectiveAgentRequestHandler(BaseHTTPRequestHandler):
     state_lock = Lock()
     reset_generation = 0
     committed_action: dict[str, str] | None = None
-    sandbox_id = "quickstart-accounts-payable"
+    environment_id = "quickstart-accounts-payable"
 
     def do_POST(self) -> None:
         if self.path not in {"/reset", "/setup", "/execute", "/snapshot"}:
@@ -91,7 +91,7 @@ class _DefectiveAgentRequestHandler(BaseHTTPRequestHandler):
             self._send_json(
                 HTTPStatus.OK,
                 {
-                    "sandbox_id": self.sandbox_id,
+                    "environment_id": self.environment_id,
                     "case_id": _case_id_from_request(request),
                     "generation": generation,
                     "clean": True,
@@ -106,7 +106,7 @@ class _DefectiveAgentRequestHandler(BaseHTTPRequestHandler):
                 return
             self._send_json(
                 HTTPStatus.OK,
-                {"sandbox_id": self.sandbox_id, "case_id": _case_id_from_request(request)},
+                {"environment_id": self.environment_id, "case_id": _case_id_from_request(request)},
             )
             return
         if self.path == "/snapshot":
@@ -118,7 +118,7 @@ class _DefectiveAgentRequestHandler(BaseHTTPRequestHandler):
             self._send_json(
                 HTTPStatus.OK,
                 {
-                    "sandbox_id": self.sandbox_id,
+                    "environment_id": self.environment_id,
                     "case_id": _case_id_from_request(request),
                     "turn_id": _turn_id_from_request(request),
                     "state": committed_action,
@@ -145,7 +145,7 @@ class _DefectiveAgentRequestHandler(BaseHTTPRequestHandler):
         self._send_json(
             HTTPStatus.OK,
             {
-                "sandbox_id": self.sandbox_id,
+                "environment_id": self.environment_id,
                 "case_id": case_id,
                 "turn_id": turn_id,
                 "result": action,
@@ -182,7 +182,7 @@ def _validated_message(request: object) -> tuple[str, str, str]:
     if set(nested_request) != {"message"}:
         raise ValueError("invalid request shape")
     if type(settings_object) is not dict or cast(dict[str, object], settings_object) != {
-        "mode": "sandbox"
+        "mode": "environment"
     }:
         raise ValueError("invalid settings")
     message = nested_request["message"]

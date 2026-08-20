@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Literal, Self, cast
 
 from pydantic import ConfigDict, Field, JsonValue, ValidationError, field_validator, model_validator
-from ul_core.contracts import SandboxExecutor
+from ul_core.contracts import EnvironmentExecutor
 from ul_core.dataset import ObservedAgentOutput
 from ul_core.evaluation import EvaluationCase, ExecutionEvidence, StateObservationAuthority
 from ul_core.models import ULModel
@@ -29,13 +29,13 @@ from ul.dataset_invariants import (
     ObservationAuthority,
     evaluate_dataset_invariant_rules,
 )
-from ul.http_sandbox import JsonHttpSandboxConfig, json_http_sandbox_config_sha256
-from ul.sandbox import (
+from ul.environment import (
     evaluation_case_from_inputs,
     execution_evidence_requires_quarantine,
     observed_outputs_from_evidence,
     validate_execution_evidence,
 )
+from ul.http_environment import JsonHttpEnvironmentConfig, json_http_environment_config_sha256
 
 _MAXIMUM_CASE_BYTES = 1_000_000
 _MAXIMUM_JSON_DEPTH = 100
@@ -77,7 +77,7 @@ class DatasetRegressionVariation(_StrictModel):
 
 class DatasetRegressionTargetSnapshot(_StrictModel):
     provenance: Literal["declared_at_case_creation"]
-    config: JsonHttpSandboxConfig
+    config: JsonHttpEnvironmentConfig
     config_sha256: str = Field(pattern=_SHA256_PATTERN)
 
     @model_validator(mode="after")
@@ -121,7 +121,7 @@ class DatasetRegressionInvariantSuite(_StrictModel):
 
 
 class DatasetRegressionCase(_StrictModel):
-    schema_version: Literal["1.0.0", "1.1.0", "1.2.0"]
+    schema_version: Literal["1.0.0", "1.1.0", "1.2.0", "1.3.0"]
     case_id: str = Field(pattern=_CASE_ID_PATTERN)
     lineage: DatasetRegressionLineage
     variation: DatasetRegressionVariation
@@ -135,7 +135,7 @@ class DatasetRegressionCase(_StrictModel):
             not isinstance(rule, JsonValuesEqualInvariant) for rule in self.invariant_suite.rules
         ):
             raise ValueError("regression schema 1.0.0 supports only json_values_equal rules")
-        if self.schema_version != "1.2.0" and any(
+        if self.schema_version not in {"1.2.0", "1.3.0"} and any(
             rule.type in _TRANSITION_RULE_TYPES for rule in self.invariant_suite.rules
         ):
             raise ValueError("state-transition regression rules require schema 1.2.0")
@@ -168,7 +168,7 @@ class DatasetRegressionExecution(_StrictModel):
 
 
 class DatasetRegressionResult(_StrictModel):
-    schema_version: Literal["1.0.0", "1.1.0", "1.2.0"] = "1.0.0"
+    schema_version: Literal["1.0.0", "1.1.0", "1.2.0", "1.3.0"] = "1.3.0"
     case_id: str = Field(pattern=_CASE_ID_PATTERN)
     target_config_sha256: str = Field(pattern=_SHA256_PATTERN)
     source_suite_sha256: str = Field(pattern=_SHA256_PATTERN)
@@ -184,7 +184,7 @@ class DatasetRegressionResult(_StrictModel):
             not isinstance(rule, DatasetInvariantRuleEvaluation) for rule in self.rules
         ):
             raise ValueError("regression result schema 1.0.0 supports only json_values_equal rules")
-        if self.schema_version != "1.2.0" and any(
+        if self.schema_version not in {"1.2.0", "1.3.0"} and any(
             isinstance(rule, DatasetInvariantTransitionRuleEvaluation) for rule in self.rules
         ):
             raise ValueError("state-transition regression results require schema 1.2.0")
@@ -196,7 +196,7 @@ class DatasetRegressionResult(_StrictModel):
             raise ValueError("regression executions must include every requested repetition")
         if any(
             execution.execution_evidence is not None
-            and execution.execution_evidence.sandbox_config_sha256 != self.target_config_sha256
+            and execution.execution_evidence.environment_config_sha256 != self.target_config_sha256
             for execution in self.executions
         ):
             raise ValueError("regression execution evidence must match the result config digest")
@@ -226,7 +226,7 @@ class DatasetRegressionRunCaseResult(_StrictModel):
 
 
 class DatasetRegressionRunResult(_StrictModel):
-    schema_version: Literal["1.0.0", "1.1.0", "1.2.0"] = "1.0.0"
+    schema_version: Literal["1.0.0", "1.1.0", "1.2.0", "1.3.0"] = "1.3.0"
     started_at: datetime
     completed_at: datetime
     target_config_sha256: str = Field(pattern=_SHA256_PATTERN)
@@ -244,9 +244,13 @@ class DatasetRegressionRunResult(_StrictModel):
         ):
             raise ValueError("regression run schema 1.0.0 only supports result schema 1.0.0")
         if self.schema_version == "1.1.0" and any(
-            case.result.schema_version == "1.2.0" for case in self.cases
+            case.result.schema_version in {"1.2.0", "1.3.0"} for case in self.cases
         ):
             raise ValueError("regression run schema 1.1.0 does not support result schema 1.2.0")
+        if self.schema_version == "1.2.0" and any(
+            case.result.schema_version == "1.3.0" for case in self.cases
+        ):
+            raise ValueError("regression run schema 1.2.0 does not support result schema 1.3.0")
         for timestamp in (self.started_at, self.completed_at):
             if timestamp.tzinfo is None or timestamp.utcoffset() != UTC.utcoffset(None):
                 raise ValueError("regression run timestamps must use UTC")
@@ -266,7 +270,9 @@ class DatasetRegressionRunResult(_StrictModel):
             case.result.requested_repetitions * case.result.target_calls_per_execution
             for case in self.cases
         ):
-            raise ValueError("requested sandbox API calls must match regression result repetitions")
+            raise ValueError(
+                "requested environment API calls must match regression result repetitions"
+            )
         expected_counts = {
             status: sum(case.result.status == status for case in self.cases)
             for status in ("passed", "failed", "inconclusive")
@@ -299,7 +305,7 @@ def create_dataset_regression_case(
     operator_version: str,
     original_input: str,
     variation_input: str,
-    target_config: JsonHttpSandboxConfig,
+    target_config: JsonHttpEnvironmentConfig,
     source_suite_sha256: str,
     observation_authority: ObservationAuthority,
     state_observation_authority: StateObservationAuthority | None,
@@ -332,12 +338,7 @@ def create_dataset_regression_case(
         state_observer_id=state_observer_id,
         rules=selected_rules,
     )
-    if any(rule.type in _TRANSITION_RULE_TYPES for rule in selected_rules):
-        schema_version: Literal["1.0.0", "1.1.0", "1.2.0"] = "1.2.0"
-    elif all(isinstance(rule, JsonValuesEqualInvariant) for rule in selected_rules):
-        schema_version = "1.0.0"
-    else:
-        schema_version = "1.1.0"
+    schema_version: Literal["1.0.0", "1.1.0", "1.2.0", "1.3.0"] = "1.3.0"
     serialized_content = cast(
         dict[str, JsonValue],
         {
@@ -360,8 +361,8 @@ def create_dataset_regression_case(
     )
 
 
-def dataset_regression_target_config_sha256(config: JsonHttpSandboxConfig) -> str:
-    return json_http_sandbox_config_sha256(config)
+def dataset_regression_target_config_sha256(config: JsonHttpEnvironmentConfig) -> str:
+    return json_http_environment_config_sha256(config)
 
 
 def load_dataset_regression_case(path: str | Path) -> DatasetRegressionCase:
@@ -396,14 +397,14 @@ def load_dataset_regression_case(path: str | Path) -> DatasetRegressionCase:
 
 async def replay_dataset_regression(
     case: DatasetRegressionCase,
-    sandbox: SandboxExecutor,
+    environment: EnvironmentExecutor,
     *,
     target_timeout_seconds: float = 30,
     allow_network_egress: bool = False,
     max_target_calls: int = 100,
 ) -> DatasetRegressionResult:
     if not allow_network_egress:
-        raise ValueError("regression sandbox API access requires explicit network opt-in")
+        raise ValueError("regression environment API access requires explicit network opt-in")
     if isinstance(max_target_calls, bool) or max_target_calls < 1:
         raise ValueError("max_target_calls must be a positive integer")
     if not math.isfinite(target_timeout_seconds) or target_timeout_seconds <= 0:
@@ -411,23 +412,23 @@ async def replay_dataset_regression(
     evaluation_case = _regression_evaluation_case(
         case,
         repetition=1,
-        max_sandbox_api_calls=max_target_calls,
+        max_environment_api_calls=max_target_calls,
         timeout_seconds=target_timeout_seconds,
     )
-    target_calls_per_execution = sandbox.api_calls_for_case(evaluation_case)
+    target_calls_per_execution = environment.api_calls_for_case(evaluation_case)
     required_target_calls = case.discovery_repetitions * target_calls_per_execution
     if required_target_calls > max_target_calls:
         raise ValueError("regression case exceeds the authorized target call budget")
-    if not sandbox.capabilities.supports_state_observation and (
+    if not environment.capabilities.supports_state_observation and (
         case.invariant_suite.observation_authority == "committed_state_snapshot"
     ):
-        raise ValueError("sandbox must support state observation for committed-state checks")
+        raise ValueError("environment must support state observation for committed-state checks")
     if case.invariant_suite.state_observation_authority is not None and (
         case.invariant_suite.state_observation_authority
-        != sandbox.capabilities.state_observation_authority
-        or case.invariant_suite.state_observer_id != sandbox.capabilities.state_observer_id
+        != environment.capabilities.state_observation_authority
+        or case.invariant_suite.state_observer_id != environment.capabilities.state_observer_id
     ):
-        raise ValueError("sandbox state authority does not match the regression case")
+        raise ValueError("environment state authority does not match the regression case")
 
     executions: list[DatasetRegressionExecution] = []
     target_state_uncertain = False
@@ -444,14 +445,14 @@ async def replay_dataset_regression(
             evaluation_case = _regression_evaluation_case(
                 case,
                 repetition=repetition,
-                max_sandbox_api_calls=target_calls_per_execution,
+                max_environment_api_calls=target_calls_per_execution,
                 timeout_seconds=target_timeout_seconds,
             )
             async with asyncio.timeout(target_timeout_seconds):
-                execution_evidence = await sandbox.execute(evaluation_case)
-                validate_execution_evidence(evaluation_case, sandbox, execution_evidence)
+                execution_evidence = await environment.execute(evaluation_case)
+                validate_execution_evidence(evaluation_case, environment, execution_evidence)
         except TimeoutError:
-            if sandbox.capabilities.cancellation_guarantee != "guaranteed":
+            if environment.capabilities.cancellation_guarantee != "guaranteed":
                 target_state_uncertain = True
             executions.append(
                 DatasetRegressionExecution(
@@ -475,7 +476,7 @@ async def replay_dataset_regression(
                         repetition=repetition,
                         status=(
                             "target_state_uncertain"
-                            if lifecycle.sandbox_state_uncertain
+                            if lifecycle.environment_state_uncertain
                             else (
                                 "target_execution_timed_out"
                                 if lifecycle.terminal_status == "timed_out"
@@ -487,14 +488,14 @@ async def replay_dataset_regression(
                             failed_phase=lifecycle.failed_phase or "unknown",
                             completed_phases=lifecycle.completed_phases,
                             cleanup_reset_failed=lifecycle.cleanup == "failed",
-                            sandbox_state_may_remain=lifecycle.sandbox_state_uncertain,
+                            environment_state_may_remain=lifecycle.environment_state_uncertain,
                         ),
                     )
                 )
                 continue
             observed_outputs = observed_outputs_from_evidence(execution_evidence)
             if len(observed_outputs) != 1:
-                raise RuntimeError("sandbox returned invalid regression execution evidence")
+                raise RuntimeError("environment returned invalid regression execution evidence")
             executions.append(
                 DatasetRegressionExecution(
                     repetition=repetition,
@@ -539,7 +540,7 @@ def _build_dataset_regression_result(
 
 async def run_dataset_regressions(
     cases: tuple[DatasetRegressionCase, ...],
-    sandbox: SandboxExecutor,
+    environment: EnvironmentExecutor,
     *,
     case_labels: tuple[str, ...] | None = None,
     target_timeout_seconds: float = 30,
@@ -547,7 +548,7 @@ async def run_dataset_regressions(
     max_target_calls: int = 100,
 ) -> DatasetRegressionRunResult:
     if not allow_network_egress:
-        raise ValueError("regression sandbox API access requires explicit network opt-in")
+        raise ValueError("regression environment API access requires explicit network opt-in")
     if not cases:
         raise ValueError("regression run requires at least one case")
     if len(cases) > 100:
@@ -570,11 +571,11 @@ async def run_dataset_regressions(
     if not math.isfinite(target_timeout_seconds) or target_timeout_seconds <= 0:
         raise ValueError("target_timeout_seconds must be positive and finite")
     target_calls_per_case = tuple(
-        sandbox.api_calls_for_case(
+        environment.api_calls_for_case(
             _regression_evaluation_case(
                 case,
                 repetition=1,
-                max_sandbox_api_calls=max_target_calls,
+                max_environment_api_calls=max_target_calls,
                 timeout_seconds=target_timeout_seconds,
             )
         )
@@ -589,9 +590,9 @@ async def run_dataset_regressions(
 
     started_at = datetime.now(UTC)
     result_list: list[DatasetRegressionResult] = []
-    sandbox_state_uncertain = False
+    environment_state_uncertain = False
     for case, target_calls_per_execution in zip(cases, target_calls_per_case, strict=True):
-        if sandbox_state_uncertain:
+        if environment_state_uncertain:
             result_list.append(
                 _build_dataset_regression_result(
                     case,
@@ -608,13 +609,13 @@ async def run_dataset_regressions(
             continue
         result = await replay_dataset_regression(
             case,
-            sandbox,
+            environment,
             target_timeout_seconds=target_timeout_seconds,
             allow_network_egress=allow_network_egress,
             max_target_calls=case.discovery_repetitions * target_calls_per_execution,
         )
         result_list.append(result)
-        sandbox_state_uncertain = any(
+        environment_state_uncertain = any(
             execution.status == "target_state_uncertain"
             or (
                 execution.execution_evidence is not None
@@ -636,7 +637,9 @@ async def run_dataset_regressions(
         status = "passed"
     return DatasetRegressionRunResult(
         schema_version=(
-            "1.2.0"
+            "1.3.0"
+            if any(result.schema_version == "1.3.0" for result in results)
+            else "1.2.0"
             if any(result.schema_version == "1.2.0" for result in results)
             else "1.1.0"
             if any(result.schema_version == "1.1.0" for result in results)
@@ -661,13 +664,13 @@ def _regression_evaluation_case(
     case: DatasetRegressionCase,
     *,
     repetition: int,
-    max_sandbox_api_calls: int,
+    max_environment_api_calls: int,
     timeout_seconds: float,
 ) -> EvaluationCase:
     return evaluation_case_from_inputs(
         case_id=f"ul-case-{secrets.token_hex(16)}",
         raw_inputs=(case.variation.variation_input,),
-        max_sandbox_api_calls=max_sandbox_api_calls,
+        max_environment_api_calls=max_environment_api_calls,
         timeout_seconds=timeout_seconds,
         required_state_observation_authority=(case.invariant_suite.state_observation_authority),
         required_state_observer_id=case.invariant_suite.state_observer_id,

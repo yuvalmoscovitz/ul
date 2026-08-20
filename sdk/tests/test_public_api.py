@@ -17,8 +17,8 @@ from ul import (
     ExecutionResult,
     ExecutionStatus,
     InteractionRecord,
-    JsonHttpSandboxConfig,
-    JsonHttpSandboxConnection,
+    JsonHttpEnvironmentConfig,
+    JsonHttpEnvironmentConnection,
     JsonValuesEqualInvariant,
     LocalPseudonymStore,
     ObservedAgentOutput,
@@ -48,7 +48,7 @@ from ul import (
     load_dataset_invariant_suite,
     load_dataset_regression_case,
     load_dataset_semantic_settings,
-    load_json_http_sandbox_config,
+    load_json_http_environment_config,
     load_redaction_policy,
     replay_dataset_regression,
 )
@@ -109,11 +109,11 @@ def test_sdk_exposes_dataset_augmentation_api() -> None:
     assert DatasetInvariantTrialEvaluation.__name__ == "DatasetInvariantTrialEvaluation"
     assert DatasetRegressionCase.__name__ == "DatasetRegressionCase"
     assert DatasetRegressionResult.__name__ == "DatasetRegressionResult"
-    assert JsonHttpSandboxConnection.__name__ == "JsonHttpSandboxConnection"
-    assert JsonHttpSandboxConfig.__name__ == "JsonHttpSandboxConfig"
+    assert JsonHttpEnvironmentConnection.__name__ == "JsonHttpEnvironmentConnection"
+    assert JsonHttpEnvironmentConfig.__name__ == "JsonHttpEnvironmentConfig"
     assert JsonValuesEqualInvariant.__name__ == "JsonValuesEqualInvariant"
     assert LocalPseudonymStore.__name__ == "LocalPseudonymStore"
-    assert load_json_http_sandbox_config.__name__ == ("load_json_http_sandbox_config")
+    assert load_json_http_environment_config.__name__ == ("load_json_http_environment_config")
     assert load_redaction_policy.__name__ == "load_redaction_policy"
     assert evaluate_dataset_invariants.__name__ == "evaluate_dataset_invariants"
     assert create_dataset_regression_case.__name__ == "create_dataset_regression_case"

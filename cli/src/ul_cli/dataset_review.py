@@ -43,7 +43,7 @@ from ul.dataset_invariants import (
     evaluate_dataset_invariants,
 )
 from ul.dataset_regression import dataset_regression_target_config_sha256
-from ul.http_sandbox import JsonHttpSandboxConfig
+from ul.http_environment import JsonHttpEnvironmentConfig
 
 if sys.platform == "win32":
     import msvcrt
@@ -59,7 +59,7 @@ _MAXIMUM_SENSITIVE_DISCLOSURE_LINES = 50
 _SHA256_PATTERN = r"^[0-9a-f]{64}$"
 _FINDING_ID_PATTERN = r"^ulf_v1_[0-9a-f]{64}$"
 _REVIEW_ID_PATTERN = r"^ulr_[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
-_DATASET_EVALUATION_PIPELINE_VERSION = "1.1.0"
+_DATASET_EVALUATION_PIPELINE_VERSION = "1.2.0"
 
 ReviewStatus = Literal["confirmed", "expected", "unsupported", "inconclusive"]
 ReviewSeverity = Literal["unrated", "low", "medium", "high", "critical"]
@@ -116,11 +116,11 @@ class _OutcomeGroup(_StrictModel):
 
 
 class _LifecycleFailure(_StrictModel):
-    protocol_version: Literal[4]
+    protocol_version: Literal[5]
     failed_phase: str
     completed_phases: list[str]
     cleanup_reset_failed: bool
-    sandbox_state_may_remain: bool
+    environment_state_may_remain: bool
 
 
 class _Trial(_StrictModel):
@@ -172,8 +172,8 @@ class DatasetEvidenceRedactionCoverage(_StrictModel):
 
 
 class DatasetEvidenceTarget(_StrictModel):
-    kind: Literal["sandbox_http"]
-    config: JsonHttpSandboxConfig
+    kind: Literal["environment_http"]
+    config: JsonHttpEnvironmentConfig
     sha256: str = Field(pattern=_SHA256_PATTERN)
 
     @model_validator(mode="after")
@@ -185,8 +185,8 @@ class DatasetEvidenceTarget(_StrictModel):
 
 
 class DatasetEvidenceRunContext(_StrictModel):
-    schema_version: Literal["1.0.0"] = "1.0.0"
-    pipeline_version: Literal["1.1.0"] = _DATASET_EVALUATION_PIPELINE_VERSION
+    schema_version: Literal["1.1.0"] = "1.1.0"
+    pipeline_version: Literal["1.2.0"] = _DATASET_EVALUATION_PIPELINE_VERSION
     selected_dataset_sha256: str = Field(pattern=_SHA256_PATTERN)
     operators: tuple[DatasetEvidenceOperator, ...] = Field(min_length=1)
     repetitions: int = Field(ge=1)
@@ -229,7 +229,7 @@ class _Case(_StrictModel):
 
 
 class _EvidenceRecord(_StrictModel):
-    schema_version: Literal["1.3.0", "1.4.0", "1.5.0", "1.6.0"]
+    schema_version: Literal["1.3.0", "1.4.0", "1.5.0", "1.6.0", "1.7.0"]
     interaction_id: str
     original_input: str
     execution_plan: _ExecutionPlan
@@ -244,9 +244,12 @@ class _EvidenceRecord(_StrictModel):
     def validate_invariant_evaluation(self) -> Self:
         if self.schema_version == "1.3.0" and "invariant_evaluation" in self.model_fields_set:
             raise ValueError("schema 1.3.0 does not include invariant evaluation")
-        if self.schema_version in {"1.5.0", "1.6.0"} and self.run_context is None:
+        if self.schema_version in {"1.5.0", "1.6.0", "1.7.0"} and self.run_context is None:
             raise ValueError(f"schema {self.schema_version} requires run context")
-        if self.schema_version not in {"1.5.0", "1.6.0"} and "run_context" in self.model_fields_set:
+        if (
+            self.schema_version not in {"1.5.0", "1.6.0", "1.7.0"}
+            and "run_context" in self.model_fields_set
+        ):
             raise ValueError("legacy evidence does not include run context")
         uses_extended_invariants = self.invariant_evaluation is not None and any(
             rule.rule_type != "json_values_equal"
@@ -256,7 +259,7 @@ class _EvidenceRecord(_StrictModel):
             )
             for rule in arm.rules
         )
-        if uses_extended_invariants != (self.schema_version == "1.6.0"):
+        if uses_extended_invariants and self.schema_version not in {"1.6.0", "1.7.0"}:
             raise ValueError("extended invariant results require evidence schema 1.6.0")
         if (
             self.invariant_evaluation is not None
@@ -281,7 +284,7 @@ def create_dataset_evidence_run_context(
     operators: tuple[tuple[str, str], ...],
     repetitions: int,
     invariant_suite_sha256: str | None,
-    target_config: JsonHttpSandboxConfig | None = None,
+    target_config: JsonHttpEnvironmentConfig | None = None,
     semantic_settings: DatasetEvidenceSemanticSettings,
     redaction_policy_sha256: str | None = None,
     redaction_coverage: tuple[DatasetEvidenceRedactionCoverage, ...] = (),
@@ -294,14 +297,14 @@ def create_dataset_evidence_run_context(
         for operator_id, version in operators
     )
     if target_config is None:
-        raise ValueError("run context requires a sandbox API connection")
+        raise ValueError("run context requires a environment API connection")
     target = DatasetEvidenceTarget(
-        kind="sandbox_http",
+        kind="environment_http",
         config=target_config,
         sha256=dataset_regression_target_config_sha256(target_config),
     )
     content = {
-        "schema_version": "1.0.0",
+        "schema_version": "1.1.0",
         "pipeline_version": _DATASET_EVALUATION_PIPELINE_VERSION,
         "selected_dataset_sha256": selected_dataset_sha256,
         "operators": [operator.model_dump(mode="json") for operator in operator_snapshots],
@@ -365,7 +368,10 @@ def validate_dataset_resume_evidence(
             evidence = _EvidenceRecord.model_validate_json(raw_line)
         except (ValidationError, ValueError):
             raise ValueError("resume evidence is not valid UL JSONL") from None
-        if evidence.schema_version not in {"1.5.0", "1.6.0"} or evidence.run_context is None:
+        if (
+            evidence.schema_version not in {"1.5.0", "1.6.0", "1.7.0"}
+            or evidence.run_context is None
+        ):
             raise ValueError(
                 "resume requires evidence created with schema 1.5.0 or 1.6.0 run "
                 "compatibility metadata"
@@ -417,7 +423,7 @@ def validate_dataset_resume_evidence(
         projected_evidence = evidence_projector(
             technical_result,
             repetitions=evidence.execution_plan.repetitions,
-            max_sandbox_api_calls=evidence.execution_plan.max_target_calls,
+            max_environment_api_calls=evidence.execution_plan.max_target_calls,
             planned_target_calls=evidence.execution_plan.dataset_planned_target_calls,
             run_context=expected_context,
             invariant_evaluation=expected_invariant_evaluation,

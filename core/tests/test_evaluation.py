@@ -3,14 +3,14 @@ from __future__ import annotations
 import pytest
 from pydantic import ValidationError
 from ul_core.evaluation import (
+    EnvironmentCapabilities,
+    EnvironmentLifecycleEvidence,
+    EnvironmentResetEvidence,
+    EnvironmentStateEvidence,
+    EnvironmentTurnEvidence,
     EvaluationCase,
     ExecutionEvidence,
     ProductionObservation,
-    SandboxCapabilities,
-    SandboxLifecycleEvidence,
-    SandboxResetEvidence,
-    SandboxStateEvidence,
-    SandboxTurnEvidence,
     TimeoutAfterCommitEventEvidence,
     TimeoutAfterCommitEventRequest,
 )
@@ -39,7 +39,7 @@ def test_evaluation_case_rejects_duplicate_turn_identifiers() -> None:
         EvaluationCase(
             id="case-1",
             turns=(_turn(), _turn()),
-            max_sandbox_api_calls=10,
+            max_environment_api_calls=10,
             timeout_seconds=30,
         )
 
@@ -50,7 +50,7 @@ def test_evaluation_case_rejects_production_routing_metadata() -> None:
             {
                 "id": "case-1",
                 "turns": [_turn().model_dump(mode="json")],
-                "max_sandbox_api_calls": 5,
+                "max_environment_api_calls": 5,
                 "timeout_seconds": 30,
                 "production_endpoint": "https://production.example/execute",
                 "production_headers": {"Authorization": "secret"},
@@ -63,7 +63,7 @@ def test_timeout_after_commit_event_must_reference_a_case_turn() -> None:
         EvaluationCase(
             id="case-1",
             turns=(_turn(),),
-            max_sandbox_api_calls=10,
+            max_environment_api_calls=10,
             timeout_seconds=30,
             timeout_after_commit_event=TimeoutAfterCommitEventRequest(
                 event_id="lost-ack",
@@ -89,22 +89,22 @@ def test_successful_execution_requires_timeout_event_cleanup() -> None:
     with pytest.raises(ValidationError, match="completed event"):
         ExecutionEvidence(
             case_id="case-1",
-            sandbox_id="invoice-sandbox",
-            sandbox_config_sha256="a" * 64,
-            initial_state=SandboxStateEvidence(
-                value={"payments": []}, authority="sandbox_self_reported"
+            environment_id="invoice-environment",
+            environment_config_sha256="a" * 64,
+            initial_state=EnvironmentStateEvidence(
+                value={"payments": []}, authority="environment_self_reported"
             ),
             turns=(
-                SandboxTurnEvidence(
+                EnvironmentTurnEvidence(
                     turn_id="turn-1",
                     response={"status": "ok"},
                     state_snapshot={"payments": ["payment-1"]},
-                    state_observation_authority="sandbox_self_reported",
+                    state_observation_authority="environment_self_reported",
                 ),
             ),
             final_response={"status": "ok"},
-            final_state=SandboxStateEvidence(
-                value={"payments": ["payment-1"]}, authority="sandbox_self_reported"
+            final_state=EnvironmentStateEvidence(
+                value={"payments": ["payment-1"]}, authority="environment_self_reported"
             ),
             timeout_after_commit_event=TimeoutAfterCommitEventEvidence(
                 event_id="lost-ack",
@@ -114,14 +114,14 @@ def test_successful_execution_requires_timeout_event_cleanup() -> None:
                 trigger_status="fired",
                 cleaned=False,
             ),
-            lifecycle=SandboxLifecycleEvidence(
-                initial_reset=SandboxResetEvidence(
+            lifecycle=EnvironmentLifecycleEvidence(
+                initial_reset=EnvironmentResetEvidence(
                     reset_session_requested=True,
                     reset_session_acknowledged=True,
                     reset_env_requested=True,
                     reset_env_acknowledged=True,
                 ),
-                cleanup_reset=SandboxResetEvidence(
+                cleanup_reset=EnvironmentResetEvidence(
                     reset_session_requested=True,
                     reset_session_acknowledged=True,
                     reset_env_requested=True,
@@ -130,14 +130,14 @@ def test_successful_execution_requires_timeout_event_cleanup() -> None:
                 terminal_status="succeeded",
                 delivery="certain",
                 cleanup="succeeded",
-                sandbox_state_uncertain=False,
+                environment_state_uncertain=False,
             ),
         )
 
 
 def test_state_evidence_requires_explicit_authority() -> None:
     with pytest.raises(ValidationError):
-        SandboxTurnEvidence(
+        EnvironmentTurnEvidence(
             turn_id="turn-1",
             response={"status": "ok"},
             state_snapshot={"payments": []},
@@ -146,7 +146,7 @@ def test_state_evidence_requires_explicit_authority() -> None:
 
 def test_independent_state_evidence_requires_observer_identity() -> None:
     with pytest.raises(ValidationError):
-        SandboxTurnEvidence(
+        EnvironmentTurnEvidence(
             turn_id="turn-1",
             response={"status": "ok"},
             state_snapshot={"payments": []},
@@ -156,21 +156,21 @@ def test_independent_state_evidence_requires_observer_identity() -> None:
 
 def test_reset_receipt_requires_explicit_factual_acknowledgements() -> None:
     with pytest.raises(ValidationError):
-        SandboxResetEvidence.model_validate(
+        EnvironmentResetEvidence.model_validate(
             {"reset_session_requested": True, "reset_env_requested": True}
         )
 
 
-def test_uncertain_delivery_requires_uncertain_sandbox_state() -> None:
+def test_uncertain_delivery_requires_uncertain_environment_state() -> None:
     with pytest.raises(ValidationError):
-        SandboxLifecycleEvidence(
-            initial_reset=SandboxResetEvidence(
+        EnvironmentLifecycleEvidence(
+            initial_reset=EnvironmentResetEvidence(
                 reset_session_requested=True,
                 reset_session_acknowledged=True,
                 reset_env_requested=True,
                 reset_env_acknowledged=True,
             ),
-            cleanup_reset=SandboxResetEvidence(
+            cleanup_reset=EnvironmentResetEvidence(
                 reset_session_requested=True,
                 reset_session_acknowledged=True,
                 reset_env_requested=True,
@@ -179,23 +179,23 @@ def test_uncertain_delivery_requires_uncertain_sandbox_state() -> None:
             terminal_status="failed",
             failed_phase="execute_turn",
             failure_code="response_timeout",
-            failure_reason="sandbox API response timed out",
+            failure_reason="environment API response timed out",
             delivery="uncertain",
             cleanup="succeeded",
-            sandbox_state_uncertain=False,
+            environment_state_uncertain=False,
         )
 
 
 def test_cleanup_failure_requires_safe_detail() -> None:
     with pytest.raises(ValidationError, match="cleanup failure detail"):
-        SandboxLifecycleEvidence(
-            initial_reset=SandboxResetEvidence(
+        EnvironmentLifecycleEvidence(
+            initial_reset=EnvironmentResetEvidence(
                 reset_session_requested=True,
                 reset_session_acknowledged=True,
                 reset_env_requested=True,
                 reset_env_acknowledged=True,
             ),
-            cleanup_reset=SandboxResetEvidence(
+            cleanup_reset=EnvironmentResetEvidence(
                 reset_session_requested=True,
                 reset_session_acknowledged=True,
                 reset_env_requested=True,
@@ -204,23 +204,23 @@ def test_cleanup_failure_requires_safe_detail() -> None:
             terminal_status="failed",
             failed_phase="cleanup_reset",
             failure_code="reset_not_clean",
-            failure_reason="sandbox API reset did not report clean state",
+            failure_reason="environment API reset did not report clean state",
             delivery="certain",
             cleanup="failed",
-            sandbox_state_uncertain=True,
+            environment_state_uncertain=True,
         )
 
 
 def test_failure_reason_requires_stable_code() -> None:
     with pytest.raises(ValidationError, match="failure code and reason"):
-        SandboxLifecycleEvidence(
-            initial_reset=SandboxResetEvidence(
+        EnvironmentLifecycleEvidence(
+            initial_reset=EnvironmentResetEvidence(
                 reset_session_requested=True,
                 reset_session_acknowledged=True,
                 reset_env_requested=True,
                 reset_env_acknowledged=True,
             ),
-            cleanup_reset=SandboxResetEvidence(
+            cleanup_reset=EnvironmentResetEvidence(
                 reset_session_requested=True,
                 reset_session_acknowledged=True,
                 reset_env_requested=True,
@@ -228,23 +228,23 @@ def test_failure_reason_requires_stable_code() -> None:
             ),
             terminal_status="failed",
             failed_phase="execute_turn",
-            failure_reason="sandbox lifecycle failed",
+            failure_reason="environment lifecycle failed",
             delivery="certain",
             cleanup="succeeded",
-            sandbox_state_uncertain=False,
+            environment_state_uncertain=False,
         )
 
 
 def test_cleanup_failure_reason_requires_stable_code() -> None:
     with pytest.raises(ValidationError, match="cleanup failure code and reason"):
-        SandboxLifecycleEvidence(
-            initial_reset=SandboxResetEvidence(
+        EnvironmentLifecycleEvidence(
+            initial_reset=EnvironmentResetEvidence(
                 reset_session_requested=True,
                 reset_session_acknowledged=True,
                 reset_env_requested=True,
                 reset_env_acknowledged=True,
             ),
-            cleanup_reset=SandboxResetEvidence(
+            cleanup_reset=EnvironmentResetEvidence(
                 reset_session_requested=True,
                 reset_session_acknowledged=True,
                 reset_env_requested=True,
@@ -253,40 +253,42 @@ def test_cleanup_failure_reason_requires_stable_code() -> None:
             terminal_status="failed",
             failed_phase="cleanup_reset",
             failure_code="reset_not_clean",
-            failure_reason="sandbox API reset did not report clean state",
+            failure_reason="environment API reset did not report clean state",
             delivery="certain",
             cleanup="failed",
-            cleanup_failure_reason="sandbox API reset did not report clean state",
-            sandbox_state_uncertain=True,
+            cleanup_failure_reason="environment API reset did not report clean state",
+            environment_state_uncertain=True,
         )
 
 
 def test_successful_execution_evidence_is_explicit() -> None:
     evidence = ExecutionEvidence(
         case_id="case-1",
-        sandbox_id="invoice-sandbox",
-        sandbox_config_sha256="a" * 64,
-        initial_state=SandboxStateEvidence(
-            value={"clean": True}, authority="sandbox_self_reported"
+        environment_id="invoice-environment",
+        environment_config_sha256="a" * 64,
+        initial_state=EnvironmentStateEvidence(
+            value={"clean": True}, authority="environment_self_reported"
         ),
         turns=(
-            SandboxTurnEvidence(
+            EnvironmentTurnEvidence(
                 turn_id="turn-1",
                 response={"status": "ok"},
                 state_snapshot={"payments": []},
-                state_observation_authority="sandbox_self_reported",
+                state_observation_authority="environment_self_reported",
             ),
         ),
         final_response={"status": "ok"},
-        final_state=SandboxStateEvidence(value={"payments": []}, authority="sandbox_self_reported"),
-        lifecycle=SandboxLifecycleEvidence(
-            initial_reset=SandboxResetEvidence(
+        final_state=EnvironmentStateEvidence(
+            value={"payments": []}, authority="environment_self_reported"
+        ),
+        lifecycle=EnvironmentLifecycleEvidence(
+            initial_reset=EnvironmentResetEvidence(
                 reset_session_requested=True,
                 reset_session_acknowledged=True,
                 reset_env_requested=True,
                 reset_env_acknowledged=True,
             ),
-            cleanup_reset=SandboxResetEvidence(
+            cleanup_reset=EnvironmentResetEvidence(
                 reset_session_requested=True,
                 reset_session_acknowledged=True,
                 reset_env_requested=True,
@@ -296,16 +298,16 @@ def test_successful_execution_evidence_is_explicit() -> None:
             completed_phases=("reset", "execute_turn", "snapshot", "cleanup_reset"),
             delivery="certain",
             cleanup="succeeded",
-            sandbox_state_uncertain=False,
+            environment_state_uncertain=False,
         ),
     )
 
-    assert evidence.turns[0].state_observation_authority == "sandbox_self_reported"
+    assert evidence.turns[0].state_observation_authority == "environment_self_reported"
 
 
-def test_sandbox_capabilities_bind_state_authority() -> None:
+def test_environment_capabilities_bind_state_authority() -> None:
     with pytest.raises(ValidationError):
-        SandboxCapabilities(
+        EnvironmentCapabilities(
             supports_conversations=True,
             supports_state_observation=True,
             cancellation_guarantee="best_effort",
