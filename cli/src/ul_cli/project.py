@@ -28,8 +28,9 @@ from ul_cli.dataset import (
     validate_dataset_operator_ids,
     validate_interaction_dataset,
 )
-from ul_cli.dataset_review import is_reportable_dataset_evidence, report_dataset_evidence
+from ul_cli.dataset_review import is_reportable_dataset_evidence
 from ul_cli.environment import TEST_ENVIRONMENT_CONFIRMATION_MESSAGE
+from ul_cli.report import report_evidence
 
 console = Console()
 
@@ -434,14 +435,17 @@ def report_project(
             exists=True,
             dir_okay=False,
             readable=True,
-            help="Evidence JSONL; defaults to the latest ul run with evidence.",
+            help="UL evidence; defaults to the latest ul run with evidence.",
         ),
     ] = None,
     reviews: Annotated[Path | None, typer.Option(help="Review JSONL sidecar.")] = None,
     show_sensitive_values: Annotated[bool, typer.Option()] = False,
     finding: Annotated[str | None, typer.Option("--finding")] = None,
+    json_output: Annotated[
+        bool, typer.Option("--json", help="Emit stable non-sensitive JSON.")
+    ] = False,
 ) -> None:
-    """Report findings from an explicit or latest run with evidence."""
+    """Report findings from supported explicit or latest run evidence."""
     selected_evidence = evidence
     if selected_evidence is None:
         project_root, _ = _load_project()
@@ -451,11 +455,12 @@ def report_project(
             raise typer.BadParameter(
                 "no run evidence found; run 'ul run' first or pass EVIDENCE"
             ) from error
-    report_dataset_evidence(
-        evidence=selected_evidence,
+    report_evidence(
+        selected_evidence,
         reviews=reviews,
         show_sensitive_values=show_sensitive_values,
-        sensitive_finding_id=finding,
+        finding=finding,
+        json_output=json_output,
     )
 
 

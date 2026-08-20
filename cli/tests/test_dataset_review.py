@@ -368,6 +368,117 @@ def test_report_review_report_journey_preserves_evidence_and_history(tmp_path: P
     assert "history: 2" in final_report.output
 
 
+def test_root_json_report_is_stable_and_omits_private_dataset_fields(tmp_path: Path) -> None:
+    evidence = tmp_path / "evidence.jsonl"
+    _write_evidence(evidence)
+
+    report = runner.invoke(app, ["report", str(evidence), "--json"])
+
+    assert report.exit_code == 1, report.output
+    expected = {
+        "schema_version": "1.0.0",
+        "evidence_type": "dataset_evaluation",
+        "evidence_schema_versions": ["1.3.0"],
+        "status": "failed",
+        "exit_code": 1,
+        "finding_count": 1,
+        "findings": [
+            {
+                "finding_id": FINDING_ID,
+                "kind": "behavior_difference",
+                "category": "changed_grounded_effect_argument",
+                "operator_id": "input.surface.disfluency_repeat",
+                "operator_version": "1.0.0",
+                "rule_id": None,
+                "rule_version": None,
+                "declared_severity": None,
+                "review_status": "needs_review",
+                "review_severity": "unrated",
+                "summary": "The variation changed a grounded action argument.",
+            }
+        ],
+    }
+    assert json.loads(report.output) == expected
+    assert (
+        report.output == json.dumps(expected, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+    )
+    assert "Pay AC-100" not in report.output
+    assert "Pay pay AC-100" not in report.output
+    assert "AC-101" not in report.output
+    assert "technical_details" not in report.output
+
+
+def test_root_report_treats_unstable_variation_as_exit_one_finding(tmp_path: Path) -> None:
+    evidence = tmp_path / "unstable.jsonl"
+    record = _evidence_record()
+    case = record["cases"][0]
+    case["findings"] = []
+    case["status"] = "UNSTABLE VARIATION — REVIEW"
+    observations = case["observations"]
+    observations["stability"] = "unstable"
+    observations["outcome_group_count"] = 2
+    observations["outcome_groups"] = [
+        {
+            "repetitions": [1, 2],
+            "count": 2,
+            "representative_effects": [_effect("AC-100")],
+        },
+        {
+            "repetitions": [3],
+            "count": 1,
+            "representative_effects": [_effect("AC-101")],
+        },
+    ]
+    _write_evidence(evidence, [record])
+
+    report = runner.invoke(app, ["report", str(evidence), "--json"])
+
+    assert report.exit_code == 1, report.output
+    payload = json.loads(report.output)
+    assert payload["status"] == "failed"
+    assert payload["finding_count"] == 1
+    assert payload["findings"][0]["category"] == "unstable_behavior"
+    assert payload["findings"][0]["summary"] == (
+        "The variation produced unstable behavior across repetitions."
+    )
+
+
+def test_root_report_maps_incomplete_dataset_evidence_to_exit_two(tmp_path: Path) -> None:
+    evidence = tmp_path / "inconclusive.jsonl"
+    record = _evidence_record()
+    case = record["cases"][0]
+    case["findings"] = []
+    case["status"] = "COULDN'T DETERMINE"
+    case["inconclusive_reasons"] = ["variation execution failed"]
+    observations = case["observations"]
+    observations.update(
+        {
+            "stability": "inconclusive",
+            "observed_repetitions": 0,
+            "inconclusive_repetitions": 3,
+            "outcome_group_count": 0,
+            "outcome_groups": [],
+            "trials": [
+                {
+                    "repetition": repetition,
+                    "status": "inconclusive",
+                    "inconclusive_reasons": ["variation execution failed"],
+                }
+                for repetition in (1, 2, 3)
+            ],
+        }
+    )
+    _write_evidence(evidence, [record])
+
+    report = runner.invoke(app, ["report", str(evidence), "--json"])
+
+    assert report.exit_code == 2, report.output
+    payload = json.loads(report.output)
+    assert payload["status"] == "inconclusive"
+    assert payload["exit_code"] == 2
+    assert payload["findings"] == []
+
+
 def test_report_schema_1_4_shows_customer_invariants_separately(tmp_path: Path) -> None:
     evidence = tmp_path / "evidence.jsonl"
     record = _evidence_record()

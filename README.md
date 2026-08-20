@@ -101,6 +101,7 @@ deterministic reset, and preventing real business effects.
 
 ```bash
 ul report
+ul report PRIVATE_EVIDENCE.json --json
 
 ul dataset review .ul/runs/EVIDENCE.jsonl FINDING_ID \
   --status confirmed \
@@ -108,6 +109,11 @@ ul dataset review .ul/runs/EVIDENCE.jsonl FINDING_ID \
   --reviewer payments-risk \
   --reason "The variation committed payment for the wrong invoice."
 ```
+
+With an explicit evidence path, `ul report` auto-detects dataset evaluation, correction,
+retry-after-successful-commit, and timeout-after-commit evidence. Its default human summary and
+versioned JSON omit inputs, responses, state, customer descriptions, and arbitrary evidence text.
+Use `ul dataset report EVIDENCE.jsonl` when you need the detailed private dataset review surface.
 
 Reviews are appended to a separate audit file. Evidence is never rewritten. Exit codes are:
 

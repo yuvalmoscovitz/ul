@@ -598,10 +598,11 @@ def test_report_uses_latest_evidence_and_explicit_path_wins(
     explicit.write_text("{}\n", encoding="utf-8")
     reported: list[Path] = []
 
-    def fake_report_dataset_evidence(**arguments: Any) -> None:
-        reported.append(arguments["evidence"])
+    def fake_report_evidence(evidence: Path, **arguments: Any) -> None:
+        del arguments
+        reported.append(evidence)
 
-    monkeypatch.setattr(project, "report_dataset_evidence", fake_report_dataset_evidence)
+    monkeypatch.setattr(project, "report_evidence", fake_report_evidence)
 
     latest_result = runner.invoke(app, ["report"])
     explicit_result = runner.invoke(app, ["report", str(explicit)])
@@ -621,6 +622,51 @@ def test_report_without_run_evidence_is_actionable(
 
     assert result.exit_code == 2
     assert "no run evidence found" in result.output
+
+
+def test_report_rejects_invalid_stateful_evidence_without_disclosing_values(
+    tmp_path: Path,
+) -> None:
+    private_value = "private-stateful-evidence-value"
+    evidence = tmp_path / "invalid-stateful.json"
+    _write_private_file(
+        evidence,
+        json.dumps(
+            {
+                "schema_version": "1.1.0",
+                "case": {
+                    "operator_id": "conversation.correction_after_first_response",
+                    "private": private_value,
+                },
+            }
+        ),
+    )
+
+    result = runner.invoke(
+        app,
+        ["report", str(evidence), "--json"],
+        terminal_width=200,
+    )
+
+    assert result.exit_code == 2
+    assert "unsupported evidence" in result.output
+    assert "retry, or timeout" in result.output
+    assert private_value not in result.output
+
+
+def test_report_rejects_symlinked_stateful_evidence(tmp_path: Path) -> None:
+    target = tmp_path / "evidence.json"
+    _write_private_file(target, "{}")
+    evidence = tmp_path / "evidence-link.json"
+    try:
+        evidence.symlink_to(target)
+    except OSError:
+        pytest.skip("symbolic links are unavailable")
+
+    result = runner.invoke(app, ["report", str(evidence), "--json"])
+
+    assert result.exit_code == 2
+    assert "cannot safely read evidence" in result.output
 
 
 def test_malformed_or_unknown_project_config_is_rejected(

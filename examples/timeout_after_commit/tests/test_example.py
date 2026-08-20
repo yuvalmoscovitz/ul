@@ -67,6 +67,13 @@ def test_runnable_timeout_after_commit_variants(
         "not_evaluable" if not fire_event else "satisfied" if retry_mode == "safe" else "violated"
     )
     assert evidence["invariant_rules"][0]["status"] == expected_rule_status
+    report = CliRunner().invoke(app, ["report", str(evidence_path), "--json"])
+    assert report.exit_code == expected_exit, report.output
+    report_payload = json.loads(report.output)
+    assert report_payload["evidence_type"] == "timeout_after_commit"
+    assert report_payload["status"] == expected_status
+    assert report_payload["finding_count"] == (1 if expected_exit == 1 else 0)
+    assert "Payment workflow completed" not in report.output
 
 
 def test_unsupported_capability_fails_preflight_without_a_request(tmp_path: Path) -> None:
