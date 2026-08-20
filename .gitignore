@@ -4,6 +4,9 @@
 # Temporary artifacts
 /tmp/
 
+# Private UL project configuration, state, and evidence
+.ul/
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]

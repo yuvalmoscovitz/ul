@@ -825,6 +825,14 @@ def _load_evidence(path: Path) -> list[_LoadedEvidenceRecord]:
     return records
 
 
+def is_reportable_dataset_evidence(path: Path) -> bool:
+    try:
+        _load_evidence(path)
+    except _ReviewInputError:
+        return False
+    return True
+
+
 def _load_reviews(path: Path) -> list[ReviewRecord]:
     try:
         descriptor = _open_regular_file(path, os.O_RDONLY)
