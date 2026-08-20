@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import stat
+import sys
 from contextlib import suppress
 from datetime import UTC, datetime
 from pathlib import Path
@@ -12,8 +14,12 @@ from uuid import uuid4
 import typer
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 from rich.console import Console
-from ul import load_dataset_invariant_suite
-from ul.http_sandbox import load_json_http_sandbox_config
+from ul import load_dataset_invariant_suite, load_redaction_policy
+from ul.http_sandbox import (
+    JsonHttpSandboxConfig,
+    json_http_sandbox_origin,
+    load_json_http_sandbox_config,
+)
 
 from ul_cli.dataset import (
     evaluate_dataset,
@@ -39,11 +45,15 @@ class ProjectConfig(_StrictModel):
     schema_version: Literal[1] = 1
     dataset: str = Field(min_length=1)
     sandbox_config: str = Field(min_length=1)
+    sandbox_origin: str = Field(min_length=1)
     invariants: str | None = None
+    redaction_policy: str | None = None
+    redaction_state: str | None = None
+    save_augmentations: bool = True
     operators: tuple[str, ...] = Field(default=("input.surface.rephrase",), min_length=1)
-    limit: int = Field(default=10, ge=1, le=100)
+    limit: int = Field(default=3, ge=1, le=100)
     repetitions: int = Field(default=3, ge=1)
-    max_sandbox_api_calls: int = Field(default=100, ge=1)
+    max_sandbox_api_calls: int = Field(default=120, ge=1)
     allow_sandbox_network_egress: bool
     confirm_isolated_sandbox: bool
     allow_insecure_http: bool = False
@@ -57,6 +67,7 @@ class ProjectConfig(_StrictModel):
 class ProjectState(_StrictModel):
     schema_version: Literal[1] = 1
     latest_evidence: str = Field(min_length=1)
+    latest_evidence_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
 
 
 def initialize_project(
@@ -90,13 +101,25 @@ def initialize_project(
         Path | None,
         typer.Option(exists=True, dir_okay=False, readable=True),
     ] = None,
+    redaction_policy: Annotated[
+        Path | None,
+        typer.Option(exists=True, dir_okay=False, readable=True),
+    ] = None,
+    redaction_state: Annotated[
+        Path | None,
+        typer.Option(help="Private pseudonym mapping file used with --redaction-policy."),
+    ] = None,
+    no_save_augmentations: Annotated[
+        bool,
+        typer.Option(help="Do not retain generated augmentation inputs beside run evidence."),
+    ] = False,
     operator: Annotated[
         list[str] | None,
         typer.Option("--operator", help="Augmentation ID; repeat as needed."),
     ] = None,
-    limit: Annotated[int, typer.Option(min=1, max=100)] = 10,
+    limit: Annotated[int, typer.Option(min=1, max=100)] = 3,
     repetitions: Annotated[int, typer.Option(min=1)] = 3,
-    max_sandbox_api_calls: Annotated[int, typer.Option("--max-sandbox-api-calls", min=1)] = 100,
+    max_sandbox_api_calls: Annotated[int, typer.Option("--max-sandbox-api-calls", min=1)] = 120,
     allow_sandbox_network_egress: Annotated[
         bool,
         typer.Option(
@@ -129,6 +152,10 @@ def initialize_project(
             "initialization requires --confirm-isolated-sandbox",
             param_hint="--confirm-isolated-sandbox",
         )
+    if (redaction_policy is None) != (redaction_state is None):
+        raise typer.BadParameter(
+            "--redaction-policy and --redaction-state must be configured together"
+        )
 
     project_root = Path.cwd().resolve()
     project_directory = project_root / _PROJECT_DIRECTORY
@@ -136,33 +163,53 @@ def initialize_project(
     if project_config_path.exists():
         raise typer.BadParameter(".ul/config.json already exists; UL will not overwrite it")
 
+    loaded_sandbox_config: JsonHttpSandboxConfig | None = None
     try:
         validate_interaction_dataset(dataset)
         selected_operators = validate_dataset_operator_ids(operator)
         if invariants is not None:
             load_dataset_invariant_suite(invariants)
+        if redaction_policy is not None:
+            load_redaction_policy(redaction_policy)
         if sandbox_config is not None:
-            load_json_http_sandbox_config(sandbox_config)
-    except (OSError, RuntimeError, ValidationError, ValueError) as error:
+            loaded_sandbox_config = load_json_http_sandbox_config(sandbox_config)
+    except ValidationError as error:
+        raise typer.BadParameter(_format_validation_error(error)) from None
+    except (OSError, RuntimeError, ValueError) as error:
         raise typer.BadParameter(str(error)) from None
 
     try:
         _ensure_private_directory(project_directory)
         runs_directory = project_directory / "runs"
         _ensure_private_directory(runs_directory)
+        _create_private_text(project_directory / ".gitignore", "*\n")
 
         selected_sandbox_config = sandbox_config
         if sandbox_url is not None:
             selected_sandbox_config = project_directory / "sandbox.json"
             initialize_dataset_sandbox(selected_sandbox_config, sandbox_url, show_guidance=False)
         assert selected_sandbox_config is not None
+        if loaded_sandbox_config is None:
+            loaded_sandbox_config = load_json_http_sandbox_config(selected_sandbox_config)
 
         config = ProjectConfig(
             dataset=_relative_project_path(dataset, project_root),
             sandbox_config=_relative_project_path(selected_sandbox_config, project_root),
+            sandbox_origin=json_http_sandbox_origin(loaded_sandbox_config),
             invariants=(
                 _relative_project_path(invariants, project_root) if invariants is not None else None
             ),
+            redaction_policy=(
+                _relative_project_path(redaction_policy, project_root)
+                if redaction_policy is not None
+                else None
+            ),
+            redaction_state=(
+                _relative_project_path(redaction_state, project_root)
+                if redaction_state is not None
+                else None
+            ),
+            save_augmentations=not no_save_augmentations,
             operators=selected_operators,
             limit=limit,
             repetitions=repetitions,
@@ -172,7 +219,11 @@ def initialize_project(
             allow_insecure_http=allow_insecure_http,
         )
         _create_private_json(project_config_path, config.model_dump(mode="json"))
-    except (OSError, ValueError) as error:
+    except ValidationError as error:
+        raise typer.BadParameter(
+            f"cannot create UL project: {_format_validation_error(error)}"
+        ) from None
+    except (OSError, RuntimeError, ValueError) as error:
         raise typer.BadParameter(f"cannot create UL project: {error}") from None
     console.print(f"Configured UL project: {project_config_path}")
     if sandbox_url is not None:
@@ -180,6 +231,7 @@ def initialize_project(
             "Before running: review .ul/sandbox.json and match its lifecycle requests and "
             "response pointers to your sandbox API."
         )
+        console.print("Then verify it with 'ul sandbox check .ul/sandbox.json --help'.")
     console.print("Next: set semantic-provider credentials and UL_LIVE=true, then run 'ul run'.")
 
 
@@ -197,10 +249,27 @@ def run_project(
         list[str] | None,
         typer.Option("--operator", help="Override configured augmentations; repeat as needed."),
     ] = None,
+    no_save_augmentations: Annotated[
+        bool,
+        typer.Option(help="Do not retain generated augmentations for this run."),
+    ] = False,
+    resume: Annotated[
+        bool,
+        typer.Option(help="Resume the latest run with evidence instead of starting a new run."),
+    ] = False,
 ) -> None:
     """Run the configured project, with optional one-run overrides."""
     project_root, config = _load_project()
-    output = project_root / _PROJECT_DIRECTORY / "runs" / _new_evidence_name()
+    try:
+        output = (
+            _load_latest_evidence(project_root)
+            if resume
+            else project_root / _PROJECT_DIRECTORY / "runs" / _new_evidence_name()
+        )
+    except (OSError, ValueError, ValidationError):
+        raise typer.BadParameter(
+            "cannot resume: latest evidence is missing or changed; start a new run"
+        ) from None
     selected_operators = operator if operator is not None else list(config.operators)
 
     try:
@@ -209,7 +278,7 @@ def run_project(
             sandbox_config=_resolve_project_path(config.sandbox_config, project_root),
             output=output,
             augmentations_output=None,
-            no_save_augmentations=False,
+            no_save_augmentations=no_save_augmentations or not config.save_augmentations,
             invariants=(
                 _resolve_project_path(config.invariants, project_root)
                 if config.invariants is not None
@@ -227,17 +296,26 @@ def run_project(
             confirm_isolated_sandbox=config.confirm_isolated_sandbox,
             allow_insecure_http=config.allow_insecure_http,
             dry_run=dry_run,
-            resume=None,
-            redaction_policy=None,
-            redaction_state=None,
+            resume=output if resume else None,
+            redaction_policy=(
+                _resolve_project_path(config.redaction_policy, project_root)
+                if config.redaction_policy is not None
+                else None
+            ),
+            redaction_state=(
+                _resolve_project_path(config.redaction_state, project_root)
+                if config.redaction_state is not None
+                else None
+            ),
+            expected_sandbox_origin=config.sandbox_origin,
             show_report_guidance=False,
         )
     except typer.Exit as exit_error:
-        if exit_error.exit_code in {0, 1} and output.is_file():
+        if exit_error.exit_code in {0, 1, 2} and _has_nonempty_evidence(output):
             _save_latest_evidence(project_root, output)
             console.print("Next: ul report")
         raise
-    if output.is_file():
+    if _has_nonempty_evidence(output):
         _save_latest_evidence(project_root, output)
         console.print("Next: ul report")
 
@@ -249,29 +327,23 @@ def report_project(
             exists=True,
             dir_okay=False,
             readable=True,
-            help="Evidence JSONL; defaults to the latest completed ul run.",
+            help="Evidence JSONL; defaults to the latest ul run with evidence.",
         ),
     ] = None,
     reviews: Annotated[Path | None, typer.Option(help="Review JSONL sidecar.")] = None,
     show_sensitive_values: Annotated[bool, typer.Option()] = False,
     finding: Annotated[str | None, typer.Option("--finding")] = None,
 ) -> None:
-    """Report findings from an explicit or latest completed run."""
+    """Report findings from an explicit or latest run with evidence."""
     selected_evidence = evidence
     if selected_evidence is None:
         project_root, _ = _load_project()
-        state_path = project_root / _PROJECT_DIRECTORY / _PROJECT_STATE
         try:
-            state = ProjectState.model_validate(_read_private_json(state_path))
+            selected_evidence = _load_latest_evidence(project_root)
         except (OSError, ValueError, ValidationError) as error:
             raise typer.BadParameter(
-                "no completed run found; run 'ul run' first or pass EVIDENCE"
+                "no run evidence found; run 'ul run' first or pass EVIDENCE"
             ) from error
-        selected_evidence = _resolve_project_path(state.latest_evidence, project_root)
-        if not selected_evidence.is_file():
-            raise typer.BadParameter(
-                "latest evidence no longer exists; run 'ul run' or pass EVIDENCE"
-            )
     report_dataset_evidence(
         evidence=selected_evidence,
         reviews=reviews,
@@ -286,14 +358,20 @@ def _load_project() -> tuple[Path, ProjectConfig]:
         if not config_path.exists() and not config_path.is_symlink():
             continue
         try:
+            _validate_private_directory(candidate_root / _PROJECT_DIRECTORY)
+            _validate_private_directory(candidate_root / _PROJECT_DIRECTORY / "runs")
             return candidate_root, ProjectConfig.model_validate(_read_private_json(config_path))
-        except (OSError, ValueError, ValidationError) as error:
+        except ValidationError as error:
+            raise typer.BadParameter(
+                f"invalid UL project config: {_format_validation_error(error)}"
+            ) from None
+        except (OSError, ValueError) as error:
             raise typer.BadParameter(f"invalid UL project config: {error}") from None
     raise typer.BadParameter("no UL project found; run 'ul init' first")
 
 
 def _read_private_json(path: Path) -> object:
-    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    descriptor = _open_private_regular_file(path)
     try:
         file_status = os.fstat(descriptor)
         if not stat.S_ISREG(file_status.st_mode):
@@ -305,19 +383,67 @@ def _read_private_json(path: Path) -> object:
         os.close(descriptor)
     if len(encoded) > _MAXIMUM_PROJECT_FILE_BYTES:
         raise ValueError("project file exceeds the size limit")
-    return json.loads(
-        encoded,
-        object_pairs_hook=_reject_duplicate_json_keys,
-        parse_constant=_reject_nonstandard_json_constant,
-    )
+    try:
+        return json.loads(
+            encoded,
+            object_pairs_hook=_reject_duplicate_json_keys,
+            parse_constant=_reject_nonstandard_json_constant,
+        )
+    except RecursionError:
+        raise ValueError("project file exceeds the nesting limit") from None
+
+
+def _open_private_regular_file(path: Path) -> int:
+    no_follow_flag = getattr(os, "O_NOFOLLOW", 0)
+    requires_identity_check = no_follow_flag == 0
+    initial_path_status: os.stat_result | None = None
+    if requires_identity_check:
+        initial_path_status = os.lstat(path)
+        if stat.S_ISLNK(initial_path_status.st_mode):
+            raise OSError("project file must not be a symbolic link")
+
+    binary_flag = os.O_BINARY if sys.platform == "win32" else 0
+    descriptor = os.open(path, os.O_RDONLY | no_follow_flag | binary_flag)
+    try:
+        descriptor_status = os.fstat(descriptor)
+        if not stat.S_ISREG(descriptor_status.st_mode):
+            raise OSError("project file must be a regular file")
+        if descriptor_status.st_nlink != 1:
+            raise OSError("project file must not have multiple hard links")
+        if sys.platform != "win32" and stat.S_IMODE(descriptor_status.st_mode) & 0o077:
+            raise OSError("project file permissions must not allow group or other access")
+        if hasattr(os, "getuid") and descriptor_status.st_uid != os.getuid():
+            raise OSError("project file must be owned by the current user")
+        if requires_identity_check:
+            assert initial_path_status is not None
+            current_path_status = os.lstat(path)
+            if (
+                stat.S_ISLNK(current_path_status.st_mode)
+                or not os.path.samestat(initial_path_status, descriptor_status)
+                or not os.path.samestat(current_path_status, descriptor_status)
+            ):
+                raise OSError("project file changed while it was opened")
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
 
 
 def _create_private_json(path: Path, value: object) -> None:
+    _create_private_text(path, json.dumps(value, indent=2) + "\n")
+
+
+def _create_private_text(path: Path, value: str) -> None:
     descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    os.fchmod(descriptor, 0o600)
-    with os.fdopen(descriptor, "w", encoding="utf-8") as output:
-        json.dump(value, output, indent=2)
-        output.write("\n")
+    try:
+        if sys.platform != "win32":
+            os.fchmod(descriptor, 0o600)
+        output = os.fdopen(descriptor, "w", encoding="utf-8")
+    except BaseException:
+        os.close(descriptor)
+        raise
+    with output:
+        output.write(value)
 
 
 def _replace_private_json(path: Path, value: object) -> None:
@@ -331,11 +457,45 @@ def _replace_private_json(path: Path, value: object) -> None:
 
 
 def _save_latest_evidence(project_root: Path, evidence: Path) -> None:
-    state = ProjectState(latest_evidence=_relative_project_path(evidence, project_root))
+    state = ProjectState(
+        latest_evidence=_relative_project_path(evidence, project_root),
+        latest_evidence_sha256=_private_file_sha256(evidence),
+    )
     _replace_private_json(
         project_root / _PROJECT_DIRECTORY / _PROJECT_STATE,
         state.model_dump(mode="json"),
     )
+
+
+def _has_nonempty_evidence(evidence: Path) -> bool:
+    try:
+        descriptor = _open_private_regular_file(evidence)
+    except OSError:
+        return False
+    try:
+        return os.fstat(descriptor).st_size > 0
+    finally:
+        os.close(descriptor)
+
+
+def _load_latest_evidence(project_root: Path) -> Path:
+    state_path = project_root / _PROJECT_DIRECTORY / _PROJECT_STATE
+    state = ProjectState.model_validate(_read_private_json(state_path))
+    evidence = _resolve_project_path(state.latest_evidence, project_root)
+    if _private_file_sha256(evidence) != state.latest_evidence_sha256:
+        raise ValueError("latest evidence changed after it was recorded")
+    return evidence
+
+
+def _private_file_sha256(path: Path) -> str:
+    descriptor = _open_private_regular_file(path)
+    digest = hashlib.sha256()
+    try:
+        while chunk := os.read(descriptor, 65_536):
+            digest.update(chunk)
+    finally:
+        os.close(descriptor)
+    return digest.hexdigest()
 
 
 def _relative_project_path(path: Path, project_root: Path) -> str:
@@ -343,7 +503,7 @@ def _relative_project_path(path: Path, project_root: Path) -> str:
 
 
 def _resolve_project_path(path: str, project_root: Path) -> Path:
-    return (project_root / path).resolve()
+    return Path(os.path.abspath(project_root / path))
 
 
 def _new_evidence_name() -> str:
@@ -361,6 +521,16 @@ def _ensure_private_directory(path: Path) -> None:
         os.chmod(path, 0o700)
 
 
+def _validate_private_directory(path: Path) -> None:
+    path_status = path.lstat()
+    if stat.S_ISLNK(path_status.st_mode) or not stat.S_ISDIR(path_status.st_mode):
+        raise OSError(f"{path} must be a directory, not a symlink")
+    if sys.platform != "win32" and stat.S_IMODE(path_status.st_mode) & 0o077:
+        raise OSError(f"{path} permissions must not allow group or other access")
+    if hasattr(os, "getuid") and path_status.st_uid != os.getuid():
+        raise OSError(f"{path} must be owned by the current user")
+
+
 def _reject_duplicate_json_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
     result: dict[str, object] = {}
     for key, value in pairs:
@@ -372,3 +542,12 @@ def _reject_duplicate_json_keys(pairs: list[tuple[str, object]]) -> dict[str, ob
 
 def _reject_nonstandard_json_constant(value: str) -> Never:
     raise ValueError(f"project file contains invalid JSON constant {value}")
+
+
+def _format_validation_error(error: ValidationError) -> str:
+    reasons: list[str] = []
+    for issue in error.errors(include_url=False, include_context=False, include_input=False):
+        field_path = ".".join(str(part) for part in issue["loc"])
+        message = str(issue["msg"]).removeprefix("Value error, ")
+        reasons.append(f"{field_path}: {message}" if field_path else message)
+    return "; ".join(reasons) or "validation failed"

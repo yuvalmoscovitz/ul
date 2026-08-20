@@ -50,6 +50,7 @@ from ul.http_sandbox import (
     JsonHttpSandboxConnection,
     json_http_sandbox_calls_per_execution,
     json_http_sandbox_config_urls,
+    json_http_sandbox_origin,
     load_json_http_sandbox_config,
     validate_json_http_sandbox_configuration,
 )
@@ -356,6 +357,10 @@ def evaluate_dataset(
         Path | None,
         typer.Option(help="Private local reversible pseudonym mapping state."),
     ] = None,
+    expected_sandbox_origin: Annotated[
+        str | None,
+        typer.Option(hidden=True),
+    ] = None,
     show_report_guidance: Annotated[bool, typer.Option(hidden=True)] = True,
 ) -> None:
     """Explore behavioral differences against an isolated black-box agent.
@@ -435,6 +440,14 @@ def evaluate_dataset(
         loaded_target_config = (
             load_json_http_sandbox_config(sandbox_config) if sandbox_config is not None else None
         )
+        if expected_sandbox_origin is not None:
+            if loaded_target_config is None:
+                raise ValueError("saved sandbox origin requires --sandbox-config")
+            if json_http_sandbox_origin(loaded_target_config) != expected_sandbox_origin:
+                raise ValueError(
+                    "sandbox origin changed since 'ul init'; reinitialize the project and repeat "
+                    "the sandbox safety acknowledgements"
+                )
         if loaded_target_config is not None:
             validate_json_http_sandbox_configuration(
                 loaded_target_config,
@@ -1226,7 +1239,8 @@ def _default_augmentations_output(evidence_output: Path) -> Path:
 
 def _create_private_output(path: Path) -> TextIO:
     descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    os.fchmod(descriptor, 0o600)
+    if sys.platform != "win32":
+        os.fchmod(descriptor, 0o600)
     return os.fdopen(descriptor, "w", encoding="utf-8")
 
 

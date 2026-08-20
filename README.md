@@ -48,17 +48,30 @@ OpenAI-compatible semantic-model endpoint.
 For your own agent, configure the project once and then use three top-level commands:
 
 ```bash
-uv run ul init interactions.jsonl \
+# Install the CLI once. uv will tell you if its tool directory is not yet on PATH.
+uv tool install git+https://github.com/yuvalmoscovitz/ul.git
+
+# interactions.jsonl contains one object per line, for example:
+# {"id":"case-1","input":"Pay AC-100.","output":{"action":"payment_committed","invoice":"AC-100"}}
+ul init interactions.jsonl \
   --sandbox-url https://your-sandbox.example \
   --allow-sandbox-network-egress \
   --confirm-isolated-sandbox
 
-# Review .ul/sandbox.json once so its request bodies and response pointers match your API.
+# Your sandbox needs reset, execute-turn, and snapshot endpoints. Match the generated
+# request bodies and response pointers to that API, then verify the adapter before model calls.
+ul sandbox check .ul/sandbox.json \
+  --probe "Return sandbox health only; do not take action." \
+  --allow-sandbox-network-egress \
+  --confirm-isolated-sandbox \
+  --confirm-harmless-probe
+ul run --dry-run
+
 export OPEN_ROUTER_API_KEY=YOUR_SECRET_FROM_A_SECRET_MANAGER
 export UL_LIVE=true
 
-uv run ul run
-uv run ul report
+ul run
+ul report
 ```
 
 `ul init` validates the dataset and saves project settings under `.ul/`. After that, `ul run`
@@ -71,7 +84,10 @@ values for one run without changing the project configuration.
 If you already have a sandbox configuration, pass `--sandbox-config sandbox.json` to `ul init`
 instead of `--sandbox-url`. Provider credentials remain in environment variables and are never
 written to project files. The isolation and network flags are explicit one-time acknowledgments
-saved by `init`; they are not repeated on every run.
+saved by `init` and bound to the sandbox origin; they are not repeated on every run. Changing the
+origin requires reinitializing and acknowledging the new sandbox. Use `ul run --resume` after an
+interrupted run. Projects that need provider redaction can save `--redaction-policy` and
+`--redaction-state` during init; use `--no-save-augmentations` when local retention is prohibited.
 
 To run UL's bundled defective-agent example instead:
 
@@ -409,18 +425,18 @@ to the 50 MB bundle limit. Keep them in governed local storage.
 Give UL the base URL of an isolated, non-production deployment of your agent:
 
 ```bash
-uv run ul init your-data.jsonl \
+ul init your-data.jsonl \
   --sandbox-url https://your-sandbox.example \
   --allow-sandbox-network-egress \
   --confirm-isolated-sandbox
 
 # Adjust the generated lifecycle mapping once, then verify it.
-uv run ul sandbox check .ul/sandbox.json \
+ul sandbox check .ul/sandbox.json \
   --probe "Describe your harmless sandbox-only check here" \
   --allow-sandbox-network-egress \
   --confirm-isolated-sandbox \
   --confirm-harmless-probe
-uv run ul run --dry-run
+ul run --dry-run
 ```
 
 The customer builds and operates this sandbox; UL only calls its API. It must expose reset,

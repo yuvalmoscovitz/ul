@@ -1161,6 +1161,14 @@ def json_http_sandbox_config_urls(
     )
 
 
+def json_http_sandbox_origin(config: JsonHttpSandboxConfig) -> str:
+    scheme, hostname, port = _endpoint_origin(json_http_sandbox_config_urls(config)[0])
+    formatted_hostname = f"[{hostname}]" if ":" in hostname else hostname
+    default_port = 443 if scheme == "https" else 80
+    port_suffix = "" if port == default_port else f":{port}"
+    return f"{scheme}://{formatted_hostname}{port_suffix}"
+
+
 def _endpoint_origin(endpoint: str) -> tuple[str, str, int]:
     parsed = urlsplit(endpoint)
     hostname = parsed.hostname
