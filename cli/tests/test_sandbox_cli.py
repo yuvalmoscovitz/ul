@@ -48,6 +48,7 @@ class _SandboxServer(ThreadingHTTPServer):
     execute_content_type: str
     execute_status: int
     cleanup_generation_changes: bool
+    reset_env_acknowledged: bool
 
 
 @contextmanager
@@ -56,6 +57,7 @@ def _sandbox_server(
     execute_content_type: str = "application/json",
     execute_status: int = 200,
     cleanup_generation_changes: bool = True,
+    reset_env_acknowledged: bool = True,
 ) -> Iterator[_SandboxServer]:
     class Handler(BaseHTTPRequestHandler):
         def do_POST(self) -> None:
@@ -72,6 +74,8 @@ def _sandbox_server(
                     "case_id": request_body["case_id"],
                     "generation": server.generation,
                     "clean": True,
+                    "reset_session": True,
+                    "reset_env": server.reset_env_acknowledged,
                 }
             elif self.path == "/setup":
                 response = {
@@ -115,6 +119,7 @@ def _sandbox_server(
     server.execute_content_type = execute_content_type
     server.execute_status = execute_status
     server.cleanup_generation_changes = cleanup_generation_changes
+    server.reset_env_acknowledged = reset_env_acknowledged
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     try:
@@ -221,6 +226,8 @@ def test_check_runs_complete_model_free_lifecycle(tmp_path: Path) -> None:
     ]
     case_ids = {request["case_id"] for _, request in server.requests}
     assert len(case_ids) == 1
+    assert server.requests[0][1]["reset_session"] is True
+    assert server.requests[0][1]["reset_env"] is True
     assert server.requests[2][1]["turn_id"] == "__ul_initial_state__"
     assert server.requests[3][1]["turn_id"] == server.requests[4][1]["turn_id"]
 
@@ -245,6 +252,20 @@ def test_check_reports_precise_phase_and_protocol_error(tmp_path: Path) -> None:
         "/execute",
         "/reset",
     ]
+
+
+def test_check_blocks_execution_when_environment_reset_is_not_acknowledged(
+    tmp_path: Path,
+) -> None:
+    with _sandbox_server(reset_env_acknowledged=False) as server:
+        config = _write_config(tmp_path, server)
+        result = runner.invoke(app, _check_arguments(config, output_json=True))
+
+    assert result.exit_code == 2, result.output
+    summary = json.loads(result.output)
+    assert summary["failed_phase"] == "reset"
+    assert summary["error_code"] == "reset_env_not_acknowledged"
+    assert [path for path, _ in server.requests] == ["/reset"]
 
 
 def test_check_reports_authentication_rejection(tmp_path: Path) -> None:

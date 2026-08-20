@@ -29,7 +29,13 @@ class DefectiveCorrectionHandler(BaseHTTPRequestHandler):
                 generation = type(self).generation
             self._send(
                 HTTPStatus.OK,
-                {"case_id": request.get("case_id"), "generation": generation, "clean": True},
+                {
+                    "case_id": request.get("case_id"),
+                    "generation": generation,
+                    "clean": True,
+                    "reset_session": request.get("reset_session") is True,
+                    "reset_env": request.get("reset_env") is True,
+                },
             )
         elif self.path == "/setup":
             self._send(HTTPStatus.OK, {"case_id": request.get("case_id")})

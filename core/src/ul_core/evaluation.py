@@ -23,6 +23,8 @@ SandboxLifecycleFailureCode = Literal[
     "turn_identity",
     "reset_generation",
     "reset_generation_reused",
+    "reset_session_not_acknowledged",
+    "reset_env_not_acknowledged",
     "reset_not_clean",
     "request_too_large",
     "response_too_large",
@@ -196,9 +198,22 @@ class SandboxLifecycleEvidence(_StrictModel):
     cleanup_failure_code: SandboxLifecycleFailureCode | None = None
     cleanup_failure_reason: str | None = Field(default=None, min_length=1, max_length=500)
     sandbox_state_uncertain: bool
+    reset_session_requested: bool = True
+    reset_session_acknowledged: bool = True
+    reset_env_requested: bool = True
+    reset_env_acknowledged: bool = True
 
     @model_validator(mode="after")
     def validate_terminal_status(self) -> Self:
+        if self.reset_session_acknowledged and not self.reset_session_requested:
+            raise ValueError("session reset cannot be acknowledged when it was not requested")
+        if self.reset_env_acknowledged and not self.reset_env_requested:
+            raise ValueError("environment reset cannot be acknowledged when it was not requested")
+        if self.terminal_status == "succeeded" and (
+            self.reset_session_requested != self.reset_session_acknowledged
+            or self.reset_env_requested != self.reset_env_acknowledged
+        ):
+            raise ValueError("successful lifecycle evidence requires every requested reset")
         if self.terminal_status == "succeeded" and (
             self.failed_phase is not None
             or self.failure_code is not None

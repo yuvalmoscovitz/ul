@@ -370,6 +370,8 @@ class _ReplayHandler(BaseHTTPRequestHandler):
                 "case_id": payload["case_id"],
                 "generation": replay_server.generation,
                 "clean": True,
+                "reset_session": True,
+                "reset_env": True,
             }
         elif self.path == "/execute":
             replay_server.requests.append(cast(dict[str, Any], payload))

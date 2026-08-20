@@ -141,6 +141,8 @@ def initialize_dataset_sandbox(
                 "reset": {
                     "url": f"{base_url}/reset",
                     "request_json_template": {"case_id": "{{case_id}}"},
+                    "reset_session": True,
+                    "reset_env": True,
                     "case_id_json_pointer": "/case_id",
                     "generation_json_pointer": "/generation",
                     "clean_state_json_pointer": "/clean",
@@ -199,8 +201,10 @@ def initialize_dataset_sandbox(
 
     console.print(f"Created private sandbox connection config: {sandbox_config}")
     console.print(
-        "Next: adjust the lifecycle request bodies and response pointers, add any "
-        "headers_from_env, then validate the connection with 'ul sandbox check "
+        "Next: implement the generated reset, setup, execute, and snapshot endpoints. "
+        "The reset request already asks for a clean agent session and clean external "
+        "environment. Add any headers_from_env, then validate the connection with "
+        "'ul sandbox check "
         f'{sandbox_config} --probe "Return sandbox health only; do not take action." '
         "--allow-sandbox-network-egress "
         "--confirm-isolated-sandbox --confirm-harmless-probe'. After that, validate a "

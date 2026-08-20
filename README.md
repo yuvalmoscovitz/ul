@@ -393,6 +393,19 @@ execute-turn, and snapshot lifecycle endpoints. Use `headers_from_env` in the sa
 credentials so secret values remain outside the configuration. Dry-run validates the production
 dataset and sandbox mapping without making external calls.
 
+`dataset init` writes the normal reset request for you. Implement `POST /reset` to accept:
+
+```json
+{"case_id": "...", "reset_session": true, "reset_env": true}
+```
+
+`reset_session` means clear the agent's conversation or memory for the case. `reset_env` means
+restore external sandbox state such as test database rows, queues, files, and tool state. Return
+both requested acknowledgements as `true`, alongside the existing case, sandbox, generation, and
+clean-state fields. UL will not execute the case when a requested acknowledgement is missing or
+false. Both resets default to `true`; set one reset flag to `false` in the generated config only
+when that layer is genuinely stateless.
+
 Credential environment-variable names must use the dedicated `UL_SANDBOX_*` namespace. This keeps
 a sandbox configuration from selecting unrelated ambient process credentials.
 
@@ -424,8 +437,9 @@ original or variation repetition, UL sends these same-origin POST requests in or
 reset → optional setup → initial snapshot → execute_turn → snapshot → cleanup reset
 ```
 
-Each reset must return JSON containing a configured clean-state field and a generation string or
-integer that changes on every reset. UL validates both fields before setup and again during cleanup.
+Each reset must separately acknowledge the requested session and environment resets, and return
+JSON containing a configured clean-state field and a generation string or integer that changes on
+every reset. UL validates all of these before setup and again during cleanup.
 This proves the adapter returned a fresh acknowledgement, not that the underlying system actually
 erased every state store.
 

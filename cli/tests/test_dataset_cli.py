@@ -222,7 +222,10 @@ def _run_context(
 
 def test_run_context_uses_current_pipeline() -> None:
     record = _evaluation_result("interaction-1").source
-    assert _run_context((record,)).pipeline_version == "1.1.0"
+    run_context = _run_context((record,))
+    assert run_context.pipeline_version == "1.1.0"
+    assert run_context.target.config.reset.reset_session is True
+    assert run_context.target.config.reset.reset_env is True
 
 
 def _write_target_config(
@@ -447,6 +450,8 @@ def test_init_creates_private_strict_starter_config(tmp_path: Path) -> None:
         "reset": {
             "url": "https://sandbox.example.test/reset",
             "request_json_template": {"case_id": "{{case_id}}"},
+            "reset_session": True,
+            "reset_env": True,
             "case_id_json_pointer": "/case_id",
             "sandbox_id_json_pointer": "/sandbox_id",
             "generation_json_pointer": "/generation",
@@ -484,7 +489,8 @@ def test_init_creates_private_strict_starter_config(tmp_path: Path) -> None:
         },
     }
     assert stat.S_IMODE(target_config.stat().st_mode) == 0o600
-    assert "lifecycle request bodies and response pointers" in result.output
+    assert "clean agent session" in result.output
+    assert "clean external" in result.output
     assert "headers_from_env" in result.output
     assert "--dry-run" in result.output
 
@@ -1845,6 +1851,8 @@ def test_target_config_runs_nested_request_and_response_against_loopback(
                     "case_id": request["case_id"],
                     "generation": generation,
                     "clean": True,
+                    "reset_session": True,
+                    "reset_env": True,
                 }
             elif self.path == "/execute":
                 received_requests.append(request)

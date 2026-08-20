@@ -464,6 +464,12 @@ def _remediation_for_code(code: str) -> str:
         "turn_identity": "Echo the request turn_id unchanged in the response.",
         "reset_generation": "Return a non-empty string or integer reset generation.",
         "reset_generation_reused": "Return a new generation after every reset.",
+        "reset_session_not_acknowledged": (
+            "Return reset_session=true after clearing the agent conversation/session."
+        ),
+        "reset_env_not_acknowledged": (
+            "Return reset_env=true after restoring external sandbox state."
+        ),
         "reset_not_clean": (
             "Return the configured clean-state acknowledgement only after reset completes."
         ),
