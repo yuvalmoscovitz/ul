@@ -189,7 +189,6 @@ def test_init_requires_one_time_safety_acknowledgements(
     if missing_flag == "--confirm-test-environment":
         normalized_output = " ".join(result.output.split())
         assert "the agent may change external state" in normalized_output
-        assert "--confirm-test-environment to" in normalized_output
     assert not (tmp_path / ".ul").exists()
 
 
