@@ -22,6 +22,10 @@ def _write_private_file(path: Path, value: str) -> None:
         path.chmod(0o600)
 
 
+def _accept_test_evidence(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(project, "is_reportable_dataset_evidence", lambda path: True)
+
+
 def _write_dataset(path: Path) -> None:
     path.write_text(
         json.dumps(
@@ -289,6 +293,34 @@ def test_failed_init_does_not_delete_existing_sandbox_file(
     assert sandbox.read_text(encoding="utf-8") == "customer-owned\n"
 
 
+def test_interrupted_init_removes_only_owned_scaffolding(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    dataset = tmp_path / "interactions.jsonl"
+    _write_dataset(dataset)
+
+    def interrupt_sandbox_creation(*arguments: Any, **keywords: Any) -> None:
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(project, "initialize_dataset_sandbox", interrupt_sandbox_creation)
+
+    result = runner.invoke(
+        app,
+        [
+            "init",
+            str(dataset),
+            "--sandbox-url",
+            "https://sandbox.example",
+            "--allow-sandbox-network-egress",
+            "--confirm-isolated-sandbox",
+        ],
+    )
+
+    assert result.exit_code != 0
+    assert not (tmp_path / ".ul").exists()
+
+
 def test_run_discovers_parent_project_and_applies_one_run_overrides(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -297,6 +329,7 @@ def test_run_discovers_parent_project_and_applies_one_run_overrides(
     nested_directory = tmp_path / "src" / "package"
     nested_directory.mkdir(parents=True)
     monkeypatch.chdir(nested_directory)
+    _accept_test_evidence(monkeypatch)
     received: dict[str, Any] = {}
 
     def fake_evaluate_dataset(**arguments: Any) -> None:
@@ -399,6 +432,7 @@ def test_run_resumes_latest_reportable_evidence(
 ) -> None:
     monkeypatch.chdir(tmp_path)
     _initialize(tmp_path)
+    _accept_test_evidence(monkeypatch)
 
     def interrupted_evaluation(**arguments: Any) -> None:
         _write_private_file(arguments["output"], "{}\n")
@@ -442,6 +476,7 @@ def test_run_records_any_nonempty_evidence(
 ) -> None:
     monkeypatch.chdir(tmp_path)
     _initialize(tmp_path)
+    _accept_test_evidence(monkeypatch)
 
     def fake_evaluate_dataset(**arguments: Any) -> None:
         _write_private_file(arguments["output"], "{}\n")
@@ -479,6 +514,7 @@ def test_run_records_evidence_before_keyboard_interrupt(
 ) -> None:
     monkeypatch.chdir(tmp_path)
     _initialize(tmp_path)
+    _accept_test_evidence(monkeypatch)
 
     def interrupted_evaluation(**arguments: Any) -> None:
         _write_private_file(arguments["output"], "{}\n")
@@ -491,6 +527,47 @@ def test_run_records_evidence_before_keyboard_interrupt(
     assert result.exit_code != 0
     assert (tmp_path / ".ul" / "state.json").is_file()
     assert "Next: ul report" in result.output
+
+
+def test_run_does_not_replace_latest_with_malformed_partial_evidence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    _initialize(tmp_path)
+    monkeypatch.setattr(
+        project,
+        "is_reportable_dataset_evidence",
+        lambda path: path.read_text(encoding="utf-8") == "{}\n",
+    )
+
+    def completed_evaluation(**arguments: Any) -> None:
+        _write_private_file(arguments["output"], "{}\n")
+
+    monkeypatch.setattr(project, "evaluate_dataset", completed_evaluation)
+    completed = runner.invoke(app, ["run"])
+    assert completed.exit_code == 0, completed.output
+    state_path = tmp_path / ".ul" / "state.json"
+    original_state = state_path.read_bytes()
+
+    def malformed_evaluation(**arguments: Any) -> None:
+        _write_private_file(arguments["output"], "{partial")
+        raise OSError("simulated interruption")
+
+    monkeypatch.setattr(project, "evaluate_dataset", malformed_evaluation)
+    interrupted = runner.invoke(app, ["run"])
+
+    assert interrupted.exit_code != 0
+    assert state_path.read_bytes() == original_state
+    assert "Next: ul report" not in interrupted.output
+
+
+def test_arbitrary_json_object_is_not_reportable_evidence(
+    tmp_path: Path,
+) -> None:
+    evidence = tmp_path / "not-evidence.jsonl"
+    _write_private_file(evidence, '{"diagnostic":"interrupted"}\n')
+
+    assert not project._has_nonempty_evidence(evidence)
 
 
 def test_report_uses_latest_evidence_and_explicit_path_wins(

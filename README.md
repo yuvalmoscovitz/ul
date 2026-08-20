@@ -2,71 +2,61 @@
 
 [![CI](https://github.com/yuvalmoscovitz/ul/actions/workflows/ci.yml/badge.svg)](https://github.com/yuvalmoscovitz/ul/actions/workflows/ci.yml)
 
-UL is early-stage; APIs and evidence schemas may change. [Contributing](CONTRIBUTING.md) ·
-[Security](SECURITY.md) · [MIT License](LICENSE)
+UL finds consequential failures in high-risk AI agents. It takes recorded interactions, creates
+realistic variations, runs them against an isolated customer-owned sandbox, and produces evidence
+for human review.
 
-UL actively tests black-box AI agents for behavioral differences that could matter in
-high-risk workflows. It passively imports real production observations, makes realistic
-variations, and sends only those test cases to a customer-managed, non-production sandbox API.
-UL never executes augmentations against the production system it observed.
+UL does not test production systems, decide which behavior is correct, prove causality, or estimate
+a production failure rate.
 
-UL reports observed differences for human review. It does not decide which behavior is
-correct, prove causality, or estimate a production failure rate.
+> UL is early-stage. APIs and evidence schemas may change.
 
-Inspect every built-in input, conversation, and environment augmentation through one catalog:
+## Install
 
-```bash
-uv run ul augmentations list
-uv run ul augmentations show environment.tool.timeout_after_commit@1.0.0
-```
-
-The catalog states whether the SDK augmentation registry or a CLI owns each binding,
-and which model, sandbox, state, evaluator, and capability requirements apply.
-Catalog inspection is local and makes no model, sandbox, or network calls. Runtime commands retain
-their own explicit safety confirmations, budgets, lifecycle validation, and evidence contracts.
-
-## Model-free first finding
-
-Run a deterministic, consequential failure locally without an API key or semantic-model calls:
+You need Python 3.12+ and [`uv`](https://docs.astral.sh/uv/).
 
 ```bash
-uv sync
-uv run python -m examples.retry_after_successful_commit.run
+uv tool install git+https://github.com/yuvalmoscovitz/ul.git
 ```
 
-The isolated example commits one synthetic payment successfully, then explicitly retries it. Its
-seeded agent creates a duplicate payment, and UL confirms the critical exactly-once violation from
-three committed-state repetitions. The command retains private evidence and exits `0` when the
-expected finding is confirmed. See the
-[retry-after-successful-commit example](examples/retry_after_successful_commit/README.md).
+If `uv` reports that its tool directory is not on `PATH`, run `uv tool update-shell`.
 
 ## Quickstart
 
-You need Python 3.12+, [`uv`](https://docs.astral.sh/uv/), and access to either OpenRouter or an
-OpenAI-compatible semantic-model endpoint.
+Create a JSONL dataset with one interaction per line:
 
-For your own agent, configure the project once and then use three top-level commands:
+```json
+{"id":"case-1","input":"Pay AC-100.","output":{"action":"payment_committed","invoice":"AC-100"}}
+```
+
+Configure UL once:
 
 ```bash
-# Install the CLI once. uv will tell you if its tool directory is not yet on PATH.
-uv tool install git+https://github.com/yuvalmoscovitz/ul.git
-
-# interactions.jsonl contains one object per line, for example:
-# {"id":"case-1","input":"Pay AC-100.","output":{"action":"payment_committed","invoice":"AC-100"}}
 ul init interactions.jsonl \
   --sandbox-url https://your-sandbox.example \
   --allow-sandbox-network-egress \
   --confirm-isolated-sandbox
+```
 
-# Your adapter must implement the generated reset, setup, execute-turn, and snapshot contract.
-# If you need a custom mapping, prepare it first and pass it with --sandbox-config instead.
+The generated `.ul/sandbox.json` defines the adapter contract. Your isolated sandbox must implement
+its reset, setup, execute-turn, and snapshot requests. If you already have a custom mapping, use
+`--sandbox-config sandbox.json` instead of `--sandbox-url`.
+
+Verify the adapter before spending money on model calls:
+
+```bash
 ul sandbox check .ul/sandbox.json \
   --probe "Return sandbox health only; do not take action." \
   --allow-sandbox-network-egress \
   --confirm-isolated-sandbox \
   --confirm-harmless-probe
-ul run --dry-run
 
+ul run --dry-run
+```
+
+Then run and report:
+
+```bash
 export OPEN_ROUTER_API_KEY=YOUR_SECRET_FROM_A_SECRET_MANAGER
 export UL_LIVE=true
 
@@ -74,565 +64,158 @@ ul run
 ul report
 ```
 
-`ul init` validates the dataset and saves project settings under `.ul/`. After that, `ul run`
-finds the project from the current directory or a parent, creates a new evidence file, and remembers
-the latest completed run. `ul report` opens that run without another path argument or any model or
-sandbox calls. Use `ul run --dry-run` to validate the saved plan without external calls. Options
-such as `--limit`, `--repetitions`, `--operator`, and `--max-sandbox-api-calls` override the saved
-values for one run without changing the project configuration.
+`ul init` stores private project settings under `.ul/`. `ul run` discovers that directory from the
+current directory or a parent and writes a new evidence file. `ul report` opens the latest
+reportable run. Use `ul run --resume` after an interruption.
 
-If you already have a sandbox configuration, pass `--sandbox-config sandbox.json` to `ul init`
-instead of `--sandbox-url`. Provider credentials remain in environment variables and are never
-written to project files. The isolation and network flags are explicit one-time acknowledgments
-saved by `init` and bound to the complete sandbox configuration; they are not repeated on every
-run. Changing that configuration requires reinitializing and acknowledging the sandbox again. Use
-`ul run --resume` after an
-interrupted run. Projects that need provider redaction can save `--redaction-policy` and
-`--redaction-state` during init; see the [policy schema and example](docs/privacy.md). Use
-`--no-save-augmentations` when local retention is prohibited.
-
-To run UL's bundled defective-agent example instead:
+One-run overrides do not change the saved project:
 
 ```bash
-git clone https://github.com/yuvalmoscovitz/ul.git
-cd ul
-uv sync
-# Provide OPEN_ROUTER_API_KEY through your environment or secret manager.
-export UL_LIVE=true
-uv run python -m examples.quickstart.run
+ul run --limit 3 --repetitions 3 --operator input.surface.rephrase
 ```
 
-Never put the key in a committed file or paste it into the command. `UL_LIVE=true` is the
-convenience setting for a local run: it enables both billed semantic-model calls and external
-processing of the selected data. For separate policy control, use
-`UL_DATASET_LIVE_CALLS=true` and `UL_DATASET_ALLOW_EXTERNAL_DATA_PROCESSING=true` instead.
-Either granular variable takes precedence when explicitly set, including `false`.
+## How it works
 
-### Semantic model providers
+```text
+recorded interaction
+  → realistic input variation
+  → fresh sandbox runs for original and variation
+  → comparison of responses and committed state
+  → evidence for human review
+  → confirmed regression case
+```
 
-OpenRouter is the default and uses
-`OPEN_ROUTER_API_KEY` and the existing `UL_DATASET_*_MODEL` variables. To send semantic-model
-requests to a customer-controlled OpenAI-compatible Chat Completions endpoint instead, configure
-the API root and a provider-scoped key:
+Every repetition uses this lifecycle:
+
+```text
+reset → optional setup → initial snapshot → execute turn → snapshot → cleanup reset
+```
+
+UL only calls the configured customer-owned sandbox. The sandbox is responsible for isolation,
+deterministic reset, and preventing real business effects.
+
+## Review and regressions
+
+`ul report` is offline. It makes no model or sandbox calls.
+
+```bash
+ul report
+
+ul dataset review .ul/runs/EVIDENCE.jsonl FINDING_ID \
+  --status confirmed \
+  --severity high \
+  --reviewer payments-risk \
+  --reason "The variation committed payment for the wrong invoice."
+```
+
+Reviews are appended to a separate audit file. Evidence is never rewritten. Exit codes are:
+
+- `0`: no review finding or declared-rule violation.
+- `1`: a difference needs review or a declared rule was violated.
+- `2`: the evaluation was incomplete or not evaluable.
+
+Exit `1` is not a general correctness verdict.
+
+Save a confirmed finding as a regression:
+
+```bash
+ul regression save EVIDENCE.jsonl FINDING_ID \
+  --rule RULE_ID \
+  --sandbox-config .ul/sandbox.json \
+  --output regressions/finding.json \
+  --confirm-versioned-input
+
+ul regression run regressions \
+  --sandbox-config .ul/sandbox.json \
+  --allow-sandbox-network-egress \
+  --confirm-isolated-sandbox \
+  --max-sandbox-api-calls 100 \
+  --output regression-results.jsonl
+```
+
+## Configuration
+
+Project defaults are saved by `ul init`. Common options include:
+
+- `--invariants invariants.json` for deterministic customer rules.
+- `--redaction-policy redaction.json --redaction-state STATE` for provider-boundary redaction.
+- `--no-save-augmentations` when local augmentation retention is prohibited.
+- `--allow-insecure-http` for an exact local HTTP sandbox.
+- `--limit`, `--repetitions`, `--operator`, and `--max-sandbox-api-calls` for run scope.
+
+See [Privacy and redaction](docs/privacy.md) for the policy schema and data-flow details.
+
+OpenRouter is the default semantic-model provider. For a customer-controlled OpenAI-compatible
+endpoint:
 
 ```bash
 export UL_DATASET_SEMANTIC_PROVIDER=openai-compatible
 export UL_DATASET_OPENAI_BASE_URL=https://models.example.com/v1
-export UL_DATASET_OPENAI_API_KEY=YOUR_SECRET_FROM_A_SECRET_MANAGER  # if required
+export UL_DATASET_OPENAI_API_KEY=YOUR_SECRET_FROM_A_SECRET_MANAGER
 export UL_DATASET_MODEL=your-semantic-model
 export UL_LIVE=true
-
-uv run ul dataset evaluate interactions.jsonl \
-  --sandbox-config sandbox.json \
-  --allow-sandbox-network-egress \
-  --confirm-isolated-sandbox \
-  --output results.jsonl
 ```
 
-`UL_DATASET_RENDER_MODEL` and `UL_DATASET_EQUIVALENCE_MODEL` are optional for an
-OpenAI-compatible provider; both inherit `UL_DATASET_MODEL` when omitted. Set
-`UL_DATASET_OPENAI_PROVIDER_ID` to a stable lowercase identifier when evidence should distinguish
-multiple internal gateways. The endpoint must support `POST /chat/completions` and strict JSON
-Schema response formatting. UL sends only standard Chat Completions request fields to this generic
-provider; OpenRouter-only routing and reasoning fields are not sent.
+Secrets belong in environment variables or a secret manager, never in datasets or configuration
+files. Sandbox header mappings may reference only dedicated `UL_SANDBOX_*` environment variables.
 
-Use an API-root URL such as `https://models.example.com/v1`, not the full
-`/chat/completions` URL. UL rejects credentials, queries, and fragments in the URL, rejects
-redirects, ignores ambient proxy settings for customer-configured endpoints, and requires HTTPS
-except for exact loopback addresses such as `http://127.0.0.1:8000/v1`. The scoped key is optional
-for the generic provider; when it is unset, UL omits the authorization header so unauthenticated
-local runtimes work without a placeholder secret. OpenRouter retains its environment transport
-behavior and requires `OPEN_ROUTER_API_KEY`. UL records the provider identifier, a SHA-256 endpoint
-identity, protocol, generation ID, and resolved model in evidence, but never records the custom
-base URL, API key, or authorization header. The explicit live-call and data-processing permissions
-still apply to customer-controlled and local endpoints.
+## Traces and stateful stress
 
-The command starts an intentionally defective agent on localhost, gives every request clean
-synthetic state, and evaluates one synthetic accounts-payable interaction. A typical run finds
-a `REPEATABLE DIFFERENCE — REVIEW`: the agent pays invoice `AC-100` for the original request but
-pays `AC-101` for a naturally repeated-word variation. Generation and checking use models, so
-the exact variation and result can differ between runs.
-
-The quickstart also applies one deterministic customer rule to the raw structured sandbox response:
-the committed invoice reference must equal the requested invoice reference. The original trials
-satisfy that rule and the defective variation violates it. The rule uses no model calls and stays
-separate from UL's behavioral-difference finding.
-
-The quickstart permits up to 6 calls to the local sandbox API and up to 10 semantic-model calls. The
-quickstart explicitly requests `x-ai/grok-4.6` for semantic deconstruction, rendering, and
-equivalence checking to improve consistency. This model may cost more, and OpenRouter or the
-underlying provider can still behave differently between runs. The semantic provider receives
-the synthetic historical input and output, generated variation, and replayed sandbox responses.
-Model usage may cost money. The local sandbox performs no real payment or network action.
+Import OTLP traces without sending data to a model:
 
 ```bash
-uv run python -m examples.quickstart.run --dry-run
+ul dataset ingest otlp traces.json --output interactions.jsonl
 ```
 
-Dry-run makes no sandbox API or model calls. It prints the dataset plan, destination, external-data
-notice, and maximum call counts first.
-
-The full evidence is written locally as JSONL. Live dataset evaluation also saves each generated
-augmentation before sandbox execution in a private sibling ledger: `results.jsonl` produces
-`results.augmentations.jsonl`. The ledger is reused by `--resume`, so an interruption after
-generation does not repeat paid or nondeterministic augmentation work. Both files contain
-customer-derived data, use mode `0600` on Unix, and are neither encrypted nor automatically
-redacted. Use `--augmentations-output PATH` to choose its location, or
-`--no-save-augmentations` only when local retention is prohibited and regeneration is acceptable.
-
-The quickstart exits `0` when it confirms both its
-expected stable 3/3 `changed action value` finding and the customer-rule violation; any
-unconfirmed or interrupted run exits nonzero.
-For the underlying `ul dataset evaluate` command, exit `0` means no review finding or declared-rule
-violation, `1` means an observed difference needs review or a declared rule was violated, and `2`
-means the evaluation could not finish or a declared rule was not evaluable. Exit `1` is not a
-general correctness judgment.
-
-Resume an interrupted evaluation by passing its existing evidence file with the identical
-dataset selection, operators, repetitions, sandbox mapping, invariant suite, and semantic-model
-configuration:
+Create an approved replay bundle and stress a selected conversation:
 
 ```bash
-uv run ul dataset evaluate interactions.jsonl \
-  --sandbox-config sandbox.json \
-  --resume results.jsonl \
+ul dataset ingest otlp traces.json \
+  --mapping examples/otlp_mapping.json \
+  --replay-output trace-replay.json
+
+ul stress trace trace-replay.json \
+  --sandbox-config .ul/sandbox.json \
+  --case-id CASE_ID \
   --dry-run
 ```
 
-The preflight validates the saved run context and augmentation ledger, then reports completed and
-remaining interactions. Execution reuses saved augmentation records and appends only after the
-compatibility check succeeds. Evidence without run-context
-metadata, changed inputs, or changed evaluation semantics is rejected; call-budget and credential
-changes remain allowed because they authorize execution rather than change its meaning.
+Other stateful operators cover correction, retry-after-commit, and timeout-after-commit scenarios.
+Run `ul stress --help` for the available commands.
 
-Review findings without making more model or sandbox API calls:
+## Local examples
 
-```bash
-uv run ul dataset report PATH_TO_EVIDENCE.jsonl
-uv run ul dataset review PATH_TO_EVIDENCE.jsonl FINDING_ID \
-  --status confirmed \
-  --severity high \
-  --reviewer "payments-risk" \
-  --reason "The variation committed payment for the wrong invoice."
-uv run ul dataset report PATH_TO_EVIDENCE.jsonl
-```
-
-Reviews are appended to a separate `PATH_TO_EVIDENCE.reviews.jsonl` audit file; the evaluation
-evidence is never rewritten. UL creates the sidecar with mode `0600` on Unix. On Windows it
-inherits the parent directory's access controls, so store it in a directory restricted to the
-review team. Available judgments are `confirmed` (the reviewer sees a problem in this context),
-`expected` (a supported but acceptable difference), `unsupported` (the machine finding is not
-supported), and `inconclusive` (the reviewer needs more context). These are human judgments, not
-UL correctness labels. Correcting a judgment requires `--supersedes REVIEW_ID`, preserving the
-earlier decision.
-
-When an original satisfies a customer invariant and its variation violates that same rule,
-`dataset report` assigns the transition its own finding ID even if the semantic comparison found
-no behavioral difference. Review that ID with the same command. Other invariant outcomes remain
-visible in the invariant evaluation but are not presented as variation-caused findings.
-
-Reports hide compared and configured invariant values by default. When those values are necessary
-to make a review decision, rerun `dataset report` with `--show-sensitive-values --finding
-FINDING_ID`. This explicit opt-in prints values already stored for that one reviewable invariant
-finding, or refuses to disclose any if the bounded safety cap would be exceeded. They may contain
-secrets or PII and may be retained in terminal scrollback, CI output, or logs. Array-uniqueness
-evidence retains duplicate indices and pointers, not the selected values themselves.
-
-After a finding has an active `confirmed` review, save its exact variation and one or more
-violated customer rules as a replayable regression case:
+From a source checkout:
 
 ```bash
-uv run ul regression save PATH_TO_EVIDENCE.jsonl FINDING_ID \
-  --rule committed-invoice-matches-request \
-  --sandbox-config sandbox.json \
-  --output regressions/wrong-invoice.json \
-  --confirm-versioned-input
+uv sync
+
+# No model key required.
+uv run python -m examples.retry_after_successful_commit.run
+
+# Full synthetic-agent example.
+export OPEN_ROUTER_API_KEY=YOUR_SECRET_FROM_A_SECRET_MANAGER
+export UL_LIVE=true
+uv run python -m examples.quickstart.run
 ```
 
-For a customer-invariant finding, omit `--rule`: the finding already identifies its one violated
-rule, and UL selects it automatically. Semantic findings still require one or more explicit
-`--rule` options.
+Useful examples:
 
-`--confirm-versioned-input` is required because the case copies the exact raw input, literal
-target-template values, and selected customer-rule definitions. Rule literals and allowed sets
-can contain sensitive data. UL does not automatically redact these values: changing them could
-change the behavior being reproduced. Treat the case as sensitive, inspect it before committing,
-and apply your own data-governance policy.
+- [Quickstart agent](examples/quickstart/README.md)
+- [Retry after successful commit](examples/retry_after_successful_commit/README.md)
+- [Timeout after commit](examples/timeout_after_commit/README.md)
+- [Multi-turn correction](examples/multiturn_correction/README.md)
+- [Accounts payable](examples/accounts_payable/README.md)
 
-Replay the saved input and deterministic rules against a sandbox:
+## Development
 
 ```bash
-uv run ul regression replay regressions/wrong-invoice.json \
-  --sandbox-config sandbox.json \
-  --allow-sandbox-network-egress \
-  --confirm-isolated-sandbox \
-  --max-sandbox-api-calls 15 \
-  --output tmp/wrong-invoice-replay.json
+uv sync --locked
+uv run --frozen ruff format --check .
+uv run --frozen ruff check .
+uv run --frozen pyright
+uv run --frozen pytest -q
 ```
 
-For a local HTTP sandbox, also pass `--allow-insecure-http`. Replay makes exactly the saved number
-of sandbox API calls, refuses to start when that exceeds `--max-sandbox-api-calls`, and makes no
-semantic-model calls. It exits `0` when every selected rule is satisfied,
-`1` when any selected rule is violated, and `2` when a rule or sandbox call is inconclusive. A
-passing replay means only that the saved customer expectations held in those trials; it does not
-prove the agent is correct or that a failure was fixed.
-
-Replay a directory of saved cases against the current sandbox deployment:
-
-```bash
-uv run ul regression run regressions/ \
-  --sandbox-config sandbox.json \
-  --allow-sandbox-network-egress \
-  --confirm-isolated-sandbox \
-  --max-sandbox-api-calls 100 \
-  --output tmp/regression-run.json
-```
-
-The runner reads every immediate `.json` file in the directory in filename order, validates the
-complete suite and its total call budget before resolving sandbox credentials, and then executes
-all cases sequentially. It exits `0` when every case passes, `1` when any known failure is
-observed, and `2` when no case fails but at least one is inconclusive. A failed case takes
-precedence over an inconclusive case so a known recurrence is never hidden; the JSON artifact
-retains every case result and its source filename. The artifact includes UTC start and completion
-times and the trusted target-configuration digest. It does not claim that a behavioral change was
-caused by a vendor deployment or model update.
-
-Use the same command for manual, CI, and scheduled monitoring. For example, a cron job can run it
-daily with a unique immutable output such as
-`tmp/regression-run-$(date -u +\%Y\%m\%dT\%H\%M\%SZ).json`. A GitHub Actions workflow can use both
-`workflow_dispatch` and `schedule` triggers:
-
-```yaml
-name: Scheduled UL regressions
-
-on:
-  workflow_dispatch:
-  schedule:
-    - cron: "17 3 * * *"
-
-permissions:
-  contents: read
-
-concurrency:
-  group: ul-regressions-production-sandbox
-  cancel-in-progress: false
-
-jobs:
-  monitor:
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
-        with:
-          version: "0.12.4"
-          python-version: "3.12"
-      - run: uv sync --locked
-      - name: Run UL regressions
-        env:
-          UL_SANDBOX_TARGET_TOKEN: ${{ secrets.TARGET_TOKEN }}
-        run: uv run --frozen ul regression run regressions/ --sandbox-config sandbox.json --allow-sandbox-network-egress --confirm-isolated-sandbox --max-sandbox-api-calls 100 --output tmp/regression-run-${{ github.run_id }}.json
-      - name: Upload UL evidence
-        if: ${{ !cancelled() && vars.UL_UPLOAD_RAW_EVIDENCE == 'true' }}
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        with:
-          name: ul-regression-${{ github.run_id }}
-          path: tmp/regression-run-${{ github.run_id }}.json
-          if-no-files-found: ignore
-          retention-days: 1
-```
-
-Review and update the pinned action commits under your dependency policy. Raw-evidence upload is
-disabled unless the repository variable `UL_UPLOAD_RAW_EVIDENCE` is set to `true`; enable it only
-when GitHub Actions artifact access and retention meet your data policy. Otherwise send the safe
-terminal summary to your alerting system and move raw evidence directly to approved encrypted
-storage. Scheduled monitoring still requires a sandbox that is isolated, has no real business
-effects, and starts every request from equivalent fresh state. Regression run evidence contains
-raw sandbox responses and may be sensitive; store and retain it according to the same policy as
-single-case replay evidence.
-
-The case contains a sandbox configuration declared by the customer when the case is created. UL
-cannot verify that it was the discovery sandbox; its digest only binds future replay to that
-declaration. UL never executes the embedded configuration. You must separately provide a trusted
-sandbox configuration, and its digest must match before any request is sent. Literal request-template
-values and replay evidence can contain sensitive data. Keep cases and complete replay evidence as
-versioned artifacts only when that matches your access-control and retention policy.
-
-See [the quickstart details](examples/quickstart/README.md) for the expanded command and file
-layout.
-
-## Import agent traces
-
-Turn an OTLP JSON or OTLP File Exporter JSON Lines export into trace-native UL scenarios with the
-built-in OpenTelemetry GenAI and OpenInference mapping:
-
-```bash
-uv run ul dataset ingest otlp traces.json \
-  --mapping examples/otlp_mapping.json \
-  --dry-run
-uv run ul dataset ingest otlp traces.json \
-  --mapping examples/otlp_mapping.json \
-  --output interactions.jsonl
-```
-
-Dry-run reports only counts and mapping gaps; it never prints trace values. Each imported output
-contains ordered messages, parent-child span topology, tool calls and results, errors and retries,
-mapped state snapshots and deltas, session identity, agent version, and source references. Unknown
-attributes are dropped. Cumulative per-span histories are retained on their spans but collapsed into
-one compatible top-level conversation; traces with conflicting histories are skipped and reported.
-Each output record is capped at 1 MB, and the output is created with mode `0600` on Unix.
-
-[`examples/otlp_mapping.json`](examples/otlp_mapping.json) explicitly enables raw message, tool,
-error, and state content. Those values can contain credentials, personal data, or business data.
-Keep raw content disabled unless the export is approved for local processing, customize the
-allowlisted attribute names under `attributes`, and apply your retention policy to the resulting
-dataset. The default conventions cover current structured `gen_ai.input.messages` /
-`gen_ai.output.messages`, flattened OpenInference `llm.input_messages` /
-`llm.output_messages`, and the earlier `gen_ai.prompt` / `gen_ai.completion` form. UL reads a file
-export only; it does not connect to a telemetry backend or guess arbitrary vendor fields.
-
-### Replay a production conversation turn
-
-Materialize one replay case for every completed user turn in an imported trace:
-
-```bash
-uv run ul dataset ingest otlp traces.json \
-  --mapping examples/otlp_mapping.json \
-  --replay-output tmp/trace-replay.json
-
-uv run ul stress trace tmp/trace-replay.json \
-  --sandbox-config sandbox.json \
-  --case-id ultr_v1_CASE_ID \
-  --dry-run
-```
-
-Each case preserves the ordered conversation prefix, the user turns UL will send to the sandbox,
-the recorded terminal assistant response, available committed-state snapshots, source span IDs,
-and a digest-bound copy of the canonical trace envelope. If a bundle contains one case,
-`--case-id` is optional. For a live replay, add `--allow-sandbox-network-egress`,
-`--confirm-isolated-sandbox`, and `--output`.
-
-UL starts a clean sandbox lifecycle and re-executes the user turns through the sandbox API.
-Recorded assistant and tool messages remain provenance: UL does not inject them into the sandbox
-or pretend it can restore an opaque production checkpoint. A `reproduced` result
-means the selected response and any available committed-state snapshot matched across the requested
-repetitions. `drifted` means they differed; it is evidence for investigation, not an automatic
-correctness failure.
-
-Replay bundles contain approved raw trace content and are created with mode `0600` on Unix. They
-require an explicit mapping with `include_raw_content` enabled, are digest-bound, and remain subject
-to the 50 MB bundle limit. Keep them in governed local storage.
-
-## Connect your customer-managed sandbox API
-
-Give UL the base URL of an isolated, non-production deployment of your agent:
-
-```bash
-ul init your-data.jsonl \
-  --sandbox-url https://your-sandbox.example \
-  --allow-sandbox-network-egress \
-  --confirm-isolated-sandbox
-
-# Adjust the generated lifecycle mapping once, then verify it.
-ul sandbox check .ul/sandbox.json \
-  --probe "Describe your harmless sandbox-only check here" \
-  --allow-sandbox-network-egress \
-  --confirm-isolated-sandbox \
-  --confirm-harmless-probe
-ul run --dry-run
-```
-
-The customer builds and operates this sandbox; UL only calls its API. It must expose reset,
-execute-turn, and snapshot lifecycle endpoints. Use `headers_from_env` in the sandbox file for
-credentials so secret values remain outside the configuration. Dry-run validates the production
-dataset and sandbox mapping without making external calls.
-
-Credential environment-variable names must use the dedicated `UL_SANDBOX_*` namespace. This keeps
-a sandbox configuration from selecting unrelated ambient process credentials.
-
-Once the check and dry-run succeed, set the semantic-provider environment variables and use only
-`ul run` followed by `ul report`. The `ul dataset ...` commands remain available when automation
-needs every input and output path specified explicitly.
-
-`ul sandbox check` makes no UL semantic-model calls. It runs the supplied non-sensitive probe through
-the configured reset, optional setup, initial snapshot, execute-turn, post-turn snapshot, and
-cleanup-reset lifecycle. It reports the exact failing phase, a safe diagnostic category,
-delivery certainty, cleanup status, and whether the sandbox must be quarantined. The probe,
-response, committed state, endpoint URLs, and credential values are never printed. Pass `--json`
-for a machine-readable safe summary. Exit `0` means the complete protocol check succeeded; exit
-`2` means the connection is not ready or the command/configuration is invalid.
-
-The check validates UL's protocol contract. It does not prove that the endpoint is isolated, that
-reset erased every backing store, or that the supplied probe is harmless. Those properties remain
-customer attestations. UL never retries an ambiguously delivered lifecycle mutation.
-The customer-managed agent behind the sandbox API may make its own model calls; UL does not control
-or count those calls.
-
-Try the complete bundled local path with no API key or UL semantic-model calls:
-
-```bash
-uv run python -m examples.quickstart.run --sandbox-check
-```
-
-Use a lifecycle configuration such as [`examples/stateful_target.json`](examples/stateful_target.json). The
-[quickstart sandbox](examples/quickstart/README.md) is a runnable example API. For every
-original or variation repetition, UL sends these same-origin POST requests in order:
-
-```text
-reset → optional setup → initial snapshot → execute_turn → snapshot → cleanup reset
-```
-
-Each reset must return JSON containing a configured clean-state field and a generation string or
-integer that changes on every reset. UL validates both fields before setup and again during cleanup.
-This proves the adapter returned a fresh acknowledgement, not that the underlying system actually
-erased every state store.
-
-`execute_turn` returns the agent response used for semantic comparison. `snapshot` separately
-returns committed state used by invariants whose `observation_authority` is
-`committed_state_snapshot`. A failed reset, setup, execution, snapshot, or cleanup reset makes the
-repetition inconclusive. UL disables redirects, ignores proxy environment variables, applies the
-same environment-backed headers to every operation, and rejects lifecycle URLs that do not share
-one origin. Setup may return an empty successful response; reset, execute, and snapshot must
-return bounded JSON. UL verifies the reset response contract and ordering, but cannot prove
-that the sandbox actually erased or seeded its internal state. The sandbox implementation remains
-responsible for making reset deterministic and complete.
-
-Setup is one static JSON fixture from the sandbox configuration and is reused for every repetition
-in the run. Per-record setup fixtures are intentionally deferred. Put record-specific content only
-in the `execute_turn` template for now.
-
-Each physical lifecycle request counts toward `--max-sandbox-api-calls`. UL snapshots the sandbox
-after reset/setup and before the first test turn, so a configuration with setup uses six calls per
-single-turn repetition; without setup it uses five. `committed_state_snapshot` is evaluable only
-when the snapshot call succeeds.
-
-### Stress a later correction across turns
-
-UL includes one trace-independent multi-turn event operator:
-`conversation.correction_after_first_response@1.0.0`. A correction case contains exactly two ordered user
-turns. For each repetition UL runs a fresh one-turn baseline, resets the sandbox, then runs the
-initial turn and correction together in one lifecycle. It captures the agent response and a
-committed-state snapshot after both variation turns, then cleans up before the next pair.
-
-Try the complete deterministic example first. It requires no API key and, after dependencies are
-installed, makes no semantic-provider or non-loopback sandbox calls. It exits successfully only
-when it confirms the seeded critical business-rule violation:
-
-```bash
-uv run python -m examples.multiturn_correction.run
-```
-
-The runner retains private evidence under `tmp/`. Use the lower-level command below when connecting
-your own persistent sandbox.
-
-```bash
-uv run ul stress correction examples/multiturn_correction/case.json \
-  --sandbox-config examples/multiturn_correction/target.json \
-  --invariants examples/multiturn_correction/invariants.json \
-  --allow-sandbox-network-egress --allow-insecure-http --confirm-isolated-sandbox \
-  --max-sandbox-api-calls 42 --output tmp/multiturn-correction-evidence.json
-```
-
-Use `--dry-run` to validate the exact conversation, target, invariant suite, and physical call
-budget without making a request. With setup, one paired repetition uses 14 calls: six for the
-baseline and eight for the two-turn variation. Evidence identifies the first turn whose response
-or committed state differs from the baseline and retains every ordered intermediate observation.
-The customer-declared invariant evaluates the final corrected state; UL does not infer whether a
-changed state is correct.
-
-Save and replay the exact conversation without semantic-model calls:
-
-```bash
-uv run ul stress save examples/multiturn_correction/case.json \
-  --sandbox-config examples/multiturn_correction/target.json \
-  --invariants examples/multiturn_correction/invariants.json \
-  --confirm-versioned-input --output tmp/correction-regression.json
-
-uv run ul stress replay tmp/correction-regression.json \
-  --sandbox-config examples/multiturn_correction/target.json \
-  --allow-sandbox-network-egress --allow-insecure-http --confirm-isolated-sandbox \
-  --max-sandbox-api-calls 42 --output tmp/correction-replay.json
-```
-
-Saved cases contain the exact conversation and invariant literals and can therefore be sensitive.
-The embedded sandbox config is digest-bound but never trusted for execution; replay requires a
-separately supplied sandbox config with the same digest.
-
-To add customer-defined deterministic checks, provide a strict invariant file:
-
-```json
-{
-  "schema_version": "1.0.0",
-  "observation_source": "target_output",
-  "observation_authority": "committed_state_snapshot",
-  "rules": [
-    {
-      "type": "json_values_equal",
-      "id": "committed-amount-matches-corrected-amount",
-      "version": "1.0.0",
-      "description": "The committed amount must equal the corrected amount.",
-      "severity": "high",
-      "left_pointer": "/committed_amount",
-      "right_pointer": "/corrected_amount"
-    }
-  ]
-}
-```
-
-Pass it with `--invariants invariants.json`. UL evaluates the rule locally for every executed
-original and variation trial. Results are `satisfied`, `violated`, or `not_evaluable`; missing or
-non-scalar values never silently satisfy a rule. A satisfied declared rule does not establish
-that the agent is correct or safe beyond that rule. Non-integer JSON numbers and selected values
-larger than 4 KiB are `not_evaluable` in this first rule type. Represent exact decimal values as
-strings or integer minor units rather than binary JSON floats. `observation_authority` is the
-customer's choice of the agent-response or committed-snapshot channel. UL keeps those channels
-separate and never substitutes an agent response for a missing committed-state snapshot.
-
-Invariant schema `1.1.0` also supports literal values, allowed sets, and array uniqueness by a
-customer-declared composite key:
-
-```json
-{
-  "schema_version": "1.1.0",
-  "observation_source": "target_output",
-  "observation_authority": "committed_state_snapshot",
-  "rules": [
-    {
-      "type": "json_value_equals_literal",
-      "id": "approval-is-current",
-      "version": "1.0.0",
-      "description": "The approval version must be current.",
-      "severity": "critical",
-      "value_pointer": "/approval/version",
-      "literal": 7
-    },
-    {
-      "type": "json_value_in_allowed_set",
-      "id": "action-is-allowed",
-      "version": "1.0.0",
-      "description": "The committed action must be explicitly allowed.",
-      "severity": "critical",
-      "value_pointer": "/action",
-      "allowed_values": ["approved", "rejected", "needs_human_review"]
-    },
-    {
-      "type": "json_array_items_unique_by",
-      "id": "never-pay-twice",
-      "version": "1.0.0",
-      "description": "An invoice must not be paid twice from one account.",
-      "severity": "critical",
-      "array_pointer": "/payments",
-      "key_pointers": ["/invoice_reference", "/source_bank_account_id"]
-    }
-  ]
-}
-```
-
-Configured and observed rule values are limited to JSON strings, integers, booleans, or null.
-Comparison is exact and type-sensitive: `true`, `1`, and `"1"` are different values. The
-uniqueness rule checks 1–10 relative JSON pointers for each array item and reports only item counts,
-pointer locations, and duplicate indices to the terminal; selected values remain in private evidence.
-An empty or single-item array satisfies uniqueness but does not prove an action occurred. The rule
-applies only within one declared target-output snapshot, not across independent customer requests.
-UL also applies a fixed work budget across array rules and trials for each interaction. If their
-combined item and pointer-processing work exceeds that budget, affected trials are `not_evaluable`
-rather than silently passing or consuming unbounded CPU time.
+See [VISION.md](VISION.md), [Contributing](CONTRIBUTING.md), [Security](SECURITY.md), and the
+[MIT License](LICENSE).

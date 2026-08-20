@@ -28,7 +28,7 @@ from ul_cli.dataset import (
     validate_dataset_operator_ids,
     validate_interaction_dataset,
 )
-from ul_cli.dataset_review import report_dataset_evidence
+from ul_cli.dataset_review import is_reportable_dataset_evidence, report_dataset_evidence
 
 console = Console()
 
@@ -211,8 +211,12 @@ def initialize_project(
     runs_directory_created = not runs_directory.exists()
     ignore_file_created = False
     generated_sandbox_path: Path | None = None
+    project_directory_status: os.stat_result | None = None
+    project_directory_descriptor: int | None = None
     try:
         _ensure_private_directory(project_directory)
+        project_directory_status = project_directory.lstat()
+        project_directory_descriptor = _open_private_directory(project_directory)
         _ensure_private_directory(runs_directory)
         _create_private_text(project_directory / ".gitignore", "*\n")
         ignore_file_created = True
@@ -265,7 +269,10 @@ def initialize_project(
             project_directory_created=project_directory_created,
             runs_directory_created=runs_directory_created,
             ignore_file_created=ignore_file_created,
+            project_directory_status=project_directory_status,
+            project_directory_descriptor=project_directory_descriptor,
         )
+        _close_descriptor(project_directory_descriptor)
         raise
     except ValidationError as error:
         _discard_incomplete_project(
@@ -275,7 +282,10 @@ def initialize_project(
             project_directory_created=project_directory_created,
             runs_directory_created=runs_directory_created,
             ignore_file_created=ignore_file_created,
+            project_directory_status=project_directory_status,
+            project_directory_descriptor=project_directory_descriptor,
         )
+        _close_descriptor(project_directory_descriptor)
         raise typer.BadParameter(
             f"cannot create UL project: {_format_validation_error(error)}"
         ) from None
@@ -287,8 +297,25 @@ def initialize_project(
             project_directory_created=project_directory_created,
             runs_directory_created=runs_directory_created,
             ignore_file_created=ignore_file_created,
+            project_directory_status=project_directory_status,
+            project_directory_descriptor=project_directory_descriptor,
         )
+        _close_descriptor(project_directory_descriptor)
         raise typer.BadParameter(f"cannot create UL project: {error}") from None
+    except BaseException:
+        _discard_incomplete_project(
+            project_directory,
+            runs_directory=runs_directory,
+            generated_sandbox_path=generated_sandbox_path,
+            project_directory_created=project_directory_created,
+            runs_directory_created=runs_directory_created,
+            ignore_file_created=ignore_file_created,
+            project_directory_status=project_directory_status,
+            project_directory_descriptor=project_directory_descriptor,
+        )
+        _close_descriptor(project_directory_descriptor)
+        raise
+    _close_descriptor(project_directory_descriptor)
     console.print(f"Configured UL project: {project_config_path}")
     if sandbox_url is not None:
         console.print(
@@ -429,9 +456,19 @@ def _load_project() -> tuple[Path, ProjectConfig]:
         if not config_path.exists() and not config_path.is_symlink():
             continue
         try:
-            _validate_private_directory(candidate_root / _PROJECT_DIRECTORY)
-            _validate_private_directory(candidate_root / _PROJECT_DIRECTORY / "runs")
-            return candidate_root, ProjectConfig.model_validate(_read_private_json(config_path))
+            project_directory = candidate_root / _PROJECT_DIRECTORY
+            project_descriptor = _open_private_directory(project_directory)
+            try:
+                runs_descriptor = _open_private_directory_at(
+                    project_descriptor, "runs", project_directory / "runs"
+                )
+                os.close(runs_descriptor)
+                config = ProjectConfig.model_validate(
+                    _read_private_json_at(project_descriptor, _PROJECT_CONFIG, config_path)
+                )
+            finally:
+                os.close(project_descriptor)
+            return candidate_root, config
         except ValidationError as error:
             raise typer.BadParameter(
                 f"invalid UL project config: {_format_validation_error(error)}"
@@ -443,6 +480,17 @@ def _load_project() -> tuple[Path, ProjectConfig]:
 
 def _read_private_json(path: Path) -> object:
     descriptor = _open_private_regular_file(path)
+    return _read_private_json_descriptor(descriptor)
+
+
+def _read_private_json_at(directory_descriptor: int, name: str, path: Path) -> object:
+    if sys.platform == "win32":
+        return _read_private_json(path)
+    descriptor = _open_private_regular_file_at(directory_descriptor, name)
+    return _read_private_json_descriptor(descriptor)
+
+
+def _read_private_json_descriptor(descriptor: int) -> object:
     try:
         file_status = os.fstat(descriptor)
         if not stat.S_ISREG(file_status.st_mode):
@@ -500,21 +548,51 @@ def _open_private_regular_file(path: Path) -> int:
         raise
 
 
+def _open_private_regular_file_at(directory_descriptor: int, name: str) -> int:
+    no_follow_flag = getattr(os, "O_NOFOLLOW", 0)
+    binary_flag = os.O_BINARY if sys.platform == "win32" else 0
+    descriptor = os.open(
+        name,
+        os.O_RDONLY | no_follow_flag | binary_flag,
+        dir_fd=directory_descriptor,
+    )
+    try:
+        descriptor_status = os.fstat(descriptor)
+        if not stat.S_ISREG(descriptor_status.st_mode):
+            raise OSError("project file must be a regular file")
+        if descriptor_status.st_nlink != 1:
+            raise OSError("project file must not have multiple hard links")
+        if sys.platform != "win32" and stat.S_IMODE(descriptor_status.st_mode) & 0o077:
+            raise OSError("project file permissions must not allow group or other access")
+        if hasattr(os, "getuid") and descriptor_status.st_uid != os.getuid():
+            raise OSError("project file must be owned by the current user")
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
 def _create_private_json(path: Path, value: object) -> None:
     _create_private_text(path, json.dumps(value, indent=2) + "\n")
 
 
 def _create_private_text(path: Path, value: str) -> None:
     descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    created_status = os.fstat(descriptor)
     try:
         if sys.platform != "win32":
             os.fchmod(descriptor, 0o600)
         output = os.fdopen(descriptor, "w", encoding="utf-8")
     except BaseException:
         os.close(descriptor)
+        _unlink_if_same(path, created_status)
         raise
-    with output:
-        output.write(value)
+    try:
+        with output:
+            output.write(value)
+    except BaseException:
+        _unlink_if_same(path, created_status)
+        raise
 
 
 def _replace_private_json(path: Path, value: object) -> None:
@@ -539,14 +617,7 @@ def _save_latest_evidence(project_root: Path, evidence: Path) -> None:
 
 
 def _has_nonempty_evidence(evidence: Path) -> bool:
-    try:
-        descriptor = _open_private_regular_file(evidence)
-    except OSError:
-        return False
-    try:
-        return os.fstat(descriptor).st_size > 0
-    finally:
-        os.close(descriptor)
+    return is_reportable_dataset_evidence(evidence)
 
 
 def _load_latest_evidence(project_root: Path) -> Path:
@@ -592,14 +663,63 @@ def _ensure_private_directory(path: Path) -> None:
         os.chmod(path, 0o700)
 
 
-def _validate_private_directory(path: Path) -> None:
-    path_status = path.lstat()
-    if stat.S_ISLNK(path_status.st_mode) or not stat.S_ISDIR(path_status.st_mode):
-        raise OSError(f"{path} must be a directory, not a symlink")
-    if sys.platform != "win32" and stat.S_IMODE(path_status.st_mode) & 0o077:
-        raise OSError(f"{path} permissions must not allow group or other access")
-    if hasattr(os, "getuid") and path_status.st_uid != os.getuid():
-        raise OSError(f"{path} must be owned by the current user")
+def _open_private_directory(path: Path) -> int:
+    no_follow_flag = getattr(os, "O_NOFOLLOW", 0)
+    directory_flag = getattr(os, "O_DIRECTORY", 0)
+    descriptor = os.open(path, os.O_RDONLY | no_follow_flag | directory_flag)
+    try:
+        _validate_private_directory_descriptor(descriptor)
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _open_private_directory_at(parent_descriptor: int, name: str, path: Path) -> int:
+    if sys.platform == "win32":
+        return _open_private_directory(path)
+    no_follow_flag = getattr(os, "O_NOFOLLOW", 0)
+    directory_flag = getattr(os, "O_DIRECTORY", 0)
+    descriptor = os.open(
+        name,
+        os.O_RDONLY | no_follow_flag | directory_flag,
+        dir_fd=parent_descriptor,
+    )
+    try:
+        _validate_private_directory_descriptor(descriptor)
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _validate_private_directory_descriptor(descriptor: int) -> None:
+    directory_status = os.fstat(descriptor)
+    if not stat.S_ISDIR(directory_status.st_mode):
+        raise OSError("project directory must be a directory")
+    if sys.platform != "win32" and stat.S_IMODE(directory_status.st_mode) & 0o077:
+        raise OSError("project directory permissions must not allow group or other access")
+    if hasattr(os, "getuid") and directory_status.st_uid != os.getuid():
+        raise OSError("project directory must be owned by the current user")
+
+
+def _require_same_path(path: Path, expected_status: os.stat_result) -> None:
+    current_status = path.lstat()
+    if stat.S_ISLNK(current_status.st_mode) or not os.path.samestat(
+        current_status, expected_status
+    ):
+        raise OSError(f"{path} changed while the project was loaded")
+
+
+def _unlink_if_same(path: Path, expected_status: os.stat_result) -> None:
+    try:
+        current_status = path.lstat()
+    except FileNotFoundError:
+        return
+    if not stat.S_ISLNK(current_status.st_mode) and os.path.samestat(
+        current_status, expected_status
+    ):
+        path.unlink()
 
 
 def _discard_incomplete_project(
@@ -610,19 +730,50 @@ def _discard_incomplete_project(
     project_directory_created: bool,
     runs_directory_created: bool,
     ignore_file_created: bool,
+    project_directory_status: os.stat_result | None,
+    project_directory_descriptor: int | None,
 ) -> None:
+    if project_directory_status is None or project_directory_descriptor is None:
+        return
+    if sys.platform == "win32":
+        try:
+            _require_same_path(project_directory, project_directory_status)
+        except (FileNotFoundError, OSError):
+            return
+        if generated_sandbox_path is not None:
+            with suppress(FileNotFoundError):
+                generated_sandbox_path.unlink()
+        if ignore_file_created:
+            with suppress(FileNotFoundError):
+                (project_directory / ".gitignore").unlink()
+        if runs_directory_created:
+            with suppress(OSError):
+                runs_directory.rmdir()
+        if project_directory_created:
+            with suppress(OSError):
+                project_directory.rmdir()
+        return
     if generated_sandbox_path is not None:
         with suppress(FileNotFoundError):
-            generated_sandbox_path.unlink()
+            os.unlink(generated_sandbox_path.name, dir_fd=project_directory_descriptor)
     if ignore_file_created:
         with suppress(FileNotFoundError):
-            (project_directory / ".gitignore").unlink()
+            os.unlink(".gitignore", dir_fd=project_directory_descriptor)
     if runs_directory_created:
         with suppress(OSError):
-            runs_directory.rmdir()
+            os.rmdir(runs_directory.name, dir_fd=project_directory_descriptor)
     if project_directory_created:
+        try:
+            _require_same_path(project_directory, project_directory_status)
+        except (FileNotFoundError, OSError):
+            return
         with suppress(OSError):
             project_directory.rmdir()
+
+
+def _close_descriptor(descriptor: int | None) -> None:
+    if descriptor is not None:
+        os.close(descriptor)
 
 
 def _reject_duplicate_json_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:

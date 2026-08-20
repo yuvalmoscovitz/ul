@@ -196,9 +196,22 @@ def initialize_dataset_sandbox(
             message = str(error)
         raise typer.BadParameter(message, param_hint="SANDBOX_CONFIG") from None
 
-    with output_stream:
-        json.dump(config.model_dump(mode="json", exclude_none=True), output_stream, indent=2)
-        output_stream.write("\n")
+    created_config_status = os.fstat(output_stream.fileno())
+    try:
+        with output_stream:
+            json.dump(config.model_dump(mode="json", exclude_none=True), output_stream, indent=2)
+            output_stream.write("\n")
+    except BaseException:
+        try:
+            current_config_status = sandbox_config.lstat()
+        except FileNotFoundError:
+            pass
+        else:
+            if not stat.S_ISLNK(current_config_status.st_mode) and os.path.samestat(
+                current_config_status, created_config_status
+            ):
+                sandbox_config.unlink()
+        raise
 
     console.print(f"Created private sandbox connection config: {sandbox_config}")
     if not show_guidance:
