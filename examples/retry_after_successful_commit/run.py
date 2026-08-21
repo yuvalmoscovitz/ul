@@ -137,7 +137,9 @@ def main(
     temporary_root.mkdir(exist_ok=True)
     artifact_directory = Path(tempfile.mkdtemp(prefix="retry-after-commit-", dir=temporary_root))
     target_config_path = artifact_directory / "target.json"
-    evidence_path = output.resolve() if output is not None else artifact_directory / "evidence.json"
+    evidence_path = (
+        output.absolute() if output is not None else artifact_directory / "evidence.json"
+    )
     server: ThreadingHTTPServer | None = None
     server_thread: Thread | None = None
     completed_process: subprocess.CompletedProcess[str]
