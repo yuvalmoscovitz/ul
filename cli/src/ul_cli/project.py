@@ -508,8 +508,13 @@ def update_project_config(
         lock_descriptor = _open_project_config_lock(project_directory)
         _lock_descriptor(lock_descriptor)
         config_locked = True
-        config_descriptor = _open_private_regular_file_at(project_descriptor, _PROJECT_CONFIG)
-        config = ProjectConfig.model_validate(_read_private_json_descriptor(config_descriptor))
+        config = ProjectConfig.model_validate(
+            _read_private_json_at(
+                project_descriptor,
+                _PROJECT_CONFIG,
+                project_directory / _PROJECT_CONFIG,
+            )
+        )
         updated_config = update(config)
         if updated_config != config:
             _replace_private_json(
