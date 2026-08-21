@@ -29,9 +29,10 @@ Run the first no-key product experience:
 ul demo
 ```
 
-The demo uses a fully synthetic environment on `localhost`. It makes zero semantic-model calls
-and zero external-network calls, so no API key is required. It prints a finding and saves private
-evidence in UL's application data directory for review.
+The demo evaluates two fake customer requests with three common input augmentations: typing errors,
+a frustrated tone, and a short message. It shows three repeatable behavior changes in the same
+evidence format used by dataset evaluations. It makes no model or network calls, so no API key or
+connected agent is required.
 
 ## Quickstart
 

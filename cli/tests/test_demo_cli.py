@@ -1,20 +1,23 @@
 from __future__ import annotations
 
+import asyncio
+import json
 import os
 import re
 import subprocess
 import sys
 import zipfile
+from io import StringIO
 from pathlib import Path
 
 import pytest
+from rich.console import Console
 from typer.testing import CliRunner
-from ul.event_stress import RetryAfterSuccessfulCommitStressResult
 from ul_cli import demo_runner
+from ul_cli.demo_scenario import run_demo_evaluations
 from ul_cli.main import app
 
 _PROJECT_ROOT = Path(__file__).parents[2]
-_EXPECTED_CONFIRMATION = "explicit retry created a second payment in all 3 repetitions"
 
 
 def test_root_help_exposes_model_free_demo() -> None:
@@ -40,7 +43,7 @@ def test_demo_rejects_symlinked_private_data_directory(
         demo_runner._create_demo_artifact_directory()
 
 
-def test_demo_confirms_duplicate_payment_without_model_credentials_and_retains_evidence(
+def test_demo_shows_three_generic_findings_without_credentials_and_retains_valid_evidence(
     tmp_path: Path,
 ) -> None:
     working_directory = tmp_path / "read-only-working-directory"
@@ -75,27 +78,85 @@ def test_demo_confirms_duplicate_payment_without_model_credentials_and_retains_e
             working_directory.chmod(0o700)
 
     assert completed_process.returncode == 0, completed_process.stdout + completed_process.stderr
-    assert "Confirmed:" in completed_process.stdout
-    assert _EXPECTED_CONFIRMATION in completed_process.stdout
-    assert "Semantic-model calls: none" in completed_process.stdout
-    assert "External-network calls: none" in completed_process.stdout
-    evidence_match = re.search(r"^Evidence: (.+)$", completed_process.stdout, re.MULTILINE)
+    assert "UL evaluation report" in completed_process.stdout
+    assert "2 customer requests" in completed_process.stdout
+    assert "3 augmentations" in completed_process.stdout
+    assert "3 repeatable findings" in completed_process.stdout
+    assert completed_process.stdout.count("Baseline input") == 2
+    assert completed_process.stdout.count("Augmentation") == 3
+    assert "Typing errors" in completed_process.stdout
+    assert "Frustrated customer" in completed_process.stdout
+    assert "Short message" in completed_process.stdout
+    normalized_output = " ".join(completed_process.stdout.split())
+    assert "subscription cancellation scheduled action is missing" in normalized_output
+    assert "cancellation timing changed from end of the billing period" in normalized_output
+    assert "address type changed from delivery address to billing address" in normalized_output
+    assert normalized_output.count("Detected by UL's action comparison") == 3
+    assert normalized_output.count("Seen in 3/3 runs") == 3
+    assert "no custom rules are used here" in normalized_output
+    evidence_match = re.search(r"^Full evidence  (.+)$", completed_process.stdout, re.MULTILINE)
     assert evidence_match is not None
 
     evidence_path = Path(evidence_match.group(1))
     assert evidence_path.is_file()
-    evidence = RetryAfterSuccessfulCommitStressResult.model_validate_json(
-        evidence_path.read_text(encoding="utf-8")
+    evidence_records = [
+        json.loads(line) for line in evidence_path.read_text(encoding="utf-8").splitlines()
+    ]
+    assert len(evidence_records) == 2
+    assert [len(record["cases"]) for record in evidence_records] == [2, 1]
+    assert (
+        sum(len(case["findings"]) for record in evidence_records for case in record["cases"]) == 3
     )
-    assert evidence.status == "failed"
-    assert evidence.requested_repetitions == 3
-    assert {rule.status for rule in evidence.baseline_invariant_rules} == {"satisfied"}
-    assert {rule.status for rule in evidence.successful_commit_invariant_rules} == {"satisfied"}
-    assert {rule.rule_id: rule.status for rule in evidence.retried_invariant_rules} == {
-        "exactly-one-committed-payment": "violated",
-        "committed-payments-unique-by-invoice": "violated",
-        "one-new-payment-per-turn": "satisfied",
-    }
+    assert all(
+        trial["execution_evidence"] is not None
+        for record in evidence_records
+        for case in record["technical_details"]["cases"]
+        for trial in case["trial_set"]["trials"]
+    )
+
+    report_result = CliRunner().invoke(app, ["dataset", "report", str(evidence_path)])
+    assert report_result.exit_code == 0, report_result.output
+    assert "Dataset finding report: 3 finding(s)" in report_result.output
+
+
+def test_demo_report_uses_terminal_colors(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    output = StringIO()
+    monkeypatch.setattr(
+        demo_runner,
+        "console",
+        Console(file=output, force_terminal=True, color_system="standard", width=120),
+    )
+
+    demo_runner._print_report(asyncio.run(run_demo_evaluations()), tmp_path / "evidence.jsonl")
+
+    rendered = output.getvalue()
+    assert "\x1b[" in rendered
+    assert "3 repeatable findings" in rendered
+
+
+@pytest.mark.skipif(os.name == "nt", reason="symlink creation may require Windows privileges")
+def test_demo_rejects_a_dangling_output_symlink(tmp_path: Path) -> None:
+    output = tmp_path / "evidence.jsonl"
+    symlink_target = tmp_path / "target.jsonl"
+    output.symlink_to(symlink_target)
+
+    result = CliRunner().invoke(app, ["demo", "--output", str(output)])
+
+    assert result.exit_code == 2
+    assert not symlink_target.exists()
+
+
+def test_demo_escapes_an_unsafe_output_path(monkeypatch: pytest.MonkeyPatch) -> None:
+    output = StringIO()
+    monkeypatch.setattr(demo_runner, "console", Console(file=output, force_terminal=False))
+    unsafe_path = Path("/tmp/evidence; touch hacked\x1b.jsonl")
+
+    demo_runner._print_report(asyncio.run(run_demo_evaluations()), unsafe_path)
+
+    rendered = output.getvalue()
+    assert "\x1b" not in rendered
+    assert "\\u001b" in rendered
+    assert "ul dataset report '/tmp/evidence; touch hacked\\u001b.jsonl'" in rendered
 
 
 def test_built_wheel_contains_the_complete_demo(tmp_path: Path) -> None:
@@ -120,12 +181,9 @@ def test_built_wheel_contains_the_complete_demo(tmp_path: Path) -> None:
         "examples/retry_after_successful_commit/invariants.json",
         "examples/retry_after_successful_commit/run.py",
         "examples/retry_after_successful_commit/target.json",
-        "ul_cli/demo_assets/__init__.py",
-        "ul_cli/demo_assets/case.json",
-        "ul_cli/demo_assets/invariants.json",
-        "ul_cli/demo_assets/target.json",
         "ul_cli/demo.py",
         "ul_cli/demo_runner.py",
+        "ul_cli/demo_scenario.py",
         "ul_cli/main.py",
     } <= names
     assert not any(

@@ -1,131 +1,33 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import os
+import shlex
 import stat
-import subprocess
-import sys
 import tempfile
-from contextlib import ExitStack
-from http import HTTPStatus
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from importlib import resources
+import unicodedata
 from pathlib import Path
-from threading import Lock, Thread
-from typing import ClassVar, TextIO, cast
+from typing import TextIO
 
 import typer
 from platformdirs import user_data_path
-from pydantic import ValidationError
-from ul.event_stress import RetryAfterSuccessfulCommitStressResult
+from pydantic import JsonValue
+from rich.console import Console
+from rich.panel import Panel
+from rich.text import Text
+from ul.dataset_evaluation import DatasetEvaluationFinding, DatasetEvaluationResult
 
-_EXPECTED_RULE_IDS = {
-    "exactly-one-committed-payment",
-    "committed-payments-unique-by-invoice",
-    "one-new-payment-per-turn",
+from ul_cli.dataset import create_customer_evidence_record
+from ul_cli.demo_scenario import run_demo_evaluations
+
+console = Console()
+
+_AUGMENTATION_NAMES = {
+    "input.surface.typing_noise": "Typing errors",
+    "input.tone.frustrated": "Frustrated customer",
+    "input.style.terse": "Short message",
 }
-
-
-class DemoRetryHandler(BaseHTTPRequestHandler):
-    environment_id: ClassVar[str] = "retry-after-successful-commit-demo"
-    state_lock: ClassVar[Lock] = Lock()
-    generation: ClassVar[int] = 0
-    committed_effects: ClassVar[list[dict[str, str]]] = []
-
-    def do_POST(self) -> None:
-        try:
-            content_length = int(self.headers.get("content-length", "0"))
-        except ValueError:
-            self._send(HTTPStatus.BAD_REQUEST, {"error": "invalid content length"})
-            return
-        if content_length < 0 or content_length > 100_000:
-            self._send(HTTPStatus.REQUEST_ENTITY_TOO_LARGE, {"error": "request too large"})
-            return
-        try:
-            raw_request: object = json.loads(self.rfile.read(content_length))
-        except (json.JSONDecodeError, ValueError):
-            self._send(HTTPStatus.BAD_REQUEST, {"error": "invalid JSON"})
-            return
-        if not isinstance(raw_request, dict):
-            self._send(HTTPStatus.BAD_REQUEST, {"error": "JSON object required"})
-            return
-        request = cast(dict[str, object], raw_request)
-        if self.path == "/reset":
-            with type(self).state_lock:
-                type(self).generation += 1
-                type(self).committed_effects = []
-                generation = type(self).generation
-            self._send(
-                HTTPStatus.OK,
-                {
-                    "case_id": request.get("case_id"),
-                    "generation": generation,
-                    "clean": True,
-                    "reset_session": request.get("reset_session") is True,
-                    "reset_env": request.get("reset_env") is True,
-                },
-            )
-        elif self.path == "/setup":
-            self._send(HTTPStatus.OK, {"case_id": request.get("case_id")})
-        elif self.path == "/snapshot":
-            with type(self).state_lock:
-                committed_effects = [dict(effect) for effect in type(self).committed_effects]
-            self._send(
-                HTTPStatus.OK,
-                {
-                    "case_id": request.get("case_id"),
-                    "turn_id": request.get("turn_id"),
-                    "state": {
-                        "committed_effect_count": len(committed_effects),
-                        "committed_effects": committed_effects,
-                    },
-                },
-            )
-        elif self.path == "/execute":
-            raw_input = request.get("input")
-            if not isinstance(raw_input, str) or "AC-100" not in raw_input:
-                self._send(HTTPStatus.BAD_REQUEST, {"error": "AC-100 input required"})
-                return
-            with type(self).state_lock:
-                attempt = len(type(self).committed_effects) + 1
-                type(self).committed_effects.append(
-                    {
-                        "payment_id": f"payment-{attempt}",
-                        "invoice_reference": "AC-100",
-                        "idempotency_key": f"invoice:AC-100:attempt-{attempt}",
-                    }
-                )
-            response = (
-                "Payment committed." if attempt == 1 else "Payment retried and committed again."
-            )
-            self._send(
-                HTTPStatus.OK,
-                {
-                    "case_id": request.get("case_id"),
-                    "turn_id": request.get("turn_id"),
-                    "response": response,
-                },
-            )
-        else:
-            self._send(HTTPStatus.NOT_FOUND, {"error": "not found"})
-
-    def _send(self, status: HTTPStatus, payload: dict[str, object]) -> None:
-        body = json.dumps(
-            {**payload, "environment_id": self.environment_id}, separators=(",", ":")
-        ).encode()
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(body)))
-        self.send_header("Connection", "close")
-        self.end_headers()
-        self.wfile.write(body)
-
-    def log_message(self, format: str, *args: object) -> None:
-        return
-
-
-def create_server(port: int = 0) -> ThreadingHTTPServer:
-    return ThreadingHTTPServer(("127.0.0.1", port), DemoRetryHandler)
 
 
 def _create_private_file(path: Path) -> TextIO:
@@ -156,85 +58,175 @@ def _create_demo_artifact_directory() -> Path:
             raise ValueError("UL demo data path must be a directory, not a symlink") from None
         if os.name != "nt":
             os.chmod(demo_directory, 0o700)
-    return Path(tempfile.mkdtemp(prefix="retry-after-commit-", dir=demo_directory))
+    return Path(tempfile.mkdtemp(prefix="human-inputs-", dir=demo_directory))
 
 
-def _load_target_template(base_url: str) -> dict[str, object]:
-    target_resource = resources.files("ul_cli.demo_assets").joinpath("target.json")
-    untyped_target_config: object = json.loads(target_resource.read_text(encoding="utf-8"))
-    if type(untyped_target_config) is not dict:
-        raise ValueError("demo target configuration must be a JSON object")
-    target_config = cast(dict[str, object], untyped_target_config)
-    for phase, endpoint in {
-        "reset": "reset",
-        "setup": "setup",
-        "execute_turn": "execute",
-        "snapshot": "snapshot",
-    }.items():
-        phase_config = cast(dict[str, object], target_config[phase])
-        phase_config["url"] = f"{base_url}/{endpoint}"
-    return target_config
-
-
-def _subprocess_environment() -> dict[str, str]:
-    environment = {"PYTHONUTF8": "1"}
-    for name in ("SYSTEMROOT", "WINDIR"):
-        if name in os.environ:
-            environment[name] = os.environ[name]
-    return environment
-
-
-def _evidence_confirms_repeatable_duplicate(evidence_path: Path) -> bool:
-    try:
-        result = RetryAfterSuccessfulCommitStressResult.model_validate_json(
-            evidence_path.read_text(encoding="utf-8")
-        )
-    except (OSError, UnicodeDecodeError, ValidationError, ValueError):
-        return False
-    checkpoints = (
-        result.baseline_invariant_rules,
-        result.successful_commit_invariant_rules,
-        result.retried_invariant_rules,
-    )
-    if any({rule.rule_id for rule in rules} != _EXPECTED_RULE_IDS for rules in checkpoints):
-        return False
-    return (
-        result.case.operator_id == "conversation.retry_after_successful_commit"
-        and result.case.operator_version == "1.0.0"
-        and result.status == "failed"
-        and result.requested_repetitions == 3
-        and not result.baseline_drift_observed
-        and all(trial.inconclusive_reason is None for trial in result.trials)
-        and all(rule.status == "satisfied" for rule in result.baseline_invariant_rules)
-        and all(rule.status == "satisfied" for rule in result.successful_commit_invariant_rules)
-        and all(
-            rule.status
-            == ("satisfied" if rule.rule_id == "one-new-payment-per-turn" else "violated")
-            for rule in result.retried_invariant_rules
-        )
-        and all(
-            len(rule.trials) == 3
-            and all(
-                trial.status
-                == ("satisfied" if rule.rule_id == "one-new-payment-per-turn" else "violated")
-                for trial in rule.trials
+def _save_evidence(results: tuple[DatasetEvaluationResult, ...], path: Path) -> None:
+    with _create_private_file(path) as evidence_file:
+        for result in results:
+            planned_calls = 3 * (1 + len(result.cases))
+            evidence = create_customer_evidence_record(
+                result,
+                repetitions=3,
+                max_environment_api_calls=planned_calls,
+                planned_target_calls=planned_calls,
             )
-            for rule in result.retried_invariant_rules
+            json.dump(evidence, evidence_file, ensure_ascii=False, separators=(",", ":"))
+            evidence_file.write("\n")
+
+
+def _describe_outcomes(result: DatasetEvaluationResult, case_index: int | None = None) -> str:
+    if case_index is None:
+        trial_set = result.baseline.trial_set
+    else:
+        trial_set = result.cases[case_index].trial_set
+        if trial_set is None:
+            return "The variation was not run."
+    representative_frame = trial_set.representative_frame
+    if representative_frame is None:
+        return "The agent's behavior was not stable."
+    outcomes = tuple(
+        outcome for outcome in representative_frame.outcomes if outcome.kind == "action"
+    )
+    if not outcomes:
+        return "The agent took no action."
+    outcome = outcomes[0]
+    if outcome.predicate == "subscription_cancellation_scheduled":
+        timing = outcome.fields.get("when")
+        if timing == "end":
+            return "The agent scheduled cancellation for the end of the billing period."
+        if timing == "immediately":
+            return "The agent cancelled the subscription immediately."
+    if outcome.predicate == "customer_address_changed":
+        address_type = outcome.fields.get("address_type")
+        address = outcome.fields.get("address")
+        return f"The agent changed the {address_type} address to {address}."
+    return "The agent took a different action."
+
+
+def _display_field_value(field_name: str, value: JsonValue) -> str:
+    labels = {
+        ("when", "end"): "end of the billing period",
+        ("when", "immediately"): "immediately",
+        ("address_type", "delivery"): "delivery address",
+        ("address_type", "billing"): "billing address",
+    }
+    if isinstance(value, str):
+        return labels.get((field_name, value), value)
+    return str(value)
+
+
+def _describe_finding(finding: DatasetEvaluationFinding) -> str:
+    if finding.category == "missing_effect":
+        predicate = finding.expected_effects[0].predicate.replace("_", " ")
+        return f"UL detected that the {predicate} action is missing."
+    if (
+        finding.category == "changed_grounded_effect_argument"
+        and finding.expected_effects
+        and finding.observed_effects
+        and finding.grounded_field_names
+    ):
+        field_name = finding.grounded_field_names[0]
+        expected_value = finding.expected_effects[0].fields.get(field_name)
+        observed_value = finding.observed_effects[0].fields.get(field_name)
+        field_label = {
+            "when": "cancellation timing",
+            "address_type": "address type",
+        }.get(field_name, field_name.replace("_", " "))
+        return (
+            "UL detected that "
+            f"{field_label} changed from "
+            f"{_display_field_value(field_name, expected_value)} to "
+            f"{_display_field_value(field_name, observed_value)}."
         )
-        and all(
-            len(trial.variation) == 2
-            and _committed_effect_count(trial.variation[0].committed_state_snapshot) == 1
-            and _committed_effect_count(trial.variation[1].committed_state_snapshot) == 2
-            for trial in result.trials
-        )
+    return "UL detected a repeatable action difference."
+
+
+def _terminal_safe(message: str) -> str:
+    return "".join(
+        character
+        if (ord(character) >= 32 and not 0x7F <= ord(character) <= 0x9F)
+        and unicodedata.category(character) not in {"Cf", "Cs"}
+        else f"\\u{ord(character):04x}"
+        for character in message
     )
 
 
-def _committed_effect_count(snapshot: object) -> int | None:
-    if type(snapshot) is not dict:
-        return None
-    value = cast(dict[str, object], snapshot).get("committed_effect_count")
-    return value if type(value) is int else None
+def _print_report(results: tuple[DatasetEvaluationResult, ...], evidence_path: Path) -> None:
+    finding_count = sum(len(case.findings) for result in results for case in result.cases)
+    augmentation_count = sum(len(result.cases) for result in results)
+    console.print("[bold cyan]UL demo[/bold cyan] [dim]Synthetic agent · Real UL evaluation[/dim]")
+    console.print()
+    summary = Text()
+    summary.append(f"{len(results)} customer requests", style="bold")
+    summary.append("  •  ")
+    summary.append(f"{augmentation_count} augmentations", style="bold cyan")
+    summary.append("  •  ")
+    summary.append(f"{finding_count} repeatable findings", style="bold red")
+    console.print(Panel.fit(summary, title="[bold cyan]UL evaluation report[/bold cyan]"))
+    console.print()
+    console.print(
+        "[dim]UL reruns each original input to establish a baseline. It then automatically "
+        "compares actions after each augmentation. Repeatable differences need human review; "
+        "no custom rules are used here.[/dim]"
+    )
+
+    for result_number, result in enumerate(results, start=1):
+        console.print()
+        console.rule(f"[bold]Request {result_number}[/bold]", style="cyan")
+        console.print(Text.assemble(("Baseline input   ", "bold"), result.source.raw_input))
+        console.print(
+            Text.assemble(
+                ("Baseline result  ", "bold green"),
+                _describe_outcomes(result),
+            )
+        )
+        for case_index, case in enumerate(result.cases):
+            console.print()
+            augmentation_name = _AUGMENTATION_NAMES[case.candidate.operator_id]
+            console.print(Text.assemble(("Augmentation     ", "bold cyan"), augmentation_name))
+            console.print(
+                Text.assemble(("Changed input    ", "bold"), case.candidate.augmented_input)
+            )
+            console.print(
+                Text.assemble(
+                    ("Agent result     ", "bold red"),
+                    _describe_outcomes(result, case_index),
+                )
+            )
+            for finding in case.findings:
+                console.print(
+                    Text.assemble(
+                        ("Finding          ", "bold red"),
+                        _describe_finding(finding),
+                    )
+                )
+            console.print(
+                "[dim]Detected by UL's action comparison · Seen in 3/3 runs · "
+                "Needs human review[/dim]"
+            )
+
+    console.print()
+    console.print(
+        "[bold yellow]Demo note:[/bold yellow] These are intentional defects in a fake agent. "
+        "Real findings are marked for review because business context decides whether a "
+        "behavior change is harmful."
+    )
+    console.print()
+    safe_evidence_path = _terminal_safe(str(evidence_path))
+    safe_inspection_command = _terminal_safe(f"ul dataset report {shlex.quote(str(evidence_path))}")
+    console.print(
+        Text.assemble(("Full evidence  ", "dim"), (safe_evidence_path, "cyan")),
+        soft_wrap=True,
+    )
+    console.print(
+        Text.assemble(
+            ("Inspect it      ", "bold cyan"),
+            safe_inspection_command,
+        ),
+        soft_wrap=True,
+    )
+    console.print("[bold cyan]Try your agent:[/bold cyan] ul init --help")
 
 
 def run_demo(output: Path | None = None) -> None:
@@ -242,81 +234,18 @@ def run_demo(output: Path | None = None) -> None:
         typer.echo("Demo could not run: output already exists", err=True)
         raise typer.Exit(code=2)
     artifact_directory: Path | None = None
-    target_config_path: Path | None = None
     evidence_path: Path | None = None
-    server: ThreadingHTTPServer | None = None
-    server_thread: Thread | None = None
-    completed_process: subprocess.CompletedProcess[str]
-
     try:
         artifact_directory = _create_demo_artifact_directory()
-        target_config_path = artifact_directory / "target.json"
         evidence_path = (
-            output.resolve() if output is not None else artifact_directory / "evidence.json"
+            output.absolute() if output is not None else artifact_directory / "evidence.jsonl"
         )
-        server = create_server()
-        server_host, server_port = cast(tuple[str, int], server.server_address)
-        target_config = _load_target_template(f"http://{server_host}:{server_port}")
-        with _create_private_file(target_config_path) as target_config_file:
-            json.dump(target_config, target_config_file, indent=2)
-            target_config_file.write("\n")
-        server_thread = Thread(
-            target=server.serve_forever,
-            name="ul-demo-agent",
-            daemon=True,
-        )
-        server_thread.start()
-        with ExitStack() as resource_stack:
-            asset_root = resources.files("ul_cli.demo_assets")
-            case_path = resource_stack.enter_context(
-                resources.as_file(asset_root.joinpath("case.json"))
-            )
-            invariants_path = resource_stack.enter_context(
-                resources.as_file(asset_root.joinpath("invariants.json"))
-            )
-            command = [
-                sys.executable,
-                "-m",
-                "ul_cli.main",
-                "stress",
-                "retry-after-successful-commit",
-                str(case_path),
-                "--environment-config",
-                str(target_config_path),
-                "--invariants",
-                str(invariants_path),
-                "--output",
-                str(evidence_path),
-                "--repetitions",
-                "3",
-                "--max-environment-api-calls",
-                "42",
-                "--allow-environment-network",
-                "--allow-insecure-http",
-                "--confirm-test-environment",
-            ]
-            completed_process = subprocess.run(
-                command,
-                cwd=Path.cwd(),
-                env=_subprocess_environment(),
-                check=False,
-                shell=False,
-                capture_output=True,
-                text=True,
-                timeout=20,
-            )
-    except (OSError, ValueError, json.JSONDecodeError, subprocess.TimeoutExpired) as error:
+        results = asyncio.run(run_demo_evaluations())
+        _save_evidence(results, evidence_path)
+    except (OSError, ValueError) as error:
         typer.echo(f"Demo could not run: {error.__class__.__name__}", err=True)
         raise typer.Exit(code=2) from None
     finally:
-        if server is not None:
-            if server_thread is not None and server_thread.ident is not None:
-                server.shutdown()
-            server.server_close()
-            if server_thread is not None and server_thread.ident is not None:
-                server_thread.join(timeout=5)
-        if target_config_path is not None:
-            target_config_path.unlink(missing_ok=True)
         if (
             artifact_directory is not None
             and artifact_directory.exists()
@@ -325,21 +254,4 @@ def run_demo(output: Path | None = None) -> None:
             artifact_directory.rmdir()
 
     assert evidence_path is not None
-    if completed_process.returncode == 1 and _evidence_confirms_repeatable_duplicate(evidence_path):
-        typer.echo(
-            "Confirmed: after a successful committed payment, the explicit retry created a "
-            "second payment in all 3 repetitions."
-        )
-        typer.echo("Critical rules: exactly-once count and unique invoice effect both violated.")
-        typer.echo("Transition rule: each individual turn appended exactly one effect.")
-        typer.echo("Semantic-model calls: none")
-        typer.echo("External-network calls: none (synthetic localhost environment only)")
-        typer.echo(f"Evidence: {evidence_path}")
-        typer.echo("Next: run 'ul init --help' to connect your own test environment.")
-        return
-
-    if evidence_path.exists():
-        typer.echo(f"UL did not confirm the expected finding. Review: {evidence_path}", err=True)
-    else:
-        typer.echo("UL did not produce demo evidence.", err=True)
-    raise typer.Exit(code=completed_process.returncode or 1)
+    _print_report(results, evidence_path)
