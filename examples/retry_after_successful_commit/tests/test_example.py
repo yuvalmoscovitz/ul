@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import stat
 import subprocess
@@ -7,7 +8,9 @@ import sys
 import zipfile
 from pathlib import Path
 
+from typer.testing import CliRunner
 from ul.event_stress import RetryAfterSuccessfulCommitStressResult
+from ul_cli.main import app
 
 _PROJECT_ROOT = Path(__file__).parents[3]
 
@@ -66,6 +69,13 @@ def test_documented_one_command_finds_repeatable_duplicate_without_model_calls(
     assert committed_effect_counts == [2, 2, 2]
     if os.name != "nt":
         assert stat.S_IMODE(evidence_path.stat().st_mode) == 0o600
+    report = CliRunner().invoke(app, ["report", str(evidence_path), "--json"])
+    assert report.exit_code == 1, report.output
+    report_payload = json.loads(report.output)
+    assert report_payload["evidence_type"] == "retry_after_successful_commit"
+    assert report_payload["review_status"] == "action_required"
+    assert report_payload["summary"]["finding_count"] == 2
+    assert "AC-100" not in report.output
 
 
 def test_built_wheel_contains_the_complete_retry_example(tmp_path: Path) -> None:

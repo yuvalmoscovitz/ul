@@ -120,8 +120,10 @@ def test_demo_shows_three_generic_findings_without_credentials_and_retains_valid
     } == {15}
 
     report_result = CliRunner().invoke(app, ["report", str(evidence_path)])
-    assert report_result.exit_code == 0, report_result.output
-    assert "Dataset finding report: 3 finding(s)" in report_result.output
+    assert report_result.exit_code == 1, report_result.output
+    assert "UL run report" in report_result.output
+    assert "Findings: 3 total; 3 actionable" in report_result.output
+    assert "ul dataset review" in report_result.output
 
 
 def test_demo_report_uses_terminal_colors(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

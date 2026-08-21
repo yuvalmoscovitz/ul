@@ -142,6 +142,7 @@ deterministic reset, and preventing real business effects.
 
 ```bash
 ul report
+ul report PRIVATE_EVIDENCE.json --json
 
 ul dataset review .ul/runs/EVIDENCE.jsonl FINDING_ID \
   --status confirmed \
@@ -150,13 +151,24 @@ ul dataset review .ul/runs/EVIDENCE.jsonl FINDING_ID \
   --reason "The variation committed payment for the wrong invoice."
 ```
 
-Reviews are appended to a separate audit file. Evidence is never rewritten. Exit codes are:
+With an explicit evidence path, `ul report` auto-detects dataset evaluation, correction,
+retry-after-successful-commit, and timeout-after-commit evidence. Its default human summary and
+versioned JSON omit inputs, responses, state, customer descriptions, and arbitrary evidence text.
+Use `ul dataset report EVIDENCE.jsonl` when you need the detailed private dataset review surface.
+Trace replay bundles are not supported by `ul report`.
 
-- `0`: no review finding or declared-rule violation.
-- `1`: a difference needs review or a declared rule was violated.
-- `2`: the evaluation was incomplete or not evaluable.
+Reviews are appended to a separate audit file. Evidence is never rewritten. The human report and
+versioned JSON expose review workflow status (`review_status` in report schema `1.2.0`). Exit codes
+map to that review status:
 
-Exit `1` is not a general correctness verdict.
+- `0` (`resolved`): no actionable finding remains; `expected` and `unsupported` reviews resolve a
+  finding.
+- `1` (`action_required`): a finding needs review, is confirmed, or an unreviewed declared rule was
+  violated.
+- `2` (`inconclusive`): the evaluation or a finding review is inconclusive and no actionable
+  finding remains.
+
+Review status is workflow state, not an agent correctness verdict.
 
 Save a confirmed finding as a regression:
 
