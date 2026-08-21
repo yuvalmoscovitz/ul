@@ -307,6 +307,9 @@ def test_replay_output_requires_explicit_raw_content_mapping(tmp_path: Path) -> 
 
     assert result.exit_code == 2
     assert "include_raw_content" in result.output
+    assert '"schema_version":"1.0.0"' in result.output
+    assert '"include_raw_content":true' in result.output
+    assert "--mapping mapping.json" in result.output
     assert not replay_output.exists()
 
 
