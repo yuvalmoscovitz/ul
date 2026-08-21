@@ -1697,6 +1697,21 @@ def _customer_evidence_record(
     return evidence
 
 
+def create_customer_evidence_record(
+    result: DatasetEvaluationResult,
+    *,
+    repetitions: int,
+    max_environment_api_calls: int,
+    planned_target_calls: int,
+) -> dict[str, JsonValue]:
+    return _customer_evidence_record(
+        result,
+        repetitions=repetitions,
+        max_environment_api_calls=max_environment_api_calls,
+        planned_target_calls=planned_target_calls,
+    )
+
+
 def _baseline_customer_status(result: DatasetEvaluationResult) -> str:
     trial_set = result.baseline.trial_set
     stability = trial_set.stability

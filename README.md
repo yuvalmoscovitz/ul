@@ -21,6 +21,19 @@ uv tool install git+https://github.com/yuvalmoscovitz/ul.git
 
 If `uv` reports that its tool directory is not on `PATH`, run `uv tool update-shell`.
 
+## Try the demo
+
+Run the first no-key product experience:
+
+```bash
+ul demo
+```
+
+The demo evaluates two fake customer requests with three common input augmentations: typing errors,
+a frustrated tone, and a short message. It shows three repeatable behavior changes in the same
+evidence format used by dataset evaluations. It makes no model or network calls, so no API key or
+connected agent is required.
+
 ## Quickstart
 
 Create a JSONL dataset with one interaction per line:
