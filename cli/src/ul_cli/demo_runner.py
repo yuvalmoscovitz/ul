@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import json
 import os
-import shlex
 import stat
 import tempfile
 import unicodedata
@@ -152,12 +151,6 @@ def _terminal_safe(message: str) -> str:
     )
 
 
-def _inspection_instruction(evidence_path: Path) -> str:
-    if os.name == "nt":
-        return "Run 'ul report' with the evidence path shown above."
-    return f"ul report {shlex.quote(str(evidence_path))}"
-
-
 def _print_report(results: tuple[DatasetEvaluationResult, ...], evidence_path: Path) -> None:
     finding_count = sum(len(case.findings) for result in results for case in result.cases)
     augmentation_count = sum(len(result.cases) for result in results)
@@ -224,16 +217,8 @@ def _print_report(results: tuple[DatasetEvaluationResult, ...], evidence_path: P
     )
     console.print()
     safe_evidence_path = _terminal_safe(str(evidence_path))
-    safe_inspection_command = _terminal_safe(_inspection_instruction(evidence_path))
     console.print(
-        Text.assemble(("Full evidence  ", "dim"), (safe_evidence_path, "cyan")),
-        soft_wrap=True,
-    )
-    console.print(
-        Text.assemble(
-            ("Inspect it      ", "bold cyan"),
-            safe_inspection_command,
-        ),
+        Text.assemble(("Technical evidence saved  ", "dim"), (safe_evidence_path, "cyan")),
         soft_wrap=True,
     )
     console.print()
