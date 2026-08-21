@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import shlex
 import stat
 from pathlib import Path
 from typing import Annotated, TextIO
@@ -45,8 +46,13 @@ from ul.timeout_after_commit import (
 )
 from ul.trace_replay import (
     TraceReplayCase,
+    TraceReplayDifferenceGrouping,
     TraceReplayResult,
+    TraceStressPlan,
+    derive_trace_stress_plan,
+    group_trace_replay_differences,
     load_trace_replay_bundle,
+    load_trace_replay_results,
     plan_trace_replay,
     run_trace_replay,
     select_trace_replay_case,
@@ -253,6 +259,45 @@ def replay_production_trace(
         output.unlink(missing_ok=True)
         raise
     _print_trace_replay_result(result, output)
+
+
+@app.command("trace-plan")
+def plan_production_trace_stress(
+    bundle_path: Annotated[Path, typer.Argument(exists=True, dir_okay=False, readable=True)],
+    json_output: Annotated[
+        bool, typer.Option("--json", help="Emit stable machine-readable JSON.")
+    ] = False,
+) -> None:
+    """Turn imported trace evidence into a prioritized stress plan."""
+    try:
+        plan = derive_trace_stress_plan(load_trace_replay_bundle(bundle_path))
+    except (ValidationError, ValueError, RuntimeError) as error:
+        raise typer.BadParameter(str(error)) from None
+    if json_output:
+        typer.echo(json.dumps(plan.model_dump(mode="json"), ensure_ascii=False, indent=2))
+        return
+    _print_trace_stress_plan(plan, bundle_path)
+
+
+@app.command("trace-group")
+def group_production_trace_differences(
+    result_paths: Annotated[
+        list[Path],
+        typer.Argument(exists=True, dir_okay=False, readable=True),
+    ],
+    json_output: Annotated[
+        bool, typer.Option("--json", help="Emit stable machine-readable JSON.")
+    ] = False,
+) -> None:
+    """Group trace replay differences by stable evidence signatures."""
+    try:
+        grouping = group_trace_replay_differences(load_trace_replay_results(result_paths))
+    except (ValidationError, ValueError, RuntimeError) as error:
+        raise typer.BadParameter(str(error)) from None
+    if json_output:
+        typer.echo(json.dumps(grouping.model_dump(mode="json"), ensure_ascii=False, indent=2))
+        return
+    _print_trace_replay_difference_grouping(grouping)
 
 
 @app.command("save")
@@ -756,6 +801,85 @@ def _print_trace_replay_result(result: TraceReplayResult, output: Path) -> None:
         raise typer.Exit(code=1)
     if result.status == "inconclusive":
         raise typer.Exit(code=2)
+
+
+def _print_trace_stress_plan(plan: TraceStressPlan, bundle_path: Path) -> None:
+    typer.echo(f"Trace-derived stress plan: {plan.case_count} case(s)")
+    for planned_case in plan.cases:
+        typer.echo(
+            f"{planned_case.priority_rank}. {planned_case.case_id} "
+            f"(score={planned_case.priority_score})"
+        )
+        typer.echo(f"   Trace: {planned_case.source_trace_id}")
+        if planned_case.signals:
+            typer.echo("   Why this case is prioritized:")
+            for signal in planned_case.signals:
+                typer.echo(f"   - {signal.description} [{signal.code}]")
+        else:
+            typer.echo("   Why this case is prioritized: no elevated trace signals")
+        focuses = ", ".join(focus.replace("_", " ") for focus in planned_case.recommended_focuses)
+        typer.echo(f"   Suggested stress focus: {focuses}")
+        if planned_case.source_span_ids:
+            typer.echo(f"   Case spans: {', '.join(planned_case.source_span_ids)}")
+        signal_span_ids = tuple(
+            dict.fromkeys(
+                span_id for signal in planned_case.signals for span_id in signal.source_span_ids
+            )
+        )
+        if signal_span_ids:
+            typer.echo(f"   Signal spans: {', '.join(signal_span_ids)}")
+        dry_run_command = " ".join(
+            (
+                "ul stress trace",
+                shlex.quote(str(bundle_path)),
+                "--case-id",
+                planned_case.case_id,
+                "--environment-config .ul/environment.json --dry-run",
+            )
+        )
+        typer.echo(f"   Next replay check: {dry_run_command}")
+    typer.echo("Priority score schedules evidence-rich cases; it is not risk or causality.")
+    typer.echo(
+        "Suggested focus labels are review directions, not automatically runnable augmentations."
+    )
+    typer.echo("Recorded message and state content: not printed")
+
+
+def _print_trace_replay_difference_grouping(
+    grouping: TraceReplayDifferenceGrouping,
+) -> None:
+    typer.echo(
+        f"Trace replay patterns: {grouping.difference_count} difference(s), "
+        f"{grouping.reproduced_count} reproduced"
+    )
+    if not grouping.groups:
+        typer.echo("No drifted or inconclusive replay results to group.")
+        return
+    for group in grouping.groups:
+        typer.echo(f"{group.signature}: {group.occurrence_count} occurrence(s)")
+        for reason_code in group.reason_codes:
+            typer.echo(f"  - {_trace_replay_reason_explanation(reason_code)}")
+        for member in group.members:
+            typer.echo(f"  Case {member.case_id} (trace {member.source_trace_id})")
+            if member.source_span_ids:
+                typer.echo(f"    Spans: {', '.join(member.source_span_ids)}")
+    typer.echo(
+        "Groups describe technical replay differences only. They do not identify a cause or "
+        "a semantic agent failure."
+    )
+
+
+def _trace_replay_reason_explanation(reason_code: str) -> str:
+    explanations = {
+        "response_mismatch": "At least one replay response differed from the recorded response.",
+        "state_mismatch": "At least one observed replay state differed from recorded state.",
+        "environment_lifecycle_failed": "The test environment did not complete its lifecycle.",
+        "environment_execution_timeout": "The test environment did not answer before timeout.",
+        "environment_execution_failed": "The test environment could not complete execution.",
+        "environment_state_uncertain": "A prior run left the test environment state uncertain.",
+        "other_inconclusive": "The replay was inconclusive for another recorded reason.",
+    }
+    return explanations[reason_code]
 
 
 def _format_divergence_counts(counts: dict[str, int]) -> str:
