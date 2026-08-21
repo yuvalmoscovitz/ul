@@ -88,6 +88,34 @@ One-run overrides do not change the saved project:
 ul run --limit 3 --repetitions 3 --operator input.surface.rephrase
 ```
 
+Inspect which built-in augmentations the current project can run:
+
+```bash
+ul augmentations enabled
+ul augmentations list --mode dataset_variation
+ul augmentations plan
+ul augmentations plan input.surface.typing_noise
+ul augmentations plan --json
+```
+
+The planner classifies every augmentation as ready, blocked, or manual and explains why. It checks
+local configuration only; it makes no model, environment, or network calls and does not prove that
+the configured services are reachable.
+
+Configure the augmentations used by future `ul run` commands:
+
+```bash
+ul augmentations enable input.surface.typing_noise  # `add` is an alias
+ul augmentations disable input.surface.rephrase     # `remove` is an alias
+ul augmentations reset                              # restore recommended defaults
+ul run --dry-run                                    # verify the saved selection and call budget
+```
+
+These commands update only the current project's private `.ul/config.json`. Enabling a currently
+blocked augmentation still saves the selection and prints its required data and configuration steps.
+Catalog entries without a dataset CLI binding cannot be enabled for `ul run`; use their focused
+`ul augmentations plan ID` output to find the supported command or SDK path.
+
 ## How it works
 
 ```text

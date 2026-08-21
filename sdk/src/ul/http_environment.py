@@ -344,6 +344,20 @@ def load_json_http_environment_config(path: str | Path) -> JsonHttpEnvironmentCo
         ) from None
 
 
+def json_http_environment_capabilities(
+    config: JsonHttpEnvironmentConfig,
+) -> EnvironmentCapabilities:
+    return EnvironmentCapabilities(
+        supports_conversations=True,
+        supports_state_observation=True,
+        state_observation_authority="environment_self_reported",
+        cancellation_guarantee="best_effort",
+        timeout_after_commit_version=(
+            config.timeout_after_commit.version if config.timeout_after_commit is not None else None
+        ),
+    )
+
+
 class JsonHttpEnvironmentConnection:
     def __init__(
         self,
@@ -380,17 +394,7 @@ class JsonHttpEnvironmentConnection:
         self._lifecycle_state_uncertain = False
         self._owns_client = client is None
         self._client = client or httpx.AsyncClient(follow_redirects=False, trust_env=False)
-        self.capabilities = EnvironmentCapabilities(
-            supports_conversations=True,
-            supports_state_observation=True,
-            state_observation_authority="environment_self_reported",
-            cancellation_guarantee="best_effort",
-            timeout_after_commit_version=(
-                config.timeout_after_commit.version
-                if config.timeout_after_commit is not None
-                else None
-            ),
-        )
+        self.capabilities = json_http_environment_capabilities(config)
 
     @property
     def environment_id(self) -> str:
