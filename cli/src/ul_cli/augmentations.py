@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Annotated, Literal
@@ -31,7 +32,7 @@ from ul_cli.project import (
     ProjectConfig,
     load_project,
     resolve_project_path,
-    save_project_config,
+    update_project_config,
 )
 
 app = typer.Typer(help="Inspect UL's built-in augmentation library.")
@@ -306,18 +307,23 @@ def enable_augmentation(
     """Enable a built-in dataset augmentation for `ul run`."""
     augmentation = _resolve_augmentation(reference)
     _require_project_configurable(augmentation)
-    project_root, config = load_project()
-    configured = _configured_augmentations(config)
+    project_root, _ = load_project()
     identity = (augmentation.ref.id, augmentation.ref.version)
-    if identity in {(item.ref.id, item.ref.version) for item in configured}:
-        typer.echo(f"Already enabled: {augmentation.ref.id}@{augmentation.ref.version}")
-        return
     stored_reference = (
         f"{augmentation.ref.id}@{augmentation.ref.version}"
         if "@" in reference
         else augmentation.ref.id
     )
-    _save_operators(project_root, config, (*config.operators, stored_reference))
+
+    def add_operator(config: ProjectConfig) -> tuple[str, ...]:
+        configured = _configured_augmentations(config)
+        if identity in {(item.ref.id, item.ref.version) for item in configured}:
+            return config.operators
+        return (*config.operators, stored_reference)
+
+    if not _update_operators(project_root, add_operator):
+        typer.echo(f"Already enabled: {augmentation.ref.id}@{augmentation.ref.version}")
+        return
     typer.echo(f"Enabled: {augmentation.ref.id}@{augmentation.ref.version}")
     _print_selected_readiness(augmentation)
 
@@ -330,32 +336,39 @@ def disable_augmentation(
     """Disable a built-in dataset augmentation for `ul run`."""
     augmentation = _resolve_augmentation(reference)
     _require_project_configurable(augmentation)
-    project_root, config = load_project()
-    configured = _configured_augmentations(config)
+    project_root, _ = load_project()
     identity = (augmentation.ref.id, augmentation.ref.version)
-    remaining = tuple(
-        stored_reference
-        for stored_reference, item in zip(config.operators, configured, strict=True)
-        if (item.ref.id, item.ref.version) != identity
-    )
-    if len(remaining) == len(config.operators):
+
+    def remove_operator(config: ProjectConfig) -> tuple[str, ...]:
+        configured = _configured_augmentations(config)
+        remaining = tuple(
+            stored_reference
+            for stored_reference, item in zip(config.operators, configured, strict=True)
+            if (item.ref.id, item.ref.version) != identity
+        )
+        if not remaining:
+            raise typer.BadParameter(
+                "at least one augmentation must remain enabled; enable another or run "
+                "'ul augmentations reset'"
+            )
+        return remaining
+
+    if not _update_operators(project_root, remove_operator):
         typer.echo(f"Already disabled: {augmentation.ref.id}@{augmentation.ref.version}")
         return
-    if not remaining:
-        raise typer.BadParameter(
-            "at least one augmentation must remain enabled; enable another or run "
-            "'ul augmentations reset'"
-        )
-    _save_operators(project_root, config, remaining)
     typer.echo(f"Disabled: {augmentation.ref.id}@{augmentation.ref.version}")
 
 
 @app.command("reset")
 def reset_augmentations() -> None:
     """Restore the recommended project augmentation defaults."""
-    project_root, config = load_project()
-    _configured_augmentations(config)
-    _save_operators(project_root, config, DEFAULT_PROJECT_OPERATORS)
+    project_root, _ = load_project()
+
+    def reset_operators(config: ProjectConfig) -> tuple[str, ...]:
+        _configured_augmentations(config)
+        return DEFAULT_PROJECT_OPERATORS
+
+    _update_operators(project_root, reset_operators)
     typer.echo("Restored recommended defaults: input.surface.rephrase@1.0.0")
     _print_selected_readiness(builtin_augmentation_catalog().get("input.surface.rephrase"))
 
@@ -399,19 +412,28 @@ def _require_project_configurable(augmentation: BuiltinAugmentationSpec) -> None
     )
 
 
-def _save_operators(
+def _update_operators(
     project_root: Path,
-    config: ProjectConfig,
-    operators: tuple[str, ...],
-) -> None:
-    try:
+    update: Callable[[ProjectConfig], tuple[str, ...]],
+) -> bool:
+    changed = False
+
+    def update_config(config: ProjectConfig) -> ProjectConfig:
+        nonlocal changed
+        operators = update(config)
+        if operators == config.operators:
+            return config
+        changed = True
         validate_dataset_operator_ids(list(operators))
-        updated_config = ProjectConfig.model_validate(
+        return ProjectConfig.model_validate(
             {**config.model_dump(mode="json"), "operators": operators}
         )
-        save_project_config(project_root, updated_config)
+
+    try:
+        update_project_config(project_root, update_config)
     except (OSError, ValueError) as error:
         raise typer.BadParameter(f"cannot update augmentation configuration: {error}") from None
+    return changed
 
 
 def _print_selected_readiness(augmentation: BuiltinAugmentationSpec) -> None:
@@ -650,6 +672,7 @@ def _plan_augmentation(
             enabled=(augmentation.ref.id, augmentation.ref.version) in project.enabled_references,
         )
     binding = cli_bindings[0]
+    command = _project_command(augmentation, binding)
     blocking_reasons = _binding_blocking_reasons(binding, project)
     if blocking_reasons:
         return _PlannedAugmentation(
@@ -658,11 +681,10 @@ def _plan_augmentation(
             mode=binding.mode,
             status="blocked",
             reasons=blocking_reasons,
-            command=None,
+            command=command if binding.execution_owner == "stress_cli" else None,
             enabled=(augmentation.ref.id, augmentation.ref.version) in project.enabled_references,
         )
     manual_reasons = _binding_manual_reasons(binding, project)
-    command = _project_command(augmentation, binding)
     if manual_reasons:
         return _PlannedAugmentation(
             ref=augmentation.ref,
@@ -811,7 +833,11 @@ def _project_command(
     if binding.execution_owner == "dataset_cli":
         return f"ul run --operator {augmentation.ref.id}@{augmentation.ref.version}"
     if binding.execution_owner == "stress_cli":
-        return None
+        assert binding.command is not None
+        return (
+            f"{binding.command} CASE.json --environment-config ENVIRONMENT.json "
+            "--invariants INVARIANTS.json --dry-run"
+        )
     return binding.command
 
 

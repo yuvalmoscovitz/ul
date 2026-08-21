@@ -1,9 +1,12 @@
 import json
+import os
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from threading import Barrier
 
 import pytest
 from typer.testing import CliRunner
-from ul_cli import dataset
+from ul_cli import augmentations, dataset
 from ul_cli.main import app
 
 runner = CliRunner()
@@ -329,7 +332,10 @@ def test_plan_json_is_stable_complete_and_project_aware(
 
     timeout = _planned_augmentation(payload, "environment.tool.timeout_after_commit")
     assert timeout["status"] == "blocked"
-    assert timeout["command"] is None
+    assert timeout["command"] == (
+        "ul stress timeout-after-commit CASE.json --environment-config ENVIRONMENT.json "
+        "--invariants INVARIANTS.json --dry-run"
+    )
     assert {
         "customer_evaluator_unavailable",
         "environment_capability_missing",
@@ -364,7 +370,10 @@ def test_plan_reads_declared_capabilities_without_constructing_external_clients(
     assert payload["summary"] == {"ready": 6, "blocked": 0, "manual": 12}
     timeout = _planned_augmentation(payload, "environment.tool.timeout_after_commit")
     assert timeout["status"] == "manual"
-    assert timeout["command"] is None
+    assert timeout["command"] == (
+        "ul stress timeout-after-commit CASE.json --environment-config ENVIRONMENT.json "
+        "--invariants INVARIANTS.json --dry-run"
+    )
     assert "stress_case_not_configured" in _reason_codes(timeout)
     assert "environment_capability_missing" not in _reason_codes(timeout)
 
@@ -411,6 +420,40 @@ def test_plan_human_output_is_actionable_and_attests_zero_calls(
     )
 
 
+@pytest.mark.parametrize(
+    ("augmentation_id", "stress_command"),
+    (
+        (
+            "conversation.correction_after_first_response",
+            "ul stress correction",
+        ),
+        (
+            "conversation.retry_after_successful_commit",
+            "ul stress retry-after-successful-commit",
+        ),
+        (
+            "environment.tool.timeout_after_commit",
+            "ul stress timeout-after-commit",
+        ),
+    ),
+)
+def test_plan_shows_safe_stress_cli_setup_command(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    augmentation_id: str,
+    stress_command: str,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+
+    result = runner.invoke(app, ["augmentations", "plan", augmentation_id])
+
+    assert result.exit_code == 0, result.output
+    assert (
+        f"Command: {stress_command} CASE.json --environment-config ENVIRONMENT.json "
+        "--invariants INVARIANTS.json --dry-run"
+    ) in result.output
+
+
 def test_project_augmentation_configuration_persists_and_drives_plans_and_dry_runs(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -451,6 +494,59 @@ def test_project_augmentation_configuration_persists_and_drives_plans_and_dry_ru
     assert json.loads(config_path.read_text(encoding="utf-8"))["operators"] == [
         "input.surface.rephrase"
     ]
+
+
+def test_concurrent_enables_do_not_lose_a_stale_read_update(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _initialize_project(tmp_path, monkeypatch)
+    config_path = tmp_path / ".ul" / "config.json"
+    real_load_project = augmentations.load_project
+    stale_read_barrier = Barrier(2)
+
+    def load_project_before_concurrent_update() -> tuple[Path, augmentations.ProjectConfig]:
+        loaded_project = real_load_project()
+        stale_read_barrier.wait()
+        return loaded_project
+
+    monkeypatch.setattr(augmentations, "load_project", load_project_before_concurrent_update)
+    monkeypatch.setattr(augmentations, "_print_selected_readiness", lambda augmentation: None)
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        updates = (
+            executor.submit(augmentations.enable_augmentation, "input.surface.typing_noise"),
+            executor.submit(augmentations.enable_augmentation, "input.surface.fragmented_syntax"),
+        )
+        for update in updates:
+            update.result()
+
+    assert set(json.loads(config_path.read_text(encoding="utf-8"))["operators"]) == {
+        "input.surface.rephrase",
+        "input.surface.typing_noise",
+        "input.surface.fragmented_syntax",
+    }
+
+
+@pytest.mark.skipif(os.name == "nt", reason="symlink creation may require Windows privileges")
+def test_configuration_update_rejects_a_symlinked_lock_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _initialize_project(tmp_path, monkeypatch)
+    config_path = tmp_path / ".ul" / "config.json"
+    original_config = config_path.read_bytes()
+    lock_target = tmp_path / "lock-target"
+    lock_target.write_bytes(b"")
+    lock_target.chmod(0o600)
+    (tmp_path / ".ul" / ".config.json.lock").symlink_to(lock_target)
+
+    result = runner.invoke(app, ["augmentations", "enable", "input.surface.typing_noise"])
+
+    assert result.exit_code == 2
+    normalized_output = " ".join(result.output.split())
+    assert "cannot update augmentation configuration" in normalized_output
+    assert "must be a regular private file" in normalized_output
+    assert config_path.read_bytes() == original_config
+    assert lock_target.read_bytes() == b""
 
 
 def test_configuration_errors_do_not_change_project_config(

@@ -5,6 +5,7 @@ import json
 import os
 import stat
 import sys
+from collections.abc import Callable
 from contextlib import suppress
 from datetime import UTC, datetime
 from pathlib import Path
@@ -31,10 +32,16 @@ from ul_cli.dataset import (
 from ul_cli.dataset_review import is_reportable_dataset_evidence, report_dataset_evidence
 from ul_cli.environment import TEST_ENVIRONMENT_CONFIRMATION_MESSAGE
 
+if sys.platform == "win32":
+    import msvcrt
+else:
+    import fcntl
+
 console = Console()
 
 _PROJECT_DIRECTORY = ".ul"
 _PROJECT_CONFIG = "config.json"
+_PROJECT_CONFIG_LOCK = ".config.json.lock"
 _PROJECT_STATE = "state.json"
 _MAXIMUM_PROJECT_FILE_BYTES = 1_000_000
 DEFAULT_PROJECT_OPERATORS = ("input.surface.rephrase",)
@@ -488,19 +495,89 @@ def load_project() -> tuple[Path, ProjectConfig]:
     raise typer.BadParameter("no UL project found; run 'ul init' first")
 
 
-def save_project_config(project_root: Path, config: ProjectConfig) -> None:
-    """Atomically replace a validated config in an existing private UL project."""
+def update_project_config(
+    project_root: Path,
+    update: Callable[[ProjectConfig], ProjectConfig],
+) -> ProjectConfig:
+    """Update a project config under an exclusive lock and atomically replace it."""
     project_directory = project_root / _PROJECT_DIRECTORY
     project_descriptor = _open_private_directory(project_directory)
+    lock_descriptor: int | None = None
+    config_locked = False
     try:
+        lock_descriptor = _open_project_config_lock(project_directory)
+        _lock_descriptor(lock_descriptor)
+        config_locked = True
         config_descriptor = _open_private_regular_file_at(project_descriptor, _PROJECT_CONFIG)
-        os.close(config_descriptor)
-        _replace_private_json(
-            project_directory / _PROJECT_CONFIG,
-            config.model_dump(mode="json"),
-        )
+        config = ProjectConfig.model_validate(_read_private_json_descriptor(config_descriptor))
+        updated_config = update(config)
+        if updated_config != config:
+            _replace_private_json(
+                project_directory / _PROJECT_CONFIG,
+                updated_config.model_dump(mode="json"),
+            )
+        return updated_config
     finally:
+        if lock_descriptor is not None:
+            if config_locked:
+                _unlock_descriptor(lock_descriptor)
+            os.close(lock_descriptor)
         os.close(project_descriptor)
+
+
+def _open_project_config_lock(project_directory: Path) -> int:
+    lock_path = project_directory / _PROJECT_CONFIG_LOCK
+    no_follow_flag = getattr(os, "O_NOFOLLOW", 0)
+    while True:
+        try:
+            path_status = os.lstat(lock_path)
+        except FileNotFoundError:
+            try:
+                descriptor = os.open(
+                    lock_path,
+                    os.O_RDWR | os.O_CREAT | os.O_EXCL | no_follow_flag,
+                    0o600,
+                )
+                path_status = os.lstat(lock_path)
+                break
+            except FileExistsError:
+                continue
+        if not stat.S_ISREG(path_status.st_mode):
+            raise OSError("project config lock must be a regular private file")
+        descriptor = os.open(lock_path, os.O_RDWR | no_follow_flag)
+        break
+    try:
+        descriptor_status = os.fstat(descriptor)
+        if not os.path.samestat(path_status, descriptor_status):
+            raise OSError("project config lock changed while opening")
+        if not stat.S_ISREG(descriptor_status.st_mode) or descriptor_status.st_nlink != 1:
+            raise OSError("project config lock must be a regular private file")
+        if sys.platform != "win32" and stat.S_IMODE(descriptor_status.st_mode) & 0o077:
+            raise OSError("project config lock permissions must not allow group or other access")
+        if hasattr(os, "getuid") and descriptor_status.st_uid != os.getuid():
+            raise OSError("project config lock must be owned by the current user")
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _lock_descriptor(descriptor: int) -> None:
+    if sys.platform == "win32":
+        if os.fstat(descriptor).st_size == 0:
+            os.write(descriptor, b"0")
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        msvcrt.locking(descriptor, msvcrt.LK_LOCK, 1)
+    else:
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+
+
+def _unlock_descriptor(descriptor: int) -> None:
+    if sys.platform == "win32":
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        msvcrt.locking(descriptor, msvcrt.LK_UNLCK, 1)
+    else:
+        fcntl.flock(descriptor, fcntl.LOCK_UN)
 
 
 def _read_private_json(path: Path) -> object:
