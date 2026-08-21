@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import stat
 from pathlib import Path
 from typing import Any
@@ -14,6 +15,11 @@ from ul_cli import project
 from ul_cli.main import app
 
 runner = CliRunner()
+_ANSI_ESCAPE = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def _compact_plain_output(output: str) -> str:
+    return "".join(_ANSI_ESCAPE.sub("", output).split())
 
 
 def _write_private_file(path: Path, value: str) -> None:
@@ -180,7 +186,7 @@ def test_init_can_generate_explicit_isolated_response_adapter(
         terminal_width=180,
     )
     assert missing_attestation.exit_code != 0
-    assert "--confirm-request-isolation" in missing_attestation.output
+    assert "--confirm-request-isolation" in _compact_plain_output(missing_attestation.output)
 
     missing_safe_target = runner.invoke(
         app,
@@ -198,7 +204,7 @@ def test_init_can_generate_explicit_isolated_response_adapter(
         terminal_width=180,
     )
     assert missing_safe_target.exit_code != 0
-    assert "--confirm-safe-test-target" in missing_safe_target.output
+    assert "--confirm-safe-test-target" in _compact_plain_output(missing_safe_target.output)
 
     result = runner.invoke(
         app,
@@ -284,13 +290,13 @@ def test_init_existing_isolated_config_requires_safety_flags_and_prints_limitati
 
     missing_isolation = runner.invoke(app, base_arguments, terminal_width=180)
     assert missing_isolation.exit_code == 2
-    assert "--confirm-request-isolation" in missing_isolation.output
+    assert "--confirm-request-isolation" in _compact_plain_output(missing_isolation.output)
 
     missing_safe_target = runner.invoke(
         app, [*base_arguments, "--confirm-request-isolation"], terminal_width=180
     )
     assert missing_safe_target.exit_code == 2
-    assert "--confirm-safe-test-target" in missing_safe_target.output
+    assert "--confirm-safe-test-target" in _compact_plain_output(missing_safe_target.output)
 
     result = runner.invoke(
         app,
