@@ -409,3 +409,83 @@ def test_plan_human_output_is_actionable_and_attests_zero_calls(
     assert (
         "Inspection only: 0 model calls, 0 environment calls, 0 network requests." in result.output
     )
+
+
+def test_project_augmentation_configuration_persists_and_drives_plans_and_dry_runs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _initialize_project(tmp_path, monkeypatch)
+    config_path = tmp_path / ".ul" / "config.json"
+
+    enabled = runner.invoke(app, ["augmentations", "enabled", "--json"])
+    added = runner.invoke(app, ["augmentations", "enable", "input.surface.typing_noise"])
+    plan = runner.invoke(
+        app,
+        ["augmentations", "plan", "input.surface.typing_noise", "--json"],
+    )
+    dry_run = runner.invoke(app, ["run", "--dry-run"])
+
+    assert enabled.exit_code == 0, enabled.output
+    assert [item["ref"]["id"] for item in json.loads(enabled.output)["augmentations"]] == [
+        "input.surface.rephrase"
+    ]
+    assert added.exit_code == 0, added.output
+    assert "Enabled: input.surface.typing_noise@1.0.0" in added.output
+    assert "Next steps:" in added.output
+    assert "UL_LIVE=true" in added.output
+    assert json.loads(config_path.read_text(encoding="utf-8"))["operators"] == [
+        "input.surface.rephrase",
+        "input.surface.typing_noise",
+    ]
+    assert json.loads(plan.output)["augmentations"][0]["enabled"] is True
+    assert dry_run.exit_code == 0, dry_run.output
+    assert "Operators: input.surface.rephrase, input.surface.typing_noise" in dry_run.output
+
+    removed = runner.invoke(app, ["augmentations", "disable", "input.surface.rephrase"])
+    reset = runner.invoke(app, ["augmentations", "reset"])
+
+    assert removed.exit_code == 0, removed.output
+    assert "Disabled: input.surface.rephrase@1.0.0" in removed.output
+    assert reset.exit_code == 0, reset.output
+    assert "Restored recommended defaults" in reset.output
+    assert json.loads(config_path.read_text(encoding="utf-8"))["operators"] == [
+        "input.surface.rephrase"
+    ]
+
+
+def test_configuration_errors_do_not_change_project_config(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _initialize_project(tmp_path, monkeypatch)
+    config_path = tmp_path / ".ul" / "config.json"
+    original = config_path.read_bytes()
+
+    unknown = runner.invoke(app, ["augmentations", "enable", "input.unknown.operator"])
+    unsupported = runner.invoke(app, ["augmentations", "enable", "conversation.ambiguity"])
+    last = runner.invoke(app, ["augmentations", "disable", "input.surface.rephrase"])
+
+    assert unknown.exit_code == 2
+    assert "unknown augmentation" in unknown.output
+    assert unsupported.exit_code == 2
+    assert "cannot be enabled for 'ul run'" in unsupported.output
+    assert "ul augmentations plan conversation.ambiguity@1.0.0" in unsupported.output
+    assert last.exit_code == 2
+    assert "at least one augmentation must remain enabled" in last.output
+    assert config_path.read_bytes() == original
+
+
+@pytest.mark.parametrize(
+    "command", [("enabled",), ("enable", "input.surface.rephrase"), ("reset",)]
+)
+def test_configuration_commands_require_a_project(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    command: tuple[str, ...],
+) -> None:
+    monkeypatch.chdir(tmp_path)
+
+    result = runner.invoke(app, ["augmentations", *command])
+
+    assert result.exit_code == 2
+    assert "no UL project found; run 'ul init' first" in result.output
+    assert not (tmp_path / ".ul").exists()

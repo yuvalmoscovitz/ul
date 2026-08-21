@@ -37,6 +37,7 @@ _PROJECT_DIRECTORY = ".ul"
 _PROJECT_CONFIG = "config.json"
 _PROJECT_STATE = "state.json"
 _MAXIMUM_PROJECT_FILE_BYTES = 1_000_000
+DEFAULT_PROJECT_OPERATORS = ("input.surface.rephrase",)
 
 
 class _StrictModel(BaseModel):
@@ -54,7 +55,7 @@ class ProjectConfig(_StrictModel):
     redaction_policy_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
     redaction_state: str | None = None
     save_augmentations: bool = True
-    operators: tuple[str, ...] = Field(default=("input.surface.rephrase",), min_length=1)
+    operators: tuple[str, ...] = Field(default=DEFAULT_PROJECT_OPERATORS, min_length=1)
     limit: int = Field(default=3, ge=1, le=100)
     repetitions: int = Field(default=3, ge=1)
     max_environment_api_calls: int = Field(default=120, ge=1)
@@ -485,6 +486,21 @@ def load_project() -> tuple[Path, ProjectConfig]:
         except (OSError, ValueError) as error:
             raise typer.BadParameter(f"invalid UL project config: {error}") from None
     raise typer.BadParameter("no UL project found; run 'ul init' first")
+
+
+def save_project_config(project_root: Path, config: ProjectConfig) -> None:
+    """Atomically replace a validated config in an existing private UL project."""
+    project_directory = project_root / _PROJECT_DIRECTORY
+    project_descriptor = _open_private_directory(project_directory)
+    try:
+        config_descriptor = _open_private_regular_file_at(project_descriptor, _PROJECT_CONFIG)
+        os.close(config_descriptor)
+        _replace_private_json(
+            project_directory / _PROJECT_CONFIG,
+            config.model_dump(mode="json"),
+        )
+    finally:
+        os.close(project_descriptor)
 
 
 def _read_private_json(path: Path) -> object:

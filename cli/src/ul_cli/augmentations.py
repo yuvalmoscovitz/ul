@@ -25,8 +25,14 @@ from ul_core.augmentation_catalog import (
 )
 from ul_core.evaluation import EnvironmentCapabilities
 
-from ul_cli.dataset import validate_interaction_dataset
-from ul_cli.project import ProjectConfig, load_project, resolve_project_path
+from ul_cli.dataset import validate_dataset_operator_ids, validate_interaction_dataset
+from ul_cli.project import (
+    DEFAULT_PROJECT_OPERATORS,
+    ProjectConfig,
+    load_project,
+    resolve_project_path,
+    save_project_config,
+)
 
 app = typer.Typer(help="Inspect UL's built-in augmentation library.")
 
@@ -64,6 +70,7 @@ class _ProjectReadiness:
     environment_reasons: tuple[_ReadinessReason, ...]
     environment_capabilities: EnvironmentCapabilities | None
     customer_evaluator_reasons: tuple[_ReadinessReason, ...]
+    enabled_references: frozenset[tuple[str, str]]
 
 
 @dataclass(frozen=True)
@@ -74,6 +81,7 @@ class _PlannedAugmentation:
     status: _ReadinessStatus
     reasons: tuple[_ReadinessReason, ...]
     command: str | None
+    enabled: bool
 
     def as_json(self) -> dict[str, object]:
         return {
@@ -83,6 +91,7 @@ class _PlannedAugmentation:
             "status": self.status,
             "reasons": [reason.as_json() for reason in self.reasons],
             "command": self.command,
+            "enabled": self.enabled,
         }
 
 
@@ -136,15 +145,23 @@ def list_augmentations(
 
 @app.command("plan")
 def plan_augmentations(
+    reference: Annotated[
+        str | None,
+        typer.Argument(help="Optional augmentation ID with optional @VERSION."),
+    ] = None,
     json_output: Annotated[
         bool, typer.Option("--json", help="Emit stable machine-readable JSON.")
     ] = False,
 ) -> None:
     """Classify built-in augmentations for the current project without external calls."""
     project = _load_project_readiness()
+    catalog_augmentations = (
+        (_resolve_augmentation(reference),)
+        if reference is not None
+        else builtin_augmentation_catalog().list()
+    )
     augmentations = tuple(
-        _plan_augmentation(augmentation, project)
-        for augmentation in builtin_augmentation_catalog().list()
+        _plan_augmentation(augmentation, project) for augmentation in catalog_augmentations
     )
     summary = {
         status: sum(augmentation.status == status for augmentation in augmentations)
@@ -175,12 +192,26 @@ def plan_augmentations(
     )
     if project.reason is not None:
         typer.echo(f"Project: {project.reason}")
-    for augmentation in augmentations:
+    elif project.enabled_references:
         typer.echo(
-            f"{augmentation.status.upper()} {augmentation.ref.id}@{augmentation.ref.version}"
+            "Enabled for ul run: "
+            + ", ".join(
+                f"{item_id}@{version}" for item_id, version in sorted(project.enabled_references)
+            )
         )
-        for reason in augmentation.reasons:
-            typer.echo(f"  Reason: {reason.message}")
+    for augmentation in augmentations:
+        enabled = " [enabled]" if augmentation.enabled else ""
+        typer.echo(
+            f"{augmentation.status.upper()} "
+            f"{augmentation.ref.id}@{augmentation.ref.version}{enabled}"
+        )
+        if augmentation.status == "blocked":
+            typer.echo("  Next steps:")
+            for step_number, reason in enumerate(augmentation.reasons, start=1):
+                typer.echo(f"  {step_number}. {reason.message}")
+        else:
+            for reason in augmentation.reasons:
+                typer.echo(f"  Reason: {reason.message}")
         if augmentation.command is not None:
             typer.echo(f"  Command: {augmentation.command}")
     typer.echo("Inspection only: 0 model calls, 0 environment calls, 0 network requests.")
@@ -238,9 +269,167 @@ def show_augmentation(
     typer.echo("Execution safety and call cost are enforced by the selected command's planner.")
 
 
+@app.command("enabled")
+def enabled_augmentations(
+    json_output: Annotated[
+        bool, typer.Option("--json", help="Emit stable machine-readable JSON.")
+    ] = False,
+) -> None:
+    """Show augmentations enabled for `ul run` in the current project."""
+    _, config = load_project()
+    augmentations = _configured_augmentations(config)
+    project = _load_project_readiness()
+    planned = tuple(_plan_augmentation(augmentation, project) for augmentation in augmentations)
+    if json_output:
+        typer.echo(
+            json.dumps(
+                {
+                    "schema_version": "1.0.0",
+                    "augmentations": [augmentation.as_json() for augmentation in planned],
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+        return
+    typer.echo("Enabled augmentations")
+    for augmentation in planned:
+        typer.echo(f"{augmentation.ref.id}@{augmentation.ref.version} status={augmentation.status}")
+    typer.echo("Use 'ul augmentations plan ID' for required data and configuration steps.")
+
+
+@app.command("add")
+@app.command("enable")
+def enable_augmentation(
+    reference: Annotated[str, typer.Argument(help="Augmentation ID with optional @VERSION.")],
+) -> None:
+    """Enable a built-in dataset augmentation for `ul run`."""
+    augmentation = _resolve_augmentation(reference)
+    _require_project_configurable(augmentation)
+    project_root, config = load_project()
+    configured = _configured_augmentations(config)
+    identity = (augmentation.ref.id, augmentation.ref.version)
+    if identity in {(item.ref.id, item.ref.version) for item in configured}:
+        typer.echo(f"Already enabled: {augmentation.ref.id}@{augmentation.ref.version}")
+        return
+    stored_reference = (
+        f"{augmentation.ref.id}@{augmentation.ref.version}"
+        if "@" in reference
+        else augmentation.ref.id
+    )
+    _save_operators(project_root, config, (*config.operators, stored_reference))
+    typer.echo(f"Enabled: {augmentation.ref.id}@{augmentation.ref.version}")
+    _print_selected_readiness(augmentation)
+
+
+@app.command("remove")
+@app.command("disable")
+def disable_augmentation(
+    reference: Annotated[str, typer.Argument(help="Augmentation ID with optional @VERSION.")],
+) -> None:
+    """Disable a built-in dataset augmentation for `ul run`."""
+    augmentation = _resolve_augmentation(reference)
+    _require_project_configurable(augmentation)
+    project_root, config = load_project()
+    configured = _configured_augmentations(config)
+    identity = (augmentation.ref.id, augmentation.ref.version)
+    remaining = tuple(
+        stored_reference
+        for stored_reference, item in zip(config.operators, configured, strict=True)
+        if (item.ref.id, item.ref.version) != identity
+    )
+    if len(remaining) == len(config.operators):
+        typer.echo(f"Already disabled: {augmentation.ref.id}@{augmentation.ref.version}")
+        return
+    if not remaining:
+        raise typer.BadParameter(
+            "at least one augmentation must remain enabled; enable another or run "
+            "'ul augmentations reset'"
+        )
+    _save_operators(project_root, config, remaining)
+    typer.echo(f"Disabled: {augmentation.ref.id}@{augmentation.ref.version}")
+
+
+@app.command("reset")
+def reset_augmentations() -> None:
+    """Restore the recommended project augmentation defaults."""
+    project_root, config = load_project()
+    _configured_augmentations(config)
+    _save_operators(project_root, config, DEFAULT_PROJECT_OPERATORS)
+    typer.echo("Restored recommended defaults: input.surface.rephrase@1.0.0")
+    _print_selected_readiness(builtin_augmentation_catalog().get("input.surface.rephrase"))
+
+
+def _configured_augmentations(config: ProjectConfig) -> tuple[BuiltinAugmentationSpec, ...]:
+    try:
+        validate_dataset_operator_ids(list(config.operators))
+    except ValueError as error:
+        raise typer.BadParameter(f"invalid configured augmentations: {error}") from None
+    catalog = builtin_augmentation_catalog()
+    configured: list[BuiltinAugmentationSpec] = []
+    for reference in config.operators:
+        augmentation_id, separator, version = reference.partition("@")
+        try:
+            configured.append(catalog.get(augmentation_id, version if separator else None))
+        except KeyError:
+            raise typer.BadParameter(
+                "invalid configured augmentations: unknown augmentation operator reference"
+            ) from None
+    return tuple(configured)
+
+
+def _resolve_augmentation(reference: str) -> BuiltinAugmentationSpec:
+    augmentation_id, version = _parse_reference(reference)
+    try:
+        return builtin_augmentation_catalog().get(augmentation_id, version)
+    except KeyError:
+        raise typer.BadParameter(
+            "unknown augmentation; use ID or ID@VERSION from 'ul augmentations list'",
+            param_hint="REFERENCE",
+        ) from None
+
+
+def _require_project_configurable(augmentation: BuiltinAugmentationSpec) -> None:
+    if any(binding.execution_owner == "dataset_cli" for binding in augmentation.bindings):
+        return
+    reference = f"{augmentation.ref.id}@{augmentation.ref.version}"
+    raise typer.BadParameter(
+        f"{reference} cannot be enabled for 'ul run'; run "
+        f"'ul augmentations plan {reference}' for its required data, configuration, and command"
+    )
+
+
+def _save_operators(
+    project_root: Path,
+    config: ProjectConfig,
+    operators: tuple[str, ...],
+) -> None:
+    try:
+        validate_dataset_operator_ids(list(operators))
+        updated_config = ProjectConfig.model_validate(
+            {**config.model_dump(mode="json"), "operators": operators}
+        )
+        save_project_config(project_root, updated_config)
+    except (OSError, ValueError) as error:
+        raise typer.BadParameter(f"cannot update augmentation configuration: {error}") from None
+
+
+def _print_selected_readiness(augmentation: BuiltinAugmentationSpec) -> None:
+    planned = _plan_augmentation(augmentation, _load_project_readiness())
+    if planned.status == "ready":
+        typer.echo("Ready for ul run.")
+        return
+    typer.echo(f"Configured, but currently {planned.status}.")
+    typer.echo("Next steps:")
+    for step_number, reason in enumerate(planned.reasons, start=1):
+        typer.echo(f"  {step_number}. {reason.message}")
+    typer.echo(f"Recheck: ul augmentations plan {augmentation.ref.id}@{augmentation.ref.version}")
+
+
 def _load_project_readiness() -> _ProjectReadiness:
     try:
         project_root, config = load_project()
+        configured = _configured_augmentations(config)
     except typer.BadParameter as error:
         if str(error) == "no UL project found; run 'ul init' first":
             status: _ProjectStatus = "missing"
@@ -257,6 +446,7 @@ def _load_project_readiness() -> _ProjectReadiness:
             environment_reasons=(),
             environment_capabilities=None,
             customer_evaluator_reasons=(),
+            enabled_references=frozenset(),
         )
     available_source_features, dataset_reasons = _dataset_readiness(project_root, config)
     environment_reasons, environment_capabilities = _environment_readiness(project_root, config)
@@ -269,6 +459,9 @@ def _load_project_readiness() -> _ProjectReadiness:
         environment_reasons=environment_reasons,
         environment_capabilities=environment_capabilities,
         customer_evaluator_reasons=_customer_evaluator_readiness(project_root, config),
+        enabled_references=frozenset(
+            (augmentation.ref.id, augmentation.ref.version) for augmentation in configured
+        ),
     )
 
 
@@ -454,6 +647,7 @@ def _plan_augmentation(
             status="manual",
             reasons=tuple(reasons),
             command=None,
+            enabled=(augmentation.ref.id, augmentation.ref.version) in project.enabled_references,
         )
     binding = cli_bindings[0]
     blocking_reasons = _binding_blocking_reasons(binding, project)
@@ -465,6 +659,7 @@ def _plan_augmentation(
             status="blocked",
             reasons=blocking_reasons,
             command=None,
+            enabled=(augmentation.ref.id, augmentation.ref.version) in project.enabled_references,
         )
     manual_reasons = _binding_manual_reasons(binding, project)
     command = _project_command(augmentation, binding)
@@ -476,6 +671,7 @@ def _plan_augmentation(
             status="manual",
             reasons=manual_reasons,
             command=command,
+            enabled=(augmentation.ref.id, augmentation.ref.version) in project.enabled_references,
         )
     return _PlannedAugmentation(
         ref=augmentation.ref,
@@ -489,6 +685,7 @@ def _plan_augmentation(
             ),
         ),
         command=command,
+        enabled=(augmentation.ref.id, augmentation.ref.version) in project.enabled_references,
     )
 
 
