@@ -26,7 +26,7 @@ from ul_cli.report_contract import (
     FindingSummary,
     ReportEvidenceType,
     ReportInputError,
-    ReportStatus,
+    ReportReviewStatus,
     UnifiedReport,
     build_report_summary,
 )
@@ -154,12 +154,20 @@ def _summarize_stateful_stress_result(result: StatefulStressResult) -> UnifiedRe
         )
         for rule in violating_rules
     )
-    status: ReportStatus = result.status
-    exit_code = cast(Literal[0, 1, 2], {"passed": 0, "failed": 1, "inconclusive": 2}[status])
+    review_status = cast(
+        ReportReviewStatus,
+        {"passed": "resolved", "failed": "action_required", "inconclusive": "inconclusive"}[
+            result.status
+        ],
+    )
+    exit_code = cast(
+        Literal[0, 1, 2],
+        {"resolved": 0, "action_required": 1, "inconclusive": 2}[review_status],
+    )
     return UnifiedReport(
         evidence_type=evidence_type,
         evidence_schema_versions=(result.schema_version,),
-        status=status,
+        review_status=review_status,
         exit_code=exit_code,
         summary=build_report_summary(findings),
         findings=findings,
@@ -202,7 +210,7 @@ def _load_stateful_stress_result(path: Path) -> StatefulStressResult:
 def _print_human_report(report: UnifiedReport, evidence: Path) -> None:
     typer.echo("UL run report")
     typer.echo(f"Evidence type: {_EVIDENCE_LABELS[report.evidence_type]}")
-    typer.echo(f"Status: {report.status} (exit {report.exit_code})")
+    typer.echo(f"Review status: {report.review_status} (exit {report.exit_code})")
     typer.echo(
         f"Findings: {report.summary.finding_count} total; "
         f"{report.summary.actionable_finding_count} actionable"

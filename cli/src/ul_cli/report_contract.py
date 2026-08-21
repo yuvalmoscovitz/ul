@@ -10,7 +10,7 @@ ReportEvidenceType = Literal[
     "retry_after_successful_commit",
     "timeout_after_commit",
 ]
-ReportStatus = Literal["passed", "failed", "inconclusive"]
+ReportReviewStatus = Literal["resolved", "action_required", "inconclusive"]
 FindingKind = Literal["behavior_difference", "customer_invariant_violation"]
 FindingCategory = Literal[
     "duplicate_effect",
@@ -151,10 +151,10 @@ def build_report_summary(findings: tuple[FindingSummary, ...]) -> ReportSummary:
 
 
 class UnifiedReport(_StrictModel):
-    schema_version: Literal["1.1.0"] = "1.1.0"
+    schema_version: Literal["1.2.0"] = "1.2.0"
     evidence_type: ReportEvidenceType
     evidence_schema_versions: tuple[str, ...] = Field(min_length=1)
-    status: ReportStatus
+    review_status: ReportReviewStatus
     exit_code: Literal[0, 1, 2]
     summary: ReportSummary
     findings: tuple[FindingSummary, ...] = ()
@@ -163,9 +163,11 @@ class UnifiedReport(_StrictModel):
     def validate_report(self) -> Self:
         if self.evidence_schema_versions != tuple(sorted(set(self.evidence_schema_versions))):
             raise ValueError("evidence schema versions must be sorted and unique")
-        expected_exit_code = {"passed": 0, "failed": 1, "inconclusive": 2}[self.status]
+        expected_exit_code = {"resolved": 0, "action_required": 1, "inconclusive": 2}[
+            self.review_status
+        ]
         if self.exit_code != expected_exit_code:
-            raise ValueError("exit code must match report status")
+            raise ValueError("exit code must match report review status")
         if self.summary.finding_count != len(self.findings):
             raise ValueError("finding count must match report findings")
         expected_review_counts = {
@@ -186,10 +188,10 @@ class UnifiedReport(_StrictModel):
         )
         if self.summary.actionable_finding_count != expected_actionable_count:
             raise ValueError("actionable finding count must match report findings")
-        if self.status == "passed" and (
+        if self.review_status == "resolved" and (
             self.summary.actionable_finding_count or self.summary.review_status_counts.inconclusive
         ):
-            raise ValueError("passed reports cannot contain unresolved findings")
-        if self.status == "failed" and not self.summary.actionable_finding_count:
-            raise ValueError("failed reports require an actionable finding")
+            raise ValueError("resolved reports cannot contain unresolved findings")
+        if self.review_status == "action_required" and not self.summary.actionable_finding_count:
+            raise ValueError("action-required reports require an actionable finding")
         return self

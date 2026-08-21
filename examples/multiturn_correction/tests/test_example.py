@@ -76,14 +76,14 @@ def test_runnable_example_reports_real_repeatable_correction_failure(tmp_path: P
     assert report.exit_code == 1, report.output
     report_payload = json.loads(report.output)
     assert report_payload["evidence_type"] == "correction_after_first_response"
-    assert report_payload["status"] == "failed"
+    assert report_payload["review_status"] == "action_required"
     assert report_payload["summary"]["finding_count"] == 1
     assert "AC-100" not in report.output
     assert "AC-101" not in report.output
     human_report = CliRunner().invoke(app, ["report", str(evidence_path)])
     assert human_report.exit_code == 1, human_report.output
     assert "Evidence type: correction after first response" in human_report.output
-    assert "Status: failed (exit 1)" in human_report.output
+    assert "Review status: action_required (exit 1)" in human_report.output
     assert "The agent violated a customer-defined rule." in human_report.output
     assert "no dedicated stateful detail command is available" in human_report.output
     assert "AC-100" not in human_report.output

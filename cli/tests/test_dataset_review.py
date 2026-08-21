@@ -377,10 +377,10 @@ def test_root_json_report_is_stable_and_omits_private_dataset_fields(tmp_path: P
 
     assert report.exit_code == 1, report.output
     expected = {
-        "schema_version": "1.1.0",
+        "schema_version": "1.2.0",
         "evidence_type": "dataset_evaluation",
         "evidence_schema_versions": ["1.3.0"],
-        "status": "failed",
+        "review_status": "action_required",
         "exit_code": 1,
         "summary": {
             "finding_count": 1,
@@ -467,7 +467,7 @@ def test_root_report_treats_unstable_variation_as_exit_one_finding(tmp_path: Pat
 
     assert report.exit_code == 1, report.output
     payload = json.loads(report.output)
-    assert payload["status"] == "failed"
+    assert payload["review_status"] == "action_required"
     assert payload["summary"]["finding_count"] == 1
     assert payload["findings"][0]["category"] == "unstable_behavior"
     assert payload["findings"][0]["summary"] == (
@@ -506,7 +506,7 @@ def test_root_report_maps_incomplete_dataset_evidence_to_exit_two(tmp_path: Path
 
     assert report.exit_code == 2, report.output
     payload = json.loads(report.output)
-    assert payload["status"] == "inconclusive"
+    assert payload["review_status"] == "inconclusive"
     assert payload["exit_code"] == 2
     assert payload["findings"] == []
 
@@ -935,11 +935,11 @@ def test_sensitive_value_printer_does_not_wrap_beyond_counted_line(
 
 
 @pytest.mark.parametrize(
-    ("status_value", "severity", "expected_exit", "expected_status", "actionable_count"),
+    ("status_value", "severity", "expected_exit", "expected_review_status", "actionable_count"),
     [
-        ("confirmed", "critical", 1, "failed", 1),
-        ("expected", None, 0, "passed", 0),
-        ("unsupported", None, 0, "passed", 0),
+        ("confirmed", "critical", 1, "action_required", 1),
+        ("expected", None, 0, "resolved", 0),
+        ("unsupported", None, 0, "resolved", 0),
         ("inconclusive", None, 2, "inconclusive", 0),
     ],
 )
@@ -948,7 +948,7 @@ def test_all_review_statuses_are_recorded(
     status_value: str,
     severity: str | None,
     expected_exit: int,
-    expected_status: str,
+    expected_review_status: str,
     actionable_count: int,
 ) -> None:
     evidence = tmp_path / "results.jsonl"
@@ -967,7 +967,7 @@ def test_all_review_statuses_are_recorded(
     report = runner.invoke(app, ["report", str(evidence), "--json"])
     assert report.exit_code == expected_exit, report.output
     payload = json.loads(report.output)
-    assert payload["status"] == expected_status
+    assert payload["review_status"] == expected_review_status
     assert payload["summary"]["actionable_finding_count"] == actionable_count
     assert payload["summary"]["review_status_counts"][status_value] == 1
 

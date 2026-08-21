@@ -52,7 +52,7 @@ from ul_cli.report_contract import (
     FindingSummary,
     FindingSummaryText,
     ReportInputError,
-    ReportStatus,
+    ReportReviewStatus,
     UnifiedReport,
     build_report_summary,
 )
@@ -740,22 +740,25 @@ def _summarize_dataset_evidence(
     findings = tuple(finding_summaries)
     summary = build_report_summary(findings)
     if summary.actionable_finding_count:
-        status: ReportStatus = "failed"
+        report_review_status: ReportReviewStatus = "action_required"
     elif (
         summary.review_status_counts.inconclusive
         or "not_evaluable" in invariant_statuses
         or _dataset_evidence_is_inconclusive(evidence_records)
     ):
-        status = "inconclusive"
+        report_review_status = "inconclusive"
     else:
-        status = "passed"
-    exit_code = cast(Literal[0, 1, 2], {"passed": 0, "failed": 1, "inconclusive": 2}[status])
+        report_review_status = "resolved"
+    exit_code = cast(
+        Literal[0, 1, 2],
+        {"resolved": 0, "action_required": 1, "inconclusive": 2}[report_review_status],
+    )
     return UnifiedReport(
         evidence_type="dataset_evaluation",
         evidence_schema_versions=tuple(
             sorted({record.evidence.schema_version for record in evidence_records})
         ),
-        status=status,
+        review_status=report_review_status,
         exit_code=exit_code,
         summary=summary,
         findings=findings,

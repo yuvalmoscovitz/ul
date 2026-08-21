@@ -129,13 +129,18 @@ versioned JSON omit inputs, responses, state, customer descriptions, and arbitra
 Use `ul dataset report EVIDENCE.jsonl` when you need the detailed private dataset review surface.
 Trace replay bundles are not supported by `ul report`.
 
-Reviews are appended to a separate audit file. Evidence is never rewritten. Exit codes are:
+Reviews are appended to a separate audit file. Evidence is never rewritten. The human report and
+versioned JSON expose review workflow status (`review_status` in report schema `1.2.0`). Exit codes
+map to that review status:
 
-- `0`: no actionable finding remains; `expected` and `unsupported` reviews resolve a finding.
-- `1`: a finding needs review, is confirmed, or an unreviewed declared rule was violated.
-- `2`: the evaluation or a finding review is inconclusive and no actionable finding remains.
+- `0` (`resolved`): no actionable finding remains; `expected` and `unsupported` reviews resolve a
+  finding.
+- `1` (`action_required`): a finding needs review, is confirmed, or an unreviewed declared rule was
+  violated.
+- `2` (`inconclusive`): the evaluation or a finding review is inconclusive and no actionable
+  finding remains.
 
-Exit `1` is not a general correctness verdict.
+Review status is workflow state, not an agent correctness verdict.
 
 Save a confirmed finding as a regression:
 
