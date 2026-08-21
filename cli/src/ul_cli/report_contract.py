@@ -51,6 +51,7 @@ FindingSummaryText = Literal[
 _IDENTIFIER_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$"
 _VERSION_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9._+-]{0,49}$"
 _FINDING_ID_PATTERN = r"^ulf_v1_[0-9a-f]{64}$"
+_PATTERN_ID_PATTERN = r"^ulp_v1_[0-9a-f]{64}$"
 _BEHAVIOR_SUMMARIES: dict[str, str] = {
     "duplicate_effect": "The changed input made the agent repeat an action.",
     "unexpected_effect": "The changed input made the agent take a new action.",
@@ -126,6 +127,48 @@ class FindingSummary(_StrictModel):
         return self
 
 
+class PatternOperator(_StrictModel):
+    operator_id: str = Field(pattern=_IDENTIFIER_PATTERN)
+    operator_version: str = Field(pattern=_VERSION_PATTERN)
+    summary: str | None = Field(default=None, min_length=1, max_length=500)
+
+
+class FailurePattern(_StrictModel):
+    pattern_id: str = Field(pattern=_PATTERN_ID_PATTERN)
+    kind: FindingKind
+    category: FindingCategory
+    rule_id: str | None = Field(default=None, pattern=_IDENTIFIER_PATTERN)
+    rule_version: str | None = Field(default=None, pattern=_VERSION_PATTERN)
+    summary: FindingSummaryText
+    finding_count: int = Field(ge=1)
+    source_case_count: int = Field(ge=1)
+    operators: tuple[PatternOperator, ...] = Field(min_length=1)
+    needs_review_count: int = Field(ge=0)
+    confirmed_count: int = Field(ge=0)
+    finding_ids: tuple[str, ...] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def validate_pattern(self) -> Self:
+        if (self.rule_id is None) != (self.rule_version is None):
+            raise ValueError("pattern rule ID and version must be present together")
+        if self.kind == "behavior_difference" and self.rule_id is not None:
+            raise ValueError("behavior patterns cannot reference a customer rule")
+        if self.kind == "customer_invariant_violation" and self.rule_id is None:
+            raise ValueError("invariant patterns require a customer rule")
+        if self.finding_count != len(self.finding_ids):
+            raise ValueError("pattern finding count must match finding IDs")
+        if self.finding_ids != tuple(sorted(set(self.finding_ids))):
+            raise ValueError("pattern finding IDs must be sorted and unique")
+        if self.needs_review_count + self.confirmed_count != self.finding_count:
+            raise ValueError("pattern review counts must match finding count")
+        operator_keys = tuple(
+            (operator.operator_id, operator.operator_version) for operator in self.operators
+        )
+        if operator_keys != tuple(sorted(set(operator_keys))):
+            raise ValueError("pattern operators must be sorted and unique")
+        return self
+
+
 class ReviewStatusCounts(_StrictModel):
     needs_review: int = Field(ge=0)
     confirmed: int = Field(ge=0)
@@ -157,7 +200,7 @@ def build_report_summary(findings: tuple[FindingSummary, ...]) -> ReportSummary:
 
 
 class UnifiedReport(_StrictModel):
-    schema_version: Literal["1.3.0"] = "1.3.0"
+    schema_version: Literal["1.4.0"] = "1.4.0"
     evidence_type: ReportEvidenceType
     evidence_schema_versions: tuple[str, ...] = Field(min_length=1)
     evidence_scope: ReportEvidenceScope
@@ -165,6 +208,7 @@ class UnifiedReport(_StrictModel):
     review_status: ReportReviewStatus
     exit_code: Literal[0, 1, 2]
     summary: ReportSummary
+    patterns: tuple[FailurePattern, ...] = ()
     findings: tuple[FindingSummary, ...] = ()
 
     @model_validator(mode="after")
@@ -188,6 +232,33 @@ class UnifiedReport(_StrictModel):
             raise ValueError("exit code must match report review status")
         if self.summary.finding_count != len(self.findings):
             raise ValueError("finding count must match report findings")
+        if tuple(pattern.pattern_id for pattern in self.patterns) != tuple(
+            sorted({pattern.pattern_id for pattern in self.patterns})
+        ):
+            raise ValueError("patterns must be sorted and unique")
+        known_findings = {
+            finding.finding_id: finding
+            for finding in self.findings
+            if finding.finding_id is not None
+        }
+        patterned_findings: set[str] = set()
+        for pattern in self.patterns:
+            for finding_id in pattern.finding_ids:
+                finding = known_findings.get(finding_id)
+                if finding is None:
+                    raise ValueError("pattern references an unknown finding")
+                if finding_id in patterned_findings:
+                    raise ValueError("finding cannot belong to multiple patterns")
+                if (
+                    finding.kind != pattern.kind
+                    or finding.category != pattern.category
+                    or finding.rule_id != pattern.rule_id
+                    or finding.rule_version != pattern.rule_version
+                    or finding.summary != pattern.summary
+                    or finding.review_status not in {"needs_review", "confirmed"}
+                ):
+                    raise ValueError("pattern fields must match its actionable findings")
+                patterned_findings.add(finding_id)
         expected_review_counts = {
             status: sum(finding.review_status == status for finding in self.findings)
             for status in (

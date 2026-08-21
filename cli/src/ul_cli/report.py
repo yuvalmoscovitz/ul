@@ -234,6 +234,33 @@ def _print_human_report(report: UnifiedReport, evidence: Path) -> None:
             f"expected={review_counts.expected}, unsupported={review_counts.unsupported}, "
             f"inconclusive={review_counts.inconclusive}"
         )
+    if report.patterns:
+        typer.echo("")
+        typer.echo(f"Failure patterns to review: {len(report.patterns)}")
+        typer.echo("Patterns group similar evidence; they do not claim a root cause.")
+        for index, pattern in enumerate(report.patterns, start=1):
+            typer.echo("")
+            typer.echo(f"Pattern {index}: {pattern.summary}")
+            typer.echo(f"  Pattern ID: {pattern.pattern_id}")
+            if pattern.rule_id is not None:
+                typer.echo(
+                    f"  Customer rule: {pattern.rule_id}@{pattern.rule_version} "
+                    "(configured by your team)"
+                )
+            typer.echo(
+                f"  Affected: {pattern.finding_count} finding(s) across "
+                f"{pattern.source_case_count} test question(s)"
+            )
+            typer.echo("  Triggered by:")
+            for operator in pattern.operators:
+                label = operator.summary or operator.operator_id
+                typer.echo(f"    - {label} ({operator.operator_id}@{operator.operator_version})")
+            typer.echo(
+                "  Review queue: "
+                f"{pattern.needs_review_count} needs review; "
+                f"{pattern.confirmed_count} confirmed"
+            )
+            typer.echo(f"  Finding IDs: {', '.join(pattern.finding_ids)}")
     safe_evidence = "".join(
         character if character.isprintable() else f"\\u{ord(character):04x}"
         for character in str(evidence)
@@ -247,7 +274,10 @@ def _print_human_report(report: UnifiedReport, evidence: Path) -> None:
         if finding.operator_id is not None:
             typer.echo(f"  Operator: {finding.operator_id}@{finding.operator_version}")
         if finding.rule_id is not None:
-            typer.echo(f"  Rule: {finding.rule_id}@{finding.rule_version}")
+            typer.echo(
+                f"  Customer rule: {finding.rule_id}@{finding.rule_version} "
+                "(configured by your team)"
+            )
             typer.echo(f"  Declared severity: {finding.declared_severity}")
         if finding.review_status is not None:
             typer.echo(f"  Review: {finding.review_status}; severity={finding.review_severity}")
