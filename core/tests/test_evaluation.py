@@ -305,6 +305,120 @@ def test_successful_execution_evidence_is_explicit() -> None:
     assert evidence.turns[0].state_observation_authority == "environment_self_reported"
 
 
+def test_successful_response_only_evidence_has_no_reset_or_cleanup_claims() -> None:
+    evidence = ExecutionEvidence(
+        evidence_scope="response_only",
+        case_id="case-1",
+        environment_id="response-only-environment",
+        environment_config_sha256="a" * 64,
+        turns=(EnvironmentTurnEvidence(turn_id="turn-1", response={"status": "ok"}),),
+        final_response={"status": "ok"},
+        lifecycle=EnvironmentLifecycleEvidence(
+            terminal_status="succeeded",
+            completed_phases=("execute_turn",),
+            delivery="certain",
+            cleanup="not_attempted",
+            environment_state_uncertain=False,
+        ),
+    )
+
+    assert evidence.lifecycle.initial_reset is None
+    assert evidence.lifecycle.cleanup_reset is None
+
+
+@pytest.mark.parametrize(
+    ("evidence_updates", "lifecycle_updates", "message"),
+    (
+        (
+            {
+                "initial_state": EnvironmentStateEvidence(
+                    value={}, authority="environment_self_reported"
+                )
+            },
+            {},
+            "state observations",
+        ),
+        (
+            {},
+            {
+                "initial_reset": EnvironmentResetEvidence(
+                    reset_session_requested=True,
+                    reset_session_acknowledged=True,
+                    reset_env_requested=True,
+                    reset_env_acknowledged=True,
+                )
+            },
+            "reset receipts",
+        ),
+        ({}, {"completed_phases": ("reset",)}, "stateful phases"),
+        ({}, {"failed_phase": "snapshot"}, "stateful phase"),
+    ),
+)
+def test_failed_response_only_evidence_rejects_stateful_claims(
+    evidence_updates: dict[str, object],
+    lifecycle_updates: dict[str, object],
+    message: str,
+) -> None:
+    lifecycle = EnvironmentLifecycleEvidence(
+        terminal_status="failed",
+        failed_phase="execute_turn",
+        failure_code="response_timeout",
+        failure_reason="environment API response timed out",
+        delivery="uncertain",
+        cleanup="not_attempted",
+        environment_state_uncertain=True,
+    ).model_copy(update=lifecycle_updates)
+
+    with pytest.raises(ValidationError, match=message):
+        ExecutionEvidence.model_validate(
+            {
+                "evidence_scope": "response_only",
+                "case_id": "case-1",
+                "environment_id": "response-only-environment",
+                "environment_config_sha256": "a" * 64,
+                "lifecycle": lifecycle,
+                **evidence_updates,
+            }
+        )
+
+
+def test_successful_response_and_state_evidence_still_requires_cleanup() -> None:
+    with pytest.raises(ValidationError, match="requires cleanup"):
+        ExecutionEvidence(
+            case_id="case-1",
+            environment_id="stateful-environment",
+            environment_config_sha256="a" * 64,
+            initial_state=EnvironmentStateEvidence(
+                value={"clean": True}, authority="environment_self_reported"
+            ),
+            turns=(
+                EnvironmentTurnEvidence(
+                    turn_id="turn-1",
+                    response={"status": "ok"},
+                    state_snapshot={"payments": []},
+                    state_observation_authority="environment_self_reported",
+                ),
+            ),
+            final_response={"status": "ok"},
+            final_state=EnvironmentStateEvidence(
+                value={"payments": []}, authority="environment_self_reported"
+            ),
+            lifecycle=EnvironmentLifecycleEvidence(
+                initial_reset=EnvironmentResetEvidence(
+                    reset_session_requested=True,
+                    reset_session_acknowledged=True,
+                    reset_env_requested=True,
+                    reset_env_acknowledged=True,
+                ),
+                terminal_status="succeeded",
+                completed_phases=("reset", "execute_turn", "snapshot"),
+                delivery="certain",
+                cleanup="not_attempted",
+                environment_state_uncertain=False,
+            ),
+        )
+
+
 def test_environment_capabilities_bind_state_authority() -> None:
     with pytest.raises(ValidationError):
         EnvironmentCapabilities(

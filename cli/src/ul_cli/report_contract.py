@@ -11,6 +11,12 @@ ReportEvidenceType = Literal[
     "timeout_after_commit",
 ]
 ReportReviewStatus = Literal["resolved", "action_required", "inconclusive"]
+ReportEvidenceScope = Literal["response_only", "response_and_state"]
+ReportCapabilityLimitation = Literal[
+    "cleanup_verification",
+    "conversation_replay",
+    "state_observation",
+]
 FindingKind = Literal["behavior_difference", "customer_invariant_violation"]
 FindingCategory = Literal[
     "duplicate_effect",
@@ -151,9 +157,11 @@ def build_report_summary(findings: tuple[FindingSummary, ...]) -> ReportSummary:
 
 
 class UnifiedReport(_StrictModel):
-    schema_version: Literal["1.2.0"] = "1.2.0"
+    schema_version: Literal["1.3.0"] = "1.3.0"
     evidence_type: ReportEvidenceType
     evidence_schema_versions: tuple[str, ...] = Field(min_length=1)
+    evidence_scope: ReportEvidenceScope
+    capability_limitations: tuple[ReportCapabilityLimitation, ...] = ()
     review_status: ReportReviewStatus
     exit_code: Literal[0, 1, 2]
     summary: ReportSummary
@@ -161,6 +169,16 @@ class UnifiedReport(_StrictModel):
 
     @model_validator(mode="after")
     def validate_report(self) -> Self:
+        if self.capability_limitations != tuple(sorted(set(self.capability_limitations))):
+            raise ValueError("capability limitations must be sorted and unique")
+        if self.evidence_scope == "response_only" and self.capability_limitations != (
+            "cleanup_verification",
+            "conversation_replay",
+            "state_observation",
+        ):
+            raise ValueError("response-only reports must name every unverified capability")
+        if self.evidence_scope == "response_and_state" and self.capability_limitations:
+            raise ValueError("response-and-state reports cannot name adapter limitations")
         if self.evidence_schema_versions != tuple(sorted(set(self.evidence_schema_versions))):
             raise ValueError("evidence schema versions must be sorted and unique")
         expected_exit_code = {"resolved": 0, "action_required": 1, "inconclusive": 2}[

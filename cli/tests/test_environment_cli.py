@@ -186,6 +186,32 @@ def _write_config(tmp_path: Path, server: _EnvironmentServer) -> Path:
     return config
 
 
+def _write_isolated_response_config(tmp_path: Path, server: _EnvironmentServer) -> Path:
+    config = tmp_path / "isolated-response.json"
+    config.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "adapter_tier": "isolated_response",
+                "environment_id": "check-environment",
+                "request_isolation_attested": True,
+                "safe_test_target_attested": True,
+                "execute": {
+                    "url": f"http://127.0.0.1:{server.server_port}/execute",
+                    "request_json_template": {
+                        "case_id": "{{case_id}}",
+                        "turn_id": "{{turn_id}}",
+                        "input": "{{input}}",
+                    },
+                    "response_json_pointer": "/response",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    return config
+
+
 def _check_arguments(config: Path, *, output_json: bool = False) -> list[str]:
     arguments = [
         "environment",
@@ -232,6 +258,56 @@ def test_check_runs_complete_model_free_lifecycle(tmp_path: Path) -> None:
     assert server.requests[0][1]["reset_env"] is True
     assert server.requests[2][1]["turn_id"] == "__ul_initial_state__"
     assert server.requests[3][1]["turn_id"] == server.requests[4][1]["turn_id"]
+
+
+def test_check_reports_no_cleanup_or_reset_for_isolated_response(tmp_path: Path) -> None:
+    with _environment_server() as server:
+        config = _write_isolated_response_config(tmp_path, server)
+        result = runner.invoke(app, _check_arguments(config, output_json=True))
+
+    assert result.exit_code == 0, result.output
+    summary = json.loads(result.output)
+    assert summary["status"] == "ready"
+    assert summary["environment_api_call_budget"] == 1
+    assert summary["completed_phases"] == ["execute_turn"]
+    assert summary["state_observation_authority"] is None
+    assert summary["cleanup"] == "not_attempted"
+    assert summary["initial_reset"] is None
+    assert summary["cleanup_reset"] is None
+    assert [path for path, _ in server.requests] == ["/execute"]
+
+
+def test_isolated_check_uses_no_reset_confirmation_wording(tmp_path: Path) -> None:
+    with _environment_server() as server:
+        config = _write_isolated_response_config(tmp_path, server)
+        arguments = _check_arguments(config, output_json=True)
+        arguments.remove("--confirm-test-environment")
+        result = runner.invoke(app, arguments)
+
+    assert result.exit_code == 2
+    summary = json.loads(result.output)
+    assert "dedicated test target" in summary["reason"]
+    assert "reset" not in summary["reason"]
+    assert server.requests == []
+
+
+def test_check_rejects_generated_environment_id_placeholder_before_network(
+    tmp_path: Path,
+) -> None:
+    with _environment_server() as server:
+        config = _write_isolated_response_config(tmp_path, server)
+        raw_config = json.loads(config.read_text(encoding="utf-8"))
+        raw_config["environment_id"] = "replace-with-stable-environment-id"
+        config.write_text(json.dumps(raw_config), encoding="utf-8")
+
+        result = runner.invoke(app, _check_arguments(config, output_json=True))
+
+    assert result.exit_code == 2
+    summary = json.loads(result.output)
+    assert summary["status"] == "not_ready"
+    assert summary["error_code"] == "environment_config_invalid"
+    assert "generated placeholder" in summary["reason"]
+    assert server.requests == []
 
 
 def test_check_reports_precise_phase_and_protocol_error(tmp_path: Path) -> None:

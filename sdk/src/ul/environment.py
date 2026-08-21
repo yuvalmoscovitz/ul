@@ -4,7 +4,12 @@ from collections.abc import Iterable
 
 from ul_core.contracts import EnvironmentExecutor
 from ul_core.dataset import ObservedAgentOutput
-from ul_core.evaluation import EvaluationCase, ExecutionEvidence, StateObservationAuthority
+from ul_core.evaluation import (
+    EnvironmentCapabilities,
+    EvaluationCase,
+    ExecutionEvidence,
+    StateObservationAuthority,
+)
 from ul_core.models import ConversationRole, ConversationTurn
 
 
@@ -148,6 +153,8 @@ def observed_outputs_from_evidence(
 
 
 def execution_evidence_requires_quarantine(evidence: ExecutionEvidence) -> bool:
+    if evidence.evidence_scope == "response_only":
+        return False
     lifecycle = evidence.lifecycle
     return (
         lifecycle.delivery == "uncertain"
@@ -158,4 +165,11 @@ def execution_evidence_requires_quarantine(evidence: ExecutionEvidence) -> bool:
             and evidence.timeout_after_commit_event.armed
             and not evidence.timeout_after_commit_event.cleaned
         )
+    )
+
+
+def environment_timeout_requires_quarantine(capabilities: EnvironmentCapabilities) -> bool:
+    return (
+        capabilities.request_isolation != "per_request_attested"
+        and capabilities.cancellation_guarantee != "guaranteed"
     )

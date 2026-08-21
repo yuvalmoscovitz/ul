@@ -7,6 +7,7 @@ from typing import Any
 
 import pytest
 import ul.trace_replay as trace_replay_module
+from ul.http_environment import JsonHttpIsolatedResponseConfig
 from ul.otlp_ingest import OtlpMappingConfig, parse_otlp_traces
 from ul.trace_replay import (
     TraceReplayResult,
@@ -17,6 +18,7 @@ from ul.trace_replay import (
     load_trace_replay_result,
     load_trace_replay_results,
     materialize_trace_replay_bundle,
+    plan_trace_replay,
     run_trace_replay,
 )
 from ul_core.dataset import ObservedAgentOutput
@@ -501,6 +503,64 @@ async def test_replay_without_recorded_state_compares_response_only() -> None:
     assert result.status == "reproduced"
     assert result.response_match_count == 2
     assert result.state_match_count is None
+
+
+def _isolated_response_config() -> JsonHttpIsolatedResponseConfig:
+    return JsonHttpIsolatedResponseConfig.model_validate(
+        {
+            "version": 1,
+            "adapter_tier": "isolated_response",
+            "environment_id": "isolated-test",
+            "request_isolation_attested": True,
+            "safe_test_target_attested": True,
+            "execute": {
+                "url": "https://environment.example.test/execute",
+                "request_json_template": {
+                    "case_id": "{{case_id}}",
+                    "turn_id": "{{turn_id}}",
+                    "input": "{{input}}",
+                },
+                "response_json_pointer": "/response",
+            },
+        }
+    )
+
+
+def test_trace_replay_plan_rejects_recorded_state_for_response_only_target() -> None:
+    case = materialize_trace_replay_bundle(_trace_records()).cases[0]
+
+    with pytest.raises(ValueError, match="cannot observe committed state"):
+        plan_trace_replay(case, _isolated_response_config())
+
+
+@pytest.mark.asyncio
+async def test_trace_replay_rejects_recorded_state_before_environment_call() -> None:
+    class NoCallEnvironment:
+        environment_id = "isolated-test"
+        config_sha256 = "0" * 64
+        capabilities = EnvironmentCapabilities(
+            request_isolation="per_request_attested",
+            supports_conversations=False,
+            supports_state_observation=False,
+            cancellation_guarantee="none",
+        )
+        call_count = 0
+
+        def api_calls_for_case(self, case: EvaluationCase) -> int:
+            self.call_count += 1
+            return 1
+
+        async def execute(self, case: EvaluationCase) -> ExecutionEvidence:
+            self.call_count += 1
+            raise AssertionError("response-only target must not be called")
+
+    case = materialize_trace_replay_bundle(_trace_records()).cases[0]
+    environment = NoCallEnvironment()
+
+    with pytest.raises(ValueError, match="cannot observe committed state"):
+        await run_trace_replay(case, environment, allow_network_egress=True)
+
+    assert environment.call_count == 0
 
 
 @pytest.mark.asyncio

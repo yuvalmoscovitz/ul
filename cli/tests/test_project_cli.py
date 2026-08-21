@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import stat
 from pathlib import Path
 from typing import Any
@@ -14,6 +15,11 @@ from ul_cli import project
 from ul_cli.main import app
 
 runner = CliRunner()
+_ANSI_ESCAPE = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def _compact_plain_output(output: str) -> str:
+    return "".join(_ANSI_ESCAPE.sub("", output).split())
 
 
 def _write_private_file(path: Path, value: str) -> None:
@@ -156,6 +162,154 @@ def test_init_defaults_fit_generated_environment_call_budget(
     assert dry_run.exit_code == 0, dry_run.output
     assert "Selected interactions: 3" in dry_run.output
     assert "Potential environment API calls: up to 90 (authorized maximum: 120)" in dry_run.output
+
+
+def test_init_can_generate_explicit_isolated_response_adapter(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    dataset = tmp_path / "interactions.jsonl"
+    _write_dataset(dataset)
+
+    missing_attestation = runner.invoke(
+        app,
+        [
+            "init",
+            str(dataset),
+            "--environment-url",
+            "https://environment.example",
+            "--adapter-tier",
+            "isolated-response",
+            "--allow-environment-network",
+            "--confirm-test-environment",
+        ],
+        terminal_width=180,
+    )
+    assert missing_attestation.exit_code != 0
+    assert "--confirm-request-isolation" in _compact_plain_output(missing_attestation.output)
+
+    missing_safe_target = runner.invoke(
+        app,
+        [
+            "init",
+            str(dataset),
+            "--environment-url",
+            "https://environment.example",
+            "--adapter-tier",
+            "isolated-response",
+            "--allow-environment-network",
+            "--confirm-test-environment",
+            "--confirm-request-isolation",
+        ],
+        terminal_width=180,
+    )
+    assert missing_safe_target.exit_code != 0
+    assert "--confirm-safe-test-target" in _compact_plain_output(missing_safe_target.output)
+
+    result = runner.invoke(
+        app,
+        [
+            "init",
+            str(dataset),
+            "--environment-url",
+            "https://environment.example",
+            "--adapter-tier",
+            "isolated-response",
+            "--allow-environment-network",
+            "--confirm-test-environment",
+            "--confirm-request-isolation",
+            "--confirm-safe-test-target",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    environment = json.loads((tmp_path / ".ul" / "environment.json").read_text(encoding="utf-8"))
+    assert environment == {
+        "version": 1,
+        "adapter_tier": "isolated_response",
+        "environment_id": "replace-with-stable-environment-id",
+        "request_isolation_attested": True,
+        "safe_test_target_attested": True,
+        "headers_from_env": {},
+        "execute": {
+            "url": "https://environment.example/execute",
+            "request_json_template": {
+                "case_id": "{{case_id}}",
+                "turn_id": "{{turn_id}}",
+                "input": "{{input}}",
+            },
+            "response_json_pointer": "/response",
+        },
+    }
+    assert "response evidence only" in result.output
+    assert "replace environment_id" in result.output
+
+    dry_run = runner.invoke(app, ["run", "--dry-run"])
+    assert dry_run.exit_code == 0, dry_run.output
+    assert "Adapter tier: isolated-response (response evidence only)" in dry_run.output
+    assert "Potential environment API calls: up to 6" in dry_run.output
+
+
+def test_init_existing_isolated_config_requires_safety_flags_and_prints_limitations(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    dataset = tmp_path / "interactions.jsonl"
+    _write_dataset(dataset)
+    environment = tmp_path / "isolated.json"
+    environment.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "adapter_tier": "isolated_response",
+                "environment_id": "isolated-test",
+                "request_isolation_attested": True,
+                "safe_test_target_attested": True,
+                "headers_from_env": {},
+                "execute": {
+                    "url": "https://environment.example/execute",
+                    "request_json_template": {
+                        "case_id": "{{case_id}}",
+                        "turn_id": "{{turn_id}}",
+                        "input": "{{input}}",
+                    },
+                    "response_json_pointer": "/response",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    base_arguments = [
+        "init",
+        str(dataset),
+        "--environment-config",
+        str(environment),
+        "--allow-environment-network",
+        "--confirm-test-environment",
+    ]
+
+    missing_isolation = runner.invoke(app, base_arguments, terminal_width=180)
+    assert missing_isolation.exit_code == 2
+    assert "--confirm-request-isolation" in _compact_plain_output(missing_isolation.output)
+
+    missing_safe_target = runner.invoke(
+        app, [*base_arguments, "--confirm-request-isolation"], terminal_width=180
+    )
+    assert missing_safe_target.exit_code == 2
+    assert "--confirm-safe-test-target" in _compact_plain_output(missing_safe_target.output)
+
+    result = runner.invoke(
+        app,
+        [
+            *base_arguments,
+            "--confirm-request-isolation",
+            "--confirm-safe-test-target",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert "response evidence only" in result.output
+    normalized_output = " ".join(result.output.split())
+    assert "does not verify committed state, cleanup, conversations" in normalized_output
 
 
 @pytest.mark.parametrize(

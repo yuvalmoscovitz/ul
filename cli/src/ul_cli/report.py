@@ -167,6 +167,7 @@ def _summarize_stateful_stress_result(result: StatefulStressResult) -> UnifiedRe
     return UnifiedReport(
         evidence_type=evidence_type,
         evidence_schema_versions=(result.schema_version,),
+        evidence_scope="response_and_state",
         review_status=review_status,
         exit_code=exit_code,
         summary=build_report_summary(findings),
@@ -210,6 +211,16 @@ def _load_stateful_stress_result(path: Path) -> StatefulStressResult:
 def _print_human_report(report: UnifiedReport, evidence: Path) -> None:
     typer.echo("UL run report")
     typer.echo(f"Evidence type: {_EVIDENCE_LABELS[report.evidence_type]}")
+    typer.echo(
+        "Evidence scope: "
+        + (
+            "response only"
+            if report.evidence_scope == "response_only"
+            else "response and committed state"
+        )
+    )
+    if report.capability_limitations:
+        typer.echo("Not verified: committed state, cleanup, or multi-turn conversations.")
     typer.echo(f"Review status: {report.review_status} (exit {report.exit_code})")
     typer.echo(
         f"Findings: {report.summary.finding_count} total; "

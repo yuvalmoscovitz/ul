@@ -8,7 +8,7 @@ import stat
 import sys
 import unicodedata
 from pathlib import Path
-from typing import Annotated, TextIO, cast
+from typing import Annotated, Literal, TextIO, cast
 
 import httpx
 import typer
@@ -47,9 +47,13 @@ from ul.dataset_invariants import (
     load_dataset_invariant_suite,
 )
 from ul.http_environment import (
+    ENVIRONMENT_ID_PLACEHOLDER,
     JsonHttpEnvironmentConfig,
     JsonHttpEnvironmentConnection,
+    JsonHttpIsolatedResponseConfig,
+    JsonHttpTargetConfig,
     json_http_environment_calls_per_execution,
+    json_http_environment_capabilities,
     json_http_environment_config_sha256,
     json_http_environment_config_urls,
     json_http_environment_origin,
@@ -133,52 +137,104 @@ def initialize_dataset_environment(
         str,
         typer.Option(help="Base URL of the customer's agent environment API."),
     ],
+    adapter_tier: Annotated[
+        Literal["stateful-lifecycle", "isolated-response"],
+        typer.Option(
+            help=(
+                "Adapter evidence tier. Isolated-response needs one endpoint but cannot verify "
+                "state or conversations."
+            )
+        ),
+    ] = "stateful-lifecycle",
+    confirm_request_isolation: Annotated[
+        bool,
+        typer.Option(
+            help="Attest every isolated-response request starts fresh and cannot affect another."
+        ),
+    ] = False,
+    confirm_safe_test_target: Annotated[
+        bool,
+        typer.Option(
+            help="Attest this target is safe for test requests and cannot cause real effects."
+        ),
+    ] = False,
     show_guidance: Annotated[bool, typer.Option(hidden=True)] = True,
 ) -> None:
     """Create a private connection config for a customer-managed agent environment API."""
+    if adapter_tier == "isolated-response" and not confirm_request_isolation:
+        raise typer.BadParameter(
+            "isolated-response setup requires --confirm-request-isolation",
+            param_hint="--confirm-request-isolation",
+        )
+    if adapter_tier == "isolated-response" and not confirm_safe_test_target:
+        raise typer.BadParameter(
+            "isolated-response setup requires --confirm-safe-test-target",
+            param_hint="--confirm-safe-test-target",
+        )
     try:
         base_url = url.rstrip("/")
-        config = JsonHttpEnvironmentConfig.model_validate(
-            {
-                "version": 5,
-                "environment_id": "replace-with-stable-environment-id",
-                "headers_from_env": {},
-                "reset": {
-                    "url": f"{base_url}/reset",
-                    "request_json_template": {"case_id": "{{case_id}}"},
-                    "reset_session": True,
-                    "reset_env": True,
-                    "case_id_json_pointer": "/case_id",
-                    "generation_json_pointer": "/generation",
-                    "clean_state_json_pointer": "/clean",
-                    "clean_state_value": True,
-                    "environment_id_json_pointer": "/environment_id",
-                },
-                "execute_turn": {
-                    "url": f"{base_url}/execute",
-                    "request_json_template": {
-                        "case_id": "{{case_id}}",
-                        "turn_id": "{{turn_id}}",
-                        "input": "{{input}}",
+        if adapter_tier == "isolated-response":
+            config: JsonHttpTargetConfig = JsonHttpIsolatedResponseConfig.model_validate(
+                {
+                    "version": 1,
+                    "adapter_tier": "isolated_response",
+                    "environment_id": ENVIRONMENT_ID_PLACEHOLDER,
+                    "request_isolation_attested": True,
+                    "safe_test_target_attested": True,
+                    "headers_from_env": {},
+                    "execute": {
+                        "url": f"{base_url}/execute",
+                        "request_json_template": {
+                            "case_id": "{{case_id}}",
+                            "turn_id": "{{turn_id}}",
+                            "input": "{{input}}",
+                        },
+                        "response_json_pointer": "/response",
                     },
-                    "response_json_pointer": "/response",
-                    "case_id_json_pointer": "/case_id",
-                    "turn_id_json_pointer": "/turn_id",
-                    "environment_id_json_pointer": "/environment_id",
-                },
-                "snapshot": {
-                    "url": f"{base_url}/snapshot",
-                    "request_json_template": {
-                        "case_id": "{{case_id}}",
-                        "turn_id": "{{turn_id}}",
+                }
+            )
+        else:
+            config = JsonHttpEnvironmentConfig.model_validate(
+                {
+                    "version": 5,
+                    "environment_id": ENVIRONMENT_ID_PLACEHOLDER,
+                    "headers_from_env": {},
+                    "reset": {
+                        "url": f"{base_url}/reset",
+                        "request_json_template": {"case_id": "{{case_id}}"},
+                        "reset_session": True,
+                        "reset_env": True,
+                        "case_id_json_pointer": "/case_id",
+                        "generation_json_pointer": "/generation",
+                        "clean_state_json_pointer": "/clean",
+                        "clean_state_value": True,
+                        "environment_id_json_pointer": "/environment_id",
                     },
-                    "response_json_pointer": "/state",
-                    "case_id_json_pointer": "/case_id",
-                    "turn_id_json_pointer": "/turn_id",
-                    "environment_id_json_pointer": "/environment_id",
-                },
-            }
-        )
+                    "execute_turn": {
+                        "url": f"{base_url}/execute",
+                        "request_json_template": {
+                            "case_id": "{{case_id}}",
+                            "turn_id": "{{turn_id}}",
+                            "input": "{{input}}",
+                        },
+                        "response_json_pointer": "/response",
+                        "case_id_json_pointer": "/case_id",
+                        "turn_id_json_pointer": "/turn_id",
+                        "environment_id_json_pointer": "/environment_id",
+                    },
+                    "snapshot": {
+                        "url": f"{base_url}/snapshot",
+                        "request_json_template": {
+                            "case_id": "{{case_id}}",
+                            "turn_id": "{{turn_id}}",
+                        },
+                        "response_json_pointer": "/state",
+                        "case_id_json_pointer": "/case_id",
+                        "turn_id_json_pointer": "/turn_id",
+                        "environment_id_json_pointer": "/environment_id",
+                    },
+                }
+            )
         output_stream = _create_private_output(environment_config)
     except (OSError, ValidationError, ValueError) as error:
         if isinstance(error, FileExistsError):
@@ -210,6 +266,22 @@ def initialize_dataset_environment(
 
     console.print(f"Created private environment connection config: {environment_config}")
     if not show_guidance:
+        return
+    console.print(
+        f"First: replace environment_id '{ENVIRONMENT_ID_PLACEHOLDER}' with a stable name for "
+        "this test environment."
+    )
+    if adapter_tier == "isolated-response":
+        console.print(
+            "Next: implement the generated /execute endpoint and add any headers_from_env. "
+            "This tier records response evidence only: committed state, conversations, and "
+            "state-dependent stress tests are unavailable. Validate a dataset plan with "
+            f"'ul dataset evaluate DATASET --environment-config {environment_config} --dry-run'."
+        )
+        console.print(
+            "Each request must start from fresh isolated state and remain safe for testing. "
+            "Keep exactly one {{case_id}}, {{turn_id}}, and {{input}} in the request template."
+        )
         return
     console.print(
         "Next: implement the generated reset, execute, and snapshot endpoints. "
@@ -496,6 +568,16 @@ def evaluate_dataset(
                 or resume is not None,
                 allow_insecure_http=allow_insecure_http,
             )
+            target_capabilities = json_http_environment_capabilities(loaded_target_config)
+            if (
+                invariant_suite is not None
+                and invariant_suite.observation_authority == "committed_state_snapshot"
+                and not target_capabilities.supports_state_observation
+            ):
+                raise ValueError(
+                    "committed-state invariants require the stateful-lifecycle adapter tier; "
+                    "isolated-response targets provide response evidence only"
+                )
         normalized_target_config = loaded_target_config
         if resume is not None and normalized_target_config is None:
             raise ValueError("--resume requires --environment-config")
@@ -643,6 +725,11 @@ def evaluate_dataset(
             repetitions=repetitions,
             max_environment_api_calls=max_environment_api_calls,
             target_calls_per_execution=target_calls_per_execution,
+            target_supports_state_observation=(
+                json_http_environment_capabilities(loaded_target_config).supports_state_observation
+                if loaded_target_config is not None
+                else None
+            ),
             invariant_suite=invariant_suite,
             output=output,
             augmentations_output=augmentations_output,
@@ -1135,7 +1222,7 @@ def _dataset_evidence_run_context(
     selected_operator_ids: tuple[str, ...],
     repetitions: int,
     invariant_suite: DatasetInvariantSuite | None,
-    target_config: JsonHttpEnvironmentConfig | None,
+    target_config: JsonHttpTargetConfig | None,
     settings: DatasetSemanticSettings,
     redaction_policy_sha256: str | None = None,
     redaction_coverage: tuple[DatasetEvidenceRedactionCoverage, ...] = (),
@@ -1177,6 +1264,7 @@ def _print_dataset_plan(
     repetitions: int,
     max_environment_api_calls: int,
     target_calls_per_execution: int,
+    target_supports_state_observation: bool | None,
     invariant_suite: DatasetInvariantSuite | None,
     output: Path | None,
     augmentations_output: Path | None,
@@ -1230,6 +1318,8 @@ def _print_dataset_plan(
             f"Lifecycle calls per execution: {target_calls_per_execution} "
             "(reset, optional setup, execute_turn, snapshot, cleanup reset)"
         )
+    elif target_supports_state_observation is False:
+        console.print("Adapter tier: isolated-response (response evidence only)")
     target_status = "configured" if target_configured else "not configured"
     console.print(f"Customer-managed environment API: {target_status}")
     if output is not None:
@@ -1260,10 +1350,16 @@ def _print_dataset_plan(
         "Semantic models receive historical inputs and outputs, generated variations, "
         "live control responses, and variation responses on execution."
     )
-    console.print(
-        "Every test case invokes and validates the configured environment reset contract. Optional "
-        "setup uses one static fixture from the environment config for the entire run."
-    )
+    if target_supports_state_observation is False:
+        console.print(
+            "Every test case sends one isolated request. UL does not observe committed state, "
+            "cleanup, or behavior across turns at this tier."
+        )
+    else:
+        console.print(
+            "Every test case invokes and validates the configured environment reset contract. "
+            "Optional setup uses one static fixture from the environment config for the entire run."
+        )
     console.print(
         "Target requests and semantic model calls may be billed separately. Repetitions only "
         "show observed behavioral consistency: they do not determine correctness, identify "

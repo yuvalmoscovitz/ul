@@ -35,6 +35,7 @@ from ul.event_stress import (
 from ul.http_environment import (
     JsonHttpEnvironmentConnection,
     load_json_http_environment_config,
+    require_stateful_json_http_environment,
     validate_json_http_environment_configuration,
 )
 from ul.timeout_after_commit import (
@@ -91,7 +92,9 @@ def run_timeout_after_commit(
     """Inject one versioned lost acknowledgement after a committed tool write."""
     try:
         case = load_timeout_after_commit_case(case_path)
-        target_config = load_json_http_environment_config(target_config_path)
+        target_config = require_stateful_json_http_environment(
+            load_json_http_environment_config(target_config_path)
+        )
         invariant_suite = load_dataset_invariant_suite(invariants_path)
         if invariant_suite.observation_authority != "committed_state_snapshot":
             raise ValueError("timeout-after-commit testing requires committed-state invariants")
@@ -327,7 +330,9 @@ def save_multi_turn_regression(
         raise typer.BadParameter("output already exists; UL will not overwrite it")
     try:
         case = load_correction_after_first_response_case(case_path)
-        target_config = load_json_http_environment_config(target_config_path)
+        target_config = require_stateful_json_http_environment(
+            load_json_http_environment_config(target_config_path)
+        )
         invariant_suite = load_dataset_invariant_suite(invariants_path)
         regression = create_multi_turn_regression_case(
             stress_case=case,
@@ -375,7 +380,9 @@ def run_correction_after_first_response(
     """Run the fixed correction-after-first-response event operator."""
     try:
         case = load_correction_after_first_response_case(case_path)
-        target_config = load_json_http_environment_config(target_config_path)
+        target_config = require_stateful_json_http_environment(
+            load_json_http_environment_config(target_config_path)
+        )
         invariant_suite = load_dataset_invariant_suite(invariants_path)
         validate_json_http_environment_configuration(
             target_config,
@@ -465,7 +472,9 @@ def run_retry_after_successful_commit(
     """Retry an operation only after its first committed-state checkpoint succeeds."""
     try:
         case = load_retry_after_successful_commit_case(case_path)
-        target_config = load_json_http_environment_config(target_config_path)
+        target_config = require_stateful_json_http_environment(
+            load_json_http_environment_config(target_config_path)
+        )
         invariant_suite = load_dataset_invariant_suite(invariants_path)
         if invariant_suite.observation_authority != "committed_state_snapshot":
             raise ValueError("retry stress testing requires committed-state invariant observation")
@@ -549,7 +558,9 @@ def replay_saved_multi_turn_case(
     """Replay a content-addressed multi-turn correction regression."""
     try:
         case = load_multi_turn_regression_case(case_path)
-        target_config = load_json_http_environment_config(target_config_path)
+        target_config = require_stateful_json_http_environment(
+            load_json_http_environment_config(target_config_path)
+        )
         if dataset_regression_target_config_sha256(target_config) != case.target.config_sha256:
             raise ValueError("trusted environment config digest does not match the regression case")
         plan_correction_stress_test(

@@ -20,14 +20,16 @@ from ul_core.models import ConversationRole, ConversationTurn, ULModel
 
 from ul.dataset_evaluation import DatasetTargetLifecycleFailure
 from ul.environment import (
+    environment_timeout_requires_quarantine,
     evaluation_case_from_inputs,
     execution_evidence_requires_quarantine,
     observed_outputs_from_evidence,
     validate_execution_evidence,
 )
 from ul.http_environment import (
-    JsonHttpEnvironmentConfig,
+    JsonHttpTargetConfig,
     json_http_environment_calls_per_conversation,
+    json_http_environment_capabilities,
 )
 from ul.otlp_ingest import OtlpInteractionRecord
 
@@ -479,7 +481,7 @@ def group_trace_replay_differences(
 
 def plan_trace_replay(
     case: TraceReplayCase,
-    target_config: JsonHttpEnvironmentConfig,
+    target_config: JsonHttpTargetConfig,
     *,
     repetitions: int = 3,
     max_target_calls: int = 100,
@@ -490,6 +492,14 @@ def plan_trace_replay(
         raise ValueError(f"repetitions must not exceed {_MAXIMUM_REPLAY_REPETITIONS}")
     if type(max_target_calls) is not int or max_target_calls < 1:
         raise ValueError("max_target_calls must be a positive integer")
+    target_capabilities = json_http_environment_capabilities(target_config)
+    if (
+        case.recorded_state_snapshot_available
+        and not target_capabilities.supports_state_observation
+    ):
+        raise ValueError(
+            "trace replay includes recorded state but the target cannot observe committed state"
+        )
     target_calls_per_repetition = json_http_environment_calls_per_conversation(
         target_config, len(case.replay_user_turns)
     )
@@ -522,6 +532,13 @@ async def run_trace_replay(
         raise ValueError("max_target_calls must be a positive integer")
     if not allow_network_egress:
         raise ValueError("trace replay environment API access requires explicit network opt-in")
+    if (
+        case.recorded_state_snapshot_available
+        and not environment.capabilities.supports_state_observation
+    ):
+        raise ValueError(
+            "trace replay includes recorded state but the target cannot observe committed state"
+        )
     planned_case = evaluation_case_from_inputs(
         case_id=f"ul-case-{secrets.token_hex(16)}",
         raw_inputs=(turn.content for turn in case.replay_user_turns),
@@ -622,8 +639,8 @@ async def run_trace_replay(
                 )
             )
         except TimeoutError:
-            environment_state_uncertain = (
-                environment.capabilities.cancellation_guarantee != "guaranteed"
+            environment_state_uncertain = environment_timeout_requires_quarantine(
+                environment.capabilities
             )
             trials.append(
                 TraceReplayTrial(
