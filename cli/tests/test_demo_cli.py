@@ -113,8 +113,11 @@ def test_demo_shows_three_generic_findings_without_credentials_and_retains_valid
         for case in record["technical_details"]["cases"]
         for trial in case["trial_set"]["trials"]
     )
+    assert {
+        record["execution_plan"]["dataset_planned_target_calls"] for record in evidence_records
+    } == {15}
 
-    report_result = CliRunner().invoke(app, ["dataset", "report", str(evidence_path)])
+    report_result = CliRunner().invoke(app, ["report", str(evidence_path)])
     assert report_result.exit_code == 0, report_result.output
     assert "Dataset finding report: 3 finding(s)" in report_result.output
 
@@ -156,7 +159,18 @@ def test_demo_escapes_an_unsafe_output_path(monkeypatch: pytest.MonkeyPatch) -> 
     rendered = output.getvalue()
     assert "\x1b" not in rendered
     assert "\\u001b" in rendered
-    assert "ul dataset report '/tmp/evidence; touch hacked\\u001b.jsonl'" in rendered
+    assert "ul report '/tmp/evidence; touch hacked\\u001b.jsonl'" in rendered
+
+
+def test_demo_does_not_generate_a_windows_shell_command(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(demo_runner.os, "name", "nt")
+
+    instruction = demo_runner._inspection_instruction(Path("evidence & malicious-command.jsonl"))
+
+    assert instruction == "Run 'ul report' with the evidence path shown above."
+    assert "&" not in instruction
 
 
 def test_built_wheel_contains_the_complete_demo(tmp_path: Path) -> None:

@@ -62,9 +62,9 @@ def _create_demo_artifact_directory() -> Path:
 
 
 def _save_evidence(results: tuple[DatasetEvaluationResult, ...], path: Path) -> None:
+    planned_calls = sum(3 * (1 + len(result.cases)) for result in results)
     with _create_private_file(path) as evidence_file:
         for result in results:
-            planned_calls = 3 * (1 + len(result.cases))
             evidence = create_customer_evidence_record(
                 result,
                 repetitions=3,
@@ -152,10 +152,19 @@ def _terminal_safe(message: str) -> str:
     )
 
 
+def _inspection_instruction(evidence_path: Path) -> str:
+    if os.name == "nt":
+        return "Run 'ul report' with the evidence path shown above."
+    return f"ul report {shlex.quote(str(evidence_path))}"
+
+
 def _print_report(results: tuple[DatasetEvaluationResult, ...], evidence_path: Path) -> None:
     finding_count = sum(len(case.findings) for result in results for case in result.cases)
     augmentation_count = sum(len(result.cases) for result in results)
-    console.print("[bold cyan]UL demo[/bold cyan] [dim]Synthetic agent · Real UL evaluation[/dim]")
+    console.print(
+        "[bold cyan]UL demo[/bold cyan] "
+        "[dim]Synthetic agent · UL comparison and evidence pipeline[/dim]"
+    )
     console.print()
     summary = Text()
     summary.append(f"{len(results)} customer requests", style="bold")
@@ -168,7 +177,8 @@ def _print_report(results: tuple[DatasetEvaluationResult, ...], evidence_path: P
     console.print(
         "[dim]UL reruns each original input to establish a baseline. It then automatically "
         "compares actions after each augmentation. Repeatable differences need human review; "
-        "no custom rules are used here.[/dim]"
+        "no custom rules are used here. The input changes are prewritten so this demo needs "
+        "no model.[/dim]"
     )
 
     for result_number, result in enumerate(results, start=1):
@@ -214,7 +224,7 @@ def _print_report(results: tuple[DatasetEvaluationResult, ...], evidence_path: P
     )
     console.print()
     safe_evidence_path = _terminal_safe(str(evidence_path))
-    safe_inspection_command = _terminal_safe(f"ul dataset report {shlex.quote(str(evidence_path))}")
+    safe_inspection_command = _terminal_safe(_inspection_instruction(evidence_path))
     console.print(
         Text.assemble(("Full evidence  ", "dim"), (safe_evidence_path, "cyan")),
         soft_wrap=True,
@@ -226,7 +236,19 @@ def _print_report(results: tuple[DatasetEvaluationResult, ...], evidence_path: P
         ),
         soft_wrap=True,
     )
-    console.print("[bold cyan]Try your agent:[/bold cyan] ul init --help")
+    console.print()
+    console.print("[bold cyan]Try this workflow with your agent[/bold cyan]")
+    console.print(
+        "1. Export recorded interactions to interactions.jsonl (one interaction per line)."
+    )
+    console.print(
+        "2. Point UL at a safe test environment that can reset, run a turn, and show state."
+    )
+    console.print(
+        "3. Start: [bold]ul init interactions.jsonl --environment-url "
+        "https://your-test-environment.example --allow-environment-network "
+        "--confirm-test-environment[/bold]"
+    )
 
 
 def run_demo(output: Path | None = None) -> None:
