@@ -469,6 +469,11 @@ class JsonHttpEnvironmentConnection:
             max_request_bytes=max_request_bytes,
             max_response_bytes=max_response_bytes,
         )
+        self._credential_values = (
+            _credential_values_from_headers(self._headers)
+            if isinstance(config, JsonHttpIsolatedResponseConfig)
+            else ()
+        )
         self._timeout_seconds = timeout_seconds
         self._max_request_bytes = max_request_bytes
         self._max_response_bytes = max_response_bytes
@@ -1236,7 +1241,9 @@ class JsonHttpEnvironmentConnection:
             consume_budget=consume_budget,
         )
         if result is None:
-            raise AssertionError("JSON observation request requires a result")
+            raise _EnvironmentProtocolError(
+                "response_mapping", "environment API response JSON pointer selected null"
+            )
         return result
 
     async def _post(
@@ -1358,7 +1365,7 @@ class JsonHttpEnvironmentConnection:
                 "null_json",
                 "environment API returned null JSON",
             )
-        if _json_contains_any_string(raw_output, tuple(self._headers.values())):
+        if _json_contains_any_string(raw_output, self._credential_values):
             raise _EnvironmentProtocolError(
                 "response_contains_credential",
                 "environment API response contains a configured credential",
@@ -1562,8 +1569,31 @@ def _json_contains_any_string(value: JsonValue, secrets: tuple[str, ...]) -> boo
     if isinstance(value, list):
         return any(_json_contains_any_string(item, secrets) for item in value)
     if isinstance(value, dict):
-        return any(_json_contains_any_string(item, secrets) for item in value.values())
+        return any(
+            any(secret in key for secret in secrets) or _json_contains_any_string(item, secrets)
+            for key, item in value.items()
+        )
     return False
+
+
+def _credential_values_from_headers(headers: Mapping[str, str]) -> tuple[str, ...]:
+    credential_values: list[str] = []
+    for header_name, value in headers.items():
+        normalized_name = header_name.casefold()
+        if not (
+            normalized_name in {"authorization", "proxy-authorization", "cookie"}
+            or any(
+                marker in normalized_name
+                for marker in ("api-key", "apikey", "auth", "credential", "secret", "token")
+            )
+        ):
+            continue
+        credential_values.append(value)
+        if normalized_name in {"authorization", "proxy-authorization"}:
+            _, separator, credential = value.partition(" ")
+            if separator and credential:
+                credential_values.append(credential)
+    return tuple(dict.fromkeys(credential_values))
 
 
 def _reject_nonstandard_json_constant(value: str) -> Never:

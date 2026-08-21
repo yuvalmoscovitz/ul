@@ -588,6 +588,31 @@ def test_init_translates_custom_isolated_json_contract(tmp_path: Path) -> None:
     assert "no UL-specific endpoint" in result.output
 
 
+def test_init_allows_root_response_json_pointer(tmp_path: Path) -> None:
+    target_config = tmp_path / "target.json"
+
+    result = runner.invoke(
+        root_app,
+        [
+            "dataset",
+            "init",
+            str(target_config),
+            "--url",
+            "https://agent.example.test/chat",
+            "--adapter-tier",
+            "isolated-response",
+            "--confirm-request-isolation",
+            "--confirm-safe-test-target",
+            "--response-json-pointer",
+            "",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    config = json.loads(target_config.read_text(encoding="utf-8"))
+    assert config["execute"]["response_json_pointer"] == ""
+
+
 def test_init_rejects_invalid_isolated_mapping_before_creating_file(tmp_path: Path) -> None:
     target_config = tmp_path / "target.json"
 

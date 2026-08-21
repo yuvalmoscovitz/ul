@@ -125,7 +125,10 @@ def initialize_project(
         str | None,
         typer.Option(
             "--environment-url",
-            help=("Stateful API base URL, or exact POST URL for an isolated-response target."),
+            help=(
+                "Stateful API base URL, or an isolated-response POST URL without credentials, "
+                "query, or fragment."
+            ),
         ),
     ] = None,
     adapter_tier: Annotated[

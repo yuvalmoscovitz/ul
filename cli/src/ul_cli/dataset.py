@@ -144,7 +144,10 @@ def initialize_dataset_environment(
     url: Annotated[
         str,
         typer.Option(
-            help=("Stateful API base URL, or the exact POST URL for an isolated-response target.")
+            help=(
+                "Stateful API base URL, or an isolated-response POST URL without credentials, "
+                "query, or fragment."
+            )
         ),
     ],
     adapter_tier: Annotated[
@@ -266,7 +269,11 @@ def initialize_dataset_environment(
                     "execute": {
                         "url": url,
                         "request_json_template": selected_template,
-                        "response_json_pointer": response_json_pointer or preset_pointer,
+                        "response_json_pointer": (
+                            response_json_pointer
+                            if response_json_pointer is not None
+                            else preset_pointer
+                        ),
                     },
                 }
             )

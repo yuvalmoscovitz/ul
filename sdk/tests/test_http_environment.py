@@ -229,6 +229,80 @@ async def test_isolated_response_rejects_reflected_header_secret_before_mapping(
     assert "private-agent-token" not in evidence.model_dump_json()
 
 
+@pytest.mark.parametrize(
+    "response",
+    [
+        {"response": "safe", "debug": "private-agent-token"},
+        {"response": {"private-agent-token": "reflected as a key"}},
+    ],
+)
+async def test_isolated_response_rejects_partial_or_keyed_authorization_credential(
+    monkeypatch: pytest.MonkeyPatch,
+    response: dict[str, object],
+) -> None:
+    monkeypatch.setenv("UL_ENVIRONMENT_AGENT_TOKEN", "Bearer private-agent-token")
+    raw_config = _isolated_response_config().model_dump(mode="json")
+    raw_config["headers_from_env"] = {"Authorization": "UL_ENVIRONMENT_AGENT_TOKEN"}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return _raw_response(json.dumps(response).encode())
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        environment = JsonHttpEnvironmentConnection.from_config(
+            JsonHttpIsolatedResponseConfig.model_validate(raw_config),
+            test_environment_confirmed=True,
+            client=client,
+        )
+        evidence = await environment.execute(_case("hello", max_calls=1))
+
+    assert evidence.lifecycle.failure_code == "response_contains_credential"
+    assert "private-agent-token" not in evidence.model_dump_json()
+
+
+async def test_isolated_response_allows_reflected_routing_header() -> None:
+    raw_config = _isolated_response_config().model_dump(mode="json")
+    raw_config["headers_from_env"] = {"X-Tenant-ID": "UL_ENVIRONMENT_TENANT_ID"}
+
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setenv("UL_ENVIRONMENT_TENANT_ID", "payments-test")
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            return _raw_response(json.dumps({"response": "payments-test"}).encode())
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            environment = JsonHttpEnvironmentConnection.from_config(
+                JsonHttpIsolatedResponseConfig.model_validate(raw_config),
+                test_environment_confirmed=True,
+                client=client,
+            )
+            evidence = await environment.execute(_case("hello", max_calls=1))
+
+    assert evidence.lifecycle.terminal_status == "succeeded"
+    assert evidence.final_response == "payments-test"
+
+
+async def test_isolated_response_turning_to_tools_is_a_mapping_failure() -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return _raw_response(
+            json.dumps(
+                {"choices": [{"message": {"content": None, "tool_calls": [{"id": "call-1"}]}}]}
+            ).encode()
+        )
+
+    raw_config = _isolated_response_config().model_dump(mode="json")
+    raw_config["execute"]["response_json_pointer"] = "/choices/0/message/content"
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        environment = JsonHttpEnvironmentConnection.from_config(
+            JsonHttpIsolatedResponseConfig.model_validate(raw_config),
+            test_environment_confirmed=True,
+            client=client,
+        )
+        evidence = await environment.execute(_case("hello", max_calls=1))
+
+    assert evidence.lifecycle.terminal_status == "failed"
+    assert evidence.lifecycle.failure_code == "response_mapping"
+
+
 async def test_isolated_response_does_not_carry_server_cookies_between_cases() -> None:
     observed_cookies: list[str | None] = []
 

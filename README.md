@@ -83,6 +83,9 @@ real-world effects. UL records response evidence only at this tier. It rejects c
 invariants, conversations, timeout-after-commit checks, and other state-dependent stress tests. Move
 to `stateful-lifecycle` when UL must inspect side effects or behavior across turns.
 
+The endpoint URL cannot contain credentials, a query string, or a fragment. Put credentials in
+`--header-from-env`; use a custom adapter when the endpoint requires query parameters.
+
 Verify the adapter before spending money on model calls:
 
 ```bash
