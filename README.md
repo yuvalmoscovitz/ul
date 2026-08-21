@@ -297,6 +297,23 @@ ul stress trace trace-replay.json \
   --dry-run
 ```
 
+Run the highest-priority replay cases as one bounded campaign:
+
+```bash
+ul stress trace-replay-campaign trace-replay.json \
+  --environment-config .ul/environment.json \
+  --limit 10 \
+  --max-environment-api-calls 100 \
+  --dry-run
+```
+
+The dry run does not require environment credential values. It explains priority signals, shows
+per-case and cumulative call budgets, and prints a copy-ready execution command without revealing
+recorded content or making external calls. The private campaign result contains every case replay
+plus deterministic groups for drift and inconclusive outcomes. This is a ranked reproducibility
+check; it does not apply the suggested stress focuses or input augmentations. A completed campaign
+exits `0` even when drift needs review, while an inconclusive campaign exits `2`.
+
 Other stateful operators cover correction, retry-after-commit, and timeout-after-commit scenarios.
 Run `ul stress --help` for the available commands.
 

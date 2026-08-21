@@ -181,6 +181,9 @@ from ul.timeout_after_commit import (
 )
 from ul.trace_replay import (
     TraceReplayBundle,
+    TraceReplayCampaignPlan,
+    TraceReplayCampaignPlanCase,
+    TraceReplayCampaignResult,
     TraceReplayCase,
     TraceReplayDifferenceGroup,
     TraceReplayDifferenceGrouping,
@@ -199,7 +202,9 @@ from ul.trace_replay import (
     load_trace_replay_results,
     materialize_trace_replay_bundle,
     plan_trace_replay,
+    plan_trace_replay_campaign,
     run_trace_replay,
+    run_trace_replay_campaign,
     select_trace_replay_case,
 )
 
@@ -326,6 +331,9 @@ __all__ = [
     "TimeoutAfterCommitStressTrial",
     "TimeoutAfterCommitTriggerStatus",
     "TraceReplayBundle",
+    "TraceReplayCampaignPlan",
+    "TraceReplayCampaignPlanCase",
+    "TraceReplayCampaignResult",
     "TraceReplayCase",
     "TraceReplayDifferenceGroup",
     "TraceReplayDifferenceGrouping",
@@ -369,6 +377,7 @@ __all__ = [
     "plan_retry_after_successful_commit_stress_test",
     "plan_timeout_after_commit_stress_test",
     "plan_trace_replay",
+    "plan_trace_replay_campaign",
     "replay_dataset_regression",
     "replay_multi_turn_regression",
     "resolve_dataset_augmentation_operator",
@@ -377,5 +386,6 @@ __all__ = [
     "run_retry_after_successful_commit_stress_test",
     "run_timeout_after_commit_stress_test",
     "run_trace_replay",
+    "run_trace_replay_campaign",
     "select_trace_replay_case",
 ]

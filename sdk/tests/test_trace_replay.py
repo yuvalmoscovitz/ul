@@ -7,9 +7,10 @@ from typing import Any
 
 import pytest
 import ul.trace_replay as trace_replay_module
-from ul.http_environment import JsonHttpIsolatedResponseConfig
+from ul.http_environment import JsonHttpEnvironmentConfig, JsonHttpIsolatedResponseConfig
 from ul.otlp_ingest import OtlpMappingConfig, parse_otlp_traces
 from ul.trace_replay import (
+    TraceReplayCampaignResult,
     TraceReplayResult,
     TraceReplayTrial,
     derive_trace_stress_plan,
@@ -19,7 +20,9 @@ from ul.trace_replay import (
     load_trace_replay_results,
     materialize_trace_replay_bundle,
     plan_trace_replay,
+    plan_trace_replay_campaign,
     run_trace_replay,
+    run_trace_replay_campaign,
 )
 from ul_core.dataset import ObservedAgentOutput
 from ul_core.evaluation import (
@@ -524,6 +527,186 @@ def _isolated_response_config() -> JsonHttpIsolatedResponseConfig:
             },
         }
     )
+
+
+def _stateful_response_config() -> JsonHttpEnvironmentConfig:
+    return JsonHttpEnvironmentConfig.model_validate(
+        {
+            "version": 5,
+            "environment_id": "trace-replay-campaign-test",
+            "reset": {
+                "url": "https://environment.example.test/reset",
+                "request_json_template": {"case_id": "{{case_id}}"},
+                "case_id_json_pointer": "/case_id",
+                "generation_json_pointer": "/generation",
+                "clean_state_json_pointer": "/clean",
+                "clean_state_value": True,
+            },
+            "execute_turn": {
+                "url": "https://environment.example.test/execute",
+                "request_json_template": {
+                    "case_id": "{{case_id}}",
+                    "turn_id": "{{turn_id}}",
+                    "input": "{{input}}",
+                },
+                "case_id_json_pointer": "/case_id",
+                "turn_id_json_pointer": "/turn_id",
+            },
+            "snapshot": {
+                "url": "https://environment.example.test/snapshot",
+                "request_json_template": {
+                    "case_id": "{{case_id}}",
+                    "turn_id": "{{turn_id}}",
+                },
+                "case_id_json_pointer": "/case_id",
+                "turn_id_json_pointer": "/turn_id",
+            },
+        }
+    )
+
+
+def test_trace_replay_campaign_plan_selects_ranked_cases_deterministically() -> None:
+    bundle = materialize_trace_replay_bundle(_trace_records(include_stress_signals=True))
+
+    first = plan_trace_replay_campaign(
+        bundle,
+        _stateful_response_config(),
+        limit=2,
+        repetitions=2,
+        max_target_calls=24,
+    )
+    second = plan_trace_replay_campaign(
+        bundle,
+        _stateful_response_config(),
+        limit=2,
+        repetitions=2,
+        max_target_calls=24,
+    )
+
+    assert first == second
+    assert first.selected_case_count == 2
+    assert first.total_case_count == 2
+    assert first.repetitions == 2
+    assert first.required_target_calls == 24
+    assert first.authorized_target_calls == 24
+    assert [case.stress.case_id for case in first.cases] == [
+        case.case_id for case in derive_trace_stress_plan(bundle).cases
+    ]
+
+
+def test_trace_replay_campaign_plan_rejects_cumulative_call_budget() -> None:
+    bundle = materialize_trace_replay_bundle(_trace_records(include_stress_signals=True))
+
+    with pytest.raises(ValueError, match=r"requires 24 environment API calls.*only 23"):
+        plan_trace_replay_campaign(
+            bundle,
+            _stateful_response_config(),
+            limit=2,
+            repetitions=2,
+            max_target_calls=23,
+        )
+
+
+@pytest.mark.asyncio
+async def test_trace_replay_campaign_runs_each_selected_case_and_groups_differences() -> None:
+    bundle = materialize_trace_replay_bundle(_trace_records(include_stress_signals=True))
+    plan = plan_trace_replay_campaign(
+        bundle,
+        _stateful_response_config(),
+        limit=2,
+        repetitions=1,
+        max_target_calls=12,
+    )
+
+    result = await run_trace_replay_campaign(
+        bundle,
+        _ReplayTarget(drift=True),
+        plan=plan,
+        allow_network_egress=True,
+    )
+
+    assert [case_result.case.case_id for case_result in result.results] == [
+        planned_case.replay.case_id for planned_case in plan.cases
+    ]
+    assert all(isinstance(case_result, TraceReplayResult) for case_result in result.results)
+    assert result.grouping == group_trace_replay_differences(result.results)
+
+
+@pytest.mark.asyncio
+async def test_trace_replay_campaign_rejects_a_plan_changed_after_validation() -> None:
+    bundle = materialize_trace_replay_bundle(_trace_records(include_stress_signals=True))
+    plan = plan_trace_replay_campaign(
+        bundle,
+        _stateful_response_config(),
+        limit=1,
+        repetitions=1,
+        max_target_calls=7,
+    )
+    changed_replay = plan.cases[0].replay.model_copy(
+        update={"target_calls_per_repetition": 99, "required_target_calls": 99}
+    )
+    changed_case = plan.cases[0].model_copy(update={"replay": changed_replay})
+    changed_plan = plan.model_copy(update={"cases": (changed_case,), "required_target_calls": 99})
+
+    with pytest.raises(ValueError, match="does not match the target execution contract"):
+        await run_trace_replay_campaign(
+            bundle,
+            _ReplayTarget(),
+            plan=changed_plan,
+            allow_network_egress=True,
+        )
+
+
+@pytest.mark.asyncio
+async def test_trace_replay_campaign_quarantines_later_cases_after_uncertain_state() -> None:
+    bundle = materialize_trace_replay_bundle(_trace_records(include_stress_signals=True))
+    plan = plan_trace_replay_campaign(
+        bundle,
+        _stateful_response_config(),
+        limit=2,
+        repetitions=1,
+        max_target_calls=12,
+    )
+    environment = _UncertainReplayEnvironment()
+
+    result = await run_trace_replay_campaign(
+        bundle,
+        environment,
+        plan=plan,
+        allow_network_egress=True,
+    )
+
+    assert environment.execution_count == 1
+    assert result.results[1].status == "inconclusive"
+    assert result.results[1].trials[0].execution_evidence is None
+    assert result.results[1].trials[0].inconclusive_reason == (
+        "environment not called because prior execution left state uncertain"
+    )
+
+
+@pytest.mark.asyncio
+async def test_trace_replay_campaign_result_rejects_changed_grouping() -> None:
+    bundle = materialize_trace_replay_bundle(_trace_records(include_stress_signals=True))
+    plan = plan_trace_replay_campaign(
+        bundle,
+        _stateful_response_config(),
+        limit=1,
+        repetitions=1,
+        max_target_calls=7,
+    )
+    result = await run_trace_replay_campaign(
+        bundle,
+        _ReplayTarget(),
+        plan=plan,
+        allow_network_egress=True,
+    )
+
+    with pytest.raises(ValueError, match="grouping must match"):
+        TraceReplayCampaignResult(
+            plan=plan,
+            results=result.results,
+            grouping=result.grouping.model_copy(update={"reproduced_count": 99}),
+        )
 
 
 def test_trace_replay_plan_rejects_recorded_state_for_response_only_target() -> None:
