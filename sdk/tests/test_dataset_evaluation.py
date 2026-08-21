@@ -397,6 +397,45 @@ class BlockingEnvironment(DeterministicEnvironment):
         raise AssertionError("blocking environment returned")
 
 
+class IsolatedTimeoutThenSuccessEnvironment:
+    environment_id = "isolated-test-environment"
+    config_sha256 = "2" * 64
+    capabilities = EnvironmentCapabilities(
+        request_isolation="per_request_attested",
+        supports_conversations=False,
+        supports_state_observation=False,
+        cancellation_guarantee="none",
+    )
+
+    def __init__(self) -> None:
+        self.raw_inputs: list[str] = []
+
+    def api_calls_for_case(self, case: EvaluationCase) -> int:
+        return 1
+
+    async def execute(self, case: EvaluationCase) -> ExecutionEvidence:
+        self.raw_inputs.append(case.turns[0].content)
+        if len(self.raw_inputs) == 1:
+            await asyncio.Event().wait()
+            raise AssertionError("cancelled isolated request returned")
+        response = _raw_output_for_actions((_source_outcomes()[0],))
+        return ExecutionEvidence(
+            evidence_scope="response_only",
+            case_id=case.id,
+            environment_id=self.environment_id,
+            environment_config_sha256=self.config_sha256,
+            turns=(EnvironmentTurnEvidence(turn_id=case.turns[0].id, response=response),),
+            final_response=response,
+            lifecycle=EnvironmentLifecycleEvidence(
+                terminal_status="succeeded",
+                completed_phases=("execute_turn",),
+                delivery="certain",
+                cleanup="not_attempted",
+                environment_state_uncertain=False,
+            ),
+        )
+
+
 class FailingEnvironment(DeterministicEnvironment):
     def __init__(self, fail_on_execution: int) -> None:
         super().__init__()
@@ -1957,6 +1996,24 @@ async def test_runner_times_out_environment_execution() -> None:
     assert result.cases[0].verdict == "inconclusive"
     assert result.cases[0].target_output is None
     assert target.raw_inputs == ["Transfer 100 to Alice."]
+
+
+async def test_isolated_timeout_does_not_quarantine_the_next_request() -> None:
+    semantic_pipeline = DeterministicSemanticPipeline((_source_outcomes()[0],))
+    target = IsolatedTimeoutThenSuccessEnvironment()
+    runner = DatasetEvaluationRunner(
+        DatasetAugmentationEngine(semantic_pipeline, semantic_pipeline),
+        semantic_pipeline,
+        target,
+        target_timeout_seconds=0.01,
+    )
+
+    result = await runner.run(_source(), repetitions=2)
+
+    first_trial, second_trial = result.baseline.trial_set.trials
+    assert first_trial.inconclusive_reasons == ("current baseline execution timed out",)
+    assert second_trial.target_output is not None
+    assert target.raw_inputs[:2] == ["Transfer 100 to Alice.", "Transfer 100 to Alice."]
 
 
 @pytest.mark.parametrize("fail_on_execution", [1, 2])

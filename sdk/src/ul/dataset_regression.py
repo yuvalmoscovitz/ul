@@ -30,6 +30,7 @@ from ul.dataset_invariants import (
     evaluate_dataset_invariant_rules,
 )
 from ul.environment import (
+    environment_timeout_requires_quarantine,
     evaluation_case_from_inputs,
     execution_evidence_requires_quarantine,
     observed_outputs_from_evidence,
@@ -455,7 +456,7 @@ async def replay_dataset_regression(
                 execution_evidence = await environment.execute(evaluation_case)
                 validate_execution_evidence(evaluation_case, environment, execution_evidence)
         except TimeoutError:
-            if environment.capabilities.cancellation_guarantee != "guaranteed":
+            if environment_timeout_requires_quarantine(environment.capabilities):
                 target_state_uncertain = True
             executions.append(
                 DatasetRegressionExecution(

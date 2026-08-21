@@ -26,6 +26,7 @@ from ul import (
     DatasetEvaluationTrialSet,
     InteractionRecord,
     JsonHttpEnvironmentConfig,
+    JsonHttpIsolatedResponseConfig,
     ObservedAgentOutput,
     OpenAICompatibleDatasetSettings,
     SemanticFrame,
@@ -185,13 +186,16 @@ def _run_context(
     records: tuple[InteractionRecord, ...],
     *,
     invariant_suite: object | None = None,
+    target_config: object | None = None,
 ) -> object:
     return main._dataset_evidence_run_context(
         selected_records=records,
         selected_operator_ids=("input.surface.rephrase",),
         repetitions=1,
         invariant_suite=cast(Any, invariant_suite),
-        target_config=JsonHttpEnvironmentConfig.model_validate(
+        target_config=cast(Any, target_config)
+        if target_config is not None
+        else JsonHttpEnvironmentConfig.model_validate(
             {
                 "version": 5,
                 "environment_id": "test-environment",
@@ -228,12 +232,64 @@ def _run_context(
     )
 
 
+def _isolated_response_target_config() -> JsonHttpIsolatedResponseConfig:
+    return JsonHttpIsolatedResponseConfig.model_validate(
+        {
+            "version": 1,
+            "adapter_tier": "isolated_response",
+            "environment_id": "isolated-test",
+            "request_isolation_attested": True,
+            "safe_test_target_attested": True,
+            "execute": {
+                "url": "https://environment.example.test/execute",
+                "request_json_template": {
+                    "case_id": "{{case_id}}",
+                    "turn_id": "{{turn_id}}",
+                    "input": "{{input}}",
+                },
+                "response_json_pointer": "/response",
+            },
+        }
+    )
+
+
 def test_run_context_uses_current_pipeline() -> None:
     record = _evaluation_result("interaction-1").source
     run_context = _run_context((record,))
     assert run_context.pipeline_version == "1.2.0"
     assert run_context.target.config.reset.reset_session is True
     assert run_context.target.config.reset.reset_env is True
+
+
+def test_unified_report_surfaces_response_only_scope_and_limitations(tmp_path: Path) -> None:
+    result = _evaluation_result("interaction-1")
+    run_context = _run_context((result.source,), target_config=_isolated_response_target_config())
+    record = main._customer_evidence_record(
+        result,
+        repetitions=1,
+        max_environment_api_calls=2,
+        planned_target_calls=2,
+        run_context=cast(Any, run_context),
+    )
+    evidence = tmp_path / "evidence.jsonl"
+    evidence.write_text(json.dumps(record) + "\n", encoding="utf-8")
+
+    json_report = runner.invoke(root_app, ["report", str(evidence), "--json"])
+    human_report = runner.invoke(root_app, ["report", str(evidence)])
+
+    assert json_report.exit_code == 0, json_report.output
+    parsed_report = json.loads(json_report.output)
+    assert parsed_report["evidence_scope"] == "response_only"
+    assert parsed_report["capability_limitations"] == [
+        "cleanup_verification",
+        "conversation_replay",
+        "state_observation",
+    ]
+    assert human_report.exit_code == 0, human_report.output
+    assert "Evidence scope: response only" in human_report.output
+    assert "Not verified: committed state, cleanup, or multi-turn conversations." in (
+        human_report.output
+    )
 
 
 def _write_target_config(

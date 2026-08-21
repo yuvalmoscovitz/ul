@@ -132,6 +132,7 @@ class EvaluationCase(_StrictModel):
 
 class EnvironmentCapabilities(_StrictModel):
     isolation: Literal["customer_managed"] = "customer_managed"
+    request_isolation: Literal["not_attested", "per_request_attested"] = "not_attested"
     supports_conversations: bool
     supports_state_observation: bool
     state_observation_authority: StateObservationAuthority | None = None
@@ -281,10 +282,20 @@ class ExecutionEvidence(_StrictModel):
     @model_validator(mode="after")
     def validate_successful_evidence(self) -> Self:
         if self.evidence_scope == "response_only":
+            if (
+                self.initial_state is not None
+                or self.final_state is not None
+                or any(turn.state_snapshot is not None for turn in self.turns)
+            ):
+                raise ValueError("response-only evidence cannot contain state observations")
             if self.lifecycle.initial_reset is not None or self.lifecycle.cleanup_reset is not None:
                 raise ValueError("response-only evidence cannot contain reset receipts")
             if self.lifecycle.cleanup != "not_attempted":
                 raise ValueError("response-only evidence must record cleanup as not attempted")
+            if any(phase != "execute_turn" for phase in self.lifecycle.completed_phases):
+                raise ValueError("response-only evidence cannot contain stateful phases")
+            if self.lifecycle.failed_phase not in {None, "execute_turn"}:
+                raise ValueError("response-only evidence cannot fail during a stateful phase")
             if self.timeout_after_commit_event is not None:
                 raise ValueError("response-only evidence cannot contain state-dependent events")
         else:
@@ -303,14 +314,7 @@ class ExecutionEvidence(_StrictModel):
             final_turn = self.turns[-1]
             if self.final_response != final_turn.response:
                 raise ValueError("final response must match the last turn")
-            if self.evidence_scope == "response_only":
-                if (
-                    self.initial_state is not None
-                    or self.final_state is not None
-                    or any(turn.state_snapshot is not None for turn in self.turns)
-                ):
-                    raise ValueError("response-only evidence cannot contain state observations")
-            else:
+            if self.evidence_scope == "response_and_state":
                 if self.initial_state is None or self.final_state is None:
                     raise ValueError("response-and-state evidence requires explicit pre/post state")
                 if any(turn.state_snapshot is None for turn in self.turns):

@@ -277,6 +277,39 @@ def test_check_reports_no_cleanup_or_reset_for_isolated_response(tmp_path: Path)
     assert [path for path, _ in server.requests] == ["/execute"]
 
 
+def test_isolated_check_uses_no_reset_confirmation_wording(tmp_path: Path) -> None:
+    with _environment_server() as server:
+        config = _write_isolated_response_config(tmp_path, server)
+        arguments = _check_arguments(config, output_json=True)
+        arguments.remove("--confirm-test-environment")
+        result = runner.invoke(app, arguments)
+
+    assert result.exit_code == 2
+    summary = json.loads(result.output)
+    assert "dedicated test target" in summary["reason"]
+    assert "reset" not in summary["reason"]
+    assert server.requests == []
+
+
+def test_check_rejects_generated_environment_id_placeholder_before_network(
+    tmp_path: Path,
+) -> None:
+    with _environment_server() as server:
+        config = _write_isolated_response_config(tmp_path, server)
+        raw_config = json.loads(config.read_text(encoding="utf-8"))
+        raw_config["environment_id"] = "replace-with-stable-environment-id"
+        config.write_text(json.dumps(raw_config), encoding="utf-8")
+
+        result = runner.invoke(app, _check_arguments(config, output_json=True))
+
+    assert result.exit_code == 2
+    summary = json.loads(result.output)
+    assert summary["status"] == "not_ready"
+    assert summary["error_code"] == "environment_config_invalid"
+    assert "generated placeholder" in summary["reason"]
+    assert server.requests == []
+
+
 def test_check_reports_precise_phase_and_protocol_error(tmp_path: Path) -> None:
     with _environment_server(execute_content_type="text/plain") as server:
         config = _write_config(tmp_path, server)

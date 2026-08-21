@@ -10,6 +10,7 @@ from typing import Annotated, Never
 import typer
 from ul.environment import evaluation_case_from_inputs, validate_execution_evidence
 from ul.http_environment import (
+    ENVIRONMENT_ID_PLACEHOLDER,
     JsonHttpEnvironmentConnection,
     json_http_environment_calls_per_execution,
     json_http_environment_capabilities,
@@ -49,7 +50,7 @@ def check_environment(
         bool,
         typer.Option(
             "--confirm-test-environment",
-            help="Confirm this environment is intended for testing and can be reset.",
+            help="Confirm this is a dedicated test environment, not a production target.",
             rich_help_panel="Required safety flags",
         ),
     ] = False,
@@ -124,6 +125,14 @@ def check_environment(
             remediation="Correct the environment configuration and try again.",
             param_hint="ENVIRONMENT_CONFIG",
         )
+    if config.environment_id == ENVIRONMENT_ID_PLACEHOLDER:
+        _preflight_failure(
+            output_json=output_json,
+            code="environment_config_invalid",
+            reason="environment_id is still the generated placeholder",
+            remediation="Replace environment_id with a stable name for this test environment.",
+            param_hint="ENVIRONMENT_CONFIG",
+        )
     if not allow_environment_network:
         _preflight_failure(
             output_json=output_json,
@@ -133,10 +142,16 @@ def check_environment(
             param_hint="--allow-environment-network",
         )
     if not confirm_test_environment:
+        capabilities = json_http_environment_capabilities(config)
         _preflight_failure(
             output_json=output_json,
             code="test_environment_not_confirmed",
-            reason=TEST_ENVIRONMENT_CONFIRMATION_MESSAGE,
+            reason=(
+                "UL will send an isolated request to this target. Use a dedicated test target, "
+                "not a production system. Re-run with --confirm-test-environment to continue."
+                if capabilities.request_isolation == "per_request_attested"
+                else TEST_ENVIRONMENT_CONFIRMATION_MESSAGE
+            ),
             remediation="Confirm the environment before UL calls it.",
             param_hint="--confirm-test-environment",
         )

@@ -64,12 +64,15 @@ ul init interactions.jsonl \
   --adapter-tier isolated-response \
   --allow-environment-network \
   --confirm-test-environment \
-  --confirm-request-isolation
+  --confirm-request-isolation \
+  --confirm-safe-test-target
 ```
 
-This creates an `isolated-response` adapter that calls `/execute` once per case. The confirmation is
-an explicit attestation that every request starts fresh, is isolated from every other request, and
-is safe for testing. UL records response evidence only at this tier. It rejects committed-state
+This creates an `isolated-response` adapter that calls `/execute` once per case. The separate
+confirmations attest that this is a test target, every request starts fresh and is isolated from
+every other request, and requests cannot cause real-world effects. Replace the generated
+`environment_id` placeholder with a stable name before checking the connection. UL records response
+evidence only at this tier. It rejects committed-state
 invariants, conversations, timeout-after-commit checks, and other state-dependent stress tests. Move
 to `stateful-lifecycle` when UL must inspect side effects or behavior across turns.
 

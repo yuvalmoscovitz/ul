@@ -47,6 +47,7 @@ from ul.dataset_invariants import (
     load_dataset_invariant_suite,
 )
 from ul.http_environment import (
+    ENVIRONMENT_ID_PLACEHOLDER,
     JsonHttpEnvironmentConfig,
     JsonHttpEnvironmentConnection,
     JsonHttpIsolatedResponseConfig,
@@ -177,7 +178,7 @@ def initialize_dataset_environment(
                 {
                     "version": 1,
                     "adapter_tier": "isolated_response",
-                    "environment_id": "replace-with-stable-environment-id",
+                    "environment_id": ENVIRONMENT_ID_PLACEHOLDER,
                     "request_isolation_attested": True,
                     "safe_test_target_attested": True,
                     "headers_from_env": {},
@@ -196,7 +197,7 @@ def initialize_dataset_environment(
             config = JsonHttpEnvironmentConfig.model_validate(
                 {
                     "version": 5,
-                    "environment_id": "replace-with-stable-environment-id",
+                    "environment_id": ENVIRONMENT_ID_PLACEHOLDER,
                     "headers_from_env": {},
                     "reset": {
                         "url": f"{base_url}/reset",
@@ -266,6 +267,10 @@ def initialize_dataset_environment(
     console.print(f"Created private environment connection config: {environment_config}")
     if not show_guidance:
         return
+    console.print(
+        f"First: replace environment_id '{ENVIRONMENT_ID_PLACEHOLDER}' with a stable name for "
+        "this test environment."
+    )
     if adapter_tier == "isolated-response":
         console.print(
             "Next: implement the generated /execute endpoint and add any headers_from_env. "

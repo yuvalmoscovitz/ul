@@ -26,7 +26,11 @@ from ul.dataset_augmentation import (
     DatasetAugmentationResult,
     builtin_dataset_augmentation_operators,
 )
-from ul.environment import validate_execution_evidence
+from ul.environment import (
+    environment_timeout_requires_quarantine,
+    execution_evidence_requires_quarantine,
+    validate_execution_evidence,
+)
 
 FindingCategory = Literal[
     "duplicate_effect",
@@ -491,7 +495,7 @@ class DatasetEvaluationRunner:
                 )
                 execution_evidence = await self._environment.execute(evaluation_case)
         except TimeoutError:
-            if self._environment.capabilities.cancellation_guarantee != "guaranteed":
+            if environment_timeout_requires_quarantine(self._environment.capabilities):
                 self._target_state_uncertain = True
             return DatasetEvaluationTrial(
                 repetition=repetition,
@@ -505,7 +509,9 @@ class DatasetEvaluationRunner:
         validate_execution_evidence(evaluation_case, self._environment, execution_evidence)
         lifecycle = execution_evidence.lifecycle
         if lifecycle.terminal_status != "succeeded":
-            environment_state_may_remain = lifecycle.environment_state_uncertain
+            environment_state_may_remain = execution_evidence_requires_quarantine(
+                execution_evidence
+            )
             if environment_state_may_remain:
                 self._target_state_uncertain = True
             cleanup_reason = (

@@ -46,6 +46,7 @@ _INPUT_PLACEHOLDER = "{{input}}"
 _CASE_ID_PLACEHOLDER = "{{case_id}}"
 _TURN_ID_PLACEHOLDER = "{{turn_id}}"
 _INITIAL_STATE_TURN_ID = "__ul_initial_state__"
+ENVIRONMENT_ID_PLACEHOLDER = "replace-with-stable-environment-id"
 _MAXIMUM_CONFIG_BYTES = 1_000_000
 _MAXIMUM_HEADER_COUNT = 32
 _MAXIMUM_HEADER_VALUE_BYTES = 8_192
@@ -406,6 +407,7 @@ def json_http_environment_capabilities(
 ) -> EnvironmentCapabilities:
     if isinstance(config, JsonHttpIsolatedResponseConfig):
         return EnvironmentCapabilities(
+            request_isolation="per_request_attested",
             supports_conversations=False,
             supports_state_observation=False,
             cancellation_guarantee="none",

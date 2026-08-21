@@ -43,7 +43,7 @@ from ul.dataset_invariants import (
     evaluate_dataset_invariants,
 )
 from ul.dataset_regression import dataset_regression_target_config_sha256
-from ul.http_environment import JsonHttpTargetConfig
+from ul.http_environment import JsonHttpIsolatedResponseConfig, JsonHttpTargetConfig
 
 from ul_cli.report_contract import (
     FindingCategory,
@@ -753,10 +753,28 @@ def _summarize_dataset_evidence(
         Literal[0, 1, 2],
         {"resolved": 0, "action_required": 1, "inconclusive": 2}[report_review_status],
     )
+    target_configs = tuple(
+        loaded_record.evidence.run_context.target.config
+        for loaded_record in evidence_records
+        if loaded_record.evidence.run_context is not None
+    )
+    if any(
+        isinstance(config, JsonHttpIsolatedResponseConfig) for config in target_configs
+    ) and not all(isinstance(config, JsonHttpIsolatedResponseConfig) for config in target_configs):
+        raise _ReviewInputError("evidence combines incompatible target capability tiers")
+    response_only = bool(target_configs) and all(
+        isinstance(config, JsonHttpIsolatedResponseConfig) for config in target_configs
+    )
     return UnifiedReport(
         evidence_type="dataset_evaluation",
         evidence_schema_versions=tuple(
             sorted({record.evidence.schema_version for record in evidence_records})
+        ),
+        evidence_scope="response_only" if response_only else "response_and_state",
+        capability_limitations=(
+            ("cleanup_verification", "conversation_replay", "state_observation")
+            if response_only
+            else ()
         ),
         review_status=report_review_status,
         exit_code=exit_code,

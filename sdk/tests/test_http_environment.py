@@ -162,6 +162,7 @@ async def test_isolated_response_executes_one_request_and_labels_response_only_e
     assert requests == [{"case_id": "case-1", "turn_id": "turn-1", "input": "Pay invoice AC-100"}]
     assert environment.capabilities.supports_conversations is False
     assert environment.capabilities.supports_state_observation is False
+    assert environment.capabilities.request_isolation == "per_request_attested"
     assert evidence.evidence_scope == "response_only"
     assert evidence.final_response == {"message": "done"}
     assert evidence.initial_state is None
@@ -169,6 +170,33 @@ async def test_isolated_response_executes_one_request_and_labels_response_only_e
     assert evidence.lifecycle.cleanup == "not_attempted"
     assert evidence.lifecycle.initial_reset is None
     assert evidence.lifecycle.cleanup_reset is None
+
+
+async def test_isolated_response_failure_does_not_block_the_next_independent_request() -> None:
+    request_count = 0
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal request_count
+        request_count += 1
+        if request_count == 1:
+            raise httpx.ReadTimeout("response lost", request=request)
+        return _raw_response(json.dumps({"response": "second request succeeded"}).encode())
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        environment = JsonHttpEnvironmentConnection.from_config(
+            _isolated_response_config(),
+            test_environment_confirmed=True,
+            max_environment_api_calls=2,
+            client=client,
+        )
+        first = await environment.execute(_case("first", max_calls=1))
+        second = await environment.execute(_case("second", max_calls=1))
+
+    assert first.lifecycle.terminal_status == "failed"
+    assert first.lifecycle.delivery == "uncertain"
+    assert second.lifecycle.terminal_status == "succeeded"
+    assert second.final_response == "second request succeeded"
+    assert request_count == 2
 
 
 async def test_isolated_response_requires_attestations_and_rejects_stateful_cases() -> None:

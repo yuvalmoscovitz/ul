@@ -377,9 +377,11 @@ def test_root_json_report_is_stable_and_omits_private_dataset_fields(tmp_path: P
 
     assert report.exit_code == 1, report.output
     expected = {
-        "schema_version": "1.2.0",
+        "schema_version": "1.3.0",
         "evidence_type": "dataset_evaluation",
         "evidence_schema_versions": ["1.3.0"],
+        "evidence_scope": "response_and_state",
+        "capability_limitations": [],
         "review_status": "action_required",
         "exit_code": 1,
         "summary": {
