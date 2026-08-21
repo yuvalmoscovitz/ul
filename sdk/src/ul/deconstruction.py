@@ -824,7 +824,7 @@ class SemanticModelDeconstructor:
     @staticmethod
     def _render_seed(raw_input: str, instruction: str) -> int:
         digest = hashlib.sha256(f"{raw_input}\0{instruction}".encode()).digest()
-        return int.from_bytes(digest[:4], "big")
+        return int.from_bytes(digest[:4], "big") & 0x7FFF_FFFF
 
     def _require_live_access(self) -> str | None:
         if not self.settings.live_calls:
