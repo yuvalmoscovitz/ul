@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import stat
 from pathlib import Path
 from typing import Any
@@ -13,6 +14,11 @@ from ul_cli.main import app
 
 runner = CliRunner()
 FIXTURES = Path(__file__).parent / "fixtures"
+_ANSI_ESCAPE = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def _compact_plain_output(output: str) -> str:
+    return "".join(_ANSI_ESCAPE.sub("", output).split())
 
 
 def _attr(key: str, string_value: str) -> dict[str, Any]:
@@ -259,6 +265,7 @@ def test_trace_native_materializes_private_replay_bundle_and_dry_run_plan(
     )
 
     assert ingest_result.exit_code == 0, ingest_result.output
+    assert f"ul stress trace-plan {replay_output}" in ingest_result.output
     bundle = json.loads(replay_output.read_text(encoding="utf-8"))
     assert bundle["schema_version"] == "1.0.0"
     assert len(bundle["envelopes"]) == 1
@@ -306,6 +313,9 @@ def test_replay_output_requires_explicit_raw_content_mapping(tmp_path: Path) -> 
 
     assert result.exit_code == 2
     assert "include_raw_content" in result.output
+    assert '"schema_version":"1.0.0"' in result.output
+    assert '"include_raw_content":true' in result.output
+    assert "--mappingmapping.json" in _compact_plain_output(result.output)
     assert not replay_output.exists()
 
 

@@ -159,7 +159,10 @@ def ingest_otlp_traces(
     if replay_output is not None:
         if mapping_config is None or not mapping_config.include_raw_content:
             raise typer.BadParameter(
-                "--replay-output requires a mapping with include_raw_content enabled",
+                "--replay-output needs explicit permission to store replay content. Create "
+                "mapping.json with "
+                '{"schema_version":"1.0.0","include_raw_content":true,'
+                '"attributes":{}} and rerun with --mapping mapping.json',
                 param_hint="--replay-output",
             )
         try:
@@ -251,8 +254,7 @@ def ingest_otlp_traces(
         )
     if replay_output is not None:
         _print_safe(
-            f"Next: run 'ul stress trace {replay_output} "
-            "--environment-config target.json --dry-run'."
+            f"Next: inspect the evidence-linked plan with 'ul stress trace-plan {replay_output}'."
         )
 
 

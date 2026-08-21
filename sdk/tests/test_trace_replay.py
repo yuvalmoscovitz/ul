@@ -6,10 +6,17 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+import ul.trace_replay as trace_replay_module
 from ul.http_environment import JsonHttpIsolatedResponseConfig
 from ul.otlp_ingest import OtlpMappingConfig, parse_otlp_traces
 from ul.trace_replay import (
+    TraceReplayResult,
+    TraceReplayTrial,
+    derive_trace_stress_plan,
+    group_trace_replay_differences,
     load_trace_replay_bundle,
+    load_trace_replay_result,
+    load_trace_replay_results,
     materialize_trace_replay_bundle,
     plan_trace_replay,
     run_trace_replay,
@@ -30,7 +37,13 @@ def _attribute(key: str, value: str) -> dict[str, Any]:
     return {"key": key, "value": {"stringValue": value}}
 
 
-def _trace_records(*, include_state: bool = True) -> tuple[Any, ...]:
+def _trace_records(
+    *,
+    include_state: bool = True,
+    include_stress_signals: bool = False,
+    stress_error_span_id: str = "11" * 8,
+    include_future_child_signals: bool = False,
+) -> tuple[Any, ...]:
     first_user = {"role": "user", "parts": [{"type": "text", "content": "Pay AC-100."}]}
     first_response = {
         "role": "assistant",
@@ -48,9 +61,11 @@ def _trace_records(*, include_state: bool = True) -> tuple[Any, ...]:
     def span(
         span_id: str,
         start: str,
+        end: str,
         inputs: list[dict[str, Any]],
         outputs: list[dict[str, Any]],
         state: dict[str, Any],
+        parent_span_id: str | None = None,
     ) -> dict[str, Any]:
         attributes = [
             _attribute("gen_ai.operation.name", "invoke_agent"),
@@ -59,40 +74,74 @@ def _trace_records(*, include_state: bool = True) -> tuple[Any, ...]:
         ]
         if include_state:
             attributes.append(_attribute("ul.state.snapshot", json.dumps(state)))
-        return {
+        if include_stress_signals:
+            attributes.extend(
+                [
+                    _attribute("gen_ai.tool.call.id", f"call-{span_id[:2]}"),
+                    _attribute("gen_ai.tool.name", "accounting.submit_invoice"),
+                ]
+            )
+            if span_id == stress_error_span_id:
+                attributes.extend(
+                    [
+                        _attribute("retry.attempt", "2"),
+                        _attribute("error.type", "TransientTimeout"),
+                    ]
+                )
+        raw_span = {
             "traceId": "aa" * 16,
             "spanId": span_id,
             "name": "invoice agent turn",
             "startTimeUnixNano": start,
+            "endTimeUnixNano": end,
             "attributes": attributes,
         }
+        if parent_span_id is not None:
+            raw_span["parentSpanId"] = parent_span_id
+        return raw_span
 
-    data = {
-        "resourceSpans": [
-            {
-                "scopeSpans": [
-                    {
-                        "spans": [
-                            span(
-                                "11" * 8,
-                                "1",
-                                [first_user],
-                                [first_response],
-                                {"invoice": "AC-100", "status": "prepared"},
-                            ),
-                            span(
-                                "22" * 8,
-                                "2",
-                                [first_user, first_response, second_user],
-                                [second_response],
-                                {"invoice": "AC-100", "status": "submitted"},
-                            ),
-                        ]
-                    }
-                ]
-            }
-        ]
-    }
+    spans = [
+        span(
+            "11" * 8,
+            "1",
+            "2",
+            [first_user],
+            [first_response],
+            {"invoice": "AC-100", "status": "prepared"},
+        ),
+        span(
+            "22" * 8,
+            "3",
+            "4",
+            [first_user, first_response, second_user],
+            [second_response],
+            {"invoice": "AC-100", "status": "submitted"},
+        ),
+    ]
+    if include_future_child_signals:
+        future_message_child = span(
+            "33" * 8,
+            "3",
+            "4",
+            [first_user, first_response, second_user],
+            [second_response],
+            {"invoice": "AC-100", "status": "submitted"},
+            parent_span_id="11" * 8,
+        )
+        future_message_child["attributes"].append(_attribute("error.type", "FutureTurnError"))
+        future_message_less_child = span(
+            "44" * 8,
+            "5",
+            "6",
+            [],
+            [],
+            {},
+            parent_span_id="11" * 8,
+        )
+        future_message_less_child["attributes"].append(_attribute("retry.attempt", "2"))
+        spans.extend((future_message_child, future_message_less_child))
+
+    data = {"resourceSpans": [{"scopeSpans": [{"spans": spans}]}]}
     return parse_otlp_traces(
         data,
         mapping=OtlpMappingConfig(include_raw_content=True),
@@ -261,6 +310,74 @@ def test_materializes_one_replay_case_per_completed_user_turn() -> None:
     assert bundle.envelopes[0].scenario["messages"][-1]["content"] == "Submitted AC-100."
 
 
+def test_derives_ranked_stress_plan_from_explicit_trace_evidence() -> None:
+    bundle = materialize_trace_replay_bundle(_trace_records(include_stress_signals=True))
+
+    plan = derive_trace_stress_plan(bundle)
+
+    assert plan.case_count == 2
+    first = plan.cases[0]
+    assert first.case_id == bundle.cases[1].case_id
+    assert [signal.code for signal in first.signals] == [
+        "trace_error",
+        "retry_attempt",
+        "repeated_tool_call",
+        "multi_turn_follow_up",
+        "recorded_state_evidence",
+    ]
+    assert first.priority_score == 18
+    assert first.recommended_focuses == (
+        "error_recovery",
+        "retry_safety",
+        "multi_turn_change_handling",
+        "state_consistency",
+    )
+    assert first.source_span_ids == ("2222222222222222",)
+    assert first.signals[0].source_span_ids == ("1111111111111111",)
+    assert first.signals[2].source_span_ids == (
+        "1111111111111111",
+        "2222222222222222",
+    )
+
+
+def test_stress_plan_falls_back_to_reproducibility_without_elevated_signals() -> None:
+    bundle = materialize_trace_replay_bundle(_trace_records(include_state=False))
+
+    plan = derive_trace_stress_plan(bundle)
+
+    assert plan.cases[0].recommended_focuses == ("multi_turn_change_handling",)
+    assert plan.cases[1].signals == ()
+    assert plan.cases[1].recommended_focuses == ("production_reproducibility",)
+
+
+def test_stress_plan_does_not_apply_later_span_signals_to_earlier_case() -> None:
+    bundle = materialize_trace_replay_bundle(
+        _trace_records(include_stress_signals=True, stress_error_span_id="22" * 8)
+    )
+
+    plan_by_case_id = {case.case_id: case for case in derive_trace_stress_plan(bundle).cases}
+    earlier_signals = {signal.code for signal in plan_by_case_id[bundle.cases[0].case_id].signals}
+    later_signals = {signal.code for signal in plan_by_case_id[bundle.cases[1].case_id].signals}
+
+    assert "trace_error" not in earlier_signals
+    assert "repeated_tool_call" not in earlier_signals
+    assert "trace_error" in later_signals
+    assert "repeated_tool_call" in later_signals
+
+
+def test_stress_plan_excludes_future_children_of_an_earlier_case_span() -> None:
+    bundle = materialize_trace_replay_bundle(_trace_records(include_future_child_signals=True))
+
+    plan_by_case_id = {case.case_id: case for case in derive_trace_stress_plan(bundle).cases}
+    earlier_signals = {signal.code for signal in plan_by_case_id[bundle.cases[0].case_id].signals}
+    later_signals = {signal.code for signal in plan_by_case_id[bundle.cases[1].case_id].signals}
+
+    assert "trace_error" not in earlier_signals
+    assert "retry_attempt" not in earlier_signals
+    assert "trace_error" in later_signals
+    assert "retry_attempt" not in later_signals
+
+
 @pytest.mark.asyncio
 async def test_replays_selected_conversation_prefix_and_reports_reproduction() -> None:
     case = materialize_trace_replay_bundle(_trace_records()).cases[1]
@@ -308,6 +425,49 @@ async def test_replay_reports_observed_drift_without_claiming_correctness() -> N
 
 
 @pytest.mark.asyncio
+async def test_groups_replay_failures_by_stable_evidence_signature() -> None:
+    stateful_case = materialize_trace_replay_bundle(_trace_records()).cases[1]
+    response_only_case = materialize_trace_replay_bundle(_trace_records(include_state=False)).cases[
+        1
+    ]
+    state_and_response_drift = await run_trace_replay(
+        stateful_case,
+        _ReplayTarget(drift=True),
+        repetitions=1,
+        max_target_calls=7,
+        allow_network_egress=True,
+    )
+    response_drift = await run_trace_replay(
+        response_only_case,
+        _ReplayTarget(drift=True, include_state=False),
+        repetitions=1,
+        max_target_calls=7,
+        allow_network_egress=True,
+    )
+    reproduced = await run_trace_replay(
+        stateful_case,
+        _ReplayTarget(),
+        repetitions=1,
+        max_target_calls=7,
+        allow_network_egress=True,
+    )
+
+    grouping = group_trace_replay_differences(
+        (state_and_response_drift, response_drift, reproduced)
+    )
+
+    assert grouping.result_count == 3
+    assert grouping.difference_count == 2
+    assert grouping.reproduced_count == 1
+    assert [group.signature for group in grouping.groups] == [
+        "response_mismatch",
+        "response_mismatch+state_mismatch",
+    ]
+    assert grouping.groups[1].members[0].source_trace_id == "aa" * 16
+    assert grouping.groups[1].members[0].source_span_ids == ("2222222222222222",)
+
+
+@pytest.mark.asyncio
 async def test_replay_stops_after_uncertain_environment_state() -> None:
     case = materialize_trace_replay_bundle(_trace_records()).cases[1]
     environment = _UncertainReplayEnvironment()
@@ -320,6 +480,12 @@ async def test_replay_stops_after_uncertain_environment_state() -> None:
     assert environment.execution_count == 1
     assert result.trials[0].execution_evidence is not None
     assert all(trial.inconclusive_reason is not None for trial in result.trials)
+
+    grouping = group_trace_replay_differences((result,))
+
+    assert grouping.groups[0].signature == (
+        "environment_lifecycle_failed+environment_state_uncertain"
+    )
 
 
 @pytest.mark.asyncio
@@ -395,6 +561,201 @@ async def test_trace_replay_rejects_recorded_state_before_environment_call() -> 
         await run_trace_replay(case, environment, allow_network_egress=True)
 
     assert environment.call_count == 0
+
+
+@pytest.mark.asyncio
+async def test_replay_result_json_round_trip_preserves_nested_tuple_models(
+    tmp_path: Path,
+) -> None:
+    case = materialize_trace_replay_bundle(_trace_records()).cases[1]
+    result = await run_trace_replay(
+        case,
+        _ReplayTarget(),
+        repetitions=1,
+        max_target_calls=7,
+        allow_network_egress=True,
+    )
+    path = tmp_path / "result.json"
+    path.write_text(result.model_dump_json(indent=2), encoding="utf-8")
+
+    loaded = load_trace_replay_result(path)
+
+    assert loaded == result
+    assert isinstance(loaded.trials, tuple)
+    assert isinstance(loaded.trials[0].outputs, tuple)
+    assert loaded.trials[0].execution_evidence is not None
+    assert isinstance(loaded.trials[0].execution_evidence.turns, tuple)
+    assert isinstance(loaded.trials[0].execution_evidence.lifecycle.completed_phases, tuple)
+
+
+@pytest.mark.asyncio
+async def test_replay_result_rejects_aggregate_counts_that_disagree_with_trials() -> None:
+    case = materialize_trace_replay_bundle(_trace_records()).cases[1]
+    result = await run_trace_replay(
+        case,
+        _ReplayTarget(),
+        repetitions=1,
+        max_target_calls=7,
+        allow_network_egress=True,
+    )
+
+    with pytest.raises(ValueError, match="response match count"):
+        TraceReplayResult.model_validate({**result.model_dump(), "response_match_count": 0})
+    with pytest.raises(ValueError, match="state match count"):
+        TraceReplayResult.model_validate({**result.model_dump(), "state_match_count": 0})
+    conclusive_trial_without_state_comparison = result.trials[0].model_copy(
+        update={"state_matches_recorded": None}
+    )
+    with pytest.raises(ValueError, match="recorded state comparison"):
+        TraceReplayResult.model_validate(
+            {
+                **result.model_dump(exclude={"trials"}),
+                "state_match_count": 0,
+                "trials": (conclusive_trial_without_state_comparison,),
+            }
+        )
+
+
+@pytest.mark.asyncio
+async def test_replay_result_rejects_state_comparison_when_recorded_state_is_unavailable() -> None:
+    case = materialize_trace_replay_bundle(_trace_records(include_state=False)).cases[1]
+    result = await run_trace_replay(
+        case,
+        _ReplayTarget(include_state=False),
+        repetitions=1,
+        max_target_calls=7,
+        allow_network_egress=True,
+    )
+    trial_with_state_comparison = result.trials[0].model_copy(
+        update={"state_matches_recorded": True}
+    )
+
+    with pytest.raises(ValueError, match="unavailable recorded state"):
+        TraceReplayResult.model_validate(
+            {
+                **result.model_dump(exclude={"trials"}),
+                "state_match_count": None,
+                "trials": (trial_with_state_comparison,),
+            }
+        )
+
+
+def test_replay_result_rejects_excessive_trial_count() -> None:
+    case = materialize_trace_replay_bundle(_trace_records()).cases[1]
+    trials = tuple(
+        TraceReplayTrial.model_construct(repetition=index, inconclusive_reason="unknown")
+        for index in range(1, 102)
+    )
+
+    with pytest.raises(ValueError):
+        TraceReplayResult(
+            case=case,
+            requested_repetitions=100,
+            required_target_calls=101,
+            status="inconclusive",
+            response_match_count=0,
+            state_match_count=0,
+            trials=trials,
+        )
+
+
+@pytest.mark.asyncio
+async def test_replay_rejects_excessive_repetitions_before_environment_calls() -> None:
+    case = materialize_trace_replay_bundle(_trace_records()).cases[1]
+    environment = _ReplayTarget()
+
+    with pytest.raises(ValueError, match="must not exceed 100"):
+        await run_trace_replay(
+            case,
+            environment,
+            repetitions=101,
+            max_target_calls=1_000,
+            allow_network_egress=True,
+        )
+
+    assert environment.conversations == []
+
+
+@pytest.mark.asyncio
+async def test_grouping_keeps_mismatch_reasons_when_another_trial_is_inconclusive() -> None:
+    case = materialize_trace_replay_bundle(_trace_records()).cases[1]
+    drifted = await run_trace_replay(
+        case,
+        _ReplayTarget(drift=True),
+        repetitions=1,
+        max_target_calls=7,
+        allow_network_egress=True,
+    )
+    mixed_result = TraceReplayResult(
+        case=case,
+        requested_repetitions=2,
+        required_target_calls=14,
+        status="inconclusive",
+        response_match_count=0,
+        state_match_count=0,
+        trials=(
+            drifted.trials[0],
+            TraceReplayTrial(
+                repetition=2,
+                inconclusive_reason="environment execution timed out",
+            ),
+        ),
+    )
+
+    grouping = group_trace_replay_differences((mixed_result,))
+
+    assert grouping.groups[0].reason_codes == (
+        "response_mismatch",
+        "state_mismatch",
+        "environment_execution_timeout",
+    )
+
+
+def test_grouping_uses_stable_fallback_for_unknown_inconclusive_reason() -> None:
+    case = materialize_trace_replay_bundle(_trace_records(include_state=False)).cases[1]
+    result = TraceReplayResult(
+        case=case,
+        requested_repetitions=1,
+        required_target_calls=1,
+        status="inconclusive",
+        response_match_count=0,
+        state_match_count=None,
+        trials=(TraceReplayTrial(repetition=1, inconclusive_reason="new reason"),),
+    )
+
+    grouping = group_trace_replay_differences((result,))
+
+    assert grouping.groups[0].reason_codes == ("other_inconclusive",)
+
+
+@pytest.mark.asyncio
+async def test_group_result_loader_enforces_cumulative_byte_limit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    case = materialize_trace_replay_bundle(_trace_records()).cases[1]
+    result = await run_trace_replay(
+        case,
+        _ReplayTarget(),
+        repetitions=1,
+        max_target_calls=7,
+        allow_network_egress=True,
+    )
+    encoded = result.model_dump_json().encode("utf-8")
+    first_path = tmp_path / "first.json"
+    second_path = tmp_path / "second.json"
+    first_path.write_bytes(encoded)
+    second_path.write_bytes(encoded)
+    monkeypatch.setattr(trace_replay_module, "_MAXIMUM_GROUP_RESULT_BYTES", len(encoded) + 1)
+
+    with pytest.raises(ValueError, match="cumulative size limit"):
+        load_trace_replay_results((first_path, second_path))
+
+
+def test_group_result_loader_rejects_too_many_paths_before_reading() -> None:
+    paths = (Path(f"missing-{index}.json") for index in range(101))
+
+    with pytest.raises(ValueError, match="at most 100 result files"):
+        load_trace_replay_results(paths)
 
 
 def test_private_bundle_loader_rejects_tampered_source_envelope(tmp_path: Path) -> None:
