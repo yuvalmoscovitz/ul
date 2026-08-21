@@ -3297,6 +3297,7 @@ def test_customer_evidence_keeps_summary_and_nested_technical_details() -> None:
             baseline=SimpleNamespace(
                 verdict="no_divergence",
                 trial_set=_trial_set(representative_effect=expected_effect),
+                findings=(),
                 inconclusive_reasons=(),
             ),
             cases=(case,),
@@ -3317,7 +3318,7 @@ def test_customer_evidence_keeps_summary_and_nested_technical_details() -> None:
     assert evidence["schema_version"] == "1.4.0"
     assert evidence["invariant_evaluation"] is None
     assert evidence["current_baseline"]["status"] == "ORIGINAL REPLAY STABLE (3/3 OBSERVED)"
-    assert "findings" not in evidence["current_baseline"]
+    assert evidence["current_baseline"]["findings"] == []
     assert evidence["current_baseline"]["observations"]["outcome_group_count"] == 1
     assert evidence["current_baseline"]["observations"]["outcome_groups"][0]["repetitions"] == [
         1,
@@ -3342,7 +3343,7 @@ def test_customer_evidence_keeps_summary_and_nested_technical_details() -> None:
         "max_target_calls": 100,
         "dataset_planned_target_calls": 6,
     }
-    assert "does not determine" in evidence["limitations"]
+    assert "does not prove" in evidence["limitations"]
     assert "caused" in evidence["limitations"]
     assert "production failure rate" in evidence["limitations"]
     assert evidence["technical_details"] == {"full": "technical evidence"}
@@ -3354,7 +3355,9 @@ def test_customer_evidence_keeps_invariants_separate_from_behavioral_findings() 
         SimpleNamespace(
             source=SimpleNamespace(id="case-1", raw_input="Correct amount to 100."),
             baseline=SimpleNamespace(
+                verdict="no_divergence",
                 trial_set=_trial_set(requested_repetitions=1),
+                findings=(),
                 inconclusive_reasons=(),
             ),
             cases=(),
@@ -3628,6 +3631,7 @@ def test_duplicate_semantic_findings_get_stable_unique_reportable_ids(tmp_path: 
             baseline=SimpleNamespace(
                 verdict="no_divergence",
                 trial_set=_trial_set(representative_effect=first_reference),
+                findings=(),
                 inconclusive_reasons=(),
             ),
             cases=(case,),
@@ -3649,7 +3653,7 @@ def test_duplicate_semantic_findings_get_stable_unique_reportable_ids(tmp_path: 
     assert "Dataset finding report: 2 finding(s)" in report.output
 
 
-def test_stored_output_drift_does_not_require_review_or_appear_in_original_replay(
+def test_stored_output_drift_requires_review_and_appears_in_original_replay(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -3678,7 +3682,7 @@ def test_stored_output_drift_does_not_require_review_or_appear_in_original_repla
         SimpleNamespace(
             source=SimpleNamespace(id="case-1", raw_input="transfer 100 to Alice"),
             baseline=SimpleNamespace(
-                verdict="no_divergence",
+                verdict="divergence_needs_review",
                 trial_set=_trial_set(),
                 findings=(finding,),
                 inconclusive_reasons=(),
@@ -3700,15 +3704,15 @@ def test_stored_output_drift_does_not_require_review_or_appear_in_original_repla
 
     main._print_dataset_results((result,), tmp_path / "evidence.jsonl")
 
-    assert main._result_needs_review(result) is False
+    assert main._result_needs_review(result) is True
     assert printed_rows == [
         (
             "1",
             "original replay",
-            "ORIGINAL REPLAY STABLE (3/3 OBSERVED)",
+            "ORIGINAL DIFFERS FROM EXPECTED (3/3 OBSERVED) — REVIEW",
             "stable",
             "3 / 1",
-            "—",
+            "changed action value",
         ),
         (
             "2",

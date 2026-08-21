@@ -23,6 +23,7 @@ FindingCategory = Literal[
     "unexpected_effect",
     "missing_effect",
     "changed_grounded_effect_argument",
+    "changed_answer",
     "unstable_behavior",
     "customer_invariant_violation",
 ]
@@ -40,10 +41,11 @@ FindingNextAction = Literal[
     "inspect_stateful_evidence",
 ]
 FindingSummaryText = Literal[
-    "The changed input made the agent repeat an action.",
-    "The changed input made the agent take a new action.",
-    "The changed input made the agent skip a baseline action.",
-    "The changed input altered an important action detail.",
+    "The observed behavior repeated an expected action.",
+    "The observed behavior included an unexpected action.",
+    "The observed behavior omitted an expected action.",
+    "The observed behavior altered an important action detail.",
+    "The observed answer or clarification differed from the expectation.",
     "The changed input produced inconsistent behavior across repetitions.",
     "The agent violated a customer-defined rule.",
 ]
@@ -60,10 +62,11 @@ _SEVERITY_RANK: dict[FindingSeverity, int] = {
     "critical": 4,
 }
 _BEHAVIOR_SUMMARIES: dict[str, str] = {
-    "duplicate_effect": "The changed input made the agent repeat an action.",
-    "unexpected_effect": "The changed input made the agent take a new action.",
-    "missing_effect": "The changed input made the agent skip a baseline action.",
-    "changed_grounded_effect_argument": "The changed input altered an important action detail.",
+    "duplicate_effect": "The observed behavior repeated an expected action.",
+    "unexpected_effect": "The observed behavior included an unexpected action.",
+    "missing_effect": "The observed behavior omitted an expected action.",
+    "changed_grounded_effect_argument": "The observed behavior altered an important action detail.",
+    "changed_answer": "The observed answer or clarification differed from the expectation.",
     "unstable_behavior": "The changed input produced inconsistent behavior across repetitions.",
 }
 

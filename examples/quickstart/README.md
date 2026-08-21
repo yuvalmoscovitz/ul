@@ -2,7 +2,7 @@
 
 This package is a complete but synthetic black-box evaluation:
 
-- `dataset.jsonl` contains one historical accounts-payable interaction.
+- `dataset.jsonl` contains one accounts-payable input and its expected observable action.
 - `target.json` is the environment API mapping for reset, setup, execution, and committed-state snapshot calls to the local
   environment.
 - `invariants.json` declares that the committed invoice must match the requested invoice in the
@@ -52,7 +52,7 @@ checked-in `target.json`. The environment API mapping describes this exchange:
 ```
 
 UL applies `input.surface.disfluency_repeat`, replays the original and accepted variation three
-times each, and compares their observed actions. The seeded agent mishandles a repeated word,
+times each, and compares both with the expected action in `dataset.jsonl`. The seeded agent mishandles a repeated word,
 changing the committed invoice from `AC-100` to `AC-101`, so a typical model-generated variation
 produces a stable 3/3 `changed action value` finding for review. This is deliberately a
 behavioral finding, not a claim that UL established which response was correct.

@@ -37,6 +37,7 @@ FindingCategory = Literal[
     "unexpected_effect",
     "missing_effect",
     "changed_grounded_effect_argument",
+    "changed_answer",
 ]
 _NUMBER_PATTERN = r"[-+]?(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?(?:e[-+]?\d+)?"
 CaseVerdict = Literal[
@@ -45,7 +46,7 @@ CaseVerdict = Literal[
     "no_divergence",
     "divergence_needs_review",
 ]
-BaselineVerdict = Literal["inconclusive", "no_divergence"]
+BaselineVerdict = Literal["inconclusive", "no_divergence", "divergence_needs_review"]
 TrialSetStability = Literal["stable", "unstable", "inconclusive"]
 
 
@@ -100,8 +101,8 @@ class DatasetEvaluationOutcomeGroup(_StrictULModel):
             raise ValueError("outcome group repetitions must be positive")
         if tuple(sorted(set(self.repetitions))) != self.repetitions:
             raise ValueError("outcome group repetitions must be unique and ordered")
-        if any(effect.kind != "action" for effect in self.representative_effects):
-            raise ValueError("outcome groups contain only observable action effects")
+        if any(effect.kind not in {"action", "answer"} for effect in self.representative_effects):
+            raise ValueError("outcome groups contain only supported observable outcomes")
         return self
 
 
@@ -130,11 +131,11 @@ class DatasetEvaluationTrialSet(_StrictULModel):
             representative_frame = self.trials[group.repetitions[0] - 1].observed_frame
             if representative_frame is None:
                 raise ValueError("outcome groups require conclusive representative trials")
-            representative_effects = tuple(
-                outcome for outcome in representative_frame.outcomes if outcome.kind == "action"
-            )
-            if group.representative_effects != representative_effects:
-                raise ValueError("outcome group effects must match their representative trial")
+            if any(
+                effect not in representative_frame.outcomes
+                for effect in group.representative_effects
+            ):
+                raise ValueError("outcome group effects must come from their representative trial")
         expected_stability: TrialSetStability
         if len(conclusive_repetitions) != self.requested_repetitions:
             expected_stability = "inconclusive"
@@ -211,13 +212,15 @@ class DatasetEvaluationBaseline(_StrictULModel):
 
     @model_validator(mode="after")
     def validate_execution_state(self) -> Self:
-        if self.findings:
-            raise ValueError("historical output is grounding evidence, not a review oracle")
         expected_verdict: BaselineVerdict
         if self.inconclusive_reasons or self.trial_set.stability != "stable":
             expected_verdict = "inconclusive"
+        elif self.findings:
+            expected_verdict = "divergence_needs_review"
         else:
             expected_verdict = "no_divergence"
+        if self.findings and self.trial_set.stability != "stable":
+            raise ValueError("baseline findings require stable observed trials")
         if self.verdict != expected_verdict:
             raise ValueError("baseline verdict must match its evaluation results")
         return self
@@ -310,16 +313,21 @@ class DatasetEvaluationRunner:
             augmentation = precomputed_augmentation
             _validate_precomputed_augmentation(source, augmentation, operator_ids=operator_ids)
         source_frame = augmentation.source_frames[0]
-        if not any(outcome.kind == "action" for outcome in source_frame.outcomes):
-            raise ValueError("source frame requires at least one observable action outcome")
-        source_action_issues = _action_outcome_reliability_issues(
+        if not any(outcome.kind in {"action", "answer"} for outcome in source_frame.outcomes):
+            raise ValueError("source frame requires at least one supported observable outcome")
+        source_outcome_issues = _outcome_reliability_issues(
             source_frame,
             source.raw_observed_output,
             source.raw_input,
             require_input_grounded_fields=True,
         )
-        if source_action_issues:
-            raise ValueError(f"source action outcomes are inconclusive: {source_action_issues[0]}")
+        if source_outcome_issues:
+            source_label = (
+                "source action outcomes"
+                if any(outcome.kind == "action" for outcome in source_frame.outcomes)
+                else "source answer outcomes"
+            )
+            raise ValueError(f"{source_label} are inconclusive: {source_outcome_issues[0]}")
         accepted_candidates = tuple(
             candidate for candidate in augmentation.candidates if candidate.passed
         )
@@ -349,15 +357,14 @@ class DatasetEvaluationRunner:
                         )
                     )
                     continue
-                reference_frame = baseline_trial.observed_frame
-                if reference_frame is None:
+                if baseline_trial.observed_frame is None:
                     raise AssertionError("conclusive baseline trial requires an observed frame")
                 candidate_trials[candidate.operator_id].append(
                     await self._execute_trial(
                         repetition=repetition,
                         interaction_id=(f"{source.id}:{candidate.operator_id}:round-{repetition}"),
                         raw_input=candidate.augmented_input,
-                        reference_frame=reference_frame,
+                        reference_frame=source_frame,
                         source=source,
                         subject="variation",
                     )
@@ -366,7 +373,11 @@ class DatasetEvaluationRunner:
         baseline_trial_set = _group_evaluation_trials(
             tuple(baseline_trials), source.raw_input, source_frame
         )
-        baseline = self._classify_baseline(baseline_trial_set)
+        baseline = self._classify_baseline(
+            baseline_trial_set,
+            source_frame=source_frame,
+            source_input=source.raw_input,
+        )
         cases: list[DatasetEvaluationCase] = []
         for candidate in augmentation.candidates:
             if not candidate.passed:
@@ -430,15 +441,13 @@ class DatasetEvaluationRunner:
                     )
                 )
                 continue
-            baseline_frame = baseline_trial_set.representative_frame
             observed_frame = trial_set.representative_frame
-            if baseline_frame is None or observed_frame is None:
+            if observed_frame is None:
                 raise AssertionError("stable trial sets require representative frames")
-            findings = _compare_action_outcomes(
-                baseline_frame,
+            findings = _compare_expected_outcomes(
+                source_frame,
                 observed_frame,
                 source.raw_input,
-                grounding_frame=source_frame,
             )
             cases.append(
                 DatasetEvaluationCase(
@@ -566,7 +575,7 @@ class DatasetEvaluationRunner:
             )
         if observed_frame.interaction_id != record.id:
             raise ValueError(f"observed frame must reference its {subject} interaction")
-        inconclusive_reasons = _action_outcome_reliability_issues(
+        inconclusive_reasons = _outcome_reliability_issues(
             observed_frame,
             target_output.raw_output,
             source.raw_input,
@@ -590,6 +599,9 @@ class DatasetEvaluationRunner:
     @staticmethod
     def _classify_baseline(
         trial_set: DatasetEvaluationTrialSet,
+        *,
+        source_frame: SemanticFrame,
+        source_input: str,
     ) -> DatasetEvaluationBaseline:
         if trial_set.stability == "inconclusive":
             return DatasetEvaluationBaseline(
@@ -606,9 +618,11 @@ class DatasetEvaluationRunner:
         observed_frame = trial_set.representative_frame
         if observed_frame is None:
             raise AssertionError("stable baseline requires a representative frame")
+        findings = _compare_expected_outcomes(source_frame, observed_frame, source_input)
         return DatasetEvaluationBaseline(
-            verdict="no_divergence",
+            verdict=("divergence_needs_review" if findings else "no_divergence"),
             trial_set=trial_set,
+            findings=findings,
         )
 
 
@@ -681,6 +695,26 @@ def _validate_precomputed_augmentation(
         raise ValueError("precomputed augmentation operators do not match the evaluation plan")
 
 
+def _comparable_outcomes(
+    frame: SemanticFrame,
+    reference_frame: SemanticFrame,
+) -> tuple[ObservedOutcome, ...]:
+    if any(outcome.kind == "action" for outcome in reference_frame.outcomes):
+        return tuple(outcome for outcome in frame.outcomes if outcome.kind == "action")
+    return tuple(outcome for outcome in frame.outcomes if outcome.kind == "answer")
+
+
+def _answer_outcome_key(outcome: ObservedOutcome) -> str:
+    propositions: list[JsonValue] = list(outcome.propositions)
+    key: list[JsonValue] = [
+        outcome.kind,
+        outcome.predicate,
+        outcome.fields,
+        sorted(propositions, key=_json_key),
+    ]
+    return _json_key(key)
+
+
 def _group_evaluation_trials(
     trials: tuple[DatasetEvaluationTrial, ...],
     source_input: str,
@@ -694,9 +728,7 @@ def _group_evaluation_trials(
         observed_frame = trial.observed_frame
         if observed_frame is None:
             raise AssertionError("conclusive trials require observed frames")
-        action_effects = tuple(
-            outcome for outcome in observed_frame.outcomes if outcome.kind == "action"
-        )
+        effects = _comparable_outcomes(observed_frame, source_frame)
         grounded_names_by_outcome, association_issues = (
             _input_grounded_action_field_names_by_outcome(
                 observed_frame,
@@ -706,17 +738,20 @@ def _group_evaluation_trials(
         )
         if association_issues:
             raise AssertionError("reliable trials require unambiguous action grounding")
-        action_keys: list[str] = []
-        for effect in action_effects:
-            grounded_fields: dict[str, JsonValue] = {
-                name: _observable_field_key(name, value)
-                for name, value in effect.fields.items()
-                if name in grounded_names_by_outcome.get(effect.id, set())
-            }
-            action_keys.append(_json_key([effect.predicate, grounded_fields]))
-        outcome_key = tuple(sorted(action_keys))
+        outcome_keys: list[str] = []
+        for effect in effects:
+            if effect.kind == "action":
+                grounded_fields: dict[str, JsonValue] = {
+                    name: _observable_field_key(name, value)
+                    for name, value in effect.fields.items()
+                    if name in grounded_names_by_outcome.get(effect.id, set())
+                }
+                outcome_keys.append(_json_key([effect.kind, effect.predicate, grounded_fields]))
+            else:
+                outcome_keys.append(_answer_outcome_key(effect))
+        outcome_key = tuple(sorted(outcome_keys))
         grouped_repetitions.setdefault(outcome_key, []).append(trial.repetition)
-        representative_effects.setdefault(outcome_key, action_effects)
+        representative_effects.setdefault(outcome_key, effects)
     outcome_groups = tuple(
         DatasetEvaluationOutcomeGroup(
             repetitions=tuple(repetitions),
@@ -745,6 +780,48 @@ def _trial_inconclusive_reasons(
     return tuple(
         dict.fromkeys(reason for trial in trial_set.trials for reason in trial.inconclusive_reasons)
     )
+
+
+def _outcome_reliability_issues(
+    frame: SemanticFrame,
+    raw_observed_output: JsonValue,
+    source_input: str,
+    *,
+    reference_frame: SemanticFrame | None = None,
+    require_input_grounded_fields: bool = False,
+) -> tuple[str, ...]:
+    issues = list(
+        _action_outcome_reliability_issues(
+            frame,
+            raw_observed_output,
+            source_input,
+            reference_frame=reference_frame,
+            require_input_grounded_fields=require_input_grounded_fields,
+        )
+    )
+    frame_has_actions = any(outcome.kind == "action" for outcome in frame.outcomes)
+    supported_outcomes = tuple(
+        outcome
+        for outcome in frame.outcomes
+        if outcome.kind == "action" or (outcome.kind == "answer" and not frame_has_actions)
+    )
+    for outcome in supported_outcomes:
+        if outcome.kind != "answer":
+            continue
+        if outcome.status.casefold() != "observed":
+            issues.append(f"answer outcome {outcome.id} is not affirmatively observed")
+        if outcome.confidence < 1:
+            issues.append(f"answer outcome {outcome.id} has confidence below 1")
+        if not any(evidence.source == "output" for evidence in outcome.evidence):
+            issues.append(f"answer outcome {outcome.id} lacks output evidence")
+        for evidence in outcome.evidence:
+            if evidence.source != "output":
+                continue
+            try:
+                _resolve_output_pointer(raw_observed_output, evidence.json_pointer)
+            except ValueError:
+                issues.append(f"answer outcome {outcome.id} has invalid output evidence")
+    return tuple(issues)
 
 
 def _action_outcome_reliability_issues(
@@ -822,7 +899,7 @@ def _action_outcome_reliability_issues(
                 f"action outcome {outcome.id} grounded fields lack one coherent action record: "
                 f"{', '.join(sorted(grounded_fields))}"
             )
-        if require_input_grounded_fields and not grounded_fields:
+        if require_input_grounded_fields and outcome.fields and not grounded_fields:
             issues.append(f"action outcome {outcome.id} has no input-grounded fields")
     return tuple(issues)
 
@@ -977,6 +1054,29 @@ def _resolve_output_pointer(raw_observed_output: JsonValue, pointer: str) -> Jso
             continue
         raise ValueError("action evidence pointer does not resolve")
     return current
+
+
+def _compare_expected_outcomes(
+    expected_frame: SemanticFrame,
+    observed_frame: SemanticFrame,
+    source_input: str,
+) -> tuple[DatasetEvaluationFinding, ...]:
+    if any(outcome.kind == "action" for outcome in expected_frame.outcomes):
+        return _compare_action_outcomes(expected_frame, observed_frame, source_input)
+    expected = _comparable_outcomes(expected_frame, expected_frame)
+    observed = _comparable_outcomes(observed_frame, expected_frame)
+    expected_keys = sorted(_answer_outcome_key(outcome) for outcome in expected)
+    observed_keys = sorted(_answer_outcome_key(outcome) for outcome in observed)
+    if expected_keys == observed_keys:
+        return ()
+    return (
+        DatasetEvaluationFinding(
+            category="changed_answer",
+            message="Needs review: the observed answer or clarification changed from expected.",
+            expected_effects=expected,
+            observed_effects=observed,
+        ),
+    )
 
 
 def _compare_action_outcomes(

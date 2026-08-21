@@ -691,7 +691,7 @@ async def test_runner_executes_only_accepted_candidates_and_keeps_rejected_candi
     assert rejected.findings == ()
     assert target.raw_inputs == ["Transfer 100 to Alice.", "Please transfer 100 to Alice."]
     last_reference = semantic_pipeline.references[-1]
-    assert last_reference == result.baseline.observed_frame
+    assert last_reference == result.augmentation.source_frames[0]
     assert last_reference is not None
     assert last_reference.outcomes == _source_outcomes()
     assert result.baseline.verdict == "no_divergence"
@@ -746,7 +746,7 @@ async def test_redacted_runner_evidence_never_persists_environment_secrets(tmp_p
     assert "__UL_SECRET_target_secret_" in serialized_evidence
 
 
-async def test_current_baseline_drift_is_not_blame_on_augmentation() -> None:
+async def test_current_baseline_drift_is_reported_against_expected_output() -> None:
     current_outcome = _outcome(
         "current_transfer",
         0,
@@ -769,12 +769,12 @@ async def test_current_baseline_drift_is_not_blame_on_augmentation() -> None:
 
     result = await runner.run(_source())
 
-    assert result.baseline.verdict == "no_divergence"
-    assert result.baseline.findings == ()
-    assert result.cases[0].verdict == "no_divergence"
+    assert result.baseline.verdict == "divergence_needs_review"
+    assert result.baseline.findings[0].grounded_field_names == ("amount",)
+    assert result.cases[0].verdict == "divergence_needs_review"
 
 
-async def test_candidate_is_compared_with_changed_current_baseline() -> None:
+async def test_candidate_is_compared_with_expected_output() -> None:
     baseline_outcome = _outcome(
         "baseline_transfer",
         0,
@@ -801,12 +801,12 @@ async def test_candidate_is_compared_with_changed_current_baseline() -> None:
 
     result = await runner.run(_source())
 
-    assert result.baseline.verdict == "no_divergence"
+    assert result.baseline.verdict == "divergence_needs_review"
     assert result.cases[0].verdict == "divergence_needs_review"
     assert result.cases[0].findings[0].grounded_field_names == ("amount",)
 
 
-async def test_candidate_change_to_new_baseline_action_is_detected() -> None:
+async def test_candidate_does_not_inherit_an_unexpected_baseline_action() -> None:
     source_transfer = _source_outcomes()[0]
     baseline_outcomes = (
         source_transfer,
@@ -842,11 +842,10 @@ async def test_candidate_change_to_new_baseline_action_is_detected() -> None:
 
     result = await runner.run(_source())
 
-    assert result.baseline.verdict == "no_divergence"
-    assert result.baseline.findings == ()
+    assert result.baseline.verdict == "divergence_needs_review"
+    assert result.baseline.findings[0].category == "unexpected_effect"
     assert result.cases[0].verdict == "divergence_needs_review"
-    assert result.cases[0].findings[0].category == "changed_grounded_effect_argument"
-    assert result.cases[0].findings[0].grounded_field_names == ("recipient",)
+    assert result.cases[0].findings[0].category == "unexpected_effect"
 
 
 async def test_derived_field_is_not_grounded_by_another_action_with_the_same_field() -> None:
@@ -1395,7 +1394,7 @@ async def test_stable_repeated_difference_keeps_findings() -> None:
     assert [finding.category for finding in case.findings] == ["changed_grounded_effect_argument"]
 
 
-async def test_stored_output_is_grounding_not_a_live_review_oracle() -> None:
+async def test_stored_output_is_the_expected_behavior_oracle() -> None:
     live_outcome = _outcome(
         "live",
         0,
@@ -1407,14 +1406,14 @@ async def test_stored_output_is_grounding_not_a_live_review_oracle() -> None:
     result = await runner.run(_source(), repetitions=3)
 
     assert result.source.raw_observed_output != live_output
-    assert result.baseline.verdict == "no_divergence"
+    assert result.baseline.verdict == "divergence_needs_review"
     assert result.baseline.trial_set.stability == "stable"
-    assert result.baseline.findings == ()
+    assert result.baseline.findings[0].category == "changed_grounded_effect_argument"
     case = result.cases[0]
     assert case.trial_set is not None
     assert case.trial_set.stability == "stable"
-    assert case.verdict == "no_divergence"
-    assert case.findings == ()
+    assert case.verdict == "divergence_needs_review"
+    assert case.findings[0].category == "changed_grounded_effect_argument"
 
 
 async def test_numeric_representations_group_and_compare_as_the_same_observation() -> None:
@@ -1622,25 +1621,111 @@ async def test_trial_set_model_rejects_inconsistent_group_partition() -> None:
         )
 
 
-async def test_runner_does_not_execute_without_an_observable_action_baseline() -> None:
-    runner, semantic_pipeline, target = _runner(())
+async def test_runner_executes_with_an_observable_answer_baseline() -> None:
+    answer = _outcome(
+        "answer",
+        0,
+        kind="answer",
+        predicate="request_confirmation_number",
+        fields={"requested_field": "confirmation number"},
+    )
+    runner, semantic_pipeline, target = _runner((answer,))
+    answer_output = {"answer": "Please provide your confirmation number."}
+    target.raw_output = answer_output
+    target.baseline_raw_output = answer_output
     semantic_pipeline.source_frame = _frame(
         "source",
-        (
-            _outcome(
-                "answer",
-                0,
-                kind="answer",
-                predicate="confirmation",
-                fields={"text": "Done"},
-            ),
-        ),
+        (answer,),
     )
 
-    with pytest.raises(ValueError, match="observable action outcome"):
-        await runner.run(_source())
+    source = _source().model_copy(update={"raw_observed_output": answer_output})
+    result = await runner.run(source)
 
-    assert target.raw_inputs == []
+    assert result.baseline.verdict == "no_divergence"
+    assert target.raw_inputs
+
+
+async def test_runner_reports_changed_expected_answer_on_original_and_variation() -> None:
+    expected_answer = _outcome(
+        "expected_answer",
+        0,
+        kind="answer",
+        predicate="answer_carry_on_policy",
+        fields={"allowed_bags": 1},
+    )
+    observed_answer = _outcome(
+        "observed_answer",
+        0,
+        kind="answer",
+        predicate="request_airline_name",
+        fields={"requested_field": "airline"},
+    )
+    semantic_pipeline = DeterministicSemanticPipeline(
+        (observed_answer,),
+        baseline_outcomes=(observed_answer,),
+    )
+    semantic_pipeline.source_frame = _frame("source", (expected_answer,))
+    observed_output = {"answer": "Which airline are you flying?"}
+    target = DeterministicEnvironment(
+        raw_output=observed_output,
+        baseline_raw_output=observed_output,
+    )
+    runner = DatasetEvaluationRunner(
+        DatasetAugmentationEngine(semantic_pipeline, semantic_pipeline),
+        semantic_pipeline,
+        target,
+    )
+    source = _source().model_copy(
+        update={"raw_observed_output": {"answer": "One carry-on bag is allowed."}}
+    )
+
+    result = await runner.run(source)
+
+    assert result.baseline.verdict == "divergence_needs_review"
+    assert result.baseline.findings[0].category == "changed_answer"
+    assert result.cases[0].findings[0].category == "changed_answer"
+
+
+async def test_answer_expectation_ignores_incidental_tool_actions() -> None:
+    answer = _outcome(
+        "answer",
+        0,
+        kind="answer",
+        predicate="answer_carry_on_policy",
+        fields={"allowed_bags": 1},
+    )
+    lookup = _outcome(
+        "lookup",
+        1,
+        predicate="faq_lookup_tool",
+        fields={"question": "carry-on rules"},
+    )
+    semantic_pipeline = DeterministicSemanticPipeline(
+        (answer, lookup),
+        baseline_outcomes=(answer, lookup),
+    )
+    semantic_pipeline.source_frame = _frame("source", (answer,))
+    observed_output = {
+        "answer": "One carry-on bag is allowed.",
+        "outcomes": {"1": {"action": "faq_lookup_tool", "question": "carry-on rules"}},
+    }
+    target = DeterministicEnvironment(
+        raw_output=observed_output,
+        baseline_raw_output=observed_output,
+    )
+    runner = DatasetEvaluationRunner(
+        DatasetAugmentationEngine(semantic_pipeline, semantic_pipeline),
+        semantic_pipeline,
+        target,
+    )
+    source = _source().model_copy(
+        update={"raw_observed_output": {"answer": "One carry-on bag is allowed."}}
+    )
+
+    result = await runner.run(source)
+
+    assert result.baseline.verdict == "no_divergence"
+    assert result.cases[0].verdict == "no_divergence"
 
 
 @pytest.mark.parametrize(

@@ -113,11 +113,12 @@ _FINDING_LABELS = {
     "unexpected_effect": "unexpected action",
     "missing_effect": "missing action",
     "changed_grounded_effect_argument": "changed action value",
+    "changed_answer": "changed answer",
 }
 _BEHAVIORAL_LIMITATIONS = (
-    "UL compares observed action behavior only. It does not determine whether the original or "
-    "variation is correct, prove that the variation caused a difference, or estimate a "
-    "production failure rate."
+    "UL compares observed behavior with the expected behavior supplied in the dataset output. "
+    "It does not prove that the expectation is correct, that an augmentation caused a "
+    "difference, or estimate a production failure rate."
 )
 _ISOLATED_ADAPTER_PRESETS: dict[str, tuple[JsonValue, str]] = {
     "generic-json": ({"input": "{{input}}"}, "/response"),
@@ -1724,7 +1725,8 @@ def _print_dataset_results(
             _baseline_customer_status(result),
             result.baseline.trial_set.stability,
             _trial_set_summary(result.baseline.trial_set),
-            "—",
+            ", ".join(_FINDING_LABELS[finding.category] for finding in result.baseline.findings)
+            or "—",
         )
         for case in result.cases:
             case_number += 1
@@ -1747,7 +1749,9 @@ def _print_dataset_results(
 
 
 def _result_needs_review(result: DatasetEvaluationResult) -> bool:
-    return any(case.verdict == "divergence_needs_review" for case in result.cases)
+    return result.baseline.verdict == "divergence_needs_review" or any(
+        case.verdict == "divergence_needs_review" for case in result.cases
+    )
 
 
 def _invariant_exit_code(
@@ -1905,6 +1909,14 @@ def _customer_evidence_record(
         "current_baseline": {
             "status": _baseline_customer_status(result),
             "observations": _customer_trial_set(result.baseline.trial_set),
+            "findings": _customer_findings(
+                result.baseline.findings,
+                interaction_id=result.source.id,
+                original_input=result.source.raw_input,
+                operator_id="current_baseline",
+                operator_version="1.0.0",
+                augmented_input=result.source.raw_input,
+            ),
             "inconclusive_reasons": list(result.baseline.inconclusive_reasons),
         },
         "cases": cases,
@@ -1944,6 +1956,8 @@ def _baseline_customer_status(result: DatasetEvaluationResult) -> str:
     if stability == "inconclusive":
         return "COULDN'T DETERMINE"
     repetitions = trial_set.requested_repetitions
+    if result.baseline.verdict == "divergence_needs_review":
+        return f"ORIGINAL DIFFERS FROM EXPECTED ({repetitions}/{repetitions} OBSERVED) — REVIEW"
     return f"ORIGINAL REPLAY STABLE ({repetitions}/{repetitions} OBSERVED)"
 
 

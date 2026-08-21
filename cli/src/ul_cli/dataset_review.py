@@ -238,6 +238,7 @@ class DatasetEvidenceRunContext(_StrictModel):
 class _Baseline(_StrictModel):
     status: str
     observations: _Observations
+    findings: list[_Finding] = Field(default_factory=lambda: list[_Finding]())
     inconclusive_reasons: list[str]
 
 
@@ -562,10 +563,11 @@ def load_confirmed_dataset_finding(
 
 
 _BEHAVIOR_FINDING_SUMMARIES: dict[str, FindingSummaryText] = {
-    "duplicate_effect": "The changed input made the agent repeat an action.",
-    "unexpected_effect": "The changed input made the agent take a new action.",
-    "missing_effect": "The changed input made the agent skip a baseline action.",
-    "changed_grounded_effect_argument": "The changed input altered an important action detail.",
+    "duplicate_effect": "The observed behavior repeated an expected action.",
+    "unexpected_effect": "The observed behavior included an unexpected action.",
+    "missing_effect": "The observed behavior omitted an expected action.",
+    "changed_grounded_effect_argument": "The observed behavior altered an important action detail.",
+    "changed_answer": "The observed answer or clarification differed from the expectation.",
     "unstable_behavior": "The changed input produced inconsistent behavior across repetitions.",
 }
 
@@ -1408,6 +1410,27 @@ def _index_findings(
 ) -> dict[str, _IndexedFinding]:
     findings: dict[str, _IndexedFinding] = {}
     for loaded_record in records:
+        baseline_case = _Case(
+            operator_id="current_baseline",
+            operator_version="1.0.0",
+            augmented_input=loaded_record.evidence.original_input,
+            status=loaded_record.evidence.current_baseline.status,
+            variation_accepted=True,
+            variation_rejection_reasons=[],
+            observations=loaded_record.evidence.current_baseline.observations,
+            findings=loaded_record.evidence.current_baseline.findings,
+            inconclusive_reasons=loaded_record.evidence.current_baseline.inconclusive_reasons,
+        )
+        for finding in loaded_record.evidence.current_baseline.findings:
+            if finding.finding_id in findings:
+                raise _ReviewInputError("evidence contains a duplicate finding ID")
+            findings[finding.finding_id] = _IndexedFinding(
+                finding_id=finding.finding_id,
+                kind="semantic_difference",
+                evidence_record=loaded_record,
+                case=baseline_case,
+                semantic_finding=finding,
+            )
         for case in loaded_record.evidence.cases:
             for finding in case.findings:
                 if finding.finding_id in findings:

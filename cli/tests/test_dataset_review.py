@@ -405,7 +405,7 @@ def test_root_json_report_is_stable_and_omits_private_dataset_fields(tmp_path: P
                 "category": "changed_grounded_effect_argument",
                 "rule_id": None,
                 "rule_version": None,
-                "summary": "The changed input altered an important action detail.",
+                "summary": "The observed behavior altered an important action detail.",
                 "severity": "unrated",
                 "finding_count": 1,
                 "source_case_count": 1,
@@ -439,7 +439,7 @@ def test_root_json_report_is_stable_and_omits_private_dataset_fields(tmp_path: P
                 "stability": "stable",
                 "violated_repetitions": None,
                 "next_action": "review_dataset_finding",
-                "summary": "The changed input altered an important action detail.",
+                "summary": "The observed behavior altered an important action detail.",
             }
         ],
     }
@@ -453,6 +453,23 @@ def test_root_json_report_is_stable_and_omits_private_dataset_fields(tmp_path: P
     assert "technical_details" not in report.output
 
 
+def test_root_report_includes_original_replay_findings(tmp_path: Path) -> None:
+    evidence = tmp_path / "evidence.jsonl"
+    record = _evidence_record()
+    baseline_finding = record["cases"][0]["findings"][0]
+    record["current_baseline"]["findings"] = [baseline_finding]
+    record["cases"][0]["findings"] = []
+    _write_evidence(evidence, [record])
+
+    report = runner.invoke(app, ["report", str(evidence), "--json"])
+
+    assert report.exit_code == 1, report.output
+    payload = json.loads(report.output)
+    assert payload["summary"]["finding_count"] == 1
+    assert payload["findings"][0]["operator_id"] == "current_baseline"
+    assert payload["findings"][0]["category"] == "changed_grounded_effect_argument"
+
+
 def test_root_human_report_explains_patterns_and_augmentation_names(tmp_path: Path) -> None:
     evidence = tmp_path / "evidence.jsonl"
     _write_evidence(evidence)
@@ -462,7 +479,7 @@ def test_root_human_report_explains_patterns_and_augmentation_names(tmp_path: Pa
     assert report.exit_code == 1, report.output
     assert "Reviewable finding patterns: 1" in report.output
     assert "Patterns group similar evidence; they do not claim a root cause." in report.output
-    assert "Pattern 1: The changed input altered an important action detail." in report.output
+    assert "Pattern 1: The observed behavior altered an important action detail." in report.output
     assert "Priority: unrated" in report.output
     assert "Why grouped: same finding category and private action shape." in report.output
     assert "Affected: 1 finding(s) across 1 test question(s)" in report.output
@@ -502,10 +519,10 @@ def test_failure_patterns_group_same_mechanism_across_questions_and_augmentation
         "duplicate_effect",
     )
     summaries = (
-        "The changed input altered an important action detail.",
-        "The changed input altered an important action detail.",
-        "The changed input altered an important action detail.",
-        "The changed input made the agent repeat an action.",
+        "The observed behavior altered an important action detail.",
+        "The observed behavior altered an important action detail.",
+        "The observed behavior altered an important action detail.",
+        "The observed behavior repeated an expected action.",
     )
     findings = tuple(
         FindingSummary(

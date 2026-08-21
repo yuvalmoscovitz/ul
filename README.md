@@ -42,6 +42,10 @@ Create a JSONL dataset with one interaction per line:
 {"id":"case-1","input":"Pay AC-100.","output":{"action":"payment_committed","invoice":"AC-100"}}
 ```
 
+`output` is the expected observable behavior. UL compares every fresh replay of the original input
+and every accepted variation with that expectation, so an agent that already drifted is reported
+before input robustness is considered.
+
 Configure UL once:
 
 ```bash
@@ -149,10 +153,10 @@ Catalog entries without a dataset CLI binding cannot be enabled for `ul run`; us
 ## How it works
 
 ```text
-recorded interaction
+input with expected observable behavior
   → realistic input variation
   → fresh environment runs for original and variation
-  → comparison of responses and committed state
+  → comparison with the expected response or action behavior and committed state
   → evidence for human review
   → confirmed regression case
 ```
