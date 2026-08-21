@@ -945,6 +945,57 @@ def test_invariant_dry_run_reports_rules_authority_and_no_extra_calls(
     assert "Potential environment API calls: up to 6" in result.output
 
 
+def test_isolated_response_dry_run_rejects_committed_state_invariants(
+    tmp_path: Path,
+) -> None:
+    dataset = tmp_path / "interactions.jsonl"
+    invariant_suite = tmp_path / "invariants.json"
+    target_config = tmp_path / "isolated-response.json"
+    _write_dataset(dataset, [_record()])
+    _write_invariant_suite(invariant_suite)
+    target_config.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "adapter_tier": "isolated_response",
+                "environment_id": "response-only-test",
+                "request_isolation_attested": True,
+                "safe_test_target_attested": True,
+                "execute": {
+                    "url": "https://environment.example.test/execute",
+                    "request_json_template": {
+                        "case_id": "{{case_id}}",
+                        "turn_id": "{{turn_id}}",
+                        "input": "{{input}}",
+                    },
+                    "response_json_pointer": "/response",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = runner.invoke(
+        root_app,
+        [
+            "dataset",
+            "evaluate",
+            str(dataset),
+            "--environment-config",
+            str(target_config),
+            "--invariants",
+            str(invariant_suite),
+            "--dry-run",
+        ],
+        terminal_width=180,
+    )
+
+    assert result.exit_code != 0
+    assert "isolated-response targets provide response evidence only" in " ".join(
+        result.output.split()
+    )
+
+
 def test_extended_invariants_use_new_evidence_schema_and_hide_values_from_terminal(
     capsys: pytest.CaptureFixture[str],
 ) -> None:

@@ -198,8 +198,8 @@ class EnvironmentLifecycleEvidence(_StrictModel):
     cleanup_failure_code: EnvironmentLifecycleFailureCode | None = None
     cleanup_failure_reason: str | None = Field(default=None, min_length=1, max_length=500)
     environment_state_uncertain: bool
-    initial_reset: EnvironmentResetEvidence
-    cleanup_reset: EnvironmentResetEvidence | None
+    initial_reset: EnvironmentResetEvidence | None = None
+    cleanup_reset: EnvironmentResetEvidence | None = None
 
     @model_validator(mode="after")
     def validate_terminal_status(self) -> Self:
@@ -230,11 +230,9 @@ class EnvironmentLifecycleEvidence(_StrictModel):
         ):
             raise ValueError("successful lifecycle evidence cannot name a failure")
         if self.terminal_status == "succeeded" and (
-            self.delivery != "certain"
-            or self.cleanup != "succeeded"
-            or self.environment_state_uncertain
+            self.delivery != "certain" or self.environment_state_uncertain
         ):
-            raise ValueError("successful lifecycle evidence requires certain delivery and cleanup")
+            raise ValueError("successful lifecycle evidence requires certain delivery")
         if self.terminal_status != "succeeded" and self.failed_phase is None:
             raise ValueError("unsuccessful lifecycle evidence requires a failed phase")
         if self.terminal_status != "succeeded" and (
@@ -269,6 +267,7 @@ class EnvironmentResetEvidence(_StrictModel):
 
 class ExecutionEvidence(_StrictModel):
     schema_version: Literal["1.2.0"] = "1.2.0"
+    evidence_scope: Literal["response_only", "response_and_state"] = "response_and_state"
     case_id: str = Field(min_length=1, max_length=500)
     environment_id: str = Field(min_length=1, max_length=500)
     environment_config_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
@@ -281,24 +280,47 @@ class ExecutionEvidence(_StrictModel):
 
     @model_validator(mode="after")
     def validate_successful_evidence(self) -> Self:
+        if self.evidence_scope == "response_only":
+            if self.lifecycle.initial_reset is not None or self.lifecycle.cleanup_reset is not None:
+                raise ValueError("response-only evidence cannot contain reset receipts")
+            if self.lifecycle.cleanup != "not_attempted":
+                raise ValueError("response-only evidence must record cleanup as not attempted")
+            if self.timeout_after_commit_event is not None:
+                raise ValueError("response-only evidence cannot contain state-dependent events")
+        else:
+            if self.lifecycle.initial_reset is None:
+                raise ValueError("response-and-state evidence requires an initial reset receipt")
+            if (
+                self.lifecycle.terminal_status == "succeeded"
+                and self.lifecycle.cleanup != "succeeded"
+            ):
+                raise ValueError("successful response-and-state evidence requires cleanup")
         if self.lifecycle.terminal_status == "succeeded" and not self.turns:
             raise ValueError("successful execution evidence requires turn evidence")
         if self.lifecycle.terminal_status == "succeeded":
-            if (
-                self.initial_state is None
-                or self.final_response is None
-                or self.final_state is None
-            ):
-                raise ValueError("successful execution evidence requires explicit pre/post state")
+            if self.final_response is None:
+                raise ValueError("successful execution evidence requires a final response")
             final_turn = self.turns[-1]
             if self.final_response != final_turn.response:
                 raise ValueError("final response must match the last turn")
-            if (
-                self.final_state.value != final_turn.state_snapshot
-                or self.final_state.authority != final_turn.state_observation_authority
-                or self.final_state.observer_id != final_turn.state_observer_id
-            ):
-                raise ValueError("final state must match the last turn")
+            if self.evidence_scope == "response_only":
+                if (
+                    self.initial_state is not None
+                    or self.final_state is not None
+                    or any(turn.state_snapshot is not None for turn in self.turns)
+                ):
+                    raise ValueError("response-only evidence cannot contain state observations")
+            else:
+                if self.initial_state is None or self.final_state is None:
+                    raise ValueError("response-and-state evidence requires explicit pre/post state")
+                if any(turn.state_snapshot is None for turn in self.turns):
+                    raise ValueError("response-and-state evidence requires state for every turn")
+                if (
+                    self.final_state.value != final_turn.state_snapshot
+                    or self.final_state.authority != final_turn.state_observation_authority
+                    or self.final_state.observer_id != final_turn.state_observer_id
+                ):
+                    raise ValueError("final state must match the last turn")
             if self.timeout_after_commit_event is not None and (
                 not self.timeout_after_commit_event.armed
                 or self.timeout_after_commit_event.trigger_status == "unknown"

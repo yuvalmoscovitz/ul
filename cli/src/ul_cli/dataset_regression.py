@@ -37,8 +37,8 @@ from ul.dataset_regression import (
     run_dataset_regressions,
 )
 from ul.http_environment import (
-    JsonHttpEnvironmentConfig,
     JsonHttpEnvironmentConnection,
+    JsonHttpTargetConfig,
     json_http_environment_calls_per_execution,
     json_http_environment_config_urls,
     load_json_http_environment_config,
@@ -659,7 +659,7 @@ def _invariant_rule_definition(rule: DatasetInvariantRuleResult) -> DatasetInvar
     )
 
 
-def _target_config_sha256(config: JsonHttpEnvironmentConfig) -> str:
+def _target_config_sha256(config: JsonHttpTargetConfig) -> str:
     return dataset_regression_target_config_sha256(config)
 
 

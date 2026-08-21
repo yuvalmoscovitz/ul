@@ -35,7 +35,10 @@ from ul.environment import (
     observed_outputs_from_evidence,
     validate_execution_evidence,
 )
-from ul.http_environment import JsonHttpEnvironmentConfig, json_http_environment_config_sha256
+from ul.http_environment import (
+    JsonHttpTargetConfig,
+    json_http_environment_config_sha256,
+)
 
 _MAXIMUM_CASE_BYTES = 1_000_000
 _MAXIMUM_JSON_DEPTH = 100
@@ -77,7 +80,7 @@ class DatasetRegressionVariation(_StrictModel):
 
 class DatasetRegressionTargetSnapshot(_StrictModel):
     provenance: Literal["declared_at_case_creation"]
-    config: JsonHttpEnvironmentConfig
+    config: JsonHttpTargetConfig
     config_sha256: str = Field(pattern=_SHA256_PATTERN)
 
     @model_validator(mode="after")
@@ -305,7 +308,7 @@ def create_dataset_regression_case(
     operator_version: str,
     original_input: str,
     variation_input: str,
-    target_config: JsonHttpEnvironmentConfig,
+    target_config: JsonHttpTargetConfig,
     source_suite_sha256: str,
     observation_authority: ObservationAuthority,
     state_observation_authority: StateObservationAuthority | None,
@@ -361,7 +364,7 @@ def create_dataset_regression_case(
     )
 
 
-def dataset_regression_target_config_sha256(config: JsonHttpEnvironmentConfig) -> str:
+def dataset_regression_target_config_sha256(config: JsonHttpTargetConfig) -> str:
     return json_http_environment_config_sha256(config)
 
 

@@ -12,6 +12,7 @@ from ul.environment import evaluation_case_from_inputs, validate_execution_evide
 from ul.http_environment import (
     JsonHttpEnvironmentConnection,
     json_http_environment_calls_per_execution,
+    json_http_environment_capabilities,
     json_http_environment_config_sha256,
     load_json_http_environment_config,
 )
@@ -81,7 +82,7 @@ def check_environment(
         typer.Option("--json", help="Print a safe machine-readable result."),
     ] = False,
 ) -> None:
-    """Run one probe through the complete lifecycle without UL semantic-model calls.
+    """Run one probe through the complete lifecycle or response-only adapter.
 
     Requires --allow-environment-network, --confirm-test-environment, and
     --confirm-harmless-probe.
@@ -188,7 +189,11 @@ def check_environment(
         raw_inputs=(probe,),
         max_environment_api_calls=environment_api_calls,
         timeout_seconds=(environment_api_calls + 1) * request_timeout_seconds,
-        required_state_observation_authority="environment_self_reported",
+        required_state_observation_authority=(
+            "environment_self_reported"
+            if json_http_environment_capabilities(config).supports_state_observation
+            else None
+        ),
     )
     try:
         evidence = asyncio.run(_execute_and_close(environment, case))
@@ -249,7 +254,11 @@ def _print_success(
         else None,
         delivery=evidence.lifecycle.delivery,
         cleanup=evidence.lifecycle.cleanup,
-        initial_reset=evidence.lifecycle.initial_reset.model_dump(mode="json"),
+        initial_reset=(
+            evidence.lifecycle.initial_reset.model_dump(mode="json")
+            if evidence.lifecycle.initial_reset is not None
+            else None
+        ),
         cleanup_reset=(
             evidence.lifecycle.cleanup_reset.model_dump(mode="json")
             if evidence.lifecycle.cleanup_reset is not None
@@ -264,10 +273,15 @@ def _print_success(
     _print_safe(f"Environment: {evidence.environment_id}")
     _print_safe(f"Lifecycle: {' -> '.join(evidence.lifecycle.completed_phases)}")
     _print_safe(f"Environment API call budget: {environment_api_calls}")
-    _print_reset_receipt("Initial reset", evidence.lifecycle.initial_reset)
+    if evidence.lifecycle.initial_reset is not None:
+        _print_reset_receipt("Initial reset", evidence.lifecycle.initial_reset)
     if evidence.lifecycle.cleanup_reset is not None:
         _print_reset_receipt("Cleanup reset", evidence.lifecycle.cleanup_reset)
-    _print_safe("Probe, response, and state: not printed")
+    _print_safe(
+        "Probe and response: not printed"
+        if evidence.evidence_scope == "response_only"
+        else "Probe, response, and state: not printed"
+    )
     _print_safe("UL semantic-model calls: 0")
     _print_safe("Isolation and probe safety: customer-attested, not verified by UL")
 
@@ -293,7 +307,11 @@ def _print_failure(
         remediation=remediation,
         delivery=lifecycle.delivery,
         cleanup=lifecycle.cleanup,
-        initial_reset=lifecycle.initial_reset.model_dump(mode="json"),
+        initial_reset=(
+            lifecycle.initial_reset.model_dump(mode="json")
+            if lifecycle.initial_reset is not None
+            else None
+        ),
         cleanup_reset=(
             lifecycle.cleanup_reset.model_dump(mode="json")
             if lifecycle.cleanup_reset is not None
@@ -313,7 +331,8 @@ def _print_failure(
     _print_safe(f"Remediation: {remediation}")
     _print_safe(f"Delivery: {lifecycle.delivery}")
     _print_safe(f"Cleanup: {lifecycle.cleanup}")
-    _print_reset_receipt("Initial reset", lifecycle.initial_reset)
+    if lifecycle.initial_reset is not None:
+        _print_reset_receipt("Initial reset", lifecycle.initial_reset)
     if lifecycle.cleanup_reset is not None:
         _print_reset_receipt("Cleanup reset", lifecycle.cleanup_reset)
     if lifecycle.cleanup_failure_reason is not None:

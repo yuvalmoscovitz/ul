@@ -239,6 +239,31 @@ class JsonHttpLifecycleExecuteTurnConfig(BaseModel):
         return pointer
 
 
+class JsonHttpIsolatedExecuteConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    url: str
+    request_json_template: JsonValue
+    response_json_pointer: str = ""
+
+    @field_validator("url")
+    @classmethod
+    def validate_url(cls, url: str) -> str:
+        _validate_endpoint(url, allow_insecure_http=True)
+        return url
+
+    @field_validator("request_json_template", mode="before")
+    @classmethod
+    def validate_request_json_template(cls, template: object) -> JsonValue:
+        return _validated_execute_request_json_template(template)
+
+    @field_validator("response_json_pointer")
+    @classmethod
+    def validate_response_json_pointer(cls, pointer: str) -> str:
+        _parse_json_pointer(pointer)
+        return pointer
+
+
 class JsonHttpTimeoutAfterCommitConfig(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
@@ -312,7 +337,34 @@ class JsonHttpEnvironmentConfig(BaseModel):
         return self
 
 
-def load_json_http_environment_config(path: str | Path) -> JsonHttpEnvironmentConfig:
+class JsonHttpIsolatedResponseConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    version: Literal[1]
+    adapter_tier: Literal["isolated_response"]
+    environment_id: str = Field(min_length=1, max_length=500)
+    request_isolation_attested: Literal[True]
+    safe_test_target_attested: Literal[True]
+    headers_from_env: dict[str, str] = Field(default_factory=dict)
+    execute: JsonHttpIsolatedExecuteConfig
+
+    @field_validator("version", mode="before")
+    @classmethod
+    def validate_version(cls, version: object) -> object:
+        if type(version) is not int or version != 1:
+            raise ValueError("version must be 1")
+        return version
+
+    @field_validator("headers_from_env")
+    @classmethod
+    def validate_headers_from_env(cls, headers: dict[str, str]) -> dict[str, str]:
+        return _validate_header_environment_variables(headers)
+
+
+JsonHttpTargetConfig = JsonHttpEnvironmentConfig | JsonHttpIsolatedResponseConfig
+
+
+def load_json_http_environment_config(path: str | Path) -> JsonHttpTargetConfig:
     try:
         encoded_config = _read_bounded_regular_file(Path(path), maximum_bytes=_MAXIMUM_CONFIG_BYTES)
     except OSError:
@@ -330,6 +382,11 @@ def load_json_http_environment_config(path: str | Path) -> JsonHttpEnvironmentCo
     except (UnicodeDecodeError, json.JSONDecodeError, RecursionError, ValueError):
         raise ValueError("environment API config contains invalid JSON") from None
     try:
+        if (
+            isinstance(raw_config, dict)
+            and cast(dict[str, object], raw_config).get("adapter_tier") == "isolated_response"
+        ):
+            return JsonHttpIsolatedResponseConfig.model_validate(raw_config)
         return JsonHttpEnvironmentConfig.model_validate(raw_config)
     except RecursionError:
         raise ValueError("environment API config is invalid") from None
@@ -345,8 +402,14 @@ def load_json_http_environment_config(path: str | Path) -> JsonHttpEnvironmentCo
 
 
 def json_http_environment_capabilities(
-    config: JsonHttpEnvironmentConfig,
+    config: JsonHttpTargetConfig,
 ) -> EnvironmentCapabilities:
+    if isinstance(config, JsonHttpIsolatedResponseConfig):
+        return EnvironmentCapabilities(
+            supports_conversations=False,
+            supports_state_observation=False,
+            cancellation_guarantee="none",
+        )
     return EnvironmentCapabilities(
         supports_conversations=True,
         supports_state_observation=True,
@@ -358,10 +421,21 @@ def json_http_environment_capabilities(
     )
 
 
+def require_stateful_json_http_environment(
+    config: JsonHttpTargetConfig,
+) -> JsonHttpEnvironmentConfig:
+    if isinstance(config, JsonHttpIsolatedResponseConfig):
+        raise ValueError(
+            "this workflow requires the stateful-lifecycle adapter tier; "
+            "isolated-response targets provide response evidence only"
+        )
+    return config
+
+
 class JsonHttpEnvironmentConnection:
     def __init__(
         self,
-        config: JsonHttpEnvironmentConfig,
+        config: JsonHttpTargetConfig,
         *,
         test_environment_confirmed: bool,
         allow_insecure_http: bool = False,
@@ -407,7 +481,7 @@ class JsonHttpEnvironmentConnection:
     @classmethod
     def from_config(
         cls,
-        config: JsonHttpEnvironmentConfig,
+        config: JsonHttpTargetConfig,
         *,
         test_environment_confirmed: bool,
         allow_insecure_http: bool = False,
@@ -444,6 +518,14 @@ class JsonHttpEnvironmentConnection:
             await self._client.aclose()
 
     def api_calls_for_case(self, case: EvaluationCase) -> int:
+        if isinstance(self._config, JsonHttpIsolatedResponseConfig):
+            if len(case.turns) != 1:
+                raise ValueError("isolated-response targets do not support conversations")
+            if case.required_state_observation_authority is not None:
+                raise ValueError("isolated-response targets do not support state observation")
+            if case.timeout_after_commit_event is not None:
+                raise ValueError("isolated-response targets do not support stress events")
+            return 1
         calls = json_http_environment_calls_per_conversation(self._config, len(case.turns))
         if case.timeout_after_commit_event is not None:
             if self._config.timeout_after_commit is None:
@@ -459,10 +541,81 @@ class JsonHttpEnvironmentConnection:
             raise ValueError("evaluation case exceeds its environment API call budget")
         async with self._lifecycle_lock:
             async with asyncio.timeout(case.timeout_seconds):
+                if isinstance(self._config, JsonHttpIsolatedResponseConfig):
+                    return await self._execute_isolated_response(case)
                 return await self._execute_stateful(case)
 
+    async def _execute_isolated_response(self, case: EvaluationCase) -> ExecutionEvidence:
+        config = cast(JsonHttpIsolatedResponseConfig, self._config)
+        self._reserve_environment_api_calls(1)
+        turn = case.turns[0]
+        try:
+            response = await self._post_for_json(
+                config.execute.url,
+                _replace_request_placeholders(
+                    config.execute.request_json_template,
+                    case_id=case.id,
+                    turn_id=turn.id,
+                    raw_input=turn.content,
+                ),
+                config.execute.response_json_pointer,
+                consume_budget=False,
+            )
+        except _EnvironmentProtocolError as error:
+            return self._isolated_response_evidence(
+                case,
+                (),
+                terminal_status="failed",
+                failed_phase="execute_turn",
+                failure_code=error.code,
+                failure_reason=str(error),
+                delivery="uncertain" if error.delivery_uncertain else "certain",
+                environment_state_uncertain=error.delivery_uncertain,
+            )
+        return self._isolated_response_evidence(
+            case,
+            (EnvironmentTurnEvidence(turn_id=turn.id, response=response),),
+            terminal_status="succeeded",
+            failed_phase=None,
+            failure_code=None,
+            failure_reason=None,
+            delivery="certain",
+            environment_state_uncertain=False,
+        )
+
+    def _isolated_response_evidence(
+        self,
+        case: EvaluationCase,
+        turns: tuple[EnvironmentTurnEvidence, ...],
+        *,
+        terminal_status: Literal["succeeded", "failed"],
+        failed_phase: str | None,
+        failure_code: EnvironmentLifecycleFailureCode | None,
+        failure_reason: str | None,
+        delivery: Literal["certain", "uncertain"],
+        environment_state_uncertain: bool,
+    ) -> ExecutionEvidence:
+        return ExecutionEvidence(
+            evidence_scope="response_only",
+            case_id=case.id,
+            environment_id=self._config.environment_id,
+            environment_config_sha256=self._config_sha256,
+            turns=turns,
+            final_response=turns[-1].response if turns else None,
+            lifecycle=EnvironmentLifecycleEvidence(
+                terminal_status=terminal_status,
+                completed_phases=("execute_turn",) if turns else (),
+                failed_phase=failed_phase,
+                failure_code=failure_code,
+                failure_reason=failure_reason,
+                delivery=delivery,
+                cleanup="not_attempted",
+                environment_state_uncertain=environment_state_uncertain,
+            ),
+        )
+
     async def _execute_stateful(self, case: EvaluationCase) -> ExecutionEvidence:
-        config = self._config
+        config = cast(JsonHttpEnvironmentConfig, self._config)
         event_request = case.timeout_after_commit_event
         event_config = config.timeout_after_commit
         if event_request is not None and event_config is None:
@@ -982,6 +1135,7 @@ class JsonHttpEnvironmentConnection:
         event_trigger_status: TimeoutAfterCommitTriggerStatus = "unknown",
         event_cleaned: bool = False,
     ) -> ExecutionEvidence:
+        config = cast(JsonHttpEnvironmentConfig, self._config)
         event_request = case.timeout_after_commit_event
         return ExecutionEvidence(
             case_id=case.id,
@@ -1023,16 +1177,16 @@ class JsonHttpEnvironmentConnection:
                 cleanup_failure_reason=cleanup_failure_reason,
                 environment_state_uncertain=environment_state_uncertain,
                 initial_reset=EnvironmentResetEvidence(
-                    reset_session_requested=self._config.reset.reset_session,
+                    reset_session_requested=config.reset.reset_session,
                     reset_session_acknowledged=reset_session_acknowledged,
-                    reset_env_requested=self._config.reset.reset_env,
+                    reset_env_requested=config.reset.reset_env,
                     reset_env_acknowledged=reset_env_acknowledged,
                 ),
                 cleanup_reset=(
                     EnvironmentResetEvidence(
-                        reset_session_requested=self._config.reset.reset_session,
+                        reset_session_requested=config.reset.reset_session,
                         reset_session_acknowledged=cleanup_reset_session_acknowledged,
-                        reset_env_requested=self._config.reset.reset_env,
+                        reset_env_requested=config.reset.reset_env,
                         reset_env_acknowledged=cleanup_reset_env_acknowledged,
                     )
                     if cleanup != "not_attempted"
@@ -1203,7 +1357,7 @@ class JsonHttpEnvironmentConnection:
 
 
 def validate_json_http_environment_configuration(
-    config: JsonHttpEnvironmentConfig,
+    config: JsonHttpTargetConfig,
     *,
     test_environment_confirmed: bool,
     allow_insecure_http: bool = False,
@@ -1229,12 +1383,14 @@ def validate_json_http_environment_configuration(
 
 
 def json_http_environment_calls_per_execution(
-    config: JsonHttpEnvironmentConfig,
+    config: JsonHttpTargetConfig,
 ) -> int:
+    if isinstance(config, JsonHttpIsolatedResponseConfig):
+        return 1
     return json_http_environment_calls_per_conversation(config, 1)
 
 
-def json_http_environment_config_sha256(config: JsonHttpEnvironmentConfig) -> str:
+def json_http_environment_config_sha256(config: JsonHttpTargetConfig) -> str:
     canonical_config = json.dumps(
         config.model_dump(mode="json", exclude_none=True),
         ensure_ascii=True,
@@ -1245,11 +1401,15 @@ def json_http_environment_config_sha256(config: JsonHttpEnvironmentConfig) -> st
 
 
 def json_http_environment_calls_per_conversation(
-    config: JsonHttpEnvironmentConfig,
+    config: JsonHttpTargetConfig,
     turn_count: int,
 ) -> int:
     if type(turn_count) is not int or turn_count < 1:
         raise ValueError("turn_count must be a positive integer")
+    if isinstance(config, JsonHttpIsolatedResponseConfig):
+        if turn_count != 1:
+            raise ValueError("isolated-response targets do not support conversations")
+        return 1
     return 3 + (1 if config.setup is not None else 0) + (2 * turn_count)
 
 
@@ -1258,8 +1418,10 @@ def _conversation_phase_name(phase: str, turn_index: int, turn_count: int) -> st
 
 
 def json_http_environment_config_urls(
-    config: JsonHttpEnvironmentConfig,
+    config: JsonHttpTargetConfig,
 ) -> tuple[str, ...]:
+    if isinstance(config, JsonHttpIsolatedResponseConfig):
+        return (config.execute.url,)
     return (
         config.reset.url,
         *((config.setup.url,) if config.setup is not None else ()),
@@ -1269,7 +1431,7 @@ def json_http_environment_config_urls(
     )
 
 
-def json_http_environment_origin(config: JsonHttpEnvironmentConfig) -> str:
+def json_http_environment_origin(config: JsonHttpTargetConfig) -> str:
     scheme, hostname, port = _endpoint_origin(json_http_environment_config_urls(config)[0])
     formatted_hostname = f"[{hostname}]" if ":" in hostname else hostname
     default_port = 443 if scheme == "https" else 80

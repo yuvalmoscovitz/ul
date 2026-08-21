@@ -17,7 +17,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_valida
 from rich.console import Console
 from ul import load_dataset_invariant_suite, load_redaction_policy
 from ul.http_environment import (
-    JsonHttpEnvironmentConfig,
+    JsonHttpTargetConfig,
     json_http_environment_config_sha256,
     json_http_environment_origin,
     load_json_http_environment_config,
@@ -126,6 +126,21 @@ def initialize_project(
             help="Create .ul/environment.json for this environment API base URL.",
         ),
     ] = None,
+    adapter_tier: Annotated[
+        Literal["stateful-lifecycle", "isolated-response"],
+        typer.Option(
+            help=(
+                "Generated adapter evidence tier. Isolated-response uses one endpoint and "
+                "cannot verify state or conversations."
+            )
+        ),
+    ] = "stateful-lifecycle",
+    confirm_request_isolation: Annotated[
+        bool,
+        typer.Option(
+            help="Attest every isolated-response request starts fresh and cannot affect another."
+        ),
+    ] = False,
     invariants: Annotated[
         Path | None,
         typer.Option(exists=True, dir_okay=False, readable=True),
@@ -191,6 +206,11 @@ def initialize_project(
             TEST_ENVIRONMENT_CONFIRMATION_MESSAGE,
             param_hint="--confirm-test-environment",
         )
+    if adapter_tier == "isolated-response" and not confirm_request_isolation:
+        raise typer.BadParameter(
+            "isolated-response setup requires --confirm-request-isolation",
+            param_hint="--confirm-request-isolation",
+        )
     if (redaction_policy is None) != (redaction_state is None):
         raise typer.BadParameter(
             "--redaction-policy and --redaction-state must be configured together"
@@ -202,7 +222,7 @@ def initialize_project(
     if project_config_path.exists():
         raise typer.BadParameter(".ul/config.json already exists; UL will not overwrite it")
 
-    loaded_environment_config: JsonHttpEnvironmentConfig | None = None
+    loaded_environment_config: JsonHttpTargetConfig | None = None
     loaded_redaction_policy = None
     try:
         validate_interaction_dataset(dataset)
@@ -237,7 +257,12 @@ def initialize_project(
         if environment_url is not None:
             selected_environment_config = project_directory / "environment.json"
             initialize_dataset_environment(
-                selected_environment_config, environment_url, show_guidance=False
+                selected_environment_config,
+                environment_url,
+                adapter_tier=adapter_tier,
+                confirm_request_isolation=confirm_request_isolation,
+                confirm_safe_test_target=confirm_test_environment,
+                show_guidance=False,
             )
             generated_environment_path = selected_environment_config
         assert selected_environment_config is not None
@@ -336,10 +361,17 @@ def initialize_project(
     _close_descriptor(project_directory_descriptor)
     console.print(f"Configured UL project: {project_config_path}")
     if environment_url is not None:
-        console.print(
-            "Before running: implement the reset, execute-turn, and snapshot contract "
-            "generated in .ul/environment.json."
-        )
+        if adapter_tier == "isolated-response":
+            console.print(
+                "Before running: implement the one-request /execute contract generated in "
+                ".ul/environment.json. This tier records response evidence only; it cannot verify "
+                "committed state, conversations, or state-dependent stress tests."
+            )
+        else:
+            console.print(
+                "Before running: implement the reset, execute-turn, and snapshot contract "
+                "generated in .ul/environment.json."
+            )
         console.print("Then verify it with 'ul environment check .ul/environment.json --help'.")
     console.print("Next: set semantic-provider credentials and UL_LIVE=true, then run 'ul run'.")
 

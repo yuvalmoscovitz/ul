@@ -43,7 +43,7 @@ from ul.dataset_invariants import (
     evaluate_dataset_invariants,
 )
 from ul.dataset_regression import dataset_regression_target_config_sha256
-from ul.http_environment import JsonHttpEnvironmentConfig
+from ul.http_environment import JsonHttpTargetConfig
 
 from ul_cli.report_contract import (
     FindingCategory,
@@ -185,7 +185,7 @@ class DatasetEvidenceRedactionCoverage(_StrictModel):
 
 class DatasetEvidenceTarget(_StrictModel):
     kind: Literal["environment_http"]
-    config: JsonHttpEnvironmentConfig
+    config: JsonHttpTargetConfig
     sha256: str = Field(pattern=_SHA256_PATTERN)
 
     @model_validator(mode="after")
@@ -296,7 +296,7 @@ def create_dataset_evidence_run_context(
     operators: tuple[tuple[str, str], ...],
     repetitions: int,
     invariant_suite_sha256: str | None,
-    target_config: JsonHttpEnvironmentConfig | None = None,
+    target_config: JsonHttpTargetConfig | None = None,
     semantic_settings: DatasetEvidenceSemanticSettings,
     redaction_policy_sha256: str | None = None,
     redaction_coverage: tuple[DatasetEvidenceRedactionCoverage, ...] = (),

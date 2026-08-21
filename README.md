@@ -51,10 +51,27 @@ ul init interactions.jsonl \
   --confirm-test-environment
 ```
 
-The generated `.ul/environment.json` defines the adapter contract. Your environment must implement
-its reset, execute-turn, and snapshot requests. Reset asks separately for a fresh agent session and
-a clean external environment; both are required by default. If you already have a custom mapping, use
-`--environment-config environment.json` instead of `--environment-url`.
+The generated `.ul/environment.json` uses UL's full `stateful-lifecycle` adapter. Your environment
+implements reset, execute-turn, and snapshot requests. Reset asks separately for a fresh agent
+session and a clean external environment; both are required by default. If you already have a custom
+mapping, use `--environment-config environment.json` instead of `--environment-url`.
+
+To start with one HTTP endpoint and response checks only:
+
+```bash
+ul init interactions.jsonl \
+  --environment-url https://your-environment.example \
+  --adapter-tier isolated-response \
+  --allow-environment-network \
+  --confirm-test-environment \
+  --confirm-request-isolation
+```
+
+This creates an `isolated-response` adapter that calls `/execute` once per case. The confirmation is
+an explicit attestation that every request starts fresh, is isolated from every other request, and
+is safe for testing. UL records response evidence only at this tier. It rejects committed-state
+invariants, conversations, timeout-after-commit checks, and other state-dependent stress tests. Move
+to `stateful-lifecycle` when UL must inspect side effects or behavior across turns.
 
 Verify the adapter before spending money on model calls:
 
@@ -127,7 +144,7 @@ recorded interaction
   → confirmed regression case
 ```
 
-Every repetition uses this lifecycle:
+With the default `stateful-lifecycle` tier, every repetition uses this lifecycle:
 
 ```text
 reset → optional setup → initial snapshot → execute turn → snapshot → cleanup reset

@@ -25,7 +25,7 @@ from ul.environment import (
     validate_execution_evidence,
 )
 from ul.http_environment import (
-    JsonHttpEnvironmentConfig,
+    JsonHttpTargetConfig,
     json_http_environment_calls_per_conversation,
 )
 from ul.otlp_ingest import OtlpInteractionRecord
@@ -255,7 +255,7 @@ def select_trace_replay_case(
 
 def plan_trace_replay(
     case: TraceReplayCase,
-    target_config: JsonHttpEnvironmentConfig,
+    target_config: JsonHttpTargetConfig,
     *,
     repetitions: int = 3,
     max_target_calls: int = 100,
