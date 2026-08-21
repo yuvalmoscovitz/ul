@@ -127,12 +127,13 @@ With an explicit evidence path, `ul report` auto-detects dataset evaluation, cor
 retry-after-successful-commit, and timeout-after-commit evidence. Its default human summary and
 versioned JSON omit inputs, responses, state, customer descriptions, and arbitrary evidence text.
 Use `ul dataset report EVIDENCE.jsonl` when you need the detailed private dataset review surface.
+Trace replay bundles are not supported by `ul report`.
 
 Reviews are appended to a separate audit file. Evidence is never rewritten. Exit codes are:
 
-- `0`: no review finding or declared-rule violation.
-- `1`: a difference needs review or a declared rule was violated.
-- `2`: the evaluation was incomplete or not evaluable.
+- `0`: no actionable finding remains; `expected` and `unsupported` reviews resolve a finding.
+- `1`: a finding needs review, is confirmed, or an unreviewed declared rule was violated.
+- `2`: the evaluation or a finding review is inconclusive and no actionable finding remains.
 
 Exit `1` is not a general correctness verdict.
 

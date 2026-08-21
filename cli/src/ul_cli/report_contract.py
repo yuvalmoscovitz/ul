@@ -28,24 +28,29 @@ FindingReviewStatus = Literal[
     "unsupported",
     "inconclusive",
 ]
+FindingNextAction = Literal[
+    "review_dataset_finding",
+    "inspect_dataset_evidence",
+    "inspect_stateful_evidence",
+]
 FindingSummaryText = Literal[
-    "The variation repeated an observed action effect.",
-    "The variation produced an unexpected action effect.",
-    "The variation omitted an expected action effect.",
-    "The variation changed a grounded action argument.",
-    "The variation produced unstable behavior across repetitions.",
-    "A customer invariant was violated.",
+    "The changed input made the agent repeat an action.",
+    "The changed input made the agent take a new action.",
+    "The changed input made the agent skip a baseline action.",
+    "The changed input altered an important action detail.",
+    "The changed input produced inconsistent behavior across repetitions.",
+    "The agent violated a customer-defined rule.",
 ]
 
 _IDENTIFIER_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$"
 _VERSION_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9._+-]{0,49}$"
 _FINDING_ID_PATTERN = r"^ulf_v1_[0-9a-f]{64}$"
 _BEHAVIOR_SUMMARIES: dict[str, str] = {
-    "duplicate_effect": "The variation repeated an observed action effect.",
-    "unexpected_effect": "The variation produced an unexpected action effect.",
-    "missing_effect": "The variation omitted an expected action effect.",
-    "changed_grounded_effect_argument": "The variation changed a grounded action argument.",
-    "unstable_behavior": "The variation produced unstable behavior across repetitions.",
+    "duplicate_effect": "The changed input made the agent repeat an action.",
+    "unexpected_effect": "The changed input made the agent take a new action.",
+    "missing_effect": "The changed input made the agent skip a baseline action.",
+    "changed_grounded_effect_argument": "The changed input altered an important action detail.",
+    "unstable_behavior": "The changed input produced inconsistent behavior across repetitions.",
 }
 
 
@@ -68,6 +73,12 @@ class FindingSummary(_StrictModel):
     declared_severity: FindingSeverity | None = None
     review_status: FindingReviewStatus | None = None
     review_severity: FindingSeverity | None = None
+    requested_repetitions: int = Field(ge=1)
+    conclusive_repetitions: int = Field(ge=0)
+    inconclusive_repetitions: int = Field(ge=0)
+    stability: Literal["stable", "unstable", "inconclusive"] | None = None
+    violated_repetitions: int | None = Field(default=None, ge=0)
+    next_action: FindingNextAction
     summary: FindingSummaryText
 
     @model_validator(mode="after")
@@ -80,6 +91,16 @@ class FindingSummary(_StrictModel):
             raise ValueError("review status and severity must be present together")
         if self.review_status not in {None, "confirmed"} and self.review_severity != "unrated":
             raise ValueError("only confirmed findings can have a rated review severity")
+        if (
+            self.conclusive_repetitions + self.inconclusive_repetitions
+            != self.requested_repetitions
+        ):
+            raise ValueError("finding repetition counts must match requested repetitions")
+        if (
+            self.violated_repetitions is not None
+            and self.violated_repetitions > self.conclusive_repetitions
+        ):
+            raise ValueError("violated repetitions cannot exceed conclusive repetitions")
         if self.kind == "behavior_difference":
             expected_summary = _BEHAVIOR_SUMMARIES.get(self.category)
             if (
@@ -93,19 +114,49 @@ class FindingSummary(_StrictModel):
             self.category != "customer_invariant_violation"
             or self.rule_id is None
             or self.declared_severity is None
-            or self.summary != "A customer invariant was violated."
+            or self.summary != "The agent violated a customer-defined rule."
         ):
             raise ValueError("invariant finding fields are inconsistent")
         return self
 
 
+class ReviewStatusCounts(_StrictModel):
+    needs_review: int = Field(ge=0)
+    confirmed: int = Field(ge=0)
+    expected: int = Field(ge=0)
+    unsupported: int = Field(ge=0)
+    inconclusive: int = Field(ge=0)
+
+
+class ReportSummary(_StrictModel):
+    finding_count: int = Field(ge=0)
+    actionable_finding_count: int = Field(ge=0)
+    review_status_counts: ReviewStatusCounts
+
+
+def build_report_summary(findings: tuple[FindingSummary, ...]) -> ReportSummary:
+    return ReportSummary(
+        finding_count=len(findings),
+        actionable_finding_count=sum(
+            finding.review_status in {None, "needs_review", "confirmed"} for finding in findings
+        ),
+        review_status_counts=ReviewStatusCounts(
+            needs_review=sum(finding.review_status == "needs_review" for finding in findings),
+            confirmed=sum(finding.review_status == "confirmed" for finding in findings),
+            expected=sum(finding.review_status == "expected" for finding in findings),
+            unsupported=sum(finding.review_status == "unsupported" for finding in findings),
+            inconclusive=sum(finding.review_status == "inconclusive" for finding in findings),
+        ),
+    )
+
+
 class UnifiedReport(_StrictModel):
-    schema_version: Literal["1.0.0"] = "1.0.0"
+    schema_version: Literal["1.1.0"] = "1.1.0"
     evidence_type: ReportEvidenceType
     evidence_schema_versions: tuple[str, ...] = Field(min_length=1)
     status: ReportStatus
     exit_code: Literal[0, 1, 2]
-    finding_count: int = Field(ge=0)
+    summary: ReportSummary
     findings: tuple[FindingSummary, ...] = ()
 
     @model_validator(mode="after")
@@ -115,10 +166,30 @@ class UnifiedReport(_StrictModel):
         expected_exit_code = {"passed": 0, "failed": 1, "inconclusive": 2}[self.status]
         if self.exit_code != expected_exit_code:
             raise ValueError("exit code must match report status")
-        if self.finding_count != len(self.findings):
+        if self.summary.finding_count != len(self.findings):
             raise ValueError("finding count must match report findings")
-        if self.status == "passed" and self.findings:
-            raise ValueError("passed reports cannot contain findings")
-        if self.status == "failed" and not self.findings:
-            raise ValueError("failed reports require at least one finding")
+        expected_review_counts = {
+            status: sum(finding.review_status == status for finding in self.findings)
+            for status in (
+                "needs_review",
+                "confirmed",
+                "expected",
+                "unsupported",
+                "inconclusive",
+            )
+        }
+        if self.summary.review_status_counts.model_dump() != expected_review_counts:
+            raise ValueError("review status counts must match report findings")
+        expected_actionable_count = sum(
+            finding.review_status in {None, "needs_review", "confirmed"}
+            for finding in self.findings
+        )
+        if self.summary.actionable_finding_count != expected_actionable_count:
+            raise ValueError("actionable finding count must match report findings")
+        if self.status == "passed" and (
+            self.summary.actionable_finding_count or self.summary.review_status_counts.inconclusive
+        ):
+            raise ValueError("passed reports cannot contain unresolved findings")
+        if self.status == "failed" and not self.summary.actionable_finding_count:
+            raise ValueError("failed reports require an actionable finding")
         return self

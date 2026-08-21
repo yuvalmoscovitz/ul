@@ -72,7 +72,7 @@ def test_runnable_timeout_after_commit_variants(
     report_payload = json.loads(report.output)
     assert report_payload["evidence_type"] == "timeout_after_commit"
     assert report_payload["status"] == expected_status
-    assert report_payload["finding_count"] == (1 if expected_exit == 1 else 0)
+    assert report_payload["summary"]["finding_count"] == (1 if expected_exit == 1 else 0)
     assert "Payment workflow completed" not in report.output
 
 

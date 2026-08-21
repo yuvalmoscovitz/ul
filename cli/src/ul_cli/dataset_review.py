@@ -54,6 +54,7 @@ from ul_cli.report_contract import (
     ReportInputError,
     ReportStatus,
     UnifiedReport,
+    build_report_summary,
 )
 
 if sys.platform == "win32":
@@ -548,11 +549,11 @@ def load_confirmed_dataset_finding(
 
 
 _BEHAVIOR_FINDING_SUMMARIES: dict[str, FindingSummaryText] = {
-    "duplicate_effect": "The variation repeated an observed action effect.",
-    "unexpected_effect": "The variation produced an unexpected action effect.",
-    "missing_effect": "The variation omitted an expected action effect.",
-    "changed_grounded_effect_argument": "The variation changed a grounded action argument.",
-    "unstable_behavior": "The variation produced unstable behavior across repetitions.",
+    "duplicate_effect": "The changed input made the agent repeat an action.",
+    "unexpected_effect": "The changed input made the agent take a new action.",
+    "missing_effect": "The changed input made the agent skip a baseline action.",
+    "changed_grounded_effect_argument": "The changed input altered an important action detail.",
+    "unstable_behavior": "The changed input produced inconsistent behavior across repetitions.",
 }
 
 
@@ -588,6 +589,14 @@ def _summarize_dataset_evidence(
         review_severity: FindingSeverity = (
             active_review.severity if active_review is not None else "unrated"
         )
+        observations = indexed_finding.case.observations
+        if observations is None:
+            raise AssertionError("indexed findings require variation observations")
+        next_action = (
+            "review_dataset_finding"
+            if review_status == "needs_review"
+            else "inspect_dataset_evidence"
+        )
         if indexed_finding.semantic_finding is not None:
             category = indexed_finding.semantic_finding.category
             summary = _BEHAVIOR_FINDING_SUMMARIES.get(category)
@@ -602,6 +611,11 @@ def _summarize_dataset_evidence(
                     operator_version=indexed_finding.case.operator_version,
                     review_status=review_status,
                     review_severity=review_severity,
+                    requested_repetitions=observations.requested_repetitions,
+                    conclusive_repetitions=observations.observed_repetitions,
+                    inconclusive_repetitions=observations.inconclusive_repetitions,
+                    stability=observations.stability,
+                    next_action=next_action,
                     summary=summary,
                 )
             )
@@ -630,7 +644,15 @@ def _summarize_dataset_evidence(
                 declared_severity=variation_rule.severity,
                 review_status=review_status,
                 review_severity=review_severity,
-                summary="A customer invariant was violated.",
+                requested_repetitions=observations.requested_repetitions,
+                conclusive_repetitions=observations.observed_repetitions,
+                inconclusive_repetitions=observations.inconclusive_repetitions,
+                stability=observations.stability,
+                violated_repetitions=sum(
+                    trial.status == "violated" for trial in variation_rule.trials
+                ),
+                next_action=next_action,
+                summary="The agent violated a customer-defined rule.",
             )
         )
 
@@ -647,7 +669,14 @@ def _summarize_dataset_evidence(
                         category="unstable_behavior",
                         operator_id=case.operator_id,
                         operator_version=case.operator_version,
-                        summary=("The variation produced unstable behavior across repetitions."),
+                        requested_repetitions=case.observations.requested_repetitions,
+                        conclusive_repetitions=case.observations.observed_repetitions,
+                        inconclusive_repetitions=case.observations.inconclusive_repetitions,
+                        stability=case.observations.stability,
+                        next_action="inspect_dataset_evidence",
+                        summary=(
+                            "The changed input produced inconsistent behavior across repetitions."
+                        ),
                     )
                 )
 
@@ -680,6 +709,13 @@ def _summarize_dataset_evidence(
                     in indexed_invariant_keys
                 ):
                     continue
+                observations = (
+                    loaded_record.evidence.current_baseline.observations
+                    if operator_id is None
+                    else cases_by_operator[operator_id].observations
+                )
+                if observations is None:
+                    raise AssertionError("violated invariant rules require observations")
                 finding_summaries.append(
                     FindingSummary(
                         kind="customer_invariant_violation",
@@ -689,18 +725,28 @@ def _summarize_dataset_evidence(
                         rule_id=rule.rule_id,
                         rule_version=rule.rule_version,
                         declared_severity=rule.severity,
-                        summary="A customer invariant was violated.",
+                        requested_repetitions=observations.requested_repetitions,
+                        conclusive_repetitions=observations.observed_repetitions,
+                        inconclusive_repetitions=observations.inconclusive_repetitions,
+                        stability=observations.stability,
+                        violated_repetitions=sum(
+                            trial.status == "violated" for trial in rule.trials
+                        ),
+                        next_action="inspect_dataset_evidence",
+                        summary="The agent violated a customer-defined rule.",
                     )
                 )
 
-    if "violated" in invariant_statuses:
+    findings = tuple(finding_summaries)
+    summary = build_report_summary(findings)
+    if summary.actionable_finding_count:
         status: ReportStatus = "failed"
-    elif "not_evaluable" in invariant_statuses or _dataset_evidence_is_inconclusive(
-        evidence_records
+    elif (
+        summary.review_status_counts.inconclusive
+        or "not_evaluable" in invariant_statuses
+        or _dataset_evidence_is_inconclusive(evidence_records)
     ):
         status = "inconclusive"
-    elif finding_summaries:
-        status = "failed"
     else:
         status = "passed"
     exit_code = cast(Literal[0, 1, 2], {"passed": 0, "failed": 1, "inconclusive": 2}[status])
@@ -711,8 +757,8 @@ def _summarize_dataset_evidence(
         ),
         status=status,
         exit_code=exit_code,
-        finding_count=len(finding_summaries),
-        findings=tuple(finding_summaries),
+        summary=summary,
+        findings=findings,
     )
 
 

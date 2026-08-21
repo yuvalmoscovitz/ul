@@ -74,7 +74,7 @@ def test_documented_one_command_finds_repeatable_duplicate_without_model_calls(
     report_payload = json.loads(report.output)
     assert report_payload["evidence_type"] == "retry_after_successful_commit"
     assert report_payload["status"] == "failed"
-    assert report_payload["finding_count"] == 2
+    assert report_payload["summary"]["finding_count"] == 2
     assert "AC-100" not in report.output
 
 

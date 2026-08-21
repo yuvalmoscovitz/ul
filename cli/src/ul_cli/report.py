@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import shlex
 import stat
 from pathlib import Path
 from typing import Literal, Never, cast
@@ -27,11 +28,14 @@ from ul_cli.report_contract import (
     ReportInputError,
     ReportStatus,
     UnifiedReport,
+    build_report_summary,
 )
 
 type StatefulStressResult = (
     CorrectionStressResult | RetryAfterSuccessfulCommitStressResult | TimeoutAfterCommitStressResult
 )
+
+_WINDOWS = os.name == "nt"
 
 _MAXIMUM_EVIDENCE_BYTES = 128_000_000
 _MAXIMUM_JSON_DEPTH = 100
@@ -83,7 +87,7 @@ def report_evidence(
             )
         )
     else:
-        _print_human_report(report)
+        _print_human_report(report, evidence)
 
     if report.exit_code:
         raise typer.Exit(code=report.exit_code)
@@ -131,6 +135,7 @@ def _summarize_stateful_stress_result(result: StatefulStressResult) -> UnifiedRe
             else ()
         )
 
+    conclusive_repetitions = sum(trial.inconclusive_reason is None for trial in result.trials)
     findings = tuple(
         FindingSummary(
             kind="customer_invariant_violation",
@@ -140,7 +145,12 @@ def _summarize_stateful_stress_result(result: StatefulStressResult) -> UnifiedRe
             rule_id=rule.rule_id,
             rule_version=rule.rule_version,
             declared_severity=rule.severity,
-            summary="A customer invariant was violated.",
+            requested_repetitions=result.requested_repetitions,
+            conclusive_repetitions=conclusive_repetitions,
+            inconclusive_repetitions=result.requested_repetitions - conclusive_repetitions,
+            violated_repetitions=sum(trial.status == "violated" for trial in rule.trials),
+            next_action="inspect_stateful_evidence",
+            summary="The agent violated a customer-defined rule.",
         )
         for rule in violating_rules
     )
@@ -151,7 +161,7 @@ def _summarize_stateful_stress_result(result: StatefulStressResult) -> UnifiedRe
         evidence_schema_versions=(result.schema_version,),
         status=status,
         exit_code=exit_code,
-        finding_count=len(findings),
+        summary=build_report_summary(findings),
         findings=findings,
     )
 
@@ -189,11 +199,27 @@ def _load_stateful_stress_result(path: Path) -> StatefulStressResult:
     raise ReportInputError("unsupported evidence; expected dataset, correction, retry, or timeout")
 
 
-def _print_human_report(report: UnifiedReport) -> None:
-    typer.echo("UL finding report")
+def _print_human_report(report: UnifiedReport, evidence: Path) -> None:
+    typer.echo("UL run report")
     typer.echo(f"Evidence type: {_EVIDENCE_LABELS[report.evidence_type]}")
     typer.echo(f"Status: {report.status} (exit {report.exit_code})")
-    typer.echo(f"Findings: {report.finding_count}")
+    typer.echo(
+        f"Findings: {report.summary.finding_count} total; "
+        f"{report.summary.actionable_finding_count} actionable"
+    )
+    review_counts = report.summary.review_status_counts
+    if any(review_counts.model_dump().values()):
+        typer.echo(
+            "Reviews: "
+            f"needs_review={review_counts.needs_review}, confirmed={review_counts.confirmed}, "
+            f"expected={review_counts.expected}, unsupported={review_counts.unsupported}, "
+            f"inconclusive={review_counts.inconclusive}"
+        )
+    safe_evidence = "".join(
+        character if character.isprintable() else f"\\u{ord(character):04x}"
+        for character in str(evidence)
+    )
+    quoted_evidence = None if _WINDOWS else shlex.quote(safe_evidence)
     for index, finding in enumerate(report.findings, start=1):
         typer.echo("")
         typer.echo(f"Finding {finding.finding_id or index}")
@@ -206,11 +232,38 @@ def _print_human_report(report: UnifiedReport) -> None:
             typer.echo(f"  Declared severity: {finding.declared_severity}")
         if finding.review_status is not None:
             typer.echo(f"  Review: {finding.review_status}; severity={finding.review_severity}")
+        typer.echo(
+            "  Repetitions: "
+            f"{finding.conclusive_repetitions}/{finding.requested_repetitions} conclusive; "
+            f"{finding.inconclusive_repetitions} inconclusive"
+        )
+        if finding.stability is not None:
+            typer.echo(f"  Stability: {finding.stability}")
+        if finding.violated_repetitions is not None:
+            typer.echo(f"  Violated repetitions: {finding.violated_repetitions}")
+        if finding.next_action == "review_dataset_finding":
+            evidence_argument = quoted_evidence or "EVIDENCE"
+            typer.echo(
+                "  Next: "
+                f"ul dataset review {evidence_argument} {finding.finding_id} "
+                "--status STATUS --reviewer REVIEWER --reason REASON"
+            )
+        elif finding.next_action == "inspect_dataset_evidence":
+            typer.echo(f"  Next: ul dataset report {quoted_evidence or 'EVIDENCE'}")
+        else:
+            typer.echo(
+                "  Next: inspect the supplied evidence JSON; "
+                "no dedicated stateful detail command is available."
+            )
     typer.echo("")
     typer.echo("Sensitive inputs, outputs, state, and arbitrary evidence text are omitted.")
     if report.evidence_type == "dataset_evaluation":
-        typer.echo("Use 'ul dataset report EVIDENCE' for the detailed private review surface.")
-    typer.echo("Complete technical evidence remains unchanged in the supplied evidence file.")
+        typer.echo(f"Drill-down: ul dataset report {quoted_evidence or 'EVIDENCE'}")
+    else:
+        typer.echo(
+            "Drill-down: inspect the supplied evidence JSON; "
+            "no dedicated stateful detail command is available."
+        )
 
 
 def _read_bounded_regular_file(path: Path) -> bytes:

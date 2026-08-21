@@ -30,6 +30,7 @@ from ul import (
 from ul.dataset_augmentation import DatasetAugmentationCandidate
 from ul.dataset_invariants import DatasetInvariantSuite, JsonValuesEqualInvariant
 from ul_cli import dataset_review
+from ul_cli import report as report_module
 from ul_cli.main import app
 
 runner = CliRunner()
@@ -376,12 +377,22 @@ def test_root_json_report_is_stable_and_omits_private_dataset_fields(tmp_path: P
 
     assert report.exit_code == 1, report.output
     expected = {
-        "schema_version": "1.0.0",
+        "schema_version": "1.1.0",
         "evidence_type": "dataset_evaluation",
         "evidence_schema_versions": ["1.3.0"],
         "status": "failed",
         "exit_code": 1,
-        "finding_count": 1,
+        "summary": {
+            "finding_count": 1,
+            "actionable_finding_count": 1,
+            "review_status_counts": {
+                "needs_review": 1,
+                "confirmed": 0,
+                "expected": 0,
+                "unsupported": 0,
+                "inconclusive": 0,
+            },
+        },
         "findings": [
             {
                 "finding_id": FINDING_ID,
@@ -394,7 +405,13 @@ def test_root_json_report_is_stable_and_omits_private_dataset_fields(tmp_path: P
                 "declared_severity": None,
                 "review_status": "needs_review",
                 "review_severity": "unrated",
-                "summary": "The variation changed a grounded action argument.",
+                "requested_repetitions": 3,
+                "conclusive_repetitions": 3,
+                "inconclusive_repetitions": 0,
+                "stability": "stable",
+                "violated_repetitions": None,
+                "next_action": "review_dataset_finding",
+                "summary": "The changed input altered an important action detail.",
             }
         ],
     }
@@ -406,6 +423,21 @@ def test_root_json_report_is_stable_and_omits_private_dataset_fields(tmp_path: P
     assert "Pay pay AC-100" not in report.output
     assert "AC-101" not in report.output
     assert "technical_details" not in report.output
+
+
+def test_root_report_uses_a_placeholder_in_windows_commands(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    evidence = tmp_path / "evidence & injected.jsonl"
+    _write_evidence(evidence)
+    monkeypatch.setattr(report_module, "_WINDOWS", True)
+
+    report = runner.invoke(app, ["report", str(evidence)])
+
+    assert report.exit_code == 1, report.output
+    assert f"ul dataset review EVIDENCE {FINDING_ID}" in report.output
+    assert "ul dataset report EVIDENCE" in report.output
+    assert f"ul dataset review {evidence}" not in report.output
 
 
 def test_root_report_treats_unstable_variation_as_exit_one_finding(tmp_path: Path) -> None:
@@ -436,10 +468,10 @@ def test_root_report_treats_unstable_variation_as_exit_one_finding(tmp_path: Pat
     assert report.exit_code == 1, report.output
     payload = json.loads(report.output)
     assert payload["status"] == "failed"
-    assert payload["finding_count"] == 1
+    assert payload["summary"]["finding_count"] == 1
     assert payload["findings"][0]["category"] == "unstable_behavior"
     assert payload["findings"][0]["summary"] == (
-        "The variation produced unstable behavior across repetitions."
+        "The changed input produced inconsistent behavior across repetitions."
     )
 
 
@@ -903,16 +935,21 @@ def test_sensitive_value_printer_does_not_wrap_beyond_counted_line(
 
 
 @pytest.mark.parametrize(
-    ("status_value", "severity"),
+    ("status_value", "severity", "expected_exit", "expected_status", "actionable_count"),
     [
-        ("confirmed", "critical"),
-        ("expected", None),
-        ("unsupported", None),
-        ("inconclusive", None),
+        ("confirmed", "critical", 1, "failed", 1),
+        ("expected", None, 0, "passed", 0),
+        ("unsupported", None, 0, "passed", 0),
+        ("inconclusive", None, 2, "inconclusive", 0),
     ],
 )
 def test_all_review_statuses_are_recorded(
-    tmp_path: Path, status_value: str, severity: str | None
+    tmp_path: Path,
+    status_value: str,
+    severity: str | None,
+    expected_exit: int,
+    expected_status: str,
+    actionable_count: int,
 ) -> None:
     evidence = tmp_path / "results.jsonl"
     _write_evidence(evidence)
@@ -926,6 +963,13 @@ def test_all_review_statuses_are_recorded(
     record = _read_reviews(tmp_path / "results.reviews.jsonl")[0]
     assert record["status"] == status_value
     assert record["severity"] == (severity or "unrated")
+
+    report = runner.invoke(app, ["report", str(evidence), "--json"])
+    assert report.exit_code == expected_exit, report.output
+    payload = json.loads(report.output)
+    assert payload["status"] == expected_status
+    assert payload["summary"]["actionable_finding_count"] == actionable_count
+    assert payload["summary"]["review_status_counts"][status_value] == 1
 
 
 @pytest.mark.parametrize("status_value", ["expected", "unsupported", "inconclusive"])
