@@ -552,6 +552,67 @@ def test_init_creates_private_strict_starter_config(tmp_path: Path) -> None:
     assert "--dry-run" in result.output
 
 
+def test_init_translates_custom_isolated_json_contract(tmp_path: Path) -> None:
+    target_config = tmp_path / "target.json"
+
+    result = runner.invoke(
+        root_app,
+        [
+            "dataset",
+            "init",
+            str(target_config),
+            "--url",
+            "https://agent.example.test/chat",
+            "--adapter-tier",
+            "isolated-response",
+            "--confirm-request-isolation",
+            "--confirm-safe-test-target",
+            "--request-json-template",
+            '{"query":"{{input}}","options":{"mode":"safe"}}',
+            "--response-json-pointer",
+            "/result/answer",
+            "--header-from-env",
+            "X-Agent-Key=UL_ENVIRONMENT_AGENT_KEY",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    config = json.loads(target_config.read_text(encoding="utf-8"))
+    assert config["environment_id"] == "isolated-response:agent.example.test"
+    assert config["headers_from_env"] == {"X-Agent-Key": "UL_ENVIRONMENT_AGENT_KEY"}
+    assert config["execute"] == {
+        "url": "https://agent.example.test/chat",
+        "request_json_template": {"query": "{{input}}", "options": {"mode": "safe"}},
+        "response_json_pointer": "/result/answer",
+    }
+    assert "no UL-specific endpoint" in result.output
+
+
+def test_init_rejects_invalid_isolated_mapping_before_creating_file(tmp_path: Path) -> None:
+    target_config = tmp_path / "target.json"
+
+    result = runner.invoke(
+        root_app,
+        [
+            "dataset",
+            "init",
+            str(target_config),
+            "--url",
+            "https://agent.example.test/chat",
+            "--adapter-tier",
+            "isolated-response",
+            "--confirm-request-isolation",
+            "--confirm-safe-test-target",
+            "--request-json-template",
+            '{"query":"missing placeholder"}',
+        ],
+    )
+
+    assert result.exit_code != 0
+    assert "exactly one {{input}}" in result.output
+    assert not target_config.exists()
+
+
 def test_init_refuses_invalid_url_and_existing_file(tmp_path: Path) -> None:
     invalid_config = tmp_path / "invalid.json"
     invalid_url = runner.invoke(

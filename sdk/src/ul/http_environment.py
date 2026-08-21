@@ -65,6 +65,16 @@ _UNSAFE_HEADER_NAMES = {
     "trailer",
     "transfer-encoding",
     "upgrade",
+    "forwarded",
+    "x-forwarded-for",
+    "x-forwarded-host",
+    "x-forwarded-port",
+    "x-forwarded-proto",
+    "x-http-method",
+    "x-http-method-override",
+    "x-method-override",
+    "x-original-url",
+    "x-rewrite-url",
 }
 
 
@@ -256,7 +266,7 @@ class JsonHttpIsolatedExecuteConfig(BaseModel):
     @field_validator("request_json_template", mode="before")
     @classmethod
     def validate_request_json_template(cls, template: object) -> JsonValue:
-        return _validated_execute_request_json_template(template)
+        return _validated_isolated_execute_request_json_template(template)
 
     @field_validator("response_json_pointer")
     @classmethod
@@ -1250,6 +1260,8 @@ class JsonHttpEnvironmentConnection:
             self._reserve_environment_api_calls(1)
         try:
             async with asyncio.timeout(self._timeout_seconds):
+                if isinstance(self._config, JsonHttpIsolatedResponseConfig):
+                    self._client.cookies.clear()
                 async with self._client.stream(
                     "POST",
                     endpoint,
@@ -1345,6 +1357,11 @@ class JsonHttpEnvironmentConnection:
             raise _EnvironmentProtocolError(
                 "null_json",
                 "environment API returned null JSON",
+            )
+        if _json_contains_any_string(raw_output, tuple(self._headers.values())):
+            raise _EnvironmentProtocolError(
+                "response_contains_credential",
+                "environment API response contains a configured credential",
             )
         return _resolve_json_pointer(raw_output, response_json_pointer)
 
@@ -1539,6 +1556,16 @@ def _http_status_failure_code(status_code: int) -> EnvironmentLifecycleFailureCo
     return "http_status"
 
 
+def _json_contains_any_string(value: JsonValue, secrets: tuple[str, ...]) -> bool:
+    if isinstance(value, str):
+        return any(secret in value for secret in secrets)
+    if isinstance(value, list):
+        return any(_json_contains_any_string(item, secrets) for item in value)
+    if isinstance(value, dict):
+        return any(_json_contains_any_string(item, secrets) for item in value.values())
+    return False
+
+
 def _reject_nonstandard_json_constant(value: str) -> Never:
     raise ValueError("nonstandard JSON constant")
 
@@ -1613,6 +1640,12 @@ def _validated_template(template: object, *, name: str) -> tuple[JsonValue, dict
         if depth > _MAXIMUM_JSON_DEPTH:
             raise ValueError(f"{name} exceeds the nesting limit")
         if value is None or isinstance(value, bool | int | str):
+            if (
+                isinstance(value, str)
+                and ("{{" in value or "}}" in value)
+                and value not in {_INPUT_PLACEHOLDER, _CASE_ID_PLACEHOLDER, _TURN_ID_PLACEHOLDER}
+            ):
+                raise ValueError(f"{name} contains an unknown or embedded placeholder")
             placeholder_count = int(
                 value in {_INPUT_PLACEHOLDER, _CASE_ID_PLACEHOLDER}
                 if isinstance(value, str)
@@ -1664,6 +1697,20 @@ def _validated_execute_request_json_template(template: object) -> JsonValue:
         raise ValueError(
             "execute request_json_template must contain exactly one {{input}} and "
             "one {{case_id}} and {{turn_id}} leaf"
+        )
+    return validated
+
+
+def _validated_isolated_execute_request_json_template(template: object) -> JsonValue:
+    validated, counts = _validated_template(template, name="request_json_template")
+    if (
+        counts[_INPUT_PLACEHOLDER] != 1
+        or counts[_CASE_ID_PLACEHOLDER] > 1
+        or counts[_TURN_ID_PLACEHOLDER] > 1
+    ):
+        raise ValueError(
+            "isolated execute request_json_template must contain exactly one {{input}} leaf "
+            "and at most one {{case_id}} and {{turn_id}} leaf"
         )
     return validated
 

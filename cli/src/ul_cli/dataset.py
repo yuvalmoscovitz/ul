@@ -9,6 +9,7 @@ import sys
 import unicodedata
 from pathlib import Path
 from typing import Annotated, Literal, TextIO, cast
+from urllib.parse import urlsplit
 
 import httpx
 import typer
@@ -118,6 +119,13 @@ _BEHAVIORAL_LIMITATIONS = (
     "variation is correct, prove that the variation caused a difference, or estimate a "
     "production failure rate."
 )
+_ISOLATED_ADAPTER_PRESETS: dict[str, tuple[JsonValue, str]] = {
+    "generic-json": ({"input": "{{input}}"}, "/response"),
+    "openai-chat": (
+        {"messages": [{"role": "user", "content": "{{input}}"}]},
+        "/choices/0/message/content",
+    ),
+}
 
 
 class _DatasetInputError(ValueError):
@@ -135,7 +143,9 @@ def initialize_dataset_environment(
     ],
     url: Annotated[
         str,
-        typer.Option(help="Base URL of the customer's agent environment API."),
+        typer.Option(
+            help=("Stateful API base URL, or the exact POST URL for an isolated-response target.")
+        ),
     ],
     adapter_tier: Annotated[
         Literal["stateful-lifecycle", "isolated-response"],
@@ -158,6 +168,35 @@ def initialize_dataset_environment(
             help="Attest this target is safe for test requests and cannot cause real effects."
         ),
     ] = False,
+    isolated_preset: Annotated[
+        Literal["generic-json", "openai-chat"],
+        typer.Option(help="Known request/response shape for an existing isolated JSON endpoint."),
+    ] = "generic-json",
+    environment_id: Annotated[
+        str | None,
+        typer.Option(help="Stable evidence name; isolated mode defaults to the endpoint host."),
+    ] = None,
+    request_json_template: Annotated[
+        str | None,
+        typer.Option(
+            help="JSON object or array with one complete {{input}} value; overrides the preset."
+        ),
+    ] = None,
+    response_json_pointer: Annotated[
+        str | None,
+        typer.Option(help="RFC 6901 pointer to the agent response; overrides the preset."),
+    ] = None,
+    agent_model: Annotated[
+        str | None,
+        typer.Option(help="Agent model sent by the openai-chat preset."),
+    ] = None,
+    header_from_env: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--header-from-env",
+            help="HTTP_HEADER=UL_ENVIRONMENT_VARIABLE; repeat for credentials or routing.",
+        ),
+    ] = None,
     show_guidance: Annotated[bool, typer.Option(hidden=True)] = True,
 ) -> None:
     """Create a private connection config for a customer-managed agent environment API."""
@@ -171,25 +210,63 @@ def initialize_dataset_environment(
             "isolated-response setup requires --confirm-safe-test-target",
             param_hint="--confirm-safe-test-target",
         )
+    isolated_options_used = (
+        isolated_preset != "generic-json"
+        or environment_id is not None
+        or request_json_template is not None
+        or response_json_pointer is not None
+        or agent_model is not None
+        or bool(header_from_env)
+    )
+    if adapter_tier != "isolated-response" and isolated_options_used:
+        raise typer.BadParameter(
+            "isolated adapter mapping options require --adapter-tier isolated-response",
+            param_hint="--adapter-tier",
+        )
+    if (
+        adapter_tier == "isolated-response"
+        and isolated_preset == "openai-chat"
+        and request_json_template is None
+        and (agent_model is None or not agent_model.strip())
+    ):
+        raise typer.BadParameter(
+            "openai-chat preset requires --agent-model unless --request-json-template is set",
+            param_hint="--agent-model",
+        )
+    if agent_model is not None and (
+        isolated_preset != "openai-chat" or request_json_template is not None
+    ):
+        raise typer.BadParameter(
+            "--agent-model is available only with the openai-chat preset request template",
+            param_hint="--agent-model",
+        )
     try:
         base_url = url.rstrip("/")
         if adapter_tier == "isolated-response":
+            preset_template, preset_pointer = _ISOLATED_ADAPTER_PRESETS[isolated_preset]
+            selected_template = (
+                _parse_request_json_template(request_json_template)
+                if request_json_template is not None
+                else (
+                    {"model": agent_model, **cast(dict[str, JsonValue], preset_template)}
+                    if isolated_preset == "openai-chat"
+                    else preset_template
+                )
+            )
+            selected_headers = _parse_header_environment_mappings(header_from_env or [])
+            endpoint_host = urlsplit(url).hostname or "target"
             config: JsonHttpTargetConfig = JsonHttpIsolatedResponseConfig.model_validate(
                 {
                     "version": 1,
                     "adapter_tier": "isolated_response",
-                    "environment_id": ENVIRONMENT_ID_PLACEHOLDER,
+                    "environment_id": environment_id or f"isolated-response:{endpoint_host}",
                     "request_isolation_attested": True,
                     "safe_test_target_attested": True,
-                    "headers_from_env": {},
+                    "headers_from_env": selected_headers,
                     "execute": {
-                        "url": f"{base_url}/execute",
-                        "request_json_template": {
-                            "case_id": "{{case_id}}",
-                            "turn_id": "{{turn_id}}",
-                            "input": "{{input}}",
-                        },
-                        "response_json_pointer": "/response",
+                        "url": url,
+                        "request_json_template": selected_template,
+                        "response_json_pointer": response_json_pointer or preset_pointer,
                     },
                 }
             )
@@ -242,7 +319,7 @@ def initialize_dataset_environment(
         elif isinstance(error, OSError):
             message = f"cannot create environment config ({error.__class__.__name__})"
         elif isinstance(error, ValidationError):
-            message = "environment config is invalid"
+            message = _summarize_validation_error(error)
         else:
             message = str(error)
         raise typer.BadParameter(message, param_hint="ENVIRONMENT_CONFIG") from None
@@ -267,20 +344,23 @@ def initialize_dataset_environment(
     console.print(f"Created private environment connection config: {environment_config}")
     if not show_guidance:
         return
-    console.print(
-        f"First: replace environment_id '{ENVIRONMENT_ID_PLACEHOLDER}' with a stable name for "
-        "this test environment."
-    )
+    if config.environment_id == ENVIRONMENT_ID_PLACEHOLDER:
+        console.print(
+            f"First: replace environment_id '{ENVIRONMENT_ID_PLACEHOLDER}' with a stable name "
+            "for this test environment."
+        )
     if adapter_tier == "isolated-response":
         console.print(
-            "Next: implement the generated /execute endpoint and add any headers_from_env. "
-            "This tier records response evidence only: committed state, conversations, and "
-            "state-dependent stress tests are unavailable. Validate a dataset plan with "
-            f"'ul dataset evaluate DATASET --environment-config {environment_config} --dry-run'."
+            "Connected the existing one-request JSON endpoint; no UL-specific endpoint is "
+            "required. Set any configured UL_ENVIRONMENT_* variables, then run "
+            f"'ul environment check {environment_config} --help'. This tier records response "
+            "evidence only: committed state, conversations, and state-dependent stress tests "
+            "are unavailable."
         )
         console.print(
             "Each request must start from fresh isolated state and remain safe for testing. "
-            "Keep exactly one {{case_id}}, {{turn_id}}, and {{input}} in the request template."
+            "Keep exactly one complete {{input}} value in the request template; {{case_id}} and "
+            "{{turn_id}} are optional correlation values."
         )
         return
     console.print(
@@ -307,6 +387,47 @@ def initialize_dataset_environment(
         'Reset response: {"environment_id":"...","case_id":"{{case_id}}",'
         '"generation":1,"clean":true,"reset_session":true,"reset_env":true}'
     )
+
+
+def _parse_request_json_template(encoded_template: str) -> JsonValue:
+    try:
+        value: object = json.loads(
+            encoded_template,
+            object_pairs_hook=_reject_duplicate_json_keys,
+            parse_constant=_reject_nonstandard_json_constant,
+        )
+    except (json.JSONDecodeError, RecursionError, ValueError):
+        raise ValueError("request JSON template must be valid standard JSON") from None
+    return cast(JsonValue, value)
+
+
+def _summarize_validation_error(error: ValidationError) -> str:
+    reasons: list[str] = []
+    for issue in error.errors(include_url=False, include_context=False, include_input=False):
+        field_path = ".".join(str(part) for part in issue["loc"])
+        message = str(issue["msg"]).removeprefix("Value error, ")
+        reasons.append(f"{field_path}: {message}" if field_path else message)
+    return f"environment config is invalid: {'; '.join(reasons)}"
+
+
+def _parse_header_environment_mappings(mappings: list[str]) -> dict[str, str]:
+    parsed: dict[str, str] = {}
+    normalized_names: set[str] = set()
+    for mapping in mappings:
+        header_name, separator, environment_variable = mapping.partition("=")
+        normalized_name = header_name.casefold()
+        if (
+            not separator
+            or not header_name
+            or not environment_variable
+            or normalized_name in normalized_names
+        ):
+            raise ValueError(
+                "header mappings must be unique HTTP_HEADER=UL_ENVIRONMENT_VARIABLE values"
+            )
+        normalized_names.add(normalized_name)
+        parsed[header_name] = environment_variable
+    return parsed
 
 
 @app.command("operators")
