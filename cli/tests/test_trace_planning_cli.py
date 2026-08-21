@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import stat
 from pathlib import Path
 
 from typer.testing import CliRunner
@@ -23,6 +24,50 @@ def _write_trace_bundle(path: Path) -> TraceReplayBundle:
     bundle = materialize_trace_replay_bundle(records)
     path.write_text(bundle.model_dump_json(indent=2), encoding="utf-8")
     return bundle
+
+
+def _write_trace_campaign_target(path: Path) -> None:
+    path.write_text(
+        json.dumps(
+            {
+                "version": 5,
+                "environment_id": "trace-campaign-test",
+                "reset": {
+                    "url": "http://127.0.0.1:8765/reset",
+                    "request_json_template": {"case_id": "{{case_id}}"},
+                    "case_id_json_pointer": "/case_id",
+                    "generation_json_pointer": "/generation",
+                    "clean_state_json_pointer": "/clean",
+                    "clean_state_value": True,
+                },
+                "setup": {
+                    "url": "http://127.0.0.1:8765/setup",
+                    "request_json_template": {"case_id": "{{case_id}}"},
+                    "case_id_json_pointer": "/case_id",
+                },
+                "execute_turn": {
+                    "url": "http://127.0.0.1:8765/execute",
+                    "request_json_template": {
+                        "case_id": "{{case_id}}",
+                        "turn_id": "{{turn_id}}",
+                        "input": "{{input}}",
+                    },
+                    "case_id_json_pointer": "/case_id",
+                    "turn_id_json_pointer": "/turn_id",
+                },
+                "snapshot": {
+                    "url": "http://127.0.0.1:8765/snapshot",
+                    "request_json_template": {
+                        "case_id": "{{case_id}}",
+                        "turn_id": "{{turn_id}}",
+                    },
+                    "case_id_json_pointer": "/case_id",
+                    "turn_id_json_pointer": "/turn_id",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
 
 
 def test_trace_plan_prints_evidence_links_without_recorded_content(tmp_path: Path) -> None:
@@ -126,3 +171,76 @@ def test_trace_group_explains_technical_difference_without_private_content(
     assert "semantic agent failure" in result.output
     assert "failure(s)" not in result.output
     assert "Pay approved invoice" not in result.output
+
+
+def test_trace_campaign_dry_run_reports_selection_and_cumulative_calls_privately(
+    tmp_path: Path,
+) -> None:
+    bundle_path = tmp_path / "bundle.json"
+    bundle = _write_trace_bundle(bundle_path)
+    target_path = tmp_path / "environment.json"
+    _write_trace_campaign_target(target_path)
+
+    result = runner.invoke(
+        app,
+        [
+            "stress",
+            "trace-campaign",
+            str(bundle_path),
+            "--environment-config",
+            str(target_path),
+            "--limit",
+            "1",
+            "--repetitions",
+            "2",
+            "--max-environment-api-calls",
+            "12",
+            "--allow-insecure-http",
+            "--dry-run",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert f"Trace campaign: 1/{len(bundle.cases)} prioritized case(s)" in result.output
+    assert "Repetitions per case: 2" in result.output
+    assert "Potential environment API calls: 12" in result.output
+    assert "Recorded message and state content: not printed" in result.output
+    assert "External calls: none" in result.output
+    assert "Pay approved invoice" not in result.output
+
+
+def test_trace_campaign_refuses_to_overwrite_existing_output(tmp_path: Path) -> None:
+    bundle_path = tmp_path / "bundle.json"
+    _write_trace_bundle(bundle_path)
+    target_path = tmp_path / "environment.json"
+    _write_trace_campaign_target(target_path)
+    output_path = tmp_path / "campaign.json"
+    output_path.write_text("keep me", encoding="utf-8")
+    output_path.chmod(0o640)
+
+    result = runner.invoke(
+        app,
+        [
+            "stress",
+            "trace-campaign",
+            str(bundle_path),
+            "--environment-config",
+            str(target_path),
+            "--output",
+            str(output_path),
+            "--limit",
+            "1",
+            "--repetitions",
+            "1",
+            "--max-environment-api-calls",
+            "8",
+            "--allow-environment-network",
+            "--confirm-test-environment",
+            "--allow-insecure-http",
+        ],
+    )
+
+    assert result.exit_code != 0
+    assert "output already exists; UL will not overwrite it" in result.output
+    assert output_path.read_text(encoding="utf-8") == "keep me"
+    assert stat.S_IMODE(output_path.stat().st_mode) == 0o640

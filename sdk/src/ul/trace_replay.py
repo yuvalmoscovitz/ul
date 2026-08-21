@@ -372,6 +372,70 @@ class TraceReplayResult(_StrictModel):
         return self
 
 
+class TraceStressCampaignPlanCase(_StrictModel):
+    stress: TraceStressPlanCase
+    replay: TraceReplayPlan
+
+    @model_validator(mode="after")
+    def validate_case_identity(self) -> Self:
+        if (
+            self.stress.case_id != self.replay.case_id
+            or self.stress.source_trace_id != self.replay.source_trace_id
+        ):
+            raise ValueError("campaign stress and replay plans must identify the same case")
+        return self
+
+
+class TraceStressCampaignPlan(_StrictModel):
+    schema_version: Literal["1.0.0"] = "1.0.0"
+    total_case_count: int = Field(ge=1)
+    selected_case_count: int = Field(ge=1)
+    repetitions: int = Field(ge=1, le=_MAXIMUM_REPLAY_REPETITIONS)
+    required_target_calls: int = Field(ge=1)
+    cases: tuple[TraceStressCampaignPlanCase, ...] = Field(min_length=1)
+
+    @field_validator("cases", mode="before")
+    @classmethod
+    def accept_json_case_array(cls, cases: object) -> object:
+        return tuple(cast(list[object], cases)) if isinstance(cases, list) else cases
+
+    @model_validator(mode="after")
+    def validate_plan_totals(self) -> Self:
+        if self.selected_case_count != len(self.cases):
+            raise ValueError("selected campaign case count must match its cases")
+        if self.total_case_count < self.selected_case_count:
+            raise ValueError("campaign cannot select more cases than the bundle contains")
+        if any(case.replay.repetitions != self.repetitions for case in self.cases):
+            raise ValueError("campaign cases must use the campaign repetition count")
+        if self.required_target_calls != sum(
+            case.replay.required_target_calls for case in self.cases
+        ):
+            raise ValueError("campaign call count must match its case plans")
+        return self
+
+
+class TraceStressCampaignResult(_StrictModel):
+    schema_version: Literal["1.0.0"] = "1.0.0"
+    plan: TraceStressCampaignPlan
+    results: tuple[TraceReplayResult, ...] = Field(min_length=1)
+    grouping: TraceReplayDifferenceGrouping
+
+    @field_validator("results", mode="before")
+    @classmethod
+    def accept_json_result_array(cls, results: object) -> object:
+        return tuple(cast(list[object], results)) if isinstance(results, list) else results
+
+    @model_validator(mode="after")
+    def validate_result_coverage(self) -> Self:
+        planned_case_ids = tuple(case.replay.case_id for case in self.plan.cases)
+        result_case_ids = tuple(result.case.case_id for result in self.results)
+        if result_case_ids != planned_case_ids:
+            raise ValueError("campaign results must preserve planned case order")
+        if self.grouping.result_count != len(self.results):
+            raise ValueError("campaign grouping must cover every result")
+        return self
+
+
 def materialize_trace_replay_bundle(
     records: tuple[OtlpInteractionRecord, ...],
 ) -> TraceReplayBundle:
@@ -439,6 +503,44 @@ def derive_trace_stress_plan(bundle: TraceReplayBundle) -> TraceStressPlan:
         for rank, item in enumerate(ordered_cases, start=1)
     )
     return TraceStressPlan(case_count=len(ranked_cases), cases=ranked_cases)
+
+
+def plan_trace_stress_campaign(
+    bundle: TraceReplayBundle,
+    target_config: JsonHttpTargetConfig,
+    *,
+    limit: int = 10,
+    repetitions: int = 3,
+    max_target_calls: int = 100,
+) -> TraceStressCampaignPlan:
+    if type(limit) is not int or limit < 1:
+        raise ValueError("limit must be a positive integer")
+    if type(max_target_calls) is not int or max_target_calls < 1:
+        raise ValueError("max_target_calls must be a positive integer")
+    stress_plan = derive_trace_stress_plan(bundle)
+    replay_case_by_id = {case.case_id: case for case in bundle.cases}
+    campaign_cases = tuple(
+        TraceStressCampaignPlanCase(
+            stress=stress_case,
+            replay=plan_trace_replay(
+                replay_case_by_id[stress_case.case_id],
+                target_config,
+                repetitions=repetitions,
+                max_target_calls=max_target_calls,
+            ),
+        )
+        for stress_case in stress_plan.cases[:limit]
+    )
+    required_target_calls = sum(case.replay.required_target_calls for case in campaign_cases)
+    if required_target_calls > max_target_calls:
+        raise ValueError("trace stress campaign exceeds the authorized target call budget")
+    return TraceStressCampaignPlan(
+        total_case_count=stress_plan.case_count,
+        selected_case_count=len(campaign_cases),
+        repetitions=repetitions,
+        required_target_calls=required_target_calls,
+        cases=campaign_cases,
+    )
 
 
 def group_trace_replay_differences(
@@ -680,6 +782,43 @@ async def run_trace_replay(
         response_match_count=response_match_count,
         state_match_count=state_match_count,
         trials=tuple(trials),
+    )
+
+
+async def run_trace_stress_campaign(
+    bundle: TraceReplayBundle,
+    environment: EnvironmentExecutor,
+    *,
+    plan: TraceStressCampaignPlan,
+    allow_network_egress: bool = False,
+) -> TraceStressCampaignResult:
+    if not allow_network_egress:
+        raise ValueError("trace stress campaign requires explicit network opt-in")
+    derived_plan = derive_trace_stress_plan(bundle)
+    expected_stress_cases = derived_plan.cases[: plan.selected_case_count]
+    if (
+        plan.total_case_count != derived_plan.case_count
+        or tuple(case.stress for case in plan.cases) != expected_stress_cases
+    ):
+        raise ValueError("trace stress campaign plan does not match the replay bundle")
+    replay_case_by_id = {case.case_id: case for case in bundle.cases}
+    results: list[TraceReplayResult] = []
+    for campaign_case in plan.cases:
+        replay_plan = campaign_case.replay
+        results.append(
+            await run_trace_replay(
+                replay_case_by_id[replay_plan.case_id],
+                environment,
+                repetitions=replay_plan.repetitions,
+                max_target_calls=replay_plan.required_target_calls,
+                allow_network_egress=True,
+            )
+        )
+    result_tuple = tuple(results)
+    return TraceStressCampaignResult(
+        plan=plan,
+        results=result_tuple,
+        grouping=group_trace_replay_differences(result_tuple),
     )
 
 

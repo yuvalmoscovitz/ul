@@ -7,7 +7,7 @@ from typing import Any
 
 import pytest
 import ul.trace_replay as trace_replay_module
-from ul.http_environment import JsonHttpIsolatedResponseConfig
+from ul.http_environment import JsonHttpEnvironmentConfig, JsonHttpIsolatedResponseConfig
 from ul.otlp_ingest import OtlpMappingConfig, parse_otlp_traces
 from ul.trace_replay import (
     TraceReplayResult,
@@ -19,7 +19,9 @@ from ul.trace_replay import (
     load_trace_replay_results,
     materialize_trace_replay_bundle,
     plan_trace_replay,
+    plan_trace_stress_campaign,
     run_trace_replay,
+    run_trace_stress_campaign,
 )
 from ul_core.dataset import ObservedAgentOutput
 from ul_core.evaluation import (
@@ -524,6 +526,113 @@ def _isolated_response_config() -> JsonHttpIsolatedResponseConfig:
             },
         }
     )
+
+
+def _stateful_response_config() -> JsonHttpEnvironmentConfig:
+    return JsonHttpEnvironmentConfig.model_validate(
+        {
+            "version": 5,
+            "environment_id": "trace-campaign-test",
+            "reset": {
+                "url": "https://environment.example.test/reset",
+                "request_json_template": {"case_id": "{{case_id}}"},
+                "case_id_json_pointer": "/case_id",
+                "generation_json_pointer": "/generation",
+                "clean_state_json_pointer": "/clean",
+                "clean_state_value": True,
+            },
+            "setup": {
+                "url": "https://environment.example.test/setup",
+                "request_json_template": {"case_id": "{{case_id}}"},
+                "case_id_json_pointer": "/case_id",
+            },
+            "execute_turn": {
+                "url": "https://environment.example.test/execute",
+                "request_json_template": {
+                    "case_id": "{{case_id}}",
+                    "turn_id": "{{turn_id}}",
+                    "input": "{{input}}",
+                },
+                "case_id_json_pointer": "/case_id",
+                "turn_id_json_pointer": "/turn_id",
+            },
+            "snapshot": {
+                "url": "https://environment.example.test/snapshot",
+                "request_json_template": {
+                    "case_id": "{{case_id}}",
+                    "turn_id": "{{turn_id}}",
+                },
+                "case_id_json_pointer": "/case_id",
+                "turn_id_json_pointer": "/turn_id",
+            },
+        }
+    )
+
+
+def test_trace_stress_campaign_plan_selects_ranked_cases_deterministically() -> None:
+    bundle = materialize_trace_replay_bundle(_trace_records(include_stress_signals=True))
+
+    first = plan_trace_stress_campaign(
+        bundle,
+        _stateful_response_config(),
+        limit=2,
+        repetitions=2,
+        max_target_calls=28,
+    )
+    second = plan_trace_stress_campaign(
+        bundle,
+        _stateful_response_config(),
+        limit=2,
+        repetitions=2,
+        max_target_calls=28,
+    )
+
+    assert first == second
+    assert first.selected_case_count == 2
+    assert first.total_case_count == 2
+    assert first.repetitions == 2
+    assert first.required_target_calls == 28
+    assert [case.stress.case_id for case in first.cases] == [
+        case.case_id for case in derive_trace_stress_plan(bundle).cases
+    ]
+
+
+def test_trace_stress_campaign_plan_rejects_cumulative_call_budget() -> None:
+    bundle = materialize_trace_replay_bundle(_trace_records(include_stress_signals=True))
+
+    with pytest.raises(ValueError, match="campaign exceeds the authorized target call budget"):
+        plan_trace_stress_campaign(
+            bundle,
+            _stateful_response_config(),
+            limit=2,
+            repetitions=2,
+            max_target_calls=27,
+        )
+
+
+@pytest.mark.asyncio
+async def test_trace_stress_campaign_runs_each_selected_case_and_groups_differences() -> None:
+    bundle = materialize_trace_replay_bundle(_trace_records(include_stress_signals=True))
+    plan = plan_trace_stress_campaign(
+        bundle,
+        _stateful_response_config(),
+        limit=2,
+        repetitions=1,
+        max_target_calls=14,
+    )
+
+    result = await run_trace_stress_campaign(
+        bundle,
+        _ReplayTarget(drift=True),
+        plan=plan,
+        allow_network_egress=True,
+    )
+
+    assert [case_result.case.case_id for case_result in result.results] == [
+        planned_case.replay.case_id for planned_case in plan.cases
+    ]
+    assert all(isinstance(case_result, TraceReplayResult) for case_result in result.results)
+    assert result.grouping == group_trace_replay_differences(result.results)
 
 
 def test_trace_replay_plan_rejects_recorded_state_for_response_only_target() -> None:
