@@ -8,6 +8,8 @@ from typing import Any
 import pytest
 from ul.otlp_ingest import OtlpMappingConfig, parse_otlp_traces
 from ul.trace_replay import (
+    derive_trace_stress_plan,
+    group_trace_replay_failures,
     load_trace_replay_bundle,
     materialize_trace_replay_bundle,
     run_trace_replay,
@@ -28,7 +30,9 @@ def _attribute(key: str, value: str) -> dict[str, Any]:
     return {"key": key, "value": {"stringValue": value}}
 
 
-def _trace_records(*, include_state: bool = True) -> tuple[Any, ...]:
+def _trace_records(
+    *, include_state: bool = True, include_stress_signals: bool = False
+) -> tuple[Any, ...]:
     first_user = {"role": "user", "parts": [{"type": "text", "content": "Pay AC-100."}]}
     first_response = {
         "role": "assistant",
@@ -57,6 +61,20 @@ def _trace_records(*, include_state: bool = True) -> tuple[Any, ...]:
         ]
         if include_state:
             attributes.append(_attribute("ul.state.snapshot", json.dumps(state)))
+        if include_stress_signals:
+            attributes.extend(
+                [
+                    _attribute("gen_ai.tool.call.id", f"call-{span_id[:2]}"),
+                    _attribute("gen_ai.tool.name", "accounting.submit_invoice"),
+                ]
+            )
+            if span_id == "11" * 8:
+                attributes.extend(
+                    [
+                        _attribute("retry.attempt", "2"),
+                        _attribute("error.type", "TransientTimeout"),
+                    ]
+                )
         return {
             "traceId": "aa" * 16,
             "spanId": span_id,
@@ -259,6 +277,46 @@ def test_materializes_one_replay_case_per_completed_user_turn() -> None:
     assert bundle.envelopes[0].scenario["messages"][-1]["content"] == "Submitted AC-100."
 
 
+def test_derives_ranked_stress_plan_from_explicit_trace_evidence() -> None:
+    bundle = materialize_trace_replay_bundle(_trace_records(include_stress_signals=True))
+
+    plan = derive_trace_stress_plan(bundle)
+
+    assert plan.case_count == 2
+    first = plan.cases[0]
+    assert first.case_id == bundle.cases[1].case_id
+    assert [signal.code for signal in first.signals] == [
+        "trace_error",
+        "retry_attempt",
+        "repeated_tool_call",
+        "multi_turn_follow_up",
+        "recorded_state_evidence",
+    ]
+    assert first.priority_score == 18
+    assert first.recommended_focuses == (
+        "error_recovery",
+        "retry_safety",
+        "multi_turn_change_handling",
+        "state_consistency",
+    )
+    assert first.source_span_ids == ("2222222222222222",)
+    assert first.signals[0].source_span_ids == ("1111111111111111",)
+    assert first.signals[2].source_span_ids == (
+        "1111111111111111",
+        "2222222222222222",
+    )
+
+
+def test_stress_plan_falls_back_to_reproducibility_without_elevated_signals() -> None:
+    bundle = materialize_trace_replay_bundle(_trace_records(include_state=False))
+
+    plan = derive_trace_stress_plan(bundle)
+
+    assert plan.cases[0].recommended_focuses == ("multi_turn_change_handling",)
+    assert plan.cases[1].signals == ()
+    assert plan.cases[1].recommended_focuses == ("production_reproducibility",)
+
+
 @pytest.mark.asyncio
 async def test_replays_selected_conversation_prefix_and_reports_reproduction() -> None:
     case = materialize_trace_replay_bundle(_trace_records()).cases[1]
@@ -306,6 +364,47 @@ async def test_replay_reports_observed_drift_without_claiming_correctness() -> N
 
 
 @pytest.mark.asyncio
+async def test_groups_replay_failures_by_stable_evidence_signature() -> None:
+    stateful_case = materialize_trace_replay_bundle(_trace_records()).cases[1]
+    response_only_case = materialize_trace_replay_bundle(_trace_records(include_state=False)).cases[
+        1
+    ]
+    state_and_response_drift = await run_trace_replay(
+        stateful_case,
+        _ReplayTarget(drift=True),
+        repetitions=1,
+        max_target_calls=7,
+        allow_network_egress=True,
+    )
+    response_drift = await run_trace_replay(
+        response_only_case,
+        _ReplayTarget(drift=True, include_state=False),
+        repetitions=1,
+        max_target_calls=7,
+        allow_network_egress=True,
+    )
+    reproduced = await run_trace_replay(
+        stateful_case,
+        _ReplayTarget(),
+        repetitions=1,
+        max_target_calls=7,
+        allow_network_egress=True,
+    )
+
+    grouping = group_trace_replay_failures((state_and_response_drift, response_drift, reproduced))
+
+    assert grouping.result_count == 3
+    assert grouping.failure_count == 2
+    assert grouping.reproduced_count == 1
+    assert [group.signature for group in grouping.groups] == [
+        "response_mismatch",
+        "response_mismatch+state_mismatch",
+    ]
+    assert grouping.groups[1].members[0].source_trace_id == "aa" * 16
+    assert grouping.groups[1].members[0].source_span_ids == ("2222222222222222",)
+
+
+@pytest.mark.asyncio
 async def test_replay_stops_after_uncertain_environment_state() -> None:
     case = materialize_trace_replay_bundle(_trace_records()).cases[1]
     environment = _UncertainReplayEnvironment()
@@ -318,6 +417,12 @@ async def test_replay_stops_after_uncertain_environment_state() -> None:
     assert environment.execution_count == 1
     assert result.trials[0].execution_evidence is not None
     assert all(trial.inconclusive_reason is not None for trial in result.trials)
+
+    grouping = group_trace_replay_failures((result,))
+
+    assert grouping.groups[0].signature == (
+        "environment_lifecycle_failed+environment_state_uncertain"
+    )
 
 
 @pytest.mark.asyncio

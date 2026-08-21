@@ -251,8 +251,7 @@ def ingest_otlp_traces(
         )
     if replay_output is not None:
         _print_safe(
-            f"Next: run 'ul stress trace {replay_output} "
-            "--environment-config target.json --dry-run'."
+            f"Next: inspect the evidence-linked plan with 'ul stress trace-plan {replay_output}'."
         )
 
 

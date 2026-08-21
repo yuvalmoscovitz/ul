@@ -44,9 +44,14 @@ from ul.timeout_after_commit import (
     run_timeout_after_commit_stress_test,
 )
 from ul.trace_replay import (
+    TraceFailureGrouping,
     TraceReplayCase,
     TraceReplayResult,
+    TraceStressPlan,
+    derive_trace_stress_plan,
+    group_trace_replay_failures,
     load_trace_replay_bundle,
+    load_trace_replay_result,
     plan_trace_replay,
     run_trace_replay,
     select_trace_replay_case,
@@ -253,6 +258,49 @@ def replay_production_trace(
         output.unlink(missing_ok=True)
         raise
     _print_trace_replay_result(result, output)
+
+
+@app.command("trace-plan")
+def plan_production_trace_stress(
+    bundle_path: Annotated[Path, typer.Argument(exists=True, dir_okay=False, readable=True)],
+    json_output: Annotated[
+        bool, typer.Option("--json", help="Emit stable machine-readable JSON.")
+    ] = False,
+) -> None:
+    """Turn imported trace evidence into a prioritized stress plan."""
+    try:
+        plan = derive_trace_stress_plan(load_trace_replay_bundle(bundle_path))
+    except (ValidationError, ValueError, RuntimeError) as error:
+        raise typer.BadParameter(str(error)) from None
+    if json_output:
+        typer.echo(json.dumps(plan.model_dump(mode="json"), ensure_ascii=False, indent=2))
+        return
+    _print_trace_stress_plan(plan)
+
+
+@app.command("trace-group")
+def group_production_trace_failures(
+    result_paths: Annotated[
+        list[Path],
+        typer.Argument(exists=True, dir_okay=False, readable=True),
+    ],
+    json_output: Annotated[
+        bool, typer.Option("--json", help="Emit stable machine-readable JSON.")
+    ] = False,
+) -> None:
+    """Group trace replay failures by stable evidence signatures."""
+    if len(result_paths) > 100:
+        raise typer.BadParameter("trace failure grouping accepts at most 100 result files")
+    try:
+        grouping = group_trace_replay_failures(
+            tuple(load_trace_replay_result(path) for path in result_paths)
+        )
+    except (ValidationError, ValueError, RuntimeError) as error:
+        raise typer.BadParameter(str(error)) from None
+    if json_output:
+        typer.echo(json.dumps(grouping.model_dump(mode="json"), ensure_ascii=False, indent=2))
+        return
+    _print_trace_failure_grouping(grouping)
 
 
 @app.command("save")
@@ -756,6 +804,52 @@ def _print_trace_replay_result(result: TraceReplayResult, output: Path) -> None:
         raise typer.Exit(code=1)
     if result.status == "inconclusive":
         raise typer.Exit(code=2)
+
+
+def _print_trace_stress_plan(plan: TraceStressPlan) -> None:
+    typer.echo(f"Trace-derived stress plan: {plan.case_count} case(s)")
+    for planned_case in plan.cases:
+        typer.echo(
+            f"{planned_case.priority_rank}. {planned_case.case_id} "
+            f"(score={planned_case.priority_score})"
+        )
+        typer.echo(f"   Trace: {planned_case.source_trace_id}")
+        if planned_case.signals:
+            typer.echo("   Why this case is prioritized:")
+            for signal in planned_case.signals:
+                typer.echo(f"   - {signal.description} [{signal.code}]")
+        else:
+            typer.echo("   Why this case is prioritized: no elevated trace signals")
+        focuses = ", ".join(focus.replace("_", " ") for focus in planned_case.recommended_focuses)
+        typer.echo(f"   Suggested stress focus: {focuses}")
+        if planned_case.source_span_ids:
+            typer.echo(f"   Case spans: {', '.join(planned_case.source_span_ids)}")
+        signal_span_ids = tuple(
+            dict.fromkeys(
+                span_id for signal in planned_case.signals for span_id in signal.source_span_ids
+            )
+        )
+        if signal_span_ids:
+            typer.echo(f"   Signal spans: {', '.join(signal_span_ids)}")
+    typer.echo("Priority score schedules evidence-rich cases; it is not risk or causality.")
+    typer.echo("Recorded message and state content: not printed")
+
+
+def _print_trace_failure_grouping(grouping: TraceFailureGrouping) -> None:
+    typer.echo(
+        f"Trace replay patterns: {grouping.failure_count} failure(s), "
+        f"{grouping.reproduced_count} reproduced"
+    )
+    if not grouping.groups:
+        typer.echo("No drifted or inconclusive replay results to group.")
+        return
+    for group in grouping.groups:
+        typer.echo(f"{group.signature}: {group.occurrence_count} occurrence(s)")
+        for member in group.members:
+            typer.echo(f"  Case {member.case_id} (trace {member.source_trace_id})")
+            if member.source_span_ids:
+                typer.echo(f"    Spans: {', '.join(member.source_span_ids)}")
+    typer.echo("Groups describe observed replay evidence; they do not identify a cause.")
 
 
 def _format_divergence_counts(counts: dict[str, int]) -> str:

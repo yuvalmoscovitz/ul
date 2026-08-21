@@ -8,6 +8,7 @@ import os
 import secrets
 import stat
 import sys
+from collections.abc import Iterable
 from pathlib import Path
 from typing import Literal, Self, cast
 
@@ -31,6 +32,7 @@ from ul.http_environment import (
 from ul.otlp_ingest import OtlpInteractionRecord
 
 _MAXIMUM_BUNDLE_BYTES = 50_000_000
+_MAXIMUM_RESULT_BYTES = 10_000_000
 _MAXIMUM_JSON_DEPTH = 100
 _MAXIMUM_REPLAY_CASES = 1_000
 _MAXIMUM_REPLAY_TRACES = 100
@@ -146,6 +148,106 @@ class TraceReplayPlan(_StrictModel):
     required_target_calls: int = Field(ge=1)
 
 
+TraceStressSignalCode = Literal[
+    "trace_error",
+    "retry_attempt",
+    "repeated_tool_call",
+    "multi_turn_follow_up",
+    "recorded_state_evidence",
+]
+TraceStressFocus = Literal[
+    "error_recovery",
+    "retry_safety",
+    "multi_turn_change_handling",
+    "state_consistency",
+    "production_reproducibility",
+]
+
+
+class TraceStressSignal(_StrictModel):
+    code: TraceStressSignalCode
+    description: str = Field(min_length=1, max_length=300)
+    score: int = Field(ge=1, le=10)
+    source_span_ids: tuple[str, ...] = ()
+
+    @field_validator("source_span_ids", mode="before")
+    @classmethod
+    def accept_json_span_array(cls, span_ids: object) -> object:
+        return tuple(cast(list[object], span_ids)) if isinstance(span_ids, list) else span_ids
+
+
+class TraceStressPlanCase(_StrictModel):
+    priority_rank: int = Field(ge=1)
+    priority_score: int = Field(ge=0)
+    case_id: str = Field(pattern=_CASE_ID_PATTERN)
+    source_trace_id: str = Field(min_length=1, max_length=128)
+    source_span_ids: tuple[str, ...] = ()
+    signals: tuple[TraceStressSignal, ...] = ()
+    recommended_focuses: tuple[TraceStressFocus, ...] = Field(min_length=1)
+
+    @field_validator("source_span_ids", "signals", "recommended_focuses", mode="before")
+    @classmethod
+    def accept_json_arrays(cls, values: object) -> object:
+        return tuple(cast(list[object], values)) if isinstance(values, list) else values
+
+
+class TraceStressPlan(_StrictModel):
+    schema_version: Literal["1.0.0"] = "1.0.0"
+    case_count: int = Field(ge=1)
+    cases: tuple[TraceStressPlanCase, ...] = Field(min_length=1)
+
+    @field_validator("cases", mode="before")
+    @classmethod
+    def accept_json_case_array(cls, cases: object) -> object:
+        return tuple(cast(list[object], cases)) if isinstance(cases, list) else cases
+
+
+TraceFailureReasonCode = Literal[
+    "response_mismatch",
+    "state_mismatch",
+    "environment_lifecycle_failed",
+    "environment_execution_timeout",
+    "environment_execution_failed",
+    "environment_state_uncertain",
+]
+
+
+class TraceFailureGroupMember(_StrictModel):
+    case_id: str = Field(pattern=_CASE_ID_PATTERN)
+    source_trace_id: str = Field(min_length=1, max_length=128)
+    source_span_ids: tuple[str, ...] = ()
+
+    @field_validator("source_span_ids", mode="before")
+    @classmethod
+    def accept_json_span_array(cls, span_ids: object) -> object:
+        return tuple(cast(list[object], span_ids)) if isinstance(span_ids, list) else span_ids
+
+
+class TraceFailureGroup(_StrictModel):
+    signature: str = Field(min_length=1, max_length=300)
+    reason_codes: tuple[TraceFailureReasonCode, ...] = Field(min_length=1)
+    occurrence_count: int = Field(ge=1)
+    members: tuple[TraceFailureGroupMember, ...] = Field(min_length=1)
+
+    @field_validator("reason_codes", "members", mode="before")
+    @classmethod
+    def accept_json_arrays(cls, values: object) -> object:
+        return tuple(cast(list[object], values)) if isinstance(values, list) else values
+
+
+class TraceFailureGrouping(_StrictModel):
+    schema_version: Literal["1.0.0"] = "1.0.0"
+    result_count: int = Field(ge=1)
+    reproduced_count: int = Field(ge=0)
+    failure_count: int = Field(ge=0)
+    groups: tuple[TraceFailureGroup, ...] = ()
+
+    @field_validator("groups", mode="before")
+    @classmethod
+    def accept_json_group_array(cls, groups: object) -> object:
+        return tuple(cast(list[object], groups)) if isinstance(groups, list) else groups
+
+
 class TraceReplayTrial(_StrictModel):
     repetition: int = Field(ge=1)
     execution_evidence: ExecutionEvidence | None = None
@@ -251,6 +353,70 @@ def select_trace_replay_case(
     if len(matching) != 1:
         raise ValueError("trace replay case ID was not found in the bundle")
     return matching[0]
+
+
+def derive_trace_stress_plan(bundle: TraceReplayBundle) -> TraceStressPlan:
+    envelope_by_trace_id = {envelope.trace_id: envelope for envelope in bundle.envelopes}
+    planned_cases: list[TraceStressPlanCase] = []
+    for case in bundle.cases:
+        envelope = envelope_by_trace_id[case.source_trace_id]
+        signals = _trace_stress_signals(case, envelope)
+        planned_cases.append(
+            TraceStressPlanCase(
+                priority_rank=1,
+                priority_score=sum(signal.score for signal in signals),
+                case_id=case.case_id,
+                source_trace_id=case.source_trace_id,
+                source_span_ids=case.source_span_ids,
+                signals=signals,
+                recommended_focuses=_recommended_stress_focuses(signals),
+            )
+        )
+    ordered_cases = sorted(
+        planned_cases,
+        key=lambda item: (-item.priority_score, item.source_trace_id, item.case_id),
+    )
+    ranked_cases = tuple(
+        item.model_copy(update={"priority_rank": rank})
+        for rank, item in enumerate(ordered_cases, start=1)
+    )
+    return TraceStressPlan(case_count=len(ranked_cases), cases=ranked_cases)
+
+
+def group_trace_replay_failures(
+    results: tuple[TraceReplayResult, ...],
+) -> TraceFailureGrouping:
+    if not results:
+        raise ValueError("at least one trace replay result is required")
+    grouped_members: dict[tuple[TraceFailureReasonCode, ...], list[TraceFailureGroupMember]] = {}
+    reproduced_count = 0
+    for result in results:
+        if result.status == "reproduced":
+            reproduced_count += 1
+            continue
+        reason_codes = _trace_failure_reason_codes(result)
+        grouped_members.setdefault(reason_codes, []).append(
+            TraceFailureGroupMember(
+                case_id=result.case.case_id,
+                source_trace_id=result.case.source_trace_id,
+                source_span_ids=result.case.source_span_ids,
+            )
+        )
+    groups = tuple(
+        TraceFailureGroup(
+            signature="+".join(reason_codes),
+            reason_codes=reason_codes,
+            occurrence_count=len(members),
+            members=tuple(members),
+        )
+        for reason_codes, members in sorted(grouped_members.items())
+    )
+    return TraceFailureGrouping(
+        result_count=len(results),
+        reproduced_count=reproduced_count,
+        failure_count=len(results) - reproduced_count,
+        groups=groups,
+    )
 
 
 def plan_trace_replay(
@@ -453,6 +619,198 @@ def load_trace_replay_bundle(path: str | Path) -> TraceReplayBundle:
         raise RuntimeError("trace replay bundle could not be read") from None
     except (UnicodeDecodeError, json.JSONDecodeError, RecursionError, ValidationError, ValueError):
         raise ValueError("trace replay bundle is invalid") from None
+
+
+def load_trace_replay_result(path: str | Path) -> TraceReplayResult:
+    try:
+        encoded = _read_bounded_regular_file(Path(path), _MAXIMUM_RESULT_BYTES)
+        raw = json.loads(
+            encoded.decode("utf-8"),
+            object_pairs_hook=_reject_duplicate_object_keys,
+            parse_constant=_reject_nonstandard_json_constant,
+            parse_float=_parse_finite_float,
+        )
+        _reject_deep_json(raw)
+        return TraceReplayResult.model_validate(raw)
+    except OSError:
+        raise RuntimeError("trace replay result could not be read") from None
+    except (UnicodeDecodeError, json.JSONDecodeError, RecursionError, ValidationError, ValueError):
+        raise ValueError("trace replay result is invalid") from None
+
+
+def _trace_stress_signals(
+    case: TraceReplayCase, envelope: TraceReplayEnvelope
+) -> tuple[TraceStressSignal, ...]:
+    raw_spans = envelope.scenario.get("spans")
+    spans = (
+        tuple(
+            cast(dict[str, JsonValue], span)
+            for span in cast(list[JsonValue], raw_spans)
+            if isinstance(span, dict)
+        )
+        if isinstance(raw_spans, list)
+        else ()
+    )
+    signals: list[TraceStressSignal] = []
+    error_span_ids = _span_ids(
+        span
+        for span in spans
+        if bool(span.get("errors")) or _span_status_is_error(span.get("status"))
+    )
+    if error_span_ids:
+        signals.append(
+            TraceStressSignal(
+                code="trace_error",
+                description="The source trace recorded an error status or error event.",
+                score=5,
+                source_span_ids=error_span_ids,
+            )
+        )
+    retry_span_ids = _span_ids(
+        span for span in spans if _is_retry_attempt(span.get("retry_attempt"))
+    )
+    if retry_span_ids:
+        signals.append(
+            TraceStressSignal(
+                code="retry_attempt",
+                description="The source trace recorded a retry attempt above the initial attempt.",
+                score=4,
+                source_span_ids=retry_span_ids,
+            )
+        )
+    repeated_tool_span_ids = _repeated_tool_span_ids(spans)
+    if repeated_tool_span_ids:
+        signals.append(
+            TraceStressSignal(
+                code="repeated_tool_call",
+                description="The same named tool appeared more than once in the source trace.",
+                score=4,
+                source_span_ids=repeated_tool_span_ids,
+            )
+        )
+    if len(case.replay_user_turns) > 1:
+        signals.append(
+            TraceStressSignal(
+                code="multi_turn_follow_up",
+                description=(
+                    "A user message followed an assistant response; it may represent a "
+                    "clarification, correction, or changed instruction."
+                ),
+                score=3,
+                source_span_ids=case.source_span_ids,
+            )
+        )
+    state_span_ids = _span_ids(
+        span for span in spans if "state_snapshot" in span or "state_delta" in span
+    )
+    if state_span_ids:
+        signals.append(
+            TraceStressSignal(
+                code="recorded_state_evidence",
+                description="The source trace contains a recorded state snapshot or state delta.",
+                score=2,
+                source_span_ids=state_span_ids,
+            )
+        )
+    return tuple(signals)
+
+
+def _recommended_stress_focuses(
+    signals: tuple[TraceStressSignal, ...],
+) -> tuple[TraceStressFocus, ...]:
+    codes = {signal.code for signal in signals}
+    focuses: list[TraceStressFocus] = []
+    if "trace_error" in codes:
+        focuses.append("error_recovery")
+    if "retry_attempt" in codes or "repeated_tool_call" in codes:
+        focuses.append("retry_safety")
+    if "multi_turn_follow_up" in codes:
+        focuses.append("multi_turn_change_handling")
+    if "recorded_state_evidence" in codes:
+        focuses.append("state_consistency")
+    if not focuses:
+        focuses.append("production_reproducibility")
+    return tuple(focuses)
+
+
+def _trace_failure_reason_codes(
+    result: TraceReplayResult,
+) -> tuple[TraceFailureReasonCode, ...]:
+    reasons: list[TraceFailureReasonCode] = []
+    if result.status == "drifted":
+        if result.response_match_count < result.requested_repetitions:
+            reasons.append("response_mismatch")
+        if (
+            result.state_match_count is not None
+            and result.state_match_count < result.requested_repetitions
+        ):
+            reasons.append("state_mismatch")
+        return tuple(reasons)
+    inconclusive_reasons = {
+        trial.inconclusive_reason
+        for trial in result.trials
+        if trial.inconclusive_reason is not None
+    }
+    reason_mapping: tuple[tuple[str, TraceFailureReasonCode], ...] = (
+        ("environment lifecycle failed", "environment_lifecycle_failed"),
+        ("environment execution timed out", "environment_execution_timeout"),
+        ("environment execution failed", "environment_execution_failed"),
+        (
+            "environment not called because prior execution left state uncertain",
+            "environment_state_uncertain",
+        ),
+    )
+    return tuple(code for reason, code in reason_mapping if reason in inconclusive_reasons)
+
+
+def _span_ids(spans: Iterable[dict[str, JsonValue]]) -> tuple[str, ...]:
+    span_ids: list[str] = []
+    for span in spans:
+        span_id = span.get("span_id")
+        if isinstance(span_id, str) and span_id:
+            span_ids.append(span_id)
+    return tuple(dict.fromkeys(span_ids))
+
+
+def _span_status_is_error(status: JsonValue) -> bool:
+    return isinstance(status, dict) and cast(dict[str, JsonValue], status).get("code") == 2
+
+
+def _is_retry_attempt(value: JsonValue) -> bool:
+    if isinstance(value, bool):
+        return False
+    if isinstance(value, int | float):
+        return value > 1
+    if isinstance(value, str):
+        try:
+            return int(value) > 1
+        except ValueError:
+            return False
+    return False
+
+
+def _repeated_tool_span_ids(
+    spans: tuple[dict[str, JsonValue], ...],
+) -> tuple[str, ...]:
+    span_ids_by_tool_name: dict[str, list[str]] = {}
+    for span in spans:
+        span_id = span.get("span_id")
+        raw_tool_calls = span.get("tool_calls")
+        if not isinstance(span_id, str) or not isinstance(raw_tool_calls, list):
+            continue
+        for raw_tool_call in cast(list[JsonValue], raw_tool_calls):
+            if not isinstance(raw_tool_call, dict):
+                continue
+            tool_name = cast(dict[str, JsonValue], raw_tool_call).get("name")
+            if isinstance(tool_name, str) and tool_name:
+                span_ids_by_tool_name.setdefault(tool_name, []).append(span_id)
+    repeated_span_ids = (
+        span_id
+        for tool_name in sorted(span_ids_by_tool_name)
+        if len(span_ids_by_tool_name[tool_name]) > 1
+        for span_id in span_ids_by_tool_name[tool_name]
+    )
+    return tuple(dict.fromkeys(repeated_span_ids))
 
 
 def _materialize_trace_cases(envelope: TraceReplayEnvelope) -> tuple[TraceReplayCase, ...]:

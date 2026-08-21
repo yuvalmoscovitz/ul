@@ -259,6 +259,7 @@ def test_trace_native_materializes_private_replay_bundle_and_dry_run_plan(
     )
 
     assert ingest_result.exit_code == 0, ingest_result.output
+    assert f"ul stress trace-plan {replay_output}" in ingest_result.output
     bundle = json.loads(replay_output.read_text(encoding="utf-8"))
     assert bundle["schema_version"] == "1.0.0"
     assert len(bundle["envelopes"]) == 1
