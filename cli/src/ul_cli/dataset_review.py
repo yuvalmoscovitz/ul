@@ -75,6 +75,16 @@ _SHA256_PATTERN = r"^[0-9a-f]{64}$"
 _FINDING_ID_PATTERN = r"^ulf_v1_[0-9a-f]{64}$"
 _REVIEW_ID_PATTERN = r"^ulr_[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
 _DATASET_EVALUATION_PIPELINE_VERSION = "1.2.0"
+_MAXIMUM_PATTERN_EFFECTS = 100
+_MAXIMUM_PATTERN_FIELDS = 100
+_MAXIMUM_PATTERN_LABEL_CHARACTERS = 500
+_PATTERN_SEVERITY_RANK: dict[FindingSeverity, int] = {
+    "unrated": 0,
+    "low": 1,
+    "medium": 2,
+    "high": 3,
+    "critical": 4,
+}
 
 ReviewStatus = Literal["confirmed", "expected", "unsupported", "inconclusive"]
 ReviewSeverity = Literal["unrated", "low", "medium", "high", "critical"]
@@ -625,20 +635,13 @@ def _summarize_dataset_evidence(
             )
             if review_status in {"needs_review", "confirmed"}:
                 semantic_finding = indexed_finding.semantic_finding
-                pattern_signature = _canonical_json_sha256(
-                    {
-                        "kind": "behavior_difference",
-                        "category": category,
-                        "grounded_field_names": sorted(semantic_finding.grounded_field_names),
-                        "reference_effects": _effect_mechanisms(semantic_finding.reference_effects),
-                        "observed_effects": _effect_mechanisms(semantic_finding.observed_effects),
-                    }
-                )
-                pattern_contexts[indexed_finding.finding_id] = (
-                    pattern_signature,
-                    indexed_finding.evidence_record.sha256,
-                    indexed_finding.case.operator_id,
-                )
+                pattern_signature = _behavior_pattern_signature(semantic_finding)
+                if pattern_signature is not None:
+                    pattern_contexts[indexed_finding.finding_id] = (
+                        pattern_signature,
+                        indexed_finding.evidence_record.evidence.interaction_id,
+                        indexed_finding.case.operator_id,
+                    )
             continue
 
         variation_rule = indexed_finding.variation_rule
@@ -685,7 +688,7 @@ def _summarize_dataset_evidence(
             )
             pattern_contexts[indexed_finding.finding_id] = (
                 pattern_signature,
-                indexed_finding.evidence_record.sha256,
+                indexed_finding.evidence_record.evidence.interaction_id,
                 indexed_finding.case.operator_id,
             )
 
@@ -818,12 +821,44 @@ def _summarize_dataset_evidence(
     )
 
 
-def _effect_mechanisms(effects: list[_Effect]) -> list[dict[str, object]]:
+def _behavior_pattern_signature(finding: _Finding) -> str | None:
+    if len(finding.grounded_field_names) > _MAXIMUM_PATTERN_FIELDS or any(
+        len(field_name) > _MAXIMUM_PATTERN_LABEL_CHARACTERS
+        for field_name in finding.grounded_field_names
+    ):
+        return None
+    reference_effects = _bounded_effect_mechanisms(finding.reference_effects)
+    observed_effects = _bounded_effect_mechanisms(finding.observed_effects)
+    if reference_effects is None or observed_effects is None:
+        return None
+    return _canonical_json_sha256(
+        {
+            "kind": "behavior_difference",
+            "category": finding.category,
+            "grounded_field_names": sorted(finding.grounded_field_names),
+            "reference_effects": reference_effects,
+            "observed_effects": observed_effects,
+        }
+    )
+
+
+def _bounded_effect_mechanisms(effects: list[_Effect]) -> list[dict[str, object]] | None:
+    if len(effects) > _MAXIMUM_PATTERN_EFFECTS:
+        return None
+    if any(
+        len(effect.fields) > _MAXIMUM_PATTERN_FIELDS
+        or len(effect.kind) > _MAXIMUM_PATTERN_LABEL_CHARACTERS
+        or len(effect.predicate) > _MAXIMUM_PATTERN_LABEL_CHARACTERS
+        or any(len(field_name) > _MAXIMUM_PATTERN_LABEL_CHARACTERS for field_name in effect.fields)
+        for effect in effects
+    ):
+        return None
     return sorted(
         (
             {
                 "kind": effect.kind,
                 "predicate": effect.predicate,
+                "status": effect.status,
                 "field_names": sorted(effect.fields),
             }
             for effect in effects
@@ -847,7 +882,7 @@ def _build_failure_patterns(
 
     catalog = builtin_augmentation_catalog()
     patterns: list[FailurePattern] = []
-    for signature, members in grouped.items():
+    for members in grouped.values():
         first = members[0][0]
         operator_keys = sorted(
             {
@@ -870,14 +905,28 @@ def _build_failure_patterns(
                 )
             )
         finding_ids = tuple(sorted(cast(str, finding.finding_id) for finding, _, _ in members))
+        public_pattern_digest = _canonical_json_sha256({"finding_ids": finding_ids})
+        member_severities: list[FindingSeverity] = []
+        for finding, _, _ in members:
+            if finding.review_status == "confirmed":
+                if finding.review_severity is None:
+                    raise AssertionError("validated confirmed finding requires review severity")
+                member_severities.append(finding.review_severity)
+            else:
+                member_severities.append(finding.declared_severity or "unrated")
+        pattern_severity = sorted(
+            member_severities,
+            key=_PATTERN_SEVERITY_RANK.__getitem__,
+        )[-1]
         patterns.append(
             FailurePattern(
-                pattern_id=f"ulp_v1_{signature}",
+                pattern_id=f"ulp_v1_{public_pattern_digest}",
                 kind=first.kind,
                 category=first.category,
                 rule_id=first.rule_id,
                 rule_version=first.rule_version,
                 summary=first.summary,
+                severity=pattern_severity,
                 finding_count=len(members),
                 source_case_count=len({source_case_id for _, source_case_id, _ in members}),
                 operators=tuple(operators),
@@ -890,7 +939,15 @@ def _build_failure_patterns(
                 finding_ids=finding_ids,
             )
         )
-    return tuple(sorted(patterns, key=lambda pattern: pattern.pattern_id))
+    return tuple(
+        sorted(
+            patterns,
+            key=lambda pattern: (
+                -_PATTERN_SEVERITY_RANK[pattern.severity],
+                pattern.pattern_id,
+            ),
+        )
+    )
 
 
 def _dataset_evidence_is_inconclusive(records: list[_LoadedEvidenceRecord]) -> bool:

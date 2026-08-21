@@ -236,22 +236,26 @@ def _print_human_report(report: UnifiedReport, evidence: Path) -> None:
         )
     if report.patterns:
         typer.echo("")
-        typer.echo(f"Failure patterns to review: {len(report.patterns)}")
+        typer.echo(f"Reviewable finding patterns: {len(report.patterns)}")
         typer.echo("Patterns group similar evidence; they do not claim a root cause.")
         for index, pattern in enumerate(report.patterns, start=1):
             typer.echo("")
             typer.echo(f"Pattern {index}: {pattern.summary}")
             typer.echo(f"  Pattern ID: {pattern.pattern_id}")
+            typer.echo(f"  Priority: {pattern.severity}")
             if pattern.rule_id is not None:
                 typer.echo(
                     f"  Customer rule: {pattern.rule_id}@{pattern.rule_version} "
                     "(configured by your team)"
                 )
+                typer.echo("  Why grouped: same customer-defined rule.")
+            else:
+                typer.echo("  Why grouped: same finding category and private action shape.")
             typer.echo(
                 f"  Affected: {pattern.finding_count} finding(s) across "
                 f"{pattern.source_case_count} test question(s)"
             )
-            typer.echo("  Triggered by:")
+            typer.echo("  Observed under:")
             for operator in pattern.operators:
                 label = operator.summary or operator.operator_id
                 typer.echo(f"    - {label} ({operator.operator_id}@{operator.operator_version})")
@@ -261,6 +265,15 @@ def _print_human_report(report: UnifiedReport, evidence: Path) -> None:
                 f"{pattern.confirmed_count} confirmed"
             )
             typer.echo(f"  Finding IDs: {', '.join(pattern.finding_ids)}")
+            typer.echo("  Next: use the per-finding review commands below.")
+    grouped_finding_count = sum(pattern.finding_count for pattern in report.patterns)
+    ungrouped_actionable_count = report.summary.actionable_finding_count - grouped_finding_count
+    if ungrouped_actionable_count:
+        typer.echo("")
+        typer.echo(
+            f"Additional actionable findings not in the reviewable pattern queue: "
+            f"{ungrouped_actionable_count}. Inspect them below."
+        )
     safe_evidence = "".join(
         character if character.isprintable() else f"\\u{ord(character):04x}"
         for character in str(evidence)

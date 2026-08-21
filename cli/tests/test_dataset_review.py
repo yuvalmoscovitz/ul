@@ -32,7 +32,7 @@ from ul.dataset_invariants import DatasetInvariantSuite, JsonValuesEqualInvarian
 from ul_cli import dataset_review
 from ul_cli import report as report_module
 from ul_cli.main import app
-from ul_cli.report_contract import FindingSummary
+from ul_cli.report_contract import FindingSummary, UnifiedReport
 
 runner = CliRunner()
 FINDING_ID = f"ulf_v1_{'a' * 64}"
@@ -399,13 +399,14 @@ def test_root_json_report_is_stable_and_omits_private_dataset_fields(tmp_path: P
         "patterns": [
             {
                 "pattern_id": (
-                    "ulp_v1_8bc89421d4337a8163a1bc871d368830709629ed8c65b269198f1b210c159e9d"
+                    "ulp_v1_7b5a7ed8ae70cb94775e84e7896140c6fba2bf35c33187d09c015c645ae5bcd9"
                 ),
                 "kind": "behavior_difference",
                 "category": "changed_grounded_effect_argument",
                 "rule_id": None,
                 "rule_version": None,
                 "summary": "The changed input altered an important action detail.",
+                "severity": "unrated",
                 "finding_count": 1,
                 "source_case_count": 1,
                 "operators": [
@@ -459,14 +460,31 @@ def test_root_human_report_explains_patterns_and_augmentation_names(tmp_path: Pa
     report = runner.invoke(app, ["report", str(evidence)])
 
     assert report.exit_code == 1, report.output
-    assert "Failure patterns to review: 1" in report.output
+    assert "Reviewable finding patterns: 1" in report.output
     assert "Patterns group similar evidence; they do not claim a root cause." in report.output
     assert "Pattern 1: The changed input altered an important action detail." in report.output
+    assert "Priority: unrated" in report.output
+    assert "Why grouped: same finding category and private action shape." in report.output
     assert "Affected: 1 finding(s) across 1 test question(s)" in report.output
     assert "Repeat a word as a natural disfluency." in report.output
     assert "1 needs review; 0 confirmed" in report.output
+    assert "Next: use the per-finding review commands below." in report.output
     assert "Pay AC-100" not in report.output
     assert "AC-101" not in report.output
+
+
+def test_report_contract_rejects_pattern_review_counts_that_disagree_with_findings(
+    tmp_path: Path,
+) -> None:
+    evidence = tmp_path / "evidence.jsonl"
+    _write_evidence(evidence)
+    report = runner.invoke(app, ["report", str(evidence), "--json"])
+    payload = json.loads(report.output)
+    payload["patterns"][0]["needs_review_count"] = 0
+    payload["patterns"][0]["confirmed_count"] = 1
+
+    with pytest.raises(ValueError, match="review counts must match member findings"):
+        UnifiedReport.model_validate_json(json.dumps(payload))
 
 
 def test_failure_patterns_group_same_mechanism_across_questions_and_augmentations() -> None:
@@ -529,6 +547,31 @@ def test_failure_patterns_group_same_mechanism_across_questions_and_augmentation
     ]
     assert changed_argument_pattern.finding_ids == finding_ids[:3]
     assert len(patterns) == 2
+
+
+def test_effect_statuses_produce_distinct_pattern_signatures() -> None:
+    completed_effect = dataset_review._Effect.model_validate(_effect("AC-100"))
+    failed_effect = completed_effect.model_copy(update={"status": "failed"})
+
+    assert dataset_review._bounded_effect_mechanisms([completed_effect]) != (
+        dataset_review._bounded_effect_mechanisms([failed_effect])
+    )
+
+
+def test_behavior_pattern_signature_abstains_from_unbounded_effect_metadata() -> None:
+    effect = dataset_review._Effect.model_validate(_effect("AC-100"))
+    finding = dataset_review._Finding(
+        finding_id=FINDING_ID,
+        category="changed_grounded_effect_argument",
+        grounded_field_names=["invoice_reference"],
+        severity="unrated",
+        review_status="needs_review",
+        summary="The live variation changed a grounded action value.",
+        reference_effects=[effect] * (dataset_review._MAXIMUM_PATTERN_EFFECTS + 1),
+        observed_effects=[effect],
+    )
+
+    assert dataset_review._behavior_pattern_signature(finding) is None
 
 
 def test_root_report_uses_a_placeholder_in_windows_commands(

@@ -52,6 +52,13 @@ _IDENTIFIER_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$"
 _VERSION_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9._+-]{0,49}$"
 _FINDING_ID_PATTERN = r"^ulf_v1_[0-9a-f]{64}$"
 _PATTERN_ID_PATTERN = r"^ulp_v1_[0-9a-f]{64}$"
+_SEVERITY_RANK: dict[FindingSeverity, int] = {
+    "unrated": 0,
+    "low": 1,
+    "medium": 2,
+    "high": 3,
+    "critical": 4,
+}
 _BEHAVIOR_SUMMARIES: dict[str, str] = {
     "duplicate_effect": "The changed input made the agent repeat an action.",
     "unexpected_effect": "The changed input made the agent take a new action.",
@@ -133,6 +140,14 @@ class PatternOperator(_StrictModel):
     summary: str | None = Field(default=None, min_length=1, max_length=500)
 
 
+def _effective_finding_severity(finding: FindingSummary) -> FindingSeverity:
+    if finding.review_status == "confirmed":
+        if finding.review_severity is None:
+            raise AssertionError("validated confirmed finding requires review severity")
+        return finding.review_severity
+    return finding.declared_severity or "unrated"
+
+
 class FailurePattern(_StrictModel):
     pattern_id: str = Field(pattern=_PATTERN_ID_PATTERN)
     kind: FindingKind
@@ -140,6 +155,7 @@ class FailurePattern(_StrictModel):
     rule_id: str | None = Field(default=None, pattern=_IDENTIFIER_PATTERN)
     rule_version: str | None = Field(default=None, pattern=_VERSION_PATTERN)
     summary: FindingSummaryText
+    severity: FindingSeverity
     finding_count: int = Field(ge=1)
     source_case_count: int = Field(ge=1)
     operators: tuple[PatternOperator, ...] = Field(min_length=1)
@@ -157,6 +173,8 @@ class FailurePattern(_StrictModel):
             raise ValueError("invariant patterns require a customer rule")
         if self.finding_count != len(self.finding_ids):
             raise ValueError("pattern finding count must match finding IDs")
+        if self.source_case_count > self.finding_count:
+            raise ValueError("pattern source case count cannot exceed finding count")
         if self.finding_ids != tuple(sorted(set(self.finding_ids))):
             raise ValueError("pattern finding IDs must be sorted and unique")
         if self.needs_review_count + self.confirmed_count != self.finding_count:
@@ -232,9 +250,15 @@ class UnifiedReport(_StrictModel):
             raise ValueError("exit code must match report review status")
         if self.summary.finding_count != len(self.findings):
             raise ValueError("finding count must match report findings")
-        if tuple(pattern.pattern_id for pattern in self.patterns) != tuple(
-            sorted({pattern.pattern_id for pattern in self.patterns})
-        ):
+        pattern_ids = tuple(pattern.pattern_id for pattern in self.patterns)
+        expected_pattern_order = tuple(
+            pattern.pattern_id
+            for pattern in sorted(
+                self.patterns,
+                key=lambda pattern: (-_SEVERITY_RANK[pattern.severity], pattern.pattern_id),
+            )
+        )
+        if len(pattern_ids) != len(set(pattern_ids)) or pattern_ids != expected_pattern_order:
             raise ValueError("patterns must be sorted and unique")
         known_findings = {
             finding.finding_id: finding
@@ -243,6 +267,7 @@ class UnifiedReport(_StrictModel):
         }
         patterned_findings: set[str] = set()
         for pattern in self.patterns:
+            pattern_findings: list[FindingSummary] = []
             for finding_id in pattern.finding_ids:
                 finding = known_findings.get(finding_id)
                 if finding is None:
@@ -259,6 +284,22 @@ class UnifiedReport(_StrictModel):
                 ):
                     raise ValueError("pattern fields must match its actionable findings")
                 patterned_findings.add(finding_id)
+                pattern_findings.append(finding)
+            if pattern.needs_review_count != sum(
+                finding.review_status == "needs_review" for finding in pattern_findings
+            ) or pattern.confirmed_count != sum(
+                finding.review_status == "confirmed" for finding in pattern_findings
+            ):
+                raise ValueError("pattern review counts must match member findings")
+            member_severities: list[FindingSeverity] = [
+                _effective_finding_severity(finding) for finding in pattern_findings
+            ]
+            expected_severity = sorted(
+                member_severities,
+                key=_SEVERITY_RANK.__getitem__,
+            )[-1]
+            if pattern.severity != expected_severity:
+                raise ValueError("pattern severity must match member findings")
         expected_review_counts = {
             status: sum(finding.review_status == status for finding in self.findings)
             for status in (
