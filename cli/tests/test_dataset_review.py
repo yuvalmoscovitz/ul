@@ -32,6 +32,7 @@ from ul.dataset_invariants import DatasetInvariantSuite, JsonValuesEqualInvarian
 from ul_cli import dataset_review
 from ul_cli import report as report_module
 from ul_cli.main import app
+from ul_cli.report_contract import FindingSummary, UnifiedReport
 
 runner = CliRunner()
 FINDING_ID = f"ulf_v1_{'a' * 64}"
@@ -377,7 +378,7 @@ def test_root_json_report_is_stable_and_omits_private_dataset_fields(tmp_path: P
 
     assert report.exit_code == 1, report.output
     expected = {
-        "schema_version": "1.3.0",
+        "schema_version": "1.4.0",
         "evidence_type": "dataset_evaluation",
         "evidence_schema_versions": ["1.3.0"],
         "evidence_scope": "response_and_state",
@@ -395,6 +396,31 @@ def test_root_json_report_is_stable_and_omits_private_dataset_fields(tmp_path: P
                 "inconclusive": 0,
             },
         },
+        "patterns": [
+            {
+                "pattern_id": (
+                    "ulp_v1_7b5a7ed8ae70cb94775e84e7896140c6fba2bf35c33187d09c015c645ae5bcd9"
+                ),
+                "kind": "behavior_difference",
+                "category": "changed_grounded_effect_argument",
+                "rule_id": None,
+                "rule_version": None,
+                "summary": "The changed input altered an important action detail.",
+                "severity": "unrated",
+                "finding_count": 1,
+                "source_case_count": 1,
+                "operators": [
+                    {
+                        "operator_id": "input.surface.disfluency_repeat",
+                        "operator_version": "1.0.0",
+                        "summary": "Repeat a word as a natural disfluency.",
+                    }
+                ],
+                "needs_review_count": 1,
+                "confirmed_count": 0,
+                "finding_ids": [FINDING_ID],
+            }
+        ],
         "findings": [
             {
                 "finding_id": FINDING_ID,
@@ -425,6 +451,127 @@ def test_root_json_report_is_stable_and_omits_private_dataset_fields(tmp_path: P
     assert "Pay pay AC-100" not in report.output
     assert "AC-101" not in report.output
     assert "technical_details" not in report.output
+
+
+def test_root_human_report_explains_patterns_and_augmentation_names(tmp_path: Path) -> None:
+    evidence = tmp_path / "evidence.jsonl"
+    _write_evidence(evidence)
+
+    report = runner.invoke(app, ["report", str(evidence)])
+
+    assert report.exit_code == 1, report.output
+    assert "Reviewable finding patterns: 1" in report.output
+    assert "Patterns group similar evidence; they do not claim a root cause." in report.output
+    assert "Pattern 1: The changed input altered an important action detail." in report.output
+    assert "Priority: unrated" in report.output
+    assert "Why grouped: same finding category and private action shape." in report.output
+    assert "Affected: 1 finding(s) across 1 test question(s)" in report.output
+    assert "Repeat a word as a natural disfluency." in report.output
+    assert "1 needs review; 0 confirmed" in report.output
+    assert "Next: use the per-finding review commands below." in report.output
+    assert "Pay AC-100" not in report.output
+    assert "AC-101" not in report.output
+
+
+def test_report_contract_rejects_pattern_review_counts_that_disagree_with_findings(
+    tmp_path: Path,
+) -> None:
+    evidence = tmp_path / "evidence.jsonl"
+    _write_evidence(evidence)
+    report = runner.invoke(app, ["report", str(evidence), "--json"])
+    payload = json.loads(report.output)
+    payload["patterns"][0]["needs_review_count"] = 0
+    payload["patterns"][0]["confirmed_count"] = 1
+
+    with pytest.raises(ValueError, match="review counts must match member findings"):
+        UnifiedReport.model_validate_json(json.dumps(payload))
+
+
+def test_failure_patterns_group_same_mechanism_across_questions_and_augmentations() -> None:
+    finding_ids = tuple(f"ulf_v1_{character * 64}" for character in "abcd")
+    operators = (
+        "input.surface.typing_noise",
+        "input.style.terse",
+        "input.surface.typing_noise",
+        "input.style.verbose",
+    )
+    categories = (
+        "changed_grounded_effect_argument",
+        "changed_grounded_effect_argument",
+        "changed_grounded_effect_argument",
+        "duplicate_effect",
+    )
+    summaries = (
+        "The changed input altered an important action detail.",
+        "The changed input altered an important action detail.",
+        "The changed input altered an important action detail.",
+        "The changed input made the agent repeat an action.",
+    )
+    findings = tuple(
+        FindingSummary(
+            finding_id=finding_id,
+            kind="behavior_difference",
+            category=category,
+            operator_id=operator_id,
+            operator_version="1.0.0",
+            review_status="needs_review",
+            review_severity="unrated",
+            requested_repetitions=3,
+            conclusive_repetitions=3,
+            inconclusive_repetitions=0,
+            stability="stable",
+            next_action="review_dataset_finding",
+            summary=summary,
+        )
+        for finding_id, operator_id, category, summary in zip(
+            finding_ids, operators, categories, summaries, strict=True
+        )
+    )
+    contexts = {
+        finding_ids[0]: ("1" * 64, "source-a", operators[0]),
+        finding_ids[1]: ("1" * 64, "source-a", operators[1]),
+        finding_ids[2]: ("1" * 64, "source-b", operators[2]),
+        finding_ids[3]: ("2" * 64, "source-b", operators[3]),
+    }
+
+    patterns = dataset_review._build_failure_patterns(findings, contexts)
+
+    changed_argument_pattern = next(
+        pattern for pattern in patterns if pattern.category == "changed_grounded_effect_argument"
+    )
+    assert changed_argument_pattern.finding_count == 3
+    assert changed_argument_pattern.source_case_count == 2
+    assert [operator.operator_id for operator in changed_argument_pattern.operators] == [
+        "input.style.terse",
+        "input.surface.typing_noise",
+    ]
+    assert changed_argument_pattern.finding_ids == finding_ids[:3]
+    assert len(patterns) == 2
+
+
+def test_effect_statuses_produce_distinct_pattern_signatures() -> None:
+    completed_effect = dataset_review._Effect.model_validate(_effect("AC-100"))
+    failed_effect = completed_effect.model_copy(update={"status": "failed"})
+
+    assert dataset_review._bounded_effect_mechanisms([completed_effect]) != (
+        dataset_review._bounded_effect_mechanisms([failed_effect])
+    )
+
+
+def test_behavior_pattern_signature_abstains_from_unbounded_effect_metadata() -> None:
+    effect = dataset_review._Effect.model_validate(_effect("AC-100"))
+    finding = dataset_review._Finding(
+        finding_id=FINDING_ID,
+        category="changed_grounded_effect_argument",
+        grounded_field_names=["invoice_reference"],
+        severity="unrated",
+        review_status="needs_review",
+        summary="The live variation changed a grounded action value.",
+        reference_effects=[effect] * (dataset_review._MAXIMUM_PATTERN_EFFECTS + 1),
+        observed_effects=[effect],
+    )
+
+    assert dataset_review._behavior_pattern_signature(finding) is None
 
 
 def test_root_report_uses_a_placeholder_in_windows_commands(

@@ -44,13 +44,16 @@ from ul.dataset_invariants import (
 )
 from ul.dataset_regression import dataset_regression_target_config_sha256
 from ul.http_environment import JsonHttpIsolatedResponseConfig, JsonHttpTargetConfig
+from ul_core.augmentation_catalog import builtin_augmentation_catalog
 
 from ul_cli.report_contract import (
+    FailurePattern,
     FindingCategory,
     FindingReviewStatus,
     FindingSeverity,
     FindingSummary,
     FindingSummaryText,
+    PatternOperator,
     ReportInputError,
     ReportReviewStatus,
     UnifiedReport,
@@ -72,6 +75,16 @@ _SHA256_PATTERN = r"^[0-9a-f]{64}$"
 _FINDING_ID_PATTERN = r"^ulf_v1_[0-9a-f]{64}$"
 _REVIEW_ID_PATTERN = r"^ulr_[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
 _DATASET_EVALUATION_PIPELINE_VERSION = "1.2.0"
+_MAXIMUM_PATTERN_EFFECTS = 100
+_MAXIMUM_PATTERN_FIELDS = 100
+_MAXIMUM_PATTERN_LABEL_CHARACTERS = 500
+_PATTERN_SEVERITY_RANK: dict[FindingSeverity, int] = {
+    "unrated": 0,
+    "low": 1,
+    "medium": 2,
+    "high": 3,
+    "critical": 4,
+}
 
 ReviewStatus = Literal["confirmed", "expected", "unsupported", "inconclusive"]
 ReviewSeverity = Literal["unrated", "low", "medium", "high", "critical"]
@@ -580,6 +593,7 @@ def _summarize_dataset_evidence(
     active_reviews = _active_reviews(review_records)
 
     finding_summaries: list[FindingSummary] = []
+    pattern_contexts: dict[str, tuple[str, str, str]] = {}
     indexed_invariant_keys: set[tuple[str, str, str, str]] = set()
     for indexed_finding in indexed_findings.values():
         active_review = active_reviews.get(indexed_finding.finding_id)
@@ -619,6 +633,15 @@ def _summarize_dataset_evidence(
                     summary=summary,
                 )
             )
+            if review_status in {"needs_review", "confirmed"}:
+                semantic_finding = indexed_finding.semantic_finding
+                pattern_signature = _behavior_pattern_signature(semantic_finding)
+                if pattern_signature is not None:
+                    pattern_contexts[indexed_finding.finding_id] = (
+                        pattern_signature,
+                        indexed_finding.evidence_record.evidence.interaction_id,
+                        indexed_finding.case.operator_id,
+                    )
             continue
 
         variation_rule = indexed_finding.variation_rule
@@ -655,6 +678,19 @@ def _summarize_dataset_evidence(
                 summary="The agent violated a customer-defined rule.",
             )
         )
+        if review_status in {"needs_review", "confirmed"}:
+            pattern_signature = _canonical_json_sha256(
+                {
+                    "kind": "customer_invariant_violation",
+                    "rule_id": variation_rule.rule_id,
+                    "rule_version": variation_rule.rule_version,
+                }
+            )
+            pattern_contexts[indexed_finding.finding_id] = (
+                pattern_signature,
+                indexed_finding.evidence_record.evidence.interaction_id,
+                indexed_finding.case.operator_id,
+            )
 
     for loaded_record in evidence_records:
         for case in loaded_record.evidence.cases:
@@ -738,6 +774,7 @@ def _summarize_dataset_evidence(
                 )
 
     findings = tuple(finding_summaries)
+    patterns = _build_failure_patterns(findings, pattern_contexts)
     summary = build_report_summary(findings)
     if summary.actionable_finding_count:
         report_review_status: ReportReviewStatus = "action_required"
@@ -779,7 +816,137 @@ def _summarize_dataset_evidence(
         review_status=report_review_status,
         exit_code=exit_code,
         summary=summary,
+        patterns=patterns,
         findings=findings,
+    )
+
+
+def _behavior_pattern_signature(finding: _Finding) -> str | None:
+    if len(finding.grounded_field_names) > _MAXIMUM_PATTERN_FIELDS or any(
+        len(field_name) > _MAXIMUM_PATTERN_LABEL_CHARACTERS
+        for field_name in finding.grounded_field_names
+    ):
+        return None
+    reference_effects = _bounded_effect_mechanisms(finding.reference_effects)
+    observed_effects = _bounded_effect_mechanisms(finding.observed_effects)
+    if reference_effects is None or observed_effects is None:
+        return None
+    return _canonical_json_sha256(
+        {
+            "kind": "behavior_difference",
+            "category": finding.category,
+            "grounded_field_names": sorted(finding.grounded_field_names),
+            "reference_effects": reference_effects,
+            "observed_effects": observed_effects,
+        }
+    )
+
+
+def _bounded_effect_mechanisms(effects: list[_Effect]) -> list[dict[str, object]] | None:
+    if len(effects) > _MAXIMUM_PATTERN_EFFECTS:
+        return None
+    if any(
+        len(effect.fields) > _MAXIMUM_PATTERN_FIELDS
+        or len(effect.kind) > _MAXIMUM_PATTERN_LABEL_CHARACTERS
+        or len(effect.predicate) > _MAXIMUM_PATTERN_LABEL_CHARACTERS
+        or any(len(field_name) > _MAXIMUM_PATTERN_LABEL_CHARACTERS for field_name in effect.fields)
+        for effect in effects
+    ):
+        return None
+    return sorted(
+        (
+            {
+                "kind": effect.kind,
+                "predicate": effect.predicate,
+                "status": effect.status,
+                "field_names": sorted(effect.fields),
+            }
+            for effect in effects
+        ),
+        key=lambda value: json.dumps(value, sort_keys=True, separators=(",", ":")),
+    )
+
+
+def _build_failure_patterns(
+    findings: tuple[FindingSummary, ...],
+    contexts: dict[str, tuple[str, str, str]],
+) -> tuple[FailurePattern, ...]:
+    findings_by_id = {
+        finding.finding_id: finding for finding in findings if finding.finding_id is not None
+    }
+    grouped: dict[str, list[tuple[FindingSummary, str, str]]] = {}
+    for finding_id, (signature, source_case_id, operator_id) in contexts.items():
+        grouped.setdefault(signature, []).append(
+            (findings_by_id[finding_id], source_case_id, operator_id)
+        )
+
+    catalog = builtin_augmentation_catalog()
+    patterns: list[FailurePattern] = []
+    for members in grouped.values():
+        first = members[0][0]
+        operator_keys = sorted(
+            {
+                (operator_id, finding.operator_version)
+                for finding, _, operator_id in members
+                if finding.operator_version is not None
+            }
+        )
+        operators: list[PatternOperator] = []
+        for operator_id, operator_version in operator_keys:
+            try:
+                operator_summary = catalog.get(operator_id, operator_version).summary
+            except KeyError:
+                operator_summary = None
+            operators.append(
+                PatternOperator(
+                    operator_id=operator_id,
+                    operator_version=operator_version,
+                    summary=operator_summary,
+                )
+            )
+        finding_ids = tuple(sorted(cast(str, finding.finding_id) for finding, _, _ in members))
+        public_pattern_digest = _canonical_json_sha256({"finding_ids": finding_ids})
+        member_severities: list[FindingSeverity] = []
+        for finding, _, _ in members:
+            if finding.review_status == "confirmed":
+                if finding.review_severity is None:
+                    raise AssertionError("validated confirmed finding requires review severity")
+                member_severities.append(finding.review_severity)
+            else:
+                member_severities.append(finding.declared_severity or "unrated")
+        pattern_severity = sorted(
+            member_severities,
+            key=_PATTERN_SEVERITY_RANK.__getitem__,
+        )[-1]
+        patterns.append(
+            FailurePattern(
+                pattern_id=f"ulp_v1_{public_pattern_digest}",
+                kind=first.kind,
+                category=first.category,
+                rule_id=first.rule_id,
+                rule_version=first.rule_version,
+                summary=first.summary,
+                severity=pattern_severity,
+                finding_count=len(members),
+                source_case_count=len({source_case_id for _, source_case_id, _ in members}),
+                operators=tuple(operators),
+                needs_review_count=sum(
+                    finding.review_status == "needs_review" for finding, _, _ in members
+                ),
+                confirmed_count=sum(
+                    finding.review_status == "confirmed" for finding, _, _ in members
+                ),
+                finding_ids=finding_ids,
+            )
+        )
+    return tuple(
+        sorted(
+            patterns,
+            key=lambda pattern: (
+                -_PATTERN_SEVERITY_RANK[pattern.severity],
+                pattern.pattern_id,
+            ),
+        )
     )
 
 

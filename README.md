@@ -174,11 +174,16 @@ ul dataset review .ul/runs/EVIDENCE.jsonl FINDING_ID \
 With an explicit evidence path, `ul report` auto-detects dataset evaluation, correction,
 retry-after-successful-commit, and timeout-after-commit evidence. Its default human summary and
 versioned JSON omit inputs, responses, state, customer descriptions, and arbitrary evidence text.
+For reviewable dataset findings, the report groups matching evidence into deterministic finding
+patterns. Each pattern shows how many test questions are affected, which augmentations it was
+observed under, its review queue, and the exact underlying finding IDs. Patterns are
+evidence-navigation aids, not correctness, causation, or root-cause claims. Inspect-only findings,
+such as unstable behavior without a reviewable semantic difference, remain listed separately.
 Use `ul dataset report EVIDENCE.jsonl` when you need the detailed private dataset review surface.
 Trace replay bundles are not supported by `ul report`.
 
 Reviews are appended to a separate audit file. Evidence is never rewritten. The human report and
-versioned JSON expose review workflow status (`review_status` in report schema `1.2.0`). Exit codes
+versioned JSON expose review workflow status (`review_status` in report schema `1.4.0`). Exit codes
 map to that review status:
 
 - `0` (`resolved`): no actionable finding remains; `expected` and `unsupported` reviews resolve a
