@@ -372,7 +372,7 @@ class TraceReplayResult(_StrictModel):
         return self
 
 
-class TraceStressCampaignPlanCase(_StrictModel):
+class TraceReplayCampaignPlanCase(_StrictModel):
     stress: TraceStressPlanCase
     replay: TraceReplayPlan
 
@@ -386,13 +386,14 @@ class TraceStressCampaignPlanCase(_StrictModel):
         return self
 
 
-class TraceStressCampaignPlan(_StrictModel):
+class TraceReplayCampaignPlan(_StrictModel):
     schema_version: Literal["1.0.0"] = "1.0.0"
     total_case_count: int = Field(ge=1)
     selected_case_count: int = Field(ge=1)
     repetitions: int = Field(ge=1, le=_MAXIMUM_REPLAY_REPETITIONS)
     required_target_calls: int = Field(ge=1)
-    cases: tuple[TraceStressCampaignPlanCase, ...] = Field(min_length=1)
+    authorized_target_calls: int = Field(ge=1)
+    cases: tuple[TraceReplayCampaignPlanCase, ...] = Field(min_length=1)
 
     @field_validator("cases", mode="before")
     @classmethod
@@ -411,12 +412,14 @@ class TraceStressCampaignPlan(_StrictModel):
             case.replay.required_target_calls for case in self.cases
         ):
             raise ValueError("campaign call count must match its case plans")
+        if self.required_target_calls > self.authorized_target_calls:
+            raise ValueError("campaign call count exceeds its authorized target calls")
         return self
 
 
-class TraceStressCampaignResult(_StrictModel):
+class TraceReplayCampaignResult(_StrictModel):
     schema_version: Literal["1.0.0"] = "1.0.0"
-    plan: TraceStressCampaignPlan
+    plan: TraceReplayCampaignPlan
     results: tuple[TraceReplayResult, ...] = Field(min_length=1)
     grouping: TraceReplayDifferenceGrouping
 
@@ -431,8 +434,8 @@ class TraceStressCampaignResult(_StrictModel):
         result_case_ids = tuple(result.case.case_id for result in self.results)
         if result_case_ids != planned_case_ids:
             raise ValueError("campaign results must preserve planned case order")
-        if self.grouping.result_count != len(self.results):
-            raise ValueError("campaign grouping must cover every result")
+        if self.grouping != group_trace_replay_differences(self.results):
+            raise ValueError("campaign grouping must match its replay results")
         return self
 
 
@@ -505,14 +508,14 @@ def derive_trace_stress_plan(bundle: TraceReplayBundle) -> TraceStressPlan:
     return TraceStressPlan(case_count=len(ranked_cases), cases=ranked_cases)
 
 
-def plan_trace_stress_campaign(
+def plan_trace_replay_campaign(
     bundle: TraceReplayBundle,
     target_config: JsonHttpTargetConfig,
     *,
     limit: int = 10,
     repetitions: int = 3,
     max_target_calls: int = 100,
-) -> TraceStressCampaignPlan:
+) -> TraceReplayCampaignPlan:
     if type(limit) is not int or limit < 1:
         raise ValueError("limit must be a positive integer")
     if type(max_target_calls) is not int or max_target_calls < 1:
@@ -520,7 +523,7 @@ def plan_trace_stress_campaign(
     stress_plan = derive_trace_stress_plan(bundle)
     replay_case_by_id = {case.case_id: case for case in bundle.cases}
     campaign_cases = tuple(
-        TraceStressCampaignPlanCase(
+        TraceReplayCampaignPlanCase(
             stress=stress_case,
             replay=plan_trace_replay(
                 replay_case_by_id[stress_case.case_id],
@@ -533,12 +536,18 @@ def plan_trace_stress_campaign(
     )
     required_target_calls = sum(case.replay.required_target_calls for case in campaign_cases)
     if required_target_calls > max_target_calls:
-        raise ValueError("trace stress campaign exceeds the authorized target call budget")
-    return TraceStressCampaignPlan(
+        raise ValueError(
+            "trace replay campaign requires "
+            f"{required_target_calls} environment API calls but only {max_target_calls} are "
+            "authorized; reduce --limit or --repetitions, or raise "
+            "--max-environment-api-calls"
+        )
+    return TraceReplayCampaignPlan(
         total_case_count=stress_plan.case_count,
         selected_case_count=len(campaign_cases),
         repetitions=repetitions,
         required_target_calls=required_target_calls,
+        authorized_target_calls=max_target_calls,
         cases=campaign_cases,
     )
 
@@ -607,7 +616,11 @@ def plan_trace_replay(
     )
     required_target_calls = repetitions * target_calls_per_repetition
     if required_target_calls > max_target_calls:
-        raise ValueError("trace replay exceeds the authorized target call budget")
+        raise ValueError(
+            f"trace replay requires {required_target_calls} environment API calls but only "
+            f"{max_target_calls} are authorized; reduce --repetitions or raise "
+            "--max-environment-api-calls"
+        )
     return TraceReplayPlan(
         case_id=case.case_id,
         source_trace_id=case.source_trace_id,
@@ -785,41 +798,129 @@ async def run_trace_replay(
     )
 
 
-async def run_trace_stress_campaign(
+async def run_trace_replay_campaign(
     bundle: TraceReplayBundle,
     environment: EnvironmentExecutor,
     *,
-    plan: TraceStressCampaignPlan,
+    plan: TraceReplayCampaignPlan,
     allow_network_egress: bool = False,
-) -> TraceStressCampaignResult:
+) -> TraceReplayCampaignResult:
     if not allow_network_egress:
-        raise ValueError("trace stress campaign requires explicit network opt-in")
+        raise ValueError("trace replay campaign requires explicit network opt-in")
     derived_plan = derive_trace_stress_plan(bundle)
     expected_stress_cases = derived_plan.cases[: plan.selected_case_count]
     if (
         plan.total_case_count != derived_plan.case_count
         or tuple(case.stress for case in plan.cases) != expected_stress_cases
     ):
-        raise ValueError("trace stress campaign plan does not match the replay bundle")
+        raise ValueError("trace replay campaign plan does not match the replay bundle")
     replay_case_by_id = {case.case_id: case for case in bundle.cases}
+    runtime_replay_plans = tuple(
+        _runtime_trace_replay_plan(
+            replay_case_by_id[campaign_case.replay.case_id],
+            environment,
+            repetitions=plan.repetitions,
+        )
+        for campaign_case in plan.cases
+    )
+    if tuple(case.replay for case in plan.cases) != runtime_replay_plans:
+        raise ValueError("trace replay campaign plan does not match the target execution contract")
     results: list[TraceReplayResult] = []
+    environment_state_uncertain = False
     for campaign_case in plan.cases:
         replay_plan = campaign_case.replay
-        results.append(
-            await run_trace_replay(
-                replay_case_by_id[replay_plan.case_id],
+        replay_case = replay_case_by_id[replay_plan.case_id]
+        if environment_state_uncertain:
+            result = TraceReplayResult(
+                case=replay_case,
+                requested_repetitions=replay_plan.repetitions,
+                required_target_calls=replay_plan.required_target_calls,
+                status="inconclusive",
+                response_match_count=0,
+                state_match_count=(0 if replay_case.recorded_state_snapshot_available else None),
+                trials=tuple(
+                    TraceReplayTrial(
+                        repetition=repetition,
+                        inconclusive_reason=(
+                            "environment not called because prior execution left state uncertain"
+                        ),
+                    )
+                    for repetition in range(1, replay_plan.repetitions + 1)
+                ),
+            )
+        else:
+            result = await run_trace_replay(
+                replay_case,
                 environment,
                 repetitions=replay_plan.repetitions,
                 max_target_calls=replay_plan.required_target_calls,
                 allow_network_egress=True,
             )
-        )
+            environment_state_uncertain = _trace_replay_result_requires_quarantine(
+                result, environment
+            )
+        results.append(result)
     result_tuple = tuple(results)
-    return TraceStressCampaignResult(
+    return TraceReplayCampaignResult(
         plan=plan,
         results=result_tuple,
         grouping=group_trace_replay_differences(result_tuple),
     )
+
+
+def _runtime_trace_replay_plan(
+    case: TraceReplayCase,
+    environment: EnvironmentExecutor,
+    *,
+    repetitions: int,
+) -> TraceReplayPlan:
+    evaluation_case = evaluation_case_from_inputs(
+        case_id=f"ul-case-{secrets.token_hex(16)}",
+        raw_inputs=(turn.content for turn in case.replay_user_turns),
+        max_environment_api_calls=1,
+        timeout_seconds=30,
+        required_state_observation_authority=(
+            environment.capabilities.state_observation_authority
+            if case.recorded_state_snapshot_available
+            else None
+        ),
+        required_state_observer_id=(
+            environment.capabilities.state_observer_id
+            if case.recorded_state_snapshot_available
+            else None
+        ),
+    )
+    target_calls_per_repetition = environment.api_calls_for_case(evaluation_case)
+    if type(target_calls_per_repetition) is not int or target_calls_per_repetition < 1:
+        raise ValueError("trace replay target returned an invalid physical call count")
+    return TraceReplayPlan(
+        case_id=case.case_id,
+        source_trace_id=case.source_trace_id,
+        replay_turn_count=len(case.replay_user_turns),
+        repetitions=repetitions,
+        target_calls_per_repetition=target_calls_per_repetition,
+        required_target_calls=repetitions * target_calls_per_repetition,
+    )
+
+
+def _trace_replay_result_requires_quarantine(
+    result: TraceReplayResult,
+    environment: EnvironmentExecutor,
+) -> bool:
+    for trial in result.trials:
+        if trial.execution_evidence is not None and execution_evidence_requires_quarantine(
+            trial.execution_evidence
+        ):
+            return True
+        if trial.inconclusive_reason == "environment execution timed out" and (
+            environment_timeout_requires_quarantine(environment.capabilities)
+        ):
+            return True
+        if trial.inconclusive_reason == (
+            "environment not called because prior execution left state uncertain"
+        ):
+            return True
+    return False
 
 
 def load_trace_replay_bundle(path: str | Path) -> TraceReplayBundle:

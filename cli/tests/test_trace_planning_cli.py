@@ -31,7 +31,7 @@ def _write_trace_campaign_target(path: Path) -> None:
         json.dumps(
             {
                 "version": 5,
-                "environment_id": "trace-campaign-test",
+                "environment_id": "trace-replay-campaign-test",
                 "reset": {
                     "url": "http://127.0.0.1:8765/reset",
                     "request_json_template": {"case_id": "{{case_id}}"},
@@ -173,19 +173,22 @@ def test_trace_group_explains_technical_difference_without_private_content(
     assert "Pay approved invoice" not in result.output
 
 
-def test_trace_campaign_dry_run_reports_selection_and_cumulative_calls_privately(
+def test_trace_replay_campaign_dry_run_reports_actionable_plan_without_credentials(
     tmp_path: Path,
 ) -> None:
     bundle_path = tmp_path / "bundle.json"
     bundle = _write_trace_bundle(bundle_path)
     target_path = tmp_path / "environment.json"
     _write_trace_campaign_target(target_path)
+    target = json.loads(target_path.read_text(encoding="utf-8"))
+    target["headers_from_env"] = {"Authorization": "UL_ENVIRONMENT_MISSING_TEST_TOKEN"}
+    target_path.write_text(json.dumps(target), encoding="utf-8")
 
     result = runner.invoke(
         app,
         [
             "stress",
-            "trace-campaign",
+            "trace-replay-campaign",
             str(bundle_path),
             "--environment-config",
             str(target_path),
@@ -201,15 +204,21 @@ def test_trace_campaign_dry_run_reports_selection_and_cumulative_calls_privately
     )
 
     assert result.exit_code == 0, result.output
-    assert f"Trace campaign: 1/{len(bundle.cases)} prioritized case(s)" in result.output
+    assert f"Trace replay campaign: 1/{len(bundle.cases)} prioritized case(s)" in result.output
     assert "Repetitions per case: 2" in result.output
-    assert "Potential environment API calls: 12" in result.output
+    assert "Potential environment API calls: 12 / 12 authorized" in result.output
+    assert "priority score" in result.output
+    assert "Why:" in result.output
+    assert "Calls: 6 per replay x 2 = 12" in result.output
     assert "Recorded message and state content: not printed" in result.output
     assert "External calls: none" in result.output
+    assert "Next: ul stress trace-replay-campaign" in result.output
+    assert "--output trace-replay-campaign.json" in result.output
+    assert "--allow-environment-network --confirm-test-environment" in result.output
     assert "Pay approved invoice" not in result.output
 
 
-def test_trace_campaign_refuses_to_overwrite_existing_output(tmp_path: Path) -> None:
+def test_trace_replay_campaign_refuses_to_overwrite_existing_output(tmp_path: Path) -> None:
     bundle_path = tmp_path / "bundle.json"
     _write_trace_bundle(bundle_path)
     target_path = tmp_path / "environment.json"
@@ -222,7 +231,7 @@ def test_trace_campaign_refuses_to_overwrite_existing_output(tmp_path: Path) -> 
         app,
         [
             "stress",
-            "trace-campaign",
+            "trace-replay-campaign",
             str(bundle_path),
             "--environment-config",
             str(target_path),
@@ -244,3 +253,16 @@ def test_trace_campaign_refuses_to_overwrite_existing_output(tmp_path: Path) -> 
     assert "output already exists; UL will not overwrite it" in result.output
     assert output_path.read_text(encoding="utf-8") == "keep me"
     assert stat.S_IMODE(output_path.stat().st_mode) == 0o640
+
+
+def test_trace_replay_campaign_help_explains_setup_and_budget_controls() -> None:
+    result = runner.invoke(app, ["stress", "trace-replay-campaign", "--help"])
+
+    assert result.exit_code == 0, result.output
+    normalized_output = " ".join(result.output.split())
+    assert "-e" in normalized_output
+    assert "-b" in normalized_output
+    assert "-n" in normalized_output
+    assert "resettable" in normalized_output
+    assert "cumulative" in normalized_output
+    assert "call budget" in normalized_output

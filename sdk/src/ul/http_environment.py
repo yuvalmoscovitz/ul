@@ -1390,6 +1390,7 @@ def validate_json_http_environment_configuration(
     timeout_seconds: float = 30,
     max_request_bytes: int = 1_000_000,
     max_response_bytes: int = 1_000_000,
+    resolve_header_values: bool = True,
 ) -> dict[str, str]:
     if test_environment_confirmed is not True:
         raise ValueError("environment API access requires explicit test-environment confirmation")
@@ -1405,7 +1406,7 @@ def validate_json_http_environment_configuration(
         raise ValueError("max_request_bytes must be positive")
     if isinstance(max_response_bytes, bool) or max_response_bytes <= 0:
         raise ValueError("max_response_bytes must be positive")
-    return _headers_from_environment(config.headers_from_env)
+    return _headers_from_environment(config.headers_from_env) if resolve_header_values else {}
 
 
 def json_http_environment_calls_per_execution(

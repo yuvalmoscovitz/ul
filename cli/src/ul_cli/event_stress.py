@@ -47,20 +47,20 @@ from ul.timeout_after_commit import (
 )
 from ul.trace_replay import (
     TraceReplayBundle,
+    TraceReplayCampaignPlan,
+    TraceReplayCampaignResult,
     TraceReplayCase,
     TraceReplayDifferenceGrouping,
     TraceReplayResult,
-    TraceStressCampaignPlan,
-    TraceStressCampaignResult,
     TraceStressPlan,
     derive_trace_stress_plan,
     group_trace_replay_differences,
     load_trace_replay_bundle,
     load_trace_replay_results,
     plan_trace_replay,
-    plan_trace_stress_campaign,
+    plan_trace_replay_campaign,
     run_trace_replay,
-    run_trace_stress_campaign,
+    run_trace_replay_campaign,
     select_trace_replay_case,
 )
 
@@ -107,6 +107,7 @@ def run_timeout_after_commit(
             target_config,
             test_environment_confirmed=confirm_test_environment or dry_run,
             allow_insecure_http=allow_insecure_http,
+            resolve_header_values=not dry_run,
         )
         plan = plan_timeout_after_commit_stress_test(
             case,
@@ -206,6 +207,7 @@ def replay_production_trace(
             target_config,
             test_environment_confirmed=confirm_test_environment or dry_run,
             allow_insecure_http=allow_insecure_http,
+            resolve_header_values=not dry_run,
         )
         plan = plan_trace_replay(
             case,
@@ -287,19 +289,47 @@ def plan_production_trace_stress(
     _print_trace_stress_plan(plan, bundle_path)
 
 
-@app.command("trace-campaign")
+@app.command("trace-replay-campaign")
 def run_production_trace_campaign(
     bundle_path: Annotated[Path, typer.Argument(exists=True, dir_okay=False, readable=True)],
     target_config_path: Annotated[
-        Path, typer.Option("--environment-config", exists=True, dir_okay=False, readable=True)
+        Path,
+        typer.Option(
+            "-e",
+            "--environment-config",
+            exists=True,
+            dir_okay=False,
+            readable=True,
+            help="JSON connection config for the resettable test environment.",
+        ),
     ],
     output: Annotated[
-        Path | None, typer.Option(help="New private JSON campaign evidence file.")
+        Path | None,
+        typer.Option("-o", "--output", help="New private JSON campaign evidence file."),
     ] = None,
-    limit: Annotated[int, typer.Option(min=1, max=100)] = 10,
-    repetitions: Annotated[int, typer.Option(min=1)] = 3,
-    max_target_calls: Annotated[int, typer.Option("--max-environment-api-calls", min=1)] = 100,
-    allow_target_network: Annotated[bool, typer.Option("--allow-environment-network")] = False,
+    limit: Annotated[
+        int, typer.Option(min=1, max=100, help="Run at most this many prioritized cases.")
+    ] = 10,
+    repetitions: Annotated[
+        int, typer.Option(min=1, help="Fresh replay attempts for each selected case.")
+    ] = 3,
+    max_target_calls: Annotated[
+        int,
+        typer.Option(
+            "-b",
+            "--max-environment-api-calls",
+            min=1,
+            help="Hard cumulative environment API call budget for the campaign.",
+        ),
+    ] = 100,
+    allow_target_network: Annotated[
+        bool,
+        typer.Option(
+            "-n",
+            "--allow-environment-network",
+            help="Authorize calls to the configured test environment.",
+        ),
+    ] = False,
     confirm_test_environment: Annotated[
         bool,
         typer.Option(help="Confirm the environment is intended for testing and can be reset."),
@@ -319,8 +349,9 @@ def run_production_trace_campaign(
             target_config,
             test_environment_confirmed=confirm_test_environment or dry_run,
             allow_insecure_http=allow_insecure_http,
+            resolve_header_values=not dry_run,
         )
-        plan = plan_trace_stress_campaign(
+        plan = plan_trace_replay_campaign(
             bundle,
             target_config,
             limit=limit,
@@ -331,7 +362,12 @@ def run_production_trace_campaign(
         raise typer.BadParameter(str(error)) from None
 
     if dry_run:
-        _print_trace_campaign_plan(plan)
+        _print_trace_replay_campaign_plan(
+            plan,
+            bundle_path=bundle_path,
+            target_config_path=target_config_path,
+            allow_insecure_http=allow_insecure_http,
+        )
         return
     if not allow_target_network:
         raise typer.BadParameter(
@@ -359,7 +395,7 @@ def run_production_trace_campaign(
                 allow_insecure_http=allow_insecure_http,
                 max_environment_api_calls=max_target_calls,
             )
-            result = asyncio.run(_run_trace_campaign_and_close(bundle, target, plan=plan))
+            result = asyncio.run(_run_trace_replay_campaign_and_close(bundle, target, plan=plan))
             json.dump(result.model_dump(mode="json"), output_stream, ensure_ascii=False, indent=2)
             output_stream.write("\n")
             output_stream.flush()
@@ -367,7 +403,7 @@ def run_production_trace_campaign(
     except BaseException:
         output.unlink(missing_ok=True)
         raise
-    _print_trace_campaign_result(result, output)
+    _print_trace_replay_campaign_result(result, output)
 
 
 @app.command("trace-group")
@@ -772,14 +808,14 @@ async def _run_trace_replay_and_close(
         await target.aclose()
 
 
-async def _run_trace_campaign_and_close(
+async def _run_trace_replay_campaign_and_close(
     bundle: TraceReplayBundle,
     target: JsonHttpEnvironmentConnection,
     *,
-    plan: TraceStressCampaignPlan,
-) -> TraceStressCampaignResult:
+    plan: TraceReplayCampaignPlan,
+) -> TraceReplayCampaignResult:
     try:
-        return await run_trace_stress_campaign(
+        return await run_trace_replay_campaign(
             bundle,
             target,
             plan=plan,
@@ -961,33 +997,77 @@ def _print_trace_stress_plan(plan: TraceStressPlan, bundle_path: Path) -> None:
     typer.echo("Recorded message and state content: not printed")
 
 
-def _print_trace_campaign_plan(plan: TraceStressCampaignPlan) -> None:
+def _print_trace_replay_campaign_plan(
+    plan: TraceReplayCampaignPlan,
+    *,
+    bundle_path: Path,
+    target_config_path: Path,
+    allow_insecure_http: bool,
+) -> None:
     typer.echo(
-        f"Trace campaign: {plan.selected_case_count}/{plan.total_case_count} prioritized case(s)"
+        "Trace replay campaign: "
+        f"{plan.selected_case_count}/{plan.total_case_count} prioritized case(s)"
     )
     typer.echo(f"Repetitions per case: {plan.repetitions}")
-    typer.echo(f"Potential environment API calls: {plan.required_target_calls}")
+    typer.echo(
+        "Potential environment API calls: "
+        f"{plan.required_target_calls} / {plan.authorized_target_calls} authorized"
+    )
     typer.echo("Execution order:")
     for case in plan.cases:
         focuses = ", ".join(focus.replace("_", " ") for focus in case.stress.recommended_focuses)
-        typer.echo(f"  {case.stress.priority_rank}. {case.replay.case_id} — {focuses}")
+        signals = ", ".join(signal.code for signal in case.stress.signals) or "baseline replay"
+        typer.echo(
+            f"  {case.stress.priority_rank}. {case.replay.case_id} "
+            f"(priority score {case.stress.priority_score})"
+        )
+        typer.echo(f"     Why: {signals}")
+        typer.echo(f"     Review focus: {focuses}")
+        typer.echo(
+            f"     Calls: {case.replay.target_calls_per_repetition} per replay x "
+            f"{case.replay.repetitions} = {case.replay.required_target_calls}"
+        )
     typer.echo("Recorded message and state content: not printed")
     typer.echo("External calls: none")
+    command_parts = [
+        "ul",
+        "stress",
+        "trace-replay-campaign",
+        str(bundle_path),
+        "--environment-config",
+        str(target_config_path),
+        "--output",
+        "trace-replay-campaign.json",
+        "--limit",
+        str(plan.selected_case_count),
+        "--repetitions",
+        str(plan.repetitions),
+        "--max-environment-api-calls",
+        str(plan.authorized_target_calls),
+        "--allow-environment-network",
+        "--confirm-test-environment",
+    ]
+    if allow_insecure_http:
+        command_parts.append("--allow-insecure-http")
+    typer.echo(f"Next: {' '.join(shlex.quote(part) for part in command_parts)}")
 
 
-def _print_trace_campaign_result(result: TraceStressCampaignResult, output: Path) -> None:
+def _print_trace_replay_campaign_result(result: TraceReplayCampaignResult, output: Path) -> None:
     reproduced = result.grouping.reproduced_count
     drifted = sum(case.status == "drifted" for case in result.results)
     inconclusive = sum(case.status == "inconclusive" for case in result.results)
-    typer.echo(f"Trace campaign complete: {len(result.results)} case(s)")
+    typer.echo(f"Trace replay campaign complete: {len(result.results)} case(s)")
     typer.echo(f"Reproduced: {reproduced}  Different: {drifted}  Inconclusive: {inconclusive}")
     typer.echo(f"Difference patterns: {len(result.grouping.groups)}")
+    for group in result.grouping.groups:
+        typer.echo(f"  {group.signature}: {group.occurrence_count} case(s)")
+        for reason_code in group.reason_codes:
+            typer.echo(f"    {_trace_replay_reason_explanation(reason_code)}")
+        typer.echo(f"    Cases: {', '.join(member.case_id for member in group.members)}")
     typer.echo(f"Complete private evidence: {output}")
     typer.echo("Interpretation: differences show replay drift, not correctness or cause.")
     if inconclusive:
         raise typer.Exit(code=2)
-    if drifted:
-        raise typer.Exit(code=1)
 
 
 def _print_trace_replay_difference_grouping(
