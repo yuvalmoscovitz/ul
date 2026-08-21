@@ -34,11 +34,16 @@ class _StaticResponseStream(httpx.AsyncByteStream):
         yield self._body
 
 
-def _raw_response(body: bytes, *, status_code: int = 200) -> httpx.Response:
+def _raw_response(
+    body: bytes,
+    *,
+    status_code: int = 200,
+    headers: dict[str, str] | None = None,
+) -> httpx.Response:
     return httpx.Response(
         status_code,
         stream=_StaticResponseStream(body),
-        headers={"content-type": "application/json"},
+        headers={"content-type": "application/json", **(headers or {})},
     )
 
 
@@ -132,11 +137,7 @@ def _isolated_response_config() -> JsonHttpIsolatedResponseConfig:
             "safe_test_target_attested": True,
             "execute": {
                 "url": "https://environment.example.test/execute",
-                "request_json_template": {
-                    "case_id": "{{case_id}}",
-                    "turn_id": "{{turn_id}}",
-                    "input": "{{input}}",
-                },
+                "request_json_template": {"input": "{{input}}"},
                 "response_json_pointer": "/response",
             },
         }
@@ -159,7 +160,7 @@ async def test_isolated_response_executes_one_request_and_labels_response_only_e
     evidence = await environment.execute(_case("Pay invoice AC-100", max_calls=1))
     await client.aclose()
 
-    assert requests == [{"case_id": "case-1", "turn_id": "turn-1", "input": "Pay invoice AC-100"}]
+    assert requests == [{"input": "Pay invoice AC-100"}]
     assert environment.capabilities.supports_conversations is False
     assert environment.capabilities.supports_state_observation is False
     assert environment.capabilities.request_isolation == "per_request_attested"
@@ -199,6 +200,132 @@ async def test_isolated_response_failure_does_not_block_the_next_independent_req
     assert request_count == 2
 
 
+async def test_isolated_response_rejects_reflected_header_secret_before_mapping(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("UL_ENVIRONMENT_AGENT_TOKEN", "private-agent-token")
+    raw_config = _isolated_response_config().model_dump(mode="json")
+    raw_config["headers_from_env"] = {"Authorization": "UL_ENVIRONMENT_AGENT_TOKEN"}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return _raw_response(
+            json.dumps(
+                {
+                    "response": "safe selected value",
+                    "debug": "Bearer private-agent-token",
+                }
+            ).encode()
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        environment = JsonHttpEnvironmentConnection.from_config(
+            JsonHttpIsolatedResponseConfig.model_validate(raw_config),
+            test_environment_confirmed=True,
+            client=client,
+        )
+        evidence = await environment.execute(_case("hello", max_calls=1))
+
+    assert evidence.lifecycle.failure_code == "response_contains_credential"
+    assert "private-agent-token" not in evidence.model_dump_json()
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        {"response": "safe", "debug": "private-agent-token"},
+        {"response": {"private-agent-token": "reflected as a key"}},
+    ],
+)
+async def test_isolated_response_rejects_partial_or_keyed_authorization_credential(
+    monkeypatch: pytest.MonkeyPatch,
+    response: dict[str, object],
+) -> None:
+    monkeypatch.setenv("UL_ENVIRONMENT_AGENT_TOKEN", "Bearer private-agent-token")
+    raw_config = _isolated_response_config().model_dump(mode="json")
+    raw_config["headers_from_env"] = {"Authorization": "UL_ENVIRONMENT_AGENT_TOKEN"}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return _raw_response(json.dumps(response).encode())
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        environment = JsonHttpEnvironmentConnection.from_config(
+            JsonHttpIsolatedResponseConfig.model_validate(raw_config),
+            test_environment_confirmed=True,
+            client=client,
+        )
+        evidence = await environment.execute(_case("hello", max_calls=1))
+
+    assert evidence.lifecycle.failure_code == "response_contains_credential"
+    assert "private-agent-token" not in evidence.model_dump_json()
+
+
+async def test_isolated_response_allows_reflected_routing_header() -> None:
+    raw_config = _isolated_response_config().model_dump(mode="json")
+    raw_config["headers_from_env"] = {"X-Tenant-ID": "UL_ENVIRONMENT_TENANT_ID"}
+
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setenv("UL_ENVIRONMENT_TENANT_ID", "payments-test")
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            return _raw_response(json.dumps({"response": "payments-test"}).encode())
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            environment = JsonHttpEnvironmentConnection.from_config(
+                JsonHttpIsolatedResponseConfig.model_validate(raw_config),
+                test_environment_confirmed=True,
+                client=client,
+            )
+            evidence = await environment.execute(_case("hello", max_calls=1))
+
+    assert evidence.lifecycle.terminal_status == "succeeded"
+    assert evidence.final_response == "payments-test"
+
+
+async def test_isolated_response_turning_to_tools_is_a_mapping_failure() -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return _raw_response(
+            json.dumps(
+                {"choices": [{"message": {"content": None, "tool_calls": [{"id": "call-1"}]}}]}
+            ).encode()
+        )
+
+    raw_config = _isolated_response_config().model_dump(mode="json")
+    raw_config["execute"]["response_json_pointer"] = "/choices/0/message/content"
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        environment = JsonHttpEnvironmentConnection.from_config(
+            JsonHttpIsolatedResponseConfig.model_validate(raw_config),
+            test_environment_confirmed=True,
+            client=client,
+        )
+        evidence = await environment.execute(_case("hello", max_calls=1))
+
+    assert evidence.lifecycle.terminal_status == "failed"
+    assert evidence.lifecycle.failure_code == "response_mapping"
+
+
+async def test_isolated_response_does_not_carry_server_cookies_between_cases() -> None:
+    observed_cookies: list[str | None] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        observed_cookies.append(request.headers.get("cookie"))
+        return _raw_response(
+            json.dumps({"response": "ok"}).encode(),
+            headers={"set-cookie": "session=hidden"},
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        environment = JsonHttpEnvironmentConnection.from_config(
+            _isolated_response_config(),
+            test_environment_confirmed=True,
+            max_environment_api_calls=2,
+            client=client,
+        )
+        await environment.execute(_case("first", max_calls=1))
+        await environment.execute(_case("second", max_calls=1))
+
+    assert observed_cookies == [None, None]
+
+
 async def test_isolated_response_requires_attestations_and_rejects_stateful_cases() -> None:
     raw_config = _isolated_response_config().model_dump(mode="json")
     raw_config["request_isolation_attested"] = False
@@ -218,6 +345,24 @@ async def test_isolated_response_requires_attestations_and_rejects_stateful_case
             )
         )
     await environment.aclose()
+
+
+@pytest.mark.parametrize(
+    "template",
+    [
+        {"prompt": "missing"},
+        {"first": "{{input}}", "second": "{{input}}"},
+        {"input": "{{input}}", "case_a": "{{case_id}}", "case_b": "{{case_id}}"},
+        {"input": "{{input}}", "unknown": "{{secret}}"},
+        {"input": "{{input}}", "embedded": "Prefix {{case_id}}"},
+    ],
+)
+async def test_isolated_response_rejects_ambiguous_request_templates(template: object) -> None:
+    raw_config = _isolated_response_config().model_dump(mode="json")
+    raw_config["execute"]["request_json_template"] = template
+
+    with pytest.raises(ValidationError, match="request_json_template"):
+        JsonHttpIsolatedResponseConfig.model_validate(raw_config)
 
 
 def _timeout_after_commit_case(*, max_calls: int = 9) -> EvaluationCase:

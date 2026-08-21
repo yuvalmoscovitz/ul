@@ -212,13 +212,21 @@ def test_init_can_generate_explicit_isolated_response_adapter(
             "init",
             str(dataset),
             "--environment-url",
-            "https://environment.example",
+            "https://environment.example/v1/chat/completions",
             "--adapter-tier",
             "isolated-response",
             "--allow-environment-network",
             "--confirm-test-environment",
             "--confirm-request-isolation",
             "--confirm-safe-test-target",
+            "--isolated-preset",
+            "openai-chat",
+            "--agent-model",
+            "customer-agent-v1",
+            "--environment-id",
+            "customer-chat-test",
+            "--header-from-env",
+            "Authorization=UL_ENVIRONMENT_AGENT_TOKEN",
         ],
     )
 
@@ -227,27 +235,28 @@ def test_init_can_generate_explicit_isolated_response_adapter(
     assert environment == {
         "version": 1,
         "adapter_tier": "isolated_response",
-        "environment_id": "replace-with-stable-environment-id",
+        "environment_id": "customer-chat-test",
         "request_isolation_attested": True,
         "safe_test_target_attested": True,
-        "headers_from_env": {},
+        "headers_from_env": {"Authorization": "UL_ENVIRONMENT_AGENT_TOKEN"},
         "execute": {
-            "url": "https://environment.example/execute",
+            "url": "https://environment.example/v1/chat/completions",
             "request_json_template": {
-                "case_id": "{{case_id}}",
-                "turn_id": "{{turn_id}}",
-                "input": "{{input}}",
+                "model": "customer-agent-v1",
+                "messages": [{"role": "user", "content": "{{input}}"}],
             },
-            "response_json_pointer": "/response",
+            "response_json_pointer": "/choices/0/message/content",
         },
     }
     assert "response evidence only" in result.output
-    assert "replace environment_id" in result.output
+    assert "noUL-specificendpointisrequired" in _compact_plain_output(result.output)
 
+    monkeypatch.setenv("UL_ENVIRONMENT_AGENT_TOKEN", "private-test-token")
     dry_run = runner.invoke(app, ["run", "--dry-run"])
     assert dry_run.exit_code == 0, dry_run.output
     assert "Adapter tier: isolated-response (response evidence only)" in dry_run.output
     assert "Potential environment API calls: up to 6" in dry_run.output
+    assert "private-test-token" not in dry_run.output
 
 
 def test_init_existing_isolated_config_requires_safety_flags_and_prints_limitations(

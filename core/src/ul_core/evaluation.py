@@ -17,6 +17,7 @@ EnvironmentLifecycleFailureCode = Literal[
     "response_content_encoding",
     "invalid_json",
     "null_json",
+    "response_contains_credential",
     "response_mapping",
     "environment_identity",
     "case_identity",

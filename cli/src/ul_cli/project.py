@@ -125,7 +125,10 @@ def initialize_project(
         str | None,
         typer.Option(
             "--environment-url",
-            help="Create .ul/environment.json for this environment API base URL.",
+            help=(
+                "Stateful API base URL, or an isolated-response POST URL without credentials, "
+                "query, or fragment."
+            ),
         ),
     ] = None,
     adapter_tier: Annotated[
@@ -147,6 +150,33 @@ def initialize_project(
         bool,
         typer.Option(help="Attest this isolated target cannot cause real-world effects."),
     ] = False,
+    isolated_preset: Annotated[
+        Literal["generic-json", "openai-chat"],
+        typer.Option(help="Known JSON shape for an existing isolated agent endpoint."),
+    ] = "generic-json",
+    environment_id: Annotated[
+        str | None,
+        typer.Option(help="Stable evidence name; isolated mode defaults to the endpoint host."),
+    ] = None,
+    request_json_template: Annotated[
+        str | None,
+        typer.Option(help="JSON request template for an existing isolated endpoint."),
+    ] = None,
+    response_json_pointer: Annotated[
+        str | None,
+        typer.Option(help="RFC 6901 pointer to the isolated endpoint's response value."),
+    ] = None,
+    agent_model: Annotated[
+        str | None,
+        typer.Option(help="Agent model sent by the openai-chat preset."),
+    ] = None,
+    header_from_env: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--header-from-env",
+            help="HTTP_HEADER=UL_ENVIRONMENT_VARIABLE; repeat as needed.",
+        ),
+    ] = None,
     invariants: Annotated[
         Path | None,
         typer.Option(exists=True, dir_okay=False, readable=True),
@@ -202,6 +232,19 @@ def initialize_project(
     """Configure this project once for `ul run` and `ul report`."""
     if (environment_config is None) == (environment_url is None):
         raise typer.BadParameter("provide exactly one of --environment-config or --environment-url")
+    generated_mapping_options_used = (
+        isolated_preset != "generic-json"
+        or environment_id is not None
+        or request_json_template is not None
+        or response_json_pointer is not None
+        or agent_model is not None
+        or bool(header_from_env)
+    )
+    if environment_config is not None and generated_mapping_options_used:
+        raise typer.BadParameter(
+            "isolated adapter mapping options require --environment-url",
+            param_hint="--environment-url",
+        )
     loaded_environment_config: JsonHttpTargetConfig | None = None
     if environment_config is not None:
         try:
@@ -286,6 +329,12 @@ def initialize_project(
                 adapter_tier=adapter_tier,
                 confirm_request_isolation=confirm_request_isolation,
                 confirm_safe_test_target=confirm_safe_test_target,
+                isolated_preset=isolated_preset,
+                environment_id=environment_id,
+                request_json_template=request_json_template,
+                response_json_pointer=response_json_pointer,
+                agent_model=agent_model,
+                header_from_env=header_from_env,
                 show_guidance=False,
             )
             generated_environment_path = selected_environment_config
@@ -393,9 +442,10 @@ def initialize_project(
     if environment_url is not None:
         if isinstance(loaded_environment_config, JsonHttpIsolatedResponseConfig):
             console.print(
-                "Before running: implement the one-request /execute contract generated in "
-                ".ul/environment.json. This tier records response evidence only; it cannot verify "
-                "committed state, conversations, or state-dependent stress tests."
+                "Existing one-request JSON endpoint configured; no UL-specific endpoint is "
+                "required. Set any configured UL_ENVIRONMENT_* variables. This tier records "
+                "response evidence only; it cannot verify committed state, conversations, or "
+                "state-dependent stress tests."
             )
         else:
             console.print(

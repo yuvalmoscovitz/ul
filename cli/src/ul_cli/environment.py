@@ -532,6 +532,9 @@ def _remediation_for_code(code: str) -> str:
         "response_content_encoding": "Disable compressed lifecycle responses.",
         "invalid_json": "Return bounded, standards-compliant JSON without duplicate keys.",
         "null_json": "Return the configured lifecycle response object instead of null.",
+        "response_contains_credential": (
+            "Stop reflecting request credentials anywhere in the JSON response."
+        ),
         "response_mapping": "Correct the response JSON pointer for this lifecycle phase.",
         "environment_identity": (
             "Return the configured environment_id and the request case identity unchanged."

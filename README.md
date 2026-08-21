@@ -56,25 +56,35 @@ implements reset, execute-turn, and snapshot requests. Reset asks separately for
 session and a clean external environment; both are required by default. If you already have a custom
 mapping, use `--environment-config environment.json` instead of `--environment-url`.
 
-To start with one HTTP endpoint and response checks only:
+To connect an existing response-only JSON endpoint that starts every request from isolated state:
 
 ```bash
+export UL_ENVIRONMENT_AGENT_TOKEN='Bearer replace-me'
+
 ul init interactions.jsonl \
-  --environment-url https://your-environment.example \
+  --environment-url https://your-environment.example/v1/chat/completions \
   --adapter-tier isolated-response \
+  --isolated-preset openai-chat \
+  --agent-model your-test-model \
+  --header-from-env Authorization=UL_ENVIRONMENT_AGENT_TOKEN \
   --allow-environment-network \
   --confirm-test-environment \
   --confirm-request-isolation \
   --confirm-safe-test-target
 ```
 
-This creates an `isolated-response` adapter that calls `/execute` once per case. The separate
-confirmations attest that this is a test target, every request starts fresh and is isolated from
-every other request, and requests cannot cause real-world effects. Replace the generated
-`environment_id` placeholder with a stable name before checking the connection. UL records response
-evidence only at this tier. It rejects committed-state
+This translates the OpenAI-style request and response shape into UL's internal contract; no
+UL-specific endpoint is required. `generic-json` is the default preset (`{"input":"{{input}}"}`
+and `/response`). For another JSON shape, use `--request-json-template` and
+`--response-json-pointer`. Header values come only from the named `UL_ENVIRONMENT_*` variables and
+are never written to the config. The separate confirmations attest that this is a test target,
+every request starts fresh and is isolated from every other request, and requests cannot cause
+real-world effects. UL records response evidence only at this tier. It rejects committed-state
 invariants, conversations, timeout-after-commit checks, and other state-dependent stress tests. Move
 to `stateful-lifecycle` when UL must inspect side effects or behavior across turns.
+
+The endpoint URL cannot contain credentials, a query string, or a fragment. Put credentials in
+`--header-from-env`; use a custom adapter when the endpoint requires query parameters.
 
 Verify the adapter before spending money on model calls:
 
