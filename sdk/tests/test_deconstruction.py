@@ -1586,7 +1586,7 @@ async def test_live_augmentation_generates_or_safely_rejects_each_candidate() ->
     assert all(candidate.passed or candidate.failure_reasons for candidate in result.candidates)
     assert [
         candidate.operator_id for candidate in result.candidates if candidate.human_review_required
-    ] == ["input.tone.frustrated"]
+    ] == ["input.tone.frustrated", "input.intent.self_correction"]
 
 
 async def test_live_equivalence_qualification_across_ten_domains() -> None:
