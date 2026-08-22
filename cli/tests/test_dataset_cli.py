@@ -24,11 +24,15 @@ from ul import (
     DatasetEvaluationResult,
     DatasetEvaluationTrial,
     DatasetEvaluationTrialSet,
+    EvaluatorModelCompatibilityError,
+    EvaluatorModelPreflight,
     InteractionRecord,
     JsonHttpEnvironmentConfig,
     JsonHttpIsolatedResponseConfig,
     ObservedAgentOutput,
     OpenAICompatibleDatasetSettings,
+    ProviderDiagnostic,
+    ProviderDiagnosticError,
     SemanticFrame,
 )
 from ul.dataset_augmentation import DatasetAugmentationCandidate
@@ -54,6 +58,50 @@ from ul_core.evaluation import (
 
 runner = CliRunner()
 _ANSI_ESCAPE_PATTERN = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+
+
+def _evaluator_preflight() -> EvaluatorModelPreflight:
+    return EvaluatorModelPreflight.model_validate(
+        {
+            "provider": "openrouter",
+            "profiles": (
+                {
+                    "roles": ("deconstruct", "render", "equivalence"),
+                    "requested_model": "test/model",
+                    "routed_model": "test/model",
+                    "upstream_provider": "test-provider",
+                    "required_parameters": (
+                        "response_format",
+                        "seed",
+                        "temperature",
+                        "max_tokens",
+                    ),
+                    "parameter_support": "routing_enforced",
+                    "unverified_options": (),
+                },
+            ),
+            "verified_capabilities": (
+                "routing",
+                "structured_output",
+                "required_parameters",
+            ),
+            "ignored_or_unsupported_options": (),
+            "unverified_options": (),
+            "data_policy": {
+                "external_processing": True,
+                "implication": "Evaluator requests are processed externally.",
+            },
+        }
+    )
+
+
+@pytest.fixture(autouse=True)
+def _stub_evaluator_preflight(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def successful_preflight(settings: object) -> EvaluatorModelPreflight:
+        del settings
+        return _evaluator_preflight()
+
+    monkeypatch.setattr(main, "_preflight_evaluator", successful_preflight)
 
 
 def _write_dataset(path: Path, records: list[dict[str, Any]]) -> None:
@@ -1359,6 +1407,9 @@ def test_openai_compatible_execution_allows_an_unauthenticated_endpoint(
         def from_config(cls, *args: object, **kwargs: object) -> FakeTarget:
             return cls()
 
+        async def aclose(self) -> None:
+            return None
+
     async def fake_evaluate(*args: object, **kwargs: object) -> tuple[object, ...]:
         return ()
 
@@ -1382,6 +1433,158 @@ def test_openai_compatible_execution_allows_an_unauthenticated_endpoint(
 
     assert result.exit_code == 0, result.output
     assert output.exists()
+
+
+def test_evaluator_preflight_failure_surfaces_capability_and_safe_action(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    dataset = tmp_path / "interactions.jsonl"
+    output = tmp_path / "results.jsonl"
+    target_config = tmp_path / "target.json"
+    _write_dataset(dataset, [_record()])
+    _write_target_config(target_config)
+    monkeypatch.setenv("UL_LIVE", "true")
+    monkeypatch.setenv("OPEN_ROUTER_API_KEY", "test-key")
+
+    class FakeTarget:
+        @classmethod
+        def from_config(cls, *args: object, **kwargs: object) -> FakeTarget:
+            return cls()
+
+        async def aclose(self) -> None:
+            return None
+
+    async def fail_preflight(*args: object, **kwargs: object) -> EvaluatorModelPreflight:
+        raise EvaluatorModelCompatibilityError(
+            "evaluator model is incompatible with required seed capability; "
+            "choose another configured evaluator model or verify the configured route and retry"
+        )
+
+    monkeypatch.setattr(main, "_preflight_evaluator", fail_preflight)
+    monkeypatch.setattr(main, "JsonHttpEnvironmentConnection", FakeTarget)
+
+    result = runner.invoke(
+        root_app,
+        [
+            "dataset",
+            "evaluate",
+            str(dataset),
+            "--environment-config",
+            str(target_config),
+            "--allow-environment-network",
+            "--confirm-test-environment",
+            "--output",
+            str(output),
+        ],
+    )
+
+    assert result.exit_code == 2
+    assert "required seed capability" in result.output
+    assert "choose another configured evaluator model" in result.output
+    assert "before campaign execution" in result.output
+    assert not output.exists()
+    assert not (tmp_path / "results.augmentations.jsonl").exists()
+    assert not (tmp_path / "results.jsonl.preflight.json").exists()
+
+
+def test_local_environment_gate_fails_before_evaluator_preflight(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    dataset = tmp_path / "interactions.jsonl"
+    output = tmp_path / "results.jsonl"
+    target_config = tmp_path / "target.json"
+    _write_dataset(dataset, [_record()])
+    _write_target_config(target_config)
+    monkeypatch.setenv("UL_LIVE", "true")
+    monkeypatch.setenv("OPEN_ROUTER_API_KEY", "test-key")
+    preflight_calls = 0
+
+    async def unexpected_preflight(*args: object, **kwargs: object) -> EvaluatorModelPreflight:
+        nonlocal preflight_calls
+        preflight_calls += 1
+        raise AssertionError("local validation must run before evaluator preflight")
+
+    monkeypatch.setattr(main, "_preflight_evaluator", unexpected_preflight)
+
+    result = runner.invoke(
+        root_app,
+        [
+            "dataset",
+            "evaluate",
+            str(dataset),
+            "--environment-config",
+            str(target_config),
+            "--confirm-test-environment",
+            "--output",
+            str(output),
+        ],
+    )
+
+    assert result.exit_code == 2
+    assert "--allow-environment-network" in result.output
+    assert preflight_calls == 0
+    assert not output.exists()
+    assert not (tmp_path / "results.jsonl.preflight.json").exists()
+
+
+def test_evaluator_preflight_receipt_survives_later_semantic_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    dataset = tmp_path / "interactions.jsonl"
+    output = tmp_path / "results.jsonl"
+    receipt = tmp_path / "results.jsonl.preflight.json"
+    target_config = tmp_path / "target.json"
+    _write_dataset(dataset, [_record()])
+    _write_target_config(target_config)
+    monkeypatch.setenv("UL_LIVE", "true")
+    monkeypatch.setenv("OPEN_ROUTER_API_KEY", "test-key")
+    expected_preflight = _evaluator_preflight()
+    preflight_calls = 0
+
+    async def successful_preflight(settings: object) -> EvaluatorModelPreflight:
+        nonlocal preflight_calls
+        del settings
+        preflight_calls += 1
+        return expected_preflight
+
+    class FakeTarget:
+        @classmethod
+        def from_config(cls, *args: object, **kwargs: object) -> FakeTarget:
+            return cls()
+
+        async def aclose(self) -> None:
+            return None
+
+    async def fail_after_preflight(*args: object, **kwargs: object) -> tuple[object, ...]:
+        assert kwargs["evaluator_preflight"] is expected_preflight
+        raise ValueError("later semantic failure")
+
+    monkeypatch.setattr(main, "_preflight_evaluator", successful_preflight)
+    monkeypatch.setattr(main, "JsonHttpEnvironmentConnection", FakeTarget)
+    monkeypatch.setattr(main, "_evaluate_interaction_records", fail_after_preflight)
+
+    result = runner.invoke(
+        root_app,
+        [
+            "dataset",
+            "evaluate",
+            str(dataset),
+            "--environment-config",
+            str(target_config),
+            "--allow-environment-network",
+            "--confirm-test-environment",
+            "--output",
+            str(output),
+        ],
+    )
+
+    assert result.exit_code == 2
+    assert preflight_calls == 1
+    assert EvaluatorModelPreflight.model_validate_json(receipt.read_text()) == expected_preflight
+    assert stat.S_IMODE(receipt.stat().st_mode) == 0o600
 
 
 def test_stateful_target_dry_run_counts_physical_lifecycle_calls(
@@ -1722,6 +1925,9 @@ def test_invariant_evaluation_reuses_results_without_extra_runner_calls(
         async def __aexit__(self, *args: object) -> None:
             pass
 
+        def reuse_preflight(self, result: object) -> None:
+            assert result == _evaluator_preflight()
+
     class FakeRunner:
         def __init__(self, *args: object, **kwargs: object) -> None:
             pass
@@ -1766,6 +1972,7 @@ def test_invariant_evaluation_reuses_results_without_extra_runner_calls(
                 planned_target_calls=2,
                 invariant_suite=suite,
                 invariant_evaluations=stored_evaluations,
+                evaluator_preflight=_evaluator_preflight(),
             )
         )
 
@@ -2353,8 +2560,10 @@ def test_execution_creates_private_explicit_output(
         augmentation_ledger: object,
         saved_augmentations: object,
         redaction_engine: object,
+        evaluator_preflight: object,
     ) -> tuple[object, ...]:
         del settings, target, run_context, augmentation_ledger, saved_augmentations
+        assert evaluator_preflight == _evaluator_preflight()
         assert redaction_engine is None
         captured_records.extend(record.id for record in records)
         assert operator_ids == ("input.surface.disfluency_repeat",)
@@ -2397,6 +2606,152 @@ def test_execution_creates_private_explicit_output(
     assert "Complete evidence" in result.output
     assert "Next: ul dataset report" in result.output
     assert "Transfer 100" not in result.output
+
+
+def test_provider_failure_has_concise_output_and_private_sanitized_diagnostics(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    dataset = tmp_path / "interactions.jsonl"
+    output = tmp_path / "results.jsonl"
+    target_config = tmp_path / "target.json"
+    secret = "private-provider-response"
+    _write_dataset(dataset, [_record()])
+    _write_target_config(target_config, url="http://127.0.0.1:8765/execute")
+
+    class FakeTarget:
+        @classmethod
+        def from_config(cls, *_args: object, **_kwargs: object) -> FakeTarget:
+            return cls()
+
+    async def fail_evaluation(*_args: object, **_kwargs: object) -> tuple[object, ...]:
+        error = ProviderDiagnosticError(
+            ProviderDiagnostic(
+                provider="customer-gateway",
+                operation="verify",
+                category="provider_unavailable",
+                retryable=True,
+                suggested_action="check provider status, then resume the run.",
+                endpoint_sha256="a" * 64,
+                http_status=503,
+            )
+        )
+        error.add_note(secret)
+        raise error
+
+    monkeypatch.setattr(main, "load_dataset_semantic_settings", _settings)
+    monkeypatch.setattr(main, "JsonHttpEnvironmentConnection", FakeTarget)
+    monkeypatch.setattr(main, "_evaluate_interaction_records", fail_evaluation)
+
+    result = runner.invoke(
+        root_app,
+        [
+            "dataset",
+            "evaluate",
+            str(dataset),
+            "--environment-config",
+            str(target_config),
+            "--allow-insecure-http",
+            "--allow-environment-network",
+            "--confirm-test-environment",
+            "--output",
+            str(output),
+            "--no-save-augmentations",
+        ],
+    )
+
+    diagnostics = tmp_path / "results.jsonl.debug.json"
+    normalized_output = " ".join(_ANSI_ESCAPE_PATTERN.sub("", result.output).split())
+    assert result.exit_code == 2
+    assert "customer-gateway failed during verify" in normalized_output
+    assert "provider_unavailable; retryable: yes" in normalized_output
+    assert "Next: check provider status" in normalized_output
+    assert secret not in normalized_output
+    assert diagnostics.exists()
+    assert stat.S_IMODE(diagnostics.stat().st_mode) == 0o600
+    serialized_diagnostics = diagnostics.read_text(encoding="utf-8")
+    assert secret not in serialized_diagnostics
+    assert json.loads(serialized_diagnostics) == {
+        "schema_version": "1.0.0",
+        "record_type": "provider_diagnostic",
+        "diagnostic": {
+            "provider": "customer-gateway",
+            "operation": "verify",
+            "category": "provider_unavailable",
+            "retryable": True,
+            "retry_status": "not_retried",
+            "suggested_action": "check provider status, then resume the run.",
+            "endpoint_sha256": "a" * 64,
+            "http_status": 503,
+        },
+    }
+
+    def fail_diagnostic_write(*_args: object, **_kwargs: object) -> None:
+        raise OSError("private filesystem detail")
+
+    failed_output = tmp_path / "failed-receipt-results.jsonl"
+    monkeypatch.setattr(main, "_write_provider_diagnostic", fail_diagnostic_write)
+    failed_receipt_result = runner.invoke(
+        root_app,
+        [
+            "dataset",
+            "evaluate",
+            str(dataset),
+            "--environment-config",
+            str(target_config),
+            "--allow-insecure-http",
+            "--allow-environment-network",
+            "--confirm-test-environment",
+            "--output",
+            str(failed_output),
+            "--no-save-augmentations",
+        ],
+    )
+    failed_receipt_output = " ".join(
+        _ANSI_ESCAPE_PATTERN.sub("", failed_receipt_result.output).split()
+    )
+    assert failed_receipt_result.exit_code == 2
+    assert "customer-gateway failed during verify" in failed_receipt_output
+    assert "diagnostics could not be written (OSError)" in failed_receipt_output
+    assert "private filesystem detail" not in failed_receipt_output
+
+
+def test_provider_diagnostic_receipts_preserve_collisions_and_reject_symlinks(
+    tmp_path: Path,
+) -> None:
+    output = tmp_path / "results.jsonl"
+    diagnostic_error = ProviderDiagnosticError(
+        ProviderDiagnostic(
+            provider="customer-gateway",
+            operation="render",
+            category="rate_limit",
+            retryable=True,
+            suggested_action="wait, then resume the run.",
+            endpoint_sha256="b" * 64,
+            http_status=429,
+        )
+    )
+
+    first = main._write_provider_diagnostic(output, diagnostic_error)
+    second = main._write_provider_diagnostic(output, diagnostic_error)
+
+    assert first == tmp_path / "results.jsonl.debug.json"
+    assert second == tmp_path / "results.jsonl.debug.2.json"
+    assert first.read_text(encoding="utf-8") == second.read_text(encoding="utf-8")
+    assert stat.S_IMODE(first.stat().st_mode) == 0o600
+    assert stat.S_IMODE(second.stat().st_mode) == 0o600
+
+    if sys.platform == "win32":
+        return
+    symlink_output = tmp_path / "symlink-results.jsonl"
+    protected_file = tmp_path / "protected.txt"
+    protected_file.write_text("unchanged", encoding="utf-8")
+    symlink_receipt = tmp_path / "symlink-results.jsonl.debug.json"
+    symlink_receipt.symlink_to(protected_file)
+
+    collision_receipt = main._write_provider_diagnostic(symlink_output, diagnostic_error)
+
+    assert collision_receipt == tmp_path / "symlink-results.jsonl.debug.2.json"
+    assert protected_file.read_text(encoding="utf-8") == "unchanged"
 
 
 def test_execution_wires_redaction_into_records_pipeline_and_run_context(
@@ -2452,6 +2807,7 @@ def test_execution_wires_redaction_into_records_pipeline_and_run_context(
         augmentation_ledger: object,
         saved_augmentations: object,
         redaction_engine: object,
+        evaluator_preflight: object,
     ) -> tuple[object, ...]:
         del (
             repetitions,
@@ -2461,6 +2817,7 @@ def test_execution_wires_redaction_into_records_pipeline_and_run_context(
             saved_augmentations,
         )
         assert redaction_engine is not None
+        assert evaluator_preflight == _evaluator_preflight()
         assert secret not in records[0].model_dump_json()
         serialized_context = cast(Any, run_context).model_dump_json()
         assert secret not in serialized_context
@@ -2599,6 +2956,7 @@ def test_target_config_runs_nested_request_and_response_against_loopback(
             augmentation_ledger: object,
             saved_augmentations: object,
             redaction_engine: object,
+            evaluator_preflight: object,
         ) -> tuple[object, ...]:
             del (
                 operator_ids,
@@ -2611,6 +2969,7 @@ def test_target_config_runs_nested_request_and_response_against_loopback(
                 saved_augmentations,
             )
             assert redaction_engine is None
+            assert evaluator_preflight == _evaluator_preflight()
             async with target:
                 case = evaluation_case_from_inputs(
                     case_id="ul-case-00000000000000000000000000000000",
@@ -2888,6 +3247,7 @@ def test_resume_skips_already_processed_interaction_ids(
         augmentation_ledger: object,
         saved_augmentations: object,
         redaction_engine: object,
+        evaluator_preflight: object,
     ) -> tuple[object, ...]:
         del (
             operator_ids,
@@ -2902,6 +3262,7 @@ def test_resume_skips_already_processed_interaction_ids(
             == evaluation_results[1].augmentation
         )
         assert redaction_engine is None
+        assert evaluator_preflight == _evaluator_preflight()
         assert repetitions == 1
         for record in records:
             evaluated_ids.append(record.id)

@@ -13,8 +13,11 @@ from ul.dataset_augmentation import (
     builtin_dataset_augmentation_operators,
 )
 from ul.deconstruction import (
+    EvaluatorModelCompatibilityError,
     OpenAICompatibleDatasetSettings,
     OpenRouterDatasetSettings,
+    ProviderDiagnostic,
+    ProviderDiagnosticError,
     SemanticModelDeconstructor,
     create_semantic_model_deconstructor,
     load_dataset_semantic_settings,
@@ -179,6 +182,239 @@ def completion(content: str) -> httpx.Response:
             },
         },
     )
+
+
+async def test_evaluator_preflight_proves_required_capabilities_and_records_policy() -> None:
+    requests: list[dict[str, object]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = cast(dict[str, object], json.loads(request.content))
+        requests.append(body)
+        if len(requests) <= 3:
+            return completion('{"compatible":true}')
+        return completion(json.dumps(frame_payload()))
+
+    client = mock_client(handler)
+    async with create_semantic_model_deconstructor(settings(), client=client) as deconstructor:
+        result = await deconstructor.preflight()
+        frame = await deconstructor.deconstruct(interaction())
+
+    assert [request["model"] for request in requests[:3]] == [
+        "google/gemini-2.5-flash",
+        "x-ai/grok-4.3",
+        "google/gemini-3.5-flash",
+    ]
+    assert [request["reasoning"] for request in requests[:3]] == [
+        {"effort": "minimal"},
+        {"effort": "none"},
+        {"effort": "low"},
+    ]
+    assert [request["temperature"] for request in requests[:3]] == [0, 0.7, 0]
+    assert requests[0]["seed"] == 0
+    assert requests[1]["seed"] == SemanticModelDeconstructor._render_seed(
+        "UL evaluator preflight", "Check renderer compatibility."
+    )
+    assert requests[1]["top_p"] == 0.95
+    assert all(request["max_tokens"] == 16 for request in requests[:3])
+    assert requests[0]["response_format"] == {
+        "type": "json_schema",
+        "json_schema": {
+            "name": "evaluator_preflight",
+            "strict": True,
+            "schema": {
+                "additionalProperties": False,
+                "properties": {
+                    "compatible": {
+                        "const": True,
+                        "title": "Compatible",
+                        "type": "boolean",
+                    }
+                },
+                "required": ["compatible"],
+                "title": "_EvaluatorPreflightSample",
+                "type": "object",
+            },
+        },
+    }
+    assert tuple(profile.roles for profile in result.profiles) == (
+        ("deconstruct",),
+        ("render",),
+        ("equivalence",),
+    )
+    assert all(profile.routed_model == "provider/resolved-model" for profile in result.profiles)
+    assert result.verified_capabilities == (
+        "routing",
+        "structured_output",
+        "required_parameters",
+    )
+    assert all(profile.parameter_support == "routing_enforced" for profile in result.profiles)
+    assert result.ignored_or_unsupported_options == ()
+    assert result.unverified_options == ()
+    assert result.data_policy == {
+        "external_processing": True,
+        "provider_policy_declared": True,
+        "data_collection": "deny",
+        "zero_data_retention_required": True,
+        "implication": (
+            "The configured route requires data collection to be denied and zero data retention; "
+            "the evaluator request is still processed externally."
+        ),
+    }
+    assert frame.metadata["evaluator_preflight"] == result.model_dump(mode="json")
+    await client.aclose()
+
+
+async def test_generic_endpoint_deduplicates_without_claiming_parameter_support() -> None:
+    request_bodies: list[dict[str, object]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        request_bodies.append(cast(dict[str, object], json.loads(request.content)))
+        return completion('{"compatible":true}')
+
+    client = mock_client(handler)
+    async with create_semantic_model_deconstructor(
+        openai_compatible_settings(), client=client
+    ) as deconstructor:
+        result = await deconstructor.preflight()
+
+    assert len(request_bodies) == 2
+    assert tuple(profile.roles for profile in result.profiles) == (
+        ("deconstruct", "equivalence"),
+        ("render",),
+    )
+    assert result.verified_capabilities == ("routing", "structured_output")
+    assert result.unverified_options == (
+        "response_format",
+        "seed",
+        "temperature",
+        "max_tokens",
+        "top_p",
+    )
+    assert all(
+        profile.parameter_support == "endpoint_accepted_unverified" for profile in result.profiles
+    )
+    assert all(profile.unverified_options for profile in result.profiles)
+    await client.aclose()
+
+
+async def test_evaluator_preflight_rejects_invalid_structured_output() -> None:
+    client = mock_client(lambda request: completion('{"compatible":false}'))
+    async with create_semantic_model_deconstructor(settings(), client=client) as deconstructor:
+        with pytest.raises(EvaluatorModelCompatibilityError, match="structured output capability"):
+            await deconstructor.preflight()
+    await client.aclose()
+
+
+async def test_evaluator_preflight_names_seed_rejection() -> None:
+    client = mock_client(lambda request: httpx.Response(400, json={"error": {"param": "seed"}}))
+    async with create_semantic_model_deconstructor(settings(), client=client) as deconstructor:
+        with pytest.raises(EvaluatorModelCompatibilityError, match="seed capability") as error:
+            await deconstructor.preflight()
+    assert "choose another configured evaluator model" in str(error.value)
+    await client.aclose()
+
+
+@pytest.mark.parametrize(
+    ("provider_body", "capability"),
+    [
+        (b'{"error":{"param":"seed","message":"private-seed-detail"}}', "seed"),
+        (
+            b'{"error":{"param":"response_format","message":"private-schema-detail"}}',
+            "structured output",
+        ),
+    ],
+)
+async def test_evaluator_preflight_classifies_bounded_streamed_parameter_errors(
+    provider_body: bytes,
+    capability: str,
+) -> None:
+    class ErrorStream(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            yield provider_body
+            yield b"x" * 10_000
+
+    client = mock_client(lambda request: httpx.Response(400, stream=ErrorStream()))
+    async with create_semantic_model_deconstructor(settings(), client=client) as deconstructor:
+        with pytest.raises(
+            EvaluatorModelCompatibilityError, match=f"required {capability} capability"
+        ) as error:
+            await deconstructor.preflight()
+    assert "private-" not in str(error.value)
+    await client.aclose()
+
+
+async def test_evaluator_preflight_names_unavailable_model_route() -> None:
+    client = mock_client(lambda request: httpx.Response(404, json={"error": "not found"}))
+    async with create_semantic_model_deconstructor(settings(), client=client) as deconstructor:
+        with pytest.raises(
+            EvaluatorModelCompatibilityError, match="model availability or routing capability"
+        ):
+            await deconstructor.preflight()
+    await client.aclose()
+
+
+async def test_evaluator_preflight_normalizes_provider_error() -> None:
+    client = mock_client(
+        lambda request: httpx.Response(
+            503,
+            json={"error": "secret provider diagnostic must not be surfaced"},
+        )
+    )
+    async with create_semantic_model_deconstructor(settings(), client=client) as deconstructor:
+        with pytest.raises(
+            EvaluatorModelCompatibilityError, match="provider routing capability"
+        ) as error:
+            await deconstructor.preflight()
+    assert "secret provider diagnostic" not in str(error.value)
+    await client.aclose()
+
+
+async def test_evaluator_preflight_consumes_sanitized_provider_diagnostic(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    secret = "private-provider-note"
+    client = mock_client(lambda request: completion('{"compatible":true}'))
+    deconstructor = create_semantic_model_deconstructor(settings(), client=client)
+
+    async def fail_request(**request: object):
+        assert request["operation"] == "preflight"
+        error = ProviderDiagnosticError(
+            ProviderDiagnostic(
+                provider="openrouter",
+                operation="preflight",
+                category="provider_unavailable",
+                retryable=True,
+                suggested_action="check provider status, then resume the run.",
+                endpoint_sha256="a" * 64,
+                http_status=503,
+            )
+        )
+        error.add_note(secret)
+        raise error
+
+    monkeypatch.setattr(deconstructor, "_request", fail_request)
+    async with deconstructor:
+        with pytest.raises(
+            EvaluatorModelCompatibilityError, match="provider routing capability"
+        ) as compatibility_error:
+            await deconstructor.preflight()
+
+    assert secret not in str(compatibility_error.value)
+    await client.aclose()
+
+
+async def test_evaluator_preflight_has_a_bounded_timeout() -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        await asyncio.sleep(0.02)
+        return completion('{"compatible":true}')
+
+    client = mock_client(handler)
+    async with create_semantic_model_deconstructor(
+        settings(timeout_seconds=0.001), client=client
+    ) as deconstructor:
+        with pytest.raises(EvaluatorModelCompatibilityError, match="timeout capability"):
+            await deconstructor.preflight()
+    await client.aclose()
 
 
 def semantic_frame() -> SemanticFrame:
@@ -444,9 +680,10 @@ async def test_provider_provenance_strings_are_bounded(
     async with create_semantic_model_deconstructor(
         openai_compatible_settings(), client=client
     ) as deconstructor:
-        with pytest.raises(ValidationError) as error:
+        with pytest.raises(ProviderDiagnosticError) as error:
             await deconstructor.deconstruct(interaction())
 
+    assert error.value.diagnostic.category == "invalid_response"
     assert field_value not in str(error.value)
     await client.aclose()
 
@@ -478,8 +715,9 @@ async def test_provider_usage_values_are_size_and_type_bounded(
     async with create_semantic_model_deconstructor(
         openai_compatible_settings(), client=client
     ) as deconstructor:
-        with pytest.raises(ValidationError):
+        with pytest.raises(ProviderDiagnosticError) as provider_error:
             await deconstructor.deconstruct(interaction())
+    assert provider_error.value.diagnostic.category == "invalid_response"
     await client.aclose()
 
 
@@ -1015,8 +1253,10 @@ async def test_deconstruct_rejects_non_factor_communication_references() -> None
 
     client = mock_client(handler)
     async with create_semantic_model_deconstructor(settings(), client=client) as deconstructor:
-        with pytest.raises(ValidationError, match="unknown reference"):
+        with pytest.raises(ProviderDiagnosticError) as provider_error:
             await deconstructor.deconstruct(interaction())
+    assert provider_error.value.diagnostic.operation == "deconstruct"
+    assert provider_error.value.diagnostic.category == "invalid_response"
     await client.aclose()
 
 
@@ -1207,8 +1447,63 @@ async def test_complete_request_has_a_wall_clock_deadline() -> None:
     async with create_semantic_model_deconstructor(
         settings(timeout_seconds=0.01), client=client
     ) as deconstructor:
-        with pytest.raises(TimeoutError):
+        with pytest.raises(ProviderDiagnosticError) as provider_error:
             await deconstructor.deconstruct(interaction())
+    assert provider_error.value.diagnostic.category == "timeout"
+    assert provider_error.value.diagnostic.retryable is True
+    assert provider_error.value.diagnostic.operation == "deconstruct"
+    await client.aclose()
+
+
+async def test_provider_error_is_normalized_without_response_secrets() -> None:
+    secret = "provider-secret-response-detail"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            429,
+            json={"error": {"message": secret}},
+            headers={"x-request-id": secret, "retry-after": "17"},
+        )
+
+    client = mock_client(handler)
+    async with create_semantic_model_deconstructor(
+        openai_compatible_settings(), client=client
+    ) as deconstructor:
+        with pytest.raises(ProviderDiagnosticError) as provider_error:
+            await deconstructor.render("Pay INV-104", "Rephrase.")
+
+    diagnostic = provider_error.value.diagnostic
+    serialized_diagnostic = diagnostic.model_dump_json()
+    assert diagnostic.provider == "customer-model-gateway"
+    assert diagnostic.operation == "render"
+    assert diagnostic.category == "rate_limit"
+    assert diagnostic.http_status == 429
+    assert diagnostic.retryable is True
+    assert diagnostic.retry_status == "not_retried"
+    assert secret not in serialized_diagnostic
+    assert secret not in str(provider_error.value)
+    assert "retryable: yes" in str(provider_error.value)
+    await client.aclose()
+
+
+async def test_malformed_successful_provider_envelope_is_normalized() -> None:
+    secret = "malformed-provider-response-secret"
+    client = mock_client(lambda request: httpx.Response(200, content=secret))
+
+    async with create_semantic_model_deconstructor(
+        openai_compatible_settings(), client=client
+    ) as deconstructor:
+        with pytest.raises(ProviderDiagnosticError) as provider_error:
+            await deconstructor.verify("Pay INV-104", "Please pay INV-104")
+
+    diagnostic = provider_error.value.diagnostic
+    assert diagnostic.provider == "customer-model-gateway"
+    assert diagnostic.operation == "verify"
+    assert diagnostic.category == "invalid_response"
+    assert diagnostic.retryable is False
+    assert diagnostic.http_status is None
+    assert secret not in str(provider_error.value)
+    assert secret not in diagnostic.model_dump_json()
     await client.aclose()
 
 
@@ -1218,8 +1513,10 @@ async def test_invalid_provider_response_is_rejected() -> None:
 
     client = mock_client(handler)
     async with create_semantic_model_deconstructor(settings(), client=client) as deconstructor:
-        with pytest.raises(ValidationError):
+        with pytest.raises(ProviderDiagnosticError) as provider_error:
             await deconstructor.render("Pay INV-104", "Rephrase.")
+    assert provider_error.value.diagnostic.operation == "render"
+    assert provider_error.value.diagnostic.category == "invalid_response"
     await client.aclose()
 
 

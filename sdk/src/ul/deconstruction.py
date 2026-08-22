@@ -7,6 +7,7 @@ import json
 import re
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
+from dataclasses import replace as dataclass_replace
 from types import TracebackType
 from typing import Any, Literal, Protocol, Self, cast
 from urllib.parse import urlsplit, urlunsplit
@@ -38,6 +39,84 @@ _PROMPTS = PromptManager.instance()
 
 def _sha256_text(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+class ProviderDiagnostic(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    provider: str
+    operation: Literal["deconstruct", "render", "verify", "preflight"]
+    category: Literal[
+        "authentication",
+        "bad_request",
+        "connection",
+        "invalid_response",
+        "provider_unavailable",
+        "rate_limit",
+        "timeout",
+    ]
+    retryable: bool
+    retry_status: Literal["not_retried"] = "not_retried"
+    suggested_action: str
+    endpoint_sha256: str
+    http_status: int | None = None
+
+
+class ProviderDiagnosticError(RuntimeError):
+    def __init__(self, diagnostic: ProviderDiagnostic) -> None:
+        self.diagnostic = diagnostic
+        super().__init__(
+            f"Semantic provider {diagnostic.provider} failed during {diagnostic.operation} "
+            f"({diagnostic.category}; retryable: {'yes' if diagnostic.retryable else 'no'}). "
+            f"Next: {diagnostic.suggested_action}"
+        )
+
+
+def _provider_diagnostic(
+    error: BaseException,
+    *,
+    provider: str,
+    operation: Literal["deconstruct", "render", "verify", "preflight"],
+    endpoint_sha256: str,
+) -> ProviderDiagnostic:
+    http_status = error.response.status_code if isinstance(error, httpx.HTTPStatusError) else None
+    if http_status in {401, 403}:
+        category = "authentication"
+        retryable = False
+        suggested_action = "check the provider credential and account access, then retry."
+    elif http_status == 429:
+        category = "rate_limit"
+        retryable = True
+        suggested_action = "wait for the provider rate limit to reset, then resume the run."
+    elif http_status == 408 or isinstance(error, (TimeoutError, httpx.TimeoutException)):
+        category = "timeout"
+        retryable = True
+        suggested_action = "check provider availability, then resume the run."
+    elif isinstance(error, httpx.RequestError):
+        category = "connection"
+        retryable = True
+        suggested_action = "check provider connectivity, then resume the run."
+    elif http_status is not None and http_status >= 500:
+        category = "provider_unavailable"
+        retryable = True
+        suggested_action = "check provider status, then resume the run."
+    elif http_status is not None:
+        category = "bad_request"
+        retryable = False
+        suggested_action = "check the configured provider and model settings before retrying."
+    else:
+        category = "invalid_response"
+        retryable = False
+        suggested_action = "check that the provider supports the configured response format."
+    return ProviderDiagnostic(
+        provider=provider,
+        operation=operation,
+        category=category,
+        retryable=retryable,
+        suggested_action=suggested_action,
+        endpoint_sha256=endpoint_sha256,
+        http_status=http_status,
+    )
 
 
 class OpenRouterDatasetSettings(BaseSettings):
@@ -452,6 +531,59 @@ class _RenderedInput(BaseModel):
     rendered_input: str = Field(min_length=1)
 
 
+class _EvaluatorPreflightSample(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    compatible: Literal[True]
+
+
+class EvaluatorModelProfilePreflight(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    roles: tuple[Literal["deconstruct", "render", "equivalence"], ...] = Field(min_length=1)
+    requested_model: str = Field(min_length=1, max_length=200)
+    routed_model: str = Field(min_length=1, max_length=200)
+    upstream_provider: str | None = Field(default=None, max_length=200)
+    required_parameters: tuple[str, ...]
+    parameter_support: Literal["routing_enforced", "endpoint_accepted_unverified"]
+    unverified_options: tuple[str, ...] = ()
+
+
+class EvaluatorModelPreflight(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    provider: str = Field(min_length=1, max_length=100)
+    profiles: tuple[EvaluatorModelProfilePreflight, ...] = Field(min_length=1)
+    verified_capabilities: tuple[
+        Literal["routing", "structured_output", "required_parameters"], ...
+    ]
+    ignored_or_unsupported_options: tuple[str, ...] = ()
+    unverified_options: tuple[str, ...] = ()
+    data_policy: dict[str, JsonValue]
+
+
+class EvaluatorModelCompatibilityError(ValueError):
+    pass
+
+
+class _EvaluatorPreflightHTTPError(ValueError):
+    def __init__(self, capability: str) -> None:
+        self.capability = capability
+        super().__init__(capability)
+
+
+@dataclass(frozen=True)
+class _EvaluatorPreflightProfile:
+    roles: tuple[Literal["deconstruct", "render", "equivalence"], ...]
+    model: str
+    reasoning: dict[str, JsonValue]
+    max_tokens: int
+    temperature: float
+    seed: int
+    top_p: float | None
+    required_parameters: tuple[str, ...]
+
+
 class SemanticCompletionProvider(Protocol):
     @property
     def provider_id(self) -> str: ...
@@ -485,6 +617,11 @@ class SemanticCompletionProvider(Protocol):
         response: _ChatCompletionResponse,
     ) -> dict[str, JsonValue]: ...
 
+    def preflight_data_policy(self) -> dict[str, JsonValue]: ...
+
+    @property
+    def enforces_parameter_support(self) -> bool: ...
+
 
 @dataclass(frozen=True)
 class OpenAICompatibleSemanticProvider:
@@ -495,6 +632,10 @@ class OpenAICompatibleSemanticProvider:
     equivalence_verifier_version: str = "semantic-equivalence-verifier/2.0.0"
     requires_api_key: bool = False
     trust_environment_transport: bool = False
+
+    @property
+    def enforces_parameter_support(self) -> bool:
+        return False
 
     def add_request_options(
         self,
@@ -518,6 +659,16 @@ class OpenAICompatibleSemanticProvider:
             "semantic_usage": usage,
         }
 
+    def preflight_data_policy(self) -> dict[str, JsonValue]:
+        return {
+            "external_processing": True,
+            "provider_policy_declared": False,
+            "implication": (
+                "The configured endpoint receives evaluator prompts and sample data; UL cannot "
+                "verify its retention or training policy."
+            ),
+        }
+
 
 @dataclass(frozen=True)
 class OpenRouterSemanticProvider(OpenAICompatibleSemanticProvider):
@@ -526,6 +677,10 @@ class OpenRouterSemanticProvider(OpenAICompatibleSemanticProvider):
     endpoint_sha256: str = _sha256_text("https://openrouter.ai/api/v1")
     requires_api_key: bool = True
     trust_environment_transport: bool = True
+
+    @property
+    def enforces_parameter_support(self) -> bool:
+        return True
 
     def add_request_options(
         self,
@@ -537,6 +692,18 @@ class OpenRouterSemanticProvider(OpenAICompatibleSemanticProvider):
             "require_parameters": True,
             "data_collection": "deny",
             "zdr": True,
+        }
+
+    def preflight_data_policy(self) -> dict[str, JsonValue]:
+        return {
+            "external_processing": True,
+            "provider_policy_declared": True,
+            "data_collection": "deny",
+            "zero_data_retention_required": True,
+            "implication": (
+                "The configured route requires data collection to be denied and zero data "
+                "retention; the evaluator request is still processed externally."
+            ),
         }
 
 
@@ -556,6 +723,7 @@ class SemanticModelDeconstructor:
             follow_redirects=False,
             trust_env=self.provider.trust_environment_transport,
         )
+        self._preflight_result: EvaluatorModelPreflight | None = None
 
     async def __aenter__(self) -> Self:
         return self
@@ -571,6 +739,186 @@ class SemanticModelDeconstructor:
     async def aclose(self) -> None:
         if self._owns_client:
             await self._client.aclose()
+
+    async def preflight(self) -> EvaluatorModelPreflight:
+        profile_results: list[EvaluatorModelProfilePreflight] = []
+        for profile in self._preflight_profiles():
+            try:
+                response = await self._request(
+                    operation="preflight",
+                    model=profile.model,
+                    reasoning=profile.reasoning,
+                    max_tokens=profile.max_tokens,
+                    temperature=profile.temperature,
+                    seed=profile.seed,
+                    top_p=profile.top_p,
+                    schema_name="evaluator_preflight",
+                    schema=_EvaluatorPreflightSample.model_json_schema(mode="validation"),
+                    strict_schema=True,
+                    system_prompt=_PROMPTS.get_prompt("semantic.preflight"),
+                    untrusted_payload="{}",
+                    preflight_error_body_limit=4_096,
+                )
+            except TimeoutError:
+                raise self._compatibility_error(profile, "timeout") from None
+            except _EvaluatorPreflightHTTPError as error:
+                raise self._compatibility_error(profile, error.capability) from None
+            except ProviderDiagnosticError as error:
+                capability = {
+                    "timeout": "timeout",
+                    "invalid_response": "structured output",
+                }.get(error.diagnostic.category, "provider routing")
+                raise self._compatibility_error(profile, capability) from None
+            except httpx.HTTPError:
+                raise self._compatibility_error(profile, "routing") from None
+            try:
+                _EvaluatorPreflightSample.model_validate_json(response.choices[0].message.content)
+            except (ValidationError, ValueError):
+                raise self._compatibility_error(profile, "structured output") from None
+            routing_enforced = self.provider.enforces_parameter_support
+            profile_results.append(
+                EvaluatorModelProfilePreflight(
+                    roles=profile.roles,
+                    requested_model=profile.model,
+                    routed_model=response.model,
+                    upstream_provider=response.provider,
+                    required_parameters=profile.required_parameters,
+                    parameter_support=(
+                        "routing_enforced" if routing_enforced else "endpoint_accepted_unverified"
+                    ),
+                    unverified_options=() if routing_enforced else profile.required_parameters,
+                )
+            )
+        unverified_options = tuple(
+            dict.fromkeys(
+                option
+                for profile_result in profile_results
+                for option in profile_result.unverified_options
+            )
+        )
+        self._preflight_result = EvaluatorModelPreflight(
+            provider=self.provider.provider_id,
+            profiles=tuple(profile_results),
+            verified_capabilities=(
+                ("routing", "structured_output", "required_parameters")
+                if self.provider.enforces_parameter_support
+                else ("routing", "structured_output")
+            ),
+            unverified_options=unverified_options,
+            data_policy=self.provider.preflight_data_policy(),
+        )
+        return self._preflight_result
+
+    def reuse_preflight(self, result: EvaluatorModelPreflight) -> None:
+        expected_profiles = self._preflight_profiles()
+        expected_roles_and_models = tuple(
+            (profile.roles, profile.model, profile.required_parameters)
+            for profile in expected_profiles
+        )
+        actual_roles_and_models = tuple(
+            (profile.roles, profile.requested_model, profile.required_parameters)
+            for profile in result.profiles
+        )
+        if (
+            result.provider != self.provider.provider_id
+            or actual_roles_and_models != expected_roles_and_models
+        ):
+            raise ValueError("evaluator preflight does not match the configured semantic profiles")
+        self._preflight_result = result
+
+    def _preflight_profiles(self) -> tuple[_EvaluatorPreflightProfile, ...]:
+        render_seed = self._render_seed("UL evaluator preflight", "Check renderer compatibility.")
+        candidates = (
+            self._preflight_profile(
+                role="deconstruct",
+                model=self.settings.model,
+                reasoning={"effort": "minimal"},
+                max_tokens=min(self.settings.max_output_tokens, 16),
+                temperature=0,
+                seed=0,
+                top_p=None,
+            ),
+            self._preflight_profile(
+                role="render",
+                model=self.settings.render_model,
+                reasoning={"effort": "none"},
+                max_tokens=min(self.settings.max_render_tokens, 16),
+                temperature=0.7,
+                seed=render_seed,
+                top_p=0.95,
+            ),
+            self._preflight_profile(
+                role="equivalence",
+                model=self.settings.equivalence_model,
+                reasoning={"effort": "low"},
+                max_tokens=min(self.settings.max_output_tokens, 1_024, 16),
+                temperature=0,
+                seed=0,
+                top_p=None,
+            ),
+        )
+        profiles_by_signature: dict[str, _EvaluatorPreflightProfile] = {}
+        for candidate in candidates:
+            signature_body: dict[str, Any] = {
+                "model": candidate.model,
+                "max_tokens": candidate.max_tokens,
+                "temperature": candidate.temperature,
+                "seed": candidate.seed,
+            }
+            self.provider.add_request_options(signature_body, candidate.reasoning)
+            if candidate.top_p is not None:
+                signature_body["top_p"] = candidate.top_p
+            signature = json.dumps(signature_body, sort_keys=True, separators=(",", ":"))
+            existing = profiles_by_signature.get(signature)
+            if existing is None:
+                profiles_by_signature[signature] = candidate
+            else:
+                profiles_by_signature[signature] = dataclass_replace(
+                    existing,
+                    roles=(*existing.roles, *candidate.roles),
+                )
+        return tuple(profiles_by_signature.values())
+
+    def _preflight_profile(
+        self,
+        *,
+        role: Literal["deconstruct", "render", "equivalence"],
+        model: str,
+        reasoning: dict[str, JsonValue],
+        max_tokens: int,
+        temperature: float,
+        seed: int,
+        top_p: float | None,
+    ) -> _EvaluatorPreflightProfile:
+        request_options: dict[str, Any] = {}
+        self.provider.add_request_options(request_options, reasoning)
+        required_parameters = ["response_format", "seed", "temperature", "max_tokens"]
+        if "reasoning" in request_options:
+            required_parameters.append("reasoning")
+        if top_p is not None:
+            required_parameters.append("top_p")
+        return _EvaluatorPreflightProfile(
+            roles=(role,),
+            model=model,
+            reasoning=reasoning,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            seed=seed,
+            top_p=top_p,
+            required_parameters=tuple(required_parameters),
+        )
+
+    def _compatibility_error(
+        self,
+        profile: _EvaluatorPreflightProfile,
+        capability: str,
+    ) -> EvaluatorModelCompatibilityError:
+        roles = ", ".join(profile.roles)
+        return EvaluatorModelCompatibilityError(
+            f"semantic model profile for {roles} is incompatible with required {capability} "
+            "capability; "
+            "choose another configured evaluator model or verify the configured route and retry"
+        )
 
     async def deconstruct(
         self,
@@ -588,6 +936,7 @@ class SemanticModelDeconstructor:
             request_payload["reference_vocabulary"] = self._reference_vocabulary(reference_frame)
         untrusted_record = self._bounded_json(request_payload)
         response = await self._request(
+            operation="deconstruct",
             model=self.settings.model,
             reasoning={"effort": "minimal"},
             max_tokens=self.settings.max_output_tokens,
@@ -600,19 +949,22 @@ class SemanticModelDeconstructor:
             system_prompt=_PROMPTS.get_prompt("semantic.deconstruct"),
             untrusted_payload=untrusted_record,
         )
-        raw_frame = self._decode_object(response.choices[0].message.content)
-        raw_frame.update(
-            {
-                "schema_version": "1.0.0",
-                "interaction_id": record.id,
-                "extractor_version": self.provider.extractor_version,
-                "metadata": {
-                    **self._generation_metadata(response),
-                    "prompts": prompt_provenance("semantic.deconstruct"),
-                },
-            }
-        )
-        frame = SemanticFrame.model_validate_json(json.dumps(raw_frame))
+        try:
+            raw_frame = self._decode_object(response.choices[0].message.content)
+            raw_frame.update(
+                {
+                    "schema_version": "1.0.0",
+                    "interaction_id": record.id,
+                    "extractor_version": self.provider.extractor_version,
+                    "metadata": {
+                        **self._generation_metadata(response),
+                        "prompts": prompt_provenance("semantic.deconstruct"),
+                    },
+                }
+            )
+            frame = SemanticFrame.model_validate_json(json.dumps(raw_frame))
+        except (ValidationError, ValueError) as error:
+            raise self._invalid_response(error, operation="deconstruct") from None
         frame = self._expand_unambiguous_evidence_quotes(record, frame)
         frame = self._ground_self_correction_evidence(record, frame)
         self._validate_evidence(record, frame)
@@ -638,6 +990,7 @@ class SemanticModelDeconstructor:
         )
         temporary_value_rule = _PROMPTS.get_prompt(temporary_value_prompt)
         response = await self._request(
+            operation="render",
             model=self.settings.render_model,
             reasoning={"effort": "none"},
             max_tokens=self.settings.max_render_tokens,
@@ -653,9 +1006,12 @@ class SemanticModelDeconstructor:
             ),
             untrusted_payload=untrusted_payload,
         )
-        rendered = _RenderedInput.model_validate_json(
-            response.choices[0].message.content
-        ).rendered_input
+        try:
+            rendered = _RenderedInput.model_validate_json(
+                response.choices[0].message.content
+            ).rendered_input
+        except (ValidationError, ValueError) as error:
+            raise self._invalid_response(error, operation="render") from None
         if len(rendered) > self.settings.max_input_chars:
             raise ValueError("rendered input exceeds max_input_chars")
         return RenderedUserInput(
@@ -682,6 +1038,7 @@ class SemanticModelDeconstructor:
             {"source_input": source_input, "candidate_input": candidate_input}
         )
         response = await self._request(
+            operation="verify",
             model=self.settings.equivalence_model,
             reasoning={"effort": "low"},
             max_tokens=min(self.settings.max_output_tokens, 1_024),
@@ -694,19 +1051,24 @@ class SemanticModelDeconstructor:
             system_prompt=_PROMPTS.get_prompt("semantic.verify"),
             untrusted_payload=untrusted_payload,
         )
-        raw_assessment = self._decode_object(response.choices[0].message.content)
-        raw_assessment.update(
-            {
-                "schema_version": "1.0.0",
-                "verifier_version": self.provider.equivalence_verifier_version,
-                "metadata": {
-                    **self._generation_metadata(response),
-                    "requested_model": self.settings.equivalence_model,
-                    "prompts": prompt_provenance("semantic.verify"),
-                },
-            }
-        )
-        assessment = SemanticEquivalenceAssessment.model_validate_json(json.dumps(raw_assessment))
+        try:
+            raw_assessment = self._decode_object(response.choices[0].message.content)
+            raw_assessment.update(
+                {
+                    "schema_version": "1.0.0",
+                    "verifier_version": self.provider.equivalence_verifier_version,
+                    "metadata": {
+                        **self._generation_metadata(response),
+                        "requested_model": self.settings.equivalence_model,
+                        "prompts": prompt_provenance("semantic.verify"),
+                    },
+                }
+            )
+            assessment = SemanticEquivalenceAssessment.model_validate_json(
+                json.dumps(raw_assessment)
+            )
+        except (ValidationError, ValueError) as error:
+            raise self._invalid_response(error, operation="verify") from None
         assessment = assessment.model_copy(
             update={
                 "deltas": tuple(
@@ -739,9 +1101,25 @@ class SemanticModelDeconstructor:
                 raise ValueError("semantic equivalence candidate evidence is invalid")
         return assessment
 
+    def _invalid_response(
+        self,
+        error: BaseException,
+        *,
+        operation: Literal["deconstruct", "render", "verify"],
+    ) -> ProviderDiagnosticError:
+        return ProviderDiagnosticError(
+            _provider_diagnostic(
+                error,
+                provider=self.provider.provider_id,
+                operation=operation,
+                endpoint_sha256=self.provider.endpoint_sha256,
+            )
+        )
+
     async def _request(
         self,
         *,
+        operation: Literal["deconstruct", "render", "verify", "preflight"],
         model: str,
         reasoning: dict[str, JsonValue],
         max_tokens: int,
@@ -753,8 +1131,57 @@ class SemanticModelDeconstructor:
         strict_schema: bool,
         system_prompt: str,
         untrusted_payload: str,
+        preflight_error_body_limit: int = 0,
     ) -> _ChatCompletionResponse:
         api_key = self._require_live_access()
+        try:
+            return await self._request_completion(
+                api_key=api_key,
+                model=model,
+                reasoning=reasoning,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                seed=seed,
+                top_p=top_p,
+                schema_name=schema_name,
+                schema=schema,
+                strict_schema=strict_schema,
+                system_prompt=system_prompt,
+                untrusted_payload=untrusted_payload,
+                preflight_error_body_limit=preflight_error_body_limit,
+            )
+        except (
+            TimeoutError,
+            ValidationError,
+            httpx.RequestError,
+            httpx.HTTPStatusError,
+        ) as error:
+            raise ProviderDiagnosticError(
+                _provider_diagnostic(
+                    error,
+                    provider=self.provider.provider_id,
+                    operation=operation,
+                    endpoint_sha256=self.provider.endpoint_sha256,
+                )
+            ) from None
+
+    async def _request_completion(
+        self,
+        *,
+        api_key: str | None,
+        model: str,
+        reasoning: dict[str, JsonValue],
+        max_tokens: int,
+        temperature: float,
+        seed: int,
+        top_p: float | None,
+        schema_name: str,
+        schema: dict[str, Any],
+        strict_schema: bool,
+        system_prompt: str,
+        untrusted_payload: str,
+        preflight_error_body_limit: int = 0,
+    ) -> _ChatCompletionResponse:
         async with asyncio.timeout(self.settings.timeout_seconds):
             request_body: dict[str, Any] = {
                 "model": model,
@@ -794,6 +1221,14 @@ class SemanticModelDeconstructor:
                     raise ValueError("semantic provider response changed request origin")
                 if 300 <= response.status_code < 400:
                     raise ValueError("semantic provider redirects are not allowed")
+                if 400 <= response.status_code < 500 and preflight_error_body_limit:
+                    error_body = await _read_bounded_response(
+                        response,
+                        maximum_bytes=preflight_error_body_limit,
+                    )
+                    raise _EvaluatorPreflightHTTPError(
+                        _preflight_http_capability(response.status_code, error_body)
+                    )
                 response.raise_for_status()
                 content_encoding = response.headers.get("content-encoding", "identity")
                 if content_encoding.strip().lower() != "identity":
@@ -1113,7 +1548,12 @@ class SemanticModelDeconstructor:
         self,
         response: _ChatCompletionResponse,
     ) -> dict[str, JsonValue]:
-        return self.provider.generation_metadata(response)
+        metadata = self.provider.generation_metadata(response)
+        if self._preflight_result is not None:
+            metadata["evaluator_preflight"] = cast(
+                JsonValue, self._preflight_result.model_dump(mode="json")
+            )
+        return metadata
 
 
 def create_semantic_model_deconstructor(
@@ -1150,3 +1590,31 @@ def _contains_secret(value: object, secret: str) -> bool:
         sequence = cast(list[object], value)
         return any(_contains_secret(item, secret) for item in sequence)
     return False
+
+
+async def _read_bounded_response(response: httpx.Response, *, maximum_bytes: int) -> bytes:
+    chunks: list[bytes] = []
+    remaining = maximum_bytes
+    response_chunks = (
+        _single_chunk(response.content) if response.is_stream_consumed else response.aiter_raw()
+    )
+    async for chunk in response_chunks:
+        if remaining <= 0:
+            break
+        retained = chunk[:remaining]
+        chunks.append(retained)
+        remaining -= len(retained)
+        if len(chunk) > len(retained):
+            break
+    return b"".join(chunks)
+
+
+def _preflight_http_capability(status_code: int, error_body: bytes) -> str:
+    if status_code == 404:
+        return "model availability or routing"
+    detail = error_body.decode("utf-8", errors="ignore").lower()
+    if "response_format" in detail or "json_schema" in detail or "structured" in detail:
+        return "structured output"
+    if "seed" in detail:
+        return "seed"
+    return "provider routing"
