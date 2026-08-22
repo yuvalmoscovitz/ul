@@ -882,7 +882,7 @@ def test_dry_run_validates_and_makes_no_external_calls(
     assert "Selected interactions: 1" in result.output
     assert "Evaluation mode: variance" in result.output
     assert "Repetitions: 3 per original and accepted variation" in result.output
-    assert "Potential semantic model calls: up to 9" in result.output
+    assert "Potential semantic model calls: up to 12" in result.output
     assert "Potential environment API calls: up to 30" in result.output
     assert "authorized maximum: 100" in result.output
     assert "Semantic models receive historical inputs and outputs" in result.output
@@ -944,9 +944,10 @@ def test_dry_run_json_exposes_per_example_campaign_and_exact_call_plan(
         "repetitions": 2,
         "repetition_executions": 4,
         "retries": 0,
+        "preflight": 3,
         "evaluators": 7,
         "variation_generation": 0,
-        "total_semantic_model": 7,
+        "total_semantic_model": 10,
         "total_environment_api": 20,
     }
     planned_operator = next(
@@ -957,6 +958,11 @@ def test_dry_run_json_exposes_per_example_campaign_and_exact_call_plan(
     assert planned_operator["status"] == "conditional"
     assert planned_operator["selected"] is True
     assert "deterministic and free" in planned_operator["reasons"][1]
+    assert payload["tokens"] == {
+        "minimum": 0,
+        "maximum": 25_648,
+        "scope": "completion_tokens",
+    }
     assert payload["money"] is None
 
 
@@ -1040,7 +1046,7 @@ def test_campaign_plan_does_not_count_known_non_executable_variations(
     assert plan.calls.variation == 0
     assert plan.calls.repetition_executions == 3
     assert plan.calls.evaluators == 3
-    assert plan.calls.total_semantic_model == 3
+    assert plan.calls.total_semantic_model == 6
     assert plan.calls.total_environment_api == 15
 
 
@@ -1073,6 +1079,7 @@ def test_human_dry_run_escapes_untrusted_ids_and_summarizes_unselected_catalog(
     assert "\\u001b" in result.output
     assert "[bold]spoof[/bold]" in result.output
     assert "Unselected catalog operators:" in result.output
+    assert "0 eligible, 7 conditional, 10 ineligible" in result.output
     assert "use --json for full detail" in " ".join(result.output.split())
     assert "input.surface.typing_noise@" not in result.output
 
@@ -1647,7 +1654,7 @@ def test_invariant_dry_run_reports_rules_authority_and_no_extra_calls(
     assert "Declared observation authority: committed_state_snapshot" in result.output
     assert "Additional model calls for customer invariants: 0" in result.output
     assert "Additional environment API calls for customer invariants: 0" in result.output
-    assert "Potential semantic model calls: up to 10" in result.output
+    assert "Potential semantic model calls: up to 13" in result.output
     assert "Potential environment API calls: up to 6" in result.output
 
 
@@ -3100,7 +3107,7 @@ def test_legacy_operator_list_delegates_to_catalog_and_keeps_existing_call_accou
 
     assert dry_run.exit_code == 0, dry_run.output
     assert "Operators: input.intent.self_correction@1.0.0" in dry_run.output
-    assert "Potential semantic model calls: up to 10" in dry_run.output
+    assert "Potential semantic model calls: up to 13" in dry_run.output
     assert "Potential environment API calls: up to 6" in dry_run.output
 
     wrong_version = runner.invoke(

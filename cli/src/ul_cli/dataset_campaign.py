@@ -33,6 +33,7 @@ class CampaignCallCounts(_StrictModel):
     repetitions: int = Field(ge=1)
     repetition_executions: int = Field(ge=0)
     retries: int = Field(ge=0)
+    preflight: int = Field(ge=0)
     evaluators: int = Field(ge=0)
     variation_generation: int = Field(ge=0)
     total_semantic_model: int = Field(ge=0)
@@ -66,6 +67,8 @@ _DETERMINISTIC_OPERATORS = {
     "input.surface.typing_noise",
     "input.surface.disfluency_repeat",
 }
+_MAXIMUM_PREFLIGHT_PROFILE_CALLS = 3
+_MAXIMUM_PREFLIGHT_COMPLETION_TOKENS = 16 * _MAXIMUM_PREFLIGHT_PROFILE_CALLS
 
 
 def create_dataset_campaign_plan(
@@ -128,13 +131,14 @@ def create_dataset_campaign_plan(
         + equivalence_calls
         + trial_evaluator_calls
     )
-    total_semantic_calls = evaluator_calls + generation_calls
+    total_semantic_calls = evaluator_calls + generation_calls + _MAXIMUM_PREFLIGHT_PROFILE_CALLS
 
     deconstruction_calls = (
         source_deconstruction_calls + candidate_deconstruction_calls + trial_evaluator_calls
     )
     maximum_completion_tokens = (
-        deconstruction_calls * settings.max_output_tokens
+        _MAXIMUM_PREFLIGHT_COMPLETION_TOKENS
+        + deconstruction_calls * settings.max_output_tokens
         + generation_calls * settings.max_render_tokens
         + equivalence_calls * min(settings.max_output_tokens, 1_024)
     )
@@ -175,6 +179,7 @@ def create_dataset_campaign_plan(
             repetitions=repetitions,
             repetition_executions=execution_calls,
             retries=0,
+            preflight=_MAXIMUM_PREFLIGHT_PROFILE_CALLS,
             evaluators=evaluator_calls,
             variation_generation=generation_calls,
             total_semantic_model=total_semantic_calls,
@@ -203,14 +208,6 @@ def _operator_plan(
             selected=False,
             reasons=("operator is not available in dataset evaluation mode",),
         )
-    if not selected:
-        return CampaignOperatorPlan(
-            id=operator.ref.id,
-            version=operator.ref.version,
-            status="eligible",
-            selected=False,
-            reasons=("operator is compatible with this dataset campaign but was not selected",),
-        )
     candidate = (
         next(
             (
@@ -228,7 +225,7 @@ def _operator_plan(
             id=operator.ref.id,
             version=operator.ref.version,
             status="eligible" if candidate.passed else "ineligible",
-            selected=True,
+            selected=selected,
             reasons=(
                 ("saved candidate passed semantic qualification",)
                 if candidate.passed
@@ -242,7 +239,7 @@ def _operator_plan(
             id=operator.ref.id,
             version=operator.ref.version,
             status="ineligible",
-            selected=True,
+            selected=selected,
             reasons=("saved semantic qualification produced no candidate",),
         )
     deterministic_reason = (
@@ -255,8 +252,9 @@ def _operator_plan(
         id=operator.ref.id,
         version=operator.ref.version,
         status="conditional",
-        selected=True,
+        selected=selected,
         reasons=(
+            *(("operator was not selected",) if not selected else ()),
             "applicability depends on semantic source qualification performed during execution",
             deterministic_reason,
         ),

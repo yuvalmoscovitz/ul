@@ -1616,10 +1616,16 @@ def _print_dataset_plan(
         unselected_eligible = sum(
             operator.status == "eligible" for operator in unselected_operators
         )
-        unselected_ineligible = len(unselected_operators) - unselected_eligible
+        unselected_conditional = sum(
+            operator.status == "conditional" for operator in unselected_operators
+        )
+        unselected_ineligible = sum(
+            operator.status == "ineligible" for operator in unselected_operators
+        )
         console.print(
             "Unselected catalog operators: "
-            f"{unselected_eligible} eligible, {unselected_ineligible} ineligible "
+            f"{unselected_eligible} eligible, {unselected_conditional} conditional, "
+            f"{unselected_ineligible} ineligible "
             "(use --json for full detail)"
         )
     if fixture_status is not None:
