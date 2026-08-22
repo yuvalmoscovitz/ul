@@ -74,7 +74,7 @@ _MAXIMUM_SENSITIVE_DISCLOSURE_LINES = 50
 _SHA256_PATTERN = r"^[0-9a-f]{64}$"
 _FINDING_ID_PATTERN = r"^ulf_v1_[0-9a-f]{64}$"
 _REVIEW_ID_PATTERN = r"^ulr_[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
-_DATASET_EVALUATION_PIPELINE_VERSION = "1.2.0"
+_DATASET_EVALUATION_PIPELINE_VERSION = "1.3.0"
 _MAXIMUM_PATTERN_EFFECTS = 100
 _MAXIMUM_PATTERN_FIELDS = 100
 _MAXIMUM_PATTERN_LABEL_CHARACTERS = 500
@@ -210,10 +210,11 @@ class DatasetEvidenceTarget(_StrictModel):
 
 
 class DatasetEvidenceRunContext(_StrictModel):
-    schema_version: Literal["1.1.0"] = "1.1.0"
-    pipeline_version: Literal["1.2.0"] = _DATASET_EVALUATION_PIPELINE_VERSION
+    schema_version: Literal["1.1.0", "1.2.0"] = "1.2.0"
+    pipeline_version: Literal["1.2.0", "1.3.0"] = _DATASET_EVALUATION_PIPELINE_VERSION
     selected_dataset_sha256: str = Field(pattern=_SHA256_PATTERN)
     operators: tuple[DatasetEvidenceOperator, ...] = Field(min_length=1)
+    evaluation_mode: Literal["variance"] | None = None
     repetitions: int = Field(ge=1)
     invariant_suite_sha256: str | None = Field(default=None, pattern=_SHA256_PATTERN)
     target: DatasetEvidenceTarget
@@ -224,7 +225,18 @@ class DatasetEvidenceRunContext(_StrictModel):
 
     @model_validator(mode="after")
     def validate_digests(self) -> Self:
+        if (self.schema_version, self.pipeline_version) not in {
+            ("1.1.0", "1.2.0"),
+            ("1.2.0", "1.3.0"),
+        }:
+            raise ValueError("run context schema and pipeline versions must match")
+        if self.schema_version == "1.2.0" and self.evaluation_mode is None:
+            raise ValueError("run context schema 1.2.0 requires an evaluation mode")
+        if self.schema_version == "1.1.0" and "evaluation_mode" in self.model_fields_set:
+            raise ValueError("run context schema 1.1.0 does not include evaluation mode")
         context_content = self.model_dump(mode="json", exclude={"context_sha256"})
+        if self.evaluation_mode is None:
+            context_content.pop("evaluation_mode")
         if self.redaction_policy_sha256 is None:
             context_content.pop("redaction_policy_sha256")
         if not self.redaction_coverage:
@@ -254,7 +266,8 @@ class _Case(_StrictModel):
 
 
 class _EvidenceRecord(_StrictModel):
-    schema_version: Literal["1.3.0", "1.4.0", "1.5.0", "1.6.0", "1.7.0"]
+    schema_version: Literal["1.3.0", "1.4.0", "1.5.0", "1.6.0", "1.7.0", "1.8.0"]
+    evaluation_mode: Literal["variance"] | None = None
     interaction_id: str
     original_input: str
     execution_plan: _ExecutionPlan
@@ -267,12 +280,21 @@ class _EvidenceRecord(_StrictModel):
 
     @model_validator(mode="after")
     def validate_invariant_evaluation(self) -> Self:
+        if self.schema_version == "1.8.0" and self.evaluation_mode is None:
+            raise ValueError("evidence schema 1.8.0 requires an evaluation mode")
+        if self.schema_version == "1.8.0" and (
+            not isinstance(self.technical_details, dict)
+            or self.technical_details.get("evaluation_mode") != self.evaluation_mode
+        ):
+            raise ValueError("evidence evaluation mode must match technical details")
+        if self.schema_version != "1.8.0" and "evaluation_mode" in self.model_fields_set:
+            raise ValueError("legacy evidence does not include evaluation mode")
         if self.schema_version == "1.3.0" and "invariant_evaluation" in self.model_fields_set:
             raise ValueError("schema 1.3.0 does not include invariant evaluation")
         if self.schema_version in {"1.5.0", "1.6.0", "1.7.0"} and self.run_context is None:
             raise ValueError(f"schema {self.schema_version} requires run context")
         if (
-            self.schema_version not in {"1.5.0", "1.6.0", "1.7.0"}
+            self.schema_version not in {"1.5.0", "1.6.0", "1.7.0", "1.8.0"}
             and "run_context" in self.model_fields_set
         ):
             raise ValueError("legacy evidence does not include run context")
@@ -284,8 +306,14 @@ class _EvidenceRecord(_StrictModel):
             )
             for rule in arm.rules
         )
-        if uses_extended_invariants and self.schema_version not in {"1.6.0", "1.7.0"}:
+        if uses_extended_invariants and self.schema_version not in {"1.6.0", "1.7.0", "1.8.0"}:
             raise ValueError("extended invariant results require evidence schema 1.6.0")
+        if (
+            self.run_context is not None
+            and self.evaluation_mode is not None
+            and self.run_context.evaluation_mode != self.evaluation_mode
+        ):
+            raise ValueError("evidence evaluation mode must match its run context")
         if (
             self.invariant_evaluation is not None
             and self.invariant_evaluation.interaction_id != self.interaction_id
@@ -307,6 +335,7 @@ def create_dataset_evidence_run_context(
     *,
     selected_records: tuple[InteractionRecord, ...],
     operators: tuple[tuple[str, str], ...],
+    evaluation_mode: Literal["variance"] = "variance",
     repetitions: int,
     invariant_suite_sha256: str | None,
     target_config: JsonHttpTargetConfig | None = None,
@@ -329,10 +358,11 @@ def create_dataset_evidence_run_context(
         sha256=dataset_regression_target_config_sha256(target_config),
     )
     content = {
-        "schema_version": "1.1.0",
+        "schema_version": "1.2.0",
         "pipeline_version": _DATASET_EVALUATION_PIPELINE_VERSION,
         "selected_dataset_sha256": selected_dataset_sha256,
         "operators": [operator.model_dump(mode="json") for operator in operator_snapshots],
+        "evaluation_mode": evaluation_mode,
         "repetitions": repetitions,
         "invariant_suite_sha256": invariant_suite_sha256,
         "target": target.model_dump(mode="json"),
@@ -347,6 +377,7 @@ def create_dataset_evidence_run_context(
     return DatasetEvidenceRunContext(
         selected_dataset_sha256=selected_dataset_sha256,
         operators=operator_snapshots,
+        evaluation_mode=evaluation_mode,
         repetitions=repetitions,
         invariant_suite_sha256=invariant_suite_sha256,
         target=target,
@@ -394,11 +425,11 @@ def validate_dataset_resume_evidence(
         except (ValidationError, ValueError):
             raise ValueError("resume evidence is not valid UL JSONL") from None
         if (
-            evidence.schema_version not in {"1.5.0", "1.6.0", "1.7.0"}
+            evidence.schema_version not in {"1.5.0", "1.6.0", "1.7.0", "1.8.0"}
             or evidence.run_context is None
         ):
             raise ValueError(
-                "resume requires evidence created with schema 1.5.0 or 1.6.0 run "
+                "resume requires evidence created with schema 1.5.0 or later run "
                 "compatibility metadata"
             )
         if evidence.run_context != expected_context:
@@ -415,6 +446,8 @@ def validate_dataset_resume_evidence(
         except (ValidationError, ValueError):
             raise ValueError("resume evidence contains invalid technical details") from None
         technical_results.append(technical_result)
+        if technical_result.evaluation_mode != evidence.evaluation_mode:
+            raise ValueError("resume evidence evaluation mode does not match technical details")
         if technical_result.source != selected_record:
             raise ValueError("resume evidence source does not match the selected dataset")
         if evidence.original_input != technical_result.source.raw_input:
@@ -587,6 +620,7 @@ def _summarize_dataset_evidence(
     reviews: Path | None,
 ) -> UnifiedReport:
     evidence_records = _load_evidence(evidence)
+    evaluation_mode = _dataset_evaluation_mode(evidence_records)
     review_records = _load_reviews(reviews or _default_reviews_path(evidence))
     indexed_findings = _index_findings(evidence_records)
     _validate_review_history(review_records, indexed_findings)
@@ -808,6 +842,7 @@ def _summarize_dataset_evidence(
             sorted({record.evidence.schema_version for record in evidence_records})
         ),
         evidence_scope="response_only" if response_only else "response_and_state",
+        evaluation_mode=evaluation_mode,
         capability_limitations=(
             ("cleanup_verification", "conversation_replay", "state_observation")
             if response_only
@@ -819,6 +854,17 @@ def _summarize_dataset_evidence(
         patterns=patterns,
         findings=findings,
     )
+
+
+def _dataset_evaluation_mode(
+    records: list[_LoadedEvidenceRecord],
+) -> Literal["variance"] | None:
+    evaluation_modes: set[Literal["variance"] | None] = {
+        record.evidence.evaluation_mode for record in records
+    }
+    if len(evaluation_modes) != 1:
+        raise _ReviewInputError("evidence combines incompatible evaluation modes")
+    return next(iter(evaluation_modes))
 
 
 def _behavior_pattern_signature(finding: _Finding) -> str | None:
@@ -1032,6 +1078,12 @@ def report_dataset_evidence(
         status_counts[active_review.status if active_review else "needs_review"] += 1
 
     _print_plain(f"Dataset finding report: {len(findings)} finding(s)")
+    evaluation_mode = _dataset_evaluation_mode(evidence_records)
+    if evaluation_mode is not None:
+        _print_plain(
+            f"Evaluation mode: {evaluation_mode} (historical output is not an expected answer; "
+            "correctness not assessed)"
+        )
     _print_plain(
         "Reviews: " + ", ".join(f"{status}={count}" for status, count in status_counts.items())
     )
@@ -1261,9 +1313,7 @@ def _load_evidence(path: Path) -> list[_LoadedEvidenceRecord]:
                 )
             )
     except (ValidationError, ValueError):
-        raise _ReviewInputError(
-            "evidence is not valid UL schema 1.3.0, 1.4.0, 1.5.0, or 1.6.0 JSONL"
-        ) from None
+        raise _ReviewInputError("evidence is not valid UL schema through 1.8.0 JSONL") from None
     return records
 
 
