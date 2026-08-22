@@ -321,6 +321,8 @@ class JsonHttpEnvironmentConfig(BaseModel):
 
     version: Literal[5]
     environment_id: str = Field(min_length=1, max_length=500)
+    fixture_id: str | None = Field(default=None, min_length=1, max_length=500)
+    fixture_version: str | None = Field(default=None, min_length=1, max_length=500)
     headers_from_env: dict[str, str] = Field(default_factory=dict)
     reset: JsonHttpLifecycleResetConfig
     setup: JsonHttpLifecycleMutationConfig | None = None
@@ -342,6 +344,8 @@ class JsonHttpEnvironmentConfig(BaseModel):
 
     @model_validator(mode="after")
     def validate_same_origin(self) -> Self:
+        if (self.fixture_id is None) != (self.fixture_version is None):
+            raise ValueError("fixture_id and fixture_version must be provided together")
         origins = {_endpoint_origin(url) for url in json_http_environment_config_urls(self)}
         if len(origins) != 1:
             raise ValueError("all lifecycle endpoints must use the same origin")
