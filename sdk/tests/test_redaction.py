@@ -290,7 +290,7 @@ class _RecordingEnvironment:
             ),
             observations=(
                 ProbeObservation(
-                    id="observation-1",
+                    id=f"observation:{_SECRET}",
                     source_id="observer-1",
                     correlation_id="correlation-1",
                     authority="independent_observer",
@@ -303,9 +303,9 @@ class _RecordingEnvironment:
             ),
             execution_events=(
                 ProbeExecutionEvent(
-                    id="event-1",
+                    id=f"event:{_SECRET}",
                     correlation_id="correlation-1",
-                    kind="tool_call",
+                    kind=f"tool_call:{_SECRET}",
                     payload={"contact": _SECRET},
                 ),
             ),
@@ -376,6 +376,9 @@ async def test_pipeline_is_one_boundary_and_environment_rehydrates(tmp_path: Pat
     assert environment.inputs == [f"Please Email {_SECRET}"]
     assert _SECRET not in protected_evidence.model_dump_json()
     assert "__UL_SECRET_email_" in protected_evidence.model_dump_json()
+    assert protected_evidence.observations[0].id.startswith("observation:__UL_SECRET_email_")
+    assert protected_evidence.execution_events[0].id.startswith("event:__UL_SECRET_email_")
+    assert protected_evidence.execution_events[0].kind.startswith("tool_call:__UL_SECRET_email_")
     for metadata in (frame.metadata, rendered.metadata, assessment.metadata):
         assert metadata == {"redaction_policy_sha256": policy().digest}
         assert _SECRET not in json.dumps(metadata)

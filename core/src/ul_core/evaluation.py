@@ -5,6 +5,7 @@ from typing import Literal, Self
 
 from pydantic import ConfigDict, Field, JsonValue, model_validator
 
+from ul_core.evaluators import EvaluatorSpec
 from ul_core.models import ConversationTurn, ULModel
 
 StateObservationAuthority = Literal["environment_self_reported", "independent_observer"]
@@ -91,7 +92,7 @@ class ProbeResult(_StrictModel):
     id: str = Field(min_length=1, max_length=500)
     correlation_id: str = Field(min_length=1, max_length=500)
     response: JsonValue
-    response_size_bytes: int = Field(ge=0)
+    response_size_bytes: int | None = Field(default=None, ge=0)
     response_truncated: bool = False
     execution_events: tuple[ProbeExecutionEvent, ...] = Field(default=(), max_length=1_000)
 
@@ -229,6 +230,7 @@ class ProbeInvokerCapabilities(_StrictModel):
     schema_version: Literal["1.0.0"] = "1.0.0"
     invoker_id: str = Field(min_length=1, max_length=500)
     response_size_limit_bytes: int = Field(ge=1)
+    execution_events_size_limit_bytes: int = Field(default=1_000_000, ge=1)
     supports_structured_execution_events: bool = False
     supports_conversations: bool = False
     request_isolation: Literal["not_attested", "per_request_attested"] = "not_attested"
@@ -262,6 +264,7 @@ class ObservationSourceCapabilities(_StrictModel):
 class StateEnvironmentCapabilities(_StrictModel):
     schema_version: Literal["1.0.0"] = "1.0.0"
     environment_id: str = Field(min_length=1, max_length=500)
+    snapshot_size_limit_bytes: int = Field(default=1_000_000, ge=1)
     supports_reset: bool = False
     supports_setup: bool = False
     supports_snapshot: bool = False
@@ -299,16 +302,17 @@ class ProbeCapabilities(_StrictModel):
 
 class EvidenceProfile(_StrictModel):
     schema_version: Literal["1.0.0"] = "1.0.0"
-    supported_facts: frozenset[EvidenceFact]
+    basis: Literal["declared_capabilities"] = "declared_capabilities"
+    available_facts: frozenset[EvidenceFact]
     sources: dict[EvidenceFact, str]
     authorities: dict[EvidenceFact, EvidenceAuthority]
 
     @model_validator(mode="after")
     def validate_fact_provenance(self) -> Self:
-        if set(self.sources) != set(self.supported_facts):
-            raise ValueError("every supported evidence fact requires exactly one source")
-        if set(self.authorities) != set(self.supported_facts):
-            raise ValueError("every supported evidence fact requires exactly one authority")
+        if set(self.sources) != set(self.available_facts):
+            raise ValueError("every available evidence fact requires exactly one source")
+        if set(self.authorities) != set(self.available_facts):
+            raise ValueError("every available evidence fact requires exactly one authority")
         return self
 
 
@@ -341,7 +345,7 @@ def evidence_profile_from_capabilities(capabilities: ProbeCapabilities) -> Evide
             else "environment_self_reported"
         )
     return EvidenceProfile(
-        supported_facts=frozenset(supported_facts),
+        available_facts=frozenset(supported_facts),
         sources=sources,
         authorities=authorities,
     )
@@ -407,6 +411,7 @@ class EvaluationCase(_StrictModel):
     required_state_observation_authority: StateObservationAuthority | None = None
     required_state_observer_id: str | None = Field(default=None, min_length=1, max_length=500)
     timeout_after_commit_event: TimeoutAfterCommitEventRequest | None = None
+    evaluators: tuple[EvaluatorSpec, ...] = ()
 
     @model_validator(mode="after")
     def validate_identifiers(self) -> Self:
@@ -415,6 +420,9 @@ class EvaluationCase(_StrictModel):
         turn_ids = tuple(turn.id for turn in self.turns)
         if len(turn_ids) != len(set(turn_ids)):
             raise ValueError("evaluation case turn identifiers must be unique")
+        evaluator_ids = tuple(evaluator.id for evaluator in self.evaluators)
+        if len(evaluator_ids) != len(set(evaluator_ids)):
+            raise ValueError("evaluation case evaluator identifiers must be unique")
         if (
             self.timeout_after_commit_event is not None
             and self.timeout_after_commit_event.turn_id not in turn_ids

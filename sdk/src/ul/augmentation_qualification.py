@@ -308,6 +308,8 @@ def create_augmentation_qualification_report(
     attempts: tuple[AugmentationQualificationAttempt, ...],
     thresholds: AugmentationQualificationThresholds | None = None,
 ) -> AugmentationQualificationReport:
+    if applicability_profile != operator.applicability_profile:
+        raise ValueError("qualification profile must match the operator applicability contract")
     selected_thresholds = thresholds or augmentation_qualification_thresholds(applicability_profile)
     attempts = tuple(sorted(attempts, key=lambda item: (item.case_id, item.repetition)))
     _validate_attempt_coverage(corpus, attempts)

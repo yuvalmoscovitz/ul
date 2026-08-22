@@ -29,8 +29,16 @@ from ul_core.dataset import (
     SemanticFrame,
     UserInputRecord,
 )
-from ul_core.evaluation import EnvironmentCapabilities, EvaluationCase, ExecutionEvidence
+from ul_core.evaluation import (
+    EnvironmentCapabilities,
+    EvaluationCase,
+    ExecutionEvidence,
+    ProbeExecutionEvent,
+    ProbeObservation,
+)
 from ul_core.models import ULModel
+
+from ul.deconstruction import SemanticCallMetrics
 
 if sys.platform == "win32":
     import msvcrt
@@ -464,6 +472,13 @@ class RedactedSemanticPipeline:
         self._pipeline = pipeline
         self.engine = engine
 
+    @property
+    def semantic_call_metrics(self) -> SemanticCallMetrics:
+        metrics = getattr(self._pipeline, "semantic_call_metrics", None)
+        if not isinstance(metrics, SemanticCallMetrics):
+            return SemanticCallMetrics(actual_calls=0, cache_hits=0)
+        return metrics
+
     def protect_record(
         self, record: InteractionRecord | UserInputRecord
     ) -> InteractionRecord | UserInputRecord:
@@ -604,8 +619,13 @@ class RehydratingEnvironmentConnection:
             for turn in evidence.turns
         )
         protected_observations = tuple(
-            observation.model_copy(
-                update={
+            ProbeObservation.model_validate(
+                {
+                    **observation.model_dump(mode="python"),
+                    "id": self._engine.transform(
+                        observation.id,
+                        location="output",
+                    ).value,
                     "traces": tuple(
                         self._engine.transform(value, location="output").value
                         for value in observation.traces
@@ -655,12 +675,21 @@ class RehydratingEnvironmentConnection:
             for observation in evidence.observations
         )
         protected_execution_events = tuple(
-            event.model_copy(
-                update={
+            ProbeExecutionEvent.model_validate(
+                {
+                    **event.model_dump(mode="python"),
+                    "id": self._engine.transform(
+                        event.id,
+                        location="output",
+                    ).value,
+                    "kind": self._engine.transform(
+                        event.kind,
+                        location="output",
+                    ).value,
                     "payload": self._engine.transform(
                         event.payload,
                         location="output",
-                    ).value
+                    ).value,
                 }
             )
             for event in evidence.execution_events

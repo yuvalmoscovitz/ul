@@ -676,7 +676,7 @@ class JsonHttpEnvironmentConnection:
                 if isinstance(self._config, JsonHttpIsolatedResponseConfig):
                     self._reserve_environment_api_calls(required_calls)
                     return await self._composed_executor.execute(case)
-                if self._config.timeout_after_commit is None:
+                if case.timeout_after_commit_event is None:
                     if self._composed_executor.state_uncertain:
                         return await self._composed_executor.execute(case)
                     self._reserve_environment_api_calls(required_calls)

@@ -4,8 +4,11 @@ import asyncio
 import hashlib
 import inspect
 import json
+import math
 import secrets
+import threading
 from collections.abc import Awaitable, Callable
+from contextlib import suppress
 from typing import Literal, cast, get_args
 
 from ul_core.contracts import ObservationSource, ProbeInvoker, StateEnvironment
@@ -60,13 +63,68 @@ async def _resolve[T](value: T | Awaitable[T]) -> T:
     return value
 
 
+class _SyncAdapterRunner:
+    def __init__(self, thread_name_prefix: str) -> None:
+        self._thread_name = thread_name_prefix
+        self._lock = threading.Lock()
+        self._running = False
+        self._unavailable = False
+
+    async def call[RequestT, ResultT](
+        self,
+        operation: Callable[[RequestT], ResultT | Awaitable[ResultT]],
+        request: RequestT,
+    ) -> ResultT:
+        loop = asyncio.get_running_loop()
+        result_future: asyncio.Future[ResultT | Awaitable[ResultT]] = loop.create_future()
+        with self._lock:
+            if self._running or self._unavailable:
+                raise RuntimeError("synchronous adapter operation is unavailable")
+            self._running = True
+
+        def deliver_result(value: ResultT | Awaitable[ResultT]) -> None:
+            if not result_future.done():
+                result_future.set_result(value)
+
+        def deliver_error(error: BaseException) -> None:
+            if not result_future.done():
+                result_future.set_exception(error)
+
+        def run() -> None:
+            try:
+                value = operation(request)
+            except BaseException as error:
+                with suppress(RuntimeError):
+                    loop.call_soon_threadsafe(deliver_error, error)
+            else:
+                with suppress(RuntimeError):
+                    loop.call_soon_threadsafe(deliver_result, value)
+            finally:
+                with self._lock:
+                    self._running = False
+
+        threading.Thread(
+            target=run,
+            name=self._thread_name,
+            daemon=True,
+        ).start()
+        try:
+            value = await result_future
+            return await _resolve(value)
+        except asyncio.CancelledError:
+            with self._lock:
+                self._unavailable = True
+            raise
+
+
 async def _call[RequestT, ResultT](
     operation: Callable[[RequestT], ResultT | Awaitable[ResultT]],
     request: RequestT,
+    sync_runner: _SyncAdapterRunner,
 ) -> ResultT:
     if inspect.iscoroutinefunction(operation):
         return await cast(Awaitable[ResultT], operation(request))
-    return await _resolve(await asyncio.to_thread(operation, request))
+    return await sync_runner.call(operation, request)
 
 
 class ComposedEnvironmentExecutor:
@@ -78,11 +136,17 @@ class ComposedEnvironmentExecutor:
         observation_source: ObservationSource | None = None,
         state_environment: StateEnvironment | None = None,
         fixture_id: str | None = None,
+        observation_timeout_seconds: float = 1.0,
+        cleanup_grace_seconds: float = 1.0,
     ) -> None:
         if len(config_sha256) != 64 or any(
             character not in "0123456789abcdef" for character in config_sha256
         ):
             raise ValueError("config_sha256 must be a lowercase SHA-256 digest")
+        if not math.isfinite(observation_timeout_seconds) or observation_timeout_seconds <= 0:
+            raise ValueError("observation_timeout_seconds must be finite and positive")
+        if not math.isfinite(cleanup_grace_seconds) or cleanup_grace_seconds <= 0:
+            raise ValueError("cleanup_grace_seconds must be finite and positive")
         state_capabilities = (
             state_environment.capabilities if state_environment is not None else None
         )
@@ -105,8 +169,14 @@ class ComposedEnvironmentExecutor:
             else invoker.capabilities.invoker_id
         )
         self._config_sha256 = config_sha256
+        self._observation_timeout_seconds = observation_timeout_seconds
+        self._cleanup_grace_seconds = cleanup_grace_seconds
         self._lock = asyncio.Lock()
         self._state_uncertain = False
+        self._invoker_sync_runner = _SyncAdapterRunner("ul-probe-invoker")
+        self._observer_sync_runner = _SyncAdapterRunner("ul-probe-observer")
+        self._state_sync_runner = _SyncAdapterRunner("ul-probe-state")
+        self._cleanup_sync_runner = _SyncAdapterRunner("ul-probe-cleanup")
         self.probe_capabilities = ProbeCapabilities(
             invoker=invoker.capabilities,
             observation_source=(
@@ -175,11 +245,13 @@ class ComposedEnvironmentExecutor:
         if required_calls > case.max_environment_api_calls:
             raise ValueError("evaluation case exceeds its environment API call budget")
         async with self._lock:
+            execution_id = f"ul-probe-{secrets.token_hex(16)}"
             async with asyncio.timeout(case.timeout_seconds):
-                execution_id = f"ul-probe-{secrets.token_hex(16)}"
                 if self._state_environment is None:
-                    return await self._execute_response_only(case, execution_id)
-                return await self._execute_with_state(case, execution_id)
+                    evidence = await self._execute_response_only(case, execution_id)
+                else:
+                    evidence = await self._execute_with_state(case, execution_id)
+            return await self._attach_observations(case, evidence, execution_id)
 
     async def _execute_response_only(
         self,
@@ -216,9 +288,6 @@ class ComposedEnvironmentExecutor:
                 )
             )
             execution_events.extend(result.execution_events)
-            observations.append(await self._observe(case, correlation_id, execution_id)) if (
-                self._observation_source is not None
-            ) else None
         return self._response_only_evidence(
             case,
             tuple(turns),
@@ -274,6 +343,7 @@ class ComposedEnvironmentExecutor:
                         correlation_id=execution_id,
                         session_id=execution_id,
                     ),
+                    self._state_sync_runner,
                 ),
                 "reset",
                 self._state_request(
@@ -294,6 +364,7 @@ class ComposedEnvironmentExecutor:
                             correlation_id=execution_id,
                             session_id=execution_id,
                         ),
+                        self._state_sync_runner,
                     ),
                     "setup",
                     self._state_request(
@@ -312,6 +383,7 @@ class ComposedEnvironmentExecutor:
                     session_id=execution_id,
                     turn_id="__ul_initial_state__",
                 ),
+                self._state_sync_runner,
             )
             self._validate_snapshot(initial_state, execution_id)
             completed_phases.append("initial_snapshot")
@@ -326,6 +398,15 @@ class ComposedEnvironmentExecutor:
                     execution_id,
                 )
                 completed_phases.append(current_phase)
+                turns.append(
+                    EnvironmentTurnEvidence(
+                        turn_id=turn.id,
+                        response=result.response,
+                        response_source_id=self._invoker.capabilities.invoker_id,
+                        correlation_id=correlation_id,
+                    )
+                )
+                execution_events.extend(result.execution_events)
                 current_phase = _phase("snapshot", index, len(case.turns))
                 snapshot = await _call(
                     state_environment.snapshot,
@@ -335,23 +416,17 @@ class ComposedEnvironmentExecutor:
                         session_id=execution_id,
                         turn_id=turn.id,
                     ),
+                    self._state_sync_runner,
                 )
                 self._validate_snapshot(snapshot, correlation_id)
                 completed_phases.append(current_phase)
-                turns.append(
-                    EnvironmentTurnEvidence(
-                        turn_id=turn.id,
-                        response=result.response,
-                        response_source_id=self._invoker.capabilities.invoker_id,
-                        correlation_id=correlation_id,
-                        state_snapshot=snapshot.value,
-                        state_observation_authority=snapshot.authority,
-                        state_observer_id=snapshot.observer_id,
-                    )
+                turns[-1] = turns[-1].model_copy(
+                    update={
+                        "state_snapshot": snapshot.value,
+                        "state_observation_authority": snapshot.authority,
+                        "state_observer_id": snapshot.observer_id,
+                    }
                 )
-                execution_events.extend(result.execution_events)
-                if self._observation_source is not None:
-                    observations.append(await self._observe(case, correlation_id, execution_id))
         except CapabilityExecutionError as caught_error:
             error = caught_error
             failed_phase = current_phase
@@ -369,23 +444,31 @@ class ComposedEnvironmentExecutor:
         finally:
             if lifecycle_started:
                 try:
-                    cleanup_result = await self._state_operation(
-                        await _call(
-                            state_environment.cleanup,
+                    async with asyncio.timeout(self._cleanup_grace_seconds):
+                        cleanup_result = await self._state_operation(
+                            await _call(
+                                state_environment.cleanup,
+                                self._state_request(
+                                    case,
+                                    correlation_id=execution_id,
+                                    session_id=execution_id,
+                                ),
+                                self._cleanup_sync_runner,
+                            ),
+                            "cleanup",
                             self._state_request(
                                 case,
                                 correlation_id=execution_id,
                                 session_id=execution_id,
                             ),
-                        ),
-                        "cleanup",
-                        self._state_request(
-                            case,
-                            correlation_id=execution_id,
-                            session_id=execution_id,
-                        ),
-                    )
+                        )
                     completed_phases.append("cleanup_reset")
+                except TimeoutError:
+                    cleanup_error = CapabilityExecutionError(
+                        "environment_cleanup_error",
+                        "environment cleanup timed out",
+                        delivery_uncertain=True,
+                    )
                 except CapabilityExecutionError as caught_cleanup_error:
                     cleanup_error = caught_cleanup_error
                     cleanup_result = caught_cleanup_error.state_operation_result
@@ -440,6 +523,7 @@ class ComposedEnvironmentExecutor:
                     correlation_id=correlation_id,
                     turn=ProbeTurn(id=turn_id, input=content),
                 ),
+                self._invoker_sync_runner,
             )
         except CapabilityExecutionError:
             raise
@@ -462,12 +546,6 @@ class ComposedEnvironmentExecutor:
                 separators=(",", ":"),
             ).encode("utf-8")
         )
-        if result.response_size_bytes != response_size_bytes:
-            raise CapabilityExecutionError(
-                "response_mapping",
-                "probe response size did not match its normalized value",
-                delivery_uncertain=True,
-            )
         if result.response_truncated or response_size_bytes > (
             self._invoker.capabilities.response_size_limit_bytes
         ):
@@ -485,7 +563,42 @@ class ComposedEnvironmentExecutor:
                 "probe invoker returned unsupported structured execution events",
                 delivery_uncertain=True,
             )
+        execution_events_size_bytes = len(
+            json.dumps(
+                [event.model_dump(mode="json") for event in result.execution_events],
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        )
+        if execution_events_size_bytes > (
+            self._invoker.capabilities.execution_events_size_limit_bytes
+        ):
+            raise CapabilityExecutionError(
+                "response_too_large",
+                "probe execution events exceed the size limit",
+                delivery_uncertain=True,
+            )
         return result
+
+    async def _attach_observations(
+        self,
+        case: EvaluationCase,
+        evidence: ExecutionEvidence,
+        execution_id: str,
+    ) -> ExecutionEvidence:
+        if self._observation_source is None or not evidence.turns:
+            return evidence
+        observations = tuple(
+            [
+                await self._observe(
+                    case,
+                    cast(str, turn.correlation_id),
+                    execution_id,
+                )
+                for turn in evidence.turns
+            ]
+        )
+        return evidence.model_copy(update={"observations": observations})
 
     async def _observe(
         self,
@@ -495,14 +608,16 @@ class ComposedEnvironmentExecutor:
     ) -> ProbeObservation:
         observation_source = cast(ObservationSource, self._observation_source)
         try:
-            observation = await _call(
-                observation_source.observe,
-                ObservationRequest(
-                    case_id=case.id,
-                    session_id=session_id,
-                    correlation_id=correlation_id,
-                ),
-            )
+            async with asyncio.timeout(self._observation_timeout_seconds):
+                observation = await _call(
+                    observation_source.observe,
+                    ObservationRequest(
+                        case_id=case.id,
+                        session_id=session_id,
+                        correlation_id=correlation_id,
+                    ),
+                    self._observer_sync_runner,
+                )
             capabilities = observation_source.capabilities
             if observation.correlation_id != correlation_id or (
                 observation.source_id != capabilities.source_id
@@ -584,6 +699,18 @@ class ComposedEnvironmentExecutor:
                 "environment_identity",
                 "state snapshot did not match its request",
                 delivery_uncertain=True,
+            )
+        snapshot_size_bytes = len(
+            json.dumps(
+                snapshot.value,
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        )
+        if snapshot_size_bytes > capabilities.snapshot_size_limit_bytes:
+            raise CapabilityExecutionError(
+                "response_too_large",
+                "state snapshot exceeds the size limit",
             )
 
     def _state_request(
@@ -670,9 +797,7 @@ class ComposedEnvironmentExecutor:
                 else None
             ),
             turns=turns,
-            final_response=(
-                final_turn.response if final_turn is not None and error is None else None
-            ),
+            final_response=final_turn.response if final_turn is not None else None,
             final_state=(
                 EnvironmentStateEvidence(
                     value=final_turn.state_snapshot,

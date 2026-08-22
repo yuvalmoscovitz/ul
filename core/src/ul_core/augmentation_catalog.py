@@ -15,6 +15,7 @@ AugmentationMode = Literal[
 ]
 AugmentationStage = Literal["materialization", "execution", "evaluation"]
 AugmentationExecutionOwner = Literal["dataset_cli", "augmentation_registry", "stress_cli"]
+AugmentationApplicabilityProfile = Literal["broad", "conditional"]
 
 _AUGMENTATION_ID_PATTERN = r"^[a-z][a-z0-9_]*(?:\.[a-z][a-z0-9_]*)+$"
 _VERSION_PATTERN = r"^(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)$"
@@ -90,6 +91,8 @@ class BuiltinAugmentationSpec(_CatalogModel):
     ref: AugmentationRef
     scope: AugmentationScope
     summary: str = Field(min_length=1, max_length=500)
+    applicability_profile: AugmentationApplicabilityProfile
+    applicability_rule: str = Field(min_length=1, max_length=500)
     bindings: tuple[AugmentationBinding, ...] = Field(min_length=1)
 
     @model_validator(mode="after")
@@ -189,12 +192,16 @@ def _dataset_spec(
     summary: str,
     *,
     human_review: bool = False,
+    applicability_profile: AugmentationApplicabilityProfile = "broad",
+    applicability_rule: str = "Applies to any nonempty user input with qualified source semantics.",
 ) -> BuiltinAugmentationSpec:
     version = "1.0.0"
     return BuiltinAugmentationSpec(
         ref=AugmentationRef(id=augmentation_id, version=version),
         scope="input",
         summary=summary,
+        applicability_profile=applicability_profile,
+        applicability_rule=applicability_rule,
         bindings=(
             _binding(
                 "dataset_variation",
@@ -223,6 +230,10 @@ def _scenario_spec(
         ref=AugmentationRef(id=augmentation_id, version="1.0.0"),
         scope=scope,
         summary=summary,
+        applicability_profile="conditional",
+        applicability_rule=(
+            "Applies only when the source contains: " + ", ".join(required_source_features) + "."
+        ),
         bindings=(
             _binding(
                 "scenario_materialization",
@@ -238,6 +249,24 @@ def _scenario_spec(
 _BUILTIN_AUGMENTATION_SPECS = (
     _dataset_spec("input.surface.rephrase", "Rephrase while preserving the requested behavior."),
     _dataset_spec("input.surface.typing_noise", "Add plausible typing noise."),
+    _dataset_spec(
+        "input.surface.case_variation",
+        "Add one harmless casing error.",
+        applicability_profile="conditional",
+        applicability_rule=(
+            "Applies only when the input contains an unprotected Unicode letter with a "
+            "single-code-point uppercase or lowercase mapping."
+        ),
+    ),
+    _dataset_spec(
+        "input.surface.punctuation_noise",
+        "Add one harmless punctuation error.",
+        applicability_profile="conditional",
+        applicability_rule=(
+            "Applies only when punctuation can be inserted outside a protected semantic value."
+        ),
+    ),
+    _dataset_spec("input.surface.grammar_error", "Add one harmless grammatical error."),
     _dataset_spec("input.surface.fragmented_syntax", "Use plausible fragmented syntax."),
     _dataset_spec("input.surface.disfluency_repeat", "Repeat a word as a natural disfluency."),
     _dataset_spec("input.style.terse", "Express the same request tersely."),
@@ -249,6 +278,11 @@ _BUILTIN_AUGMENTATION_SPECS = (
         "input.intent.self_correction",
         "Correct one request value within the same input.",
         human_review=True,
+        applicability_profile="conditional",
+        applicability_rule=(
+            "Applies only when one explicit numeric, monetary, date, or duration value can be "
+            "temporarily misstated and immediately corrected without ambiguity."
+        ),
     ),
     _scenario_spec(
         "conversation.ambiguity",
@@ -260,6 +294,8 @@ _BUILTIN_AUGMENTATION_SPECS = (
         ref=AugmentationRef(id="conversation.correction_after_first_response", version="1.0.0"),
         scope="conversation",
         summary="Correct the request after the agent has already responded once.",
+        applicability_profile="conditional",
+        applicability_rule="Applies only to an environment that supports two ordered user turns.",
         bindings=(
             _binding(
                 "scenario_materialization",
@@ -317,6 +353,11 @@ _BUILTIN_AUGMENTATION_SPECS = (
         ref=AugmentationRef(id="environment.tool.timeout_after_commit", version="1.0.0"),
         scope="environment",
         summary="Lose acknowledgement after a consequential effect commits.",
+        applicability_profile="conditional",
+        applicability_rule=(
+            "Applies only to consequential write actions in an environment that can inject a "
+            "timeout after commit."
+        ),
         bindings=(
             _binding(
                 "scenario_materialization",
@@ -348,6 +389,10 @@ _BUILTIN_AUGMENTATION_SPECS = (
         ref=AugmentationRef(id="conversation.retry_after_successful_commit", version="1.0.0"),
         scope="conversation",
         summary="Retry only after the first committed-state checkpoint succeeds.",
+        applicability_profile="conditional",
+        applicability_rule=(
+            "Applies only when a committed effect can be observed before a second user turn."
+        ),
         bindings=(
             _binding(
                 "conversation_stress",

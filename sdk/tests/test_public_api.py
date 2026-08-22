@@ -15,6 +15,7 @@ from ul import (
     DatasetInvariantTrialEvaluation,
     DatasetRegressionCase,
     DatasetRegressionResult,
+    EvaluationCaseResult,
     ExecutionResult,
     ExecutionStatus,
     InteractionRecord,
@@ -45,6 +46,7 @@ from ul import (
     create_dataset_regression_case,
     create_semantic_model_deconstructor,
     dataset_regression_target_config_sha256,
+    evaluate_case,
     evaluate_dataset_invariants,
     load_dataset_invariant_suite,
     load_dataset_regression_case,
@@ -104,6 +106,8 @@ def test_sdk_exposes_dataset_augmentation_api() -> None:
     assert DatasetEvaluationRunner.__name__ == "DatasetEvaluationRunner"
     assert DatasetEvaluationTrial.__name__ == "DatasetEvaluationTrial"
     assert DatasetEvaluationTrialSet.__name__ == "DatasetEvaluationTrialSet"
+    assert EvaluationCaseResult.__name__ == "EvaluationCaseResult"
+    assert evaluate_case.__name__ == "evaluate_case"
     assert DatasetInvariantArmEvaluation.__name__ == "DatasetInvariantArmEvaluation"
     assert DatasetInvariantEvaluation.__name__ == "DatasetInvariantEvaluation"
     assert DatasetInvariantRuleEvaluation.__name__ == "DatasetInvariantRuleEvaluation"
@@ -125,7 +129,7 @@ def test_sdk_exposes_dataset_augmentation_api() -> None:
     assert load_dataset_invariant_suite.__name__ == "load_dataset_invariant_suite"
     assert load_dataset_regression_case.__name__ == "load_dataset_regression_case"
     assert replay_dataset_regression.__name__ == "replay_dataset_regression"
-    assert len(builtin_dataset_augmentation_operators()) == 8
+    assert len(builtin_dataset_augmentation_operators()) == 11
     assert OpenRouterDatasetSettings is not None
     assert OpenAICompatibleDatasetSettings is not None
     assert SemanticModelDeconstructor is not None
