@@ -17,6 +17,7 @@ class CampaignOperatorPlan(_StrictModel):
     status: Literal["eligible", "conditional", "ineligible"]
     selected: bool
     reasons: tuple[str, ...] = ()
+    candidate_input_available: bool = False
     candidate_input: str | None = None
 
 
@@ -75,6 +76,7 @@ def create_dataset_campaign_plan(
     target_calls_per_execution: int,
     settings: DatasetSemanticSettings,
     saved_augmentations: dict[str, DatasetAugmentationResult] | None = None,
+    show_sensitive_values: bool = False,
 ) -> DatasetCampaignPlan:
     saved = saved_augmentations or {}
     selected_ids = {reference.partition("@")[0] for reference in selected_operator_ids}
@@ -87,6 +89,7 @@ def create_dataset_campaign_plan(
                     operator,
                     selected=operator.ref.id in selected_ids,
                     saved_augmentation=saved.get(record.id),
+                    show_sensitive_values=show_sensitive_values,
                 )
                 for operator in catalog
             ),
@@ -97,7 +100,14 @@ def create_dataset_campaign_plan(
     selected_count = len(records)
     operator_count = len(selected_operator_ids)
     baseline_calls = selected_count * repetitions
-    variation_calls = selected_count * operator_count * repetitions
+    variation_candidate_count = sum(
+        _planned_variation_count(
+            selected_operator_ids=selected_ids,
+            saved_augmentation=saved.get(record.id),
+        )
+        for record in records
+    )
+    variation_calls = variation_candidate_count * repetitions
     execution_calls = baseline_calls + variation_calls
     records_without_saved_augmentation = tuple(
         record for record in records if record.id not in saved
@@ -129,14 +139,18 @@ def create_dataset_campaign_plan(
         + equivalence_calls * min(settings.max_output_tokens, 1_024)
     )
     warnings = list(_model_parameter_warnings(settings))
-    if any(
-        operator.candidate_input is not None
-        for example in examples
-        for operator in example.operators
-    ):
+    candidate_inputs_available = any(
+        operator.candidate_input_available for example in examples for operator in example.operators
+    )
+    if candidate_inputs_available and show_sensitive_values:
         warnings.append(
             "Candidate inputs come from the private augmentation ledger and may contain "
             "sensitive data."
+        )
+    elif candidate_inputs_available:
+        warnings.append(
+            "Private candidate inputs are available but omitted; use --show-sensitive-values "
+            "only when terminal and JSON output may contain sensitive data."
         )
     if any(
         operator.ref.id in selected_ids
@@ -176,6 +190,7 @@ def _operator_plan(
     *,
     selected: bool,
     saved_augmentation: DatasetAugmentationResult | None,
+    show_sensitive_values: bool,
 ) -> CampaignOperatorPlan:
     dataset_binding = next(
         (binding for binding in operator.bindings if binding.mode == "dataset_variation"), None
@@ -219,7 +234,8 @@ def _operator_plan(
                 if candidate.passed
                 else candidate.failure_reasons
             ),
-            candidate_input=candidate.augmented_input,
+            candidate_input_available=True,
+            candidate_input=(candidate.augmented_input if show_sensitive_values else None),
         )
     if saved_augmentation is not None:
         return CampaignOperatorPlan(
@@ -244,6 +260,19 @@ def _operator_plan(
             "applicability depends on semantic source qualification performed during execution",
             deterministic_reason,
         ),
+    )
+
+
+def _planned_variation_count(
+    *,
+    selected_operator_ids: set[str],
+    saved_augmentation: DatasetAugmentationResult | None,
+) -> int:
+    if saved_augmentation is None:
+        return len(selected_operator_ids)
+    return sum(
+        candidate.passed and candidate.operator_id in selected_operator_ids
+        for candidate in saved_augmentation.candidates
     )
 
 

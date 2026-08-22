@@ -528,6 +528,29 @@ def test_run_discovers_parent_project_and_applies_one_run_overrides(
     assert "Next: ul report" in result.output
 
 
+def test_run_threads_sensitive_dry_run_opt_in(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    _initialize(tmp_path)
+    received: dict[str, Any] = {}
+
+    def fake_evaluate_dataset(**arguments: Any) -> None:
+        received.update(arguments)
+
+    monkeypatch.setattr(project, "evaluate_dataset", fake_evaluate_dataset)
+
+    result = runner.invoke(
+        app,
+        ["run", "--dry-run", "--json", "--show-sensitive-values"],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert received["dry_run"] is True
+    assert received["json_output"] is True
+    assert received["show_sensitive_values"] is True
+
+
 def test_init_persists_redaction_and_retention_choices(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

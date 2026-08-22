@@ -815,6 +815,21 @@ def test_dry_run_json_exposes_per_example_campaign_and_exact_call_plan(
     assert payload["money"] is None
 
 
+def test_sensitive_candidate_output_requires_dry_run(tmp_path: Path) -> None:
+    dataset = tmp_path / "interactions.jsonl"
+    _write_dataset(dataset, [_record()])
+
+    result = runner.invoke(
+        root_app,
+        ["dataset", "evaluate", str(dataset), "--show-sensitive-values"],
+    )
+
+    assert result.exit_code == 2
+    normalized_output = " ".join(_ANSI_ESCAPE_PATTERN.sub("", result.output).split())
+    assert "--show-sensitive-values requires" in normalized_output
+    assert "--dry-run" in normalized_output
+
+
 def test_campaign_plan_exposes_precomputed_candidate_without_new_generation() -> None:
     evaluation_result = _evaluation_result("interaction-1", has_review_finding=True)
     plan = main.create_dataset_campaign_plan(
@@ -832,12 +847,89 @@ def test_campaign_plan_exposes_precomputed_candidate_without_new_generation() ->
         if operator.id == "input.surface.rephrase"
     )
     assert planned_operator.status == "eligible"
+    assert planned_operator.candidate_input_available is True
+    assert planned_operator.candidate_input is None
+    assert plan.calls.variation_generation == 0
+    assert any("available but omitted" in warning for warning in plan.warnings)
+
+    sensitive_plan = main.create_dataset_campaign_plan(
+        records=(evaluation_result.source,),
+        selected_operator_ids=("input.surface.rephrase",),
+        repetitions=1,
+        target_calls_per_execution=1,
+        settings=main.load_dataset_semantic_settings(),
+        saved_augmentations={evaluation_result.source.id: evaluation_result.augmentation},
+        show_sensitive_values=True,
+    )
+    sensitive_operator = next(
+        operator
+        for operator in sensitive_plan.examples[0].operators
+        if operator.id == "input.surface.rephrase"
+    )
     assert (
-        planned_operator.candidate_input
+        sensitive_operator.candidate_input
         == evaluation_result.augmentation.candidates[0].augmented_input
     )
-    assert plan.calls.variation_generation == 0
-    assert any("sensitive data" in warning for warning in plan.warnings)
+    assert any("sensitive data" in warning for warning in sensitive_plan.warnings)
+
+
+@pytest.mark.parametrize("candidate_state", ["rejected", "missing"])
+def test_campaign_plan_does_not_count_known_non_executable_variations(
+    candidate_state: str,
+) -> None:
+    evaluation_result = _evaluation_result("interaction-1")
+    saved_augmentation = evaluation_result.augmentation
+    if candidate_state == "missing":
+        saved_augmentation = saved_augmentation.model_copy(update={"candidates": ()})
+
+    plan = main.create_dataset_campaign_plan(
+        records=(evaluation_result.source,),
+        selected_operator_ids=("input.surface.rephrase",),
+        repetitions=3,
+        target_calls_per_execution=5,
+        settings=main.load_dataset_semantic_settings(),
+        saved_augmentations={evaluation_result.source.id: saved_augmentation},
+    )
+
+    assert plan.calls.baseline == 3
+    assert plan.calls.variation == 0
+    assert plan.calls.repetition_executions == 3
+    assert plan.calls.evaluators == 3
+    assert plan.calls.total_semantic_model == 3
+    assert plan.calls.total_environment_api == 15
+
+
+def test_human_dry_run_escapes_untrusted_ids_and_summarizes_unselected_catalog(
+    tmp_path: Path,
+) -> None:
+    dataset = tmp_path / "interactions.jsonl"
+    unsafe_id = "[bold]spoof[/bold]\x1b]8;;https://example.test\x07link"
+    _write_dataset(
+        dataset,
+        [_record(unsafe_id), *(_record(f"interaction-{index}") for index in range(2, 101))],
+    )
+
+    result = runner.invoke(
+        root_app,
+        [
+            "dataset",
+            "evaluate",
+            str(dataset),
+            "--limit",
+            "100",
+            "--max-environment-api-calls",
+            "600",
+            "--dry-run",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "\x1b" not in result.output
+    assert "\\u001b" in result.output
+    assert "[bold]spoof[/bold]" in result.output
+    assert "Unselected catalog operators:" in result.output
+    assert "use --json for full detail" in " ".join(result.output.split())
+    assert "input.surface.typing_noise@" not in result.output
 
 
 def test_campaign_plan_warns_about_missing_review_and_provider_parameters() -> None:
@@ -2686,6 +2778,17 @@ def test_resume_skips_already_processed_interaction_ids(
     assert f"Augmentations destination: {augmentations}" in " ".join(
         _ANSI_ESCAPE_PATTERN.sub("", dry_run.output).split()
     )
+    assert "Please transfer 100 to Alice." not in dry_run.output
+    assert "Candidate input: omitted (sensitive)" in dry_run.output
+
+    sensitive_dry_run = runner.invoke(
+        root_app,
+        [*command, "--dry-run", "--show-sensitive-values"],
+    )
+    assert sensitive_dry_run.exit_code == 0, sensitive_dry_run.output
+    warning_position = sensitive_dry_run.output.index("may contain sensitive data")
+    candidate_position = sensitive_dry_run.output.index("Please transfer 100 to Alice.")
+    assert warning_position < candidate_position
 
     result = runner.invoke(root_app, command)
 

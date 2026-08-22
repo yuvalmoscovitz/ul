@@ -549,6 +549,13 @@ def evaluate_dataset(
         bool,
         typer.Option("--json", help="Emit the dry-run campaign plan as stable JSON."),
     ] = False,
+    show_sensitive_values: Annotated[
+        bool,
+        typer.Option(
+            "--show-sensitive-values",
+            help="Include private saved candidate inputs in dry-run human or JSON output.",
+        ),
+    ] = False,
     resume: Annotated[
         Path | None,
         typer.Option(
@@ -606,8 +613,9 @@ def evaluate_dataset(
     Discover operators: ul augmentations list --mode dataset_variation
     Augmentation retention: --augmentations-output PATH or --no-save-augmentations
     """
-    if json_output and not dry_run:
-        raise typer.BadParameter("--json requires --dry-run", param_hint="--json")
+    if (json_output or show_sensitive_values) and not dry_run:
+        option = "--show-sensitive-values" if show_sensitive_values else "--json"
+        raise typer.BadParameter(f"{option} requires --dry-run", param_hint=option)
     if augmentations_output is not None and no_save_augmentations:
         raise typer.BadParameter(
             "--augmentations-output cannot be used with --no-save-augmentations",
@@ -835,6 +843,7 @@ def evaluate_dataset(
         target_calls_per_execution=target_calls_per_execution,
         settings=settings,
         saved_augmentations=saved_augmentations,
+        show_sensitive_values=show_sensitive_values,
     )
     potential_target_calls = campaign_plan.calls.total_environment_api
     if potential_target_calls > max_environment_api_calls:
@@ -1477,21 +1486,38 @@ def _print_dataset_plan(
         console.print("Adapter tier: isolated-response (response evidence only)")
     target_status = "configured" if target_configured else "not configured"
     console.print(f"Customer-managed environment API: {target_status}")
-    console.print("Operator applicability by interaction")
+    for warning in campaign_plan.warnings:
+        _print_dataset_plain(f"Warning: {warning}")
+    console.print("Selected operator applicability by interaction")
     for example in campaign_plan.examples:
-        console.print(f"  {example.interaction_id}")
-        for planned_operator in example.operators:
-            selected_label = " selected" if planned_operator.selected else ""
-            console.print(
+        _print_dataset_plain(f"  {example.interaction_id}")
+        for planned_operator in (operator for operator in example.operators if operator.selected):
+            _print_dataset_plain(
                 f"    {planned_operator.status.upper()} {planned_operator.id}@"
-                f"{planned_operator.version}{selected_label}"
+                f"{planned_operator.version} selected"
             )
             for reason in planned_operator.reasons:
-                console.print(f"      Reason: {reason}")
+                _print_dataset_plain(f"      Reason: {reason}")
+            if (
+                planned_operator.candidate_input_available
+                and planned_operator.candidate_input is None
+            ):
+                _print_dataset_plain("      Candidate input: omitted (sensitive)")
             if planned_operator.candidate_input is not None:
-                console.print(f"      Candidate input: {planned_operator.candidate_input}")
-    for warning in campaign_plan.warnings:
-        console.print(f"Warning: {warning}")
+                _print_dataset_plain(f"      Candidate input: {planned_operator.candidate_input}")
+    if campaign_plan.examples:
+        unselected_operators = tuple(
+            operator for operator in campaign_plan.examples[0].operators if not operator.selected
+        )
+        unselected_eligible = sum(
+            operator.status == "eligible" for operator in unselected_operators
+        )
+        unselected_ineligible = len(unselected_operators) - unselected_eligible
+        console.print(
+            "Unselected catalog operators: "
+            f"{unselected_eligible} eligible, {unselected_ineligible} ineligible "
+            "(use --json for full detail)"
+        )
     if output is not None:
         console.print(f"Evidence destination: {output}")
     if augmentations_output is None:

@@ -140,6 +140,7 @@ ul augmentations disable input.surface.rephrase     # `remove` is an alias
 ul augmentations reset                              # restore recommended defaults
 ul run --dry-run                                    # verify the saved selection and call budget
 ul run --dry-run --json                             # machine-readable campaign plan
+ul run --dry-run --show-sensitive-values            # include private saved candidate inputs
 ```
 
 These commands update only the current project's private `.ul/config.json`. Enabling a currently
@@ -151,7 +152,8 @@ The run dry-run classifies every operator for each selected interaction, explain
 ineligible cases, and separates baseline, variation, repetition, retry, evaluator, token, and
 environment-call budgets. Planning makes no model or environment requests. When a resumable
 augmentation ledger already contains a deterministic candidate, the candidate input is included for
-inspection; monetary estimates stay unavailable unless trusted model pricing is configured.
+inspection only with the explicit `--show-sensitive-values` opt-in; monetary estimates stay
+unavailable unless trusted model pricing is configured.
 
 ## How it works
 
