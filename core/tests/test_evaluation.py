@@ -14,6 +14,7 @@ from ul_core.evaluation import (
     TimeoutAfterCommitEventEvidence,
     TimeoutAfterCommitEventRequest,
 )
+from ul_core.evaluators import RubricEvaluator, ToolCallEvaluator
 from ul_core.models import ConversationRole, ConversationTurn
 
 
@@ -41,6 +42,41 @@ def test_evaluation_case_rejects_duplicate_turn_identifiers() -> None:
             turns=(_turn(), _turn()),
             max_environment_api_calls=10,
             timeout_seconds=30,
+        )
+
+
+def test_evaluation_case_accepts_multiple_customer_evaluators() -> None:
+    evaluation_case = EvaluationCase(
+        id="case-1",
+        turns=(_turn(),),
+        max_environment_api_calls=10,
+        timeout_seconds=30,
+        evaluators=(
+            ToolCallEvaluator(
+                id="payment-call",
+                tool_name="execute_payment",
+                arguments={"invoice_id": "INV-42"},
+            ),
+            RubricEvaluator(
+                id="answer-quality", rubric="The answer must clearly describe the outcome."
+            ),
+        ),
+    )
+
+    assert EvaluationCase.model_validate_json(evaluation_case.model_dump_json()) == evaluation_case
+
+
+def test_evaluation_case_rejects_duplicate_evaluator_identifiers() -> None:
+    with pytest.raises(ValidationError, match="evaluator identifiers must be unique"):
+        EvaluationCase(
+            id="case-1",
+            turns=(_turn(),),
+            max_environment_api_calls=10,
+            timeout_seconds=30,
+            evaluators=(
+                ToolCallEvaluator(id="duplicate", tool_name="first"),
+                ToolCallEvaluator(id="duplicate", tool_name="second"),
+            ),
         )
 
 
