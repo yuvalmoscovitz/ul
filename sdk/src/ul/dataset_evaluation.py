@@ -232,12 +232,25 @@ class DatasetEvaluationBaseline(_StrictULModel):
         return self.trial_set.trials[0].observed_frame
 
 
+class DatasetSemanticCallCounts(_StrictULModel):
+    actual_calls: int = Field(ge=0)
+    cache_hits: int = Field(ge=0)
+
+    @property
+    def total_requests(self) -> int:
+        return self.actual_calls + self.cache_hits
+
+
 class DatasetEvaluationResult(_StrictULModel):
     evaluation_mode: Literal["variance"] = "variance"
     source: InteractionRecord
     augmentation: DatasetAugmentationResult
     baseline: DatasetEvaluationBaseline
     cases: tuple[DatasetEvaluationCase, ...]
+    semantic_calls: DatasetSemanticCallCounts = DatasetSemanticCallCounts(
+        actual_calls=0,
+        cache_hits=0,
+    )
 
     @model_validator(mode="after")
     def validate_lineage(self) -> Self:
@@ -309,6 +322,7 @@ class DatasetEvaluationRunner:
     ) -> DatasetEvaluationResult:
         if type(repetitions) is not int or repetitions < 1:
             raise ValueError("repetitions must be a positive integer")
+        starting_actual_calls, starting_cache_hits = self._semantic_call_metrics()
         if precomputed_augmentation is None:
             augmentation = await self._augmentation_engine.augment(
                 (source,), operator_ids=operator_ids
@@ -458,13 +472,33 @@ class DatasetEvaluationRunner:
                     findings=findings,
                 )
             )
+        ending_actual_calls, ending_cache_hits = self._semantic_call_metrics()
         return DatasetEvaluationResult(
             evaluation_mode=self._evaluation_mode,
             source=source,
             augmentation=augmentation,
             baseline=baseline,
             cases=tuple(cases),
+            semantic_calls=DatasetSemanticCallCounts(
+                actual_calls=ending_actual_calls - starting_actual_calls,
+                cache_hits=ending_cache_hits - starting_cache_hits,
+            ),
         )
+
+    def _semantic_call_metrics(self) -> tuple[int, int]:
+        metrics = getattr(self._deconstructor, "semantic_call_metrics", None)
+        if metrics is None:
+            return (0, 0)
+        actual_calls = getattr(metrics, "actual_calls", None)
+        cache_hits = getattr(metrics, "cache_hits", None)
+        if (
+            type(actual_calls) is not int
+            or actual_calls < 0
+            or type(cache_hits) is not int
+            or cache_hits < 0
+        ):
+            raise ValueError("semantic call metrics are invalid")
+        return actual_calls, cache_hits
 
     async def _execute_trial(
         self,

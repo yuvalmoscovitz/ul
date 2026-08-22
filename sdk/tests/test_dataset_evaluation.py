@@ -6,6 +6,7 @@ from collections.abc import Callable, Iterable
 from pathlib import Path
 from typing import Literal, cast
 
+import httpx
 import pytest
 from pydantic import JsonValue, SecretStr, ValidationError
 from ul.dataset_augmentation import DatasetAugmentationEngine, DatasetAugmentationResult
@@ -19,6 +20,7 @@ from ul.dataset_evaluation import (
     DatasetEvaluationTrialSet,
 )
 from ul.dataset_evaluation import DatasetEvaluationRunner as _DatasetEvaluationRunner
+from ul.deconstruction import OpenRouterDatasetSettings, create_semantic_model_deconstructor
 from ul.redaction import (
     LocalPseudonymStore,
     RedactedSemanticPipeline,
@@ -615,6 +617,94 @@ async def test_runner_uses_valid_precomputed_augmentation_without_regenerating(
     assert result.augmentation == precomputed
     assert checkpoints == []
     assert target.raw_inputs
+
+
+async def test_repetition_benchmark_reduces_semantic_calls_without_changing_findings() -> None:
+    source = _source()
+    producer_pipeline = DeterministicSemanticPipeline((_source_outcomes()[0],))
+    precomputed = await DatasetAugmentationEngine(producer_pipeline, producer_pipeline).augment(
+        (source,)
+    )
+    baseline_output = _raw_output_for_actions((_source_outcomes()[0],))
+    changed_outcome = _outcome(
+        "changed_transfer",
+        0,
+        fields={"amount": 200, "recipient": "Alice", "receipt_id": "receipt-1"},
+    )
+    variation_output = _raw_output_for_actions((changed_outcome,))
+    target = SequenceEnvironment(
+        [baseline_output, variation_output, baseline_output, variation_output] * 2
+    )
+    provider_requests = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal provider_requests
+        provider_requests += 1
+        request_body = cast(dict[str, object], json.loads(request.content))
+        messages = cast(list[dict[str, object]], request_body["messages"])
+        request_payload = cast(dict[str, object], json.loads(cast(str, messages[1]["content"])))
+        raw_output = cast(dict[str, object], request_payload["raw_observed_output"])
+        raw_actions = cast(dict[str, dict[str, JsonValue]], raw_output["outcomes"])
+        outcomes = tuple(
+            _outcome(
+                f"provider-{position}",
+                int(position),
+                predicate=cast(str, action["action"]),
+                fields={name: value for name, value in action.items() if name != "action"},
+            )
+            for position, action in raw_actions.items()
+        )
+        frame_payload = _frame("untrusted", outcomes).model_dump(mode="json")
+        raw_input = cast(str, request_payload["raw_input"])
+        for collection_name in ("request_units", "factors", "communication_acts"):
+            collection = cast(list[dict[str, object]], frame_payload[collection_name])
+            for element in collection:
+                evidence_items = cast(list[dict[str, object]], element["evidence"])
+                for evidence_item in evidence_items:
+                    evidence_item["text_quote"] = raw_input
+        outcome_collection = cast(list[dict[str, object]], frame_payload["outcomes"])
+        for outcome in outcome_collection:
+            evidence_items = cast(list[dict[str, object]], outcome["evidence"])
+            for evidence_item in evidence_items:
+                pointer = cast(str, evidence_item["json_pointer"])
+                _, position, field_name = pointer.rsplit("/", maxsplit=2)
+                resolved_value = raw_actions[position][field_name]
+                if isinstance(resolved_value, str):
+                    evidence_item["text_quote"] = resolved_value
+        return httpx.Response(
+            200,
+            json={
+                "id": f"generation-{provider_requests}",
+                "model": "provider/resolved-model",
+                "choices": [{"message": {"content": json.dumps(frame_payload)}}],
+            },
+        )
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    semantic_settings = OpenRouterDatasetSettings(
+        live_calls=True,
+        allow_external_data_processing=True,
+        api_key=SecretStr("test-openrouter-key"),
+    )
+    async with create_semantic_model_deconstructor(
+        semantic_settings,
+        client=client,
+    ) as semantic_pipeline:
+        result = await DatasetEvaluationRunner(
+            DatasetAugmentationEngine(semantic_pipeline, semantic_pipeline),
+            semantic_pipeline,
+            target,
+        ).run(source, repetitions=3, precomputed_augmentation=precomputed)
+
+    assert provider_requests == 2
+    assert result.semantic_calls.actual_calls == 2
+    assert result.semantic_calls.cache_hits == 4
+    assert result.semantic_calls.total_requests == 6
+    assert len(result.cases) == 1
+    assert [finding.category for finding in result.cases[0].findings] == [
+        "changed_grounded_effect_argument"
+    ]
+    await client.aclose()
 
 
 async def test_runner_rejects_precomputed_operator_or_source_mismatch_before_environment() -> None:
