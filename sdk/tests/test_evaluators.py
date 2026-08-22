@@ -5,7 +5,7 @@ from typing import cast
 
 import httpx
 import pytest
-from pydantic import JsonValue
+from pydantic import JsonValue, ValidationError
 from ul.evaluators import (
     JudgeRequest,
     OpenAICompatibleEvaluatorJudge,
@@ -40,6 +40,57 @@ class RecordingJudge:
     async def evaluate(self, request: JudgeRequest) -> EvaluatorDecision:
         self.requests.append(request)
         return self.decisions.pop(0)
+
+
+@pytest.mark.parametrize(
+    "base_url",
+    [
+        "http://models.example.test/v1",
+        "ftp://localhost:8000/v1",
+        "https://user:password@models.example.test/v1",
+        "https://models.example.test/v1?tenant=secret",
+        "https://models.example.test/v1#fragment",
+        "https://models.example.test:invalid/v1",
+        "https://models.example.test/v1/chat/completions",
+    ],
+)
+async def test_judge_config_rejects_unsafe_base_urls(base_url: str) -> None:
+    with pytest.raises(ValidationError):
+        OpenAICompatibleJudgeConfig(
+            base_url=base_url,
+            model="customer/judge",
+            allow_external_data_processing=True,
+        )
+
+
+async def test_judge_config_hides_rejected_url_credentials_and_queries() -> None:
+    credential_sentinel = "credential-sentinel"
+    query_sentinel = "query-sentinel"
+    rejected_url = (
+        f"https://user:{credential_sentinel}@models.example.test/v1?token={query_sentinel}"
+    )
+
+    with pytest.raises(ValidationError) as error:
+        OpenAICompatibleJudgeConfig(
+            base_url=rejected_url,
+            model="customer/judge",
+            allow_external_data_processing=True,
+        )
+
+    rendered_error = str(error.value)
+    assert credential_sentinel not in rendered_error
+    assert query_sentinel not in rendered_error
+    assert rejected_url not in rendered_error
+
+
+async def test_judge_config_allows_and_normalizes_loopback_http() -> None:
+    config = OpenAICompatibleJudgeConfig(
+        base_url="http://[::1]:8000/v1/",
+        model="local/judge",
+        allow_external_data_processing=True,
+    )
+
+    assert config.base_url == "http://[::1]:8000/v1"
 
 
 def _subject() -> EvaluationSubject:

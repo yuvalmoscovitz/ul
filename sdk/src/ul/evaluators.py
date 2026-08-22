@@ -1,14 +1,16 @@
 from __future__ import annotations
 
 import inspect
+import ipaddress
 import json
 from collections.abc import Awaitable, Callable, Mapping
 from copy import deepcopy
 from types import TracebackType
 from typing import Any, Literal, Protocol, Self, cast
+from urllib.parse import urlsplit, urlunsplit
 
 import httpx
-from pydantic import BaseModel, ConfigDict, Field, JsonValue, SecretStr
+from pydantic import BaseModel, ConfigDict, Field, JsonValue, SecretStr, model_validator
 from ul_core.evaluators import (
     CallableEvaluator,
     EvaluationResults,
@@ -50,7 +52,12 @@ class EvaluatorJudge(Protocol):
 
 
 class OpenAICompatibleJudgeConfig(ULModel):
-    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+    model_config = ConfigDict(
+        extra="forbid",
+        frozen=True,
+        strict=True,
+        hide_input_in_errors=True,
+    )
 
     base_url: str = Field(min_length=1, max_length=2_000)
     model: str = Field(min_length=1, max_length=200)
@@ -59,6 +66,42 @@ class OpenAICompatibleJudgeConfig(ULModel):
     data_policy: Literal["provider_default", "openrouter_zdr"] = "provider_default"
     timeout_seconds: float = Field(default=60, gt=0, le=300)
     max_output_tokens: int = Field(default=1_024, ge=64, le=8_192)
+
+    @model_validator(mode="after")
+    def validate_and_normalize_base_url(self) -> Self:
+        object.__setattr__(self, "base_url", _validated_judge_base_url(self.base_url))
+        return self
+
+
+def _validated_judge_base_url(value: str) -> str:
+    parsed = urlsplit(value)
+    if parsed.scheme not in {"http", "https"}:
+        raise ValueError("judge base_url must use https or loopback http")
+    if not parsed.hostname:
+        raise ValueError("judge base_url must include a host")
+    try:
+        _ = parsed.port
+    except ValueError:
+        raise ValueError("judge base_url has an invalid port") from None
+    if parsed.username is not None or parsed.password is not None:
+        raise ValueError("judge base_url must not include credentials")
+    if parsed.query or parsed.fragment:
+        raise ValueError("judge base_url must not include a query or fragment")
+    if parsed.scheme == "http" and not _is_loopback_host(parsed.hostname):
+        raise ValueError("judge base_url only permits plaintext HTTP on loopback")
+    normalized_path = parsed.path.rstrip("/")
+    if normalized_path.endswith("/chat/completions"):
+        raise ValueError("judge base_url must be an API root")
+    return urlunsplit((parsed.scheme, parsed.netloc, normalized_path, "", ""))
+
+
+def _is_loopback_host(host: str) -> bool:
+    if host.lower() == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
 
 
 class _JudgeMessage(BaseModel):
