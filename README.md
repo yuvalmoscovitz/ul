@@ -59,6 +59,8 @@ session and a clean external environment; both are required by default. If you a
 mapping, use `--environment-config environment.json` instead of `--environment-url`.
 The fixture identity names the resettable business state used by the run. Change its version whenever
 that state or setup logic changes. See [Design valid test cases](docs/test-cases.md).
+For objective assertions, model-judged rubrics, pairwise preference, and human review in custom SDK
+workflows, see [Customer-defined evaluators](docs/evaluators.md).
 
 To connect an existing response-only JSON endpoint that starts every request from isolated state:
 
@@ -158,6 +160,11 @@ environment-call budgets. Planning makes no model or environment requests. When 
 augmentation ledger already contains a deterministic candidate, the candidate input is included for
 inspection only with the explicit `--show-sensitive-values` opt-in; monetary estimates stay
 unavailable unless trusted model pricing is configured.
+
+During a run, successful identical semantic requests reuse a private in-memory cache bounded to 256
+entries and 16 MiB of serialized responses, then cleared when the evaluator closes. Complete
+evidence and terminal output report actual semantic provider calls separately from private cache
+hits.
 
 ## How it works
 

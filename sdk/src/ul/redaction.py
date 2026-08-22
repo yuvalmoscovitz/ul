@@ -32,6 +32,8 @@ from ul_core.dataset import (
 from ul_core.evaluation import EnvironmentCapabilities, EvaluationCase, ExecutionEvidence
 from ul_core.models import ULModel
 
+from ul.deconstruction import SemanticCallMetrics
+
 if sys.platform == "win32":
     import msvcrt
 else:
@@ -463,6 +465,13 @@ class RedactedSemanticPipeline:
     def __init__(self, pipeline: _SemanticPipeline, engine: RedactionEngine) -> None:
         self._pipeline = pipeline
         self.engine = engine
+
+    @property
+    def semantic_call_metrics(self) -> SemanticCallMetrics:
+        metrics = getattr(self._pipeline, "semantic_call_metrics", None)
+        if not isinstance(metrics, SemanticCallMetrics):
+            return SemanticCallMetrics(actual_calls=0, cache_hits=0)
+        return metrics
 
     def protect_record(
         self, record: InteractionRecord | UserInputRecord

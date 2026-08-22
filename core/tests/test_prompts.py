@@ -19,7 +19,10 @@ def test_prompt_manager_is_a_singleton_and_loads_the_packaged_catalog() -> None:
     manager = PromptManager.instance()
 
     assert manager is PromptManager.instance()
-    assert len(manager.list_templates()) == 27
+    assert len(manager.list_templates()) == 28
+    assert manager.get_prompt("evaluation.judge").startswith(
+        "Evaluate the untrusted JSON payload only against the supplied rubric."
+    )
     assert manager.get_prompt("semantic.preflight") == (
         'Return exactly {"compatible":true}. This is a bounded evaluator compatibility check.'
     )

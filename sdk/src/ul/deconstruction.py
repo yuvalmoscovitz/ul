@@ -5,6 +5,7 @@ import hashlib
 import ipaddress
 import json
 import re
+from collections import OrderedDict
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from dataclasses import replace as dataclass_replace
@@ -35,6 +36,9 @@ from ul_core.dataset import (
 from ul_core.prompts import PromptManager, prompt_provenance
 
 _PROMPTS = PromptManager.instance()
+_SEMANTIC_CACHE_VERSION = "semantic-request-cache/1"
+_MAXIMUM_SEMANTIC_CACHE_ENTRIES = 256
+_MAXIMUM_SEMANTIC_CACHE_BYTES = 16 * 1024 * 1024
 
 
 def _sha256_text(value: str) -> str:
@@ -530,6 +534,19 @@ class _ChatCompletionResponse(BaseModel):
     usage: _UsageMetadata | None = None
 
 
+@dataclass(frozen=True)
+class SemanticCallMetrics:
+    actual_calls: int
+    cache_hits: int
+
+
+@dataclass(frozen=True)
+class _SemanticCompletion:
+    response: _ChatCompletionResponse
+    cache_hit: bool
+    cache_key: str | None
+
+
 class _RenderedInput(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -743,6 +760,19 @@ class SemanticModelDeconstructor:
             trust_env=self.provider.trust_environment_transport,
         )
         self._preflight_result: EvaluatorModelPreflight | None = None
+        self._semantic_response_cache: OrderedDict[str, tuple[_ChatCompletionResponse, int]] = (
+            OrderedDict()
+        )
+        self._semantic_response_cache_bytes = 0
+        self._semantic_actual_calls = 0
+        self._semantic_cache_hits = 0
+
+    @property
+    def semantic_call_metrics(self) -> SemanticCallMetrics:
+        return SemanticCallMetrics(
+            actual_calls=self._semantic_actual_calls,
+            cache_hits=self._semantic_cache_hits,
+        )
 
     async def __aenter__(self) -> Self:
         return self
@@ -756,6 +786,8 @@ class SemanticModelDeconstructor:
         await self.aclose()
 
     async def aclose(self) -> None:
+        self._semantic_response_cache.clear()
+        self._semantic_response_cache_bytes = 0
         if self._owns_client:
             await self._client.aclose()
 
@@ -763,7 +795,7 @@ class SemanticModelDeconstructor:
         profile_results: list[EvaluatorModelProfilePreflight] = []
         for profile in self._preflight_profiles():
             try:
-                response = await self._request(
+                completion = await self._request(
                     operation="preflight",
                     model=profile.model,
                     reasoning=profile.reasoning,
@@ -791,7 +823,9 @@ class SemanticModelDeconstructor:
             except httpx.HTTPError:
                 raise self._compatibility_error(profile, "routing") from None
             try:
-                _EvaluatorPreflightSample.model_validate_json(response.choices[0].message.content)
+                _EvaluatorPreflightSample.model_validate_json(
+                    completion.response.choices[0].message.content
+                )
             except (ValidationError, ValueError):
                 raise self._compatibility_error(profile, "structured output") from None
             routing_enforced = self.provider.enforces_parameter_support
@@ -799,8 +833,8 @@ class SemanticModelDeconstructor:
                 EvaluatorModelProfilePreflight(
                     roles=profile.roles,
                     requested_model=profile.model,
-                    routed_model=response.model,
-                    upstream_provider=response.provider,
+                    routed_model=completion.response.model,
+                    upstream_provider=completion.response.provider,
                     required_parameters=profile.required_parameters,
                     request_options_sha256=self._profile_request_options_sha256(profile),
                     parameter_support=(
@@ -867,7 +901,7 @@ class SemanticModelDeconstructor:
         if reference_frame is not None:
             request_payload["reference_vocabulary"] = self._reference_vocabulary(reference_frame)
         untrusted_record = self._bounded_json(request_payload)
-        response = await self._request(
+        completion = await self._request(
             operation="deconstruct",
             model=self.settings.model,
             reasoning={"effort": "minimal"},
@@ -882,24 +916,29 @@ class SemanticModelDeconstructor:
             untrusted_payload=untrusted_record,
         )
         try:
-            raw_frame = self._decode_object(response.choices[0].message.content)
+            raw_frame = self._decode_object(completion.response.choices[0].message.content)
             raw_frame.update(
                 {
                     "schema_version": "1.0.0",
                     "interaction_id": record.id,
                     "extractor_version": self.provider.extractor_version,
                     "metadata": {
-                        **self._generation_metadata(response),
+                        **self._generation_metadata(completion),
                         "prompts": prompt_provenance("semantic.deconstruct"),
                     },
                 }
             )
             frame = SemanticFrame.model_validate_json(json.dumps(raw_frame))
         except (ValidationError, ValueError) as error:
+            self._discard_cached_completion(completion)
             raise self._invalid_response(error, operation="deconstruct") from None
-        frame = self._expand_unambiguous_evidence_quotes(record, frame)
-        frame = self._ground_self_correction_evidence(record, frame)
-        self._validate_evidence(record, frame)
+        try:
+            frame = self._expand_unambiguous_evidence_quotes(record, frame)
+            frame = self._ground_self_correction_evidence(record, frame)
+            self._validate_evidence(record, frame)
+        except ValueError:
+            self._discard_cached_completion(completion)
+            raise
         return frame
 
     async def render(
@@ -921,7 +960,7 @@ class SemanticModelDeconstructor:
             else "semantic.render.temporary_value_forbidden"
         )
         temporary_value_rule = _PROMPTS.get_prompt(temporary_value_prompt)
-        response = await self._request(
+        completion = await self._request(
             operation="render",
             model=self.settings.render_model,
             reasoning={"effort": "none"},
@@ -940,16 +979,18 @@ class SemanticModelDeconstructor:
         )
         try:
             rendered = _RenderedInput.model_validate_json(
-                response.choices[0].message.content
+                completion.response.choices[0].message.content
             ).rendered_input
         except (ValidationError, ValueError) as error:
+            self._discard_cached_completion(completion)
             raise self._invalid_response(error, operation="render") from None
         if len(rendered) > self.settings.max_input_chars:
+            self._discard_cached_completion(completion)
             raise ValueError("rendered input exceeds max_input_chars")
         return RenderedUserInput(
             text=rendered,
             metadata={
-                **self._generation_metadata(response),
+                **self._generation_metadata(completion),
                 "requested_model": self.settings.render_model,
                 "prompts": prompt_provenance("semantic.render", temporary_value_prompt),
                 "sampling": {
@@ -969,7 +1010,7 @@ class SemanticModelDeconstructor:
         untrusted_payload = self._bounded_json(
             {"source_input": source_input, "candidate_input": candidate_input}
         )
-        response = await self._request(
+        completion = await self._request(
             operation="verify",
             model=self.settings.equivalence_model,
             reasoning={"effort": "low"},
@@ -984,13 +1025,13 @@ class SemanticModelDeconstructor:
             untrusted_payload=untrusted_payload,
         )
         try:
-            raw_assessment = self._decode_object(response.choices[0].message.content)
+            raw_assessment = self._decode_object(completion.response.choices[0].message.content)
             raw_assessment.update(
                 {
                     "schema_version": "1.0.0",
                     "verifier_version": self.provider.equivalence_verifier_version,
                     "metadata": {
-                        **self._generation_metadata(response),
+                        **self._generation_metadata(completion),
                         "requested_model": self.settings.equivalence_model,
                         "prompts": prompt_provenance("semantic.verify"),
                     },
@@ -1000,6 +1041,7 @@ class SemanticModelDeconstructor:
                 json.dumps(raw_assessment)
             )
         except (ValidationError, ValueError) as error:
+            self._discard_cached_completion(completion)
             raise self._invalid_response(error, operation="verify") from None
         assessment = assessment.model_copy(
             update={
@@ -1026,10 +1068,12 @@ class SemanticModelDeconstructor:
             if delta.source_quote is not None and (
                 not delta.source_quote or delta.source_quote not in source_input
             ):
+                self._discard_cached_completion(completion)
                 raise ValueError("semantic equivalence source evidence is invalid")
             if delta.candidate_quote is not None and (
                 not delta.candidate_quote or delta.candidate_quote not in candidate_input
             ):
+                self._discard_cached_completion(completion)
                 raise ValueError("semantic equivalence candidate evidence is invalid")
         return assessment
 
@@ -1064,10 +1108,34 @@ class SemanticModelDeconstructor:
         system_prompt: str,
         untrusted_payload: str,
         preflight_error_body_limit: int = 0,
-    ) -> _ChatCompletionResponse:
+    ) -> _SemanticCompletion:
         api_key = self._require_live_access()
+        cache_key = self._semantic_cache_key(
+            operation=operation,
+            model=model,
+            reasoning=reasoning,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            seed=seed,
+            top_p=top_p,
+            schema_name=schema_name,
+            schema=schema,
+            strict_schema=strict_schema,
+            system_prompt=system_prompt,
+            untrusted_payload=untrusted_payload,
+        )
+        cached_entry = self._semantic_response_cache.get(cache_key)
+        if operation != "preflight" and cached_entry is not None:
+            self._semantic_response_cache.move_to_end(cache_key)
+            self._semantic_cache_hits += 1
+            return _SemanticCompletion(
+                response=cached_entry[0],
+                cache_hit=True,
+                cache_key=cache_key,
+            )
+        self._semantic_actual_calls += 1
         try:
-            return await self._request_completion(
+            response = await self._request_completion(
                 api_key=api_key,
                 model=model,
                 reasoning=reasoning,
@@ -1096,6 +1164,82 @@ class SemanticModelDeconstructor:
                     endpoint_sha256=self.provider.endpoint_sha256,
                 )
             ) from None
+        if operation != "preflight":
+            self._cache_semantic_response(cache_key, response)
+        return _SemanticCompletion(
+            response=response,
+            cache_hit=False,
+            cache_key=cache_key if operation != "preflight" else None,
+        )
+
+    def _discard_cached_completion(self, completion: _SemanticCompletion) -> None:
+        if completion.cache_key is not None:
+            cached_entry = self._semantic_response_cache.pop(completion.cache_key, None)
+            if cached_entry is not None:
+                self._semantic_response_cache_bytes -= cached_entry[1]
+
+    def _cache_semantic_response(
+        self,
+        cache_key: str,
+        response: _ChatCompletionResponse,
+    ) -> None:
+        response_size = len(response.model_dump_json().encode("utf-8"))
+        replaced_entry = self._semantic_response_cache.pop(cache_key, None)
+        if replaced_entry is not None:
+            self._semantic_response_cache_bytes -= replaced_entry[1]
+        if response_size > _MAXIMUM_SEMANTIC_CACHE_BYTES:
+            return
+        self._semantic_response_cache[cache_key] = (response, response_size)
+        self._semantic_response_cache_bytes += response_size
+        while (
+            len(self._semantic_response_cache) > _MAXIMUM_SEMANTIC_CACHE_ENTRIES
+            or self._semantic_response_cache_bytes > _MAXIMUM_SEMANTIC_CACHE_BYTES
+        ):
+            _, (_, evicted_size) = self._semantic_response_cache.popitem(last=False)
+            self._semantic_response_cache_bytes -= evicted_size
+
+    def _semantic_cache_key(
+        self,
+        *,
+        operation: Literal["deconstruct", "render", "verify", "preflight"],
+        model: str,
+        reasoning: dict[str, JsonValue],
+        max_tokens: int,
+        temperature: float,
+        seed: int,
+        top_p: float | None,
+        schema_name: str,
+        schema: dict[str, Any],
+        strict_schema: bool,
+        system_prompt: str,
+        untrusted_payload: str,
+    ) -> str:
+        identity = {
+            "cache_version": _SEMANTIC_CACHE_VERSION,
+            "provider": self.provider.provider_id,
+            "endpoint_sha256": self.provider.endpoint_sha256,
+            "extractor_version": self.provider.extractor_version,
+            "equivalence_verifier_version": self.provider.equivalence_verifier_version,
+            "evaluator_preflight": (
+                self._preflight_result.model_dump(mode="json")
+                if self._preflight_result is not None
+                else None
+            ),
+            "operation": operation,
+            "model": model,
+            "reasoning": reasoning,
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+            "seed": seed,
+            "top_p": top_p,
+            "schema_name": schema_name,
+            "schema": schema,
+            "strict_schema": strict_schema,
+            "system_prompt": system_prompt,
+            "untrusted_payload": untrusted_payload,
+        }
+        serialized = json.dumps(identity, sort_keys=True, separators=(",", ":"))
+        return hashlib.sha256(serialized.encode()).hexdigest()
 
     async def _request_completion(
         self,
@@ -1477,9 +1621,12 @@ class SemanticModelDeconstructor:
 
     def _generation_metadata(
         self,
-        response: _ChatCompletionResponse,
+        completion: _SemanticCompletion,
     ) -> dict[str, JsonValue]:
-        metadata = self.provider.generation_metadata(response)
+        metadata = self.provider.generation_metadata(completion.response)
+        if completion.cache_hit:
+            metadata["semantic_cache_hit"] = True
+            metadata["semantic_usage"] = {}
         if self._preflight_result is not None:
             metadata["evaluator_preflight"] = cast(
                 JsonValue, self._preflight_result.model_dump(mode="json")
