@@ -18,6 +18,7 @@ from ul import (
 from ul.dataset_invariants import (
     DatasetInvariantEvaluation,
 )
+from ul_cli import dataset_review
 from ul_cli.dataset.evidence import customer as customer_module
 from ul_cli.dataset.presentation import evaluation as presentation_module
 from ul_cli.main import app as root_app
@@ -26,12 +27,35 @@ from ._factories import (
     _evaluation_result,
     _invariant_evaluation,
     _isolated_response_target_config,
+    _rich_evaluation_result,
     _run_context,
     _trial_set,
 )
 
 runner = CliRunner()
 _ANSI_ESCAPE_PATTERN = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+
+
+def test_rich_evidence_builds_parses_and_reports_end_to_end(tmp_path: Path) -> None:
+    result = _rich_evaluation_result()
+    run_context = _run_context((result.source,))
+    record = customer_module.build_customer_evidence_record(
+        result,
+        repetitions=1,
+        max_environment_api_calls=2,
+        planned_target_calls=2,
+        run_context=cast(Any, run_context),
+    )
+    evidence_path = tmp_path / "rich-evidence.jsonl"
+    evidence_path.write_text(json.dumps(record) + "\n", encoding="utf-8")
+
+    assert record["schema_version"] == "1.9.0"
+    assert dataset_review.is_reportable_dataset_evidence(evidence_path) is True
+    report = runner.invoke(root_app, ["report", str(evidence_path), "--json"])
+    assert report.exit_code == 0, report.output
+    parsed_report = json.loads(report.output)
+    assert parsed_report["evidence_schema_versions"] == ["1.9.0"]
+    assert parsed_report["evaluation_mode"] == "variance"
 
 
 def test_rich_customer_evidence_records_source_target_original_and_lineage() -> None:

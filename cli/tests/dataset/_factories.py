@@ -9,6 +9,8 @@ from typing import Any, cast
 from pydantic import SecretStr
 from typer.testing import CliRunner
 from ul import (
+    AugmentationTarget,
+    CaseFixtureReference,
     DatasetAugmentationResult,
     DatasetEvaluationBaseline,
     DatasetEvaluationCase,
@@ -22,7 +24,9 @@ from ul import (
     JsonHttpEnvironmentConfig,
     JsonHttpIsolatedResponseConfig,
     ObservedAgentOutput,
+    RichInteractionCase,
     SemanticFrame,
+    project_rich_interaction_case,
 )
 from ul.dataset_augmentation import DatasetAugmentationCandidate
 from ul.dataset_invariants import (
@@ -154,6 +158,38 @@ def _evaluation_result(
         ),
         baseline=DatasetEvaluationBaseline(verdict="no_divergence", trial_set=trial_set),
         cases=(evaluation_case,),
+    )
+
+
+def _rich_evaluation_result() -> DatasetEvaluationResult:
+    source = project_rich_interaction_case(
+        RichInteractionCase(
+            id="cancel-order",
+            inputs={"customer_id": "cus-7", "message": "Cancel order ord-9."},
+            augmentation_targets=(
+                AugmentationTarget(
+                    id="message", kind="input_field", json_pointer="/inputs/message"
+                ),
+            ),
+            fixture=CaseFixtureReference(id="orders", version="9"),
+            observed_output={"status": "cancelled"},
+        )
+    )[0]
+    result = _evaluation_result(source.id)
+    candidate = result.cases[0].candidate.model_copy(
+        update={
+            "source_record_id": source.source_interaction_id,
+            "augmentation_target_id": source.augmentation_target.id,
+        }
+    )
+    return result.model_copy(
+        update={
+            "source": source,
+            "augmentation": result.augmentation.model_copy(
+                update={"source_records": (source,), "candidates": (candidate,)}
+            ),
+            "cases": (result.cases[0].model_copy(update={"candidate": candidate}),),
+        }
     )
 
 
