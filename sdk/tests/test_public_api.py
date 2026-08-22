@@ -3,6 +3,7 @@ from ul import (
     DatasetAugmentationOperator,
     DatasetEvaluationBaseline,
     DatasetEvaluationFinding,
+    DatasetEvaluationMode,
     DatasetEvaluationOutcomeGroup,
     DatasetEvaluationRunner,
     DatasetEvaluationTrial,
@@ -97,6 +98,7 @@ def test_sdk_exposes_dataset_augmentation_api() -> None:
     assert DatasetAugmentationEngine is not None
     assert DatasetAugmentationOperator.__name__ == "DatasetAugmentationOperator"
     assert DatasetEvaluationBaseline.__name__ == "DatasetEvaluationBaseline"
+    assert DatasetEvaluationMode is not None
     assert DatasetEvaluationFinding.__name__ == "DatasetEvaluationFinding"
     assert DatasetEvaluationOutcomeGroup.__name__ == "DatasetEvaluationOutcomeGroup"
     assert DatasetEvaluationRunner.__name__ == "DatasetEvaluationRunner"

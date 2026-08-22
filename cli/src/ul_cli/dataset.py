@@ -22,6 +22,7 @@ from ul import (
     DatasetAugmentationResult,
     DatasetEvaluationCase,
     DatasetEvaluationFinding,
+    DatasetEvaluationMode,
     DatasetEvaluationResult,
     DatasetEvaluationRunner,
     DatasetEvaluationTrialSet,
@@ -117,9 +118,10 @@ _FINDING_LABELS = {
     "changed_grounded_effect_argument": "changed action value",
 }
 _BEHAVIORAL_LIMITATIONS = (
-    "UL compares observed action behavior only. It does not determine whether the original or "
-    "variation is correct, prove that the variation caused a difference, or estimate a "
-    "production failure rate."
+    "Evaluation mode is variance. UL compares fresh original replays with generated variations. "
+    "Historical output is grounding evidence, not an expected answer. UL does not determine "
+    "whether the original or variation is correct, prove that the variation caused a difference, "
+    "or estimate a production failure rate."
 )
 _ISOLATED_ADAPTER_PRESETS: dict[str, tuple[JsonValue, str]] = {
     "generic-json": ({"input": "{{input}}"}, "/response"),
@@ -498,6 +500,16 @@ def evaluate_dataset(
             help="Strict declarative customer invariant configuration.",
         ),
     ] = None,
+    evaluation_mode: Annotated[
+        DatasetEvaluationMode,
+        typer.Option(
+            "--evaluation-mode",
+            help=(
+                "Evaluation intent. Variance compares fresh original replays with variations; "
+                "correctness and preference evaluators are not implemented."
+            ),
+        ),
+    ] = "variance",
     operator: Annotated[
         list[str] | None,
         typer.Option(
@@ -603,6 +615,12 @@ def evaluate_dataset(
     Discover operators: ul augmentations list --mode dataset_variation
     Augmentation retention: --augmentations-output PATH or --no-save-augmentations
     """
+    if evaluation_mode != "variance":
+        raise typer.BadParameter(
+            f"evaluation mode '{evaluation_mode}' is not implemented; use 'variance'. "
+            "Historical dataset output is grounding evidence, not an expected answer.",
+            param_hint="--evaluation-mode",
+        )
     if augmentations_output is not None and no_save_augmentations:
         raise typer.BadParameter(
             "--augmentations-output cannot be used with --no-save-augmentations",
@@ -747,6 +765,7 @@ def evaluate_dataset(
             _dataset_evidence_run_context(
                 selected_records=selected_records,
                 selected_operator_ids=selected_operators,
+                evaluation_mode=evaluation_mode,
                 repetitions=repetitions,
                 invariant_suite=invariant_suite,
                 target_config=normalized_target_config,
@@ -843,6 +862,7 @@ def evaluate_dataset(
             selected_count=len(selected_records),
             skipped_count=skipped_count,
             operator_ids=selected_operators,
+            evaluation_mode=evaluation_mode,
             target_configured=environment_config is not None,
             target_endpoint=(
                 json_http_environment_config_urls(loaded_target_config)[0]
@@ -1360,6 +1380,7 @@ def _dataset_evidence_run_context(
     *,
     selected_records: tuple[InteractionRecord, ...],
     selected_operator_ids: tuple[str, ...],
+    evaluation_mode: Literal["variance"] = "variance",
     repetitions: int,
     invariant_suite: DatasetInvariantSuite | None,
     target_config: JsonHttpTargetConfig | None,
@@ -1372,6 +1393,7 @@ def _dataset_evidence_run_context(
         operators=tuple(
             _dataset_operator_identity(reference) for reference in selected_operator_ids
         ),
+        evaluation_mode=evaluation_mode,
         repetitions=repetitions,
         invariant_suite_sha256=(invariant_suite.sha256 if invariant_suite is not None else None),
         target_config=target_config,
@@ -1398,6 +1420,7 @@ def _print_dataset_plan(
     selected_count: int,
     skipped_count: int,
     operator_ids: tuple[str, ...],
+    evaluation_mode: Literal["variance"],
     target_configured: bool,
     target_endpoint: str | None,
     target_header_environment_variables: dict[str, str],
@@ -1428,6 +1451,10 @@ def _print_dataset_plan(
     else:
         console.print(f"Selected interactions: {selected_count}")
     console.print(f"Operators: {', '.join(operator_ids)}")
+    console.print(
+        f"Evaluation mode: {evaluation_mode} (historical output is not an expected answer; "
+        "correctness not assessed)"
+    )
     console.print(f"Repetitions: {repetitions} per original and accepted variation")
     if invariant_suite is None:
         console.print("Customer invariants: none")
@@ -1684,6 +1711,11 @@ async def _evaluate_interaction_records(
             semantic_pipeline,
             evaluation_target,
             allow_network_egress=allow_network_egress,
+            evaluation_mode=(
+                run_context.evaluation_mode
+                if run_context is not None and run_context.evaluation_mode is not None
+                else "variance"
+            ),
         )
         for record in records:
             precomputed_augmentation = (
@@ -1742,6 +1774,14 @@ def _print_dataset_results(
     invariant_evaluations: tuple[DatasetInvariantEvaluation, ...] = (),
     show_report_guidance: bool = True,
 ) -> None:
+    evaluation_modes = {getattr(result, "evaluation_mode", "variance") for result in results}
+    if len(evaluation_modes) > 1:
+        raise ValueError("dataset results contain incompatible evaluation modes")
+    evaluation_mode = next(iter(evaluation_modes), "variance")
+    console.print(
+        f"Evaluation mode: {evaluation_mode} (historical output is not an expected answer; "
+        "correctness not assessed)"
+    )
     table = Table(title="Dataset evaluation")
     table.add_column("Case", style="cyan")
     table.add_column("Augmentation")
@@ -1893,6 +1933,7 @@ def _customer_evidence_record(
     run_context: DatasetEvidenceRunContext | None = None,
     invariant_evaluation: DatasetInvariantEvaluation | None = None,
 ) -> dict[str, JsonValue]:
+    evaluation_mode = cast(Literal["variance"], getattr(result, "evaluation_mode", "variance"))
     cases: list[JsonValue] = []
     for case in result.cases:
         cases.append(
@@ -1922,12 +1963,9 @@ def _customer_evidence_record(
     )
     if uses_extended_invariants and run_context is None:
         raise ValueError("extended invariant evidence requires a resumable run context")
-    if uses_extended_invariants or run_context is not None:
-        evidence_schema_version = "1.7.0"
-    else:
-        evidence_schema_version = "1.4.0"
     evidence: dict[str, JsonValue] = {
-        "schema_version": evidence_schema_version,
+        "schema_version": "1.8.0",
+        "evaluation_mode": evaluation_mode,
         "interaction_id": result.source.id,
         "original_input": result.source.raw_input,
         "execution_plan": {
