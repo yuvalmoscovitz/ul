@@ -8,6 +8,7 @@ import ssl
 from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
+from urllib.parse import unquote
 
 import httpx
 import pytest
@@ -20,6 +21,7 @@ from ul.http_environment import (
     load_json_http_environment_config,
     validate_json_http_environment_configuration,
 )
+from ul.otlp_observation import OtlpObservationConfig, OtlpObservationSource
 from ul_core.evaluation import EvaluationCase, TimeoutAfterCommitEventRequest
 from ul_core.models import ConversationRole, ConversationTurn
 
@@ -299,6 +301,96 @@ async def test_lifecycle_templates_cannot_interpolate_case_context() -> None:
 
     with pytest.raises(ValidationError, match="lifecycle request_json_template"):
         JsonHttpEnvironmentConfig.model_validate(raw_config)
+
+
+async def test_http_probe_injects_w3c_trace_context_and_ul_baggage() -> None:
+    headers: dict[str, str] = {}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        headers.update(request.headers)
+        return _raw_response(json.dumps({"response": "done"}).encode("utf-8"))
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        environment = JsonHttpEnvironmentConnection.from_config(
+            _isolated_response_config(),
+            test_environment_confirmed=True,
+            client=client,
+        )
+        await environment.execute(_case("hello", max_calls=1))
+
+    traceparent = headers["traceparent"]
+    assert traceparent.startswith("00-")
+    assert len(traceparent) == 55
+    assert "ul.campaign.id=" in headers["baggage"]
+    assert "ul.case.id=case-1" in headers["baggage"]
+    assert "ul.turn.id=turn-1" in headers["baggage"]
+    assert "hello" not in headers["baggage"]
+
+
+async def test_http_probe_attaches_separately_exported_otlp_trace() -> None:
+    observer = OtlpObservationSource(
+        OtlpObservationConfig(
+            settle_window_seconds=0.01,
+            observation_timeout_seconds=0.1,
+        )
+    )
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        _, trace_id, parent_span_id, _ = request.headers["traceparent"].split("-")
+        baggage = {
+            key: unquote(value)
+            for item in request.headers["baggage"].split(",")
+            for key, value in [item.split("=", maxsplit=1)]
+        }
+        observer.export(
+            {
+                "resourceSpans": [
+                    {
+                        "scopeSpans": [
+                            {
+                                "spans": [
+                                    {
+                                        "traceId": trace_id,
+                                        "spanId": "1" * 16,
+                                        "parentSpanId": parent_span_id,
+                                        "name": "agent",
+                                        "startTimeUnixNano": "100",
+                                        "endTimeUnixNano": "200",
+                                        "attributes": [
+                                            {
+                                                "key": "ul.correlation.id",
+                                                "value": {
+                                                    "stringValue": baggage["ul.correlation.id"]
+                                                },
+                                            },
+                                            {
+                                                "key": "gen_ai.operation.name",
+                                                "value": {"stringValue": "invoke_agent"},
+                                            },
+                                        ],
+                                    }
+                                ]
+                            }
+                        ]
+                    }
+                ]
+            }
+        )
+        return _raw_response(json.dumps({"response": "done"}).encode("utf-8"))
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        environment = JsonHttpEnvironmentConnection.from_config(
+            _isolated_response_config(),
+            test_environment_confirmed=True,
+            observation_source=observer,
+            observation_timeout_seconds=0.2,
+            client=client,
+        )
+        evidence = await environment.execute(_case("hello", max_calls=1))
+
+    assert evidence.final_response == "done"
+    assert evidence.observations[0].status == "complete"
+    assert evidence.observations[0].metadata["translator_version"] == "1.0.0"
 
 
 async def test_isolated_response_failure_does_not_block_the_next_independent_request() -> None:

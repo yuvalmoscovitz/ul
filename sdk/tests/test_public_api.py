@@ -26,6 +26,9 @@ from ul import (
     ObservedAgentOutput,
     OpenAICompatibleDatasetSettings,
     OpenRouterDatasetSettings,
+    OtlpObservationConfig,
+    OtlpObservationSource,
+    ProbeExecutionIdentity,
     PromptManager,
     PromptTemplateInfo,
     RedactedSemanticPipeline,
@@ -41,6 +44,7 @@ from ul import (
     SemanticFrame,
     SemanticModelDeconstructor,
     UserInputRecord,
+    WorkerTraceFlusher,
     builtin_augmentation_registry,
     builtin_dataset_augmentation_operators,
     create_dataset_regression_case,
@@ -132,6 +136,10 @@ def test_sdk_exposes_dataset_augmentation_api() -> None:
     assert len(builtin_dataset_augmentation_operators()) == 11
     assert OpenRouterDatasetSettings is not None
     assert OpenAICompatibleDatasetSettings is not None
+    assert OtlpObservationConfig.__name__ == "OtlpObservationConfig"
+    assert OtlpObservationSource.__name__ == "OtlpObservationSource"
+    assert ProbeExecutionIdentity.__name__ == "ProbeExecutionIdentity"
+    assert WorkerTraceFlusher.__name__ == "WorkerTraceFlusher"
     assert SemanticModelDeconstructor is not None
     assert create_semantic_model_deconstructor is not None
     assert load_dataset_semantic_settings is not None

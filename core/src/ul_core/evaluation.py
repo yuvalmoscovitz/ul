@@ -128,6 +128,7 @@ class ObservationRequest(_StrictModel):
     session_id: str = Field(min_length=1, max_length=500)
     correlation_id: str = Field(min_length=1, max_length=500)
     checkpoint: str | None = Field(default=None, min_length=1, max_length=1_000)
+    context: dict[str, JsonValue] = Field(default_factory=dict)
 
 
 class ProbeObservation(_StrictModel):
@@ -163,6 +164,24 @@ class ProbeObservation(_StrictModel):
             )
         ):
             raise ValueError("missing observations cannot contain observed evidence")
+        return self
+
+
+class ProbeExecutionIdentity(_StrictModel):
+    schema_version: Literal["1.0.0"] = "1.0.0"
+    campaign_id: str = Field(min_length=1, max_length=500)
+    case_id: str = Field(min_length=1, max_length=500)
+    probe_id: str = Field(min_length=1, max_length=500)
+    attempt_id: str = Field(min_length=1, max_length=500)
+    session_id: str = Field(min_length=1, max_length=500)
+    turn_ids: tuple[str, ...]
+    variation_id: str | None = Field(default=None, min_length=1, max_length=500)
+    repetition: int | None = Field(default=None, ge=1)
+
+    @model_validator(mode="after")
+    def validate_turn_ids(self) -> Self:
+        if len(self.turn_ids) != len(set(self.turn_ids)):
+            raise ValueError("probe execution turn identifiers must be unique")
         return self
 
 
@@ -264,6 +283,7 @@ class ObservationSourceCapabilities(_StrictModel):
     supports_errors: bool = False
     supports_usage: bool = False
     supports_metadata: bool = False
+    counts_toward_environment_api_calls: bool = True
 
     @property
     def supports_trajectory(self) -> bool:
@@ -596,7 +616,7 @@ class EnvironmentResetEvidence(_StrictModel):
 
 
 class ExecutionEvidence(_StrictModel):
-    schema_version: Literal["1.3.0"] = "1.3.0"
+    schema_version: Literal["1.4.0"] = "1.4.0"
     evidence_scope: Literal["response_only", "response_and_state"] = "response_and_state"
     case_id: str = Field(min_length=1, max_length=500)
     environment_id: str = Field(min_length=1, max_length=500)
@@ -608,10 +628,17 @@ class ExecutionEvidence(_StrictModel):
     timeout_after_commit_event: TimeoutAfterCommitEventEvidence | None = None
     observations: tuple[ProbeObservation, ...] = ()
     execution_events: tuple[ProbeExecutionEvent, ...] = ()
+    probe_identity: ProbeExecutionIdentity | None = None
     lifecycle: EnvironmentLifecycleEvidence
 
     @model_validator(mode="after")
     def validate_successful_evidence(self) -> Self:
+        if self.probe_identity is not None:
+            if self.probe_identity.case_id != self.case_id:
+                raise ValueError("probe identity must match the evidence case")
+            evidence_turn_ids = tuple(turn.turn_id for turn in self.turns)
+            if self.probe_identity.turn_ids[: len(evidence_turn_ids)] != evidence_turn_ids:
+                raise ValueError("probe identity turns must contain the evidence turns in order")
         if self.evidence_scope == "response_only":
             if (
                 self.initial_state is not None
