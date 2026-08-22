@@ -249,9 +249,7 @@ async def test_evaluator_preflight_rejects_invalid_structured_output() -> None:
 
 
 async def test_evaluator_preflight_names_seed_rejection() -> None:
-    client = mock_client(
-        lambda request: httpx.Response(400, json={"error": {"param": "seed"}})
-    )
+    client = mock_client(lambda request: httpx.Response(400, json={"error": {"param": "seed"}}))
     async with create_semantic_model_deconstructor(settings(), client=client) as deconstructor:
         with pytest.raises(EvaluatorModelCompatibilityError, match="seed capability") as error:
             await deconstructor.preflight()

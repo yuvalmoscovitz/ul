@@ -728,9 +728,7 @@ class SemanticModelDeconstructor:
         except TimeoutError:
             raise self._compatibility_error("timeout") from None
         except httpx.HTTPStatusError as error:
-            raise self._compatibility_error(
-                _preflight_http_capability(error.response)
-            ) from None
+            raise self._compatibility_error(_preflight_http_capability(error.response)) from None
         except httpx.HTTPError:
             raise self._compatibility_error("routing") from None
         try:
