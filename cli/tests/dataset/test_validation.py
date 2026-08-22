@@ -1,0 +1,380 @@
+from __future__ import annotations
+
+import json
+import re
+from pathlib import Path
+from typing import Any
+
+import pytest
+from typer.testing import CliRunner
+from ul import (
+    JsonHttpEnvironmentConfig,
+)
+from ul_cli.dataset.evaluation import command as command_module
+from ul_cli.dataset.evaluation import runner as runner_module
+from ul_cli.main import app as root_app
+
+from ._factories import (
+    _settings,
+)
+from ._files import (
+    _record,
+    _write_dataset,
+    _write_target_config,
+)
+
+runner = CliRunner()
+_ANSI_ESCAPE_PATTERN = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+
+
+def test_target_config_dry_run_validates_environment_and_makes_no_calls(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    dataset = tmp_path / "interactions.jsonl"
+    target_config = tmp_path / "target.json"
+    _write_dataset(dataset, [_record()])
+    _write_target_config(
+        target_config,
+        headers_from_env={"Authorization": "UL_ENVIRONMENT_TOKEN"},
+        request_json_template={"request": {"message": "{{input}}"}},
+        response_json_pointer="/result",
+    )
+    monkeypatch.setenv("UL_ENVIRONMENT_TOKEN", "Bearer test-token")
+
+    def unexpected_deconstructor(*args: object, **kwargs: object) -> None:
+        raise AssertionError("dry-run constructed a semantic model client")
+
+    monkeypatch.setattr(
+        runner_module, "create_semantic_model_deconstructor", unexpected_deconstructor
+    )
+    result = runner.invoke(
+        root_app,
+        [
+            "dataset",
+            "evaluate",
+            str(dataset),
+            "--environment-config",
+            str(target_config),
+            "--dry-run",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "Customer-managed environment API: configured" in result.output
+    assert "Authorization=UL_ENVIRONMENT_TOKEN" in result.output
+    assert "Bearer test-token" not in result.output
+    assert "No model or environment API requests sent" in result.output
+
+    monkeypatch.delenv("UL_ENVIRONMENT_TOKEN")
+    missing_environment = runner.invoke(
+        root_app,
+        [
+            "dataset",
+            "evaluate",
+            str(dataset),
+            "--environment-config",
+            str(target_config),
+            "--dry-run",
+        ],
+    )
+
+    assert missing_environment.exit_code != 0
+    assert "environment variable is not set" in missing_environment.output
+    assert "No model or environment API requests sent" not in missing_environment.output
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {
+            "version": 5,
+            "environment_id": "test-environment",
+            "unknown": True,
+        },
+        {
+            **JsonHttpEnvironmentConfig.model_validate(
+                json.loads(
+                    (Path(__file__).parents[3] / "examples/stateful_target.json").read_text()
+                )
+            ).model_dump(mode="json"),
+            "execute_turn": {
+                "url": "https://environment.example.test/execute",
+                "request_json_template": {"input": "missing marker"},
+            },
+        },
+        {
+            **JsonHttpEnvironmentConfig.model_validate(
+                json.loads(
+                    (Path(__file__).parents[3] / "examples/stateful_target.json").read_text()
+                )
+            ).model_dump(mode="json"),
+            "snapshot": {
+                "url": "https://environment.example.test/snapshot",
+                "response_json_pointer": "not-a-pointer",
+            },
+        },
+    ],
+)
+def test_dry_run_rejects_invalid_target_config(tmp_path: Path, payload: dict[str, Any]) -> None:
+    dataset = tmp_path / "interactions.jsonl"
+    target_config = tmp_path / "target.json"
+    _write_dataset(dataset, [_record()])
+    target_config.write_text(json.dumps(payload), encoding="utf-8")
+
+    result = runner.invoke(
+        root_app,
+        [
+            "dataset",
+            "evaluate",
+            str(dataset),
+            "--environment-config",
+            str(target_config),
+            "--dry-run",
+        ],
+    )
+
+    assert result.exit_code != 0
+    assert "No model or environment API requests sent" not in result.output
+
+
+@pytest.mark.parametrize(
+    ("invalid_line", "expected_error"),
+    [
+        ("not json\n", "line 2: invalid JSON"),
+        (
+            '{"id":"bad","input":"message","output":NaN}\n',
+            "line 2: invalid JSON",
+        ),
+        (
+            '{"id":"first","id":"second","input":"message","output":{}}\n',
+            "line 2: invalid JSON",
+        ),
+        (
+            '{"id":"bad","input":"message","output":{"action":"first","action":"second"}}\n',
+            "line 2: invalid JSON",
+        ),
+        (json.dumps({"id": "bad", "input": "message"}) + "\n", "missing output"),
+        (
+            json.dumps({"id": "bad", "input": "message", "output": {}, "extra": True}) + "\n",
+            "unknown field(s)",
+        ),
+        ("\n", "line 2: blank lines are not allowed"),
+    ],
+)
+def test_preflight_reports_safe_line_numbered_errors_without_external_calls(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    invalid_line: str,
+    expected_error: str,
+) -> None:
+    dataset = tmp_path / "interactions.jsonl"
+    dataset.write_text(json.dumps(_record()) + "\n" + invalid_line, encoding="utf-8")
+
+    def unexpected_settings() -> None:
+        raise AssertionError("invalid data reached model setup")
+
+    monkeypatch.setattr(command_module, "load_dataset_semantic_settings", unexpected_settings)
+    result = runner.invoke(root_app, ["dataset", "evaluate", str(dataset)])
+
+    assert result.exit_code != 0
+    normalized_output = " ".join(_ANSI_ESCAPE_PATTERN.sub("", result.output).split())
+    assert expected_error in normalized_output
+    assert "Transfer 100" not in result.output
+
+
+def test_preflight_rejects_duplicate_ids_before_external_calls(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    dataset = tmp_path / "interactions.jsonl"
+    _write_dataset(dataset, [_record(), _record()])
+
+    def unexpected_settings() -> None:
+        raise AssertionError("duplicate data reached model setup")
+
+    monkeypatch.setattr(command_module, "load_dataset_semantic_settings", unexpected_settings)
+    result = runner.invoke(root_app, ["dataset", "evaluate", str(dataset)])
+
+    assert result.exit_code != 0
+    assert "line 2: duplicate id" in result.output
+
+
+def test_preflight_rejects_deeply_nested_json(tmp_path: Path) -> None:
+    dataset = tmp_path / "interactions.jsonl"
+    nested_output = "[" * 1_100 + "0" + "]" * 1_100
+    dataset.write_text(
+        f'{{"id":"deep","input":"message","output":{nested_output}}}\n',
+        encoding="utf-8",
+    )
+
+    result = runner.invoke(root_app, ["dataset", "evaluate", str(dataset), "--dry-run"])
+
+    assert result.exit_code != 0
+    assert "line 1: invalid output" in result.output
+
+
+def test_preflight_rejects_selected_model_input_over_limit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    dataset = tmp_path / "interactions.jsonl"
+    _write_dataset(dataset, [_record(), _record("interaction-2")])
+    monkeypatch.setattr(
+        command_module,
+        "load_dataset_semantic_settings",
+        lambda: _settings(max_input_chars=50),
+    )
+
+    result = runner.invoke(root_app, ["dataset", "evaluate", str(dataset), "--dry-run"])
+
+    assert result.exit_code != 0
+    assert "selected interaction 1 exceeds the semantic model input limit" in result.output
+
+
+def test_preflight_enforces_record_and_target_call_bounds(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    dataset = tmp_path / "interactions.jsonl"
+    _write_dataset(dataset, [_record(f"interaction-{index}") for index in range(101)])
+
+    def unexpected_settings() -> None:
+        raise AssertionError("oversized data reached model setup")
+
+    monkeypatch.setattr(command_module, "load_dataset_semantic_settings", unexpected_settings)
+    too_many_records = runner.invoke(
+        root_app,
+        ["dataset", "evaluate", str(dataset), "--dry-run"],
+    )
+
+    assert too_many_records.exit_code != 0
+    assert "line 101: dataset exceeds 100 records" in too_many_records.output
+
+    monkeypatch.setattr(
+        command_module,
+        "load_dataset_semantic_settings",
+        lambda: _settings(),
+    )
+    _write_dataset(dataset, [_record(f"interaction-{index}") for index in range(17)])
+    maximum_calls = runner.invoke(
+        root_app,
+        [
+            "dataset",
+            "evaluate",
+            str(dataset),
+            "--limit",
+            "16",
+            "--operator",
+            "input.surface.rephrase",
+            "--dry-run",
+        ],
+    )
+
+    assert maximum_calls.exit_code == 0, maximum_calls.output
+    assert "Potential environment API calls: up to 96" in maximum_calls.output
+
+    too_many_calls = runner.invoke(
+        root_app,
+        [
+            "dataset",
+            "evaluate",
+            str(dataset),
+            "--limit",
+            "17",
+            "--operator",
+            "input.surface.rephrase",
+            "--dry-run",
+        ],
+    )
+
+    assert too_many_calls.exit_code != 0
+    normalized_output = " ".join(_ANSI_ESCAPE_PATTERN.sub("", too_many_calls.output).split())
+    assert "would make up to 102 environment API calls" in normalized_output
+    assert "--max-environment-api-calls 100" in normalized_output
+
+
+def test_repetition_budget_is_explicit_and_checked_before_external_setup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    dataset = tmp_path / "interactions.jsonl"
+    _write_dataset(dataset, [_record()])
+
+    def unexpected_settings() -> None:
+        raise AssertionError("over-budget repetition plan reached model setup")
+
+    monkeypatch.setattr(command_module, "load_dataset_semantic_settings", unexpected_settings)
+    huge_plan = runner.invoke(
+        root_app,
+        [
+            "dataset",
+            "evaluate",
+            str(dataset),
+            "--repetitions",
+            "1000000000",
+            "--dry-run",
+        ],
+    )
+
+    assert huge_plan.exit_code != 0
+    normalized_output = " ".join(_ANSI_ESCAPE_PATTERN.sub("", huge_plan.output).split())
+    assert "would make up to" in normalized_output
+    assert "--max-environment-api-calls" in normalized_output
+    assert "call budget" in normalized_output
+
+    monkeypatch.setattr(
+        command_module,
+        "load_dataset_semantic_settings",
+        lambda: _settings(),
+    )
+    exact_budget = runner.invoke(
+        root_app,
+        [
+            "dataset",
+            "evaluate",
+            str(dataset),
+            "--repetitions",
+            "51",
+            "--max-environment-api-calls",
+            "102",
+            "--dry-run",
+        ],
+    )
+
+    assert exact_budget.exit_code == 0, exact_budget.output
+    assert "Potential environment API calls: up to 102 (authorized maximum: 102)" in " ".join(
+        exact_budget.output.split()
+    )
+
+
+@pytest.mark.parametrize(
+    "options",
+    (
+        ("--repetitions", "0"),
+        ("--repetitions", "-1"),
+        ("--max-environment-api-calls", "0"),
+        ("--max-environment-api-calls", "-1"),
+    ),
+)
+def test_repetition_and_call_budget_must_be_positive(
+    tmp_path: Path,
+    options: tuple[str, str],
+) -> None:
+    dataset = tmp_path / "interactions.jsonl"
+    _write_dataset(dataset, [_record()])
+
+    result = runner.invoke(
+        root_app,
+        ["dataset", "evaluate", str(dataset), *options, "--dry-run"],
+    )
+
+    assert result.exit_code != 0
+
+
+def test_default_limit_and_repetitions_fit_the_default_call_budget(tmp_path: Path) -> None:
+    dataset = tmp_path / "interactions.jsonl"
+    _write_dataset(dataset, [_record(f"interaction-{index}") for index in range(11)])
+
+    result = runner.invoke(root_app, ["dataset", "evaluate", str(dataset), "--dry-run"])
+
+    assert result.exit_code == 0, result.output
+    assert "Selected interactions: 10" in result.output
+    assert "Potential environment API calls: up to 60" in result.output
