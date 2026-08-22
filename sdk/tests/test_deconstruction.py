@@ -1018,8 +1018,10 @@ async def test_deconstruct_rejects_non_factor_communication_references() -> None
 
     client = mock_client(handler)
     async with create_semantic_model_deconstructor(settings(), client=client) as deconstructor:
-        with pytest.raises(ValidationError, match="unknown reference"):
+        with pytest.raises(ProviderDiagnosticError) as provider_error:
             await deconstructor.deconstruct(interaction())
+    assert provider_error.value.diagnostic.operation == "deconstruct"
+    assert provider_error.value.diagnostic.category == "invalid_response"
     await client.aclose()
 
 
@@ -1276,8 +1278,10 @@ async def test_invalid_provider_response_is_rejected() -> None:
 
     client = mock_client(handler)
     async with create_semantic_model_deconstructor(settings(), client=client) as deconstructor:
-        with pytest.raises(ValidationError):
+        with pytest.raises(ProviderDiagnosticError) as provider_error:
             await deconstructor.render("Pay INV-104", "Rephrase.")
+    assert provider_error.value.diagnostic.operation == "render"
+    assert provider_error.value.diagnostic.category == "invalid_response"
     await client.aclose()
 
 
