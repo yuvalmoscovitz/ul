@@ -1,0 +1,78 @@
+{
+  "schema_version": "1.0.0",
+  "name": "ul-synthetic-augmentation-release-corpus",
+  "version": "1.0.0",
+  "cases": [
+    {
+      "segment": "short",
+      "record": {
+        "schema_version": "1.0.0",
+        "id": "short-cancel",
+        "raw_input": "Cancel order 8421.",
+        "metadata": {},
+        "raw_observed_output": {"status": "cancelled", "order_id": "8421"}
+      }
+    },
+    {
+      "segment": "long",
+      "record": {
+        "schema_version": "1.0.0",
+        "id": "long-refund",
+        "raw_input": "Please locate the duplicate charge on my July statement, verify that it belongs to order 73A, refund only the later charge to the original payment method, and send me a confirmation after the refund succeeds.",
+        "metadata": {},
+        "raw_observed_output": {
+          "status": "refunded",
+          "order_id": "73A",
+          "refunded_charge": "later",
+          "confirmation_sent": true
+        }
+      }
+    },
+    {
+      "segment": "factual",
+      "record": {
+        "schema_version": "1.0.0",
+        "id": "factual-shipment",
+        "raw_input": "Create three 8 kg shipments to Munich for vendor Northwind.",
+        "metadata": {},
+        "raw_observed_output": {
+          "status": "created",
+          "shipment_count": 3,
+          "weight_kg": 8,
+          "destination": "Munich",
+          "vendor": "Northwind"
+        }
+      }
+    },
+    {
+      "segment": "conversational",
+      "record": {
+        "schema_version": "1.0.0",
+        "id": "conversational-appointment",
+        "raw_input": "Hi, could you move my annual checkup with Dr. Lee to next Tuesday morning? Thanks!",
+        "metadata": {},
+        "raw_observed_output": {
+          "status": "rescheduled",
+          "clinician": "Dr. Lee",
+          "time": "next Tuesday morning"
+        }
+      }
+    },
+    {
+      "segment": "tool_oriented",
+      "record": {
+        "schema_version": "1.0.0",
+        "id": "tool-payment",
+        "raw_input": "Look up invoice AC-100, confirm it is approved, pay exactly $125 USD, then return the payment reference.",
+        "metadata": {},
+        "raw_observed_output": {
+          "status": "paid",
+          "invoice_id": "AC-100",
+          "amount": 125,
+          "currency": "USD",
+          "payment_reference": "PAY-9001"
+        }
+      }
+    }
+  ]
+}

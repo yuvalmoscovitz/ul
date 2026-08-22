@@ -214,7 +214,7 @@ async def test_evaluator_preflight_proves_required_capabilities_and_records_poli
     assert tuple(profile.roles for profile in planned_profiles) == tuple(
         profile.roles for profile in result.profiles
     )
-    assert sum(profile.max_completion_tokens for profile in planned_profiles) == 48
+    assert sum(profile.max_completion_tokens for profile in planned_profiles) == 1_154
     assert [request["model"] for request in requests[:3]] == [
         "google/gemini-2.5-flash",
         "x-ai/grok-4.3",
@@ -231,7 +231,7 @@ async def test_evaluator_preflight_proves_required_capabilities_and_records_poli
         "UL evaluator preflight", "Check renderer compatibility."
     )
     assert requests[1]["top_p"] == 0.95
-    assert all(request["max_tokens"] == 16 for request in requests[:3])
+    assert [request["max_tokens"] for request in requests[:3]] == [321, 512, 321]
     assert requests[0]["response_format"] == {
         "type": "json_schema",
         "json_schema": {
@@ -281,6 +281,23 @@ async def test_evaluator_preflight_proves_required_capabilities_and_records_poli
     await client.aclose()
 
 
+async def test_evaluator_preflight_caps_each_sample_at_1024_tokens() -> None:
+    requests: list[dict[str, object]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(cast(dict[str, object], json.loads(request.content)))
+        return completion('{"compatible":true}')
+
+    client = mock_client(handler)
+    async with create_semantic_model_deconstructor(
+        settings(max_output_tokens=4_096, max_render_tokens=4_096), client=client
+    ) as deconstructor:
+        await deconstructor.preflight()
+
+    assert [request["max_tokens"] for request in requests] == [1_024, 1_024, 1_024]
+    await client.aclose()
+
+
 async def test_generic_endpoint_deduplicates_without_claiming_parameter_support() -> None:
     request_bodies: list[dict[str, object]] = []
 
@@ -299,7 +316,7 @@ async def test_generic_endpoint_deduplicates_without_claiming_parameter_support(
     assert tuple(profile.roles for profile in planned_profiles) == tuple(
         profile.roles for profile in result.profiles
     )
-    assert sum(profile.max_completion_tokens for profile in planned_profiles) == 32
+    assert sum(profile.max_completion_tokens for profile in planned_profiles) == 833
     assert tuple(profile.roles for profile in result.profiles) == (
         ("deconstruct", "equivalence"),
         ("render",),
@@ -1905,7 +1922,7 @@ async def test_live_augmentation_generates_or_safely_rejects_each_candidate() ->
     assert all(candidate.passed or candidate.failure_reasons for candidate in result.candidates)
     assert [
         candidate.operator_id for candidate in result.candidates if candidate.human_review_required
-    ] == ["input.tone.frustrated"]
+    ] == ["input.tone.frustrated", "input.intent.self_correction"]
 
 
 async def test_live_equivalence_qualification_across_ten_domains() -> None:

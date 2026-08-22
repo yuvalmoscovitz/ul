@@ -73,11 +73,12 @@ def _evaluator_preflight() -> EvaluatorModelPreflight:
         temperature: int | float,
         seed: int,
         *,
+        max_tokens: int = 1_024,
         top_p: float | None = None,
     ) -> str:
         options: dict[str, object] = {
             "model": model,
-            "max_tokens": 16,
+            "max_tokens": max_tokens,
             "temperature": temperature,
             "seed": seed,
             "reasoning": {"effort": reasoning_effort},
@@ -132,7 +133,12 @@ def _evaluator_preflight() -> EvaluatorModelPreflight:
                         "top_p",
                     ),
                     "request_options_sha256": request_options_sha256(
-                        "test/renderer", "none", 0.7, render_seed, top_p=0.95
+                        "test/renderer",
+                        "none",
+                        0.7,
+                        render_seed,
+                        max_tokens=512,
+                        top_p=0.95,
                     ),
                     "parameter_support": "routing_enforced",
                     "unverified_options": (),
@@ -1038,7 +1044,9 @@ def test_dry_run_json_exposes_per_example_campaign_and_exact_call_plan(
         ["render"],
         ["equivalence"],
     ]
-    assert sum(profile["max_completion_tokens"] for profile in payload["preflight_profiles"]) == 48
+    assert (
+        sum(profile["max_completion_tokens"] for profile in payload["preflight_profiles"]) == 2_560
+    )
     assert payload["calls"]["total_semantic_model"] == (
         payload["calls"]["preflight"]
         + payload["calls"]["evaluators"]
@@ -1054,7 +1062,7 @@ def test_dry_run_json_exposes_per_example_campaign_and_exact_call_plan(
     assert "deterministic and free" in planned_operator["reasons"][1]
     assert payload["tokens"] == {
         "minimum": 0,
-        "maximum": 25_648,
+        "maximum": 28_160,
         "scope": "completion_tokens",
     }
     assert payload["money"] is None
