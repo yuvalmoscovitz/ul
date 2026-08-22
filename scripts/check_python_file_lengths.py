@@ -64,8 +64,9 @@ def changed_python_files(base_commit: str, head_commit: str) -> list[ChangedFile
         if status.startswith("R"):
             if index + 1 >= len(fields):
                 raise GitError("git diff returned an incomplete rename")
-            base_path = os.fsdecode(fields[index])
+            renamed_from = os.fsdecode(fields[index])
             head_path = os.fsdecode(fields[index + 1])
+            base_path = renamed_from if renamed_from.endswith(".py") else None
             index += 2
         else:
             if index >= len(fields):

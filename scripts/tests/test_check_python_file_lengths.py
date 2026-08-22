@@ -153,6 +153,18 @@ def test_ignores_non_python_destination(repository: Path) -> None:
     assert result.stdout == ""
 
 
+def test_warns_when_long_file_is_renamed_into_python_scope(repository: Path) -> None:
+    write_lines(repository, "legacy.txt", 800)
+    base = commit(repository, "add legacy text file")
+    git(repository, "mv", "legacy.txt", "legacy.py")
+    head = commit(repository, "rename into policy")
+
+    result = check(repository, base, head)
+
+    assert result.returncode == 0
+    assert "'legacy.py': new file has 800 physical lines" in result.stdout
+
+
 def test_escapes_special_path_in_github_annotation(repository: Path) -> None:
     base = git(repository, "rev-parse", "HEAD")
     path = ":(glob) odd,100%\nfile.py"
