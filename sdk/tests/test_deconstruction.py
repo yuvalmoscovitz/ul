@@ -224,7 +224,7 @@ async def test_evaluator_preflight_proves_required_capabilities_and_records_poli
         "UL evaluator preflight", "Check renderer compatibility."
     )
     assert requests[1]["top_p"] == 0.95
-    assert all(request["max_tokens"] == 16 for request in requests[:3])
+    assert [request["max_tokens"] for request in requests[:3]] == [321, 512, 321]
     assert requests[0]["response_format"] == {
         "type": "json_schema",
         "json_schema": {
@@ -271,6 +271,23 @@ async def test_evaluator_preflight_proves_required_capabilities_and_records_poli
         ),
     }
     assert frame.metadata["evaluator_preflight"] == result.model_dump(mode="json")
+    await client.aclose()
+
+
+async def test_evaluator_preflight_caps_each_sample_at_1024_tokens() -> None:
+    requests: list[dict[str, object]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(cast(dict[str, object], json.loads(request.content)))
+        return completion('{"compatible":true}')
+
+    client = mock_client(handler)
+    async with create_semantic_model_deconstructor(
+        settings(max_output_tokens=4_096, max_render_tokens=4_096), client=client
+    ) as deconstructor:
+        await deconstructor.preflight()
+
+    assert [request["max_tokens"] for request in requests] == [1_024, 1_024, 1_024]
     await client.aclose()
 
 

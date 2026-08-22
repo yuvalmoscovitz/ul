@@ -568,6 +568,9 @@ class EvaluatorModelCompatibilityError(ValueError):
     pass
 
 
+_PREFLIGHT_MAX_TOKENS = 1_024
+
+
 class _EvaluatorPreflightHTTPError(ValueError):
     def __init__(self, capability: str) -> None:
         self.capability = capability
@@ -872,7 +875,7 @@ class SemanticModelDeconstructor:
                 role="deconstruct",
                 model=self.settings.model,
                 reasoning={"effort": "minimal"},
-                max_tokens=min(self.settings.max_output_tokens, 16),
+                max_tokens=min(self.settings.max_output_tokens, _PREFLIGHT_MAX_TOKENS),
                 temperature=0,
                 seed=0,
                 top_p=None,
@@ -881,7 +884,7 @@ class SemanticModelDeconstructor:
                 role="render",
                 model=self.settings.render_model,
                 reasoning={"effort": "none"},
-                max_tokens=min(self.settings.max_render_tokens, 16),
+                max_tokens=min(self.settings.max_render_tokens, _PREFLIGHT_MAX_TOKENS),
                 temperature=0.7,
                 seed=render_seed,
                 top_p=0.95,
@@ -890,7 +893,7 @@ class SemanticModelDeconstructor:
                 role="equivalence",
                 model=self.settings.equivalence_model,
                 reasoning={"effort": "low"},
-                max_tokens=min(self.settings.max_output_tokens, 1_024, 16),
+                max_tokens=min(self.settings.max_output_tokens, _PREFLIGHT_MAX_TOKENS),
                 temperature=0,
                 seed=0,
                 top_p=None,
