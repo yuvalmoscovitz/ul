@@ -246,6 +246,38 @@ async def test_http_template_selects_typed_rich_case_context_without_interpolati
     ]
 
 
+async def test_repeated_large_context_selection_fails_before_request_materialization() -> None:
+    request_count = 0
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal request_count
+        request_count += 1
+        raise AssertionError("oversized expanded context must not reach the transport")
+
+    raw_config = _isolated_response_config().model_dump(mode="json")
+    raw_config["execute"]["request_json_template"] = {
+        "input": "{{input}}",
+        "first": "{{context:/inputs/large}}",
+        "second": "{{context:/inputs/large}}",
+    }
+    large_value = "x" * 900_000
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        environment = JsonHttpEnvironmentConnection.from_config(
+            JsonHttpIsolatedResponseConfig.model_validate(raw_config),
+            test_environment_confirmed=True,
+            client=client,
+        )
+        evidence = await environment.execute(
+            _case("probe", max_calls=1).model_copy(
+                update={"probe_context": {"inputs": {"large": large_value}}}
+            )
+        )
+
+    assert evidence.lifecycle.failure_code == "request_too_large"
+    assert evidence.lifecycle.delivery == "certain"
+    assert request_count == 0
+
+
 @pytest.mark.parametrize("pointer", ["/metadata/secret", "/observed_evidence/0", "/evaluator/id"])
 async def test_http_template_rejects_private_or_oracle_context(pointer: str) -> None:
     raw_config = _isolated_response_config().model_dump(mode="json")

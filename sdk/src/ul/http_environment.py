@@ -714,12 +714,13 @@ class JsonHttpEnvironmentConnection:
         if isinstance(config, JsonHttpIsolatedResponseConfig):
             response = await self._post_for_json(
                 config.execute.url,
-                _replace_request_placeholders(
+                _replace_bounded_request_placeholders(
                     config.execute.request_json_template,
                     case_id=request.case_id,
                     turn_id=request.turn.id,
                     raw_input=request.turn.input,
                     probe_context=request.context,
+                    maximum_bytes=self._max_request_bytes,
                 ),
                 config.execute.response_json_pointer,
                 consume_budget=False,
@@ -727,12 +728,13 @@ class JsonHttpEnvironmentConnection:
         else:
             payload = await self._post_for_json(
                 config.execute_turn.url,
-                _replace_request_placeholders(
+                _replace_bounded_request_placeholders(
                     config.execute_turn.request_json_template,
                     case_id=request.case_id,
                     turn_id=request.turn.id,
                     raw_input=request.turn.input,
                     probe_context=request.context,
+                    maximum_bytes=self._max_request_bytes,
                 ),
                 "",
                 consume_budget=False,
@@ -2149,6 +2151,40 @@ def _replace_request_placeholders(
             for key, value in template.items()
         }
     return template
+
+
+def _replace_bounded_request_placeholders(
+    template: JsonValue,
+    *,
+    case_id: str,
+    turn_id: str,
+    raw_input: str,
+    probe_context: dict[str, JsonValue],
+    maximum_bytes: int,
+) -> JsonValue:
+    expanded = _replace_request_placeholders(
+        template,
+        case_id=case_id,
+        turn_id=turn_id,
+        raw_input=raw_input,
+        probe_context=probe_context,
+    )
+    encoded_size = 0
+    try:
+        for chunk in json.JSONEncoder(
+            ensure_ascii=True,
+            separators=(",", ":"),
+        ).iterencode(expanded):
+            encoded_size += len(chunk.encode("utf-8"))
+            if encoded_size > maximum_bytes:
+                raise _TargetNotDeliveredError(
+                    "request_too_large", "environment API request exceeds the size limit"
+                )
+    except (RecursionError, ValueError):
+        raise _TargetNotDeliveredError(
+            "request_too_large", "environment API request cannot be safely encoded"
+        ) from None
+    return expanded
 
 
 def _parse_json_pointer(pointer: str) -> tuple[str, ...]:
