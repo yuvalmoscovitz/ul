@@ -85,6 +85,7 @@ def create_dataset_campaign_plan(
     settings: DatasetSemanticSettings,
     saved_augmentations: dict[str, DatasetAugmentationResult] | None = None,
     show_sensitive_values: bool = False,
+    requires_preflight: bool = True,
 ) -> DatasetCampaignPlan:
     saved = saved_augmentations or {}
     selected_ids = {reference.partition("@")[0] for reference in selected_operator_ids}
@@ -136,7 +137,7 @@ def create_dataset_campaign_plan(
         + equivalence_calls
         + trial_evaluator_calls
     )
-    preflight_profiles = plan_evaluator_preflight_profiles(settings)
+    preflight_profiles = plan_evaluator_preflight_profiles(settings) if requires_preflight else ()
     preflight_calls = len(preflight_profiles)
     total_semantic_calls = evaluator_calls + generation_calls + preflight_calls
 

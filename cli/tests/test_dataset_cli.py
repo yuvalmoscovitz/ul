@@ -61,20 +61,96 @@ _ANSI_ESCAPE_PATTERN = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 
 
 def _evaluator_preflight() -> EvaluatorModelPreflight:
+    provider_options = {
+        "require_parameters": True,
+        "data_collection": "deny",
+        "zdr": True,
+    }
+
+    def request_options_sha256(
+        model: str,
+        reasoning_effort: str,
+        temperature: int | float,
+        seed: int,
+        *,
+        top_p: float | None = None,
+    ) -> str:
+        options: dict[str, object] = {
+            "model": model,
+            "max_tokens": 16,
+            "temperature": temperature,
+            "seed": seed,
+            "reasoning": {"effort": reasoning_effort},
+            "provider": provider_options,
+        }
+        if top_p is not None:
+            options["top_p"] = top_p
+        serialized = json.dumps(options, sort_keys=True, separators=(",", ":"))
+        return hashlib.sha256(serialized.encode()).hexdigest()
+
+    render_seed = (
+        int.from_bytes(
+            hashlib.sha256(b"UL evaluator preflight\0Check renderer compatibility.").digest()[:4],
+            "big",
+        )
+        & 0x7FFF_FFFF
+    )
     return EvaluatorModelPreflight.model_validate(
         {
             "provider": "openrouter",
+            "endpoint_sha256": _settings().semantic_endpoint_sha256,
             "profiles": (
                 {
-                    "roles": ("deconstruct", "render", "equivalence"),
-                    "requested_model": "test/model",
-                    "routed_model": "test/model",
+                    "roles": ("deconstruct",),
+                    "requested_model": "test/deconstructor",
+                    "routed_model": "test/deconstructor",
                     "upstream_provider": "test-provider",
                     "required_parameters": (
                         "response_format",
                         "seed",
                         "temperature",
                         "max_tokens",
+                        "reasoning",
+                    ),
+                    "request_options_sha256": request_options_sha256(
+                        "test/deconstructor", "minimal", 0, 0
+                    ),
+                    "parameter_support": "routing_enforced",
+                    "unverified_options": (),
+                },
+                {
+                    "roles": ("render",),
+                    "requested_model": "test/renderer",
+                    "routed_model": "test/renderer",
+                    "upstream_provider": "test-provider",
+                    "required_parameters": (
+                        "response_format",
+                        "seed",
+                        "temperature",
+                        "max_tokens",
+                        "reasoning",
+                        "top_p",
+                    ),
+                    "request_options_sha256": request_options_sha256(
+                        "test/renderer", "none", 0.7, render_seed, top_p=0.95
+                    ),
+                    "parameter_support": "routing_enforced",
+                    "unverified_options": (),
+                },
+                {
+                    "roles": ("equivalence",),
+                    "requested_model": "test/equivalence",
+                    "routed_model": "test/equivalence",
+                    "upstream_provider": "test-provider",
+                    "required_parameters": (
+                        "response_format",
+                        "seed",
+                        "temperature",
+                        "max_tokens",
+                        "reasoning",
+                    ),
+                    "request_options_sha256": request_options_sha256(
+                        "test/equivalence", "low", 0, 0
                     ),
                     "parameter_support": "routing_enforced",
                     "unverified_options": (),
@@ -89,7 +165,13 @@ def _evaluator_preflight() -> EvaluatorModelPreflight:
             "unverified_options": (),
             "data_policy": {
                 "external_processing": True,
-                "implication": "Evaluator requests are processed externally.",
+                "provider_policy_declared": True,
+                "data_collection": "deny",
+                "zero_data_retention_required": True,
+                "implication": (
+                    "The configured route requires data collection to be denied and zero data "
+                    "retention; the evaluator request is still processed externally."
+                ),
             },
         }
     )
@@ -1539,6 +1621,7 @@ def test_local_environment_gate_fails_before_evaluator_preflight(
             "--output",
             str(output),
         ],
+        terminal_width=240,
     )
 
     assert result.exit_code == 2
@@ -3244,8 +3327,8 @@ def test_resume_skips_already_processed_interaction_ids(
         + "\n",
         encoding="utf-8",
     )
-
     evaluated_ids: list[str] = []
+    preflight_calls = 0
 
     class FakeTarget:
         @classmethod
@@ -3307,6 +3390,14 @@ def test_resume_skips_already_processed_interaction_ids(
     )
     monkeypatch.setattr(main, "JsonHttpEnvironmentConnection", FakeTarget)
     monkeypatch.setattr(main, "_evaluate_interaction_records", fake_evaluate)
+
+    async def unexpected_paid_preflight(settings: object) -> EvaluatorModelPreflight:
+        nonlocal preflight_calls
+        del settings
+        preflight_calls += 1
+        raise AssertionError("partial resume must reuse its preflight receipt")
+
+    monkeypatch.setattr(main, "_preflight_evaluator", unexpected_paid_preflight)
     command = [
         "dataset",
         "evaluate",
@@ -3324,6 +3415,8 @@ def test_resume_skips_already_processed_interaction_ids(
 
     assert dry_run.exit_code == 0, dry_run.output
     assert "Resume compatible: 1 complete interaction(s) skipped; 1 remaining" in dry_run.output
+    assert "preflight=0" in dry_run.output
+    assert "Evaluator preflight profile:" not in dry_run.output
     assert "Evidence destination:" in dry_run.output
     assert evidence.name in dry_run.output
     assert f"Augmentations destination: {augmentations}" in " ".join(
@@ -3341,9 +3434,31 @@ def test_resume_skips_already_processed_interaction_ids(
     candidate_position = sensitive_dry_run.output.index("Please transfer 100 to Alice.")
     assert warning_position < candidate_position
 
+    missing_result = runner.invoke(root_app, command)
+
+    assert missing_result.exit_code == 2
+    assert "required receipt evidence.jsonl.preflight.json is missing" in missing_result.output
+    assert preflight_calls == 0
+    assert evaluated_ids == []
+
+    receipt = main._persist_evaluator_preflight(evidence, _evaluator_preflight())
+
+    mismatched_preflight = _evaluator_preflight().model_copy(update={"endpoint_sha256": "b" * 64})
+    receipt.write_text(mismatched_preflight.model_dump_json() + "\n", encoding="utf-8")
+    mismatch_result = runner.invoke(root_app, command)
+
+    assert mismatch_result.exit_code == 2
+    assert "cannot reuse evaluator preflight receipt" in mismatch_result.output
+    assert "restore the matching receipt and semantic settings" in mismatch_result.output
+    assert preflight_calls == 0
+    assert evaluated_ids == []
+
+    receipt.write_text(_evaluator_preflight().model_dump_json() + "\n", encoding="utf-8")
+
     result = runner.invoke(root_app, command)
 
     assert result.exit_code == 0, result.output
+    assert preflight_calls == 0
     assert evaluated_ids == ["interaction-2"]
     lines = [line for line in evidence.read_text(encoding="utf-8").splitlines() if line.strip()]
     assert len(lines) == 2

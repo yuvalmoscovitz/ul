@@ -550,6 +550,7 @@ class EvaluatorModelProfilePreflight(BaseModel):
     routed_model: str = Field(min_length=1, max_length=200)
     upstream_provider: str | None = Field(default=None, max_length=200)
     required_parameters: tuple[str, ...]
+    request_options_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     parameter_support: Literal["routing_enforced", "endpoint_accepted_unverified"]
     unverified_options: tuple[str, ...] = ()
 
@@ -558,6 +559,7 @@ class EvaluatorModelPreflight(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
     provider: str = Field(min_length=1, max_length=100)
+    endpoint_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     profiles: tuple[EvaluatorModelProfilePreflight, ...] = Field(min_length=1)
     verified_capabilities: tuple[
         Literal["routing", "structured_output", "required_parameters"], ...
@@ -797,6 +799,7 @@ class SemanticModelDeconstructor:
                     routed_model=response.model,
                     upstream_provider=response.provider,
                     required_parameters=profile.required_parameters,
+                    request_options_sha256=self._profile_request_options_sha256(profile),
                     parameter_support=(
                         "routing_enforced" if routing_enforced else "endpoint_accepted_unverified"
                     ),
@@ -812,6 +815,7 @@ class SemanticModelDeconstructor:
         )
         self._preflight_result = EvaluatorModelPreflight(
             provider=self.provider.provider_id,
+            endpoint_sha256=self.provider.endpoint_sha256,
             profiles=tuple(profile_results),
             verified_capabilities=(
                 ("routing", "structured_output", "required_parameters")
@@ -825,23 +829,61 @@ class SemanticModelDeconstructor:
 
     def reuse_preflight(self, result: EvaluatorModelPreflight) -> None:
         expected_profiles = self._preflight_profiles()
-        expected_roles_and_models = tuple(
-            (profile.roles, profile.model, profile.required_parameters)
+        expected_profile_bindings = tuple(
+            (
+                profile.roles,
+                profile.model,
+                profile.required_parameters,
+                self._profile_request_options_sha256(profile),
+            )
             for profile in expected_profiles
         )
-        actual_roles_and_models = tuple(
-            (profile.roles, profile.requested_model, profile.required_parameters)
+        actual_profile_bindings = tuple(
+            (
+                profile.roles,
+                profile.requested_model,
+                profile.required_parameters,
+                profile.request_options_sha256,
+            )
             for profile in result.profiles
+        )
+        routing_enforced = self.provider.enforces_parameter_support
+        expected_verified_capabilities = (
+            ("routing", "structured_output", "required_parameters")
+            if routing_enforced
+            else ("routing", "structured_output")
+        )
+        expected_unverified_options = tuple(
+            dict.fromkeys(
+                option
+                for profile in result.profiles
+                for option in (() if routing_enforced else profile.required_parameters)
+            )
         )
         if (
             result.provider != self.provider.provider_id
-            or actual_roles_and_models != expected_roles_and_models
+            or result.endpoint_sha256 != self.provider.endpoint_sha256
+            or actual_profile_bindings != expected_profile_bindings
+            or result.verified_capabilities != expected_verified_capabilities
+            or result.ignored_or_unsupported_options
+            or result.unverified_options != expected_unverified_options
+            or result.data_policy != self.provider.preflight_data_policy()
+            or any(
+                profile.parameter_support
+                != ("routing_enforced" if routing_enforced else "endpoint_accepted_unverified")
+                or profile.unverified_options
+                != (() if routing_enforced else profile.required_parameters)
+                for profile in result.profiles
+            )
         ):
             raise ValueError("evaluator preflight does not match the configured semantic profiles")
         self._preflight_result = result
 
     def _preflight_profiles(self) -> tuple[_EvaluatorPreflightProfile, ...]:
         return _evaluator_preflight_profiles(self.settings, self.provider)
+
+    def _profile_request_options_sha256(self, profile: _EvaluatorPreflightProfile) -> str:
+        return _profile_request_options_sha256(self.provider, profile)
 
     def _compatibility_error(
         self,
@@ -1591,16 +1633,7 @@ def _evaluator_preflight_profiles(
     )
     profiles_by_signature: dict[str, _EvaluatorPreflightProfile] = {}
     for candidate in candidates:
-        signature_body: dict[str, Any] = {
-            "model": candidate.model,
-            "max_tokens": candidate.max_tokens,
-            "temperature": candidate.temperature,
-            "seed": candidate.seed,
-        }
-        provider.add_request_options(signature_body, candidate.reasoning)
-        if candidate.top_p is not None:
-            signature_body["top_p"] = candidate.top_p
-        signature = json.dumps(signature_body, sort_keys=True, separators=(",", ":"))
+        signature = _profile_request_options_sha256(provider, candidate)
         existing = profiles_by_signature.get(signature)
         if existing is None:
             profiles_by_signature[signature] = candidate
@@ -1610,6 +1643,23 @@ def _evaluator_preflight_profiles(
                 roles=(*existing.roles, *candidate.roles),
             )
     return tuple(profiles_by_signature.values())
+
+
+def _profile_request_options_sha256(
+    provider: SemanticCompletionProvider,
+    profile: _EvaluatorPreflightProfile,
+) -> str:
+    request_options: dict[str, Any] = {
+        "model": profile.model,
+        "max_tokens": profile.max_tokens,
+        "temperature": profile.temperature,
+        "seed": profile.seed,
+    }
+    provider.add_request_options(request_options, profile.reasoning)
+    if profile.top_p is not None:
+        request_options["top_p"] = profile.top_p
+    serialized_options = json.dumps(request_options, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(serialized_options.encode()).hexdigest()
 
 
 def _same_origin(left: httpx.URL, right: httpx.URL) -> bool:
