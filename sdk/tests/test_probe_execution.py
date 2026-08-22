@@ -149,7 +149,7 @@ async def test_invoker_only_produces_response_evidence_with_provenance() -> None
     evidence = await executor.execute(_case("hello", "again"))
 
     assert [request.turn.input for request in invoker.requests] == ["hello", "again"]
-    assert evidence.schema_version == "1.3.0"
+    assert evidence.schema_version == "1.4.0"
     assert evidence.evidence_scope == "response_only"
     assert evidence.final_response == {"echo": "again"}
     assert evidence.turns[0].response_source_id == "test-invoker"

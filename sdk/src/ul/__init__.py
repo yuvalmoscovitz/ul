@@ -17,6 +17,7 @@ from ul_core.contracts import (
     ProductionSource,
     SemanticEquivalenceVerifier,
     StateEnvironment,
+    WorkerTraceFlusher,
 )
 from ul_core.coverage import CoverageArchive
 from ul_core.dataset import (
@@ -41,6 +42,7 @@ from ul_core.evaluation import (
     ObservationSourceCapabilities,
     ProbeCapabilities,
     ProbeExecutionEvent,
+    ProbeExecutionIdentity,
     ProbeInvokerCapabilities,
     ProbeObservation,
     ProbeRequest,
@@ -237,6 +239,11 @@ from ul.http_environment import (
     load_json_http_environment_config,
 )
 from ul.otlp_ingest import OtlpIngestResult, OtlpInteractionRecord, parse_otlp_traces
+from ul.otlp_observation import (
+    OtlpExportReceipt,
+    OtlpObservationConfig,
+    OtlpObservationSource,
+)
 from ul.probe_execution import ComposedEnvironmentExecutor
 from ul.redaction import (
     LocalPseudonymStore,
@@ -417,11 +424,15 @@ __all__ = [
     "OpenAICompatibleJudgeConfig",
     "OpenRouterDatasetSettings",
     "OracleFinding",
+    "OtlpExportReceipt",
     "OtlpIngestResult",
     "OtlpInteractionRecord",
+    "OtlpObservationConfig",
+    "OtlpObservationSource",
     "PairwiseEvaluator",
     "ProbeCapabilities",
     "ProbeExecutionEvent",
+    "ProbeExecutionIdentity",
     "ProbeInvoker",
     "ProbeInvokerCapabilities",
     "ProbeObservation",
@@ -489,6 +500,7 @@ __all__ = [
     "TraceStressSignal",
     "UnchangedBetweenCheckpointsInvariant",
     "UserInputRecord",
+    "WorkerTraceFlusher",
     "augmentation_operator_definition_sha256",
     "augmentation_qualification_thresholds",
     "builtin_augmentation_catalog",
