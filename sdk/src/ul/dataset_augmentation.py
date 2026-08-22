@@ -106,12 +106,21 @@ _BUILTIN_OPERATORS = (
     DatasetAugmentationOperator(
         id="input.surface.case_variation",
         instruction=_PROMPTS.get_prompt("augmentation.input.surface.case_variation"),
+        applicability_profile="conditional",
+        applicability_rule=(
+            "Applies only when the input contains an unprotected Unicode letter with a "
+            "single-code-point uppercase or lowercase mapping."
+        ),
         allowed_change="declared_communication_form",
         target_communication_kind="typing_noise",
     ),
     DatasetAugmentationOperator(
         id="input.surface.punctuation_noise",
         instruction=_PROMPTS.get_prompt("augmentation.input.surface.punctuation_noise"),
+        applicability_profile="conditional",
+        applicability_rule=(
+            "Applies only when punctuation can be inserted outside a protected semantic value."
+        ),
         allowed_change="declared_communication_form",
         target_communication_kind="typing_noise",
     ),
@@ -338,6 +347,32 @@ class DatasetAugmentationEngine:
                 transformation_prompt_names: tuple[str, ...] = ()
                 selected_correction_factor: SemanticFactor | None = None
                 planned_provisional_quote: str | None = None
+                if (
+                    operator.id == "input.surface.case_variation"
+                    and _first_cased_letter(record.raw_input, expected_input_frame) is None
+                ):
+                    skips.append(
+                        DatasetAugmentationSkip(
+                            source_interaction_id=record.id,
+                            operator_id=operator.id,
+                            operator_version=operator.version,
+                            reason=operator.applicability_rule,
+                        )
+                    )
+                    continue
+                if (
+                    operator.id == "input.surface.punctuation_noise"
+                    and _punctuation_insertion(record.raw_input, expected_input_frame) is None
+                ):
+                    skips.append(
+                        DatasetAugmentationSkip(
+                            source_interaction_id=record.id,
+                            operator_id=operator.id,
+                            operator_version=operator.version,
+                            reason=operator.applicability_rule,
+                        )
+                    )
+                    continue
                 if operator.allowed_change == "structured_self_correction":
                     selected_correction_factor = _select_self_correction_factor(
                         record, source_frame
@@ -371,9 +406,9 @@ class DatasetAugmentationEngine:
                 if operator.id == "input.surface.typing_noise":
                     rendered_input = _add_typing_noise(record, expected_input_frame, operator)
                 elif operator.id == "input.surface.case_variation":
-                    rendered_input = _add_case_variation(record, operator)
+                    rendered_input = _add_case_variation(record, expected_input_frame, operator)
                 elif operator.id == "input.surface.punctuation_noise":
-                    rendered_input = _add_punctuation_noise(record, operator)
+                    rendered_input = _add_punctuation_noise(record, expected_input_frame, operator)
                 elif operator.id == "input.surface.grammar_error":
                     rendered_input = _add_grammar_error(record, operator)
                 elif operator.id == "input.surface.disfluency_repeat":
@@ -529,10 +564,12 @@ def _source_skip_reason(
         return "Source semantics contain no actionable request units."
     if not source_frame.outcomes:
         return "Source interaction contains no observed outcome to preserve."
-    if _has_unresolved_nodes(source_frame):
-        return "Source semantics contain unresolved elements."
-    if _has_ambiguous_nodes(expected_input_frame):
-        return "Source semantics contain ambiguous elements."
+    unresolved_reason = _unresolved_node_reason(source_frame)
+    if unresolved_reason is not None:
+        return unresolved_reason
+    ambiguous_reason = _ambiguous_node_reason(expected_input_frame)
+    if ambiguous_reason is not None:
+        return ambiguous_reason
     return None
 
 
@@ -911,6 +948,14 @@ def _surface_footprint_reasons(
         augmented_input
     ):
         return ("rendered input only changes case, spacing, or punctuation",)
+    if operator_id == "input.surface.case_variation" and not _is_single_case_change(
+        source_input, augmented_input
+    ):
+        return ("rendered input must contain exactly one single-code-point case change",)
+    if operator_id == "input.surface.punctuation_noise" and not _is_single_punctuation_insertion(
+        source_input, augmented_input
+    ):
+        return ("rendered input must insert exactly one punctuation character",)
     if operator_id == "input.style.terse" and augmented_word_count * 10 > source_word_count * 9:
         return ("rendered input is not visibly shorter than the source",)
     if operator_id == "input.style.verbose" and not (
@@ -989,40 +1034,144 @@ def _deterministic_renderer_metadata(
 
 
 def _add_case_variation(
-    record: InteractionRecord, operator: DatasetAugmentationOperator
+    record: InteractionRecord,
+    frame: SemanticFrame,
+    operator: DatasetAugmentationOperator,
 ) -> RenderedUserInput:
-    match = re.search(r"[A-Za-z]", record.raw_input)
-    if match is None:
-        rendered_text = record.raw_input
-    else:
-        letter = match.group()
-        changed_letter = letter.lower() if letter.isupper() else letter.upper()
-        rendered_text = (
-            f"{record.raw_input[: match.start()]}{changed_letter}{record.raw_input[match.end() :]}"
-        )
+    cased_letter = _first_cased_letter(record.raw_input, frame)
+    if cased_letter is None:
+        raise AssertionError("case variation requires a Unicode cased letter")
+    index, letter = cased_letter
+    changed_letter = letter.lower() if letter.isupper() else letter.upper()
+    rendered_text = f"{record.raw_input[:index]}{changed_letter}{record.raw_input[index + 1 :]}"
     return RenderedUserInput(
         text=rendered_text,
         metadata=_deterministic_renderer_metadata(
-            record, operator, "single_ascii_letter_case_toggle"
+            record, operator, "single_unicode_cased_letter_toggle"
         ),
     )
 
 
+def _first_cased_letter(text: str, frame: SemanticFrame) -> tuple[int, str] | None:
+    protected_spans = _protected_input_spans(text, frame)
+    return next(
+        (
+            (index, character)
+            for index, character in enumerate(text)
+            if character.isalpha()
+            and character.lower() != character.upper()
+            and len(character.lower()) == 1
+            and len(character.upper()) == 1
+            and not _position_is_protected(index, protected_spans)
+        ),
+        None,
+    )
+
+
 def _add_punctuation_noise(
-    record: InteractionRecord, operator: DatasetAugmentationOperator
+    record: InteractionRecord,
+    frame: SemanticFrame,
+    operator: DatasetAugmentationOperator,
 ) -> RenderedUserInput:
-    match = re.search(r"[,.!?;:]", record.raw_input)
-    if match is None:
-        rendered_text = f"{record.raw_input}."
-    else:
-        rendered_text = (
-            f"{record.raw_input[: match.end()]}{match.group()}{record.raw_input[match.end() :]}"
-        )
+    insertion = _punctuation_insertion(record.raw_input, frame)
+    if insertion is None:
+        raise AssertionError("punctuation noise requires an unprotected insertion point")
+    position, punctuation, algorithm = insertion
+    rendered_text = (
+        f"{record.raw_input[:position]}{punctuation}{record.raw_input[position:]}"
+    )
     return RenderedUserInput(
         text=rendered_text,
-        metadata=_deterministic_renderer_metadata(
-            record, operator, "single_punctuation_duplication_or_terminal_period"
+        metadata=_deterministic_renderer_metadata(record, operator, algorithm),
+    )
+
+
+def _punctuation_insertion(
+    text: str, frame: SemanticFrame
+) -> tuple[int, str, str] | None:
+    protected_spans = _protected_input_spans(text, frame)
+    safe_punctuation = next(
+        (
+            match
+            for match in re.finditer(r"[,.!?;:]", text)
+            if not _position_is_protected(match.start(), protected_spans)
+            and (
+                match.end() == len(text)
+                or text[match.end()].isspace()
+                or (match.start() > 0 and text[match.start() - 1].isspace())
+            )
         ),
+        None,
+    )
+    if safe_punctuation is not None:
+        return (
+            safe_punctuation.end(),
+            safe_punctuation.group(),
+            "single_safe_punctuation_duplication",
+        )
+    word = next(
+        (
+            match
+            for match in re.finditer(r"[^\W\d_]{3,}", text, flags=re.UNICODE)
+            if not _insertion_is_protected(match.start() + 1, protected_spans)
+        ),
+        None,
+    )
+    if word is None:
+        return None
+    return word.start() + 1, ",", "single_unprotected_word_punctuation_insertion"
+
+
+def _protected_input_spans(text: str, frame: SemanticFrame) -> tuple[tuple[int, int], ...]:
+    spans: set[tuple[int, int]] = set()
+    for factor in frame.factors:
+        for evidence in factor.evidence:
+            quote = evidence.text_quote
+            if evidence.source != "input" or quote is None:
+                continue
+            start = 0
+            while (position := text.find(quote, start)) >= 0:
+                spans.add((position, position + len(quote)))
+                start = position + 1
+    return tuple(sorted(spans))
+
+
+def _position_is_protected(position: int, spans: tuple[tuple[int, int], ...]) -> bool:
+    return any(start <= position < end for start, end in spans)
+
+
+def _insertion_is_protected(position: int, spans: tuple[tuple[int, int], ...]) -> bool:
+    return any(start < position < end for start, end in spans)
+
+
+def _is_single_case_change(source_input: str, augmented_input: str) -> bool:
+    if len(source_input) != len(augmented_input):
+        return False
+    changed_positions = tuple(
+        index
+        for index, (source_character, augmented_character) in enumerate(
+            zip(source_input, augmented_input, strict=True)
+        )
+        if source_character != augmented_character
+    )
+    if len(changed_positions) != 1:
+        return False
+    position = changed_positions[0]
+    source_character = source_input[position]
+    augmented_character = augmented_input[position]
+    return (
+        source_character.lower() == augmented_character.lower()
+        and source_character.upper() == augmented_character.upper()
+    )
+
+
+def _is_single_punctuation_insertion(source_input: str, augmented_input: str) -> bool:
+    if len(augmented_input) != len(source_input) + 1:
+        return False
+    return any(
+        augmented_input[index] in ",.!?;:"
+        and f"{augmented_input[:index]}{augmented_input[index + 1 :]}" == source_input
+        for index in range(len(augmented_input))
     )
 
 
@@ -1098,44 +1247,70 @@ def _protected_factor_words(frame: SemanticFrame) -> set[str]:
     return protected_words
 
 
-def _has_ambiguous_nodes(frame: SemanticFrame) -> bool:
+def _ambiguous_node_reason(frame: SemanticFrame) -> str | None:
     factors_by_id = {
         factor.id: (factor.kind, factor.role, _json_key(factor.value)) for factor in frame.factors
     }
-    factor_semantics = list(factors_by_id.values())
-    request_semantics = [
+    factor_semantics = tuple((factor.id, factors_by_id[factor.id]) for factor in frame.factors)
+    request_semantics = tuple(
         (
-            request.mode,
-            request.predicate,
-            tuple(sorted(factors_by_id[factor_id] for factor_id in request.factor_ids)),
+            request.id,
+            (
+                request.mode,
+                request.predicate,
+                tuple(sorted(factors_by_id[factor_id] for factor_id in request.factor_ids)),
+            ),
         )
         for request in frame.request_units
-    ]
-    communication_semantics = [
+    )
+    communication_semantics = tuple(
         (
-            act.kind,
-            tuple(sorted(factors_by_id[factor_id] for factor_id in act.factor_ids)),
-            _json_key(act.attributes),
+            act.id,
+            (
+                act.kind,
+                tuple(sorted(factors_by_id[factor_id] for factor_id in act.factor_ids)),
+                _json_key(act.attributes),
+            ),
         )
         for act in frame.communication_acts
-    ]
-    return any(
-        len(semantics) != len(set(semantics))
-        for semantics in (factor_semantics, request_semantics, communication_semantics)
     )
+    for label, elements in (
+        ("factors", factor_semantics),
+        ("request units", request_semantics),
+        ("communication acts", communication_semantics),
+    ):
+        ids_by_semantics: dict[object, str] = {}
+        for element_id, semantics in elements:
+            previous_id = ids_by_semantics.get(semantics)
+            if previous_id is not None:
+                return (
+                    f"Source {label} {previous_id!r} and {element_id!r} have indistinguishable "
+                    "semantics; clarify their evidence or roles."
+                )
+            ids_by_semantics[semantics] = element_id
+    return None
 
 
 def _has_unresolved_nodes(frame: SemanticFrame) -> bool:
-    return any(
-        element.status.casefold().startswith("unresolved")
-        for element in (
-            *frame.request_units,
-            *frame.factors,
-            *frame.relations,
-            *frame.communication_acts,
-            *frame.outcomes,
-        )
+    return _unresolved_node_reason(frame) is not None
+
+
+def _unresolved_node_reason(frame: SemanticFrame) -> str | None:
+    element_groups = (
+        ("request unit", frame.request_units),
+        ("factor", frame.factors),
+        ("relation", frame.relations),
+        ("communication act", frame.communication_acts),
+        ("outcome", frame.outcomes),
     )
+    for label, elements in element_groups:
+        for element in elements:
+            if element.status.casefold().startswith("unresolved"):
+                return (
+                    f"Source {label} {element.id!r} is unresolved; clarify its evidence or "
+                    "improve semantic extraction."
+                )
+    return None
 
 
 def _canonical_semantics(frame: SemanticFrame) -> tuple[object, ...]:

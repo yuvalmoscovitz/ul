@@ -249,8 +249,23 @@ def _scenario_spec(
 _BUILTIN_AUGMENTATION_SPECS = (
     _dataset_spec("input.surface.rephrase", "Rephrase while preserving the requested behavior."),
     _dataset_spec("input.surface.typing_noise", "Add plausible typing noise."),
-    _dataset_spec("input.surface.case_variation", "Add one harmless casing error."),
-    _dataset_spec("input.surface.punctuation_noise", "Add one harmless punctuation error."),
+    _dataset_spec(
+        "input.surface.case_variation",
+        "Add one harmless casing error.",
+        applicability_profile="conditional",
+        applicability_rule=(
+            "Applies only when the input contains an unprotected Unicode letter with a "
+            "single-code-point uppercase or lowercase mapping."
+        ),
+    ),
+    _dataset_spec(
+        "input.surface.punctuation_noise",
+        "Add one harmless punctuation error.",
+        applicability_profile="conditional",
+        applicability_rule=(
+            "Applies only when punctuation can be inserted outside a protected semantic value."
+        ),
+    ),
     _dataset_spec("input.surface.grammar_error", "Add one harmless grammatical error."),
     _dataset_spec("input.surface.fragmented_syntax", "Use plausible fragmented syntax."),
     _dataset_spec("input.surface.disfluency_repeat", "Repeat a word as a natural disfluency."),

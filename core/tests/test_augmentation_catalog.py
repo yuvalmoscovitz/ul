@@ -74,10 +74,16 @@ def test_dataset_augmentation_declares_actual_execution_requirements() -> None:
 def test_dataset_applicability_contracts_are_discoverable_before_execution() -> None:
     catalog = builtin_augmentation_catalog()
     broad = catalog.get("input.surface.grammar_error")
+    case_variation = catalog.get("input.surface.case_variation")
+    punctuation = catalog.get("input.surface.punctuation_noise")
     conditional = catalog.get("input.intent.self_correction")
 
     assert broad.applicability_profile == "broad"
     assert "nonempty user input" in broad.applicability_rule
+    assert case_variation.applicability_profile == "conditional"
+    assert "unprotected Unicode letter" in case_variation.applicability_rule
+    assert punctuation.applicability_profile == "conditional"
+    assert "protected semantic value" in punctuation.applicability_rule
     assert conditional.applicability_profile == "conditional"
     assert "numeric, monetary, date, or duration" in conditional.applicability_rule
 
