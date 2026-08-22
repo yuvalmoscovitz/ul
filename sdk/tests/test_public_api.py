@@ -26,6 +26,7 @@ from ul import (
     ObservedAgentOutput,
     OpenAICompatibleDatasetSettings,
     OpenRouterDatasetSettings,
+    OtlpJsonHttpReceiver,
     OtlpObservationConfig,
     OtlpObservationSource,
     ProbeExecutionIdentity,
@@ -138,6 +139,7 @@ def test_sdk_exposes_dataset_augmentation_api() -> None:
     assert OpenAICompatibleDatasetSettings is not None
     assert OtlpObservationConfig.__name__ == "OtlpObservationConfig"
     assert OtlpObservationSource.__name__ == "OtlpObservationSource"
+    assert OtlpJsonHttpReceiver.__name__ == "OtlpJsonHttpReceiver"
     assert ProbeExecutionIdentity.__name__ == "ProbeExecutionIdentity"
     assert WorkerTraceFlusher.__name__ == "WorkerTraceFlusher"
     assert SemanticModelDeconstructor is not None

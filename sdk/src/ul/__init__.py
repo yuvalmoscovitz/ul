@@ -241,6 +241,7 @@ from ul.http_environment import (
 from ul.otlp_ingest import OtlpIngestResult, OtlpInteractionRecord, parse_otlp_traces
 from ul.otlp_observation import (
     OtlpExportReceipt,
+    OtlpJsonHttpReceiver,
     OtlpObservationConfig,
     OtlpObservationSource,
 )
@@ -427,6 +428,7 @@ __all__ = [
     "OtlpExportReceipt",
     "OtlpIngestResult",
     "OtlpInteractionRecord",
+    "OtlpJsonHttpReceiver",
     "OtlpObservationConfig",
     "OtlpObservationSource",
     "PairwiseEvaluator",

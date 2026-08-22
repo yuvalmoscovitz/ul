@@ -308,6 +308,7 @@ class DeterministicEnvironment:
             cancellation_guarantee=cancellation_guarantee,
         )
         self.raw_inputs: list[str] = []
+        self.cases: list[EvaluationCase] = []
         self.raw_output = (
             raw_output
             if raw_output is not None
@@ -322,6 +323,7 @@ class DeterministicEnvironment:
 
     async def execute(self, case: EvaluationCase) -> ExecutionEvidence:
         assert len(case.turns) == 1
+        self.cases.append(case)
         raw_input = case.turns[0].content
         self.raw_inputs.append(raw_input)
         return self._successful_evidence(
@@ -373,6 +375,20 @@ class DeterministicEnvironment:
                 environment_state_uncertain=False,
             ),
         )
+
+
+async def test_runner_propagates_dataset_variation_and_repetition_to_probe_cases() -> None:
+    runner, _, target = _runner((_source_outcomes()[0],))
+
+    await runner.run(_source(), repetitions=2)
+
+    assert [case.id for case in target.cases] == ["source"] * 4
+    assert [case.probe_context for case in target.cases] == [
+        {"ul.variation.id": "current_baseline", "ul.repetition": 1},
+        {"ul.variation.id": "input.surface.rephrase", "ul.repetition": 1},
+        {"ul.variation.id": "current_baseline", "ul.repetition": 2},
+        {"ul.variation.id": "input.surface.rephrase", "ul.repetition": 2},
+    ]
 
 
 class SecretBearingEnvironment(DeterministicEnvironment):

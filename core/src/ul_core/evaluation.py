@@ -432,6 +432,7 @@ class EvaluationCase(_StrictModel):
     required_state_observer_id: str | None = Field(default=None, min_length=1, max_length=500)
     timeout_after_commit_event: TimeoutAfterCommitEventRequest | None = None
     evaluators: tuple[EvaluatorSpec, ...] = ()
+    probe_context: dict[str, JsonValue] = Field(default_factory=dict)
 
     @model_validator(mode="after")
     def validate_identifiers(self) -> Self:
