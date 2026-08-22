@@ -29,7 +29,13 @@ from ul_core.dataset import (
     SemanticFrame,
     UserInputRecord,
 )
-from ul_core.evaluation import EnvironmentCapabilities, EvaluationCase, ExecutionEvidence
+from ul_core.evaluation import (
+    EnvironmentCapabilities,
+    EvaluationCase,
+    ExecutionEvidence,
+    ProbeExecutionEvent,
+    ProbeObservation,
+)
 from ul_core.models import ULModel
 
 from ul.deconstruction import SemanticCallMetrics
@@ -612,6 +618,82 @@ class RehydratingEnvironmentConnection:
             )
             for turn in evidence.turns
         )
+        protected_observations = tuple(
+            ProbeObservation.model_validate(
+                {
+                    **observation.model_dump(mode="python"),
+                    "id": self._engine.transform(
+                        observation.id,
+                        location="output",
+                    ).value,
+                    "traces": tuple(
+                        self._engine.transform(value, location="output").value
+                        for value in observation.traces
+                    ),
+                    "tool_calls": tuple(
+                        self._engine.transform(value, location="output").value
+                        for value in observation.tool_calls
+                    ),
+                    "handoffs": tuple(
+                        self._engine.transform(value, location="output").value
+                        for value in observation.handoffs
+                    ),
+                    "errors": tuple(
+                        self._engine.transform(value, location="output").value
+                        for value in observation.errors
+                    ),
+                    "usage": (
+                        self._engine.transform(
+                            observation.usage,
+                            location="output",
+                        ).value
+                        if observation.usage is not None
+                        else None
+                    ),
+                    "metadata": self._engine.transform(
+                        observation.metadata,
+                        location="output",
+                    ).value,
+                    "limitation": (
+                        self._engine.transform(
+                            observation.limitation,
+                            location="output",
+                        ).value
+                        if observation.limitation is not None
+                        else None
+                    ),
+                    "next_checkpoint": (
+                        self._engine.transform(
+                            observation.next_checkpoint,
+                            location="output",
+                        ).value
+                        if observation.next_checkpoint is not None
+                        else None
+                    ),
+                }
+            )
+            for observation in evidence.observations
+        )
+        protected_execution_events = tuple(
+            ProbeExecutionEvent.model_validate(
+                {
+                    **event.model_dump(mode="python"),
+                    "id": self._engine.transform(
+                        event.id,
+                        location="output",
+                    ).value,
+                    "kind": self._engine.transform(
+                        event.kind,
+                        location="output",
+                    ).value,
+                    "payload": self._engine.transform(
+                        event.payload,
+                        location="output",
+                    ).value,
+                }
+            )
+            for event in evidence.execution_events
+        )
         return evidence.model_copy(
             update={
                 "initial_state": (
@@ -626,6 +708,8 @@ class RehydratingEnvironmentConnection:
                     else None
                 ),
                 "turns": protected_turns,
+                "observations": protected_observations,
+                "execution_events": protected_execution_events,
                 "final_response": protected_turns[-1].response if protected_turns else None,
                 "final_state": (
                     evidence.final_state.model_copy(

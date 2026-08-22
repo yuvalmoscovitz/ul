@@ -276,6 +276,12 @@ class TraceReplayTrial(_StrictModel):
         normalized = dict(cast(dict[str, object], evidence))
         if isinstance(normalized.get("turns"), list):
             normalized["turns"] = tuple(cast(list[object], normalized["turns"]))
+        if isinstance(normalized.get("observations"), list):
+            normalized["observations"] = tuple(cast(list[object], normalized["observations"]))
+        if isinstance(normalized.get("execution_events"), list):
+            normalized["execution_events"] = tuple(
+                cast(list[object], normalized["execution_events"])
+            )
         lifecycle = normalized.get("lifecycle")
         if isinstance(lifecycle, dict):
             normalized_lifecycle = dict(cast(dict[str, object], lifecycle))
