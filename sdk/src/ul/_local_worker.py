@@ -85,7 +85,16 @@ def _request_payload(message: dict[str, Any]) -> dict[str, Any]:
     context = message.get("context", {})
     if not isinstance(context, dict):
         raise ValueError
+    case_id = message.get("case_id")
+    session_id = message.get("session_id")
+    probe_id = message.get("request_id")
+    if not all(isinstance(value, str) and value for value in (case_id, session_id, probe_id)):
+        raise ValueError
     return {
+        "schema_version": "1.0.0",
+        "case_id": case_id,
+        "session_id": session_id,
+        "probe_id": probe_id,
         "turn": cast(dict[str, Any], turn),
         "context": cast(dict[str, Any], context),
     }
