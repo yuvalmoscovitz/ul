@@ -61,6 +61,8 @@ The fixture identity names the resettable business state used by the run. Change
 that state or setup logic changes. See [Design valid test cases](docs/test-cases.md).
 For objective assertions, model-judged rubrics, pairwise preference, and human review in custom SDK
 workflows, see [Customer-defined evaluators](docs/evaluators.md).
+To probe a Python callable or an explicit local command without hosting an HTTP server, see
+[Local process targets](docs/local-targets.md).
 
 To connect an existing response-only JSON endpoint that starts every request from isolated state:
 

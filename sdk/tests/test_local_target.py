@@ -1,0 +1,609 @@
+# ruff: noqa: E501
+
+from __future__ import annotations
+
+import asyncio
+import json
+import os
+import signal
+import stat
+import sys
+import time
+from pathlib import Path
+from typing import cast
+
+import pytest
+from pydantic import JsonValue
+from ul.environment import evaluation_case_from_inputs
+from ul.local_target import (
+    CommandTargetConfig,
+    LocalTargetConnection,
+    LocalTargetLimits,
+    PythonCallableTargetConfig,
+    _LocalTargetInvoker,  # pyright: ignore[reportPrivateUsage]
+    create_local_target_dry_run_plan,
+    load_local_target_config,
+)
+from ul_core.evaluation import ProbeRequest, ProbeTurn
+
+
+def _case(case_id: str, *inputs: str, timeout_seconds: float = 2):
+    return evaluation_case_from_inputs(
+        case_id=case_id,
+        raw_inputs=inputs,
+        max_environment_api_calls=20,
+        timeout_seconds=timeout_seconds,
+    )
+
+
+def _runtime_payload(value: JsonValue) -> dict[str, JsonValue]:
+    assert isinstance(value, dict)
+    return cast(dict[str, JsonValue], value)
+
+
+def _string_payload(payload: dict[str, JsonValue], key: str) -> str:
+    value = payload[key]
+    assert isinstance(value, str)
+    return value
+
+
+def _integer_payload(payload: dict[str, JsonValue], key: str) -> int:
+    value = payload[key]
+    assert isinstance(value, int)
+    return value
+
+
+def _python_config(
+    working_directory: Path,
+    target: str,
+    *,
+    input_mode: str = "value",
+    limits: LocalTargetLimits | None = None,
+    environment_allowlist: tuple[str, ...] = (),
+) -> PythonCallableTargetConfig:
+    return PythonCallableTargetConfig.model_validate(
+        {
+            "target_id": "local-python",
+            "working_directory": working_directory,
+            "interpreter": Path(sys.executable),
+            "target": target,
+            "input_mode": input_mode,
+            "environment_allowlist": environment_allowlist,
+            "limits": (limits or LocalTargetLimits()).model_dump(),
+        }
+    )
+
+
+def _write_python_target(tmp_path: Path) -> None:
+    (tmp_path / "customer_agent.py").write_text(
+        """
+import asyncio
+import os
+import sys
+
+invocations = 0
+
+def sync_agent(value):
+    global invocations
+    invocations += 1
+    return {"response": {"value": value, "invocations": invocations}, "execution_events": [
+        {"id": f"customer-{invocations}", "kind": "customer.event", "payload": {"ok": True}}
+    ]}
+
+async def async_agent(value):
+    await asyncio.sleep(0)
+    return {"async": value}
+
+def request_agent(request):
+    return request
+
+def environment_agent(value):
+    return {"allowed": os.environ.get("YUV20_ALLOWED"), "secret": os.environ.get("YUV20_SECRET")}
+
+async def slow_agent(value):
+    await asyncio.sleep(10)
+    return value
+
+async def delayed_agent(value):
+    await asyncio.sleep(0.08)
+    return value
+
+def noisy_agent(value):
+    sys.stderr.write("x" * 10000)
+    sys.stderr.flush()
+    return value
+
+def pid_agent(value):
+    with open(value, "w", encoding="utf-8") as stream:
+        stream.write(str(os.getpid()))
+    return slow_agent(value)
+""".lstrip(),
+        encoding="utf-8",
+    )
+
+
+@pytest.mark.asyncio
+async def test_python_worker_runs_sync_async_and_reuses_process(tmp_path: Path) -> None:
+    _write_python_target(tmp_path)
+    sync_config = _python_config(tmp_path, "customer_agent:sync_agent")
+
+    async with LocalTargetConnection(
+        sync_config, customer_code_execution_confirmed=True
+    ) as connection:
+        first = await connection.execute(_case("case-1", "one"))
+        second = await connection.execute(_case("case-2", "two"))
+
+    assert first.final_response == {"value": "one", "invocations": 1}
+    assert second.final_response == {"value": "two", "invocations": 2}
+    first_runtime = _runtime_payload(first.execution_events[0].payload)
+    second_runtime = _runtime_payload(second.execution_events[0].payload)
+    assert _integer_payload(first_runtime, "worker_attempt") == 1
+    assert _integer_payload(second_runtime, "worker_attempt") == 1
+    assert _integer_payload(first_runtime, "execution_attempt") == 1
+    assert _integer_payload(second_runtime, "execution_attempt") == 2
+    assert len(_string_payload(first_runtime, "target_sha256")) == 64
+    assert len(_string_payload(first_runtime, "config_sha256")) == 64
+    assert len(_string_payload(first_runtime, "executable_sha256")) == 64
+    assert _string_payload(first_runtime, "runtime_name")
+    assert _string_payload(first_runtime, "runtime_version")
+    assert first.execution_events[1].kind == "customer.event"
+
+    async_config = _python_config(tmp_path, "customer_agent:async_agent")
+    async with LocalTargetConnection(
+        async_config, customer_code_execution_confirmed=True
+    ) as connection:
+        evidence = await connection.execute(_case("case-async", "hello"))
+
+    assert evidence.final_response == {"async": "hello"}
+
+
+@pytest.mark.asyncio
+async def test_ten_case_original_variation_campaign_uses_one_persistent_worker(
+    tmp_path: Path,
+) -> None:
+    _write_python_target(tmp_path)
+    config = _python_config(tmp_path, "customer_agent:sync_agent")
+    connection = LocalTargetConnection(config, customer_code_execution_confirmed=True)
+    inputs = tuple(f"{arm}-{index}" for index in range(1, 6) for arm in ("original", "variation"))
+
+    try:
+        evidence = tuple(
+            [
+                await connection.execute(_case(f"campaign-{index}", value))
+                for index, value in enumerate(inputs, start=1)
+            ]
+        )
+    finally:
+        await connection.aclose()
+
+    assert len(evidence) == 10
+    assert all(item.lifecycle.terminal_status == "succeeded" for item in evidence)
+    assert all(item.lifecycle.delivery == "certain" for item in evidence)
+    assert [item.final_response for item in evidence] == [
+        {"value": value, "invocations": index} for index, value in enumerate(inputs, start=1)
+    ]
+    runtime_payloads = [_runtime_payload(item.execution_events[0].payload) for item in evidence]
+    assert {_string_payload(payload, "target_id") for payload in runtime_payloads} == {
+        "local-python"
+    }
+    assert {_string_payload(payload, "target_kind") for payload in runtime_payloads} == {
+        "python_callable"
+    }
+    assert {_integer_payload(payload, "worker_attempt") for payload in runtime_payloads} == {1}
+    assert [_integer_payload(payload, "execution_attempt") for payload in runtime_payloads] == list(
+        range(1, 11)
+    )
+    assert {_string_payload(payload, "config_sha256") for payload in runtime_payloads} == {
+        connection.config_sha256
+    }
+    assert len({_string_payload(payload, "target_sha256") for payload in runtime_payloads}) == 1
+    assert len({_string_payload(payload, "executable_sha256") for payload in runtime_payloads}) == 1
+    assert (
+        len(
+            {
+                (
+                    _string_payload(payload, "runtime_name"),
+                    _string_payload(payload, "runtime_version"),
+                )
+                for payload in runtime_payloads
+            }
+        )
+        == 1
+    )
+
+
+@pytest.mark.asyncio
+async def test_probe_request_context_crosses_process_boundary_unchanged(tmp_path: Path) -> None:
+    _write_python_target(tmp_path)
+    config = _python_config(tmp_path, "customer_agent:request_agent", input_mode="request")
+    invoker = _LocalTargetInvoker(config)
+    context: dict[str, JsonValue] = {
+        "schema_version": "1.0.0",
+        "source_interaction_id": "interaction-1",
+        "inputs": {"message": "hello"},
+        "context": [{"id": "prior-1", "role": "user", "content": "prior"}],
+        "ul.campaign.id": "campaign-1",
+        "traceparent": "00-0123456789abcdef0123456789abcdef-0123456789abcdef-01",
+    }
+
+    try:
+        result = await invoker.invoke(
+            ProbeRequest(
+                case_id="case-context",
+                session_id="session-context",
+                correlation_id="correlation-context",
+                turn=ProbeTurn(id="turn-context", input="hello", metadata={"source": "test"}),
+                context=context,
+            )
+        )
+    finally:
+        await invoker.aclose()
+
+    assert result.response == {
+        "turn": {
+            "schema_version": "1.0.0",
+            "id": "turn-context",
+            "input": "hello",
+            "metadata": {"source": "test"},
+        },
+        "context": context,
+    }
+
+
+@pytest.mark.asyncio
+async def test_request_mode_preserves_turn_and_generic_context_envelope(tmp_path: Path) -> None:
+    _write_python_target(tmp_path)
+    config = _python_config(
+        tmp_path,
+        "customer_agent:request_agent",
+        input_mode="request",
+    )
+
+    async with LocalTargetConnection(config, customer_code_execution_confirmed=True) as connection:
+        evidence = await connection.execute(_case("case-context", "hello"))
+
+    assert evidence.final_response == {
+        "turn": {
+            "schema_version": "1.0.0",
+            "id": "case-context:turn-1",
+            "input": "hello",
+            "metadata": {},
+        },
+        "context": {},
+    }
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX executable-script test")
+@pytest.mark.asyncio
+async def test_explicit_non_python_command_uses_same_persistent_protocol(tmp_path: Path) -> None:
+    command = tmp_path / "command-worker"
+    command.write_text(
+        """#!/bin/sh
+read -r line
+printf '%s\n' '{"protocol_version":"1.0.0","type":"ready","request_id":"startup","runtime":{"name":"sh","version":"1"}}'
+while read -r line; do
+  request_id=$(printf '%s' "$line" | /usr/bin/sed -n 's/.*"request_id":"\\([^"]*\\)".*/\\1/p')
+  case "$line" in
+    *'"type":"session_start"'*)
+      session_id=$(printf '%s' "$line" | /usr/bin/sed -n 's/.*"session_id":"\\([^"]*\\)".*/\\1/p')
+      printf '{"protocol_version":"1.0.0","type":"session_ready","request_id":"%s","session_id":"%s"}\n' "$request_id" "$session_id"
+      ;;
+    *'"type":"invoke"'*)
+      printf '{"protocol_version":"1.0.0","type":"result","request_id":"%s","response":{"transport":"command"},"execution_events":[]}\n' "$request_id"
+      ;;
+    *'"type":"shutdown"'*)
+      printf '%s\n' '{"protocol_version":"1.0.0","type":"shutdown_complete","request_id":"shutdown"}'
+      exit 0
+      ;;
+  esac
+done
+""",
+        encoding="utf-8",
+    )
+    command.chmod(command.stat().st_mode | stat.S_IXUSR)
+    config = CommandTargetConfig(
+        target_id="local-command",
+        working_directory=tmp_path,
+        argv=(str(command),),
+    )
+
+    async with LocalTargetConnection(config, customer_code_execution_confirmed=True) as connection:
+        evidence = await connection.execute(_case("case-command", "hello", "again"))
+
+    assert evidence.lifecycle.terminal_status == "succeeded"
+    assert evidence.final_response == {"transport": "command"}
+    assert _runtime_payload(evidence.execution_events[0].payload)["target_kind"] == "command"
+
+
+def test_dry_run_validates_and_never_imports_target(tmp_path: Path) -> None:
+    marker = tmp_path / "imported"
+    (tmp_path / "dangerous.py").write_text(
+        f"from pathlib import Path\nPath({str(marker)!r}).write_text('ran')\ndef run(value): return value\n",
+        encoding="utf-8",
+    )
+    config = _python_config(tmp_path, "dangerous:run")
+
+    plan = create_local_target_dry_run_plan(config)
+
+    assert plan.target_id == "local-python"
+    assert plan.target_kind == "python_callable"
+    assert plan.worker_command[0] == sys.executable
+    assert plan.maximum_executions == 100
+    assert plan.maximum_active_wall_seconds == 302
+    assert not marker.exists()
+    with pytest.raises(ValueError, match="trust confirmation"):
+        LocalTargetConnection(config, customer_code_execution_confirmed=False)
+
+
+def test_config_loader_rejects_duplicates_and_shell_like_executable(tmp_path: Path) -> None:
+    config_path = tmp_path / "target.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "kind": "command",
+                "target_id": "command",
+                "working_directory": str(tmp_path),
+                "argv": ["echo hello"],
+            }
+        ),
+        encoding="utf-8",
+    )
+    config = load_local_target_config(config_path)
+    with pytest.raises(ValueError, match="absolute file"):
+        create_local_target_dry_run_plan(config)
+
+    config_path.write_text('{"kind":"command","kind":"command"}', encoding="utf-8")
+    with pytest.raises(ValueError, match="invalid"):
+        load_local_target_config(config_path)
+
+
+@pytest.mark.asyncio
+async def test_allowlisted_environment_is_the_only_inherited_environment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _write_python_target(tmp_path)
+    monkeypatch.setenv("YUV20_ALLOWED", "visible")
+    monkeypatch.setenv("YUV20_SECRET", "hidden")
+    config = _python_config(
+        tmp_path,
+        "customer_agent:environment_agent",
+        environment_allowlist=("YUV20_ALLOWED",),
+    )
+
+    async with LocalTargetConnection(config, customer_code_execution_confirmed=True) as connection:
+        evidence = await connection.execute(_case("case-env", "hello"))
+
+    assert evidence.final_response == {"allowed": "visible", "secret": None}
+
+
+@pytest.mark.parametrize(
+    ("target", "limits", "expected_code"),
+    [
+        (
+            "customer_agent:slow_agent",
+            LocalTargetLimits(turn_timeout_seconds=0.05, shutdown_timeout_seconds=0.1),
+            "response_timeout",
+        ),
+        (
+            "customer_agent:noisy_agent",
+            LocalTargetLimits(max_stderr_bytes=100, shutdown_timeout_seconds=0.1),
+            "response_too_large",
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_timeout_and_stderr_overflow_become_safe_failure_evidence(
+    tmp_path: Path,
+    target: str,
+    limits: LocalTargetLimits,
+    expected_code: str,
+) -> None:
+    _write_python_target(tmp_path)
+    config = _python_config(tmp_path, target, limits=limits)
+
+    async with LocalTargetConnection(config, customer_code_execution_confirmed=True) as connection:
+        evidence = await connection.execute(_case("case-failure", "hello"))
+
+    assert evidence.lifecycle.terminal_status == "failed"
+    assert evidence.lifecycle.failure_code == expected_code
+    assert "x" * 20 not in (evidence.lifecycle.failure_reason or "")
+
+
+@pytest.mark.asyncio
+async def test_call_budget_fails_without_starting_another_worker(tmp_path: Path) -> None:
+    _write_python_target(tmp_path)
+    config = _python_config(
+        tmp_path,
+        "customer_agent:sync_agent",
+        limits=LocalTargetLimits(max_executions=1),
+    )
+
+    async with LocalTargetConnection(config, customer_code_execution_confirmed=True) as connection:
+        first = await connection.execute(_case("case-first", "one"))
+        second = await connection.execute(_case("case-second", "two"))
+
+    assert first.lifecycle.terminal_status == "succeeded"
+    assert second.lifecycle.failure_code == "call_budget"
+
+
+@pytest.mark.asyncio
+async def test_failed_invocation_still_consumes_call_budget(tmp_path: Path) -> None:
+    _write_python_target(tmp_path)
+    config = _python_config(
+        tmp_path,
+        "customer_agent:slow_agent",
+        limits=LocalTargetLimits(
+            max_executions=1,
+            turn_timeout_seconds=0.05,
+            shutdown_timeout_seconds=0.1,
+        ),
+    )
+
+    async with LocalTargetConnection(config, customer_code_execution_confirmed=True) as connection:
+        first = await connection.execute(_case("case-failed-first", "one"))
+        second = await connection.execute(_case("case-budget-second", "two"))
+
+    assert first.lifecycle.failure_code == "response_timeout"
+    assert second.lifecycle.failure_code == "call_budget"
+
+
+@pytest.mark.asyncio
+async def test_total_active_execution_bound_spans_persistent_turns(tmp_path: Path) -> None:
+    _write_python_target(tmp_path)
+    config = _python_config(
+        tmp_path,
+        "customer_agent:delayed_agent",
+        limits=LocalTargetLimits(
+            turn_timeout_seconds=1,
+            total_execution_timeout_seconds=0.3,
+            shutdown_timeout_seconds=0.1,
+        ),
+    )
+
+    async with LocalTargetConnection(config, customer_code_execution_confirmed=True) as connection:
+        first = await connection.execute(_case("case-total-first", "one"))
+        second = await connection.execute(_case("case-total-second", "two", "three", "four"))
+
+    assert first.lifecycle.terminal_status == "succeeded"
+    assert first.final_response == "one"
+    assert second.lifecycle.terminal_status == "failed"
+    assert second.lifecycle.failure_code == "response_timeout"
+
+
+def _write_failure_worker(tmp_path: Path, behavior: str) -> Path:
+    command = tmp_path / f"worker-{behavior}"
+    invoke_behavior = {
+        "crash": "exit 9",
+        "malformed": "printf '%s\\n' 'not-json'",
+        "oversized": "/usr/bin/printf '%010000d\\n' 0",
+        "shutdown_hang": (
+            'printf \'{"protocol_version":"1.0.0","type":"result",'
+            '"request_id":"%s","response":"ok","execution_events":[]}\\n\' '
+            '"$request_id"'
+        ),
+    }[behavior]
+    shutdown_behavior = (
+        "trap '' TERM; /bin/sleep 10"
+        if behavior == "shutdown_hang"
+        else 'printf \'%s\\n\' \'{"protocol_version":"1.0.0","type":"shutdown_complete","request_id":"shutdown"}\'; exit 0'
+    )
+    command.write_text(
+        f"""#!/bin/sh
+read -r line
+printf '%s\n' '{{"protocol_version":"1.0.0","type":"ready","request_id":"startup","runtime":{{"name":"sh","version":"1"}}}}'
+while read -r line; do
+  request_id=$(printf '%s' "$line" | /usr/bin/sed -n 's/.*"request_id":"\\([^"]*\\)".*/\\1/p')
+  case "$line" in
+    *'"type":"session_start"'*)
+      session_id=$(printf '%s' "$line" | /usr/bin/sed -n 's/.*"session_id":"\\([^"]*\\)".*/\\1/p')
+      printf '{{"protocol_version":"1.0.0","type":"session_ready","request_id":"%s","session_id":"%s"}}\n' "$request_id" "$session_id"
+      ;;
+    *'"type":"invoke"'*) {invoke_behavior} ;;
+    *'"type":"shutdown"'*) {shutdown_behavior} ;;
+  esac
+done
+""",
+        encoding="utf-8",
+    )
+    command.chmod(command.stat().st_mode | stat.S_IXUSR)
+    return command
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX executable-script test")
+@pytest.mark.parametrize(
+    ("behavior", "expected_code"),
+    [
+        ("crash", "transport_failed"),
+        ("malformed", "invalid_json"),
+        ("oversized", "response_too_large"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_command_failures_become_deterministic_safe_evidence(
+    tmp_path: Path, behavior: str, expected_code: str
+) -> None:
+    command = _write_failure_worker(tmp_path, behavior)
+    config = CommandTargetConfig(
+        target_id="failing-command",
+        working_directory=tmp_path,
+        argv=(str(command),),
+        limits=LocalTargetLimits(max_output_bytes=500, shutdown_timeout_seconds=0.1),
+    )
+
+    async with LocalTargetConnection(config, customer_code_execution_confirmed=True) as connection:
+        evidence = await connection.execute(_case(f"case-{behavior}", "hello"))
+
+    assert evidence.lifecycle.terminal_status == "failed"
+    assert evidence.lifecycle.failure_code == expected_code
+    assert evidence.lifecycle.failure_reason == "probe invocation failed"
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX executable-script test")
+@pytest.mark.asyncio
+async def test_startup_and_shutdown_bounds_are_enforced(tmp_path: Path) -> None:
+    slow_start = tmp_path / "slow-start"
+    slow_start.write_text(
+        "#!/bin/sh\n/bin/sleep 10\n",
+        encoding="utf-8",
+    )
+    slow_start.chmod(slow_start.stat().st_mode | stat.S_IXUSR)
+    startup_config = CommandTargetConfig(
+        target_id="slow-start",
+        working_directory=tmp_path,
+        argv=(str(slow_start),),
+        limits=LocalTargetLimits(startup_timeout_seconds=0.05, shutdown_timeout_seconds=0.1),
+    )
+    async with LocalTargetConnection(
+        startup_config, customer_code_execution_confirmed=True
+    ) as connection:
+        startup_evidence = await connection.execute(_case("case-startup", "hello"))
+    assert startup_evidence.lifecycle.failure_code == "response_timeout"
+
+    shutdown_worker = _write_failure_worker(tmp_path, "shutdown_hang")
+    shutdown_config = CommandTargetConfig(
+        target_id="shutdown-hang",
+        working_directory=tmp_path,
+        argv=(str(shutdown_worker),),
+        limits=LocalTargetLimits(shutdown_timeout_seconds=0.1),
+    )
+    connection = LocalTargetConnection(shutdown_config, customer_code_execution_confirmed=True)
+    evidence = await connection.execute(_case("case-shutdown", "hello"))
+    started_at = time.monotonic()
+    await connection.aclose()
+
+    assert evidence.lifecycle.terminal_status == "succeeded"
+    assert time.monotonic() - started_at < 0.5
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX process liveness assertion")
+@pytest.mark.asyncio
+async def test_cancellation_terminates_the_customer_process(tmp_path: Path) -> None:
+    _write_python_target(tmp_path)
+    pid_file = tmp_path / "worker.pid"
+    config = _python_config(
+        tmp_path,
+        "customer_agent:pid_agent",
+        limits=LocalTargetLimits(turn_timeout_seconds=20, shutdown_timeout_seconds=0.2),
+    )
+    connection = LocalTargetConnection(config, customer_code_execution_confirmed=True)
+    task = asyncio.create_task(connection.execute(_case("case-cancel", str(pid_file))))
+    async with asyncio.timeout(2):
+        while not pid_file.exists():
+            await asyncio.sleep(0.01)
+    pid = int(pid_file.read_text(encoding="utf-8"))
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    await connection.aclose()
+
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            break
+        await asyncio.sleep(0.01)
+    else:
+        os.kill(pid, signal.SIGKILL)
+        pytest.fail("cancelled local worker remained alive")
