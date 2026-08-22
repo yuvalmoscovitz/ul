@@ -204,6 +204,71 @@ async def test_isolated_response_executes_one_request_and_labels_response_only_e
     assert evidence.lifecycle.cleanup_reset is None
 
 
+async def test_http_template_selects_typed_rich_case_context_without_interpolation() -> None:
+    requests: list[dict[str, object]] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(json.loads(request.content))
+        return _raw_response(json.dumps({"response": "cancelled"}).encode("utf-8"))
+
+    raw_config = _isolated_response_config().model_dump(mode="json")
+    raw_config["execute"]["request_json_template"] = {
+        "input": "{{input}}",
+        "customer": "{{context:/inputs/customer}}",
+        "visible_context": "{{context:/context}}",
+        "fixture_id": "{{context:/fixture/id}}",
+    }
+    environment = JsonHttpEnvironmentConnection.from_config(
+        JsonHttpIsolatedResponseConfig.model_validate(raw_config),
+        test_environment_confirmed=True,
+        client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+    )
+    case = _case("Please cancel it.", max_calls=1).model_copy(
+        update={
+            "probe_context": {
+                "inputs": {"customer": {"id": "cus-7", "tier": "gold"}},
+                "context": [{"id": "user-1", "role": "user", "content": "Cancel my order."}],
+                "fixture": {"id": "orders", "version": "9"},
+            }
+        }
+    )
+
+    await environment.execute(case)
+    await environment.aclose()
+
+    assert requests == [
+        {
+            "input": "Please cancel it.",
+            "customer": {"id": "cus-7", "tier": "gold"},
+            "visible_context": [{"id": "user-1", "role": "user", "content": "Cancel my order."}],
+            "fixture_id": "orders",
+        }
+    ]
+
+
+@pytest.mark.parametrize("pointer", ["/metadata/secret", "/observed_evidence/0", "/evaluator/id"])
+async def test_http_template_rejects_private_or_oracle_context(pointer: str) -> None:
+    raw_config = _isolated_response_config().model_dump(mode="json")
+    raw_config["execute"]["request_json_template"] = {
+        "input": "{{input}}",
+        "forbidden": f"{{{{context:{pointer}}}}}",
+    }
+
+    with pytest.raises(ValidationError, match="cannot select metadata, observed evidence"):
+        JsonHttpIsolatedResponseConfig.model_validate(raw_config)
+
+
+async def test_lifecycle_templates_cannot_interpolate_case_context() -> None:
+    raw_config = _config().model_dump(mode="json")
+    raw_config["reset"]["request_json_template"] = {
+        "case_id": "{{case_id}}",
+        "fixture": "{{context:/fixture/id}}",
+    }
+
+    with pytest.raises(ValidationError, match="lifecycle request_json_template"):
+        JsonHttpEnvironmentConfig.model_validate(raw_config)
+
+
 async def test_isolated_response_failure_does_not_block_the_next_independent_request() -> None:
     request_count = 0
 

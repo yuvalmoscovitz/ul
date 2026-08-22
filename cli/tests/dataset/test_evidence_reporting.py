@@ -9,7 +9,11 @@ from typing import Any, cast
 import pytest
 from typer.testing import CliRunner
 from ul import (
+    AugmentationTarget,
+    CaseFixtureReference,
     DatasetEvaluationResult,
+    RichInteractionCase,
+    project_rich_interaction_case,
 )
 from ul.dataset_invariants import (
     DatasetInvariantEvaluation,
@@ -28,6 +32,66 @@ from ._factories import (
 
 runner = CliRunner()
 _ANSI_ESCAPE_PATTERN = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+
+
+def test_rich_customer_evidence_records_source_target_original_and_lineage() -> None:
+    source = project_rich_interaction_case(
+        RichInteractionCase(
+            id="cancel-order",
+            inputs={"message": "Cancel order ord-9."},
+            augmentation_targets=(
+                AugmentationTarget(
+                    id="message", kind="input_field", json_pointer="/inputs/message"
+                ),
+            ),
+            fixture=CaseFixtureReference(id="orders", version="9"),
+            observed_output={"status": "cancelled"},
+        )
+    )[0]
+    candidate = SimpleNamespace(
+        operator_id="input.surface.rephrase",
+        operator_version="1.0.0",
+        augmented_input="Please cancel order ord-9.",
+        passed=True,
+        failure_reasons=(),
+    )
+    case = SimpleNamespace(
+        candidate=candidate,
+        verdict="no_divergence",
+        trial_set=_trial_set(requested_repetitions=1),
+        findings=(),
+        inconclusive_reasons=(),
+    )
+    result = cast(
+        DatasetEvaluationResult,
+        SimpleNamespace(
+            source=source,
+            baseline=SimpleNamespace(
+                trial_set=_trial_set(requested_repetitions=1),
+                inconclusive_reasons=(),
+            ),
+            cases=(case,),
+            model_dump=lambda **kwargs: {"technical": "evidence"},
+        ),
+    )
+
+    evidence = customer_module.build_customer_evidence_record(
+        result,
+        repetitions=1,
+        max_environment_api_calls=2,
+        planned_target_calls=2,
+    )
+
+    assert evidence["schema_version"] == "1.9.0"
+    assert evidence["interaction_id"] == "cancel-order::message"
+    assert evidence["source_record_id"] == "cancel-order"
+    assert evidence["augmentation_target"] == {
+        "id": "message",
+        "kind": "input_field",
+        "json_pointer": "/inputs/message",
+        "turn_id": None,
+    }
+    assert evidence["cases"][0]["original_value"] == "Cancel order ord-9."
 
 
 def test_unified_report_surfaces_response_only_scope_and_limitations(tmp_path: Path) -> None:

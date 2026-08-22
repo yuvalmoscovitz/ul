@@ -283,6 +283,11 @@ class _Baseline(_StrictModel):
 class _Case(_StrictModel):
     operator_id: str
     operator_version: str
+    source_record_id: str | None = Field(default=None, exclude_if=lambda value: value is None)
+    augmentation_target: JsonValue | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
+    original_value: str | None = Field(default=None, exclude_if=lambda value: value is None)
     augmented_input: str
     status: str
     variation_accepted: bool
@@ -293,9 +298,13 @@ class _Case(_StrictModel):
 
 
 class _EvidenceRecord(_StrictModel):
-    schema_version: Literal["1.3.0", "1.4.0", "1.5.0", "1.6.0", "1.7.0", "1.8.0"]
+    schema_version: Literal["1.3.0", "1.4.0", "1.5.0", "1.6.0", "1.7.0", "1.8.0", "1.9.0"]
     evaluation_mode: Literal["variance"] | None = None
     interaction_id: str
+    source_record_id: str | None = Field(default=None, exclude_if=lambda value: value is None)
+    augmentation_target: JsonValue | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
     original_input: str
     execution_plan: _ExecutionPlan
     limitations: str

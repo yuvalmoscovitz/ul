@@ -56,6 +56,15 @@ _ENVIRONMENT_VARIABLE_PATTERN = re.compile(r"UL_ENVIRONMENT_[A-Z][A-Z0-9_]*")
 _INPUT_PLACEHOLDER = "{{input}}"
 _CASE_ID_PLACEHOLDER = "{{case_id}}"
 _TURN_ID_PLACEHOLDER = "{{turn_id}}"
+_CONTEXT_POINTER_PLACEHOLDER_PATTERN = re.compile(r"\{\{context:(/[^{}]*)\}\}")
+_CONTEXT_POINTER_PLACEHOLDER = "{{context:/...}}"
+_ALLOWED_CONTEXT_POINTER_ROOTS = {
+    "augmentation_target",
+    "context",
+    "fixture",
+    "inputs",
+    "source_interaction_id",
+}
 _INITIAL_STATE_TURN_ID = "__ul_initial_state__"
 ENVIRONMENT_ID_PLACEHOLDER = "replace-with-stable-environment-id"
 _MAXIMUM_CONFIG_BYTES = 1_000_000
@@ -710,6 +719,7 @@ class JsonHttpEnvironmentConnection:
                     case_id=request.case_id,
                     turn_id=request.turn.id,
                     raw_input=request.turn.input,
+                    probe_context=request.context,
                 ),
                 config.execute.response_json_pointer,
                 consume_budget=False,
@@ -722,6 +732,7 @@ class JsonHttpEnvironmentConnection:
                     case_id=request.case_id,
                     turn_id=request.turn.id,
                     raw_input=request.turn.input,
+                    probe_context=request.context,
                 ),
                 "",
                 consume_budget=False,
@@ -1925,12 +1936,26 @@ def _validated_template(template: object, *, name: str) -> tuple[JsonValue, dict
         if depth > _MAXIMUM_JSON_DEPTH:
             raise ValueError(f"{name} exceeds the nesting limit")
         if value is None or isinstance(value, bool | int | str):
+            context_pointer_match = (
+                _CONTEXT_POINTER_PLACEHOLDER_PATTERN.fullmatch(value)
+                if isinstance(value, str)
+                else None
+            )
             if (
                 isinstance(value, str)
                 and ("{{" in value or "}}" in value)
                 and value not in {_INPUT_PLACEHOLDER, _CASE_ID_PLACEHOLDER, _TURN_ID_PLACEHOLDER}
+                and context_pointer_match is None
             ):
                 raise ValueError(f"{name} contains an unknown or embedded placeholder")
+            if context_pointer_match is not None:
+                pointer = context_pointer_match.group(1)
+                tokens = _parse_json_pointer(pointer)
+                if not tokens or tokens[0] not in _ALLOWED_CONTEXT_POINTER_ROOTS:
+                    raise ValueError(
+                        f"{name} context pointers cannot select metadata, observed evidence, "
+                        "or evaluators"
+                    )
             placeholder_count = int(
                 value in {_INPUT_PLACEHOLDER, _CASE_ID_PLACEHOLDER}
                 if isinstance(value, str)
@@ -1969,7 +1994,18 @@ def _validated_template(template: object, *, name: str) -> tuple[JsonValue, dict
         _INPUT_PLACEHOLDER: _count_placeholder(validated_template, _INPUT_PLACEHOLDER),
         _CASE_ID_PLACEHOLDER: _count_placeholder(validated_template, _CASE_ID_PLACEHOLDER),
         _TURN_ID_PLACEHOLDER: _count_placeholder(validated_template, _TURN_ID_PLACEHOLDER),
+        _CONTEXT_POINTER_PLACEHOLDER: _count_context_pointers(validated_template),
     }
+
+
+def _count_context_pointers(value: JsonValue) -> int:
+    if isinstance(value, str):
+        return int(_CONTEXT_POINTER_PLACEHOLDER_PATTERN.fullmatch(value) is not None)
+    if isinstance(value, list):
+        return sum(_count_context_pointers(item) for item in value)
+    if isinstance(value, dict):
+        return sum(_count_context_pointers(item) for item in value.values())
+    return 0
 
 
 def _validated_execute_request_json_template(template: object) -> JsonValue:
@@ -2006,6 +2042,7 @@ def _validated_lifecycle_request_json_template(template: object) -> JsonValue:
         counts[_INPUT_PLACEHOLDER]
         or counts[_CASE_ID_PLACEHOLDER] != 1
         or counts[_TURN_ID_PLACEHOLDER]
+        or counts[_CONTEXT_POINTER_PLACEHOLDER]
     ):
         raise ValueError(
             "lifecycle request_json_template must contain exactly one {{case_id}} leaf "
@@ -2020,6 +2057,7 @@ def _validated_turn_observation_request_json_template(template: object) -> JsonV
         counts[_INPUT_PLACEHOLDER]
         or counts[_CASE_ID_PLACEHOLDER] != 1
         or counts[_TURN_ID_PLACEHOLDER] != 1
+        or counts[_CONTEXT_POINTER_PLACEHOLDER]
     ):
         raise ValueError(
             "snapshot request_json_template must contain exactly one {{case_id}} and "
@@ -2068,6 +2106,7 @@ def _replace_request_placeholders(
     case_id: str,
     turn_id: str | None = None,
     raw_input: str | None = None,
+    probe_context: dict[str, JsonValue] | None = None,
 ) -> JsonValue:
     if template == _INPUT_PLACEHOLDER:
         if raw_input is None:
@@ -2079,17 +2118,33 @@ def _replace_request_placeholders(
         if turn_id is None:
             raise AssertionError("turn ID placeholder requires a turn ID")
         return turn_id
+    if isinstance(template, str):
+        context_pointer_match = _CONTEXT_POINTER_PLACEHOLDER_PATTERN.fullmatch(template)
+        if context_pointer_match is not None:
+            if probe_context is None:
+                raise _EnvironmentProtocolError(
+                    "response_mapping", "request context pointer requires structured case context"
+                )
+            return _resolve_json_pointer(probe_context, context_pointer_match.group(1))
     if isinstance(template, list):
         return [
             _replace_request_placeholders(
-                item, case_id=case_id, turn_id=turn_id, raw_input=raw_input
+                item,
+                case_id=case_id,
+                turn_id=turn_id,
+                raw_input=raw_input,
+                probe_context=probe_context,
             )
             for item in template
         ]
     if isinstance(template, dict):
         return {
             key: _replace_request_placeholders(
-                value, case_id=case_id, turn_id=turn_id, raw_input=raw_input
+                value,
+                case_id=case_id,
+                turn_id=turn_id,
+                raw_input=raw_input,
+                probe_context=probe_context,
             )
             for key, value in template.items()
         }

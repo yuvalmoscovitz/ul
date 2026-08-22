@@ -159,6 +159,35 @@ async def test_invoker_only_produces_response_evidence_with_provenance() -> None
 
 
 @pytest.mark.asyncio
+async def test_executor_forwards_structured_case_context_unchanged() -> None:
+    invoker = _Invoker()
+    executor = ComposedEnvironmentExecutor(invoker, config_sha256=_CONFIG_SHA256)
+    probe_context = {
+        "schema_version": "1.0.0",
+        "source_interaction_id": "cancel-order",
+        "inputs": {"order_id": "ord-9", "message": "Please cancel it."},
+        "context": [
+            {"id": "user-1", "role": "user", "content": "Cancel my order."},
+            {"id": "assistant-1", "role": "assistant", "content": "Are you sure?"},
+            {"id": "user-2", "role": "user", "content": "Please cancel it."},
+        ],
+        "augmentation_target": {
+            "id": "confirmation",
+            "kind": "conversation_turn",
+            "turn_id": "user-2",
+            "json_pointer": None,
+        },
+        "fixture": {"id": "orders", "version": "9"},
+    }
+
+    await executor.execute(
+        _case("Please cancel it.").model_copy(update={"probe_context": probe_context})
+    )
+
+    assert invoker.requests[0].context == probe_context
+
+
+@pytest.mark.asyncio
 async def test_missing_observation_does_not_block_probe_execution() -> None:
     executor = ComposedEnvironmentExecutor(
         _Invoker(),
