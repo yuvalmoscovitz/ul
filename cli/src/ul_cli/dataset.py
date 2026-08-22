@@ -28,6 +28,7 @@ from ul import (
     DatasetSemanticSettings,
     DatasetTargetLifecycleFailure,
     EvaluatorModelCompatibilityError,
+    EvaluatorModelPreflight,
     InteractionRecord,
     LocalPseudonymStore,
     ProviderDiagnosticError,
@@ -102,6 +103,7 @@ app.command("review")(review_dataset_finding)
 _MAXIMUM_DATASET_BYTES = 10_000_000
 _MAXIMUM_DATASET_RECORDS = 100
 _MAXIMUM_EVIDENCE_BYTES = 128_000_000
+_MAXIMUM_PREFLIGHT_RECEIPT_BYTES = 100_000
 _DEFAULT_MAXIMUM_ENVIRONMENT_API_CALLS = 100
 _REDACTION_KEY_ENVIRONMENT_VARIABLE = "UL_DATASET_REDACTION_KEY"
 _PROVIDER_DIAGNOSTIC_SCHEMA_VERSION = "1.0.0"
@@ -966,6 +968,22 @@ def evaluate_dataset(
             param_hint="--environment-config",
         ) from None
 
+    try:
+        evaluator_preflight = asyncio.run(_preflight_evaluator(settings))
+        evaluator_preflight_receipt = _persist_evaluator_preflight(output, evaluator_preflight)
+    except EvaluatorModelCompatibilityError as error:
+        asyncio.run(target.aclose())
+        _print_dataset_plain(f"Evaluation stopped before campaign execution: {error}")
+        raise typer.Exit(code=2) from None
+    except (OSError, ValueError) as error:
+        asyncio.run(target.aclose())
+        message = str(error) if isinstance(error, ValueError) else error.__class__.__name__
+        raise typer.BadParameter(
+            f"cannot safely persist evaluator preflight ({message})",
+            param_hint="--output",
+        ) from None
+    _print_evaluator_preflight(evaluator_preflight, evaluator_preflight_receipt)
+
     augmentation_ledger: DatasetAugmentationLedger | None = None
     augmentation_ledger_was_created = False
     output_stream: TextIO | None = None
@@ -1056,6 +1074,7 @@ def evaluate_dataset(
                     invariant_suite=invariant_suite,
                     invariant_evaluations=invariant_evaluations,
                     redaction_engine=redaction_engine,
+                    evaluator_preflight=evaluator_preflight,
                 )
             else:
                 evaluation_coroutine = _evaluate_interaction_records(
@@ -1076,13 +1095,11 @@ def evaluate_dataset(
                     augmentation_ledger=augmentation_ledger,
                     saved_augmentations=saved_augmentations,
                     redaction_engine=redaction_engine,
+                    evaluator_preflight=evaluator_preflight,
                 )
             results = asyncio.run(evaluation_coroutine)
             for result in results:
                 has_review_findings |= _result_needs_review(result)
-    except EvaluatorModelCompatibilityError as error:
-        _print_dataset_plain(f"Evaluation stopped before campaign execution: {error}")
-        raise typer.Exit(code=2) from None
     except (TimeoutError, RuntimeError, ValueError, httpx.HTTPError) as error:
         if isinstance(error, ProviderDiagnosticError):
             console.print(str(error))
@@ -1540,6 +1557,60 @@ def _write_provider_diagnostic(output: Path, error: ProviderDiagnosticError) -> 
     raise FileExistsError("provider diagnostic receipt slots are occupied")
 
 
+async def _preflight_evaluator(settings: DatasetSemanticSettings) -> EvaluatorModelPreflight:
+    async with create_semantic_model_deconstructor(settings) as deconstructor:
+        return await deconstructor.preflight()
+
+
+def _evaluator_preflight_output(evidence_output: Path) -> Path:
+    return evidence_output.with_name(f"{evidence_output.name}.preflight.json")
+
+
+def _persist_evaluator_preflight(
+    evidence_output: Path,
+    result: EvaluatorModelPreflight,
+) -> Path:
+    receipt_path = _evaluator_preflight_output(evidence_output)
+    if receipt_path.exists():
+        descriptor = _open_resume_descriptor(receipt_path, writable=False)
+        try:
+            size = os.fstat(descriptor).st_size
+            if size > _MAXIMUM_PREFLIGHT_RECEIPT_BYTES:
+                raise ValueError("existing evaluator preflight receipt exceeds its size limit")
+            existing = EvaluatorModelPreflight.model_validate_json(os.read(descriptor, size))
+        except ValidationError:
+            raise ValueError("existing evaluator preflight receipt is invalid") from None
+        finally:
+            os.close(descriptor)
+        if existing != result:
+            raise ValueError("existing evaluator preflight receipt does not match this run")
+        return receipt_path
+    with _create_private_output(receipt_path) as output_stream:
+        json.dump(result.model_dump(mode="json"), output_stream, ensure_ascii=False, sort_keys=True)
+        output_stream.write("\n")
+        output_stream.flush()
+        os.fsync(output_stream.fileno())
+    return receipt_path
+
+
+def _print_evaluator_preflight(result: EvaluatorModelPreflight, receipt: Path) -> None:
+    roles = ", ".join(role for profile in result.profiles for role in profile.roles)
+    _print_dataset_plain(
+        f"Evaluator preflight passed for {len(result.profiles)} distinct profile(s): {roles}."
+    )
+    if result.unverified_options:
+        _print_dataset_plain(
+            "Configured endpoint accepted every sample, but parameter support is unverified: "
+            f"{', '.join(result.unverified_options)}."
+        )
+    else:
+        _print_dataset_plain("Required semantic parameters were verified by enforced routing.")
+    data_policy_implication = result.data_policy.get("implication")
+    if isinstance(data_policy_implication, str):
+        _print_dataset_plain(f"Evaluator data policy: {data_policy_implication}")
+    _print_dataset_plain(f"Evaluator preflight receipt: {receipt}")
+
+
 def _create_private_output(path: Path) -> TextIO:
     descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     if sys.platform != "win32":
@@ -1666,17 +1737,12 @@ async def _evaluate_interaction_records(
     invariant_evaluations: list[DatasetInvariantEvaluation] | None = None,
     redaction_engine: RedactionEngine | None = None,
     allow_network_egress: bool = True,
+    evaluator_preflight: EvaluatorModelPreflight,
 ) -> tuple[DatasetEvaluationResult, ...]:
     results: list[DatasetEvaluationResult] = []
-    async with create_semantic_model_deconstructor(settings) as deconstructor, target:
-        evaluator_preflight = await deconstructor.preflight()
-        _print_dataset_plain(
-            "Evaluator preflight passed: routing, structured output, and seed; "
-            f"parameter verification={evaluator_preflight.parameter_verification}."
-        )
-        data_policy_implication = evaluator_preflight.data_policy.get("implication")
-        if isinstance(data_policy_implication, str):
-            _print_dataset_plain(f"Evaluator data policy: {data_policy_implication}")
+    deconstructor = create_semantic_model_deconstructor(settings)
+    deconstructor.reuse_preflight(evaluator_preflight)
+    async with deconstructor, target:
         semantic_pipeline = (
             RedactedSemanticPipeline(deconstructor, redaction_engine)
             if redaction_engine is not None

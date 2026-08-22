@@ -25,6 +25,7 @@ from ul import (
     DatasetEvaluationTrial,
     DatasetEvaluationTrialSet,
     EvaluatorModelCompatibilityError,
+    EvaluatorModelPreflight,
     InteractionRecord,
     JsonHttpEnvironmentConfig,
     JsonHttpIsolatedResponseConfig,
@@ -57,6 +58,50 @@ from ul_core.evaluation import (
 
 runner = CliRunner()
 _ANSI_ESCAPE_PATTERN = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+
+
+def _evaluator_preflight() -> EvaluatorModelPreflight:
+    return EvaluatorModelPreflight.model_validate(
+        {
+            "provider": "openrouter",
+            "profiles": (
+                {
+                    "roles": ("deconstruct", "render", "equivalence"),
+                    "requested_model": "test/model",
+                    "routed_model": "test/model",
+                    "upstream_provider": "test-provider",
+                    "required_parameters": (
+                        "response_format",
+                        "seed",
+                        "temperature",
+                        "max_tokens",
+                    ),
+                    "parameter_support": "routing_enforced",
+                    "unverified_options": (),
+                },
+            ),
+            "verified_capabilities": (
+                "routing",
+                "structured_output",
+                "required_parameters",
+            ),
+            "ignored_or_unsupported_options": (),
+            "unverified_options": (),
+            "data_policy": {
+                "external_processing": True,
+                "implication": "Evaluator requests are processed externally.",
+            },
+        }
+    )
+
+
+@pytest.fixture(autouse=True)
+def _stub_evaluator_preflight(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def successful_preflight(settings: object) -> EvaluatorModelPreflight:
+        del settings
+        return _evaluator_preflight()
+
+    monkeypatch.setattr(main, "_preflight_evaluator", successful_preflight)
 
 
 def _write_dataset(path: Path, records: list[dict[str, Any]]) -> None:
@@ -1001,6 +1046,9 @@ def test_openai_compatible_execution_allows_an_unauthenticated_endpoint(
         def from_config(cls, *args: object, **kwargs: object) -> FakeTarget:
             return cls()
 
+        async def aclose(self) -> None:
+            return None
+
     async def fake_evaluate(*args: object, **kwargs: object) -> tuple[object, ...]:
         return ()
 
@@ -1043,14 +1091,14 @@ def test_evaluator_preflight_failure_surfaces_capability_and_safe_action(
         def from_config(cls, *args: object, **kwargs: object) -> FakeTarget:
             return cls()
 
-    async def fail_preflight(*args: object, **kwargs: object) -> tuple[object, ...]:
+    async def fail_preflight(*args: object, **kwargs: object) -> EvaluatorModelPreflight:
         raise EvaluatorModelCompatibilityError(
             "evaluator model is incompatible with required seed capability; "
             "choose another configured evaluator model or verify the configured route and retry"
         )
 
+    monkeypatch.setattr(main, "_preflight_evaluator", fail_preflight)
     monkeypatch.setattr(main, "JsonHttpEnvironmentConnection", FakeTarget)
-    monkeypatch.setattr(main, "_evaluate_interaction_records", fail_preflight)
 
     result = runner.invoke(
         root_app,
@@ -1071,6 +1119,108 @@ def test_evaluator_preflight_failure_surfaces_capability_and_safe_action(
     assert "required seed capability" in result.output
     assert "choose another configured evaluator model" in result.output
     assert "before campaign execution" in result.output
+    assert not output.exists()
+    assert not (tmp_path / "results.augmentations.jsonl").exists()
+    assert not (tmp_path / "results.jsonl.preflight.json").exists()
+
+
+def test_local_environment_gate_fails_before_evaluator_preflight(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    dataset = tmp_path / "interactions.jsonl"
+    output = tmp_path / "results.jsonl"
+    target_config = tmp_path / "target.json"
+    _write_dataset(dataset, [_record()])
+    _write_target_config(target_config)
+    monkeypatch.setenv("UL_LIVE", "true")
+    monkeypatch.setenv("OPEN_ROUTER_API_KEY", "test-key")
+    preflight_calls = 0
+
+    async def unexpected_preflight(*args: object, **kwargs: object) -> EvaluatorModelPreflight:
+        nonlocal preflight_calls
+        preflight_calls += 1
+        raise AssertionError("local validation must run before evaluator preflight")
+
+    monkeypatch.setattr(main, "_preflight_evaluator", unexpected_preflight)
+
+    result = runner.invoke(
+        root_app,
+        [
+            "dataset",
+            "evaluate",
+            str(dataset),
+            "--environment-config",
+            str(target_config),
+            "--confirm-test-environment",
+            "--output",
+            str(output),
+        ],
+    )
+
+    assert result.exit_code == 2
+    assert "--allow-environment-network" in result.output
+    assert preflight_calls == 0
+    assert not output.exists()
+    assert not (tmp_path / "results.jsonl.preflight.json").exists()
+
+
+def test_evaluator_preflight_receipt_survives_later_semantic_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    dataset = tmp_path / "interactions.jsonl"
+    output = tmp_path / "results.jsonl"
+    receipt = tmp_path / "results.jsonl.preflight.json"
+    target_config = tmp_path / "target.json"
+    _write_dataset(dataset, [_record()])
+    _write_target_config(target_config)
+    monkeypatch.setenv("UL_LIVE", "true")
+    monkeypatch.setenv("OPEN_ROUTER_API_KEY", "test-key")
+    expected_preflight = _evaluator_preflight()
+    preflight_calls = 0
+
+    async def successful_preflight(settings: object) -> EvaluatorModelPreflight:
+        nonlocal preflight_calls
+        del settings
+        preflight_calls += 1
+        return expected_preflight
+
+    class FakeTarget:
+        @classmethod
+        def from_config(cls, *args: object, **kwargs: object) -> FakeTarget:
+            return cls()
+
+        async def aclose(self) -> None:
+            return None
+
+    async def fail_after_preflight(*args: object, **kwargs: object) -> tuple[object, ...]:
+        assert kwargs["evaluator_preflight"] is expected_preflight
+        raise ValueError("later semantic failure")
+
+    monkeypatch.setattr(main, "_preflight_evaluator", successful_preflight)
+    monkeypatch.setattr(main, "JsonHttpEnvironmentConnection", FakeTarget)
+    monkeypatch.setattr(main, "_evaluate_interaction_records", fail_after_preflight)
+
+    result = runner.invoke(
+        root_app,
+        [
+            "dataset",
+            "evaluate",
+            str(dataset),
+            "--environment-config",
+            str(target_config),
+            "--allow-environment-network",
+            "--confirm-test-environment",
+            "--output",
+            str(output),
+        ],
+    )
+
+    assert result.exit_code == 2
+    assert preflight_calls == 1
+    assert EvaluatorModelPreflight.model_validate_json(receipt.read_text()) == expected_preflight
+    assert stat.S_IMODE(receipt.stat().st_mode) == 0o600
 
 
 def test_stateful_target_dry_run_counts_physical_lifecycle_calls(
@@ -1404,11 +1554,8 @@ def test_invariant_evaluation_reuses_results_without_extra_runner_calls(
         async def __aexit__(self, *args: object) -> None:
             pass
 
-        async def preflight(self) -> object:
-            return SimpleNamespace(
-                parameter_verification="endpoint_accepted",
-                data_policy={},
-            )
+        def reuse_preflight(self, result: object) -> None:
+            assert result == _evaluator_preflight()
 
     class FakeRunner:
         def __init__(self, *args: object, **kwargs: object) -> None:
@@ -1454,6 +1601,7 @@ def test_invariant_evaluation_reuses_results_without_extra_runner_calls(
                 planned_target_calls=2,
                 invariant_suite=suite,
                 invariant_evaluations=stored_evaluations,
+                evaluator_preflight=_evaluator_preflight(),
             )
         )
 
@@ -2041,8 +2189,10 @@ def test_execution_creates_private_explicit_output(
         augmentation_ledger: object,
         saved_augmentations: object,
         redaction_engine: object,
+        evaluator_preflight: object,
     ) -> tuple[object, ...]:
         del settings, target, run_context, augmentation_ledger, saved_augmentations
+        assert evaluator_preflight == _evaluator_preflight()
         assert redaction_engine is None
         captured_records.extend(record.id for record in records)
         assert operator_ids == ("input.surface.disfluency_repeat",)
@@ -2286,6 +2436,7 @@ def test_execution_wires_redaction_into_records_pipeline_and_run_context(
         augmentation_ledger: object,
         saved_augmentations: object,
         redaction_engine: object,
+        evaluator_preflight: object,
     ) -> tuple[object, ...]:
         del (
             repetitions,
@@ -2295,6 +2446,7 @@ def test_execution_wires_redaction_into_records_pipeline_and_run_context(
             saved_augmentations,
         )
         assert redaction_engine is not None
+        assert evaluator_preflight == _evaluator_preflight()
         assert secret not in records[0].model_dump_json()
         serialized_context = cast(Any, run_context).model_dump_json()
         assert secret not in serialized_context
@@ -2433,6 +2585,7 @@ def test_target_config_runs_nested_request_and_response_against_loopback(
             augmentation_ledger: object,
             saved_augmentations: object,
             redaction_engine: object,
+            evaluator_preflight: object,
         ) -> tuple[object, ...]:
             del (
                 operator_ids,
@@ -2445,6 +2598,7 @@ def test_target_config_runs_nested_request_and_response_against_loopback(
                 saved_augmentations,
             )
             assert redaction_engine is None
+            assert evaluator_preflight == _evaluator_preflight()
             async with target:
                 case = evaluation_case_from_inputs(
                     case_id="ul-case-00000000000000000000000000000000",
@@ -2722,6 +2876,7 @@ def test_resume_skips_already_processed_interaction_ids(
         augmentation_ledger: object,
         saved_augmentations: object,
         redaction_engine: object,
+        evaluator_preflight: object,
     ) -> tuple[object, ...]:
         del (
             operator_ids,
@@ -2736,6 +2891,7 @@ def test_resume_skips_already_processed_interaction_ids(
             == evaluation_results[1].augmentation
         )
         assert redaction_engine is None
+        assert evaluator_preflight == _evaluator_preflight()
         assert repetitions == 1
         for record in records:
             evaluated_ids.append(record.id)
