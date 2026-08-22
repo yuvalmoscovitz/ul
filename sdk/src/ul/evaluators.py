@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+import asyncio
 import inspect
 import ipaddress
 import json
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from copy import deepcopy
 from types import TracebackType
 from typing import Any, Literal, Protocol, Self, cast
@@ -11,6 +12,8 @@ from urllib.parse import urlsplit, urlunsplit
 
 import httpx
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, SecretStr, model_validator
+from ul_core.contracts import EnvironmentExecutor
+from ul_core.evaluation import EvaluationCase, ExecutionEvidence
 from ul_core.evaluators import (
     CallableEvaluator,
     EvaluationResults,
@@ -31,9 +34,14 @@ from ul_core.evaluators import (
 from ul_core.models import ULModel
 from ul_core.prompts import PromptManager
 
+from ul.environment import validate_execution_evidence
+
 _PROMPTS = PromptManager.instance()
 
 EvaluatorCallable = Callable[[EvaluationSubject], EvaluatorDecision | Awaitable[EvaluatorDecision]]
+EvaluationSubjectBuilder = Callable[
+    [ExecutionEvidence], EvaluationSubject | Awaitable[EvaluationSubject]
+]
 
 
 class JudgeRequest(ULModel):
@@ -51,6 +59,15 @@ class EvaluatorJudge(Protocol):
     def evaluate(self, request: JudgeRequest) -> Awaitable[EvaluatorDecision]: ...
 
 
+class EvaluationCaseResult(ULModel):
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    schema_version: Literal["1.0.0"] = "1.0.0"
+    case_id: str
+    execution_evidence: ExecutionEvidence | None = None
+    evaluation_results: EvaluationResults
+
+
 class OpenAICompatibleJudgeConfig(ULModel):
     model_config = ConfigDict(
         extra="forbid",
@@ -66,6 +83,7 @@ class OpenAICompatibleJudgeConfig(ULModel):
     data_policy: Literal["provider_default", "openrouter_zdr"] = "provider_default"
     timeout_seconds: float = Field(default=60, gt=0, le=300)
     max_output_tokens: int = Field(default=1_024, ge=64, le=8_192)
+    max_response_bytes: int = Field(default=1_000_000, ge=1_024, le=5_000_000)
 
     @model_validator(mode="after")
     def validate_and_normalize_base_url(self) -> Self:
@@ -128,6 +146,7 @@ class _JudgeOutput(BaseModel):
     score: float | None = Field(ge=0, le=1)
     label: str | None = Field(min_length=1, max_length=500)
     explanation: str = Field(min_length=1, max_length=5_000)
+    citations: tuple[str, ...] = Field(min_length=1, max_length=20)
 
 
 class OpenAICompatibleEvaluatorJudge:
@@ -193,25 +212,132 @@ class OpenAICompatibleEvaluatorJudge:
         headers = {"Content-Type": "application/json"}
         if self.config.api_key is not None:
             headers["Authorization"] = f"Bearer {self.config.api_key.get_secret_value()}"
-        response = await self._client.post(
-            f"{self.config.base_url.rstrip('/')}/chat/completions",
-            headers=headers,
-            json=request_body,
-        )
-        response.raise_for_status()
-        parsed_response = _JudgeResponse.model_validate(response.json())
+        endpoint = f"{self.config.base_url}/chat/completions"
+        async with asyncio.timeout(self.config.timeout_seconds):
+            async with self._client.stream(
+                "POST",
+                endpoint,
+                headers={**headers, "Accept-Encoding": "identity"},
+                json=request_body,
+                timeout=self.config.timeout_seconds,
+                follow_redirects=False,
+            ) as response:
+                if not _same_origin(response.url, httpx.URL(endpoint)):
+                    raise ValueError("judge response changed request origin")
+                if 300 <= response.status_code < 400:
+                    raise ValueError("judge redirects are not allowed")
+                response.raise_for_status()
+                if response.headers.get("content-encoding", "identity").strip().lower() != (
+                    "identity"
+                ):
+                    raise ValueError("judge response Content-Encoding is not allowed")
+                response_body = await _read_response(
+                    response,
+                    maximum_bytes=self.config.max_response_bytes,
+                )
+        parsed_response = _JudgeResponse.model_validate_json(response_body)
+        parsed_value = parsed_response.model_dump(mode="json")
+        if _contains_secret(parsed_value, self.config.base_url):
+            raise ValueError("judge response contains the configured endpoint URL")
+        if self.config.api_key is not None and _contains_secret(
+            parsed_value, self.config.api_key.get_secret_value()
+        ):
+            raise ValueError("judge response contains the configured credential")
         output = _JudgeOutput.model_validate_json(parsed_response.choices[0].message.content)
         return EvaluatorDecision(
             score=output.score,
             label=output.label,
             explanation=output.explanation,
-            evidence=(
-                EvaluatorEvidence(
-                    source="judge",
-                    description="Structured decision returned by the configured judge model.",
+            evidence=_judge_evidence(request, output.citations),
+        )
+
+
+async def evaluate_case(
+    case: EvaluationCase,
+    environment: EnvironmentExecutor,
+    *,
+    judge: EvaluatorJudge | None = None,
+    callables: Mapping[str, EvaluatorCallable] | None = None,
+    subject_builder: EvaluationSubjectBuilder | None = None,
+) -> EvaluationCaseResult:
+    environment_api_calls = environment.api_calls_for_case(case)
+    if type(environment_api_calls) is not int or not (
+        1 <= environment_api_calls <= case.max_environment_api_calls
+    ):
+        raise ValueError("environment API calls exceed the evaluation case budget")
+    try:
+        async with asyncio.timeout(case.timeout_seconds):
+            execution_evidence = await environment.execute(case)
+    except TimeoutError:
+        return EvaluationCaseResult(
+            case_id=case.id,
+            evaluation_results=await evaluate(
+                EvaluationSubject(
+                    agent_status="timed_out",
+                    agent_failure_reason="The agent execution timed out.",
                 ),
+                case.evaluators,
+                judge=judge,
+                callables=callables,
             ),
         )
+    except RuntimeError:
+        return EvaluationCaseResult(
+            case_id=case.id,
+            evaluation_results=await evaluate(
+                EvaluationSubject(
+                    agent_status="failed",
+                    agent_failure_reason="The agent execution failed.",
+                ),
+                case.evaluators,
+                judge=judge,
+                callables=callables,
+            ),
+        )
+    validate_execution_evidence(case, environment, execution_evidence)
+    if execution_evidence.lifecycle.terminal_status == "succeeded":
+        subject_or_awaitable = (
+            subject_builder(execution_evidence)
+            if subject_builder is not None
+            else _subject_from_execution_evidence(execution_evidence)
+        )
+        subject = (
+            await subject_or_awaitable
+            if inspect.isawaitable(subject_or_awaitable)
+            else subject_or_awaitable
+        )
+        if subject.agent_status != "succeeded":
+            raise ValueError("successful execution evidence requires a successful subject")
+    else:
+        subject = EvaluationSubject(
+            agent_status=(
+                "timed_out"
+                if execution_evidence.lifecycle.terminal_status == "timed_out"
+                else "failed"
+            ),
+            agent_failure_reason=(
+                f"The agent execution {execution_evidence.lifecycle.terminal_status}."
+            ),
+        )
+    return EvaluationCaseResult(
+        case_id=case.id,
+        execution_evidence=execution_evidence,
+        evaluation_results=await evaluate(
+            subject,
+            case.evaluators,
+            judge=judge,
+            callables=callables,
+        ),
+    )
+
+
+def _subject_from_execution_evidence(evidence: ExecutionEvidence) -> EvaluationSubject:
+    return EvaluationSubject(
+        agent_status="succeeded",
+        answer=evidence.final_response,
+        initial_state=evidence.initial_state.value if evidence.initial_state is not None else None,
+        final_state=evidence.final_state.value if evidence.final_state is not None else None,
+    )
 
 
 async def evaluate(
@@ -384,6 +510,7 @@ async def _evaluate_one(
         raise ValueError("pairwise evaluation requires a reference answer")
     request = _judge_request(subject, evaluator)
     decision = await judge.evaluate(request)
+    _validate_judge_evidence(request, decision.evidence)
     if isinstance(evaluator, RubricEvaluator):
         if decision.score is None:
             raise ValueError("rubric judges must return a score")
@@ -393,7 +520,7 @@ async def _evaluate_one(
         raise ValueError("pairwise judges must return candidate, reference, or tie")
     elif decision.label == "tie":
         decision = decision.model_copy(update={"passed": evaluator.allow_tie})
-    elif decision.passed is None:
+    else:
         decision = decision.model_copy(update={"passed": decision.label == "candidate"})
     return _decision_result(evaluator, decision)
 
@@ -422,6 +549,8 @@ def _judge_request(
     if isinstance(evaluator, PairwiseEvaluator):
         payload["reference_answer"] = subject.reference_answer
     if evaluator.allow_private_data:
+        if subject.private_json_pointers:
+            raise ValueError("private data opt-in cannot ignore private JSON pointers")
         payload["private_data"] = cast(JsonValue, subject.private_data)
     else:
         for pointer in subject.private_json_pointers:
@@ -457,7 +586,7 @@ def _deterministic_result(
     passed: bool,
     explanation: str,
     source: Literal[
-        "answer", "tool_call", "initial_state", "final_state", "http_result", "callable", "judge"
+        "answer", "tool_call", "initial_state", "final_state", "http_result", "callable"
     ],
     pointer: str,
 ) -> EvaluatorResult:
@@ -497,11 +626,9 @@ def _evidence_source(
 def _resolve_json_pointer(value: JsonValue, pointer: str) -> tuple[bool, JsonValue]:
     if pointer == "":
         return True, value
-    if not pointer.startswith("/"):
-        raise ValueError("JSON pointers must be empty or start with /")
+    parts = _json_pointer_parts(pointer)
     current = value
-    for raw_part in pointer[1:].split("/"):
-        part = raw_part.replace("~1", "/").replace("~0", "~")
+    for part in parts:
         if isinstance(current, dict) and part in current:
             current = current[part]
         elif isinstance(current, list) and part.isdigit() and int(part) < len(current):
@@ -512,9 +639,9 @@ def _resolve_json_pointer(value: JsonValue, pointer: str) -> tuple[bool, JsonVal
 
 
 def _remove_json_pointer(value: dict[str, JsonValue], pointer: str) -> None:
-    if not pointer.startswith("/") or pointer == "/":
+    parts = _json_pointer_parts(pointer)
+    if not parts:
         raise ValueError("private JSON pointers must identify a nested value")
-    parts = [part.replace("~1", "/").replace("~0", "~") for part in pointer[1:].split("/")]
     current: JsonValue = value
     for part in parts[:-1]:
         if isinstance(current, dict) and part in current:
@@ -522,12 +649,98 @@ def _remove_json_pointer(value: dict[str, JsonValue], pointer: str) -> None:
         elif isinstance(current, list) and part.isdigit() and int(part) < len(current):
             current = current[int(part)]
         else:
-            return
+            raise ValueError("private JSON pointer does not resolve")
     final = parts[-1]
-    if isinstance(current, dict):
-        current.pop(final, None)
+    if isinstance(current, dict) and final in current:
+        current.pop(final)
     elif isinstance(current, list) and final.isdigit() and int(final) < len(current):
         current[int(final)] = None
+    else:
+        raise ValueError("private JSON pointer does not resolve")
+
+
+def _json_pointer_parts(pointer: str) -> tuple[str, ...]:
+    if pointer == "":
+        return ()
+    if not pointer.startswith("/"):
+        raise ValueError("JSON pointers must be empty or start with /")
+    parts: list[str] = []
+    for raw_part in pointer[1:].split("/"):
+        index = 0
+        while index < len(raw_part):
+            if raw_part[index] == "~":
+                if index + 1 >= len(raw_part) or raw_part[index + 1] not in {"0", "1"}:
+                    raise ValueError("JSON pointer contains an invalid escape")
+                index += 2
+            else:
+                index += 1
+        parts.append(raw_part.replace("~1", "/").replace("~0", "~"))
+    return tuple(parts)
+
+
+def _judge_evidence(
+    request: JudgeRequest,
+    citations: tuple[str, ...],
+) -> tuple[EvaluatorEvidence, ...]:
+    evidence = tuple(
+        EvaluatorEvidence(
+            source="judge_payload",
+            json_pointer=pointer,
+            description="Judge-cited value from the submitted payload.",
+        )
+        for pointer in citations
+    )
+    _validate_judge_evidence(request, evidence)
+    return evidence
+
+
+def _validate_judge_evidence(
+    request: JudgeRequest,
+    evidence: tuple[EvaluatorEvidence, ...],
+) -> None:
+    if not evidence:
+        raise ValueError("judge decisions require cited evidence")
+    submitted_request = cast(JsonValue, request.model_dump(mode="json"))
+    for citation in evidence:
+        if citation.source != "judge_payload" or not citation.json_pointer.startswith("/payload/"):
+            raise ValueError("judge evidence must cite the submitted payload")
+        found, _ = _resolve_json_pointer(submitted_request, citation.json_pointer)
+        if not found:
+            raise ValueError("judge evidence pointer does not resolve")
+
+
+async def _read_response(response: httpx.Response, *, maximum_bytes: int) -> bytes:
+    chunks: list[bytes] = []
+    response_size = 0
+    response_chunks = (
+        _single_chunk(response.content) if response.is_stream_consumed else response.aiter_raw()
+    )
+    async for chunk in response_chunks:
+        response_size += len(chunk)
+        if response_size > maximum_bytes:
+            raise ValueError("judge response exceeds max_response_bytes")
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
+async def _single_chunk(content: bytes) -> AsyncIterator[bytes]:
+    yield content
+
+
+def _same_origin(left: httpx.URL, right: httpx.URL) -> bool:
+    return (left.scheme, left.host, left.port) == (right.scheme, right.host, right.port)
+
+
+def _contains_secret(value: object, secret: str) -> bool:
+    if isinstance(value, str):
+        return secret in value
+    if isinstance(value, dict):
+        mapping = cast(dict[object, object], value)
+        return any(_contains_secret(item, secret) for item in mapping.values())
+    if isinstance(value, list):
+        sequence = cast(list[object], value)
+        return any(_contains_secret(item, secret) for item in sequence)
+    return False
 
 
 def _json_type(value: JsonValue) -> str:

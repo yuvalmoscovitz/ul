@@ -171,12 +171,15 @@ from ul.deconstruction import (
     validate_evaluator_preflight,
 )
 from ul.evaluators import (
+    EvaluationCaseResult,
+    EvaluationSubjectBuilder,
     EvaluatorCallable,
     EvaluatorJudge,
     JudgeRequest,
     OpenAICompatibleEvaluatorJudge,
     OpenAICompatibleJudgeConfig,
     evaluate,
+    evaluate_case,
 )
 from ul.event_stress import (
     CorrectionAfterFirstResponseCase,
@@ -335,8 +338,10 @@ __all__ = [
     "EnvironmentStateEvidence",
     "EnvironmentTurnEvidence",
     "EvaluationCase",
+    "EvaluationCaseResult",
     "EvaluationResults",
     "EvaluationSubject",
+    "EvaluationSubjectBuilder",
     "EvaluatorCallable",
     "EvaluatorDecision",
     "EvaluatorEvidence",
@@ -455,6 +460,7 @@ __all__ = [
     "dataset_regression_target_config_sha256",
     "derive_trace_stress_plan",
     "evaluate",
+    "evaluate_case",
     "evaluate_dataset_invariant_rules",
     "evaluate_dataset_invariants",
     "group_trace_replay_differences",

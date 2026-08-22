@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from typing import cast
 
@@ -7,10 +8,19 @@ import httpx
 import pytest
 from pydantic import JsonValue, ValidationError
 from ul.evaluators import (
+    EvaluationCaseResult,
     JudgeRequest,
     OpenAICompatibleEvaluatorJudge,
     OpenAICompatibleJudgeConfig,
     evaluate,
+    evaluate_case,
+)
+from ul_core.evaluation import (
+    EnvironmentCapabilities,
+    EnvironmentLifecycleEvidence,
+    EnvironmentTurnEvidence,
+    EvaluationCase,
+    ExecutionEvidence,
 )
 from ul_core.evaluators import (
     CallableEvaluator,
@@ -27,7 +37,7 @@ from ul_core.evaluators import (
     StateChangeEvaluator,
     ToolCallEvaluator,
 )
-from ul_core.models import ToolCall
+from ul_core.models import ConversationRole, ConversationTurn, ToolCall
 
 pytestmark = pytest.mark.asyncio
 
@@ -186,7 +196,9 @@ async def test_rubric_judge_defaults_to_answer_and_redacts_declared_private_valu
                 explanation="The answer clearly confirms the requested action.",
                 evidence=(
                     EvaluatorEvidence(
-                        source="judge", description="Judge assessment of the answer."
+                        source="judge_payload",
+                        json_pointer="/payload/answer/message",
+                        description="Judge assessment of the answer.",
                     ),
                 ),
             ),
@@ -217,11 +229,23 @@ async def test_rubric_judge_defaults_to_answer_and_redacts_declared_private_valu
 
 async def test_private_fixture_data_requires_explicit_judge_opt_in() -> None:
     judge = RecordingJudge(
-        (EvaluatorDecision(score=1, explanation="Allowed private fixture matched."),)
+        (
+            EvaluatorDecision(
+                score=1,
+                explanation="Allowed private fixture matched.",
+                evidence=(
+                    EvaluatorEvidence(
+                        source="judge_payload",
+                        json_pointer="/payload/private_data/fixture_password",
+                        description="Explicitly allowed fixture value.",
+                    ),
+                ),
+            ),
+        )
     )
 
     await evaluate(
-        _subject(),
+        _subject().model_copy(update={"private_json_pointers": ()}),
         (
             RubricEvaluator(
                 id="private-opt-in",
@@ -237,12 +261,39 @@ async def test_private_fixture_data_requires_explicit_judge_opt_in() -> None:
     }
 
 
+async def test_private_data_opt_in_cannot_silently_ignore_private_pointers() -> None:
+    judge = RecordingJudge(())
+
+    results = await evaluate(
+        _subject(),
+        (
+            RubricEvaluator(
+                id="conflicting-privacy",
+                rubric="Judge the answer.",
+                allow_private_data=True,
+            ),
+        ),
+        judge=judge,
+    )
+
+    assert results.results[0].status == "evaluator_error"
+    assert judge.requests == []
+
+
 async def test_pairwise_and_human_review_are_first_class_evaluators() -> None:
     judge = RecordingJudge(
         (
             EvaluatorDecision(
+                passed=False,
                 label="candidate",
                 explanation="The candidate is more direct while preserving the outcome.",
+                evidence=(
+                    EvaluatorEvidence(
+                        source="judge_payload",
+                        json_pointer="/payload/answer/message",
+                        description="Candidate answer wording.",
+                    ),
+                ),
             ),
         )
     )
@@ -301,7 +352,8 @@ async def test_openai_compatible_judge_uses_structured_output_and_explicit_data_
                         "message": {
                             "content": (
                                 '{"score":0.95,"label":"clear",'
-                                '"explanation":"The outcome is explicit."}'
+                                '"explanation":"The outcome is explicit.",'
+                                '"citations":["/payload/answer/message"]}'
                             )
                         }
                     }
@@ -340,3 +392,218 @@ async def test_openai_compatible_judge_uses_structured_output_and_explicit_data_
         "zdr": True,
     }
     assert captured_request.headers["authorization"] == "Bearer test-secret"
+
+
+@pytest.mark.parametrize(
+    ("private_pointer", "include_sources"),
+    [
+        ("answer/internal_token", ("answer",)),
+        ("/answer/internal~2token", ("answer",)),
+        ("/answer/internal_tokne", ("answer",)),
+        ("/tool_calls/8/name", ("tool_calls",)),
+        ("/tool_calls/0/nmae", ("tool_calls",)),
+    ],
+)
+async def test_invalid_private_pointers_fail_before_judge_call(
+    private_pointer: str,
+    include_sources: tuple[str, ...],
+) -> None:
+    judge = RecordingJudge(())
+    subject = _subject().model_copy(update={"private_json_pointers": (private_pointer,)})
+    evaluator = RubricEvaluator.model_validate(
+        {
+            "id": "privacy",
+            "rubric": "Judge the answer.",
+            "include_sources": include_sources,
+        }
+    )
+
+    results = await evaluate(subject, (evaluator,), judge=judge)
+
+    assert results.results[0].status == "evaluator_error"
+    assert judge.requests == []
+
+
+async def test_judge_evidence_must_resolve_against_submitted_payload() -> None:
+    judge = RecordingJudge(
+        (
+            EvaluatorDecision(
+                score=1,
+                explanation="Unsupported citation.",
+                evidence=(
+                    EvaluatorEvidence(
+                        source="judge_payload",
+                        json_pointer="/payload/answer/missing",
+                        description="Missing answer value.",
+                    ),
+                ),
+            ),
+        )
+    )
+
+    results = await evaluate(
+        _subject(),
+        (RubricEvaluator(id="citation", rubric="Judge the answer."),),
+        judge=judge,
+    )
+
+    assert results.results[0].status == "evaluator_error"
+
+
+async def test_openai_compatible_judge_rejects_oversized_streamed_responses() -> None:
+    def respond(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=b"x" * 1_025)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
+        judge = OpenAICompatibleEvaluatorJudge(
+            OpenAICompatibleJudgeConfig(
+                base_url="https://models.example.test/v1",
+                model="customer/judge",
+                allow_external_data_processing=True,
+                max_response_bytes=1_024,
+            ),
+            client=client,
+        )
+        with pytest.raises(ValueError, match="max_response_bytes"):
+            await judge.evaluate(
+                JudgeRequest(
+                    evaluator_id="bounded",
+                    mode="rubric",
+                    rubric="Judge the answer.",
+                    payload={"answer": "hello"},
+                )
+            )
+
+
+async def test_openai_compatible_judge_rejects_credential_echoes() -> None:
+    credential = "provider-credential-sentinel"
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "message": {
+                            "content": json.dumps(
+                                {
+                                    "score": 1,
+                                    "label": "clear",
+                                    "explanation": credential,
+                                    "citations": ["/payload/answer"],
+                                }
+                            )
+                        }
+                    }
+                ]
+            },
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
+        judge = OpenAICompatibleEvaluatorJudge(
+            OpenAICompatibleJudgeConfig(
+                base_url="https://models.example.test/v1",
+                model="customer/judge",
+                api_key=credential,
+                allow_external_data_processing=True,
+            ),
+            client=client,
+        )
+        with pytest.raises(ValueError, match="configured credential"):
+            await judge.evaluate(
+                JudgeRequest(
+                    evaluator_id="secret-echo",
+                    mode="rubric",
+                    rubric="Judge the answer.",
+                    payload={"answer": "hello"},
+                )
+            )
+
+
+async def test_openai_compatible_judge_has_an_absolute_response_deadline() -> None:
+    class SlowResponseStream(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            while True:
+                await asyncio.sleep(0.02)
+                yield b" "
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, stream=SlowResponseStream())
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
+        judge = OpenAICompatibleEvaluatorJudge(
+            OpenAICompatibleJudgeConfig(
+                base_url="https://models.example.test/v1",
+                model="customer/judge",
+                allow_external_data_processing=True,
+                timeout_seconds=0.01,
+            ),
+            client=client,
+        )
+        with pytest.raises(TimeoutError):
+            await judge.evaluate(
+                JudgeRequest(
+                    evaluator_id="deadline",
+                    mode="rubric",
+                    rubric="Judge the answer.",
+                    payload={"answer": "hello"},
+                )
+            )
+
+
+class ResponseOnlyEnvironment:
+    environment_id = "response-only"
+    config_sha256 = "a" * 64
+    capabilities = EnvironmentCapabilities(
+        supports_conversations=False,
+        supports_state_observation=False,
+        cancellation_guarantee="guaranteed",
+    )
+
+    def api_calls_for_case(self, case: EvaluationCase) -> int:
+        return len(case.turns)
+
+    async def execute(self, case: EvaluationCase) -> ExecutionEvidence:
+        response = {"status": "scheduled"}
+        return ExecutionEvidence(
+            evidence_scope="response_only",
+            case_id=case.id,
+            environment_id=self.environment_id,
+            environment_config_sha256=self.config_sha256,
+            turns=(EnvironmentTurnEvidence(turn_id=case.turns[0].id, response=response),),
+            final_response=response,
+            lifecycle=EnvironmentLifecycleEvidence(
+                terminal_status="succeeded",
+                completed_phases=("execute_turn",),
+                delivery="certain",
+                cleanup="not_attempted",
+                environment_state_uncertain=False,
+            ),
+        )
+
+
+async def test_evaluate_case_executes_attached_evaluators_after_the_environment() -> None:
+    case = EvaluationCase(
+        id="case-with-evaluators",
+        turns=(
+            ConversationTurn(
+                id="turn-1", role=ConversationRole.USER, content="Schedule the payment."
+            ),
+        ),
+        max_environment_api_calls=1,
+        timeout_seconds=5,
+        evaluators=(
+            ExactValueEvaluator(
+                id="scheduled",
+                source="answer",
+                json_pointer="/status",
+                expected="scheduled",
+            ),
+        ),
+    )
+
+    result = await evaluate_case(case, ResponseOnlyEnvironment())
+
+    assert isinstance(result, EvaluationCaseResult)
+    assert result.execution_evidence is not None
+    assert result.evaluation_results.results[0].status == "passed"

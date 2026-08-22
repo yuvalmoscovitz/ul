@@ -1,8 +1,15 @@
 from __future__ import annotations
 
-from typing import Annotated, Literal, Self
+from typing import Annotated, Literal, Self, cast
 
-from pydantic import ConfigDict, Field, JsonValue, model_validator
+from pydantic import (
+    ConfigDict,
+    Field,
+    JsonValue,
+    SerializerFunctionWrapHandler,
+    model_serializer,
+    model_validator,
+)
 
 from ul_core.models import ToolCall, ULModel
 
@@ -33,11 +40,31 @@ class JsonPropertyEvaluator(_EvaluatorSpecModel):
 
     @model_validator(mode="after")
     def validate_operator_parameters(self) -> Self:
-        if self.operator == "type" and self.expected_type is None:
-            raise ValueError("type checks require expected_type")
-        if self.operator != "type" and self.expected_type is not None:
-            raise ValueError("expected_type is only valid for type checks")
+        expected_was_set = "expected" in self.model_fields_set
+        if self.operator == "type":
+            if self.expected_type is None:
+                raise ValueError("type checks require expected_type")
+            if expected_was_set:
+                raise ValueError("expected is not valid for type checks")
+        elif self.operator == "equals":
+            if not expected_was_set:
+                raise ValueError("equals checks require expected")
+            if self.expected_type is not None:
+                raise ValueError("expected_type is only valid for type checks")
+        elif expected_was_set or self.expected_type is not None:
+            raise ValueError("existence checks do not accept expected values or types")
         return self
+
+    @model_serializer(mode="wrap")
+    def serialize_operator_parameters(
+        self, handler: SerializerFunctionWrapHandler
+    ) -> dict[str, object]:
+        serialized = cast(dict[str, object], handler(self))
+        if self.operator != "equals":
+            serialized.pop("expected", None)
+        if self.operator != "type":
+            serialized.pop("expected_type", None)
+        return serialized
 
 
 class ToolCallEvaluator(_EvaluatorSpecModel):
@@ -54,6 +81,24 @@ class StateChangeEvaluator(_EvaluatorSpecModel):
     operator: Literal["changed", "unchanged", "equals"]
     expected: JsonValue = None
 
+    @model_validator(mode="after")
+    def validate_operator_parameters(self) -> Self:
+        expected_was_set = "expected" in self.model_fields_set
+        if self.operator == "equals" and not expected_was_set:
+            raise ValueError("equals state checks require expected")
+        if self.operator != "equals" and expected_was_set:
+            raise ValueError("changed and unchanged state checks do not accept expected")
+        return self
+
+    @model_serializer(mode="wrap")
+    def serialize_operator_parameters(
+        self, handler: SerializerFunctionWrapHandler
+    ) -> dict[str, object]:
+        serialized = cast(dict[str, object], handler(self))
+        if self.operator != "equals":
+            serialized.pop("expected", None)
+        return serialized
+
 
 class HttpResultEvaluator(_EvaluatorSpecModel):
     type: Literal["http_result"] = "http_result"
@@ -63,9 +108,19 @@ class HttpResultEvaluator(_EvaluatorSpecModel):
 
     @model_validator(mode="after")
     def validate_assertion(self) -> Self:
+        expected_body_was_set = "expected_body_value" in self.model_fields_set
         if self.status_code is None and self.body_json_pointer is None:
             raise ValueError("HTTP evaluators require a status or body assertion")
+        if (self.body_json_pointer is None) != (not expected_body_was_set):
+            raise ValueError("HTTP body pointers and expected values must be provided together")
         return self
+
+    @model_serializer(mode="wrap")
+    def serialize_body_assertion(self, handler: SerializerFunctionWrapHandler) -> dict[str, object]:
+        serialized = cast(dict[str, object], handler(self))
+        if self.body_json_pointer is None:
+            serialized.pop("expected_body_value", None)
+        return serialized
 
 
 class CallableEvaluator(_EvaluatorSpecModel):
@@ -145,10 +200,10 @@ class EvaluatorEvidence(_StrictModel):
         "initial_state",
         "final_state",
         "http_result",
+        "judge_payload",
         "callable",
-        "judge",
     ]
-    json_pointer: str = ""
+    json_pointer: str = Field(default="", max_length=2_000)
     description: str = Field(min_length=1, max_length=1_000)
 
 
@@ -157,7 +212,7 @@ class EvaluatorDecision(_StrictModel):
     score: float | None = Field(default=None, ge=0, le=1)
     label: str | None = Field(default=None, min_length=1, max_length=500)
     explanation: str = Field(min_length=1, max_length=5_000)
-    evidence: tuple[EvaluatorEvidence, ...] = ()
+    evidence: tuple[EvaluatorEvidence, ...] = Field(default=(), max_length=20)
 
 
 class EvaluatorResult(_StrictModel):
@@ -168,7 +223,7 @@ class EvaluatorResult(_StrictModel):
     score: float | None = Field(default=None, ge=0, le=1)
     label: str | None = Field(default=None, min_length=1, max_length=500)
     explanation: str = Field(min_length=1, max_length=5_000)
-    evidence: tuple[EvaluatorEvidence, ...] = ()
+    evidence: tuple[EvaluatorEvidence, ...] = Field(default=(), max_length=20)
 
 
 class EvaluationResults(_StrictModel):
