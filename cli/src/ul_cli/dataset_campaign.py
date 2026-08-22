@@ -3,7 +3,13 @@ from __future__ import annotations
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
-from ul import DatasetAugmentationResult, DatasetSemanticSettings, InteractionRecord
+from ul import (
+    DatasetAugmentationResult,
+    DatasetSemanticSettings,
+    EvaluatorPreflightProfilePlan,
+    InteractionRecord,
+    plan_evaluator_preflight_profiles,
+)
 from ul_core.augmentation_catalog import BuiltinAugmentationSpec, builtin_augmentation_catalog
 
 
@@ -56,6 +62,7 @@ class DatasetCampaignPlan(_StrictModel):
     schema_version: Literal["1.0.0"] = "1.0.0"
     examples: tuple[CampaignExamplePlan, ...]
     calls: CampaignCallCounts
+    preflight_profiles: tuple[EvaluatorPreflightProfilePlan, ...]
     tokens: CampaignTokenRange
     money: CampaignMoneyRange | None = None
     warnings: tuple[str, ...] = ()
@@ -67,8 +74,6 @@ _DETERMINISTIC_OPERATORS = {
     "input.surface.typing_noise",
     "input.surface.disfluency_repeat",
 }
-_MAXIMUM_PREFLIGHT_PROFILE_CALLS = 3
-_MAXIMUM_PREFLIGHT_COMPLETION_TOKENS = 16 * _MAXIMUM_PREFLIGHT_PROFILE_CALLS
 
 
 def create_dataset_campaign_plan(
@@ -131,13 +136,15 @@ def create_dataset_campaign_plan(
         + equivalence_calls
         + trial_evaluator_calls
     )
-    total_semantic_calls = evaluator_calls + generation_calls + _MAXIMUM_PREFLIGHT_PROFILE_CALLS
+    preflight_profiles = plan_evaluator_preflight_profiles(settings)
+    preflight_calls = len(preflight_profiles)
+    total_semantic_calls = evaluator_calls + generation_calls + preflight_calls
 
     deconstruction_calls = (
         source_deconstruction_calls + candidate_deconstruction_calls + trial_evaluator_calls
     )
     maximum_completion_tokens = (
-        _MAXIMUM_PREFLIGHT_COMPLETION_TOKENS
+        sum(profile.max_completion_tokens for profile in preflight_profiles)
         + deconstruction_calls * settings.max_output_tokens
         + generation_calls * settings.max_render_tokens
         + equivalence_calls * min(settings.max_output_tokens, 1_024)
@@ -179,12 +186,13 @@ def create_dataset_campaign_plan(
             repetitions=repetitions,
             repetition_executions=execution_calls,
             retries=0,
-            preflight=_MAXIMUM_PREFLIGHT_PROFILE_CALLS,
+            preflight=preflight_calls,
             evaluators=evaluator_calls,
             variation_generation=generation_calls,
             total_semantic_model=total_semantic_calls,
             total_environment_api=execution_calls * target_calls_per_execution,
         ),
+        preflight_profiles=preflight_profiles,
         tokens=CampaignTokenRange(minimum=0, maximum=maximum_completion_tokens),
         warnings=tuple(warnings),
     )
