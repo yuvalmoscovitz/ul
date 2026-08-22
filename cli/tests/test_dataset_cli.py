@@ -738,7 +738,7 @@ def test_dry_run_validates_and_makes_no_external_calls(
     assert "Dataset valid: 2 interaction(s)" in result.output
     assert "Selected interactions: 1" in result.output
     assert "Repetitions: 3 per original and accepted variation" in result.output
-    assert "Potential semantic model calls: up to 10" in result.output
+    assert "Potential semantic model calls: up to 9" in result.output
     assert "Potential environment API calls: up to 30" in result.output
     assert "authorized maximum: 100" in result.output
     assert "Semantic models receive historical inputs and outputs" in result.output
@@ -753,6 +753,111 @@ def test_dry_run_validates_and_makes_no_external_calls(
     assert "estimate a production failure rate" in result.output
     assert "No model or environment API requests sent." in result.output
     assert "Transfer 100" not in result.output
+
+
+def test_dry_run_json_exposes_per_example_campaign_and_exact_call_plan(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    dataset = tmp_path / "interactions.jsonl"
+    target_config = tmp_path / "target.json"
+    _write_dataset(dataset, [_record()])
+    _write_target_config(target_config)
+
+    def unexpected_deconstructor(*args: object, **kwargs: object) -> None:
+        raise AssertionError("campaign planning constructed a semantic model client")
+
+    def unexpected_target(*args: object, **kwargs: object) -> None:
+        raise AssertionError("campaign planning constructed a target client")
+
+    monkeypatch.setattr(main, "create_semantic_model_deconstructor", unexpected_deconstructor)
+    monkeypatch.setattr(main.JsonHttpEnvironmentConnection, "from_config", unexpected_target)
+    result = runner.invoke(
+        root_app,
+        [
+            "dataset",
+            "evaluate",
+            str(dataset),
+            "--operator",
+            "input.surface.disfluency_repeat",
+            "--environment-config",
+            str(target_config),
+            "--repetitions",
+            "2",
+            "--dry-run",
+            "--json",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["inspection_model_calls"] == 0
+    assert payload["inspection_environment_calls"] == 0
+    assert payload["calls"] == {
+        "basis": "authorized_maximum",
+        "baseline": 2,
+        "variation": 2,
+        "repetitions": 2,
+        "repetition_executions": 4,
+        "retries": 0,
+        "evaluators": 7,
+        "variation_generation": 0,
+        "total_semantic_model": 7,
+        "total_environment_api": 20,
+    }
+    planned_operator = next(
+        operator
+        for operator in payload["examples"][0]["operators"]
+        if operator["id"] == "input.surface.disfluency_repeat"
+    )
+    assert planned_operator["status"] == "conditional"
+    assert planned_operator["selected"] is True
+    assert "deterministic and free" in planned_operator["reasons"][1]
+    assert payload["money"] is None
+
+
+def test_campaign_plan_exposes_precomputed_candidate_without_new_generation() -> None:
+    evaluation_result = _evaluation_result("interaction-1", has_review_finding=True)
+    plan = main.create_dataset_campaign_plan(
+        records=(evaluation_result.source,),
+        selected_operator_ids=("input.surface.rephrase",),
+        repetitions=1,
+        target_calls_per_execution=1,
+        settings=main.load_dataset_semantic_settings(),
+        saved_augmentations={evaluation_result.source.id: evaluation_result.augmentation},
+    )
+
+    planned_operator = next(
+        operator
+        for operator in plan.examples[0].operators
+        if operator.id == "input.surface.rephrase"
+    )
+    assert planned_operator.status == "eligible"
+    assert (
+        planned_operator.candidate_input
+        == evaluation_result.augmentation.candidates[0].augmented_input
+    )
+    assert plan.calls.variation_generation == 0
+    assert any("sensitive data" in warning for warning in plan.warnings)
+
+
+def test_campaign_plan_warns_about_missing_review_and_provider_parameters() -> None:
+    source = _evaluation_result("interaction-1").source
+    plan = main.create_dataset_campaign_plan(
+        records=(source,),
+        selected_operator_ids=("input.tone.frustrated",),
+        repetitions=1,
+        target_calls_per_execution=1,
+        settings=cast(
+            Any,
+            _settings(
+                semantic_provider_id="private-provider",
+                semantic_provider_type="openai-compatible",
+            ),
+        ),
+    )
+
+    assert any("no automatic customer evaluator" in warning for warning in plan.warnings)
+    assert any("strict JSON-schema" in warning for warning in plan.warnings)
 
 
 def test_augmentation_persistence_options_are_discoverable_at_80_columns(

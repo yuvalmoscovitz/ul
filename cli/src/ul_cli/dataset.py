@@ -72,6 +72,7 @@ from ul_cli.dataset_augmentation_ledger import (
     open_augmentation_ledger_for_resume,
     read_augmentation_ledger,
 )
+from ul_cli.dataset_campaign import DatasetCampaignPlan, create_dataset_campaign_plan
 from ul_cli.dataset_ingest import app as ingest_app
 from ul_cli.dataset_review import (
     DatasetEvidenceRedactionCoverage,
@@ -544,6 +545,10 @@ def evaluate_dataset(
         bool,
         typer.Option(help="Validate and show the execution plan without external calls."),
     ] = False,
+    json_output: Annotated[
+        bool,
+        typer.Option("--json", help="Emit the dry-run campaign plan as stable JSON."),
+    ] = False,
     resume: Annotated[
         Path | None,
         typer.Option(
@@ -601,6 +606,8 @@ def evaluate_dataset(
     Discover operators: ul augmentations list --mode dataset_variation
     Augmentation retention: --augmentations-output PATH or --no-save-augmentations
     """
+    if json_output and not dry_run:
+        raise typer.BadParameter("--json requires --dry-run", param_hint="--json")
     if augmentations_output is not None and no_save_augmentations:
         raise typer.BadParameter(
             "--augmentations-output cannot be used with --no-save-augmentations",
@@ -821,12 +828,15 @@ def evaluate_dataset(
         )
         skipped_count = len(resume_evidence.processed_ids)
 
-    potential_target_calls = (
-        len(selected_records)
-        * repetitions
-        * (1 + len(selected_operators))
-        * target_calls_per_execution
+    campaign_plan = create_dataset_campaign_plan(
+        records=selected_records,
+        selected_operator_ids=selected_operators,
+        repetitions=repetitions,
+        target_calls_per_execution=target_calls_per_execution,
+        settings=settings,
+        saved_augmentations=saved_augmentations,
     )
+    potential_target_calls = campaign_plan.calls.total_environment_api
     if potential_target_calls > max_environment_api_calls:
         raise typer.BadParameter(
             f"remaining selection would make up to {potential_target_calls} environment API calls, "
@@ -867,6 +877,8 @@ def evaluate_dataset(
                 redaction_engine.policy.digest if redaction_engine is not None else None
             ),
             redaction_coverage=redaction_coverage,
+            campaign_plan=campaign_plan,
+            json_output=json_output,
         )
         return
 
@@ -1400,13 +1412,14 @@ def _print_dataset_plan(
     semantic_endpoint_sha256: str,
     redaction_policy_sha256: str | None,
     redaction_coverage: tuple[DatasetEvidenceRedactionCoverage, ...],
+    campaign_plan: DatasetCampaignPlan,
+    json_output: bool,
 ) -> None:
-    potential_target_calls = (
-        selected_count * repetitions * (1 + len(operator_ids)) * target_calls_per_execution
-    )
-    potential_model_calls = selected_count * (
-        1 + 3 * len(operator_ids) + repetitions * (1 + len(operator_ids))
-    )
+    if json_output:
+        typer.echo(json.dumps(campaign_plan.model_dump(mode="json"), ensure_ascii=False, indent=2))
+        return
+    potential_target_calls = campaign_plan.calls.total_environment_api
+    potential_model_calls = campaign_plan.calls.total_semantic_model
     console.print(f"Dataset valid: {record_count} interaction(s)")
     if skipped_count:
         console.print(
@@ -1425,6 +1438,20 @@ def _print_dataset_plan(
         console.print("Additional model calls for customer invariants: 0")
         console.print("Additional environment API calls for customer invariants: 0")
     console.print(f"Potential semantic model calls: up to {potential_model_calls}")
+    console.print(
+        "Planned maximum calls: "
+        f"baseline={campaign_plan.calls.baseline}, "
+        f"variation={campaign_plan.calls.variation}, "
+        f"repetition_executions={campaign_plan.calls.repetition_executions}, "
+        f"repetition_rounds={campaign_plan.calls.repetitions}, "
+        f"retries={campaign_plan.calls.retries}, "
+        f"evaluators={campaign_plan.calls.evaluators}"
+    )
+    console.print(
+        "Estimated completion tokens: "
+        f"{campaign_plan.tokens.minimum}..{campaign_plan.tokens.maximum}"
+    )
+    console.print("Estimated monetary cost: unavailable (no trusted pricing configured)")
     console.print(
         f"Semantic provider: {semantic_provider_id} "
         f"(endpoint sha256: {semantic_endpoint_sha256[:12]})"
@@ -1450,6 +1477,21 @@ def _print_dataset_plan(
         console.print("Adapter tier: isolated-response (response evidence only)")
     target_status = "configured" if target_configured else "not configured"
     console.print(f"Customer-managed environment API: {target_status}")
+    console.print("Operator applicability by interaction")
+    for example in campaign_plan.examples:
+        console.print(f"  {example.interaction_id}")
+        for planned_operator in example.operators:
+            selected_label = " selected" if planned_operator.selected else ""
+            console.print(
+                f"    {planned_operator.status.upper()} {planned_operator.id}@"
+                f"{planned_operator.version}{selected_label}"
+            )
+            for reason in planned_operator.reasons:
+                console.print(f"      Reason: {reason}")
+            if planned_operator.candidate_input is not None:
+                console.print(f"      Candidate input: {planned_operator.candidate_input}")
+    for warning in campaign_plan.warnings:
+        console.print(f"Warning: {warning}")
     if output is not None:
         console.print(f"Evidence destination: {output}")
     if augmentations_output is None:
