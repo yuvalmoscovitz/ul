@@ -27,6 +27,7 @@ from ul import (
     DatasetEvaluationTrialSet,
     DatasetSemanticSettings,
     DatasetTargetLifecycleFailure,
+    EvaluatorModelCompatibilityError,
     InteractionRecord,
     LocalPseudonymStore,
     ProviderDiagnosticError,
@@ -1079,6 +1080,9 @@ def evaluate_dataset(
             results = asyncio.run(evaluation_coroutine)
             for result in results:
                 has_review_findings |= _result_needs_review(result)
+    except EvaluatorModelCompatibilityError as error:
+        _print_dataset_plain(f"Evaluation stopped before campaign execution: {error}")
+        raise typer.Exit(code=2) from None
     except (TimeoutError, RuntimeError, ValueError, httpx.HTTPError) as error:
         if isinstance(error, ProviderDiagnosticError):
             console.print(str(error))

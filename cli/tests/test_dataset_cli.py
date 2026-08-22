@@ -24,6 +24,7 @@ from ul import (
     DatasetEvaluationResult,
     DatasetEvaluationTrial,
     DatasetEvaluationTrialSet,
+    EvaluatorModelCompatibilityError,
     InteractionRecord,
     JsonHttpEnvironmentConfig,
     JsonHttpIsolatedResponseConfig,
@@ -1023,6 +1024,53 @@ def test_openai_compatible_execution_allows_an_unauthenticated_endpoint(
 
     assert result.exit_code == 0, result.output
     assert output.exists()
+
+
+def test_evaluator_preflight_failure_surfaces_capability_and_safe_action(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    dataset = tmp_path / "interactions.jsonl"
+    output = tmp_path / "results.jsonl"
+    target_config = tmp_path / "target.json"
+    _write_dataset(dataset, [_record()])
+    _write_target_config(target_config)
+    monkeypatch.setenv("UL_LIVE", "true")
+    monkeypatch.setenv("OPEN_ROUTER_API_KEY", "test-key")
+
+    class FakeTarget:
+        @classmethod
+        def from_config(cls, *args: object, **kwargs: object) -> FakeTarget:
+            return cls()
+
+    async def fail_preflight(*args: object, **kwargs: object) -> tuple[object, ...]:
+        raise EvaluatorModelCompatibilityError(
+            "evaluator model is incompatible with required seed capability; "
+            "choose another configured evaluator model or verify the configured route and retry"
+        )
+
+    monkeypatch.setattr(main, "JsonHttpEnvironmentConnection", FakeTarget)
+    monkeypatch.setattr(main, "_evaluate_interaction_records", fail_preflight)
+
+    result = runner.invoke(
+        root_app,
+        [
+            "dataset",
+            "evaluate",
+            str(dataset),
+            "--environment-config",
+            str(target_config),
+            "--allow-environment-network",
+            "--confirm-test-environment",
+            "--output",
+            str(output),
+        ],
+    )
+
+    assert result.exit_code == 2
+    assert "required seed capability" in result.output
+    assert "choose another configured evaluator model" in result.output
+    assert "before campaign execution" in result.output
 
 
 def test_stateful_target_dry_run_counts_physical_lifecycle_calls(
