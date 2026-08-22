@@ -36,7 +36,7 @@ def test_catalog_covers_every_current_augmentation_identity() -> None:
     }
 
     assert catalog_references == dataset_references | scenario_references | stress_references
-    assert len(catalog_references) == 18
+    assert len(catalog_references) == 21
 
 
 def test_catalog_discovery_does_not_change_runtime_metadata() -> None:
@@ -52,3 +52,12 @@ def test_catalog_discovery_does_not_change_runtime_metadata() -> None:
         for augmentation in builtin_augmentation_registry().list(latest_only=False)
     )
     assert after == before
+
+
+def test_dataset_catalog_and_runtime_share_applicability_contracts() -> None:
+    catalog = builtin_augmentation_catalog()
+
+    for operator in builtin_dataset_augmentation_operators():
+        specification = catalog.get(operator.id, operator.version)
+        assert specification.applicability_profile == operator.applicability_profile
+        assert specification.applicability_rule == operator.applicability_rule

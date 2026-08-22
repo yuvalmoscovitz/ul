@@ -140,6 +140,7 @@ def list_augmentations(
         cli_available = "yes" if augmentation.cli_available else "no"
         typer.echo(f"{augmentation.ref.id}@{augmentation.ref.version}")
         typer.echo(f"  scope={augmentation.scope} modes={modes} cli_available={cli_available}")
+        typer.echo(f"  applicability={augmentation.applicability_profile}")
         typer.echo(f"  {augmentation.summary}")
     typer.echo("Use 'ul augmentations show ID[@VERSION]' for requirements and safety details.")
 
@@ -246,6 +247,8 @@ def show_augmentation(
     typer.echo(f"{augmentation.ref.id}@{augmentation.ref.version}")
     typer.echo(f"Summary: {augmentation.summary}")
     typer.echo(f"Scope: {augmentation.scope}")
+    typer.echo(f"Applicability: {augmentation.applicability_profile}")
+    typer.echo(f"Applicability rule: {augmentation.applicability_rule}")
     typer.echo(f"CLI execution available: {'yes' if augmentation.cli_available else 'no'}")
     for binding in augmentation.bindings:
         typer.echo(f"Mode: {binding.mode}")
@@ -852,6 +855,8 @@ def _catalog_item(augmentation: BuiltinAugmentationSpec) -> dict[str, object]:
         "ref": augmentation.ref.model_dump(mode="json"),
         "scope": augmentation.scope,
         "summary": augmentation.summary,
+        "applicability_profile": augmentation.applicability_profile,
+        "applicability_rule": augmentation.applicability_rule,
         "bindings": [
             {
                 **binding.model_dump(mode="json"),

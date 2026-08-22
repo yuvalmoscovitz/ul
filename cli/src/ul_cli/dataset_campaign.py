@@ -22,6 +22,8 @@ class CampaignOperatorPlan(_StrictModel):
     version: str
     status: Literal["eligible", "conditional", "ineligible"]
     selected: bool
+    applicability_profile: Literal["broad", "conditional"]
+    applicability_rule: str
     reasons: tuple[str, ...] = ()
     candidate_input_available: bool = False
     candidate_input: str | None = None
@@ -80,7 +82,11 @@ class DatasetCampaignPlan(_StrictModel):
 
 _DETERMINISTIC_OPERATORS = {
     "input.surface.typing_noise",
+    "input.surface.case_variation",
+    "input.surface.punctuation_noise",
+    "input.surface.grammar_error",
     "input.surface.disfluency_repeat",
+    "input.tone.frustrated",
 }
 
 
@@ -242,6 +248,8 @@ def _operator_plan(
             version=operator.ref.version,
             status="ineligible",
             selected=False,
+            applicability_profile=operator.applicability_profile,
+            applicability_rule=operator.applicability_rule,
             reasons=("operator is not available in dataset evaluation mode",),
         )
     candidate = (
@@ -262,6 +270,8 @@ def _operator_plan(
             version=operator.ref.version,
             status="eligible" if candidate.passed else "ineligible",
             selected=selected,
+            applicability_profile=operator.applicability_profile,
+            applicability_rule=operator.applicability_rule,
             reasons=(
                 ("saved candidate passed semantic qualification",)
                 if candidate.passed
@@ -269,6 +279,24 @@ def _operator_plan(
             ),
             candidate_input_available=True,
             candidate_input=(candidate.augmented_input if show_sensitive_values else None),
+        )
+    saved_skip = (
+        next(
+            (skip for skip in saved_augmentation.skips if skip.operator_id == operator.ref.id),
+            None,
+        )
+        if saved_augmentation is not None
+        else None
+    )
+    if saved_skip is not None:
+        return CampaignOperatorPlan(
+            id=operator.ref.id,
+            version=operator.ref.version,
+            status="ineligible",
+            selected=selected,
+            applicability_profile=operator.applicability_profile,
+            applicability_rule=operator.applicability_rule,
+            reasons=(saved_skip.reason,),
         )
     if saved_augmentation is not None and any(
         reference.id == operator.ref.id for reference in saved_augmentation.operator_references
@@ -278,6 +306,8 @@ def _operator_plan(
             version=operator.ref.version,
             status="ineligible",
             selected=selected,
+            applicability_profile=operator.applicability_profile,
+            applicability_rule=operator.applicability_rule,
             reasons=("saved semantic qualification produced no candidate",),
         )
     deterministic_reason = (
@@ -291,9 +321,15 @@ def _operator_plan(
         version=operator.ref.version,
         status="conditional",
         selected=selected,
+        applicability_profile=operator.applicability_profile,
+        applicability_rule=operator.applicability_rule,
         reasons=(
             *(("operator was not selected",) if not selected else ()),
-            "applicability depends on semantic source qualification performed during execution",
+            (
+                "broad applicability still requires semantic source qualification during execution"
+                if operator.applicability_profile == "broad"
+                else operator.applicability_rule
+            ),
             deterministic_reason,
         ),
     )
