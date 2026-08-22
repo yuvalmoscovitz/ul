@@ -29,6 +29,8 @@ from ul_core.evaluation import (
     EnvironmentTurnEvidence,
     EvaluationCase,
     ExecutionEvidence,
+    ProbeExecutionEvent,
+    ProbeObservation,
 )
 
 _KEY = SecretStr("a-private-test-key-with-at-least-32-bytes")
@@ -286,6 +288,27 @@ class _RecordingEnvironment:
                 value=state,
                 authority="environment_self_reported",
             ),
+            observations=(
+                ProbeObservation(
+                    id=f"observation:{_SECRET}",
+                    source_id="observer-1",
+                    correlation_id="correlation-1",
+                    authority="independent_observer",
+                    status="incomplete",
+                    limitation=f"observer could not inspect {_SECRET}",
+                    traces=({"contact": _SECRET},),
+                    metadata={"contact": _SECRET},
+                    next_checkpoint=f"cursor:{_SECRET}",
+                ),
+            ),
+            execution_events=(
+                ProbeExecutionEvent(
+                    id=f"event:{_SECRET}",
+                    correlation_id="correlation-1",
+                    kind=f"tool_call:{_SECRET}",
+                    payload={"contact": _SECRET},
+                ),
+            ),
             lifecycle=EnvironmentLifecycleEvidence(
                 initial_reset=EnvironmentResetEvidence(
                     reset_session_requested=True,
@@ -353,6 +376,9 @@ async def test_pipeline_is_one_boundary_and_environment_rehydrates(tmp_path: Pat
     assert environment.inputs == [f"Please Email {_SECRET}"]
     assert _SECRET not in protected_evidence.model_dump_json()
     assert "__UL_SECRET_email_" in protected_evidence.model_dump_json()
+    assert protected_evidence.observations[0].id.startswith("observation:__UL_SECRET_email_")
+    assert protected_evidence.execution_events[0].id.startswith("event:__UL_SECRET_email_")
+    assert protected_evidence.execution_events[0].kind.startswith("tool_call:__UL_SECRET_email_")
     for metadata in (frame.metadata, rendered.metadata, assessment.metadata):
         assert metadata == {"redaction_policy_sha256": policy().digest}
         assert _SECRET not in json.dumps(metadata)

@@ -119,6 +119,22 @@ async def test_stateful_fixture_identity_requires_id_and_version() -> None:
         JsonHttpEnvironmentConfig.model_validate(raw)
 
 
+async def test_stateful_http_exposes_separate_invocation_and_state_capabilities() -> None:
+    environment = JsonHttpEnvironmentConnection.from_config(
+        _config(),
+        test_environment_confirmed=True,
+    )
+
+    assert environment.probe_capabilities.invoker.invoker_id == "payments-test"
+    assert environment.probe_capabilities.observation_source is None
+    assert environment.probe_capabilities.state_environment is not None
+    assert environment.evidence_profile.available_facts == frozenset(
+        {"response_observed", "committed_state_verified"}
+    )
+
+    await environment.aclose()
+
+
 def _case(*inputs: str, max_calls: int = 20) -> EvaluationCase:
     return EvaluationCase(
         id="case-1",
@@ -172,8 +188,15 @@ async def test_isolated_response_executes_one_request_and_labels_response_only_e
     assert environment.capabilities.supports_conversations is False
     assert environment.capabilities.supports_state_observation is False
     assert environment.capabilities.request_isolation == "per_request_attested"
+    assert environment.probe_capabilities.invoker.invoker_id == "response-only-test"
+    assert environment.probe_capabilities.state_environment is None
+    assert environment.evidence_profile.available_facts == frozenset({"response_observed"})
     assert evidence.evidence_scope == "response_only"
     assert evidence.final_response == {"message": "done"}
+    assert evidence.turns[0].response_source_id == "response-only-test"
+    assert evidence.turns[0].correlation_id is not None
+    assert evidence.turns[0].correlation_id.startswith("ul-probe-")
+    assert len(evidence.turns[0].correlation_id) < 500
     assert evidence.initial_state is None
     assert evidence.final_state is None
     assert evidence.lifecycle.cleanup == "not_attempted"
@@ -572,6 +595,35 @@ async def test_timeout_after_commit_receipts_are_correlated_and_budgeted() -> No
     assert event.armed is True
     assert event.trigger_status == "fired"
     assert event.cleaned is True
+
+
+async def test_timeout_capable_target_uses_composition_for_ordinary_case() -> None:
+    handler, requests = _successful_handler()
+    case = _case("increase the amount", max_calls=6)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        environment = JsonHttpEnvironmentConnection.from_config(
+            _config(timeout_after_commit=True),
+            test_environment_confirmed=True,
+            max_environment_api_calls=6,
+            client=client,
+        )
+        evidence = await environment.execute(case)
+
+    assert environment.api_calls_for_case(case) == 6
+    assert [path for path, _ in requests] == [
+        "/reset",
+        "/setup",
+        "/snapshot",
+        "/execute",
+        "/snapshot",
+        "/reset",
+    ]
+    assert evidence.lifecycle.terminal_status == "succeeded"
+    assert evidence.timeout_after_commit_event is None
+    assert evidence.turns[0].response_source_id == "payments-test"
+    assert evidence.turns[0].correlation_id is not None
+    assert evidence.turns[0].correlation_id.startswith("ul-probe-")
 
 
 async def test_timeout_after_commit_reserves_control_calls_before_network() -> None:
@@ -979,7 +1031,9 @@ async def test_null_snapshot_is_a_safe_protocol_failure() -> None:
     assert evidence.lifecycle.cleanup_reset is not None
     assert evidence.lifecycle.cleanup_reset.reset_session_acknowledged is True
     assert evidence.lifecycle.cleanup_reset.reset_env_acknowledged is True
-    assert evidence.final_response is None
+    assert evidence.final_response == {"input": "work"}
+    assert evidence.turns[0].response == {"input": "work"}
+    assert evidence.turns[0].state_snapshot is None
     assert [path for path, _ in requests][-1] == "/reset"
 
 

@@ -10,7 +10,7 @@ import socket
 import ssl
 import stat
 import sys
-from collections.abc import Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from pathlib import Path
 from types import TracebackType
 from typing import Any, Literal, Never, Self, cast
@@ -34,11 +34,22 @@ from ul_core.evaluation import (
     EnvironmentStateEvidence,
     EnvironmentTurnEvidence,
     EvaluationCase,
+    EvidenceProfile,
     ExecutionEvidence,
+    ProbeCapabilities,
+    ProbeInvokerCapabilities,
+    ProbeRequest,
+    ProbeResult,
+    StateEnvironmentCapabilities,
+    StateFixtureRequest,
+    StateOperationResult,
+    StateSnapshot,
     TimeoutAfterCommitEventEvidence,
     TimeoutAfterCommitEventRequest,
     TimeoutAfterCommitTriggerStatus,
 )
+
+from ul.probe_execution import CapabilityExecutionError, ComposedEnvironmentExecutor
 
 _HEADER_NAME_PATTERN = re.compile(r"[!#$%&'*+.^_`|~0-9A-Za-z-]+")
 _ENVIRONMENT_VARIABLE_PATTERN = re.compile(r"UL_ENVIRONMENT_[A-Z][A-Z0-9_]*")
@@ -78,7 +89,7 @@ _UNSAFE_HEADER_NAMES = {
 }
 
 
-class _EnvironmentProtocolError(RuntimeError):
+class _EnvironmentProtocolError(CapabilityExecutionError):
     def __init__(
         self,
         code: EnvironmentLifecycleFailureCode,
@@ -88,9 +99,12 @@ class _EnvironmentProtocolError(RuntimeError):
         reset_session_acknowledged: bool = False,
         reset_env_acknowledged: bool = False,
     ) -> None:
-        super().__init__(reason)
-        self.code: EnvironmentLifecycleFailureCode = code
-        self.delivery_uncertain: bool = delivery_uncertain
+        super().__init__(
+            code,
+            reason,
+            delivery_uncertain=delivery_uncertain,
+            _reason_is_safe=True,
+        )
         self.reset_session_acknowledged = reset_session_acknowledged
         self.reset_env_acknowledged = reset_env_acknowledged
 
@@ -448,6 +462,48 @@ def require_stateful_json_http_environment(
     return config
 
 
+class _JsonHttpProbeInvoker:
+    def __init__(
+        self,
+        capabilities: ProbeInvokerCapabilities,
+        invoke: Callable[[ProbeRequest], Awaitable[ProbeResult]],
+    ) -> None:
+        self.capabilities = capabilities
+        self._invoke = invoke
+
+    async def invoke(self, request: ProbeRequest) -> ProbeResult:
+        return await self._invoke(request)
+
+
+class _JsonHttpStateEnvironment:
+    def __init__(
+        self,
+        capabilities: StateEnvironmentCapabilities,
+        *,
+        reset: Callable[[StateFixtureRequest], Awaitable[StateOperationResult]],
+        setup: Callable[[StateFixtureRequest], Awaitable[StateOperationResult]],
+        snapshot: Callable[[StateFixtureRequest], Awaitable[StateSnapshot]],
+        cleanup: Callable[[StateFixtureRequest], Awaitable[StateOperationResult]],
+    ) -> None:
+        self.capabilities = capabilities
+        self._reset = reset
+        self._setup = setup
+        self._snapshot = snapshot
+        self._cleanup = cleanup
+
+    async def reset(self, request: StateFixtureRequest) -> StateOperationResult:
+        return await self._reset(request)
+
+    async def setup(self, request: StateFixtureRequest) -> StateOperationResult:
+        return await self._setup(request)
+
+    async def snapshot(self, request: StateFixtureRequest) -> StateSnapshot:
+        return await self._snapshot(request)
+
+    async def cleanup(self, request: StateFixtureRequest) -> StateOperationResult:
+        return await self._cleanup(request)
+
+
 class JsonHttpEnvironmentConnection:
     def __init__(
         self,
@@ -490,6 +546,53 @@ class JsonHttpEnvironmentConnection:
         self._owns_client = client is None
         self._client = client or httpx.AsyncClient(follow_redirects=False, trust_env=False)
         self.capabilities = json_http_environment_capabilities(config)
+        self._probe_invoker = _JsonHttpProbeInvoker(
+            ProbeInvokerCapabilities(
+                invoker_id=config.environment_id,
+                response_size_limit_bytes=max_response_bytes,
+                supports_conversations=isinstance(config, JsonHttpEnvironmentConfig),
+                request_isolation=(
+                    "per_request_attested"
+                    if isinstance(config, JsonHttpIsolatedResponseConfig)
+                    else "not_attested"
+                ),
+                cancellation_guarantee=(
+                    "none" if isinstance(config, JsonHttpIsolatedResponseConfig) else "best_effort"
+                ),
+            ),
+            self._invoke_probe,
+        )
+        self._state_environment = (
+            _JsonHttpStateEnvironment(
+                StateEnvironmentCapabilities(
+                    environment_id=config.environment_id,
+                    supports_reset=True,
+                    supports_setup=config.setup is not None,
+                    supports_snapshot=True,
+                    supports_cleanup=True,
+                    state_observation_authority="environment_self_reported",
+                    supports_deterministic_replay=(
+                        config.fixture_id is not None and config.fixture_version is not None
+                    ),
+                ),
+                reset=self._state_reset,
+                setup=self._state_setup,
+                snapshot=self._state_snapshot,
+                cleanup=self._state_cleanup,
+            )
+            if isinstance(config, JsonHttpEnvironmentConfig)
+            else None
+        )
+        self._composed_executor = ComposedEnvironmentExecutor(
+            self._probe_invoker,
+            config_sha256=self._config_sha256,
+            state_environment=self._state_environment,
+            fixture_id=(
+                config.fixture_id or config.environment_id
+                if isinstance(config, JsonHttpEnvironmentConfig)
+                else None
+            ),
+        )
 
     @property
     def environment_id(self) -> str:
@@ -498,6 +601,14 @@ class JsonHttpEnvironmentConnection:
     @property
     def config_sha256(self) -> str:
         return self._config_sha256
+
+    @property
+    def probe_capabilities(self) -> ProbeCapabilities:
+        return self._composed_executor.probe_capabilities
+
+    @property
+    def evidence_profile(self) -> EvidenceProfile:
+        return self._composed_executor.evidence_profile
 
     @classmethod
     def from_config(
@@ -563,76 +674,215 @@ class JsonHttpEnvironmentConnection:
         async with self._lifecycle_lock:
             async with asyncio.timeout(case.timeout_seconds):
                 if isinstance(self._config, JsonHttpIsolatedResponseConfig):
-                    return await self._execute_isolated_response(case)
+                    self._reserve_environment_api_calls(required_calls)
+                    return await self._composed_executor.execute(case)
+                if case.timeout_after_commit_event is None:
+                    if self._composed_executor.state_uncertain:
+                        return await self._composed_executor.execute(case)
+                    self._reserve_environment_api_calls(required_calls)
+                    return await self._composed_executor.execute(case)
                 return await self._execute_stateful(case)
 
-    async def _execute_isolated_response(self, case: EvaluationCase) -> ExecutionEvidence:
-        config = cast(JsonHttpIsolatedResponseConfig, self._config)
-        self._reserve_environment_api_calls(1)
-        turn = case.turns[0]
+    async def _invoke_probe(self, request: ProbeRequest) -> ProbeResult:
         try:
+            return await self._invoke_probe_request(request)
+        except (CapabilityExecutionError, asyncio.CancelledError):
+            raise
+        except Exception:
+            raise CapabilityExecutionError(
+                "environment_lifecycle_error",
+                "environment lifecycle failed",
+                delivery_uncertain=True,
+            ) from None
+
+    async def _invoke_probe_request(self, request: ProbeRequest) -> ProbeResult:
+        if not isinstance(request.turn.input, str):
+            raise CapabilityExecutionError(
+                "response_mapping",
+                "HTTP target requires a text turn input",
+            )
+        config = self._config
+        if isinstance(config, JsonHttpIsolatedResponseConfig):
             response = await self._post_for_json(
                 config.execute.url,
                 _replace_request_placeholders(
                     config.execute.request_json_template,
-                    case_id=case.id,
-                    turn_id=turn.id,
-                    raw_input=turn.content,
+                    case_id=request.case_id,
+                    turn_id=request.turn.id,
+                    raw_input=request.turn.input,
                 ),
                 config.execute.response_json_pointer,
                 consume_budget=False,
             )
-        except _EnvironmentProtocolError as error:
-            return self._isolated_response_evidence(
-                case,
-                (),
-                terminal_status="failed",
-                failed_phase="execute_turn",
-                failure_code=error.code,
-                failure_reason=str(error),
-                delivery="uncertain" if error.delivery_uncertain else "certain",
-                environment_state_uncertain=error.delivery_uncertain,
+        else:
+            payload = await self._post_for_json(
+                config.execute_turn.url,
+                _replace_request_placeholders(
+                    config.execute_turn.request_json_template,
+                    case_id=request.case_id,
+                    turn_id=request.turn.id,
+                    raw_input=request.turn.input,
+                ),
+                "",
+                consume_budget=False,
             )
-        return self._isolated_response_evidence(
-            case,
-            (EnvironmentTurnEvidence(turn_id=turn.id, response=response),),
-            terminal_status="succeeded",
-            failed_phase=None,
-            failure_code=None,
-            failure_reason=None,
-            delivery="certain",
-            environment_state_uncertain=False,
+            self._validate_response_identity(
+                payload,
+                environment_id_pointer=config.execute_turn.environment_id_json_pointer,
+                case_id_pointer=config.execute_turn.case_id_json_pointer,
+                case_id=request.case_id,
+                turn_id_pointer=config.execute_turn.turn_id_json_pointer,
+                turn_id=request.turn.id,
+            )
+            response = _resolve_json_pointer(
+                payload,
+                config.execute_turn.response_json_pointer,
+            )
+        return ProbeResult(
+            id=f"{request.correlation_id}:result",
+            correlation_id=request.correlation_id,
+            response=response,
+            response_size_bytes=len(
+                json.dumps(
+                    response,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            ),
         )
 
-    def _isolated_response_evidence(
-        self,
-        case: EvaluationCase,
-        turns: tuple[EnvironmentTurnEvidence, ...],
-        *,
-        terminal_status: Literal["succeeded", "failed"],
-        failed_phase: str | None,
-        failure_code: EnvironmentLifecycleFailureCode | None,
-        failure_reason: str | None,
-        delivery: Literal["certain", "uncertain"],
-        environment_state_uncertain: bool,
-    ) -> ExecutionEvidence:
-        return ExecutionEvidence(
-            evidence_scope="response_only",
-            case_id=case.id,
-            environment_id=self._config.environment_id,
-            environment_config_sha256=self._config_sha256,
-            turns=turns,
-            final_response=turns[-1].response if turns else None,
-            lifecycle=EnvironmentLifecycleEvidence(
-                terminal_status=terminal_status,
-                completed_phases=("execute_turn",) if turns else (),
-                failed_phase=failed_phase,
-                failure_code=failure_code,
-                failure_reason=failure_reason,
-                delivery=delivery,
-                cleanup="not_attempted",
-                environment_state_uncertain=environment_state_uncertain,
+    async def _state_reset(self, request: StateFixtureRequest) -> StateOperationResult:
+        return await self._state_reset_operation(request, "reset")
+
+    async def _state_cleanup(self, request: StateFixtureRequest) -> StateOperationResult:
+        return await self._state_reset_operation(request, "cleanup")
+
+    async def _state_setup(self, request: StateFixtureRequest) -> StateOperationResult:
+        config = cast(JsonHttpEnvironmentConfig, self._config)
+        setup = config.setup
+        if setup is None:
+            raise CapabilityExecutionError(
+                "environment_lifecycle_error",
+                "HTTP state environment does not support setup",
+            )
+        response = await self._post_for_json(
+            setup.url,
+            _replace_request_placeholders(
+                setup.request_json_template,
+                case_id=request.case_id,
             ),
+            "",
+            consume_budget=False,
+        )
+        self._validate_response_identity(
+            response,
+            environment_id_pointer=setup.environment_id_json_pointer,
+            case_id_pointer=setup.case_id_json_pointer,
+            case_id=request.case_id,
+        )
+        return self._state_operation_result(request, "setup")
+
+    async def _state_snapshot(self, request: StateFixtureRequest) -> StateSnapshot:
+        config = cast(JsonHttpEnvironmentConfig, self._config)
+        turn_id = request.turn_id or _INITIAL_STATE_TURN_ID
+        value = await self._snapshot(
+            config.snapshot,
+            request.case_id,
+            turn_id,
+            allow_null=turn_id == _INITIAL_STATE_TURN_ID,
+        )
+        return StateSnapshot(
+            id=f"{request.correlation_id}:snapshot",
+            fixture_id=request.fixture_id,
+            correlation_id=request.correlation_id,
+            source_id=config.environment_id,
+            value=value,
+            authority="environment_self_reported",
+        )
+
+    async def _state_reset_operation(
+        self,
+        request: StateFixtureRequest,
+        operation: Literal["reset", "cleanup"],
+    ) -> StateOperationResult:
+        config = cast(JsonHttpEnvironmentConfig, self._config)
+        try:
+            reset_session, reset_environment = await self._reset(
+                config.reset,
+                request.case_id,
+            )
+        except asyncio.CancelledError:
+            raise
+        except _EnvironmentProtocolError as error:
+            failed_result = StateOperationResult(
+                id=f"{request.correlation_id}:{operation}",
+                fixture_id=request.fixture_id,
+                correlation_id=request.correlation_id,
+                operation=operation,
+                succeeded=False,
+                reset_session_requested=config.reset.reset_session,
+                reset_session_acknowledged=error.reset_session_acknowledged,
+                reset_environment_requested=config.reset.reset_env,
+                reset_environment_acknowledged=error.reset_env_acknowledged,
+                state_uncertain=error.delivery_uncertain,
+                failure_code=error.code,
+                failure_reason=f"environment {operation} failed",
+            )
+            raise CapabilityExecutionError(
+                error.code,
+                str(error),
+                delivery_uncertain=error.delivery_uncertain,
+                not_delivered=isinstance(error, _TargetNotDeliveredError),
+                state_operation_result=failed_result,
+                _reason_is_safe=True,
+            ) from error
+        except Exception:
+            return StateOperationResult(
+                id=f"{request.correlation_id}:{operation}",
+                fixture_id=request.fixture_id,
+                correlation_id=request.correlation_id,
+                operation=operation,
+                succeeded=False,
+                reset_session_requested=config.reset.reset_session,
+                reset_environment_requested=config.reset.reset_env,
+                state_uncertain=True,
+                failure_code=(
+                    "environment_cleanup_error"
+                    if operation == "cleanup"
+                    else "environment_lifecycle_error"
+                ),
+                failure_reason=(
+                    "environment cleanup failed"
+                    if operation == "cleanup"
+                    else "environment lifecycle failed"
+                ),
+            )
+        return self._state_operation_result(
+            request,
+            operation,
+            reset_session=reset_session,
+            reset_environment=reset_environment,
+        )
+
+    def _state_operation_result(
+        self,
+        request: StateFixtureRequest,
+        operation: Literal["reset", "setup", "cleanup"],
+        *,
+        reset_session: bool = False,
+        reset_environment: bool = False,
+    ) -> StateOperationResult:
+        config = cast(JsonHttpEnvironmentConfig, self._config)
+        return StateOperationResult(
+            id=f"{request.correlation_id}:{operation}",
+            fixture_id=request.fixture_id,
+            correlation_id=request.correlation_id,
+            operation=operation,
+            succeeded=True,
+            reset_session_requested=(config.reset.reset_session if operation != "setup" else False),
+            reset_session_acknowledged=reset_session,
+            reset_environment_requested=(config.reset.reset_env if operation != "setup" else False),
+            reset_environment_acknowledged=reset_environment,
         )
 
     async def _execute_stateful(self, case: EvaluationCase) -> ExecutionEvidence:
