@@ -111,6 +111,14 @@ def _config(
     return JsonHttpEnvironmentConfig.model_validate(raw)
 
 
+async def test_stateful_fixture_identity_requires_id_and_version() -> None:
+    raw = _config().model_dump(mode="json")
+    raw["fixture_id"] = "standard-account"
+
+    with pytest.raises(ValidationError, match="fixture_id and fixture_version"):
+        JsonHttpEnvironmentConfig.model_validate(raw)
+
+
 def _case(*inputs: str, max_calls: int = 20) -> EvaluationCase:
     return EvaluationCase(
         id="case-1",
