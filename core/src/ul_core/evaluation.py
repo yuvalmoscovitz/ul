@@ -5,6 +5,7 @@ from typing import Literal, Self
 
 from pydantic import ConfigDict, Field, JsonValue, model_validator
 
+from ul_core.evaluators import EvaluatorSpec
 from ul_core.models import ConversationTurn, ULModel
 
 StateObservationAuthority = Literal["environment_self_reported", "independent_observer"]
@@ -110,6 +111,7 @@ class EvaluationCase(_StrictModel):
     required_state_observation_authority: StateObservationAuthority | None = None
     required_state_observer_id: str | None = Field(default=None, min_length=1, max_length=500)
     timeout_after_commit_event: TimeoutAfterCommitEventRequest | None = None
+    evaluators: tuple[EvaluatorSpec, ...] = ()
 
     @model_validator(mode="after")
     def validate_identifiers(self) -> Self:
@@ -118,6 +120,9 @@ class EvaluationCase(_StrictModel):
         turn_ids = tuple(turn.id for turn in self.turns)
         if len(turn_ids) != len(set(turn_ids)):
             raise ValueError("evaluation case turn identifiers must be unique")
+        evaluator_ids = tuple(evaluator.id for evaluator in self.evaluators)
+        if len(evaluator_ids) != len(set(evaluator_ids)):
+            raise ValueError("evaluation case evaluator identifiers must be unique")
         if (
             self.timeout_after_commit_event is not None
             and self.timeout_after_commit_event.turn_id not in turn_ids

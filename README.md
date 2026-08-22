@@ -59,6 +59,8 @@ session and a clean external environment; both are required by default. If you a
 mapping, use `--environment-config environment.json` instead of `--environment-url`.
 The fixture identity names the resettable business state used by the run. Change its version whenever
 that state or setup logic changes. See [Design valid test cases](docs/test-cases.md).
+For objective assertions, model-judged rubrics, pairwise preference, and human review in custom SDK
+workflows, see [Customer-defined evaluators](docs/evaluators.md).
 
 To connect an existing response-only JSON endpoint that starts every request from isolated state:
 

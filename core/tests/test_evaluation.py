@@ -14,6 +14,13 @@ from ul_core.evaluation import (
     TimeoutAfterCommitEventEvidence,
     TimeoutAfterCommitEventRequest,
 )
+from ul_core.evaluators import (
+    HttpResultEvaluator,
+    JsonPropertyEvaluator,
+    RubricEvaluator,
+    StateChangeEvaluator,
+    ToolCallEvaluator,
+)
 from ul_core.models import ConversationRole, ConversationTurn
 
 
@@ -42,6 +49,99 @@ def test_evaluation_case_rejects_duplicate_turn_identifiers() -> None:
             max_environment_api_calls=10,
             timeout_seconds=30,
         )
+
+
+def test_evaluation_case_accepts_multiple_customer_evaluators() -> None:
+    evaluation_case = EvaluationCase(
+        id="case-1",
+        turns=(_turn(),),
+        max_environment_api_calls=10,
+        timeout_seconds=30,
+        evaluators=(
+            ToolCallEvaluator(
+                id="payment-call",
+                tool_name="execute_payment",
+                arguments={"invoice_id": "INV-42"},
+            ),
+            RubricEvaluator(
+                id="answer-quality", rubric="The answer must clearly describe the outcome."
+            ),
+        ),
+    )
+
+    assert EvaluationCase.model_validate_json(evaluation_case.model_dump_json()) == evaluation_case
+
+
+def test_evaluation_case_rejects_duplicate_evaluator_identifiers() -> None:
+    with pytest.raises(ValidationError, match="evaluator identifiers must be unique"):
+        EvaluationCase(
+            id="case-1",
+            turns=(_turn(),),
+            max_environment_api_calls=10,
+            timeout_seconds=30,
+            evaluators=(
+                ToolCallEvaluator(id="duplicate", tool_name="first"),
+                ToolCallEvaluator(id="duplicate", tool_name="second"),
+            ),
+        )
+
+
+def test_evaluators_reject_parameters_the_selected_operator_would_ignore() -> None:
+    with pytest.raises(ValidationError, match="existence checks"):
+        JsonPropertyEvaluator(
+            id="exists",
+            source="answer",
+            json_pointer="/value",
+            operator="exists",
+            expected=True,
+        )
+    with pytest.raises(ValidationError, match="existence checks"):
+        JsonPropertyEvaluator(
+            id="not-exists",
+            source="answer",
+            json_pointer="/value",
+            operator="not_exists",
+            expected=False,
+        )
+    with pytest.raises(ValidationError, match="not valid for type checks"):
+        JsonPropertyEvaluator(
+            id="type",
+            source="answer",
+            json_pointer="/value",
+            operator="type",
+            expected=True,
+            expected_type="boolean",
+        )
+    with pytest.raises(ValidationError, match="require expected"):
+        JsonPropertyEvaluator(
+            id="equals",
+            source="answer",
+            json_pointer="/value",
+            operator="equals",
+        )
+    with pytest.raises(ValidationError, match="do not accept expected"):
+        StateChangeEvaluator(id="changed", operator="changed", expected="ignored")
+    with pytest.raises(ValidationError, match="do not accept expected"):
+        StateChangeEvaluator(id="unchanged", operator="unchanged", expected="ignored")
+    with pytest.raises(ValidationError, match="require expected"):
+        StateChangeEvaluator(id="equals", operator="equals")
+    with pytest.raises(ValidationError, match="provided together"):
+        HttpResultEvaluator(id="http", status_code=200, expected_body_value=True)
+    with pytest.raises(ValidationError, match="provided together"):
+        HttpResultEvaluator(id="http", body_json_pointer="/ok")
+
+
+def test_operator_specific_evaluators_round_trip_without_ignored_default_fields() -> None:
+    evaluators = (
+        JsonPropertyEvaluator(
+            id="exists", source="answer", json_pointer="/value", operator="exists"
+        ),
+        StateChangeEvaluator(id="changed", operator="changed"),
+        HttpResultEvaluator(id="http", status_code=202),
+    )
+
+    for evaluator in evaluators:
+        assert type(evaluator).model_validate_json(evaluator.model_dump_json()) == evaluator
 
 
 def test_evaluation_case_rejects_production_routing_metadata() -> None:
