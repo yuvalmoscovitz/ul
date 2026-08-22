@@ -22,6 +22,7 @@ from ul import (
     DatasetAugmentationResult,
     DatasetEvaluationCase,
     DatasetEvaluationFinding,
+    DatasetEvaluationMode,
     DatasetEvaluationResult,
     DatasetEvaluationRunner,
     DatasetEvaluationTrialSet,
@@ -116,9 +117,10 @@ _FINDING_LABELS = {
     "changed_grounded_effect_argument": "changed action value",
 }
 _BEHAVIORAL_LIMITATIONS = (
-    "UL compares observed action behavior only. It does not determine whether the original or "
-    "variation is correct, prove that the variation caused a difference, or estimate a "
-    "production failure rate."
+    "Evaluation mode is variance. UL compares fresh original replays with generated variations. "
+    "Historical output is grounding evidence, not an expected answer. UL does not determine "
+    "whether the original or variation is correct, prove that the variation caused a difference, "
+    "or estimate a production failure rate."
 )
 _ISOLATED_ADAPTER_PRESETS: dict[str, tuple[JsonValue, str]] = {
     "generic-json": ({"input": "{{input}}"}, "/response"),
@@ -180,6 +182,14 @@ def initialize_dataset_environment(
         str | None,
         typer.Option(help="Stable evidence name; isolated mode defaults to the endpoint host."),
     ] = None,
+    fixture_id: Annotated[
+        str | None,
+        typer.Option(help="Stable stateful fixture name recorded with every run."),
+    ] = None,
+    fixture_version: Annotated[
+        str | None,
+        typer.Option(help="Version of the stateful fixture recorded with every run."),
+    ] = None,
     request_json_template: Annotated[
         str | None,
         typer.Option(
@@ -213,6 +223,16 @@ def initialize_dataset_environment(
         raise typer.BadParameter(
             "isolated-response setup requires --confirm-safe-test-target",
             param_hint="--confirm-safe-test-target",
+        )
+    if (fixture_id is None) != (fixture_version is None):
+        raise typer.BadParameter(
+            "--fixture-id and --fixture-version must be provided together",
+            param_hint="--fixture-id",
+        )
+    if adapter_tier == "isolated-response" and fixture_id is not None:
+        raise typer.BadParameter(
+            "fixture identity applies only to --adapter-tier stateful-lifecycle",
+            param_hint="--fixture-id",
         )
     isolated_options_used = (
         isolated_preset != "generic-json"
@@ -283,6 +303,8 @@ def initialize_dataset_environment(
                 {
                     "version": 5,
                     "environment_id": ENVIRONMENT_ID_PLACEHOLDER,
+                    "fixture_id": fixture_id,
+                    "fixture_version": fixture_version,
                     "headers_from_env": {},
                     "reset": {
                         "url": f"{base_url}/reset",
@@ -497,6 +519,16 @@ def evaluate_dataset(
             help="Strict declarative customer invariant configuration.",
         ),
     ] = None,
+    evaluation_mode: Annotated[
+        DatasetEvaluationMode,
+        typer.Option(
+            "--evaluation-mode",
+            help=(
+                "Evaluation intent. Variance compares fresh original replays with variations; "
+                "correctness and preference evaluators are not implemented."
+            ),
+        ),
+    ] = "variance",
     operator: Annotated[
         list[str] | None,
         typer.Option(
@@ -616,6 +648,12 @@ def evaluate_dataset(
     if (json_output or show_sensitive_values) and not dry_run:
         option = "--show-sensitive-values" if show_sensitive_values else "--json"
         raise typer.BadParameter(f"{option} requires --dry-run", param_hint=option)
+    if evaluation_mode != "variance":
+        raise typer.BadParameter(
+            f"evaluation mode '{evaluation_mode}' is not implemented; use 'variance'. "
+            "Historical dataset output is grounding evidence, not an expected answer.",
+            param_hint="--evaluation-mode",
+        )
     if augmentations_output is not None and no_save_augmentations:
         raise typer.BadParameter(
             "--augmentations-output cannot be used with --no-save-augmentations",
@@ -760,6 +798,7 @@ def evaluate_dataset(
             _dataset_evidence_run_context(
                 selected_records=selected_records,
                 selected_operator_ids=selected_operators,
+                evaluation_mode=evaluation_mode,
                 repetitions=repetitions,
                 invariant_suite=invariant_suite,
                 target_config=normalized_target_config,
@@ -860,6 +899,7 @@ def evaluate_dataset(
             selected_count=len(selected_records),
             skipped_count=skipped_count,
             operator_ids=selected_operators,
+            evaluation_mode=evaluation_mode,
             target_configured=environment_config is not None,
             target_endpoint=(
                 json_http_environment_config_urls(loaded_target_config)[0]
@@ -875,6 +915,21 @@ def evaluate_dataset(
             target_supports_state_observation=(
                 json_http_environment_capabilities(loaded_target_config).supports_state_observation
                 if loaded_target_config is not None
+                else None
+            ),
+            fixture_status=(
+                run_context.fixture.status
+                if run_context is not None and run_context.fixture is not None
+                else None
+            ),
+            fixture_id=(
+                run_context.fixture.id
+                if run_context is not None and run_context.fixture is not None
+                else None
+            ),
+            fixture_version=(
+                run_context.fixture.version
+                if run_context is not None and run_context.fixture is not None
                 else None
             ),
             invariant_suite=invariant_suite,
@@ -952,6 +1007,12 @@ def evaluate_dataset(
         )
 
     assert run_context is not None
+    assert run_context.fixture is not None
+    _print_fixture_identity(
+        run_context.fixture.status,
+        fixture_id=run_context.fixture.id,
+        fixture_version=run_context.fixture.version,
+    )
     if not settings.live_calls:
         raise typer.BadParameter(
             "set UL_LIVE=true (or UL_DATASET_LIVE_CALLS=true) to allow semantic model calls"
@@ -1369,6 +1430,7 @@ def _dataset_evidence_run_context(
     *,
     selected_records: tuple[InteractionRecord, ...],
     selected_operator_ids: tuple[str, ...],
+    evaluation_mode: Literal["variance"] = "variance",
     repetitions: int,
     invariant_suite: DatasetInvariantSuite | None,
     target_config: JsonHttpTargetConfig | None,
@@ -1381,6 +1443,7 @@ def _dataset_evidence_run_context(
         operators=tuple(
             _dataset_operator_identity(reference) for reference in selected_operator_ids
         ),
+        evaluation_mode=evaluation_mode,
         repetitions=repetitions,
         invariant_suite_sha256=(invariant_suite.sha256 if invariant_suite is not None else None),
         target_config=target_config,
@@ -1407,6 +1470,7 @@ def _print_dataset_plan(
     selected_count: int,
     skipped_count: int,
     operator_ids: tuple[str, ...],
+    evaluation_mode: Literal["variance"],
     target_configured: bool,
     target_endpoint: str | None,
     target_header_environment_variables: dict[str, str],
@@ -1414,6 +1478,9 @@ def _print_dataset_plan(
     max_environment_api_calls: int,
     target_calls_per_execution: int,
     target_supports_state_observation: bool | None,
+    fixture_status: Literal["configured", "missing", "not_required"] | None,
+    fixture_id: str | None,
+    fixture_version: str | None,
     invariant_suite: DatasetInvariantSuite | None,
     output: Path | None,
     augmentations_output: Path | None,
@@ -1438,6 +1505,10 @@ def _print_dataset_plan(
     else:
         console.print(f"Selected interactions: {selected_count}")
     console.print(f"Operators: {', '.join(operator_ids)}")
+    console.print(
+        f"Evaluation mode: {evaluation_mode} (historical output is not an expected answer; "
+        "correctness not assessed)"
+    )
     console.print(f"Repetitions: {repetitions} per original and accepted variation")
     if invariant_suite is None:
         console.print("Customer invariants: none")
@@ -1518,6 +1589,12 @@ def _print_dataset_plan(
             f"{unselected_eligible} eligible, {unselected_ineligible} ineligible "
             "(use --json for full detail)"
         )
+    if fixture_status is not None:
+        _print_fixture_identity(
+            fixture_status,
+            fixture_id=fixture_id,
+            fixture_version=fixture_version,
+        )
     if output is not None:
         console.print(f"Evidence destination: {output}")
     if augmentations_output is None:
@@ -1562,6 +1639,23 @@ def _print_dataset_plan(
         "causality, or estimate a production failure rate."
     )
     console.print("No model or environment API requests sent.")
+
+
+def _print_fixture_identity(
+    status: Literal["configured", "missing", "not_required"],
+    *,
+    fixture_id: str | None,
+    fixture_version: str | None,
+) -> None:
+    if status == "configured":
+        _print_dataset_plain(f"Fixture: {fixture_id}@{fixture_version}")
+    elif status == "missing":
+        console.print(
+            "Warning: stateful target has no fixture identity; add fixture_id and "
+            "fixture_version so findings can be reproduced."
+        )
+    else:
+        console.print("Fixture: not required for isolated-response target")
 
 
 def _default_augmentations_output(evidence_output: Path) -> Path:
@@ -1718,6 +1812,11 @@ async def _evaluate_interaction_records(
             semantic_pipeline,
             evaluation_target,
             allow_network_egress=allow_network_egress,
+            evaluation_mode=(
+                run_context.evaluation_mode
+                if run_context is not None and run_context.evaluation_mode is not None
+                else "variance"
+            ),
         )
         for record in records:
             precomputed_augmentation = (
@@ -1776,6 +1875,14 @@ def _print_dataset_results(
     invariant_evaluations: tuple[DatasetInvariantEvaluation, ...] = (),
     show_report_guidance: bool = True,
 ) -> None:
+    evaluation_modes = {getattr(result, "evaluation_mode", "variance") for result in results}
+    if len(evaluation_modes) > 1:
+        raise ValueError("dataset results contain incompatible evaluation modes")
+    evaluation_mode = next(iter(evaluation_modes), "variance")
+    console.print(
+        f"Evaluation mode: {evaluation_mode} (historical output is not an expected answer; "
+        "correctness not assessed)"
+    )
     table = Table(title="Dataset evaluation")
     table.add_column("Case", style="cyan")
     table.add_column("Augmentation")
@@ -1927,6 +2034,7 @@ def _customer_evidence_record(
     run_context: DatasetEvidenceRunContext | None = None,
     invariant_evaluation: DatasetInvariantEvaluation | None = None,
 ) -> dict[str, JsonValue]:
+    evaluation_mode = cast(Literal["variance"], getattr(result, "evaluation_mode", "variance"))
     cases: list[JsonValue] = []
     for case in result.cases:
         cases.append(
@@ -1956,12 +2064,9 @@ def _customer_evidence_record(
     )
     if uses_extended_invariants and run_context is None:
         raise ValueError("extended invariant evidence requires a resumable run context")
-    if uses_extended_invariants or run_context is not None:
-        evidence_schema_version = "1.7.0"
-    else:
-        evidence_schema_version = "1.4.0"
     evidence: dict[str, JsonValue] = {
-        "schema_version": evidence_schema_version,
+        "schema_version": "1.8.0",
+        "evaluation_mode": evaluation_mode,
         "interaction_id": result.source.id,
         "original_input": result.source.raw_input,
         "execution_plan": {

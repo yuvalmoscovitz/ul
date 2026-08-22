@@ -90,6 +90,10 @@ def test_init_creates_private_project_and_generated_environment(
         "2",
         "--max-environment-api-calls",
         "12",
+        "--fixture-id",
+        "standard-account",
+        "--fixture-version",
+        "v3",
     )
 
     config_path = tmp_path / ".ul" / "config.json"
@@ -103,6 +107,7 @@ def test_init_creates_private_project_and_generated_environment(
         "environment_config": ".ul/environment.json",
         "environment_origin": "https://environment.example",
         "invariants": None,
+        "evaluation_mode": "variance",
         "redaction_policy": None,
         "redaction_policy_sha256": None,
         "redaction_state": None,
@@ -117,6 +122,9 @@ def test_init_creates_private_project_and_generated_environment(
     }
     assert len(environment_config_sha256) == 64
     assert environment_path.is_file()
+    environment_config = json.loads(environment_path.read_text(encoding="utf-8"))
+    assert environment_config["fixture_id"] == "standard-account"
+    assert environment_config["fixture_version"] == "v3"
     assert (tmp_path / ".ul" / ".gitignore").read_text(encoding="utf-8") == "*\n"
     if hasattr(stat, "S_IMODE"):
         assert stat.S_IMODE(config_path.stat().st_mode) == 0o600
@@ -518,6 +526,7 @@ def test_run_discovers_parent_project_and_applies_one_run_overrides(
     assert received["environment_config"] == tmp_path / ".ul" / "environment.json"
     assert received["limit"] == 1
     assert received["repetitions"] == 4
+    assert received["evaluation_mode"] == "variance"
     assert received["operator"] == ["input.surface.rephrase"]
     assert received["allow_environment_network"] is True
     assert received["confirm_test_environment"] is True
@@ -549,6 +558,37 @@ def test_run_threads_sensitive_dry_run_opt_in(
     assert received["dry_run"] is True
     assert received["json_output"] is True
     assert received["show_sensitive_values"] is True
+
+
+@pytest.mark.parametrize("evaluation_mode", ["correctness", "preference"])
+def test_init_rejects_unimplemented_evaluation_modes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    evaluation_mode: str,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    dataset = tmp_path / "interactions.jsonl"
+    _write_dataset(dataset)
+
+    result = runner.invoke(
+        app,
+        [
+            "init",
+            str(dataset),
+            "--environment-url",
+            "https://environment.example",
+            "--evaluation-mode",
+            evaluation_mode,
+            "--allow-environment-network",
+            "--confirm-test-environment",
+        ],
+        terminal_width=240,
+    )
+
+    assert result.exit_code == 2
+    compact_output = _compact_plain_output(result.output.replace("│", ""))
+    assert f"evaluationmode'{evaluation_mode}'isnotimplemented" in compact_output
+    assert not (tmp_path / ".ul").exists()
 
 
 def test_init_persists_redaction_and_retention_choices(
