@@ -1212,8 +1212,13 @@ def test_campaign_plan_keeps_unattempted_operators_conditional() -> None:
 
     unattempted_operator = operators["input.surface.typing_noise"]
     assert unattempted_operator.status == "conditional"
+    assert unattempted_operator.applicability_profile == "broad"
     assert unattempted_operator.selected is False
     assert "operator was not selected" in unattempted_operator.reasons
+
+    self_correction = operators["input.intent.self_correction"]
+    assert self_correction.applicability_profile == "conditional"
+    assert "numeric, monetary, date, or duration" in self_correction.applicability_rule
 
 
 def test_human_dry_run_escapes_untrusted_ids_and_summarizes_unselected_catalog(
@@ -1245,7 +1250,7 @@ def test_human_dry_run_escapes_untrusted_ids_and_summarizes_unselected_catalog(
     assert "\\u001b" in result.output
     assert "[bold]spoof[/bold]" in result.output
     assert "Unselected catalog operators:" in result.output
-    assert "0 eligible, 7 conditional, 10 ineligible" in result.output
+    assert "0 eligible, 10 conditional, 10 ineligible" in result.output
     assert "use --json for full detail" in " ".join(result.output.split())
     assert "input.surface.typing_noise@" not in result.output
 
@@ -3250,8 +3255,11 @@ def test_legacy_operator_list_delegates_to_catalog_and_keeps_existing_call_accou
         "input.intent.self_correction@1.0.0:",
         "input.style.terse@1.0.0:",
         "input.style.verbose@1.0.0:",
+        "input.surface.case_variation@1.0.0:",
         "input.surface.disfluency_repeat@1.0.0:",
         "input.surface.fragmented_syntax@1.0.0:",
+        "input.surface.grammar_error@1.0.0:",
+        "input.surface.punctuation_noise@1.0.0:",
         "input.surface.rephrase@1.0.0:",
         "input.surface.typing_noise@1.0.0:",
         "input.tone.frustrated@1.0.0:",

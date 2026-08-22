@@ -14,7 +14,7 @@ def test_builtin_catalog_is_unique_sorted_and_immutable() -> None:
     catalog = builtin_augmentation_catalog()
     references = tuple((item.ref.id, item.ref.version) for item in catalog.list())
 
-    assert len(references) == 18
+    assert len(references) == 21
     assert references == tuple(sorted(references))
     assert len(references) == len(set(references))
     with pytest.raises(ValidationError, match="frozen"):
@@ -71,11 +71,24 @@ def test_dataset_augmentation_declares_actual_execution_requirements() -> None:
     assert requirements.customer_evaluator is False
 
 
+def test_dataset_applicability_contracts_are_discoverable_before_execution() -> None:
+    catalog = builtin_augmentation_catalog()
+    broad = catalog.get("input.surface.grammar_error")
+    conditional = catalog.get("input.intent.self_correction")
+
+    assert broad.applicability_profile == "broad"
+    assert "nonempty user input" in broad.applicability_rule
+    assert conditional.applicability_profile == "conditional"
+    assert "numeric, monetary, date, or duration" in conditional.applicability_rule
+
+
 def test_catalog_rejects_duplicate_references() -> None:
     spec = BuiltinAugmentationSpec(
         ref=AugmentationRef(id="input.example", version="1.0.0"),
         scope="input",
         summary="Example augmentation.",
+        applicability_profile="conditional",
+        applicability_rule="Applies to examples.",
         bindings=(
             AugmentationBinding(
                 mode="scenario_materialization",
@@ -151,6 +164,8 @@ def test_latest_version_is_selected_before_cli_and_mode_filters() -> None:
         ref=AugmentationRef(id="input.example", version="1.0.0"),
         scope="input",
         summary="Old CLI-backed implementation.",
+        applicability_profile="broad",
+        applicability_rule="Applies to nonempty inputs.",
         bindings=(
             AugmentationBinding(
                 mode="dataset_variation",
@@ -164,6 +179,8 @@ def test_latest_version_is_selected_before_cli_and_mode_filters() -> None:
         ref=AugmentationRef(id="input.example", version="2.0.0"),
         scope="input",
         summary="Current SDK-only implementation.",
+        applicability_profile="conditional",
+        applicability_rule="Applies to example scenarios.",
         bindings=(
             AugmentationBinding(
                 mode="scenario_materialization",

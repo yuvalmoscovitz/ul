@@ -348,6 +348,7 @@ async def test_engine_skips_semantically_ambiguous_nodes() -> None:
     result = await DatasetAugmentationEngine(model, model).augment((record,))
 
     assert result.candidates == ()
+    assert result.skips[0].reason == "Source semantics contain ambiguous elements."
     assert model.rendered_inputs == []
 
 
@@ -363,6 +364,7 @@ async def test_engine_skips_unresolved_source_and_rejects_unresolved_candidate()
     skipped = await DatasetAugmentationEngine(source_model, source_model).augment((record,))
 
     assert skipped.candidates == ()
+    assert skipped.skips[0].reason == "Source semantics contain unresolved elements."
     candidate_frame = source_frame(record, identifier_prefix="candidate").model_copy(
         update={"outcomes": ()}
     )
@@ -463,6 +465,9 @@ async def test_builtin_operator_library_is_fixed_versioned_and_reviewable() -> N
     assert tuple(operator.id for operator in operators) == (
         "input.surface.rephrase",
         "input.surface.typing_noise",
+        "input.surface.case_variation",
+        "input.surface.punctuation_noise",
+        "input.surface.grammar_error",
         "input.surface.fragmented_syntax",
         "input.surface.disfluency_repeat",
         "input.style.terse",
@@ -475,6 +480,9 @@ async def test_builtin_operator_library_is_fixed_versioned_and_reviewable() -> N
         "input.tone.frustrated",
         "input.intent.self_correction",
     ]
+    assert [
+        operator.id for operator in operators if operator.applicability_profile == "conditional"
+    ] == ["input.intent.self_correction"]
     frustrated_instruction = next(
         operator.instruction for operator in operators if operator.id == "input.tone.frustrated"
     )
@@ -786,6 +794,8 @@ async def test_self_correction_skips_ineligible_sources(ineligible_reason: str) 
     )
 
     assert result.candidates == ()
+    assert result.skips[0].operator_id == "input.intent.self_correction"
+    assert "numeric, monetary, date, or duration" in result.skips[0].reason
     assert model.rendered_inputs == []
 
 
@@ -804,12 +814,6 @@ async def test_self_correction_skips_ineligible_sources(ineligible_reason: str) 
             "verbose",
             "hey could you transfer 100 to alice and then please let me know the balance",
             False,
-        ),
-        (
-            "input.tone.frustrated",
-            "frustrated",
-            "ugh transfer 100 to alice then tell me the balance",
-            True,
         ),
     ],
 )
@@ -842,6 +846,25 @@ async def test_behavior_operators_allow_only_their_communication_change(
         "seed": 42,
         "transformation_prompts": prompt_provenance(f"augmentation.{operator_id}"),
     }
+
+
+async def test_frustrated_tone_is_deterministic_visible_and_verbatim() -> None:
+    record = source_record()
+    original_frame = source_frame(record)
+    candidate_frame = behavior_candidate_frame(record, "frustrated")
+    model = DeterministicSemanticModel({record.id: original_frame}, candidate_frame)
+
+    result = await DatasetAugmentationEngine(model, model).augment(
+        (record,), operator_ids=("input.tone.frustrated",)
+    )
+
+    candidate = result.candidates[0]
+    assert candidate.passed
+    assert candidate.augmented_input == f"Ugh, {record.raw_input}"
+    assert candidate.human_review_required
+    assert model.rendered_inputs == []
+    assert candidate.renderer_metadata["algorithm"] == "frustration_interjection_prefix"
+    assert candidate.renderer_metadata["transformation_prompts"] == []
 
 
 async def test_behavior_operator_rejects_relations_touching_its_marker() -> None:
@@ -1030,6 +1053,52 @@ async def test_typing_noise_is_deterministic_protects_factors_and_needs_no_model
     assert candidate.renderer_metadata["renderer"] == "deterministic"
     assert candidate.renderer_metadata["algorithm"] == "protected_adjacent_transposition"
     assert candidate.renderer_metadata["transformation_prompts"] == []
+
+
+@pytest.mark.parametrize(
+    ("operator_id", "target_kind", "expected_input", "algorithm"),
+    (
+        (
+            "input.surface.case_variation",
+            "typing_noise",
+            "transfer 100 to Alice, then tell me the balance.",
+            "single_ascii_letter_case_toggle",
+        ),
+        (
+            "input.surface.punctuation_noise",
+            "typing_noise",
+            "Transfer 100 to Alice,, then tell me the balance.",
+            "single_punctuation_duplication_or_terminal_period",
+        ),
+        (
+            "input.surface.grammar_error",
+            "fragmented_syntax",
+            "Me need you to: Transfer 100 to Alice, then tell me the balance.",
+            "pronoun_case_error_request_prefix",
+        ),
+    ),
+)
+async def test_broad_surface_operators_are_deterministic_and_preserve_source_text(
+    operator_id: str,
+    target_kind: str,
+    expected_input: str,
+    algorithm: str,
+) -> None:
+    record = source_record()
+    original_frame = source_frame(record)
+    candidate_frame = behavior_candidate_frame(record, target_kind)
+    model = DeterministicSemanticModel({record.id: original_frame}, candidate_frame)
+
+    result = await DatasetAugmentationEngine(model, model).augment(
+        (record,), operator_ids=(operator_id,)
+    )
+
+    candidate = result.candidates[0]
+    assert candidate.passed
+    assert candidate.augmented_input == expected_input
+    assert candidate.renderer_metadata["algorithm"] == algorithm
+    assert candidate.renderer_metadata["transformation_prompts"] == []
+    assert model.rendered_inputs == []
 
 
 async def test_word_repetition_is_deterministic_and_protects_factors() -> None:

@@ -2,6 +2,7 @@
 
 from ul_core.augmentation import builtin_augmentation_registry
 from ul_core.augmentation_catalog import (
+    AugmentationApplicabilityProfile,
     AugmentationBinding,
     AugmentationExecutionOwner,
     AugmentationRef,
@@ -79,6 +80,7 @@ from ul.dataset_augmentation import (
     DatasetAugmentationEngine,
     DatasetAugmentationOperator,
     DatasetAugmentationResult,
+    DatasetAugmentationSkip,
     builtin_dataset_augmentation_operators,
     resolve_dataset_augmentation_operator,
 )
@@ -241,6 +243,7 @@ from ul.trace_replay import (
 __all__ = [
     "Action",
     "ActionEffect",
+    "AugmentationApplicabilityProfile",
     "AugmentationBinding",
     "AugmentationExecutionOwner",
     "AugmentationQualificationAttempt",
@@ -269,6 +272,7 @@ __all__ = [
     "DatasetAugmentationEngine",
     "DatasetAugmentationOperator",
     "DatasetAugmentationResult",
+    "DatasetAugmentationSkip",
     "DatasetEvaluationBaseline",
     "DatasetEvaluationCase",
     "DatasetEvaluationFinding",

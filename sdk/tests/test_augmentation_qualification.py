@@ -98,7 +98,7 @@ def test_every_dataset_operator_version_produces_a_reproducible_report() -> None
 
     reports = []
     for operator in builtin_dataset_augmentation_operators():
-        profile = "conditional" if operator.id == "input.intent.self_correction" else "broad"
+        profile = operator.applicability_profile
         attempts = _attempts(corpus, operator, profile=profile)
         report = create_augmentation_qualification_report(
             operator=operator,
@@ -349,13 +349,10 @@ def test_qualification_loader_rejects_named_pipes_without_blocking(tmp_path: Pat
 
 def test_corpus_requires_every_qualification_segment() -> None:
     corpus = load_augmentation_qualification_corpus(_FIXTURE)
-    replacement = corpus.cases[0].model_copy(
-        update={"record": corpus.cases[0].record.model_copy(update={"id": "short-second"})}
-    )
 
     with pytest.raises(ValidationError, match="missing segments"):
         AugmentationQualificationCorpus(
             name=corpus.name,
             version=corpus.version,
-            cases=(*corpus.cases[:-1], replacement),
+            cases=tuple(case for case in corpus.cases if case.segment != "short"),
         )

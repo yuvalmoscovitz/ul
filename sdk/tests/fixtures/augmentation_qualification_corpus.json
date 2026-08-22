@@ -73,6 +73,78 @@
           "payment_reference": "PAY-9001"
         }
       }
+    },
+    {
+      "segment": "short",
+      "record": {
+        "schema_version": "1.0.0",
+        "id": "short-access",
+        "raw_input": "Revoke Sam's Atlas access.",
+        "metadata": {},
+        "raw_observed_output": {"status": "revoked", "user": "Sam", "system": "Atlas"}
+      }
+    },
+    {
+      "segment": "long",
+      "record": {
+        "schema_version": "1.0.0",
+        "id": "long-travel",
+        "raw_input": "Find one refundable flight from London to Paris for next Thursday, choose the lowest fare that includes one checked bag, reserve it under traveler Morgan Reed, and return the booking reference without purchasing any upgrades.",
+        "metadata": {},
+        "raw_observed_output": {
+          "status": "reserved",
+          "origin": "London",
+          "destination": "Paris",
+          "traveler": "Morgan Reed",
+          "refundable": true,
+          "checked_bags": 1
+        }
+      }
+    },
+    {
+      "segment": "factual",
+      "record": {
+        "schema_version": "1.0.0",
+        "id": "factual-payroll",
+        "raw_input": "Change Jordan's payroll deposit account to 7710 starting September 1.",
+        "metadata": {},
+        "raw_observed_output": {
+          "status": "updated",
+          "employee": "Jordan",
+          "account": "7710",
+          "effective_date": "September 1"
+        }
+      }
+    },
+    {
+      "segment": "conversational",
+      "record": {
+        "schema_version": "1.0.0",
+        "id": "conversational-claim",
+        "raw_input": "Hey, can you open a parked-car damage claim under policy PA-8821 and send me the claim number?",
+        "metadata": {},
+        "raw_observed_output": {
+          "status": "opened",
+          "policy": "PA-8821",
+          "incident": "parked-car damage",
+          "claim_number": "CL-71"
+        }
+      }
+    },
+    {
+      "segment": "tool_oriented",
+      "record": {
+        "schema_version": "1.0.0",
+        "id": "tool-document",
+        "raw_input": "Attach the July payslip to case SNAP-204, verify the upload succeeded, then return the attachment ID.",
+        "metadata": {},
+        "raw_observed_output": {
+          "status": "attached",
+          "case_id": "SNAP-204",
+          "document": "July payslip",
+          "attachment_id": "ATT-19"
+        }
+      }
     }
   ]
 }

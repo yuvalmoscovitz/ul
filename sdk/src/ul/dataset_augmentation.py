@@ -30,6 +30,9 @@ _PROMPTS = PromptManager.instance()
 OperatorId = Literal[
     "input.surface.rephrase",
     "input.surface.typing_noise",
+    "input.surface.case_variation",
+    "input.surface.punctuation_noise",
+    "input.surface.grammar_error",
     "input.surface.fragmented_syntax",
     "input.surface.disfluency_repeat",
     "input.style.terse",
@@ -42,10 +45,14 @@ AllowedChange = Literal[
     "declared_communication_form",
     "structured_self_correction",
 ]
+OperatorApplicabilityProfile = Literal["broad", "conditional"]
 
 _OPERATOR_PROMPT_NAMES: dict[OperatorId, str] = {
     "input.surface.rephrase": "augmentation.input.surface.rephrase",
     "input.surface.typing_noise": "augmentation.input.surface.typing_noise",
+    "input.surface.case_variation": "augmentation.input.surface.case_variation",
+    "input.surface.punctuation_noise": "augmentation.input.surface.punctuation_noise",
+    "input.surface.grammar_error": "augmentation.input.surface.grammar_error",
     "input.surface.fragmented_syntax": "augmentation.input.surface.fragmented_syntax",
     "input.surface.disfluency_repeat": "augmentation.input.surface.disfluency_repeat",
     "input.style.terse": "augmentation.input.style.terse",
@@ -61,6 +68,11 @@ class DatasetAugmentationOperator(ULModel):
         default="1.0.0", pattern=r"^(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)$"
     )
     instruction: str = Field(min_length=1)
+    applicability_profile: OperatorApplicabilityProfile = "broad"
+    applicability_rule: str = Field(
+        default="Applies to any nonempty user input with qualified source semantics.",
+        min_length=1,
+    )
     allowed_change: AllowedChange
     target_communication_kind: str | None = Field(default=None, min_length=1)
     target_marker_required: bool = False
@@ -90,6 +102,24 @@ _BUILTIN_OPERATORS = (
         instruction=_PROMPTS.get_prompt("augmentation.input.surface.typing_noise"),
         allowed_change="declared_communication_form",
         target_communication_kind="typing_noise",
+    ),
+    DatasetAugmentationOperator(
+        id="input.surface.case_variation",
+        instruction=_PROMPTS.get_prompt("augmentation.input.surface.case_variation"),
+        allowed_change="declared_communication_form",
+        target_communication_kind="typing_noise",
+    ),
+    DatasetAugmentationOperator(
+        id="input.surface.punctuation_noise",
+        instruction=_PROMPTS.get_prompt("augmentation.input.surface.punctuation_noise"),
+        allowed_change="declared_communication_form",
+        target_communication_kind="typing_noise",
+    ),
+    DatasetAugmentationOperator(
+        id="input.surface.grammar_error",
+        instruction=_PROMPTS.get_prompt("augmentation.input.surface.grammar_error"),
+        allowed_change="declared_communication_form",
+        target_communication_kind="fragmented_syntax",
     ),
     DatasetAugmentationOperator(
         id="input.surface.fragmented_syntax",
@@ -131,6 +161,11 @@ _BUILTIN_OPERATORS = (
         target_communication_kind="self_correction",
         target_marker_required=True,
         human_review_required=True,
+        applicability_profile="conditional",
+        applicability_rule=(
+            "Applies only when one explicit numeric, monetary, date, or duration value can be "
+            "temporarily misstated and immediately corrected without ambiguity."
+        ),
     ),
 )
 _BUILTIN_OPERATORS_BY_REFERENCE = {
@@ -183,11 +218,22 @@ class DatasetAugmentationOperatorReference(ULModel):
     )
 
 
+class DatasetAugmentationSkip(ULModel):
+    source_interaction_id: str = Field(min_length=1)
+    operator_id: OperatorId
+    operator_version: str = Field(
+        default="1.0.0",
+        pattern=r"^(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)$",
+    )
+    reason: str = Field(min_length=1)
+
+
 class DatasetAugmentationResult(ULModel):
     operator_references: tuple[DatasetAugmentationOperatorReference, ...] = Field(min_length=1)
     source_records: tuple[InteractionRecord, ...]
     source_frames: tuple[SemanticFrame, ...]
     candidates: tuple[DatasetAugmentationCandidate, ...]
+    skips: tuple[DatasetAugmentationSkip, ...] = ()
 
     @model_validator(mode="after")
     def validate_operator_plan(self) -> Self:
@@ -212,6 +258,24 @@ class DatasetAugmentationResult(ULModel):
             ) from None
         if candidate_positions != tuple(sorted(candidate_positions)):
             raise ValueError("augmentation candidates must follow requested operator order")
+        source_ids = {record.id for record in self.source_records}
+        skip_references = tuple((skip.operator_id, skip.operator_version) for skip in self.skips)
+        if any(reference not in positions for reference in skip_references):
+            raise ValueError("augmentation skip is outside the requested operator plan")
+        if any(skip.source_interaction_id not in source_ids for skip in self.skips):
+            raise ValueError("augmentation skip references an unknown source interaction")
+        candidate_keys = {
+            (candidate.source_interaction_id, candidate.operator_id, candidate.operator_version)
+            for candidate in self.candidates
+        }
+        skip_keys = tuple(
+            (skip.source_interaction_id, skip.operator_id, skip.operator_version)
+            for skip in self.skips
+        )
+        if len(skip_keys) != len(set(skip_keys)):
+            raise ValueError("augmentation result contains duplicate skips")
+        if candidate_keys & set(skip_keys):
+            raise ValueError("augmentation result cannot both generate and skip an operator")
         return self
 
 
@@ -250,18 +314,24 @@ class DatasetAugmentationEngine:
             raise ValueError(f"candidate count exceeds maximum of {self.maximum_candidates}")
         source_frames: list[SemanticFrame] = []
         candidates: list[DatasetAugmentationCandidate] = []
+        skips: list[DatasetAugmentationSkip] = []
         for record in source_records:
             source_frame = await self._deconstructor.deconstruct(record)
             if source_frame.interaction_id != record.id:
                 raise ValueError("deconstructed frame must reference its source interaction")
             source_frames.append(source_frame)
             expected_input_frame = _input_only_frame(source_frame)
-            if (
-                not expected_input_frame.request_units
-                or not source_frame.outcomes
-                or _has_unresolved_nodes(source_frame)
-                or _has_ambiguous_nodes(expected_input_frame)
-            ):
+            source_skip_reason = _source_skip_reason(source_frame, expected_input_frame)
+            if source_skip_reason is not None:
+                skips.extend(
+                    DatasetAugmentationSkip(
+                        source_interaction_id=record.id,
+                        operator_id=operator.id,
+                        operator_version=operator.version,
+                        reason=source_skip_reason,
+                    )
+                    for operator in selected_operators
+                )
                 continue
             generated_inputs: set[str] = set()
             for operator in selected_operators:
@@ -273,16 +343,43 @@ class DatasetAugmentationEngine:
                         record, source_frame
                     )
                     if selected_correction_factor is None:
+                        skips.append(
+                            DatasetAugmentationSkip(
+                                source_interaction_id=record.id,
+                                operator_id=operator.id,
+                                operator_version=operator.version,
+                                reason=operator.applicability_rule,
+                            )
+                        )
                         continue
                     planned_provisional_quote = _planned_provisional_quote(
                         selected_correction_factor, record.raw_input
                     )
                     if planned_provisional_quote is None:
+                        skips.append(
+                            DatasetAugmentationSkip(
+                                source_interaction_id=record.id,
+                                operator_id=operator.id,
+                                operator_version=operator.version,
+                                reason=(
+                                    "The selected source value cannot be safely changed into a "
+                                    "distinct temporary value."
+                                ),
+                            )
+                        )
                         continue
                 if operator.id == "input.surface.typing_noise":
                     rendered_input = _add_typing_noise(record, expected_input_frame, operator)
+                elif operator.id == "input.surface.case_variation":
+                    rendered_input = _add_case_variation(record, operator)
+                elif operator.id == "input.surface.punctuation_noise":
+                    rendered_input = _add_punctuation_noise(record, operator)
+                elif operator.id == "input.surface.grammar_error":
+                    rendered_input = _add_grammar_error(record, operator)
                 elif operator.id == "input.surface.disfluency_repeat":
                     rendered_input = _add_word_repetition(record, expected_input_frame, operator)
+                elif operator.id == "input.tone.frustrated":
+                    rendered_input = _add_frustrated_tone(record, operator)
                 elif operator.allowed_change == "structured_self_correction":
                     transformation_prompt_names = (
                         _OPERATOR_PROMPT_NAMES[operator.id],
@@ -421,7 +518,22 @@ class DatasetAugmentationEngine:
             source_records=source_records,
             source_frames=tuple(source_frames),
             candidates=tuple(candidates),
+            skips=tuple(skips),
         )
+
+
+def _source_skip_reason(
+    source_frame: SemanticFrame, expected_input_frame: SemanticFrame
+) -> str | None:
+    if not expected_input_frame.request_units:
+        return "Source semantics contain no actionable request units."
+    if not source_frame.outcomes:
+        return "Source interaction contains no observed outcome to preserve."
+    if _has_unresolved_nodes(source_frame):
+        return "Source semantics contain unresolved elements."
+    if _has_ambiguous_nodes(expected_input_frame):
+        return "Source semantics contain ambiguous elements."
+    return None
 
 
 def _input_only_frame(frame: SemanticFrame) -> SemanticFrame:
@@ -858,6 +970,81 @@ def _add_typing_noise(
             "algorithm": "protected_adjacent_transposition",
             "seed": seed,
         },
+    )
+
+
+def _deterministic_renderer_metadata(
+    record: InteractionRecord,
+    operator: DatasetAugmentationOperator,
+    algorithm: str,
+) -> dict[str, JsonValue]:
+    return {
+        "renderer": "deterministic",
+        "algorithm": algorithm,
+        "seed": int.from_bytes(
+            hashlib.sha256(f"{record.id}\0{operator.id}\0{operator.version}".encode()).digest()[:4],
+            "big",
+        ),
+    }
+
+
+def _add_case_variation(
+    record: InteractionRecord, operator: DatasetAugmentationOperator
+) -> RenderedUserInput:
+    match = re.search(r"[A-Za-z]", record.raw_input)
+    if match is None:
+        rendered_text = record.raw_input
+    else:
+        letter = match.group()
+        changed_letter = letter.lower() if letter.isupper() else letter.upper()
+        rendered_text = (
+            f"{record.raw_input[: match.start()]}{changed_letter}{record.raw_input[match.end() :]}"
+        )
+    return RenderedUserInput(
+        text=rendered_text,
+        metadata=_deterministic_renderer_metadata(
+            record, operator, "single_ascii_letter_case_toggle"
+        ),
+    )
+
+
+def _add_punctuation_noise(
+    record: InteractionRecord, operator: DatasetAugmentationOperator
+) -> RenderedUserInput:
+    match = re.search(r"[,.!?;:]", record.raw_input)
+    if match is None:
+        rendered_text = f"{record.raw_input}."
+    else:
+        rendered_text = (
+            f"{record.raw_input[: match.end()]}{match.group()}{record.raw_input[match.end() :]}"
+        )
+    return RenderedUserInput(
+        text=rendered_text,
+        metadata=_deterministic_renderer_metadata(
+            record, operator, "single_punctuation_duplication_or_terminal_period"
+        ),
+    )
+
+
+def _add_grammar_error(
+    record: InteractionRecord, operator: DatasetAugmentationOperator
+) -> RenderedUserInput:
+    return RenderedUserInput(
+        text=f"Me need you to: {record.raw_input}",
+        metadata=_deterministic_renderer_metadata(
+            record, operator, "pronoun_case_error_request_prefix"
+        ),
+    )
+
+
+def _add_frustrated_tone(
+    record: InteractionRecord, operator: DatasetAugmentationOperator
+) -> RenderedUserInput:
+    return RenderedUserInput(
+        text=f"Ugh, {record.raw_input}",
+        metadata=_deterministic_renderer_metadata(
+            record, operator, "frustration_interjection_prefix"
+        ),
     )
 
 

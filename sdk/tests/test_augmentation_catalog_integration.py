@@ -36,7 +36,7 @@ def test_catalog_covers_every_current_augmentation_identity() -> None:
     }
 
     assert catalog_references == dataset_references | scenario_references | stress_references
-    assert len(catalog_references) == 18
+    assert len(catalog_references) == 21
 
 
 def test_catalog_discovery_does_not_change_runtime_metadata() -> None:
