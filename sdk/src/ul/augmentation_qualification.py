@@ -716,7 +716,10 @@ def _read_bounded_file(path: Path) -> bytes:
         path_metadata = path.lstat()
         if not stat.S_ISREG(path_metadata.st_mode):
             raise ValueError("qualification file is missing or exceeds the size limit")
-        descriptor = os.open(path, os.O_RDONLY)
+        descriptor = os.open(
+            path,
+            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0),
+        )
         with os.fdopen(descriptor, "rb") as input_file:
             opened_metadata = os.fstat(input_file.fileno())
             if (

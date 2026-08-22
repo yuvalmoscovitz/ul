@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -326,6 +327,23 @@ def test_loaded_report_recomputes_derived_metrics_from_attempt_evidence(tmp_path
 
     with pytest.raises(ValidationError, match="metrics must match"):
         load_augmentation_qualification_report(destination)
+
+
+def test_qualification_loader_rejects_symlinks(tmp_path: Path) -> None:
+    destination = tmp_path / "corpus.json"
+    destination.symlink_to(_FIXTURE)
+
+    with pytest.raises(ValueError, match="missing or exceeds"):
+        load_augmentation_qualification_corpus(destination)
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="named pipes are not available")
+def test_qualification_loader_rejects_named_pipes_without_blocking(tmp_path: Path) -> None:
+    destination = tmp_path / "corpus.pipe"
+    os.mkfifo(destination)
+
+    with pytest.raises(ValueError, match="missing or exceeds"):
+        load_augmentation_qualification_corpus(destination)
 
 
 def test_corpus_requires_every_qualification_segment() -> None:
