@@ -38,6 +38,10 @@ receives the turn input. With `input_mode: "request"`, it receives:
 
 ```json
 {
+  "schema_version": "1.0.0",
+  "case_id": "case-id",
+  "session_id": "session-id",
+  "probe_id": "probe-id",
   "turn": {
     "schema_version": "1.0.0",
     "id": "turn-id",
@@ -48,7 +52,9 @@ receives the turn input. With `input_mode: "request"`, it receives:
 }
 ```
 
-The context is forwarded unchanged, including rich-case or trace context supplied by the campaign.
+The case, session, probe, and turn identities are explicit transport fields. The context is forwarded
+unchanged, including rich-case or trace context supplied by the campaign. Turn metadata remains
+inside the bounded turn object.
 A callable may return any JSON value as the response, or return a response plus self-reported
 execution events:
 
@@ -134,6 +140,7 @@ records a sanitized lifecycle failure; it does not expose worker stderr or priva
 
 Startup, each turn, aggregate active execution time, stdout, stderr, input, call count, and shutdown
 are independently bounded. Timeout, cancellation, crash, malformed output, oversized output, or
-stderr overflow terminates the entire child process group before another worker is started. Evidence
-records the target, configuration, executable and callable hashes, runtime, worker attempt, execution
-attempt, response, and delivery certainty.
+stderr overflow terminates the entire child process tree before another worker is started. UL uses a
+dedicated process group on POSIX and a kill-on-close Job Object on Windows. Evidence records the
+target, configuration, executable and callable hashes, runtime, worker attempt, execution attempt,
+response, and delivery certainty.

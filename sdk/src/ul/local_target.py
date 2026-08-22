@@ -11,8 +11,9 @@ import stat
 import subprocess
 import sys
 import time
-from collections.abc import Mapping
-from contextlib import suppress
+from collections.abc import Generator, Mapping
+from contextlib import contextmanager, suppress
+from dataclasses import dataclass
 from pathlib import Path
 from types import TracebackType
 from typing import Annotated, Literal, Self, cast
@@ -200,14 +201,29 @@ class _LocalTargetFailure(RuntimeError):
         self.not_delivered = not_delivered
 
 
+@dataclass(frozen=True)
+class _FileIdentity:
+    resolved_path: Path
+    device: int
+    inode: int
+    size: int
+    modified_nanoseconds: int
+    sha256: str
+
+
 def load_local_target_config(path: str | Path) -> LocalTargetConfig:
     config_path = Path(path)
     try:
-        encoded = config_path.read_bytes()
+        with _open_regular_file(
+            config_path,
+            maximum_bytes=_MAXIMUM_CONFIG_BYTES,
+            allow_final_symlink=False,
+        ) as (descriptor, _):
+            encoded = _read_bounded_descriptor(descriptor, _MAXIMUM_CONFIG_BYTES)
+    except _FileTooLargeError:
+        raise ValueError("local target configuration exceeds the 1 MB limit") from None
     except OSError:
         raise RuntimeError("local target configuration could not be read") from None
-    if len(encoded) > _MAXIMUM_CONFIG_BYTES:
-        raise ValueError("local target configuration exceeds the 1 MB limit")
     try:
         raw = json.loads(
             encoded.decode("utf-8"),
@@ -241,11 +257,17 @@ def validate_local_target_config(config: LocalTargetConfig) -> None:
     working_directory = config.working_directory
     if not working_directory.is_absolute() or not working_directory.is_dir():
         raise ValueError("local target working_directory must be an existing absolute directory")
-    executable = _target_command(config)[0]
-    executable_path = Path(executable)
-    if not executable_path.is_absolute() or not executable_path.is_file():
+    executable_path = Path(_target_command(config)[0])
+    if not executable_path.is_absolute():
         raise ValueError("local target executable must be an existing absolute file")
-    if sys.platform != "win32" and not os.access(executable_path, os.X_OK):
+    try:
+        with _open_executable_identity(executable_path):
+            pass
+    except (OSError, _FileTooLargeError):
+        raise ValueError(
+            "local target executable must be an existing bounded regular file"
+        ) from None
+    if sys.platform != "win32" and not os.access(executable_path.resolve(strict=True), os.X_OK):
         raise ValueError("local target executable must be executable")
     missing_variables = tuple(
         name for name in config.environment_allowlist if name not in os.environ
@@ -280,7 +302,9 @@ class _LocalTargetInvoker:
         validate_local_target_config(config)
         self._config = config
         self._config_sha256 = local_target_config_sha256(config)
-        self._executable_sha256 = _bounded_file_sha256(Path(_target_command(config)[0]))
+        with _open_executable_identity(Path(_target_command(config)[0])) as (_, identity):
+            self._executable_identity = identity
+        self._executable_sha256 = self._executable_identity.sha256
         self._process: asyncio.subprocess.Process | None = None
         self._stderr_task: asyncio.Task[None] | None = None
         self._stderr_bytes = 0
@@ -319,6 +343,7 @@ class _LocalTargetInvoker:
                         "protocol_version": _PROTOCOL_VERSION,
                         "type": "invoke",
                         "request_id": request.correlation_id,
+                        "case_id": request.case_id,
                         "session_id": request.session_id,
                         "turn": request.turn.model_dump(mode="json"),
                         "context": request.context,
@@ -389,28 +414,13 @@ class _LocalTargetInvoker:
         self._active_session_id = None
         environment = {name: os.environ[name] for name in self._config.environment_allowlist}
         try:
-            if sys.platform == "win32":
-                process = await asyncio.create_subprocess_exec(
-                    *_target_command(self._config),
-                    stdin=asyncio.subprocess.PIPE,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
-                    cwd=self._config.working_directory,
-                    env=environment,
-                    limit=self._config.limits.max_output_bytes + 1,
-                    creationflags=subprocess.CREATE_NEW_PROCESS_GROUP,
-                )
-            else:
-                process = await asyncio.create_subprocess_exec(
-                    *_target_command(self._config),
-                    stdin=asyncio.subprocess.PIPE,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
-                    cwd=self._config.working_directory,
-                    env=environment,
-                    limit=self._config.limits.max_output_bytes + 1,
-                    start_new_session=True,
-                )
+            process = await self._spawn_process(environment)
+        except _ExecutableIdentityError:
+            raise _LocalTargetFailure(
+                "environment_identity",
+                delivery_uncertain=False,
+                not_delivered=True,
+            ) from None
         except OSError:
             raise _LocalTargetFailure(
                 "transport_failed",
@@ -437,6 +447,49 @@ class _LocalTargetInvoker:
             if isinstance(self._config, PythonCallableTargetConfig)
             else self._executable_sha256
         )
+
+    async def _spawn_process(self, environment: dict[str, str]) -> asyncio.subprocess.Process:
+        executable_path = Path(_target_command(self._config)[0])
+        with _open_executable_identity(executable_path) as (descriptor, identity):
+            if identity != self._executable_identity:
+                raise _ExecutableIdentityError
+            command = _supervised_target_command(
+                self._config,
+                identity,
+                platform=sys.platform,
+            )
+            if sys.platform == "win32":
+                process = await asyncio.create_subprocess_exec(
+                    *command,
+                    stdin=asyncio.subprocess.PIPE,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                    cwd=self._config.working_directory,
+                    env=environment,
+                    limit=self._config.limits.max_output_bytes + 1,
+                    creationflags=subprocess.CREATE_NEW_PROCESS_GROUP,
+                )
+            else:
+                process = await asyncio.create_subprocess_exec(
+                    *command,
+                    stdin=asyncio.subprocess.PIPE,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                    cwd=self._config.working_directory,
+                    env=environment,
+                    limit=self._config.limits.max_output_bytes + 1,
+                    start_new_session=True,
+                )
+            if (
+                not _identity_still_matches_path(executable_path, identity)
+                or _descriptor_sha256(descriptor) != identity.sha256
+            ):
+                _signal_process(process, force=True)
+                with suppress(TimeoutError):
+                    async with asyncio.timeout(self._config.limits.shutdown_timeout_seconds):
+                        await process.wait()
+                raise _ExecutableIdentityError
+            return process
 
     async def _ensure_session(self, request: ProbeRequest) -> None:
         if self._active_session_id == request.session_id:
@@ -734,21 +787,135 @@ def _target_command(config: LocalTargetConfig) -> tuple[str, ...]:
     )
 
 
-def _bounded_file_sha256(path: Path) -> str:
+def _supervised_target_command(
+    config: LocalTargetConfig,
+    identity: _FileIdentity,
+    *,
+    platform: str,
+) -> tuple[str, ...]:
+    target_command = (str(identity.resolved_path), *_target_command(config)[1:])
+    if platform != "win32":
+        return target_command
+    supervisor = Path(__file__).with_name("_windows_job_worker.py").resolve()
+    return (
+        sys.executable,
+        "-u",
+        str(supervisor),
+        "--expected-executable-sha256",
+        identity.sha256,
+        "--",
+        *target_command,
+    )
+
+
+class _FileTooLargeError(OSError):
+    pass
+
+
+class _ExecutableIdentityError(OSError):
+    pass
+
+
+@contextmanager
+def _open_regular_file(
+    path: Path,
+    *,
+    maximum_bytes: int,
+    allow_final_symlink: bool,
+) -> Generator[tuple[int, os.stat_result], None, None]:
+    opened_path = path.resolve(strict=True) if allow_final_symlink else path
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_BINARY", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+    )
+    if not allow_final_symlink:
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+    before = None if hasattr(os, "O_NOFOLLOW") else os.lstat(opened_path)
+    if before is not None and stat.S_ISLNK(before.st_mode):
+        raise OSError("symbolic links are not allowed")
+    descriptor = os.open(opened_path, flags)
     try:
-        size = path.stat().st_size
-    except OSError:
-        raise ValueError("local target executable identity could not be read") from None
-    if not stat.S_ISREG(path.stat().st_mode) or size > _MAXIMUM_EXECUTABLE_BYTES:
-        raise ValueError("local target executable exceeds the identity hashing limit")
+        descriptor_stat = os.fstat(descriptor)
+        if not stat.S_ISREG(descriptor_stat.st_mode):
+            raise OSError("path is not a regular file")
+        if descriptor_stat.st_size > maximum_bytes:
+            raise _FileTooLargeError
+        if before is not None:
+            after = os.lstat(opened_path)
+            if _stat_identity(after) != _stat_identity(descriptor_stat):
+                raise OSError("file identity changed while opening")
+        yield descriptor, descriptor_stat
+    finally:
+        os.close(descriptor)
+
+
+def _read_bounded_descriptor(descriptor: int, maximum_bytes: int) -> bytes:
+    chunks: list[bytes] = []
+    remaining = maximum_bytes + 1
+    while remaining > 0:
+        chunk = os.read(descriptor, min(1024 * 1024, remaining))
+        if not chunk:
+            break
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    encoded = b"".join(chunks)
+    if len(encoded) > maximum_bytes:
+        raise _FileTooLargeError
+    return encoded
+
+
+@contextmanager
+def _open_executable_identity(
+    path: Path,
+) -> Generator[tuple[int, _FileIdentity], None, None]:
+    resolved_path = path.resolve(strict=True)
+    with _open_regular_file(
+        resolved_path,
+        maximum_bytes=_MAXIMUM_EXECUTABLE_BYTES,
+        allow_final_symlink=False,
+    ) as (descriptor, descriptor_stat):
+        digest = _descriptor_sha256(descriptor)
+        identity = _FileIdentity(
+            resolved_path=resolved_path,
+            device=descriptor_stat.st_dev,
+            inode=descriptor_stat.st_ino,
+            size=descriptor_stat.st_size,
+            modified_nanoseconds=descriptor_stat.st_mtime_ns,
+            sha256=digest,
+        )
+        if not _identity_still_matches_path(path, identity):
+            raise _ExecutableIdentityError
+        yield descriptor, identity
+
+
+def _descriptor_sha256(descriptor: int) -> str:
+    os.lseek(descriptor, 0, os.SEEK_SET)
     digest = hashlib.sha256()
-    try:
-        with path.open("rb") as stream:
-            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
-                digest.update(chunk)
-    except OSError:
-        raise ValueError("local target executable identity could not be read") from None
+    while chunk := os.read(descriptor, 1024 * 1024):
+        digest.update(chunk)
+    os.lseek(descriptor, 0, os.SEEK_SET)
     return digest.hexdigest()
+
+
+def _identity_still_matches_path(path: Path, identity: _FileIdentity) -> bool:
+    try:
+        if path.resolve(strict=True) != identity.resolved_path:
+            return False
+        current = os.stat(identity.resolved_path, follow_symlinks=False)
+    except OSError:
+        return False
+    return _stat_identity(current) == (
+        identity.device,
+        identity.inode,
+        identity.size,
+        identity.modified_nanoseconds,
+    ) and stat.S_ISREG(current.st_mode)
+
+
+def _stat_identity(value: os.stat_result) -> tuple[int, int, int, int]:
+    return value.st_dev, value.st_ino, value.st_size, value.st_mtime_ns
 
 
 def _signal_process(process: asyncio.subprocess.Process, *, force: bool) -> None:

@@ -21,6 +21,8 @@ from ul.local_target import (
     LocalTargetLimits,
     PythonCallableTargetConfig,
     _LocalTargetInvoker,  # pyright: ignore[reportPrivateUsage]
+    _open_executable_identity,  # pyright: ignore[reportPrivateUsage]
+    _supervised_target_command,  # pyright: ignore[reportPrivateUsage]
     create_local_target_dry_run_plan,
     load_local_target_config,
 )
@@ -240,6 +242,10 @@ async def test_probe_request_context_crosses_process_boundary_unchanged(tmp_path
         await invoker.aclose()
 
     assert result.response == {
+        "schema_version": "1.0.0",
+        "case_id": "case-context",
+        "session_id": "session-context",
+        "probe_id": "correlation-context",
         "turn": {
             "schema_version": "1.0.0",
             "id": "turn-context",
@@ -262,15 +268,18 @@ async def test_request_mode_preserves_turn_and_generic_context_envelope(tmp_path
     async with LocalTargetConnection(config, customer_code_execution_confirmed=True) as connection:
         evidence = await connection.execute(_case("case-context", "hello"))
 
-    assert evidence.final_response == {
-        "turn": {
-            "schema_version": "1.0.0",
-            "id": "case-context:turn-1",
-            "input": "hello",
-            "metadata": {},
-        },
-        "context": {},
+    response = _runtime_payload(evidence.final_response)
+    assert response["schema_version"] == "1.0.0"
+    assert response["case_id"] == "case-context"
+    assert _string_payload(response, "session_id").startswith("ul-probe-")
+    assert _string_payload(response, "probe_id").startswith("ul-probe-")
+    assert response["turn"] == {
+        "schema_version": "1.0.0",
+        "id": "case-context:turn-1",
+        "input": "hello",
+        "metadata": {},
     }
+    assert response["context"] == {}
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX executable-script test")
@@ -355,6 +364,36 @@ def test_config_loader_rejects_duplicates_and_shell_like_executable(tmp_path: Pa
     config_path.write_text('{"kind":"command","kind":"command"}', encoding="utf-8")
     with pytest.raises(ValueError, match="invalid"):
         load_local_target_config(config_path)
+
+
+def test_config_loader_rejects_oversized_file_before_reading(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_path = tmp_path / "oversized.json"
+    with config_path.open("wb") as stream:
+        stream.truncate(1_000_001)
+
+    def unexpected_read(descriptor: int, maximum_bytes: int) -> bytes:
+        del descriptor, maximum_bytes
+        raise AssertionError("oversized config must be rejected from descriptor metadata")
+
+    monkeypatch.setattr(os, "read", unexpected_read)
+
+    with pytest.raises(ValueError, match="exceeds the 1 MB limit"):
+        load_local_target_config(config_path)
+
+
+def test_config_loader_rejects_final_component_symlink(tmp_path: Path) -> None:
+    target = tmp_path / "target.json"
+    target.write_text("{}", encoding="utf-8")
+    symlink = tmp_path / "config.json"
+    try:
+        symlink.symlink_to(target)
+    except OSError:
+        pytest.skip("test environment cannot create symbolic links")
+
+    with pytest.raises(RuntimeError, match="could not be read"):
+        load_local_target_config(symlink)
 
 
 @pytest.mark.asyncio
@@ -507,6 +546,106 @@ done
     )
     command.chmod(command.stat().st_mode | stat.S_IXUSR)
     return command
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX executable replacement")
+@pytest.mark.asyncio
+async def test_executable_identity_change_is_rejected_before_spawn(tmp_path: Path) -> None:
+    command = _write_failure_worker(tmp_path, "shutdown_hang")
+    config = CommandTargetConfig(
+        target_id="identity-command",
+        working_directory=tmp_path,
+        argv=(str(command),),
+    )
+    connection = LocalTargetConnection(config, customer_code_execution_confirmed=True)
+    replacement = tmp_path / "replacement"
+    replacement.write_bytes(command.read_bytes())
+    replacement.chmod(command.stat().st_mode)
+    os.replace(replacement, command)
+
+    try:
+        evidence = await connection.execute(_case("case-identity", "hello"))
+    finally:
+        await connection.aclose()
+
+    assert evidence.lifecycle.terminal_status == "failed"
+    assert evidence.lifecycle.failure_code == "environment_identity"
+    assert evidence.lifecycle.delivery == "certain"
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX executable mutation")
+@pytest.mark.asyncio
+async def test_executable_digest_is_revalidated_after_spawn(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    command = _write_failure_worker(tmp_path, "shutdown_hang")
+    config = CommandTargetConfig(
+        target_id="digest-command",
+        working_directory=tmp_path,
+        argv=(str(command),),
+    )
+    connection = LocalTargetConnection(config, customer_code_execution_confirmed=True)
+    original_stat = command.stat()
+
+    class _FakeProcess:
+        returncode: int | None = None
+        pid = 999_999
+
+        async def wait(self) -> int:
+            self.returncode = 1
+            return 1
+
+    async def mutate_during_spawn(*arguments: object, **keywords: object) -> _FakeProcess:
+        del arguments, keywords
+        with command.open("r+b") as stream:
+            stream.write(b"X")
+        os.utime(
+            command,
+            ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns),
+        )
+        return _FakeProcess()
+
+    def record_termination(process: object, *, force: bool) -> None:
+        del process
+        assert force is True
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", mutate_during_spawn)
+    monkeypatch.setattr("ul.local_target._signal_process", record_termination)
+
+    try:
+        evidence = await connection.execute(_case("case-digest", "hello"))
+    finally:
+        await connection.aclose()
+
+    assert evidence.lifecycle.failure_code == "environment_identity"
+    assert evidence.lifecycle.delivery == "certain"
+
+
+def test_windows_branch_wraps_target_in_kill_on_close_job_supervisor(tmp_path: Path) -> None:
+    command = _write_failure_worker(tmp_path, "shutdown_hang")
+    config = CommandTargetConfig(
+        target_id="windows-command",
+        working_directory=tmp_path,
+        argv=(str(command), "argument"),
+    )
+    with _open_executable_identity(command) as (_, identity):
+        supervised = _supervised_target_command(config, identity, platform="win32")
+
+    separator = supervised.index("--")
+    assert supervised[:3] == (
+        sys.executable,
+        "-u",
+        str(Path(__file__).parents[1] / "src" / "ul" / "_windows_job_worker.py"),
+    )
+    assert supervised[3:separator] == (
+        "--expected-executable-sha256",
+        identity.sha256,
+    )
+    assert supervised[separator + 1 :] == (str(command.resolve()), "argument")
+    supervisor_source = Path(supervised[2]).read_text(encoding="utf-8")
+    assert "_JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE" in supervisor_source
+    assert "AssignProcessToJobObject" in supervisor_source
+    assert "subprocess.Popen(command, shell=False" in supervisor_source
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX executable-script test")
