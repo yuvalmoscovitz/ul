@@ -15,7 +15,7 @@ from uuid import uuid4
 import typer
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 from rich.console import Console
-from ul import load_dataset_invariant_suite, load_redaction_policy
+from ul import DatasetEvaluationMode, load_dataset_invariant_suite, load_redaction_policy
 from ul.http_environment import (
     ENVIRONMENT_ID_PLACEHOLDER,
     JsonHttpIsolatedResponseConfig,
@@ -61,6 +61,7 @@ class ProjectConfig(_StrictModel):
     environment_origin: str = Field(min_length=1)
     environment_config_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     invariants: str | None = None
+    evaluation_mode: DatasetEvaluationMode = "variance"
     redaction_policy: str | None = None
     redaction_policy_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
     redaction_state: str | None = None
@@ -181,6 +182,16 @@ def initialize_project(
         Path | None,
         typer.Option(exists=True, dir_okay=False, readable=True),
     ] = None,
+    evaluation_mode: Annotated[
+        DatasetEvaluationMode,
+        typer.Option(
+            "--evaluation-mode",
+            help=(
+                "Evaluation intent. Variance is available now; correctness and preference "
+                "evaluators are not implemented."
+            ),
+        ),
+    ] = "variance",
     redaction_policy: Annotated[
         Path | None,
         typer.Option(
@@ -230,6 +241,12 @@ def initialize_project(
     ] = False,
 ) -> None:
     """Configure this project once for `ul run` and `ul report`."""
+    if evaluation_mode != "variance":
+        raise typer.BadParameter(
+            f"evaluation mode '{evaluation_mode}' is not implemented; use 'variance'. "
+            "Historical dataset output is grounding evidence, not an expected answer.",
+            param_hint="--evaluation-mode",
+        )
     if (environment_config is None) == (environment_url is None):
         raise typer.BadParameter("provide exactly one of --environment-config or --environment-url")
     generated_mapping_options_used = (
@@ -354,6 +371,7 @@ def initialize_project(
             invariants=(
                 _relative_project_path(invariants, project_root) if invariants is not None else None
             ),
+            evaluation_mode=evaluation_mode,
             redaction_policy=(
                 _relative_project_path(redaction_policy, project_root)
                 if redaction_policy is not None
@@ -515,6 +533,7 @@ def run_project(
                 if config.invariants is not None
                 else None
             ),
+            evaluation_mode=config.evaluation_mode,
             operator=selected_operators,
             limit=limit if limit is not None else config.limit,
             repetitions=repetitions if repetitions is not None else config.repetitions,

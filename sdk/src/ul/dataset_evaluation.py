@@ -47,6 +47,7 @@ CaseVerdict = Literal[
 ]
 BaselineVerdict = Literal["inconclusive", "no_divergence"]
 TrialSetStability = Literal["stable", "unstable", "inconclusive"]
+DatasetEvaluationMode = Literal["variance", "correctness", "preference"]
 
 
 class _StrictULModel(ULModel):
@@ -232,6 +233,7 @@ class DatasetEvaluationBaseline(_StrictULModel):
 
 
 class DatasetEvaluationResult(_StrictULModel):
+    evaluation_mode: Literal["variance"] = "variance"
     source: InteractionRecord
     augmentation: DatasetAugmentationResult
     baseline: DatasetEvaluationBaseline
@@ -275,7 +277,14 @@ class DatasetEvaluationRunner:
         *,
         target_timeout_seconds: float = 30,
         allow_network_egress: bool = False,
+        evaluation_mode: DatasetEvaluationMode = "variance",
     ) -> None:
+        if evaluation_mode != "variance":
+            raise ValueError(
+                f"evaluation mode '{evaluation_mode}' is not implemented; use 'variance' to "
+                "compare fresh original replays with generated variations without assessing "
+                "correctness"
+            )
         if not math.isfinite(target_timeout_seconds) or target_timeout_seconds <= 0:
             raise ValueError("target_timeout_seconds must be positive and finite")
         if environment.capabilities.isolation != "customer_managed":
@@ -286,6 +295,7 @@ class DatasetEvaluationRunner:
         self._deconstructor = deconstructor
         self._environment = environment
         self._target_timeout_seconds = target_timeout_seconds
+        self._evaluation_mode: Literal["variance"] = evaluation_mode
         self._target_state_uncertain = False
 
     async def run(
@@ -449,6 +459,7 @@ class DatasetEvaluationRunner:
                 )
             )
         return DatasetEvaluationResult(
+            evaluation_mode=self._evaluation_mode,
             source=source,
             augmentation=augmentation,
             baseline=baseline,

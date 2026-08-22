@@ -1406,6 +1406,8 @@ async def test_stored_output_is_grounding_not_a_live_review_oracle() -> None:
 
     result = await runner.run(_source(), repetitions=3)
 
+    assert result.evaluation_mode == "variance"
+    assert result.model_dump(mode="json")["evaluation_mode"] == "variance"
     assert result.source.raw_observed_output != live_output
     assert result.baseline.verdict == "no_divergence"
     assert result.baseline.trial_set.stability == "stable"
@@ -1964,6 +1966,22 @@ async def test_runner_requires_remote_environment_network_opt_in() -> None:
         environment,
         allow_network_egress=True,
     )
+
+
+@pytest.mark.parametrize("evaluation_mode", ["correctness", "preference"])
+async def test_runner_rejects_unimplemented_evaluation_modes_before_execution(
+    evaluation_mode: Literal["correctness", "preference"],
+) -> None:
+    semantic_pipeline = DeterministicSemanticPipeline((_source_outcomes()[0],))
+
+    with pytest.raises(ValueError, match=f"evaluation mode '{evaluation_mode}' is not implemented"):
+        _DatasetEvaluationRunner(
+            DatasetAugmentationEngine(semantic_pipeline, semantic_pipeline),
+            semantic_pipeline,
+            DeterministicEnvironment(),
+            allow_network_egress=True,
+            evaluation_mode=evaluation_mode,
+        )
 
 
 @pytest.mark.parametrize("target_timeout_seconds", [0, -1, float("inf"), float("nan")])
