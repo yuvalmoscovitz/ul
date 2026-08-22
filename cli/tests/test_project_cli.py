@@ -90,6 +90,10 @@ def test_init_creates_private_project_and_generated_environment(
         "2",
         "--max-environment-api-calls",
         "12",
+        "--fixture-id",
+        "standard-account",
+        "--fixture-version",
+        "v3",
     )
 
     config_path = tmp_path / ".ul" / "config.json"
@@ -117,6 +121,9 @@ def test_init_creates_private_project_and_generated_environment(
     }
     assert len(environment_config_sha256) == 64
     assert environment_path.is_file()
+    environment_config = json.loads(environment_path.read_text(encoding="utf-8"))
+    assert environment_config["fixture_id"] == "standard-account"
+    assert environment_config["fixture_version"] == "v3"
     assert (tmp_path / ".ul" / ".gitignore").read_text(encoding="utf-8") == "*\n"
     if hasattr(stat, "S_IMODE"):
         assert stat.S_IMODE(config_path.stat().st_mode) == 0o600

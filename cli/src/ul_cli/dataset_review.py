@@ -209,14 +209,30 @@ class DatasetEvidenceTarget(_StrictModel):
         return self
 
 
+class DatasetEvidenceFixture(_StrictModel):
+    status: Literal["configured", "missing", "not_required"]
+    id: str | None = Field(default=None, min_length=1, max_length=500)
+    version: str | None = Field(default=None, min_length=1, max_length=500)
+
+    @model_validator(mode="after")
+    def validate_identity(self) -> Self:
+        if self.status == "configured":
+            if self.id is None or self.version is None:
+                raise ValueError("configured fixture identity requires an id and version")
+        elif self.id is not None or self.version is not None:
+            raise ValueError("unconfigured fixture identity cannot include an id or version")
+        return self
+
+
 class DatasetEvidenceRunContext(_StrictModel):
-    schema_version: Literal["1.1.0"] = "1.1.0"
+    schema_version: Literal["1.2.0"] = "1.2.0"
     pipeline_version: Literal["1.2.0"] = _DATASET_EVALUATION_PIPELINE_VERSION
     selected_dataset_sha256: str = Field(pattern=_SHA256_PATTERN)
     operators: tuple[DatasetEvidenceOperator, ...] = Field(min_length=1)
     repetitions: int = Field(ge=1)
     invariant_suite_sha256: str | None = Field(default=None, pattern=_SHA256_PATTERN)
     target: DatasetEvidenceTarget
+    fixture: DatasetEvidenceFixture
     semantic_settings: DatasetEvidenceSemanticSettings
     redaction_policy_sha256: str | None = Field(default=None, pattern=_SHA256_PATTERN)
     redaction_coverage: tuple[DatasetEvidenceRedactionCoverage, ...] = ()
@@ -328,14 +344,16 @@ def create_dataset_evidence_run_context(
         config=target_config,
         sha256=dataset_regression_target_config_sha256(target_config),
     )
+    fixture = _dataset_evidence_fixture(target_config)
     content = {
-        "schema_version": "1.1.0",
+        "schema_version": "1.2.0",
         "pipeline_version": _DATASET_EVALUATION_PIPELINE_VERSION,
         "selected_dataset_sha256": selected_dataset_sha256,
         "operators": [operator.model_dump(mode="json") for operator in operator_snapshots],
         "repetitions": repetitions,
         "invariant_suite_sha256": invariant_suite_sha256,
         "target": target.model_dump(mode="json"),
+        "fixture": fixture.model_dump(mode="json"),
         "semantic_settings": semantic_settings.model_dump(mode="json"),
     }
     if redaction_policy_sha256 is not None:
@@ -350,10 +368,23 @@ def create_dataset_evidence_run_context(
         repetitions=repetitions,
         invariant_suite_sha256=invariant_suite_sha256,
         target=target,
+        fixture=fixture,
         semantic_settings=semantic_settings,
         redaction_policy_sha256=redaction_policy_sha256,
         redaction_coverage=redaction_coverage,
         context_sha256=_canonical_json_sha256(content),
+    )
+
+
+def _dataset_evidence_fixture(target_config: JsonHttpTargetConfig) -> DatasetEvidenceFixture:
+    if isinstance(target_config, JsonHttpIsolatedResponseConfig):
+        return DatasetEvidenceFixture(status="not_required")
+    if target_config.fixture_id is None:
+        return DatasetEvidenceFixture(status="missing")
+    return DatasetEvidenceFixture(
+        status="configured",
+        id=target_config.fixture_id,
+        version=target_config.fixture_version,
     )
 
 

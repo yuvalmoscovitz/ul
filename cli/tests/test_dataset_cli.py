@@ -259,6 +259,33 @@ def test_run_context_uses_current_pipeline() -> None:
     assert run_context.pipeline_version == "1.2.0"
     assert run_context.target.config.reset.reset_session is True
     assert run_context.target.config.reset.reset_env is True
+    assert run_context.fixture.status == "missing"
+
+
+def test_run_context_records_versioned_fixture_identity() -> None:
+    record = _evaluation_result("interaction-1").source
+    raw_config = cast(Any, _run_context((record,))).target.config.model_dump(mode="json")
+    raw_config["fixture_id"] = "standard-account"
+    raw_config["fixture_version"] = "2026-08-22"
+
+    run_context = _run_context(
+        (record,), target_config=JsonHttpEnvironmentConfig.model_validate(raw_config)
+    )
+
+    assert run_context.schema_version == "1.2.0"
+    assert run_context.fixture.model_dump(mode="json") == {
+        "status": "configured",
+        "id": "standard-account",
+        "version": "2026-08-22",
+    }
+
+
+def test_run_context_marks_fixture_not_required_for_isolated_target() -> None:
+    record = _evaluation_result("interaction-1").source
+
+    run_context = _run_context((record,), target_config=_isolated_response_target_config())
+
+    assert run_context.fixture.status == "not_required"
 
 
 def test_unified_report_surfaces_response_only_scope_and_limitations(tmp_path: Path) -> None:
@@ -552,6 +579,51 @@ def test_init_creates_private_strict_starter_config(tmp_path: Path) -> None:
     assert "--dry-run" in result.output
 
 
+def test_init_records_stateful_fixture_identity(tmp_path: Path) -> None:
+    target_config = tmp_path / "target.json"
+
+    result = runner.invoke(
+        root_app,
+        [
+            "dataset",
+            "init",
+            str(target_config),
+            "--url",
+            "https://environment.example.test",
+            "--fixture-id",
+            "standard-account",
+            "--fixture-version",
+            "v3",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    config = json.loads(target_config.read_text(encoding="utf-8"))
+    assert config["fixture_id"] == "standard-account"
+    assert config["fixture_version"] == "v3"
+
+
+def test_init_rejects_partial_fixture_identity(tmp_path: Path) -> None:
+    target_config = tmp_path / "target.json"
+
+    result = runner.invoke(
+        root_app,
+        [
+            "dataset",
+            "init",
+            str(target_config),
+            "--url",
+            "https://environment.example.test",
+            "--fixture-id",
+            "standard-account",
+        ],
+    )
+
+    assert result.exit_code == 2
+    assert "--fixture-id and --fixture-version" in result.output
+    assert not target_config.exists()
+
+
 def test_init_translates_custom_isolated_json_contract(tmp_path: Path) -> None:
     target_config = tmp_path / "target.json"
 
@@ -748,11 +820,39 @@ def test_dry_run_validates_and_makes_no_external_calls(
         "Every test case invokes and validates the configured environment reset contract"
         in result.output
     )
+    assert "stateful target has no fixture identity" in result.output
     assert "do not determine correctness" in result.output
     assert "identify causality" in result.output
     assert "estimate a production failure rate" in result.output
     assert "No model or environment API requests sent." in result.output
     assert "Transfer 100" not in result.output
+
+
+def test_dry_run_prints_configured_fixture_identity(tmp_path: Path) -> None:
+    dataset = tmp_path / "interactions.jsonl"
+    target_config = tmp_path / "target.json"
+    _write_dataset(dataset, [_record()])
+    _write_target_config(target_config)
+    raw_config = json.loads(target_config.read_text(encoding="utf-8"))
+    raw_config["fixture_id"] = "standard-account"
+    raw_config["fixture_version"] = "v3"
+    target_config.write_text(json.dumps(raw_config), encoding="utf-8")
+
+    result = runner.invoke(
+        root_app,
+        [
+            "dataset",
+            "evaluate",
+            str(dataset),
+            "--environment-config",
+            str(target_config),
+            "--dry-run",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "Fixture: standard-account@v3" in result.output
+    assert "no fixture identity" not in result.output
 
 
 def test_augmentation_persistence_options_are_discoverable_at_80_columns(

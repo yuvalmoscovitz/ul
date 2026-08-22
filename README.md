@@ -47,6 +47,8 @@ Configure UL once:
 ```bash
 ul init interactions.jsonl \
   --environment-url https://your-environment.example \
+  --fixture-id standard-account \
+  --fixture-version v1 \
   --allow-environment-network \
   --confirm-test-environment
 ```
@@ -55,6 +57,8 @@ The generated `.ul/environment.json` uses UL's full `stateful-lifecycle` adapter
 implements reset, execute-turn, and snapshot requests. Reset asks separately for a fresh agent
 session and a clean external environment; both are required by default. If you already have a custom
 mapping, use `--environment-config environment.json` instead of `--environment-url`.
+The fixture identity names the resettable business state used by the run. Change its version whenever
+that state or setup logic changes. See [Design valid test cases](docs/test-cases.md).
 
 To connect an existing response-only JSON endpoint that starts every request from isolated state:
 
