@@ -2098,6 +2098,16 @@ def _print_dataset_results(
                 ", ".join(_FINDING_LABELS[finding.category] for finding in case.findings) or "—",
             )
     console.print(table)
+    actual_semantic_calls = sum(
+        getattr(getattr(result, "semantic_calls", None), "actual_calls", 0) for result in results
+    )
+    semantic_cache_hits = sum(
+        getattr(getattr(result, "semantic_calls", None), "cache_hits", 0) for result in results
+    )
+    console.print(
+        "Semantic evaluator calls: "
+        f"{actual_semantic_calls} actual; {semantic_cache_hits} private cache hit(s)"
+    )
     if invariant_evaluations:
         _print_invariant_results(invariant_evaluations)
     console.print(f"Complete evidence: {output}")

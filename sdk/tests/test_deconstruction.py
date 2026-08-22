@@ -18,6 +18,7 @@ from ul.deconstruction import (
     OpenRouterDatasetSettings,
     ProviderDiagnostic,
     ProviderDiagnosticError,
+    SemanticCallMetrics,
     SemanticModelDeconstructor,
     create_semantic_model_deconstructor,
     load_dataset_semantic_settings,
@@ -562,6 +563,47 @@ async def test_deconstruct_sends_one_bounded_strict_structured_request() -> None
         },
         "prompts": prompt_provenance("semantic.deconstruct"),
     }
+    await client.aclose()
+
+
+async def test_private_semantic_cache_materially_reduces_calls_without_changing_frames() -> None:
+    request_count = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal request_count
+        request_count += 1
+        return completion(json.dumps(frame_payload()))
+
+    client = mock_client(handler)
+    async with create_semantic_model_deconstructor(settings(), client=client) as deconstructor:
+        frames = tuple(
+            [
+                await deconstructor.deconstruct(
+                    interaction().model_copy(update={"id": f"equivalent-{repetition}"})
+                )
+                for repetition in range(6)
+            ]
+        )
+        cache_keys = tuple(deconstructor._semantic_response_cache)
+
+    assert request_count == 1
+    assert len(cache_keys) == 1
+    assert len(cache_keys[0]) == 64
+    assert set(cache_keys[0]) <= set("0123456789abcdef")
+    assert interaction().raw_input not in cache_keys[0]
+    assert deconstructor.semantic_call_metrics == SemanticCallMetrics(
+        actual_calls=1,
+        cache_hits=5,
+    )
+    assert {frame.interaction_id for frame in frames} == {
+        f"equivalent-{repetition}" for repetition in range(6)
+    }
+    assert all(frame.request_units == frames[0].request_units for frame in frames)
+    assert all(frame.factors == frames[0].factors for frame in frames)
+    assert all(frame.outcomes == frames[0].outcomes for frame in frames)
+    assert "semantic_cache_hit" not in frames[0].metadata
+    assert all(frame.metadata["semantic_cache_hit"] is True for frame in frames[1:])
+    assert all(frame.metadata["semantic_usage"] == {} for frame in frames[1:])
     await client.aclose()
 
 
@@ -1886,10 +1928,20 @@ async def test_live_deconstruction_with_synthetic_interaction() -> None:
 
     async with create_semantic_model_deconstructor(configured_settings) as deconstructor:
         frame = await deconstructor.deconstruct(synthetic_interaction)
+        cached_frame = await deconstructor.deconstruct(
+            synthetic_interaction.model_copy(update={"id": "synthetic-live-cache-hit"})
+        )
 
     assert frame.interaction_id == synthetic_interaction.id
+    assert cached_frame.interaction_id == "synthetic-live-cache-hit"
     assert frame.request_units
     assert frame.outcomes
+    assert cached_frame.request_units == frame.request_units
+    assert cached_frame.outcomes == frame.outcomes
+    assert deconstructor.semantic_call_metrics == SemanticCallMetrics(
+        actual_calls=1,
+        cache_hits=1,
+    )
     extracted_elements = (*frame.request_units, *frame.factors, *frame.outcomes)
     assert all(element.evidence for element in extracted_elements)
 
