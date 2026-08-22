@@ -119,6 +119,22 @@ async def test_stateful_fixture_identity_requires_id_and_version() -> None:
         JsonHttpEnvironmentConfig.model_validate(raw)
 
 
+async def test_stateful_http_exposes_separate_invocation_and_state_capabilities() -> None:
+    environment = JsonHttpEnvironmentConnection.from_config(
+        _config(),
+        test_environment_confirmed=True,
+    )
+
+    assert environment.probe_capabilities.invoker.invoker_id == "payments-test"
+    assert environment.probe_capabilities.observation_source is None
+    assert environment.probe_capabilities.state_environment is not None
+    assert environment.evidence_profile.supported_facts == frozenset(
+        {"response_observed", "committed_state_verified"}
+    )
+
+    await environment.aclose()
+
+
 def _case(*inputs: str, max_calls: int = 20) -> EvaluationCase:
     return EvaluationCase(
         id="case-1",
@@ -172,8 +188,15 @@ async def test_isolated_response_executes_one_request_and_labels_response_only_e
     assert environment.capabilities.supports_conversations is False
     assert environment.capabilities.supports_state_observation is False
     assert environment.capabilities.request_isolation == "per_request_attested"
+    assert environment.probe_capabilities.invoker.invoker_id == "response-only-test"
+    assert environment.probe_capabilities.state_environment is None
+    assert environment.evidence_profile.supported_facts == frozenset({"response_observed"})
     assert evidence.evidence_scope == "response_only"
     assert evidence.final_response == {"message": "done"}
+    assert evidence.turns[0].response_source_id == "response-only-test"
+    assert evidence.turns[0].correlation_id is not None
+    assert evidence.turns[0].correlation_id.startswith("ul-probe-")
+    assert len(evidence.turns[0].correlation_id) < 500
     assert evidence.initial_state is None
     assert evidence.final_state is None
     assert evidence.lifecycle.cleanup == "not_attempted"

@@ -29,6 +29,8 @@ from ul_core.evaluation import (
     EnvironmentTurnEvidence,
     EvaluationCase,
     ExecutionEvidence,
+    ProbeExecutionEvent,
+    ProbeObservation,
 )
 
 _KEY = SecretStr("a-private-test-key-with-at-least-32-bytes")
@@ -285,6 +287,27 @@ class _RecordingEnvironment:
             final_state=EnvironmentStateEvidence(
                 value=state,
                 authority="environment_self_reported",
+            ),
+            observations=(
+                ProbeObservation(
+                    id="observation-1",
+                    source_id="observer-1",
+                    correlation_id="correlation-1",
+                    authority="independent_observer",
+                    status="incomplete",
+                    limitation=f"observer could not inspect {_SECRET}",
+                    traces=({"contact": _SECRET},),
+                    metadata={"contact": _SECRET},
+                    next_checkpoint=f"cursor:{_SECRET}",
+                ),
+            ),
+            execution_events=(
+                ProbeExecutionEvent(
+                    id="event-1",
+                    correlation_id="correlation-1",
+                    kind="tool_call",
+                    payload={"contact": _SECRET},
+                ),
             ),
             lifecycle=EnvironmentLifecycleEvidence(
                 initial_reset=EnvironmentResetEvidence(

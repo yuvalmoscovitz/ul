@@ -14,7 +14,17 @@ from ul_core.evaluation import (
     EnvironmentCapabilities,
     EvaluationCase,
     ExecutionEvidence,
+    ObservationRequest,
+    ObservationSourceCapabilities,
+    ProbeInvokerCapabilities,
+    ProbeObservation,
+    ProbeRequest,
+    ProbeResult,
     ProductionSourcePage,
+    StateEnvironmentCapabilities,
+    StateFixtureRequest,
+    StateOperationResult,
+    StateSnapshot,
 )
 
 
@@ -87,3 +97,43 @@ class EnvironmentExecutor(Protocol):
     def api_calls_for_case(self, case: EvaluationCase) -> int: ...
 
     def execute(self, case: EvaluationCase) -> Awaitable[ExecutionEvidence]: ...
+
+
+@runtime_checkable
+class ProbeInvoker(Protocol):
+    @property
+    def capabilities(self) -> ProbeInvokerCapabilities: ...
+
+    def invoke(self, request: ProbeRequest) -> ProbeResult | Awaitable[ProbeResult]: ...
+
+
+@runtime_checkable
+class ObservationSource(Protocol):
+    @property
+    def capabilities(self) -> ObservationSourceCapabilities: ...
+
+    def observe(
+        self, request: ObservationRequest
+    ) -> ProbeObservation | Awaitable[ProbeObservation]: ...
+
+
+@runtime_checkable
+class StateEnvironment(Protocol):
+    @property
+    def capabilities(self) -> StateEnvironmentCapabilities: ...
+
+    def reset(
+        self, request: StateFixtureRequest
+    ) -> StateOperationResult | Awaitable[StateOperationResult]: ...
+
+    def setup(
+        self, request: StateFixtureRequest
+    ) -> StateOperationResult | Awaitable[StateOperationResult]: ...
+
+    def snapshot(
+        self, request: StateFixtureRequest
+    ) -> StateSnapshot | Awaitable[StateSnapshot]: ...
+
+    def cleanup(
+        self, request: StateFixtureRequest
+    ) -> StateOperationResult | Awaitable[StateOperationResult]: ...

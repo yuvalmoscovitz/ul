@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import pytest
+import ul_core
 from pydantic import ValidationError
 from ul_core.evaluation import (
     EnvironmentCapabilities,
@@ -10,9 +11,18 @@ from ul_core.evaluation import (
     EnvironmentTurnEvidence,
     EvaluationCase,
     ExecutionEvidence,
+    ObservationSourceCapabilities,
+    ProbeCapabilities,
+    ProbeExecutionEvent,
+    ProbeInvokerCapabilities,
+    ProbeObservation,
+    ProbeResult,
     ProductionObservation,
+    StateEnvironmentCapabilities,
+    StateOperationResult,
     TimeoutAfterCommitEventEvidence,
     TimeoutAfterCommitEventRequest,
+    evidence_profile_from_capabilities,
 )
 from ul_core.models import ConversationRole, ConversationTurn
 
@@ -426,3 +436,145 @@ def test_environment_capabilities_bind_state_authority() -> None:
             supports_state_observation=True,
             cancellation_guarantee="best_effort",
         )
+
+
+def test_probe_result_rejects_mismatched_event_correlation() -> None:
+    with pytest.raises(ValidationError, match="correlation"):
+        ProbeResult(
+            id="result-1",
+            correlation_id="correlation-1",
+            response={"answer": "done"},
+            response_size_bytes=17,
+            execution_events=(
+                ProbeExecutionEvent(
+                    id="event-1",
+                    correlation_id="different-correlation",
+                    kind="tool_call",
+                    payload={"tool": "pay_invoice"},
+                ),
+            ),
+        )
+
+
+def test_unavailable_observation_requires_a_safe_limitation() -> None:
+    with pytest.raises(ValidationError, match="require a limitation"):
+        ProbeObservation(
+            id="observation-1",
+            source_id="otel-collector",
+            correlation_id="correlation-1",
+            authority="independent_observer",
+            status="missing",
+        )
+
+
+def test_missing_observation_rejects_claimed_evidence() -> None:
+    with pytest.raises(ValidationError, match="cannot contain observed evidence"):
+        ProbeObservation(
+            id="observation-1",
+            source_id="otel-collector",
+            correlation_id="correlation-1",
+            authority="independent_observer",
+            status="missing",
+            limitation="trace did not arrive",
+            traces=({"span": "stale"},),
+        )
+
+
+def test_state_capabilities_reject_incomplete_deterministic_replay() -> None:
+    with pytest.raises(ValidationError, match="deterministic replay requires"):
+        StateEnvironmentCapabilities(
+            environment_id="invoice-sandbox",
+            supports_reset=True,
+            supports_deterministic_replay=True,
+        )
+
+
+def test_state_operation_preserves_reset_acknowledgements_and_uncertainty() -> None:
+    result = StateOperationResult(
+        id="cleanup-1",
+        fixture_id="fixture-1",
+        correlation_id="correlation-1",
+        operation="cleanup",
+        succeeded=False,
+        reset_session_requested=True,
+        reset_session_acknowledged=True,
+        reset_environment_requested=True,
+        reset_environment_acknowledged=False,
+        state_uncertain=True,
+        failure_code="reset_not_clean",
+        failure_reason="environment reset was not acknowledged",
+    )
+
+    assert result.reset_session_acknowledged is True
+    assert result.reset_environment_acknowledged is False
+    assert result.state_uncertain is True
+
+
+def test_evidence_profile_is_non_ordinal_and_preserves_provenance() -> None:
+    profile = evidence_profile_from_capabilities(
+        ProbeCapabilities(
+            invoker=ProbeInvokerCapabilities(
+                invoker_id="local-python",
+                response_size_limit_bytes=10_000,
+                supports_structured_execution_events=True,
+            ),
+            observation_source=ObservationSourceCapabilities(
+                source_id="otel-collector",
+                authority="independent_observer",
+                supports_traces=True,
+                supports_tool_calls=True,
+            ),
+            state_environment=StateEnvironmentCapabilities(
+                environment_id="invoice-sandbox",
+                supports_reset=True,
+                supports_snapshot=True,
+                supports_cleanup=True,
+                state_observation_authority="environment_self_reported",
+                supports_deterministic_replay=True,
+            ),
+        )
+    )
+
+    assert profile.supported_facts == frozenset(
+        {
+            "response_observed",
+            "trajectory_observed",
+            "committed_state_verified",
+            "deterministic_replay_verified",
+        }
+    )
+    assert profile.sources["trajectory_observed"] == "otel-collector"
+    assert profile.authorities["trajectory_observed"] == "independent_observer"
+    assert profile.sources["committed_state_verified"] == "invoice-sandbox"
+    assert "level" not in type(profile).model_fields
+
+
+def test_deterministic_replay_preserves_independent_state_authority() -> None:
+    profile = evidence_profile_from_capabilities(
+        ProbeCapabilities(
+            invoker=ProbeInvokerCapabilities(
+                invoker_id="local-python",
+                response_size_limit_bytes=10_000,
+            ),
+            state_environment=StateEnvironmentCapabilities(
+                environment_id="database-observer",
+                supports_reset=True,
+                supports_snapshot=True,
+                supports_cleanup=True,
+                state_observation_authority="independent_observer",
+                state_observer_id="database-audit-log",
+                supports_deterministic_replay=True,
+            ),
+        )
+    )
+
+    assert profile.authorities["deterministic_replay_verified"] == "independent_observer"
+
+
+def test_probe_contracts_are_public_core_api() -> None:
+    assert ul_core.ProbeInvoker is not None
+    assert ul_core.ObservationSource is not None
+    assert ul_core.StateEnvironment is not None
+    assert ul_core.ProbeRequest is not None
+    assert ul_core.ProbeResult is not None
+    assert ul_core.EvidenceProfile is not None
