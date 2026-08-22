@@ -211,6 +211,11 @@ def _load_stateful_stress_result(path: Path) -> StatefulStressResult:
 def _print_human_report(report: UnifiedReport, evidence: Path) -> None:
     typer.echo("UL run report")
     typer.echo(f"Evidence type: {_EVIDENCE_LABELS[report.evidence_type]}")
+    if report.evaluation_mode is not None:
+        typer.echo(
+            f"Evaluation mode: {report.evaluation_mode} "
+            "(historical output is not an expected answer; correctness not assessed)"
+        )
     typer.echo(
         "Evidence scope: "
         + (

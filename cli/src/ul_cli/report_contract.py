@@ -11,6 +11,7 @@ ReportEvidenceType = Literal[
     "timeout_after_commit",
 ]
 ReportReviewStatus = Literal["resolved", "action_required", "inconclusive"]
+ReportEvaluationMode = Literal["variance"]
 ReportEvidenceScope = Literal["response_only", "response_and_state"]
 ReportCapabilityLimitation = Literal[
     "cleanup_verification",
@@ -218,10 +219,11 @@ def build_report_summary(findings: tuple[FindingSummary, ...]) -> ReportSummary:
 
 
 class UnifiedReport(_StrictModel):
-    schema_version: Literal["1.4.0"] = "1.4.0"
+    schema_version: Literal["1.5.0"] = "1.5.0"
     evidence_type: ReportEvidenceType
     evidence_schema_versions: tuple[str, ...] = Field(min_length=1)
     evidence_scope: ReportEvidenceScope
+    evaluation_mode: ReportEvaluationMode | None = None
     capability_limitations: tuple[ReportCapabilityLimitation, ...] = ()
     review_status: ReportReviewStatus
     exit_code: Literal[0, 1, 2]
@@ -231,6 +233,8 @@ class UnifiedReport(_StrictModel):
 
     @model_validator(mode="after")
     def validate_report(self) -> Self:
+        if self.evidence_type != "dataset_evaluation" and self.evaluation_mode is not None:
+            raise ValueError("evaluation mode is available only for dataset reports")
         if self.capability_limitations != tuple(sorted(set(self.capability_limitations))):
             raise ValueError("capability limitations must be sorted and unique")
         if self.evidence_scope == "response_only" and self.capability_limitations != (

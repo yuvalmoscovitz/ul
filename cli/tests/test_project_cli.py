@@ -107,6 +107,7 @@ def test_init_creates_private_project_and_generated_environment(
         "environment_config": ".ul/environment.json",
         "environment_origin": "https://environment.example",
         "invariants": None,
+        "evaluation_mode": "variance",
         "redaction_policy": None,
         "redaction_policy_sha256": None,
         "redaction_state": None,
@@ -525,6 +526,7 @@ def test_run_discovers_parent_project_and_applies_one_run_overrides(
     assert received["environment_config"] == tmp_path / ".ul" / "environment.json"
     assert received["limit"] == 1
     assert received["repetitions"] == 4
+    assert received["evaluation_mode"] == "variance"
     assert received["operator"] == ["input.surface.rephrase"]
     assert received["allow_environment_network"] is True
     assert received["confirm_test_environment"] is True
@@ -533,6 +535,37 @@ def test_run_discovers_parent_project_and_applies_one_run_overrides(
     assert state["latest_evidence"].startswith(".ul/runs/")
     assert (tmp_path / state["latest_evidence"]).is_file()
     assert "Next: ul report" in result.output
+
+
+@pytest.mark.parametrize("evaluation_mode", ["correctness", "preference"])
+def test_init_rejects_unimplemented_evaluation_modes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    evaluation_mode: str,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    dataset = tmp_path / "interactions.jsonl"
+    _write_dataset(dataset)
+
+    result = runner.invoke(
+        app,
+        [
+            "init",
+            str(dataset),
+            "--environment-url",
+            "https://environment.example",
+            "--evaluation-mode",
+            evaluation_mode,
+            "--allow-environment-network",
+            "--confirm-test-environment",
+        ],
+        terminal_width=240,
+    )
+
+    assert result.exit_code == 2
+    compact_output = _compact_plain_output(result.output.replace("│", ""))
+    assert f"evaluationmode'{evaluation_mode}'isnotimplemented" in compact_output
+    assert not (tmp_path / ".ul").exists()
 
 
 def test_init_persists_redaction_and_retention_choices(

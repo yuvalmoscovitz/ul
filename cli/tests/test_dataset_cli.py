@@ -13,7 +13,7 @@ from types import SimpleNamespace
 from typing import Any, cast
 
 import pytest
-from pydantic import SecretStr
+from pydantic import SecretStr, ValidationError
 from typer.testing import CliRunner
 from ul import (
     DatasetAugmentationResult,
@@ -256,7 +256,9 @@ def _isolated_response_target_config() -> JsonHttpIsolatedResponseConfig:
 def test_run_context_uses_current_pipeline() -> None:
     record = _evaluation_result("interaction-1").source
     run_context = _run_context((record,))
-    assert run_context.pipeline_version == "1.2.0"
+    assert run_context.schema_version == "1.3.0"
+    assert run_context.pipeline_version == "1.4.0"
+    assert run_context.evaluation_mode == "variance"
     assert run_context.target.config.reset.reset_session is True
     assert run_context.target.config.reset.reset_env is True
     assert run_context.fixture.status == "missing"
@@ -272,7 +274,7 @@ def test_run_context_records_versioned_fixture_identity() -> None:
         (record,), target_config=JsonHttpEnvironmentConfig.model_validate(raw_config)
     )
 
-    assert run_context.schema_version == "1.2.0"
+    assert run_context.schema_version == "1.3.0"
     assert run_context.fixture.model_dump(mode="json") == {
         "status": "configured",
         "id": "standard-account",
@@ -286,6 +288,24 @@ def test_run_context_marks_fixture_not_required_for_isolated_target() -> None:
     run_context = _run_context((record,), target_config=_isolated_response_target_config())
 
     assert run_context.fixture.status == "not_required"
+
+
+def test_run_context_accepts_pre_fixture_evaluation_mode_evidence() -> None:
+    record = _evaluation_result("interaction-1").source
+    current = cast(Any, _run_context((record,))).model_dump(mode="json")
+    current["schema_version"] = "1.2.0"
+    current["pipeline_version"] = "1.3.0"
+    current.pop("fixture")
+    current.pop("redaction_policy_sha256")
+    current.pop("redaction_coverage")
+    current["context_sha256"] = dataset_review._canonical_json_sha256(
+        {key: value for key, value in current.items() if key != "context_sha256"}
+    )
+
+    loaded = dataset_review.DatasetEvidenceRunContext.model_validate_json(json.dumps(current))
+
+    assert loaded.evaluation_mode == "variance"
+    assert loaded.fixture is None
 
 
 def test_unified_report_surfaces_response_only_scope_and_limitations(tmp_path: Path) -> None:
@@ -306,6 +326,7 @@ def test_unified_report_surfaces_response_only_scope_and_limitations(tmp_path: P
 
     assert json_report.exit_code == 0, json_report.output
     parsed_report = json.loads(json_report.output)
+    assert parsed_report["evaluation_mode"] == "variance"
     assert parsed_report["evidence_scope"] == "response_only"
     assert parsed_report["capability_limitations"] == [
         "cleanup_verification",
@@ -313,6 +334,7 @@ def test_unified_report_surfaces_response_only_scope_and_limitations(tmp_path: P
         "state_observation",
     ]
     assert human_report.exit_code == 0, human_report.output
+    assert "Evaluation mode: variance" in human_report.output
     assert "Evidence scope: response only" in human_report.output
     assert "Not verified: committed state, cleanup, or multi-turn conversations." in (
         human_report.output
@@ -810,6 +832,7 @@ def test_dry_run_validates_and_makes_no_external_calls(
     assert result.exit_code == 0, result.output
     assert "Dataset valid: 2 interaction(s)" in result.output
     assert "Selected interactions: 1" in result.output
+    assert "Evaluation mode: variance" in result.output
     assert "Repetitions: 3 per original and accepted variation" in result.output
     assert "Potential semantic model calls: up to 10" in result.output
     assert "Potential environment API calls: up to 30" in result.output
@@ -854,6 +877,46 @@ def test_dry_run_prints_configured_fixture_identity(tmp_path: Path) -> None:
     assert result.exit_code == 0, result.output
     assert "Fixture: standard-account@v3" in result.output
     assert "no fixture identity" not in result.output
+
+
+@pytest.mark.parametrize("evaluation_mode", ["correctness", "preference"])
+def test_unimplemented_evaluation_mode_fails_before_calls_or_persistence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    evaluation_mode: str,
+) -> None:
+    dataset = tmp_path / "interactions.jsonl"
+    output = tmp_path / "results.jsonl"
+    _write_dataset(dataset, [_record()])
+
+    def unexpected_settings() -> None:
+        raise AssertionError("unsupported evaluation mode reached semantic settings")
+
+    monkeypatch.setattr(main, "load_dataset_semantic_settings", unexpected_settings)
+
+    result = runner.invoke(
+        root_app,
+        [
+            "dataset",
+            "evaluate",
+            str(dataset),
+            "--evaluation-mode",
+            evaluation_mode,
+            "--output",
+            str(output),
+        ],
+        terminal_width=240,
+    )
+
+    assert result.exit_code == 2
+    normalized_output = " ".join(
+        _ANSI_ESCAPE_PATTERN.sub("", result.output).replace("│", " ").split()
+    )
+    assert f"evaluation mode '{evaluation_mode}' is not implemented" in normalized_output
+    assert "Historical dataset output is grounding evidence, not an expected answer" in (
+        normalized_output
+    )
+    assert not output.exists()
 
 
 def test_augmentation_persistence_options_are_discoverable_at_80_columns(
@@ -1290,7 +1353,14 @@ def test_extended_invariants_use_new_evidence_schema_and_hide_values_from_termin
     main._print_invariant_results((invariant_evaluation,))
     terminal_output = capsys.readouterr().out
 
-    assert parsed.schema_version == "1.7.0"
+    assert parsed.schema_version == "1.8.0"
+    assert parsed.evaluation_mode == "variance"
+    assert parsed.run_context is not None
+    assert parsed.run_context.evaluation_mode == "variance"
+    missing_technical_mode = json.loads(json.dumps(record))
+    missing_technical_mode["technical_details"].pop("evaluation_mode")
+    with pytest.raises(ValidationError, match="evaluation mode must match technical details"):
+        dataset_review._EvidenceRecord.model_validate_json(json.dumps(missing_technical_mode))
     assert "value=/approval" in terminal_output
     assert "private-current-version" not in terminal_output
     assert "private-stale-version" not in terminal_output
@@ -3415,7 +3485,8 @@ def test_customer_evidence_keeps_summary_and_nested_technical_details() -> None:
     assert main._result_needs_review(result) is True
     assert evidence["interaction_id"] == "case-1"
     assert evidence["original_input"] == "transfer 100 to Alice"
-    assert evidence["schema_version"] == "1.4.0"
+    assert evidence["schema_version"] == "1.8.0"
+    assert evidence["evaluation_mode"] == "variance"
     assert evidence["invariant_evaluation"] is None
     assert evidence["current_baseline"]["status"] == "ORIGINAL REPLAY STABLE (3/3 OBSERVED)"
     assert "findings" not in evidence["current_baseline"]
@@ -3446,6 +3517,9 @@ def test_customer_evidence_keeps_summary_and_nested_technical_details() -> None:
     assert "does not determine" in evidence["limitations"]
     assert "caused" in evidence["limitations"]
     assert "production failure rate" in evidence["limitations"]
+    assert (
+        "Historical output is grounding evidence, not an expected answer" in evidence["limitations"]
+    )
     assert evidence["technical_details"] == {"full": "technical evidence"}
 
 
@@ -3472,7 +3546,8 @@ def test_customer_evidence_keeps_invariants_separate_from_behavioral_findings() 
         invariant_evaluation=invariant_evaluation,
     )
 
-    assert evidence["schema_version"] == "1.4.0"
+    assert evidence["schema_version"] == "1.8.0"
+    assert evidence["evaluation_mode"] == "variance"
     assert evidence["cases"] == []
     stored_invariants = cast(dict[str, Any], evidence["invariant_evaluation"])
     assert stored_invariants["baseline"]["rules"][0]["status"] == "satisfied"
@@ -3732,7 +3807,10 @@ def test_duplicate_semantic_findings_get_stable_unique_reportable_ids(tmp_path: 
                 inconclusive_reasons=(),
             ),
             cases=(case,),
-            model_dump=lambda **kwargs: {"fixture": "duplicate semantic findings"},
+            model_dump=lambda **kwargs: {
+                "evaluation_mode": "variance",
+                "fixture": "duplicate semantic findings",
+            },
         ),
     )
     evidence = main._customer_evidence_record(
