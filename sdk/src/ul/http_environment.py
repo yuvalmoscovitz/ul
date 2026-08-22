@@ -26,6 +26,7 @@ from pydantic import (
     field_validator,
     model_validator,
 )
+from ul_core.contracts import ObservationSource, WorkerTraceFlusher
 from ul_core.evaluation import (
     EnvironmentCapabilities,
     EnvironmentLifecycleEvidence,
@@ -515,6 +516,10 @@ class JsonHttpEnvironmentConnection:
         max_request_bytes: int = 1_000_000,
         max_response_bytes: int = 1_000_000,
         max_environment_api_calls: int | None = None,
+        observation_source: ObservationSource | None = None,
+        worker_trace_flusher: WorkerTraceFlusher | None = None,
+        observation_timeout_seconds: float = 1.0,
+        campaign_id: str | None = None,
         client: httpx.AsyncClient | None = None,
     ) -> None:
         if max_environment_api_calls is not None and (
@@ -586,12 +591,16 @@ class JsonHttpEnvironmentConnection:
         self._composed_executor = ComposedEnvironmentExecutor(
             self._probe_invoker,
             config_sha256=self._config_sha256,
+            observation_source=observation_source,
+            worker_trace_flusher=worker_trace_flusher,
             state_environment=self._state_environment,
             fixture_id=(
                 config.fixture_id or config.environment_id
                 if isinstance(config, JsonHttpEnvironmentConfig)
                 else None
             ),
+            observation_timeout_seconds=observation_timeout_seconds,
+            campaign_id=campaign_id,
         )
 
     @property
@@ -621,6 +630,10 @@ class JsonHttpEnvironmentConnection:
         max_request_bytes: int = 1_000_000,
         max_response_bytes: int = 1_000_000,
         max_environment_api_calls: int | None = None,
+        observation_source: ObservationSource | None = None,
+        worker_trace_flusher: WorkerTraceFlusher | None = None,
+        observation_timeout_seconds: float = 1.0,
+        campaign_id: str | None = None,
         client: httpx.AsyncClient | None = None,
     ) -> JsonHttpEnvironmentConnection:
         return cls(
@@ -631,6 +644,10 @@ class JsonHttpEnvironmentConnection:
             max_request_bytes=max_request_bytes,
             max_response_bytes=max_response_bytes,
             max_environment_api_calls=max_environment_api_calls,
+            observation_source=observation_source,
+            worker_trace_flusher=worker_trace_flusher,
+            observation_timeout_seconds=observation_timeout_seconds,
+            campaign_id=campaign_id,
             client=client,
         )
 
@@ -713,6 +730,7 @@ class JsonHttpEnvironmentConnection:
                 ),
                 config.execute.response_json_pointer,
                 consume_budget=False,
+                extra_headers=_probe_context_headers(request),
             )
         else:
             payload = await self._post_for_json(
@@ -725,6 +743,7 @@ class JsonHttpEnvironmentConnection:
                 ),
                 "",
                 consume_budget=False,
+                extra_headers=_probe_context_headers(request),
             )
             self._validate_response_identity(
                 payload,
@@ -1487,12 +1506,14 @@ class JsonHttpEnvironmentConnection:
         response_json_pointer: str,
         *,
         consume_budget: bool = True,
+        extra_headers: dict[str, str] | None = None,
     ) -> JsonValue:
         result = await self._post(
             endpoint,
             request_json,
             response_json_pointer=response_json_pointer,
             consume_budget=consume_budget,
+            extra_headers=extra_headers,
         )
         if result is None:
             raise _EnvironmentProtocolError(
@@ -1507,6 +1528,7 @@ class JsonHttpEnvironmentConnection:
         *,
         response_json_pointer: str | None,
         consume_budget: bool = True,
+        extra_headers: dict[str, str] | None = None,
     ) -> JsonValue | None:
         request_body = json.dumps(
             request_json,
@@ -1530,6 +1552,7 @@ class JsonHttpEnvironmentConnection:
                         "Accept-Encoding": "identity",
                         "Content-Type": "application/json",
                         **self._headers,
+                        **(extra_headers or {}),
                     },
                     content=request_body,
                     follow_redirects=False,
@@ -2094,6 +2117,14 @@ def _replace_request_placeholders(
             for key, value in template.items()
         }
     return template
+
+
+def _probe_context_headers(request: ProbeRequest) -> dict[str, str]:
+    traceparent = request.context.get("traceparent")
+    baggage = request.context.get("baggage")
+    if not isinstance(traceparent, str) or not isinstance(baggage, str):
+        return {}
+    return {"traceparent": traceparent, "baggage": baggage}
 
 
 def _parse_json_pointer(pointer: str) -> tuple[str, ...]:
