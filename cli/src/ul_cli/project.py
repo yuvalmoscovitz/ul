@@ -496,6 +496,17 @@ def run_project(
         bool,
         typer.Option(help="Validate and show the execution plan without external calls."),
     ] = False,
+    json_output: Annotated[
+        bool,
+        typer.Option("--json", help="Emit the dry-run campaign plan as stable JSON."),
+    ] = False,
+    show_sensitive_values: Annotated[
+        bool,
+        typer.Option(
+            "--show-sensitive-values",
+            help="Include private saved candidate inputs in dry-run human or JSON output.",
+        ),
+    ] = False,
     limit: Annotated[int | None, typer.Option(min=1, max=100)] = None,
     repetitions: Annotated[int | None, typer.Option(min=1)] = None,
     max_environment_api_calls: Annotated[
@@ -518,6 +529,9 @@ def run_project(
     ] = False,
 ) -> None:
     """Run the configured project, with optional one-run overrides."""
+    if (json_output or show_sensitive_values) and not dry_run:
+        option = "--show-sensitive-values" if show_sensitive_values else "--json"
+        raise typer.BadParameter(f"{option} requires --dry-run", param_hint=option)
     project_root, config = load_project()
     try:
         output = (
@@ -558,6 +572,8 @@ def run_project(
             confirm_test_environment=config.confirm_test_environment,
             allow_insecure_http=config.allow_insecure_http,
             dry_run=dry_run,
+            json_output=json_output,
+            show_sensitive_values=show_sensitive_values,
             resume=output if resume else None,
             redaction_policy=(
                 resolve_project_path(config.redaction_policy, project_root)

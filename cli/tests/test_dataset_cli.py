@@ -24,6 +24,8 @@ from ul import (
     DatasetEvaluationResult,
     DatasetEvaluationTrial,
     DatasetEvaluationTrialSet,
+    EvaluatorModelCompatibilityError,
+    EvaluatorModelPreflight,
     InteractionRecord,
     JsonHttpEnvironmentConfig,
     JsonHttpIsolatedResponseConfig,
@@ -56,6 +58,138 @@ from ul_core.evaluation import (
 
 runner = CliRunner()
 _ANSI_ESCAPE_PATTERN = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+
+
+def _evaluator_preflight() -> EvaluatorModelPreflight:
+    provider_options = {
+        "require_parameters": True,
+        "data_collection": "deny",
+        "zdr": True,
+    }
+
+    def request_options_sha256(
+        model: str,
+        reasoning_effort: str,
+        temperature: int | float,
+        seed: int,
+        *,
+        max_tokens: int = 1_024,
+        top_p: float | None = None,
+    ) -> str:
+        options: dict[str, object] = {
+            "model": model,
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+            "seed": seed,
+            "reasoning": {"effort": reasoning_effort},
+            "provider": provider_options,
+        }
+        if top_p is not None:
+            options["top_p"] = top_p
+        serialized = json.dumps(options, sort_keys=True, separators=(",", ":"))
+        return hashlib.sha256(serialized.encode()).hexdigest()
+
+    render_seed = (
+        int.from_bytes(
+            hashlib.sha256(b"UL evaluator preflight\0Check renderer compatibility.").digest()[:4],
+            "big",
+        )
+        & 0x7FFF_FFFF
+    )
+    return EvaluatorModelPreflight.model_validate(
+        {
+            "provider": "openrouter",
+            "endpoint_sha256": _settings().semantic_endpoint_sha256,
+            "profiles": (
+                {
+                    "roles": ("deconstruct",),
+                    "requested_model": "test/deconstructor",
+                    "routed_model": "test/deconstructor",
+                    "upstream_provider": "test-provider",
+                    "required_parameters": (
+                        "response_format",
+                        "seed",
+                        "temperature",
+                        "max_tokens",
+                        "reasoning",
+                    ),
+                    "request_options_sha256": request_options_sha256(
+                        "test/deconstructor", "minimal", 0, 0
+                    ),
+                    "parameter_support": "routing_enforced",
+                    "unverified_options": (),
+                },
+                {
+                    "roles": ("render",),
+                    "requested_model": "test/renderer",
+                    "routed_model": "test/renderer",
+                    "upstream_provider": "test-provider",
+                    "required_parameters": (
+                        "response_format",
+                        "seed",
+                        "temperature",
+                        "max_tokens",
+                        "reasoning",
+                        "top_p",
+                    ),
+                    "request_options_sha256": request_options_sha256(
+                        "test/renderer",
+                        "none",
+                        0.7,
+                        render_seed,
+                        max_tokens=512,
+                        top_p=0.95,
+                    ),
+                    "parameter_support": "routing_enforced",
+                    "unverified_options": (),
+                },
+                {
+                    "roles": ("equivalence",),
+                    "requested_model": "test/equivalence",
+                    "routed_model": "test/equivalence",
+                    "upstream_provider": "test-provider",
+                    "required_parameters": (
+                        "response_format",
+                        "seed",
+                        "temperature",
+                        "max_tokens",
+                        "reasoning",
+                    ),
+                    "request_options_sha256": request_options_sha256(
+                        "test/equivalence", "low", 0, 0
+                    ),
+                    "parameter_support": "routing_enforced",
+                    "unverified_options": (),
+                },
+            ),
+            "verified_capabilities": (
+                "routing",
+                "structured_output",
+                "required_parameters",
+            ),
+            "ignored_or_unsupported_options": (),
+            "unverified_options": (),
+            "data_policy": {
+                "external_processing": True,
+                "provider_policy_declared": True,
+                "data_collection": "deny",
+                "zero_data_retention_required": True,
+                "implication": (
+                    "The configured route requires data collection to be denied and zero data "
+                    "retention; the evaluator request is still processed externally."
+                ),
+            },
+        }
+    )
+
+
+@pytest.fixture(autouse=True)
+def _stub_evaluator_preflight(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def successful_preflight(settings: object) -> EvaluatorModelPreflight:
+        del settings
+        return _evaluator_preflight()
+
+    monkeypatch.setattr(main, "_preflight_evaluator", successful_preflight)
 
 
 def _write_dataset(path: Path, records: list[dict[str, Any]]) -> None:
@@ -836,7 +970,7 @@ def test_dry_run_validates_and_makes_no_external_calls(
     assert "Selected interactions: 1" in result.output
     assert "Evaluation mode: variance" in result.output
     assert "Repetitions: 3 per original and accepted variation" in result.output
-    assert "Potential semantic model calls: up to 10" in result.output
+    assert "Potential semantic model calls: up to 12" in result.output
     assert "Potential environment API calls: up to 30" in result.output
     assert "authorized maximum: 100" in result.output
     assert "Semantic models receive historical inputs and outputs" in result.output
@@ -852,6 +986,288 @@ def test_dry_run_validates_and_makes_no_external_calls(
     assert "estimate a production failure rate" in result.output
     assert "No model or environment API requests sent." in result.output
     assert "Transfer 100" not in result.output
+
+
+def test_dry_run_json_exposes_per_example_campaign_and_exact_call_plan(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    dataset = tmp_path / "interactions.jsonl"
+    target_config = tmp_path / "target.json"
+    _write_dataset(dataset, [_record()])
+    _write_target_config(target_config)
+
+    def unexpected_deconstructor(*args: object, **kwargs: object) -> None:
+        raise AssertionError("campaign planning constructed a semantic model client")
+
+    def unexpected_target(*args: object, **kwargs: object) -> None:
+        raise AssertionError("campaign planning constructed a target client")
+
+    monkeypatch.setattr(main, "create_semantic_model_deconstructor", unexpected_deconstructor)
+    monkeypatch.setattr(main.JsonHttpEnvironmentConnection, "from_config", unexpected_target)
+    result = runner.invoke(
+        root_app,
+        [
+            "dataset",
+            "evaluate",
+            str(dataset),
+            "--operator",
+            "input.surface.disfluency_repeat",
+            "--environment-config",
+            str(target_config),
+            "--repetitions",
+            "2",
+            "--dry-run",
+            "--json",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["schema_version"] == "1.1.0"
+    assert payload["evaluation_mode"] == "variance"
+    assert payload["fixture"] == {"status": "missing", "id": None, "version": None}
+    assert any("no fixture identity" in warning.casefold() for warning in payload["warnings"])
+    assert payload["inspection_model_calls"] == 0
+    assert payload["inspection_environment_calls"] == 0
+    assert payload["calls"] == {
+        "basis": "authorized_maximum",
+        "baseline": 2,
+        "variation": 2,
+        "repetitions": 2,
+        "repetition_executions": 4,
+        "retries": 0,
+        "preflight": 3,
+        "evaluators": 7,
+        "variation_generation": 0,
+        "total_semantic_model": 10,
+        "total_environment_api": 20,
+    }
+    assert payload["calls"]["preflight"] == len(payload["preflight_profiles"])
+    assert [profile["roles"] for profile in payload["preflight_profiles"]] == [
+        ["deconstruct"],
+        ["render"],
+        ["equivalence"],
+    ]
+    assert (
+        sum(profile["max_completion_tokens"] for profile in payload["preflight_profiles"]) == 2_560
+    )
+    assert payload["calls"]["total_semantic_model"] == (
+        payload["calls"]["preflight"]
+        + payload["calls"]["evaluators"]
+        + payload["calls"]["variation_generation"]
+    )
+    planned_operator = next(
+        operator
+        for operator in payload["examples"][0]["operators"]
+        if operator["id"] == "input.surface.disfluency_repeat"
+    )
+    assert planned_operator["status"] == "conditional"
+    assert planned_operator["selected"] is True
+    assert "deterministic and free" in planned_operator["reasons"][1]
+    assert payload["tokens"] == {
+        "minimum": 0,
+        "maximum": 28_160,
+        "scope": "completion_tokens",
+    }
+    assert payload["money"] is None
+
+
+def test_sensitive_candidate_output_requires_dry_run(tmp_path: Path) -> None:
+    dataset = tmp_path / "interactions.jsonl"
+    _write_dataset(dataset, [_record()])
+
+    result = runner.invoke(
+        root_app,
+        ["dataset", "evaluate", str(dataset), "--show-sensitive-values"],
+    )
+
+    assert result.exit_code == 2
+    normalized_output = " ".join(_ANSI_ESCAPE_PATTERN.sub("", result.output).split())
+    assert "--show-sensitive-values requires" in normalized_output
+    assert "--dry-run" in normalized_output
+
+
+@pytest.mark.parametrize(
+    ("status", "fixture_id", "fixture_version"),
+    [
+        ("configured", "standard-account", "v3"),
+        ("missing", None, None),
+        ("not_required", None, None),
+    ],
+)
+def test_campaign_plan_json_preserves_fixture_contract(
+    status: str,
+    fixture_id: str | None,
+    fixture_version: str | None,
+) -> None:
+    plan = main.create_dataset_campaign_plan(
+        records=(_evaluation_result("interaction-1").source,),
+        selected_operator_ids=("input.surface.rephrase",),
+        repetitions=1,
+        target_calls_per_execution=1,
+        settings=cast(Any, _settings()),
+        fixture_status=cast(Any, status),
+        fixture_id=fixture_id,
+        fixture_version=fixture_version,
+    )
+
+    payload = plan.model_dump(mode="json")
+    assert payload["evaluation_mode"] == "variance"
+    assert payload["fixture"] == {
+        "status": status,
+        "id": fixture_id,
+        "version": fixture_version,
+    }
+    assert any("no fixture identity" in warning.casefold() for warning in payload["warnings"]) == (
+        status == "missing"
+    )
+
+
+def test_campaign_plan_exposes_precomputed_candidate_without_new_generation() -> None:
+    evaluation_result = _evaluation_result("interaction-1", has_review_finding=True)
+    plan = main.create_dataset_campaign_plan(
+        records=(evaluation_result.source,),
+        selected_operator_ids=("input.surface.rephrase",),
+        repetitions=1,
+        target_calls_per_execution=1,
+        settings=main.load_dataset_semantic_settings(),
+        saved_augmentations={evaluation_result.source.id: evaluation_result.augmentation},
+    )
+
+    planned_operator = next(
+        operator
+        for operator in plan.examples[0].operators
+        if operator.id == "input.surface.rephrase"
+    )
+    assert planned_operator.status == "eligible"
+    assert planned_operator.candidate_input_available is True
+    assert planned_operator.candidate_input is None
+    assert plan.calls.variation_generation == 0
+    assert any("available but omitted" in warning for warning in plan.warnings)
+
+    sensitive_plan = main.create_dataset_campaign_plan(
+        records=(evaluation_result.source,),
+        selected_operator_ids=("input.surface.rephrase",),
+        repetitions=1,
+        target_calls_per_execution=1,
+        settings=main.load_dataset_semantic_settings(),
+        saved_augmentations={evaluation_result.source.id: evaluation_result.augmentation},
+        show_sensitive_values=True,
+    )
+    sensitive_operator = next(
+        operator
+        for operator in sensitive_plan.examples[0].operators
+        if operator.id == "input.surface.rephrase"
+    )
+    assert (
+        sensitive_operator.candidate_input
+        == evaluation_result.augmentation.candidates[0].augmented_input
+    )
+    assert any("sensitive data" in warning for warning in sensitive_plan.warnings)
+
+
+@pytest.mark.parametrize("candidate_state", ["rejected", "missing"])
+def test_campaign_plan_does_not_count_known_non_executable_variations(
+    candidate_state: str,
+) -> None:
+    evaluation_result = _evaluation_result("interaction-1")
+    saved_augmentation = evaluation_result.augmentation
+    if candidate_state == "missing":
+        saved_augmentation = saved_augmentation.model_copy(update={"candidates": ()})
+
+    plan = main.create_dataset_campaign_plan(
+        records=(evaluation_result.source,),
+        selected_operator_ids=("input.surface.rephrase",),
+        repetitions=3,
+        target_calls_per_execution=5,
+        settings=main.load_dataset_semantic_settings(),
+        saved_augmentations={evaluation_result.source.id: saved_augmentation},
+    )
+
+    assert plan.calls.baseline == 3
+    assert plan.calls.variation == 0
+    assert plan.calls.repetition_executions == 3
+    assert plan.calls.evaluators == 3
+    assert plan.calls.total_semantic_model == 6
+    assert plan.calls.total_environment_api == 15
+
+
+def test_campaign_plan_keeps_unattempted_operators_conditional() -> None:
+    evaluation_result = _evaluation_result("interaction-1")
+    saved_augmentation = evaluation_result.augmentation.model_copy(update={"candidates": ()})
+
+    plan = main.create_dataset_campaign_plan(
+        records=(evaluation_result.source,),
+        selected_operator_ids=("input.surface.rephrase",),
+        repetitions=1,
+        target_calls_per_execution=1,
+        settings=main.load_dataset_semantic_settings(),
+        saved_augmentations={evaluation_result.source.id: saved_augmentation},
+    )
+
+    operators = {operator.id: operator for operator in plan.examples[0].operators}
+    attempted_operator = operators["input.surface.rephrase"]
+    assert attempted_operator.status == "ineligible"
+    assert attempted_operator.reasons == ("saved semantic qualification produced no candidate",)
+
+    unattempted_operator = operators["input.surface.typing_noise"]
+    assert unattempted_operator.status == "conditional"
+    assert unattempted_operator.selected is False
+    assert "operator was not selected" in unattempted_operator.reasons
+
+
+def test_human_dry_run_escapes_untrusted_ids_and_summarizes_unselected_catalog(
+    tmp_path: Path,
+) -> None:
+    dataset = tmp_path / "interactions.jsonl"
+    unsafe_id = "[bold]spoof[/bold]\x1b]8;;https://example.test\x07link"
+    _write_dataset(
+        dataset,
+        [_record(unsafe_id), *(_record(f"interaction-{index}") for index in range(2, 101))],
+    )
+
+    result = runner.invoke(
+        root_app,
+        [
+            "dataset",
+            "evaluate",
+            str(dataset),
+            "--limit",
+            "100",
+            "--max-environment-api-calls",
+            "600",
+            "--dry-run",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "\x1b" not in result.output
+    assert "\\u001b" in result.output
+    assert "[bold]spoof[/bold]" in result.output
+    assert "Unselected catalog operators:" in result.output
+    assert "0 eligible, 7 conditional, 10 ineligible" in result.output
+    assert "use --json for full detail" in " ".join(result.output.split())
+    assert "input.surface.typing_noise@" not in result.output
+
+
+def test_campaign_plan_warns_about_missing_review_and_provider_parameters() -> None:
+    source = _evaluation_result("interaction-1").source
+    plan = main.create_dataset_campaign_plan(
+        records=(source,),
+        selected_operator_ids=("input.tone.frustrated",),
+        repetitions=1,
+        target_calls_per_execution=1,
+        settings=cast(
+            Any,
+            _settings(
+                semantic_provider_id="private-provider",
+                semantic_provider_type="openai-compatible",
+            ),
+        ),
+    )
+
+    assert any("no automatic customer evaluator" in warning for warning in plan.warnings)
+    assert any("strict JSON-schema" in warning for warning in plan.warnings)
 
 
 def test_dry_run_prints_configured_fixture_identity(tmp_path: Path) -> None:
@@ -1164,6 +1580,9 @@ def test_openai_compatible_execution_allows_an_unauthenticated_endpoint(
         def from_config(cls, *args: object, **kwargs: object) -> FakeTarget:
             return cls()
 
+        async def aclose(self) -> None:
+            return None
+
     async def fake_evaluate(*args: object, **kwargs: object) -> tuple[object, ...]:
         return ()
 
@@ -1187,6 +1606,158 @@ def test_openai_compatible_execution_allows_an_unauthenticated_endpoint(
 
     assert result.exit_code == 0, result.output
     assert output.exists()
+
+
+def test_evaluator_preflight_failure_surfaces_capability_and_safe_action(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    dataset = tmp_path / "interactions.jsonl"
+    output = tmp_path / "results.jsonl"
+    target_config = tmp_path / "target.json"
+    _write_dataset(dataset, [_record()])
+    _write_target_config(target_config)
+    monkeypatch.setenv("UL_LIVE", "true")
+    monkeypatch.setenv("OPEN_ROUTER_API_KEY", "test-key")
+
+    class FakeTarget:
+        @classmethod
+        def from_config(cls, *args: object, **kwargs: object) -> FakeTarget:
+            return cls()
+
+        async def aclose(self) -> None:
+            return None
+
+    async def fail_preflight(*args: object, **kwargs: object) -> EvaluatorModelPreflight:
+        raise EvaluatorModelCompatibilityError(
+            "evaluator model is incompatible with required seed capability; "
+            "choose another configured evaluator model or verify the configured route and retry"
+        )
+
+    monkeypatch.setattr(main, "_preflight_evaluator", fail_preflight)
+    monkeypatch.setattr(main, "JsonHttpEnvironmentConnection", FakeTarget)
+
+    result = runner.invoke(
+        root_app,
+        [
+            "dataset",
+            "evaluate",
+            str(dataset),
+            "--environment-config",
+            str(target_config),
+            "--allow-environment-network",
+            "--confirm-test-environment",
+            "--output",
+            str(output),
+        ],
+    )
+
+    assert result.exit_code == 2
+    assert "required seed capability" in result.output
+    assert "choose another configured evaluator model" in result.output
+    assert "before campaign execution" in result.output
+    assert not output.exists()
+    assert not (tmp_path / "results.augmentations.jsonl").exists()
+    assert not (tmp_path / "results.jsonl.preflight.json").exists()
+
+
+def test_local_environment_gate_fails_before_evaluator_preflight(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    dataset = tmp_path / "interactions.jsonl"
+    output = tmp_path / "results.jsonl"
+    target_config = tmp_path / "target.json"
+    _write_dataset(dataset, [_record()])
+    _write_target_config(target_config)
+    monkeypatch.setenv("UL_LIVE", "true")
+    monkeypatch.setenv("OPEN_ROUTER_API_KEY", "test-key")
+    preflight_calls = 0
+
+    async def unexpected_preflight(*args: object, **kwargs: object) -> EvaluatorModelPreflight:
+        nonlocal preflight_calls
+        preflight_calls += 1
+        raise AssertionError("local validation must run before evaluator preflight")
+
+    monkeypatch.setattr(main, "_preflight_evaluator", unexpected_preflight)
+
+    result = runner.invoke(
+        root_app,
+        [
+            "dataset",
+            "evaluate",
+            str(dataset),
+            "--environment-config",
+            str(target_config),
+            "--confirm-test-environment",
+            "--output",
+            str(output),
+        ],
+        terminal_width=240,
+    )
+
+    assert result.exit_code == 2
+    assert preflight_calls == 0
+    assert not output.exists()
+    assert not (tmp_path / "results.jsonl.preflight.json").exists()
+
+
+def test_evaluator_preflight_receipt_survives_later_semantic_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    dataset = tmp_path / "interactions.jsonl"
+    output = tmp_path / "results.jsonl"
+    receipt = tmp_path / "results.jsonl.preflight.json"
+    target_config = tmp_path / "target.json"
+    _write_dataset(dataset, [_record()])
+    _write_target_config(target_config)
+    monkeypatch.setenv("UL_LIVE", "true")
+    monkeypatch.setenv("OPEN_ROUTER_API_KEY", "test-key")
+    expected_preflight = _evaluator_preflight()
+    preflight_calls = 0
+
+    async def successful_preflight(settings: object) -> EvaluatorModelPreflight:
+        nonlocal preflight_calls
+        del settings
+        preflight_calls += 1
+        return expected_preflight
+
+    class FakeTarget:
+        @classmethod
+        def from_config(cls, *args: object, **kwargs: object) -> FakeTarget:
+            return cls()
+
+        async def aclose(self) -> None:
+            return None
+
+    async def fail_after_preflight(*args: object, **kwargs: object) -> tuple[object, ...]:
+        assert kwargs["evaluator_preflight"] is expected_preflight
+        raise ValueError("later semantic failure")
+
+    monkeypatch.setattr(main, "_preflight_evaluator", successful_preflight)
+    monkeypatch.setattr(main, "JsonHttpEnvironmentConnection", FakeTarget)
+    monkeypatch.setattr(main, "_evaluate_interaction_records", fail_after_preflight)
+
+    result = runner.invoke(
+        root_app,
+        [
+            "dataset",
+            "evaluate",
+            str(dataset),
+            "--environment-config",
+            str(target_config),
+            "--allow-environment-network",
+            "--confirm-test-environment",
+            "--output",
+            str(output),
+        ],
+    )
+
+    assert result.exit_code == 2
+    assert preflight_calls == 1
+    assert EvaluatorModelPreflight.model_validate_json(receipt.read_text()) == expected_preflight
+    assert stat.S_IMODE(receipt.stat().st_mode) == 0o600
 
 
 def test_stateful_target_dry_run_counts_physical_lifecycle_calls(
@@ -1249,7 +1820,7 @@ def test_invariant_dry_run_reports_rules_authority_and_no_extra_calls(
     assert "Declared observation authority: committed_state_snapshot" in result.output
     assert "Additional model calls for customer invariants: 0" in result.output
     assert "Additional environment API calls for customer invariants: 0" in result.output
-    assert "Potential semantic model calls: up to 10" in result.output
+    assert "Potential semantic model calls: up to 13" in result.output
     assert "Potential environment API calls: up to 6" in result.output
 
 
@@ -1527,6 +2098,9 @@ def test_invariant_evaluation_reuses_results_without_extra_runner_calls(
         async def __aexit__(self, *args: object) -> None:
             pass
 
+        def reuse_preflight(self, result: object) -> None:
+            assert result == _evaluator_preflight()
+
     class FakeRunner:
         def __init__(self, *args: object, **kwargs: object) -> None:
             pass
@@ -1571,6 +2145,7 @@ def test_invariant_evaluation_reuses_results_without_extra_runner_calls(
                 planned_target_calls=2,
                 invariant_suite=suite,
                 invariant_evaluations=stored_evaluations,
+                evaluator_preflight=_evaluator_preflight(),
             )
         )
 
@@ -2158,8 +2733,10 @@ def test_execution_creates_private_explicit_output(
         augmentation_ledger: object,
         saved_augmentations: object,
         redaction_engine: object,
+        evaluator_preflight: object,
     ) -> tuple[object, ...]:
         del settings, target, run_context, augmentation_ledger, saved_augmentations
+        assert evaluator_preflight == _evaluator_preflight()
         assert redaction_engine is None
         captured_records.extend(record.id for record in records)
         assert operator_ids == ("input.surface.disfluency_repeat",)
@@ -2403,6 +2980,7 @@ def test_execution_wires_redaction_into_records_pipeline_and_run_context(
         augmentation_ledger: object,
         saved_augmentations: object,
         redaction_engine: object,
+        evaluator_preflight: object,
     ) -> tuple[object, ...]:
         del (
             repetitions,
@@ -2412,6 +2990,7 @@ def test_execution_wires_redaction_into_records_pipeline_and_run_context(
             saved_augmentations,
         )
         assert redaction_engine is not None
+        assert evaluator_preflight == _evaluator_preflight()
         assert secret not in records[0].model_dump_json()
         serialized_context = cast(Any, run_context).model_dump_json()
         assert secret not in serialized_context
@@ -2550,6 +3129,7 @@ def test_target_config_runs_nested_request_and_response_against_loopback(
             augmentation_ledger: object,
             saved_augmentations: object,
             redaction_engine: object,
+            evaluator_preflight: object,
         ) -> tuple[object, ...]:
             del (
                 operator_ids,
@@ -2562,6 +3142,7 @@ def test_target_config_runs_nested_request_and_response_against_loopback(
                 saved_augmentations,
             )
             assert redaction_engine is None
+            assert evaluator_preflight == _evaluator_preflight()
             async with target:
                 case = evaluation_case_from_inputs(
                     case_id="ul-case-00000000000000000000000000000000",
@@ -2692,7 +3273,7 @@ def test_legacy_operator_list_delegates_to_catalog_and_keeps_existing_call_accou
 
     assert dry_run.exit_code == 0, dry_run.output
     assert "Operators: input.intent.self_correction@1.0.0" in dry_run.output
-    assert "Potential semantic model calls: up to 10" in dry_run.output
+    assert "Potential semantic model calls: up to 13" in dry_run.output
     assert "Potential environment API calls: up to 6" in dry_run.output
 
     wrong_version = runner.invoke(
@@ -2817,8 +3398,8 @@ def test_resume_skips_already_processed_interaction_ids(
         + "\n",
         encoding="utf-8",
     )
-
     evaluated_ids: list[str] = []
+    preflight_calls = 0
 
     class FakeTarget:
         @classmethod
@@ -2839,6 +3420,7 @@ def test_resume_skips_already_processed_interaction_ids(
         augmentation_ledger: object,
         saved_augmentations: object,
         redaction_engine: object,
+        evaluator_preflight: object,
     ) -> tuple[object, ...]:
         del (
             operator_ids,
@@ -2853,6 +3435,7 @@ def test_resume_skips_already_processed_interaction_ids(
             == evaluation_results[1].augmentation
         )
         assert redaction_engine is None
+        assert evaluator_preflight == _evaluator_preflight()
         assert repetitions == 1
         for record in records:
             evaluated_ids.append(record.id)
@@ -2878,6 +3461,14 @@ def test_resume_skips_already_processed_interaction_ids(
     )
     monkeypatch.setattr(main, "JsonHttpEnvironmentConnection", FakeTarget)
     monkeypatch.setattr(main, "_evaluate_interaction_records", fake_evaluate)
+
+    async def unexpected_paid_preflight(settings: object) -> EvaluatorModelPreflight:
+        nonlocal preflight_calls
+        del settings
+        preflight_calls += 1
+        raise AssertionError("partial resume must reuse its preflight receipt")
+
+    monkeypatch.setattr(main, "_preflight_evaluator", unexpected_paid_preflight)
     command = [
         "dataset",
         "evaluate",
@@ -2893,17 +3484,62 @@ def test_resume_skips_already_processed_interaction_ids(
     ]
     dry_run = runner.invoke(root_app, [*command, "--dry-run"])
 
-    assert dry_run.exit_code == 0, dry_run.output
-    assert "Resume compatible: 1 complete interaction(s) skipped; 1 remaining" in dry_run.output
-    assert "Evidence destination:" in dry_run.output
-    assert evidence.name in dry_run.output
-    assert f"Augmentations destination: {augmentations}" in " ".join(
-        _ANSI_ESCAPE_PATTERN.sub("", dry_run.output).split()
+    assert dry_run.exit_code == 2
+    assert "required receipt evidence.jsonl.preflight.json is missing" in dry_run.output
+
+    missing_result = runner.invoke(root_app, command)
+
+    assert missing_result.exit_code == 2
+    assert "required receipt evidence.jsonl.preflight.json is missing" in missing_result.output
+    assert preflight_calls == 0
+    assert evaluated_ids == []
+
+    receipt = main._persist_evaluator_preflight(evidence, _evaluator_preflight())
+
+    mismatched_preflight = _evaluator_preflight().model_copy(update={"endpoint_sha256": "b" * 64})
+    receipt.write_text(mismatched_preflight.model_dump_json() + "\n", encoding="utf-8")
+    mismatch_dry_run = runner.invoke(root_app, [*command, "--dry-run"])
+    mismatch_result = runner.invoke(root_app, command)
+
+    assert mismatch_dry_run.exit_code == 2
+    assert "cannot reuse evaluator preflight receipt" in mismatch_dry_run.output
+    assert mismatch_result.exit_code == 2
+    assert "cannot reuse evaluator preflight receipt" in mismatch_result.output
+    assert "restore the matching receipt and semantic settings" in mismatch_result.output
+    assert preflight_calls == 0
+    assert evaluated_ids == []
+
+    receipt.write_text(_evaluator_preflight().model_dump_json() + "\n", encoding="utf-8")
+
+    valid_dry_run = runner.invoke(root_app, [*command, "--dry-run"])
+
+    assert valid_dry_run.exit_code == 0, valid_dry_run.output
+    assert (
+        "Resume compatible: 1 complete interaction(s) skipped; 1 remaining" in valid_dry_run.output
     )
+    assert "preflight=0" in valid_dry_run.output
+    assert "Evaluator preflight profile:" not in valid_dry_run.output
+    assert "Evidence destination:" in valid_dry_run.output
+    assert evidence.name in valid_dry_run.output
+    assert f"Augmentations destination: {augmentations}" in " ".join(
+        _ANSI_ESCAPE_PATTERN.sub("", valid_dry_run.output).split()
+    )
+    assert "Please transfer 100 to Alice." not in valid_dry_run.output
+    assert "Candidate input: omitted (sensitive)" in valid_dry_run.output
+
+    sensitive_dry_run = runner.invoke(
+        root_app,
+        [*command, "--dry-run", "--show-sensitive-values"],
+    )
+    assert sensitive_dry_run.exit_code == 0, sensitive_dry_run.output
+    warning_position = sensitive_dry_run.output.index("may contain sensitive data")
+    candidate_position = sensitive_dry_run.output.index("Please transfer 100 to Alice.")
+    assert warning_position < candidate_position
 
     result = runner.invoke(root_app, command)
 
     assert result.exit_code == 0, result.output
+    assert preflight_calls == 0
     assert evaluated_ids == ["interaction-2"]
     lines = [line for line in evidence.read_text(encoding="utf-8").splitlines() if line.strip()]
     assert len(lines) == 2
@@ -3014,23 +3650,26 @@ def test_resume_exits_early_when_all_records_already_processed(
     )
     monkeypatch.setattr(main, "load_dataset_semantic_settings", _settings)
 
-    result = runner.invoke(
-        root_app,
-        [
-            "dataset",
-            "evaluate",
-            str(dataset),
-            "--environment-config",
-            str(target_config),
-            "--allow-environment-network",
-            "--confirm-test-environment",
-            "--repetitions",
-            "1",
-            "--resume",
-            str(evidence),
-        ],
-    )
+    command = [
+        "dataset",
+        "evaluate",
+        str(dataset),
+        "--environment-config",
+        str(target_config),
+        "--allow-environment-network",
+        "--confirm-test-environment",
+        "--repetitions",
+        "1",
+        "--resume",
+        str(evidence),
+    ]
+    dry_run = runner.invoke(root_app, [*command, "--dry-run"])
+    result = runner.invoke(root_app, command)
 
+    assert dry_run.exit_code == 0, dry_run.output
+    assert "Potential semantic model calls: up to 0" in dry_run.output
+    assert "preflight=0" in dry_run.output
+    assert "Estimated completion tokens: 0..0" in dry_run.output
     assert result.exit_code == 0, result.output
     assert "Nothing to do" in result.output
 

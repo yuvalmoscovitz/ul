@@ -28,6 +28,8 @@ from ul import (
     DatasetEvaluationTrialSet,
     DatasetSemanticSettings,
     DatasetTargetLifecycleFailure,
+    EvaluatorModelCompatibilityError,
+    EvaluatorModelPreflight,
     InteractionRecord,
     LocalPseudonymStore,
     ProviderDiagnosticError,
@@ -37,6 +39,7 @@ from ul import (
     load_dataset_semantic_settings,
     load_redaction_policy,
     resolve_dataset_augmentation_operator,
+    validate_evaluator_preflight,
 )
 from ul.dataset_invariants import (
     DatasetInvariantArrayUniqueTrialEvaluation,
@@ -74,6 +77,7 @@ from ul_cli.dataset_augmentation_ledger import (
     open_augmentation_ledger_for_resume,
     read_augmentation_ledger,
 )
+from ul_cli.dataset_campaign import DatasetCampaignPlan, create_dataset_campaign_plan
 from ul_cli.dataset_ingest import app as ingest_app
 from ul_cli.dataset_review import (
     DatasetEvidenceRedactionCoverage,
@@ -102,6 +106,7 @@ app.command("review")(review_dataset_finding)
 _MAXIMUM_DATASET_BYTES = 10_000_000
 _MAXIMUM_DATASET_RECORDS = 100
 _MAXIMUM_EVIDENCE_BYTES = 128_000_000
+_MAXIMUM_PREFLIGHT_RECEIPT_BYTES = 100_000
 _DEFAULT_MAXIMUM_ENVIRONMENT_API_CALLS = 100
 _REDACTION_KEY_ENVIRONMENT_VARIABLE = "UL_DATASET_REDACTION_KEY"
 _PROVIDER_DIAGNOSTIC_SCHEMA_VERSION = "1.0.0"
@@ -578,6 +583,17 @@ def evaluate_dataset(
         bool,
         typer.Option(help="Validate and show the execution plan without external calls."),
     ] = False,
+    json_output: Annotated[
+        bool,
+        typer.Option("--json", help="Emit the dry-run campaign plan as stable JSON."),
+    ] = False,
+    show_sensitive_values: Annotated[
+        bool,
+        typer.Option(
+            "--show-sensitive-values",
+            help="Include private saved candidate inputs in dry-run human or JSON output.",
+        ),
+    ] = False,
     resume: Annotated[
         Path | None,
         typer.Option(
@@ -635,6 +651,9 @@ def evaluate_dataset(
     Discover operators: ul augmentations list --mode dataset_variation
     Augmentation retention: --augmentations-output PATH or --no-save-augmentations
     """
+    if (json_output or show_sensitive_values) and not dry_run:
+        option = "--show-sensitive-values" if show_sensitive_values else "--json"
+        raise typer.BadParameter(f"{option} requires --dry-run", param_hint=option)
     if evaluation_mode != "variance":
         raise typer.BadParameter(
             f"evaluation mode '{evaluation_mode}' is not implemented; use 'variance'. "
@@ -862,12 +881,48 @@ def evaluate_dataset(
         )
         skipped_count = len(resume_evidence.processed_ids)
 
-    potential_target_calls = (
-        len(selected_records)
-        * repetitions
-        * (1 + len(selected_operators))
-        * target_calls_per_execution
+    evaluator_preflight: EvaluatorModelPreflight | None = None
+    evaluator_preflight_receipt: Path | None = None
+    if resume is not None and selected_records:
+        assert output is not None
+        try:
+            evaluator_preflight, evaluator_preflight_receipt = asyncio.run(
+                _load_evaluator_preflight(output, settings)
+            )
+        except ValueError as error:
+            raise typer.BadParameter(
+                f"cannot reuse evaluator preflight receipt ({error}); restore the matching "
+                "receipt and semantic settings, or start a new run with a new --output",
+                param_hint="--resume",
+            ) from None
+
+    campaign_plan = create_dataset_campaign_plan(
+        records=selected_records,
+        selected_operator_ids=selected_operators,
+        repetitions=repetitions,
+        target_calls_per_execution=target_calls_per_execution,
+        settings=settings,
+        saved_augmentations=saved_augmentations,
+        show_sensitive_values=show_sensitive_values,
+        requires_preflight=evaluator_preflight is None and bool(selected_records),
+        evaluation_mode=evaluation_mode,
+        fixture_status=(
+            run_context.fixture.status
+            if run_context is not None and run_context.fixture is not None
+            else None
+        ),
+        fixture_id=(
+            run_context.fixture.id
+            if run_context is not None and run_context.fixture is not None
+            else None
+        ),
+        fixture_version=(
+            run_context.fixture.version
+            if run_context is not None and run_context.fixture is not None
+            else None
+        ),
     )
+    potential_target_calls = campaign_plan.calls.total_environment_api
     if potential_target_calls > max_environment_api_calls:
         raise typer.BadParameter(
             f"remaining selection would make up to {potential_target_calls} environment API calls, "
@@ -924,6 +979,8 @@ def evaluate_dataset(
                 redaction_engine.policy.digest if redaction_engine is not None else None
             ),
             redaction_coverage=redaction_coverage,
+            campaign_plan=campaign_plan,
+            json_output=json_output,
         )
         return
 
@@ -1026,6 +1083,24 @@ def evaluate_dataset(
             param_hint="--environment-config",
         ) from None
 
+    if evaluator_preflight is None:
+        try:
+            evaluator_preflight = asyncio.run(_preflight_evaluator(settings))
+            evaluator_preflight_receipt = _persist_evaluator_preflight(output, evaluator_preflight)
+        except EvaluatorModelCompatibilityError as error:
+            asyncio.run(target.aclose())
+            _print_dataset_plain(f"Evaluation stopped before campaign execution: {error}")
+            raise typer.Exit(code=2) from None
+        except (OSError, ValueError) as error:
+            asyncio.run(target.aclose())
+            message = str(error) if isinstance(error, ValueError) else error.__class__.__name__
+            raise typer.BadParameter(
+                f"cannot safely persist evaluator preflight ({message})",
+                param_hint="--output",
+            ) from None
+    assert evaluator_preflight_receipt is not None
+    _print_evaluator_preflight(evaluator_preflight, evaluator_preflight_receipt)
+
     augmentation_ledger: DatasetAugmentationLedger | None = None
     augmentation_ledger_was_created = False
     output_stream: TextIO | None = None
@@ -1116,6 +1191,7 @@ def evaluate_dataset(
                     invariant_suite=invariant_suite,
                     invariant_evaluations=invariant_evaluations,
                     redaction_engine=redaction_engine,
+                    evaluator_preflight=evaluator_preflight,
                 )
             else:
                 evaluation_coroutine = _evaluate_interaction_records(
@@ -1136,6 +1212,7 @@ def evaluate_dataset(
                     augmentation_ledger=augmentation_ledger,
                     saved_augmentations=saved_augmentations,
                     redaction_engine=redaction_engine,
+                    evaluator_preflight=evaluator_preflight,
                 )
             results = asyncio.run(evaluation_coroutine)
             for result in results:
@@ -1479,13 +1556,14 @@ def _print_dataset_plan(
     semantic_endpoint_sha256: str,
     redaction_policy_sha256: str | None,
     redaction_coverage: tuple[DatasetEvidenceRedactionCoverage, ...],
+    campaign_plan: DatasetCampaignPlan,
+    json_output: bool,
 ) -> None:
-    potential_target_calls = (
-        selected_count * repetitions * (1 + len(operator_ids)) * target_calls_per_execution
-    )
-    potential_model_calls = selected_count * (
-        1 + 3 * len(operator_ids) + repetitions * (1 + len(operator_ids))
-    )
+    if json_output:
+        typer.echo(json.dumps(campaign_plan.model_dump(mode="json"), ensure_ascii=False, indent=2))
+        return
+    potential_target_calls = campaign_plan.calls.total_environment_api
+    potential_model_calls = campaign_plan.calls.total_semantic_model
     console.print(f"Dataset valid: {record_count} interaction(s)")
     if skipped_count:
         console.print(
@@ -1508,6 +1586,27 @@ def _print_dataset_plan(
         console.print("Additional model calls for customer invariants: 0")
         console.print("Additional environment API calls for customer invariants: 0")
     console.print(f"Potential semantic model calls: up to {potential_model_calls}")
+    console.print(
+        "Planned maximum calls: "
+        f"baseline={campaign_plan.calls.baseline}, "
+        f"variation={campaign_plan.calls.variation}, "
+        f"repetition_executions={campaign_plan.calls.repetition_executions}, "
+        f"repetition_rounds={campaign_plan.calls.repetitions}, "
+        f"retries={campaign_plan.calls.retries}, "
+        f"preflight={campaign_plan.calls.preflight}, "
+        f"evaluators={campaign_plan.calls.evaluators}"
+    )
+    for profile in campaign_plan.preflight_profiles:
+        _print_dataset_plain(
+            "Evaluator preflight profile: "
+            f"roles={','.join(profile.roles)}, model={profile.requested_model}, "
+            f"max_completion_tokens={profile.max_completion_tokens}"
+        )
+    console.print(
+        "Estimated completion tokens: "
+        f"{campaign_plan.tokens.minimum}..{campaign_plan.tokens.maximum}"
+    )
+    console.print("Estimated monetary cost: unavailable (no trusted pricing configured)")
     console.print(
         f"Semantic provider: {semantic_provider_id} "
         f"(endpoint sha256: {semantic_endpoint_sha256[:12]})"
@@ -1533,7 +1632,45 @@ def _print_dataset_plan(
         console.print("Adapter tier: isolated-response (response evidence only)")
     target_status = "configured" if target_configured else "not configured"
     console.print(f"Customer-managed environment API: {target_status}")
-    if fixture_status is not None:
+    for warning in campaign_plan.warnings:
+        _print_dataset_plain(f"Warning: {warning}")
+    console.print("Selected operator applicability by interaction")
+    for example in campaign_plan.examples:
+        _print_dataset_plain(f"  {example.interaction_id}")
+        for planned_operator in (operator for operator in example.operators if operator.selected):
+            _print_dataset_plain(
+                f"    {planned_operator.status.upper()} {planned_operator.id}@"
+                f"{planned_operator.version} selected"
+            )
+            for reason in planned_operator.reasons:
+                _print_dataset_plain(f"      Reason: {reason}")
+            if (
+                planned_operator.candidate_input_available
+                and planned_operator.candidate_input is None
+            ):
+                _print_dataset_plain("      Candidate input: omitted (sensitive)")
+            if planned_operator.candidate_input is not None:
+                _print_dataset_plain(f"      Candidate input: {planned_operator.candidate_input}")
+    if campaign_plan.examples:
+        unselected_operators = tuple(
+            operator for operator in campaign_plan.examples[0].operators if not operator.selected
+        )
+        unselected_eligible = sum(
+            operator.status == "eligible" for operator in unselected_operators
+        )
+        unselected_conditional = sum(
+            operator.status == "conditional" for operator in unselected_operators
+        )
+        unselected_ineligible = sum(
+            operator.status == "ineligible" for operator in unselected_operators
+        )
+        console.print(
+            "Unselected catalog operators: "
+            f"{unselected_eligible} eligible, {unselected_conditional} conditional, "
+            f"{unselected_ineligible} ineligible "
+            "(use --json for full detail)"
+        )
+    if fixture_status is not None and fixture_status != "missing":
         _print_fixture_identity(
             fixture_status,
             fixture_id=fixture_id,
@@ -1628,6 +1765,86 @@ def _write_provider_diagnostic(output: Path, error: ProviderDiagnosticError) -> 
             os.fsync(output_stream.fileno())
         return diagnostic_output
     raise FileExistsError("provider diagnostic receipt slots are occupied")
+
+
+async def _preflight_evaluator(settings: DatasetSemanticSettings) -> EvaluatorModelPreflight:
+    async with create_semantic_model_deconstructor(settings) as deconstructor:
+        return await deconstructor.preflight()
+
+
+async def _load_evaluator_preflight(
+    evidence_output: Path,
+    settings: DatasetSemanticSettings,
+) -> tuple[EvaluatorModelPreflight, Path]:
+    receipt_path = _evaluator_preflight_output(evidence_output)
+    try:
+        result = _read_evaluator_preflight(receipt_path)
+    except FileNotFoundError:
+        raise ValueError(f"required receipt {receipt_path.name} is missing") from None
+    except OSError as error:
+        raise ValueError(
+            f"required receipt {receipt_path.name} cannot be safely read "
+            f"({error.__class__.__name__})"
+        ) from None
+    validate_evaluator_preflight(settings, result)
+    return result, receipt_path
+
+
+def _evaluator_preflight_output(evidence_output: Path) -> Path:
+    return evidence_output.with_name(f"{evidence_output.name}.preflight.json")
+
+
+def _persist_evaluator_preflight(
+    evidence_output: Path,
+    result: EvaluatorModelPreflight,
+) -> Path:
+    receipt_path = _evaluator_preflight_output(evidence_output)
+    if receipt_path.exists():
+        existing = _read_evaluator_preflight(receipt_path)
+        if existing != result:
+            raise ValueError("existing evaluator preflight receipt does not match this run")
+        return receipt_path
+    with _create_private_output(receipt_path) as output_stream:
+        json.dump(result.model_dump(mode="json"), output_stream, ensure_ascii=False, sort_keys=True)
+        output_stream.write("\n")
+        output_stream.flush()
+        os.fsync(output_stream.fileno())
+    return receipt_path
+
+
+def _read_evaluator_preflight(receipt_path: Path) -> EvaluatorModelPreflight:
+    descriptor = _open_resume_descriptor(receipt_path, writable=False)
+    try:
+        descriptor_status = os.fstat(descriptor)
+        if sys.platform != "win32" and stat.S_IMODE(descriptor_status.st_mode) & 0o077:
+            raise ValueError("evaluator preflight receipt permissions are not private")
+        size = descriptor_status.st_size
+        if size > _MAXIMUM_PREFLIGHT_RECEIPT_BYTES:
+            raise ValueError("evaluator preflight receipt exceeds its size limit")
+        try:
+            return EvaluatorModelPreflight.model_validate_json(os.read(descriptor, size))
+        except ValidationError:
+            raise ValueError("evaluator preflight receipt is invalid") from None
+    finally:
+        os.close(descriptor)
+
+
+def _print_evaluator_preflight(result: EvaluatorModelPreflight, receipt: Path) -> None:
+    roles = ", ".join(role for profile in result.profiles for role in profile.roles)
+    _print_dataset_plain(
+        f"Evaluator preflight passed for {len(result.profiles)} distinct profile(s): {roles}."
+    )
+    if result.unverified_options:
+        _print_dataset_plain(
+            "Configured endpoint accepted every sample, but parameter support is unverified: "
+            f"{', '.join(result.unverified_options)}."
+        )
+    else:
+        _print_dataset_plain("Required semantic parameters were verified by enforced routing.")
+    data_policy_implication = result.data_policy.get("implication")
+    if isinstance(data_policy_implication, str):
+        _print_dataset_plain(f"Evaluator data policy: {data_policy_implication}")
+    _print_dataset_plain(f"Evaluator preflight receipt: {receipt}")
 
 
 def _create_private_output(path: Path) -> TextIO:
@@ -1756,9 +1973,12 @@ async def _evaluate_interaction_records(
     invariant_evaluations: list[DatasetInvariantEvaluation] | None = None,
     redaction_engine: RedactionEngine | None = None,
     allow_network_egress: bool = True,
+    evaluator_preflight: EvaluatorModelPreflight,
 ) -> tuple[DatasetEvaluationResult, ...]:
     results: list[DatasetEvaluationResult] = []
-    async with create_semantic_model_deconstructor(settings) as deconstructor, target:
+    deconstructor = create_semantic_model_deconstructor(settings)
+    deconstructor.reuse_preflight(evaluator_preflight)
+    async with deconstructor, target:
         semantic_pipeline = (
             RedactedSemanticPipeline(deconstructor, redaction_engine)
             if redaction_engine is not None

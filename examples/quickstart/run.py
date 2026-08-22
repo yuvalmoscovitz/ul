@@ -21,9 +21,9 @@ _DATASET_PATH = _QUICKSTART_DIRECTORY / "dataset.jsonl"
 _INVARIANTS_PATH = _QUICKSTART_DIRECTORY / "invariants.json"
 _TARGET_TEMPLATE_PATH = _QUICKSTART_DIRECTORY / "target.json"
 _QUICKSTART_MODEL_ENVIRONMENT = {
-    "UL_DATASET_MODEL": "x-ai/grok-4.6",
-    "UL_DATASET_RENDER_MODEL": "x-ai/grok-4.6",
-    "UL_DATASET_EQUIVALENCE_MODEL": "x-ai/grok-4.6",
+    "UL_DATASET_MODEL": "google/gemini-3.5-flash",
+    "UL_DATASET_RENDER_MODEL": "google/gemini-2.5-flash",
+    "UL_DATASET_EQUIVALENCE_MODEL": "google/gemini-3.5-flash",
 }
 
 

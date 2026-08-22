@@ -401,9 +401,9 @@ def test_runner_uses_safe_argv_minimal_environment_private_artifacts_and_cleans_
             "OPEN_ROUTER_API_KEY": "test-only-secret",
             "UL_DATASET_LIVE_CALLS": "true",
             "UL_DATASET_ALLOW_EXTERNAL_DATA_PROCESSING": "true",
-            "UL_DATASET_MODEL": "x-ai/grok-4.6",
-            "UL_DATASET_RENDER_MODEL": "x-ai/grok-4.6",
-            "UL_DATASET_EQUIVALENCE_MODEL": "x-ai/grok-4.6",
+            "UL_DATASET_MODEL": "google/gemini-3.5-flash",
+            "UL_DATASET_RENDER_MODEL": "google/gemini-2.5-flash",
+            "UL_DATASET_EQUIVALENCE_MODEL": "google/gemini-3.5-flash",
         }
         target_config_path = Path(command[command.index("--environment-config") + 1])
         assert Path(command[command.index("--invariants") + 1]) == (
@@ -633,6 +633,9 @@ def test_dry_run_is_a_real_subprocess_and_needs_no_api_key(tmp_path: Path) -> No
 
     assert completed.returncode == 0, completed.stdout + completed.stderr
     assert "No model or target requests sent." in completed.stdout
+    assert "Potential semantic model calls: up to 12" in completed.stdout
+    assert "preflight=3" in completed.stdout
+    assert "Estimated completion tokens: 0..36352" in completed.stdout
     assert "OPEN_ROUTER_API_KEY" not in environment
 
 

@@ -152,7 +152,8 @@ case; it is not proof that the implementation is correct or that every related f
 ## Limitations
 
 The example is intentionally small and deterministic on the target side. With OpenRouter,
-variation generation, validation, and behavioral comparison explicitly request `x-ai/grok-4.6`;
+semantic analysis and behavioral comparison explicitly request `google/gemini-3.5-flash`, while
+seeded variation rendering requests `google/gemini-2.5-flash`;
 an OpenAI-compatible provider uses its configured models. Model behavior may still vary, so the
 finding is not guaranteed. The invariant result applies only to configured fields returned by the
 environment's separate committed-state snapshot endpoint. UL validates the reset acknowledgement

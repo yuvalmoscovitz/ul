@@ -19,7 +19,10 @@ def test_prompt_manager_is_a_singleton_and_loads_the_packaged_catalog() -> None:
     manager = PromptManager.instance()
 
     assert manager is PromptManager.instance()
-    assert len(manager.list_templates()) == 23
+    assert len(manager.list_templates()) == 24
+    assert manager.get_prompt("semantic.preflight") == (
+        'Return exactly {"compatible":true}. This is a bounded evaluator compatibility check.'
+    )
     assert manager.get_prompt("examples.accounts_payable.tools.get_invoice") == (
         "Get the current invoice record by its exact ID."
     )

@@ -137,6 +137,10 @@ from ul.dataset_regression import (
 )
 from ul.deconstruction import (
     DatasetSemanticSettings,
+    EvaluatorModelCompatibilityError,
+    EvaluatorModelPreflight,
+    EvaluatorModelProfilePreflight,
+    EvaluatorPreflightProfilePlan,
     OpenAICompatibleDatasetSettings,
     OpenRouterDatasetSettings,
     ProviderDiagnostic,
@@ -145,6 +149,8 @@ from ul.deconstruction import (
     SemanticModelDeconstructor,
     create_semantic_model_deconstructor,
     load_dataset_semantic_settings,
+    plan_evaluator_preflight_profiles,
+    validate_evaluator_preflight,
 )
 from ul.event_stress import (
     CorrectionAfterFirstResponseCase,
@@ -302,6 +308,10 @@ __all__ = [
     "EnvironmentStateEvidence",
     "EnvironmentTurnEvidence",
     "EvaluationCase",
+    "EvaluatorModelCompatibilityError",
+    "EvaluatorModelPreflight",
+    "EvaluatorModelProfilePreflight",
+    "EvaluatorPreflightProfilePlan",
     "ExactlyOneNewEffectInvariant",
     "ExecutionEvidence",
     "ExecutionMode",
@@ -418,6 +428,7 @@ __all__ = [
     "materialize_trace_replay_bundle",
     "parse_otlp_traces",
     "plan_correction_stress_test",
+    "plan_evaluator_preflight_profiles",
     "plan_retry_after_successful_commit_stress_test",
     "plan_timeout_after_commit_stress_test",
     "plan_trace_replay",
@@ -433,5 +444,6 @@ __all__ = [
     "run_trace_replay",
     "run_trace_replay_campaign",
     "select_trace_replay_case",
+    "validate_evaluator_preflight",
     "write_augmentation_qualification_report",
 ]
