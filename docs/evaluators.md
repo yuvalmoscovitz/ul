@@ -80,6 +80,7 @@ Executable checks are registered in-process callables, never command or shell st
 ```python
 from ul import CallableEvaluator, EvaluatorDecision, EvaluatorEvidence, evaluate
 
+
 def approved_fixture(subject):
     approved = subject.initial_state["invoice"]["status"] == "approved"
     return EvaluatorDecision(
@@ -93,6 +94,7 @@ def approved_fixture(subject):
             ),
         ),
     )
+
 
 results = await evaluate(
     subject,
