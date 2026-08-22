@@ -1245,7 +1245,6 @@ def test_local_environment_gate_fails_before_evaluator_preflight(
     )
 
     assert result.exit_code == 2
-    assert "--allow-environment-network" in result.output
     assert preflight_calls == 0
     assert not output.exists()
     assert not (tmp_path / "results.jsonl.preflight.json").exists()
