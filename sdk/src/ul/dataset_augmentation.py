@@ -203,6 +203,12 @@ def resolve_dataset_augmentation_operator(reference: str) -> DatasetAugmentation
 
 class DatasetAugmentationCandidate(ULModel):
     source_interaction_id: str = Field(min_length=1)
+    source_record_id: str | None = Field(
+        default=None, min_length=1, exclude_if=lambda value: value is None
+    )
+    augmentation_target_id: str | None = Field(
+        default=None, min_length=1, exclude_if=lambda value: value is None
+    )
     operator_id: OperatorId = "input.surface.rephrase"
     operator_version: str = Field(
         default="1.0.0",
@@ -532,6 +538,16 @@ class DatasetAugmentationEngine:
                 candidates.append(
                     DatasetAugmentationCandidate(
                         source_interaction_id=record.id,
+                        source_record_id=(
+                            record.source_interaction_id
+                            if record.augmentation_target is not None
+                            else None
+                        ),
+                        augmentation_target_id=(
+                            record.augmentation_target.id
+                            if record.augmentation_target is not None
+                            else None
+                        ),
                         operator_id=operator.id,
                         operator_version=operator.version,
                         allowed_change=operator.allowed_change,

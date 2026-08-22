@@ -283,6 +283,11 @@ class _Baseline(_StrictModel):
 class _Case(_StrictModel):
     operator_id: str
     operator_version: str
+    source_record_id: str | None = Field(default=None, exclude_if=lambda value: value is None)
+    augmentation_target: JsonValue | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
+    original_value: str | None = Field(default=None, exclude_if=lambda value: value is None)
     augmented_input: str
     status: str
     variation_accepted: bool
@@ -293,9 +298,13 @@ class _Case(_StrictModel):
 
 
 class _EvidenceRecord(_StrictModel):
-    schema_version: Literal["1.3.0", "1.4.0", "1.5.0", "1.6.0", "1.7.0", "1.8.0"]
+    schema_version: Literal["1.3.0", "1.4.0", "1.5.0", "1.6.0", "1.7.0", "1.8.0", "1.9.0"]
     evaluation_mode: Literal["variance"] | None = None
     interaction_id: str
+    source_record_id: str | None = Field(default=None, exclude_if=lambda value: value is None)
+    augmentation_target: JsonValue | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
     original_input: str
     execution_plan: _ExecutionPlan
     limitations: str
@@ -307,21 +316,24 @@ class _EvidenceRecord(_StrictModel):
 
     @model_validator(mode="after")
     def validate_invariant_evaluation(self) -> Self:
-        if self.schema_version == "1.8.0" and self.evaluation_mode is None:
-            raise ValueError("evidence schema 1.8.0 requires an evaluation mode")
-        if self.schema_version == "1.8.0" and (
+        if self.schema_version in {"1.8.0", "1.9.0"} and self.evaluation_mode is None:
+            raise ValueError(f"evidence schema {self.schema_version} requires an evaluation mode")
+        if self.schema_version in {"1.8.0", "1.9.0"} and (
             not isinstance(self.technical_details, dict)
             or self.technical_details.get("evaluation_mode") != self.evaluation_mode
         ):
             raise ValueError("evidence evaluation mode must match technical details")
-        if self.schema_version != "1.8.0" and "evaluation_mode" in self.model_fields_set:
+        if (
+            self.schema_version not in {"1.8.0", "1.9.0"}
+            and "evaluation_mode" in self.model_fields_set
+        ):
             raise ValueError("legacy evidence does not include evaluation mode")
         if self.schema_version == "1.3.0" and "invariant_evaluation" in self.model_fields_set:
             raise ValueError("schema 1.3.0 does not include invariant evaluation")
         if self.schema_version in {"1.5.0", "1.6.0", "1.7.0"} and self.run_context is None:
             raise ValueError(f"schema {self.schema_version} requires run context")
         if (
-            self.schema_version not in {"1.5.0", "1.6.0", "1.7.0", "1.8.0"}
+            self.schema_version not in {"1.5.0", "1.6.0", "1.7.0", "1.8.0", "1.9.0"}
             and "run_context" in self.model_fields_set
         ):
             raise ValueError("legacy evidence does not include run context")
@@ -333,7 +345,12 @@ class _EvidenceRecord(_StrictModel):
             )
             for rule in arm.rules
         )
-        if uses_extended_invariants and self.schema_version not in {"1.6.0", "1.7.0", "1.8.0"}:
+        if uses_extended_invariants and self.schema_version not in {
+            "1.6.0",
+            "1.7.0",
+            "1.8.0",
+            "1.9.0",
+        }:
             raise ValueError("extended invariant results require evidence schema 1.6.0")
         if (
             self.run_context is not None
@@ -467,7 +484,7 @@ def validate_dataset_resume_evidence(
         except (ValidationError, ValueError):
             raise ValueError("resume evidence is not valid UL JSONL") from None
         if (
-            evidence.schema_version not in {"1.5.0", "1.6.0", "1.7.0", "1.8.0"}
+            evidence.schema_version not in {"1.5.0", "1.6.0", "1.7.0", "1.8.0", "1.9.0"}
             or evidence.run_context is None
         ):
             raise ValueError(
@@ -1355,7 +1372,7 @@ def _load_evidence(path: Path) -> list[_LoadedEvidenceRecord]:
                 )
             )
     except (ValidationError, ValueError):
-        raise _ReviewInputError("evidence is not valid UL schema through 1.8.0 JSONL") from None
+        raise _ReviewInputError("evidence is not valid UL schema through 1.9.0 JSONL") from None
     return records
 
 

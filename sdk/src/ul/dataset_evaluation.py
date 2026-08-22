@@ -531,6 +531,7 @@ class DatasetEvaluationRunner:
                     ),
                     max_environment_api_calls=1,
                     timeout_seconds=self._target_timeout_seconds,
+                    probe_context=source.probe_context(raw_input),
                 )
                 environment_api_calls = self._environment.api_calls_for_case(evaluation_case)
                 if type(environment_api_calls) is not int or environment_api_calls < 1:

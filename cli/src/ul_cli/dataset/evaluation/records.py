@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import cast
 
 from pydantic import JsonValue, ValidationError
-from ul import InteractionRecord
+from ul import InteractionRecord, RichInteractionCase, project_rich_interaction_case
 
 _MAXIMUM_DATASET_BYTES = 10_000_000
 _MAXIMUM_DATASET_RECORDS = 100
@@ -34,6 +34,7 @@ def load_interaction_records(path: Path) -> tuple[InteractionRecord, ...]:
 
     records: list[InteractionRecord] = []
     known_ids: set[str] = set()
+    known_source_ids: set[str] = set()
     for line_number, line in enumerate(lines, start=1):
         if not line.strip():
             raise DatasetInputError(
@@ -55,11 +56,11 @@ def load_interaction_records(path: Path) -> tuple[InteractionRecord, ...]:
         if not isinstance(untyped_payload, dict):
             raise DatasetInputError(f"{dataset_name} line {line_number}: record must be an object")
         payload = cast(dict[str, JsonValue], untyped_payload)
-        expected_fields = {"id", "input", "output"}
         payload_fields = set(payload)
-        if payload_fields != expected_fields:
-            missing_fields = sorted(expected_fields - payload_fields)
-            unknown_fields = sorted(payload_fields - expected_fields)
+        shorthand_fields = {"id", "input", "output"}
+        if payload_fields & {"input", "output"} and payload_fields != shorthand_fields:
+            missing_fields = sorted(shorthand_fields - payload_fields)
+            unknown_fields = sorted(payload_fields - shorthand_fields)
             details: list[str] = []
             if missing_fields:
                 details.append(f"missing {', '.join(missing_fields)}")
@@ -70,13 +71,21 @@ def load_interaction_records(path: Path) -> tuple[InteractionRecord, ...]:
                 f"({'; '.join(details)})"
             )
         try:
-            record = InteractionRecord.model_validate(
-                {
-                    "id": payload["id"],
-                    "raw_input": payload["input"],
-                    "raw_observed_output": payload["output"],
-                }
-            )
+            if payload_fields == shorthand_fields:
+                projected_records = (
+                    InteractionRecord.model_validate(
+                        {
+                            "id": payload["id"],
+                            "raw_input": payload["input"],
+                            "raw_observed_output": payload["output"],
+                        }
+                    ),
+                )
+                source_id = projected_records[0].id
+            else:
+                source_case = RichInteractionCase.model_validate(payload)
+                projected_records = project_rich_interaction_case(source_case)
+                source_id = source_case.id
         except ValidationError as error:
             invalid_fields = sorted(
                 {
@@ -91,10 +100,22 @@ def load_interaction_records(path: Path) -> tuple[InteractionRecord, ...]:
             raise DatasetInputError(
                 f"{dataset_name} line {line_number}: invalid {field_summary}"
             ) from None
-        if record.id in known_ids:
+        except ValueError:
+            raise DatasetInputError(
+                f"{dataset_name} line {line_number}: invalid rich interaction case"
+            ) from None
+        if source_id in known_source_ids:
             raise DatasetInputError(f"{dataset_name} line {line_number}: duplicate id")
-        known_ids.add(record.id)
-        records.append(record)
+        if len(records) + len(projected_records) > _MAXIMUM_DATASET_RECORDS:
+            raise DatasetInputError(
+                f"{dataset_name} line {line_number}: dataset exceeds "
+                f"{_MAXIMUM_DATASET_RECORDS} projected records"
+            )
+        if any(record.id in known_ids for record in projected_records):
+            raise DatasetInputError(f"{dataset_name} line {line_number}: duplicate id")
+        known_source_ids.add(source_id)
+        known_ids.update(record.id for record in projected_records)
+        records.extend(projected_records)
     if not records:
         raise DatasetInputError(f"{dataset_name}: dataset contains no records")
     return tuple(records)

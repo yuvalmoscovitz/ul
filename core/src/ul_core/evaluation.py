@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import math
 from typing import Literal, Self
 
@@ -77,6 +78,21 @@ class ProbeRequest(_StrictModel):
     correlation_id: str = Field(min_length=1, max_length=500)
     turn: ProbeTurn
     context: dict[str, JsonValue] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def validate_context_size(self) -> Self:
+        if (
+            len(
+                json.dumps(
+                    self.context,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            )
+            > 1_000_000
+        ):
+            raise ValueError("probe context exceeds the 1 MB JSON limit")
+        return self
 
 
 class ProbeExecutionEvent(_StrictModel):
@@ -412,6 +428,7 @@ class EvaluationCase(_StrictModel):
     required_state_observer_id: str | None = Field(default=None, min_length=1, max_length=500)
     timeout_after_commit_event: TimeoutAfterCommitEventRequest | None = None
     evaluators: tuple[EvaluatorSpec, ...] = ()
+    probe_context: dict[str, JsonValue] = Field(default_factory=dict)
 
     @model_validator(mode="after")
     def validate_identifiers(self) -> Self:

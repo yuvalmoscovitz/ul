@@ -4,6 +4,8 @@ from typing import TypedDict
 import pytest
 from pydantic import ValidationError
 from ul_core.dataset import (
+    AugmentationTarget,
+    CaseFixtureReference,
     CommunicationAct,
     EvidenceReference,
     InteractionRecord,
@@ -11,10 +13,13 @@ from ul_core.dataset import (
     ObservedOutcome,
     RenderedUserInput,
     RequestUnit,
+    RichInteractionCase,
     SemanticFactor,
     SemanticFrame,
     SemanticRelation,
     UserInputRecord,
+    VisibleContextTurn,
+    project_rich_interaction_case,
 )
 
 
@@ -170,6 +175,104 @@ def test_models_are_frozen_and_strict() -> None:
 
     input_only = UserInputRecord(id="input-only", raw_input="Do the thing")
     assert input_only.raw_input == "Do the thing"
+
+
+def test_rich_case_projects_only_explicit_text_targets() -> None:
+    source = RichInteractionCase(
+        id="cancel-order",
+        inputs={
+            "customer": {"id": "cus-7", "tier": "gold"},
+            "order": {"id": "ord-9", "status": "pending"},
+            "policy": {"confirmation_required": True},
+            "message": "Cancel order ord-9.",
+        },
+        context=(
+            VisibleContextTurn(id="user-1", role="user", content="Cancel order ord-9."),
+            VisibleContextTurn(id="assistant-1", role="assistant", content="Confirm cancellation?"),
+            VisibleContextTurn(id="user-2", role="user", content="Yes, cancel it."),
+        ),
+        augmentation_targets=(
+            AugmentationTarget(id="message", kind="input_field", json_pointer="/inputs/message"),
+            AugmentationTarget(id="confirmation", kind="conversation_turn", turn_id="user-2"),
+        ),
+        fixture=CaseFixtureReference(id="orders", version="2026-08-22"),
+        observed_output={"status": "cancelled"},
+        metadata={"routing": "eu-test"},
+    )
+
+    projected = project_rich_interaction_case(source)
+
+    assert [record.id for record in projected] == [
+        "cancel-order::message",
+        "cancel-order::confirmation",
+    ]
+    assert [record.raw_input for record in projected] == [
+        "Cancel order ord-9.",
+        "Yes, cancel it.",
+    ]
+    changed = projected[1].probe_context("Please cancel it now.")
+    assert changed["inputs"] == source.inputs
+    assert changed["context"] == [
+        {"id": "user-1", "role": "user", "content": "Cancel order ord-9.", "name": None},
+        {
+            "id": "assistant-1",
+            "role": "assistant",
+            "content": "Confirm cancellation?",
+            "name": None,
+        },
+        {"id": "user-2", "role": "user", "content": "Please cancel it now.", "name": None},
+    ]
+    assert changed["fixture"] == {"id": "orders", "version": "2026-08-22"}
+    assert "observed_output" not in changed
+
+
+@pytest.mark.parametrize(
+    "target",
+    [
+        AugmentationTarget(id="assistant", kind="conversation_turn", turn_id="assistant-1"),
+        AugmentationTarget(id="missing", kind="conversation_turn", turn_id="unknown"),
+        AugmentationTarget(id="object", kind="input_field", json_pointer="/inputs/customer"),
+    ],
+)
+def test_rich_case_rejects_ineligible_targets(target: AugmentationTarget) -> None:
+    with pytest.raises(ValidationError, match=r"augmentation target|user context|non-empty text"):
+        RichInteractionCase(
+            id="invalid-target",
+            inputs={"customer": {"id": "cus-7"}},
+            context=(VisibleContextTurn(id="assistant-1", role="assistant", content="Hello"),),
+            augmentation_targets=(target,),
+            fixture=CaseFixtureReference(id="customers", version="1"),
+            observed_output={"status": "unchanged"},
+        )
+
+
+def test_rich_case_is_bounded_and_versioned() -> None:
+    with pytest.raises(ValidationError, match="1 MB"):
+        RichInteractionCase(
+            id="oversized",
+            inputs={"message": "x" * 1_000_001},
+            augmentation_targets=(
+                AugmentationTarget(
+                    id="message", kind="input_field", json_pointer="/inputs/message"
+                ),
+            ),
+            fixture=CaseFixtureReference(id="fixture", version="1"),
+            observed_output="done",
+        )
+
+    with pytest.raises(ValidationError, match="schema_version"):
+        RichInteractionCase.model_validate(
+            {
+                "schema_version": "2.0.0",
+                "id": "future",
+                "inputs": {"message": "hello"},
+                "augmentation_targets": [
+                    {"id": "message", "kind": "input_field", "json_pointer": "/inputs/message"}
+                ],
+                "fixture": {"id": "fixture", "version": "1"},
+                "observed_output": "done",
+            }
+        )
 
 
 def test_frame_rejects_duplicate_and_dangling_identifiers() -> None:

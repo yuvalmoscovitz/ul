@@ -522,6 +522,7 @@ class ComposedEnvironmentExecutor:
                     session_id=session_id,
                     correlation_id=correlation_id,
                     turn=ProbeTurn(id=turn_id, input=content),
+                    context=case.probe_context,
                 ),
                 self._invoker_sync_runner,
             )

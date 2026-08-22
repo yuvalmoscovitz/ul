@@ -12,6 +12,7 @@ from ul import (
 )
 from ul_cli.dataset.evaluation import command as command_module
 from ul_cli.dataset.evaluation import runner as runner_module
+from ul_cli.dataset.evaluation.records import load_interaction_records
 from ul_cli.main import app as root_app
 
 from ._factories import (
@@ -25,6 +26,81 @@ from ._files import (
 
 runner = CliRunner()
 _ANSI_ESCAPE_PATTERN = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+
+
+def test_loader_accepts_shorthand_and_projects_rich_cases(tmp_path: Path) -> None:
+    dataset = tmp_path / "interactions.jsonl"
+    rich_case = {
+        "schema_version": "1.0.0",
+        "id": "cancel-order",
+        "inputs": {"order_id": "ord-9", "message": "Cancel my order."},
+        "context": [
+            {"id": "user-1", "role": "user", "content": "Cancel my order."},
+            {"id": "assistant-1", "role": "assistant", "content": "Are you sure?"},
+            {"id": "user-2", "role": "user", "content": "Yes."},
+        ],
+        "augmentation_targets": [
+            {"id": "message", "kind": "input_field", "json_pointer": "/inputs/message"},
+            {"id": "confirmation", "kind": "conversation_turn", "turn_id": "user-2"},
+        ],
+        "fixture": {"id": "orders", "version": "9"},
+        "observed_output": {"status": "cancelled"},
+    }
+    dataset.write_text(
+        "\n".join(
+            [
+                json.dumps({"id": "simple", "input": "Hello", "output": "Hi"}),
+                json.dumps(rich_case),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    records = load_interaction_records(dataset)
+
+    assert [record.id for record in records] == [
+        "simple",
+        "cancel-order::message",
+        "cancel-order::confirmation",
+    ]
+    assert records[0].source_case is None
+    assert records[1].source_interaction_id == "cancel-order"
+    projected_context = records[2].probe_context("Absolutely.")["context"]
+    assert isinstance(projected_context, list)
+    assert projected_context[-1] == {
+        "id": "user-2",
+        "role": "user",
+        "content": "Absolutely.",
+        "name": None,
+    }
+
+
+def test_one_dataset_preserves_ten_fixture_routes(tmp_path: Path) -> None:
+    dataset = tmp_path / "fixtures.jsonl"
+    cases = [
+        {
+            "schema_version": "1.0.0",
+            "id": f"case-{index}",
+            "inputs": {"message": f"Test customer {index}"},
+            "augmentation_targets": [
+                {"id": "message", "kind": "input_field", "json_pointer": "/inputs/message"}
+            ],
+            "fixture": {"id": f"customer-{index}", "version": "1"},
+            "observed_output": {"status": "observed"},
+        }
+        for index in range(10)
+    ]
+    dataset.write_text(
+        "".join(f"{json.dumps(case)}\n" for case in cases),
+        encoding="utf-8",
+    )
+
+    records = load_interaction_records(dataset)
+
+    assert [record.probe_context()["fixture"] for record in records] == [
+        {"id": f"customer-{index}", "version": "1"} for index in range(10)
+    ]
 
 
 def test_target_config_dry_run_validates_environment_and_makes_no_calls(
