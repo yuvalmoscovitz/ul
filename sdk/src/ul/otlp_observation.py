@@ -9,6 +9,7 @@ import math
 import re
 import threading
 import time
+from collections.abc import Iterator
 from dataclasses import dataclass
 from typing import cast
 
@@ -36,7 +37,7 @@ class OtlpObservationConfig(BaseModel):
     maximum_buffer_bytes: int = Field(default=50_000_000, ge=1, le=500_000_000)
     maximum_observation_bytes: int = Field(default=10_000_000, ge=10_000, le=100_000_000)
     retention_seconds: float = Field(default=300, gt=0, le=86_400)
-    retain_raw_spans: bool = True
+    retain_raw_spans: bool = False
     redacted_attribute_terms: tuple[str, ...] = (
         "authorization",
         "api_key",
@@ -101,8 +102,8 @@ class OtlpObservationSource:
         )
         self._lock = threading.Lock()
         self._spans: list[_BufferedSpan] = []
-        self._rejected_correlations: set[str] = set()
-        self._rejected_trace_ids: set[str] = set()
+        self._rejected_correlations: dict[str, float] = {}
+        self._rejected_trace_ids: dict[str, float] = {}
 
     def export(self, payload: object) -> OtlpExportReceipt:
         try:
@@ -127,6 +128,24 @@ class OtlpObservationSource:
             self._prune(now)
             buffered_bytes = sum(span.size_bytes for span in self._spans)
             for raw_span in exported_spans:
+                span_identity = _span_identity(raw_span)
+                existing_index = (
+                    next(
+                        (
+                            index
+                            for index, existing_span in enumerate(self._spans)
+                            if (existing_span.trace_id, existing_span.span_id) == span_identity[:2]
+                        ),
+                        None,
+                    )
+                    if span_identity is not None
+                    else None
+                )
+                if existing_index is None and len(self._spans) >= self.config.maximum_spans:
+                    rejected += 1
+                    if span_identity is not None:
+                        self._record_rejection(span_identity[0], span_identity[2], now)
+                    continue
                 protected_span = cast(
                     dict[str, JsonValue],
                     _redact(raw_span, self.config.redacted_attribute_terms),
@@ -135,28 +154,18 @@ class OtlpObservationSource:
                 if buffered_span is None:
                     rejected += 1
                     continue
-                existing_index = next(
-                    (
-                        index
-                        for index, existing_span in enumerate(self._spans)
-                        if existing_span.trace_id == buffered_span.trace_id
-                        and existing_span.span_id == buffered_span.span_id
-                    ),
-                    None,
-                )
                 existing_size = (
                     self._spans[existing_index].size_bytes if existing_index is not None else 0
                 )
                 if (
-                    (existing_index is None and len(self._spans) >= self.config.maximum_spans)
-                    or buffered_bytes - existing_size + buffered_span.size_bytes
+                    buffered_bytes - existing_size + buffered_span.size_bytes
                     > self.config.maximum_buffer_bytes
                     or buffered_span.size_bytes * 3 > self.config.maximum_observation_bytes
                 ):
                     rejected += 1
-                    if buffered_span.correlation_id is not None:
-                        self._rejected_correlations.add(buffered_span.correlation_id)
-                    self._rejected_trace_ids.add(buffered_span.trace_id)
+                    self._record_rejection(
+                        buffered_span.trace_id, buffered_span.correlation_id, now
+                    )
                     continue
                 if existing_index is None:
                     self._spans.append(buffered_span)
@@ -210,9 +219,9 @@ class OtlpObservationSource:
                 span.trace_id in self._rejected_trace_ids for span in selected
             )
             self._spans = [span for span in self._spans if span not in matched]
-            self._rejected_correlations.discard(request.correlation_id)
+            self._rejected_correlations.pop(request.correlation_id, None)
             for span in selected:
-                self._rejected_trace_ids.discard(span.trace_id)
+                self._rejected_trace_ids.pop(span.trace_id, None)
         complete = root_present and ended and not truncated and not rejected
         limitation_parts: list[str] = []
         if not root_present:
@@ -252,26 +261,47 @@ class OtlpObservationSource:
 
     def _matching_spans(self, request: ObservationRequest) -> tuple[_BufferedSpan, ...]:
         trace_id = request.context.get("trace_id")
-        return tuple(
-            span
-            for span in self._spans
-            if span.correlation_id == request.correlation_id
-            or (isinstance(trace_id, str) and span.trace_id == trace_id)
-        )
+        if isinstance(trace_id, str):
+            return tuple(span for span in self._spans if span.trace_id == trace_id)
+        return tuple(span for span in self._spans if span.correlation_id == request.correlation_id)
+
+    def _record_rejection(
+        self, trace_id: str, correlation_id: str | None, received_at: float
+    ) -> None:
+        self._remember_rejection(self._rejected_trace_ids, trace_id, received_at)
+        if correlation_id is not None:
+            self._remember_rejection(self._rejected_correlations, correlation_id, received_at)
+
+    def _remember_rejection(
+        self, markers: dict[str, float], identifier: str, received_at: float
+    ) -> None:
+        markers[identifier] = received_at
+        while len(markers) > self.config.maximum_spans:
+            oldest_identifier = min(markers, key=lambda key: (markers[key], key))
+            del markers[oldest_identifier]
 
     def _prune(self, now: float) -> None:
         oldest = now - self.config.retention_seconds
         self._spans = [span for span in self._spans if span.received_at >= oldest]
+        self._rejected_correlations = {
+            correlation_id: rejected_at
+            for correlation_id, rejected_at in self._rejected_correlations.items()
+            if rejected_at >= oldest
+        }
+        self._rejected_trace_ids = {
+            trace_id: rejected_at
+            for trace_id, rejected_at in self._rejected_trace_ids.items()
+            if rejected_at >= oldest
+        }
 
 
-def _exported_spans(payload: object) -> list[dict[str, JsonValue]]:
+def _exported_spans(payload: object) -> Iterator[dict[str, JsonValue]]:
     if not isinstance(payload, dict):
-        return []
+        return
     payload_object = cast(dict[str, object], payload)
-    result: list[dict[str, JsonValue]] = []
     resource_spans = payload_object.get("resourceSpans")
     if not isinstance(resource_spans, list):
-        return result
+        return
     for raw_resource_entry in cast(list[object], resource_spans):
         resource_entry = (
             cast(dict[str, object], raw_resource_entry)
@@ -299,14 +329,27 @@ def _exported_spans(payload: object) -> list[dict[str, JsonValue]]:
             for raw_span in cast(list[object], spans):
                 if isinstance(raw_span, dict):
                     span = cast(dict[str, JsonValue], raw_span)
-                    result.append(
-                        {
-                            "resource": json.loads(json.dumps(resource_value)),
-                            "scope": json.loads(json.dumps(scope_value)),
-                            "span": json.loads(json.dumps(span)),
-                        }
-                    )
-    return result
+                    yield {
+                        "resource": resource_value,
+                        "scope": scope_value,
+                        "span": span,
+                    }
+
+
+def _span_identity(raw: dict[str, JsonValue]) -> tuple[str, str, str | None] | None:
+    span = raw.get("span")
+    if not isinstance(span, dict):
+        return None
+    trace_id = _identifier(span.get("traceId"), 16)
+    span_id = _identifier(span.get("spanId"), 8)
+    if trace_id is None or span_id is None:
+        return None
+    attributes = _attributes(span.get("attributes"))
+    resource = raw.get("resource")
+    if isinstance(resource, dict):
+        attributes = {**_attributes(resource.get("attributes")), **attributes}
+    correlation_id = attributes.get("ul.correlation.id")
+    return trace_id, span_id, correlation_id if isinstance(correlation_id, str) else None
 
 
 def _buffered_span(raw: dict[str, JsonValue], received_at: float) -> _BufferedSpan | None:
@@ -355,9 +398,7 @@ def _normalize_trajectory(
     config: OtlpObservationConfig,
 ) -> dict[str, JsonValue]:
     normalized_spans = [_normalize_span(span) for span in spans]
-    normalized_spans.sort(
-        key=lambda span: (str(span.get("start_time_unix_nano", "")), str(span["span_id"]))
-    )
+    normalized_spans.sort(key=_span_start_sort_key)
     raw_expected_parent_id = request.context.get("span_id")
     expected_parent_id = raw_expected_parent_id if isinstance(raw_expected_parent_id, str) else None
     root = next(
@@ -414,6 +455,15 @@ def _normalize_span(buffered: _BufferedSpan) -> dict[str, JsonValue]:
     }
 
 
+def _span_start_sort_key(span: dict[str, JsonValue]) -> tuple[int, int, str, str]:
+    value = span.get("start_time_unix_nano")
+    if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+        return 0, value, "", str(span["span_id"])
+    if isinstance(value, str) and value.isascii() and value.isdecimal():
+        return 0, int(value), "", str(span["span_id"])
+    return 1, 0, json.dumps(value, ensure_ascii=True, sort_keys=True), str(span["span_id"])
+
+
 def _span_kind(
     openinference_kind: JsonValue | None,
     operation: JsonValue | None,
@@ -430,6 +480,13 @@ def _span_kind(
             return "guardrail", "openinference"
         if normalized == "evaluator":
             return "evaluator", "openinference"
+        if normalized == "retriever":
+            return "retriever", "openinference"
+        if normalized == "embedding":
+            return "embedding", "openinference"
+        if normalized == "reranker":
+            return "reranker", "openinference"
+        return "span", "openinference"
     if isinstance(operation, str):
         normalized = operation.casefold()
         if normalized in {"invoke_agent", "create_agent"}:
