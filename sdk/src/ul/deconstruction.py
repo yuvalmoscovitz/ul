@@ -949,19 +949,22 @@ class SemanticModelDeconstructor:
             system_prompt=_PROMPTS.get_prompt("semantic.deconstruct"),
             untrusted_payload=untrusted_record,
         )
-        raw_frame = self._decode_object(response.choices[0].message.content)
-        raw_frame.update(
-            {
-                "schema_version": "1.0.0",
-                "interaction_id": record.id,
-                "extractor_version": self.provider.extractor_version,
-                "metadata": {
-                    **self._generation_metadata(response),
-                    "prompts": prompt_provenance("semantic.deconstruct"),
-                },
-            }
-        )
-        frame = SemanticFrame.model_validate_json(json.dumps(raw_frame))
+        try:
+            raw_frame = self._decode_object(response.choices[0].message.content)
+            raw_frame.update(
+                {
+                    "schema_version": "1.0.0",
+                    "interaction_id": record.id,
+                    "extractor_version": self.provider.extractor_version,
+                    "metadata": {
+                        **self._generation_metadata(response),
+                        "prompts": prompt_provenance("semantic.deconstruct"),
+                    },
+                }
+            )
+            frame = SemanticFrame.model_validate_json(json.dumps(raw_frame))
+        except (ValidationError, ValueError) as error:
+            raise self._invalid_response(error, operation="deconstruct") from None
         frame = self._expand_unambiguous_evidence_quotes(record, frame)
         frame = self._ground_self_correction_evidence(record, frame)
         self._validate_evidence(record, frame)
@@ -1003,9 +1006,12 @@ class SemanticModelDeconstructor:
             ),
             untrusted_payload=untrusted_payload,
         )
-        rendered = _RenderedInput.model_validate_json(
-            response.choices[0].message.content
-        ).rendered_input
+        try:
+            rendered = _RenderedInput.model_validate_json(
+                response.choices[0].message.content
+            ).rendered_input
+        except (ValidationError, ValueError) as error:
+            raise self._invalid_response(error, operation="render") from None
         if len(rendered) > self.settings.max_input_chars:
             raise ValueError("rendered input exceeds max_input_chars")
         return RenderedUserInput(
@@ -1045,19 +1051,24 @@ class SemanticModelDeconstructor:
             system_prompt=_PROMPTS.get_prompt("semantic.verify"),
             untrusted_payload=untrusted_payload,
         )
-        raw_assessment = self._decode_object(response.choices[0].message.content)
-        raw_assessment.update(
-            {
-                "schema_version": "1.0.0",
-                "verifier_version": self.provider.equivalence_verifier_version,
-                "metadata": {
-                    **self._generation_metadata(response),
-                    "requested_model": self.settings.equivalence_model,
-                    "prompts": prompt_provenance("semantic.verify"),
-                },
-            }
-        )
-        assessment = SemanticEquivalenceAssessment.model_validate_json(json.dumps(raw_assessment))
+        try:
+            raw_assessment = self._decode_object(response.choices[0].message.content)
+            raw_assessment.update(
+                {
+                    "schema_version": "1.0.0",
+                    "verifier_version": self.provider.equivalence_verifier_version,
+                    "metadata": {
+                        **self._generation_metadata(response),
+                        "requested_model": self.settings.equivalence_model,
+                        "prompts": prompt_provenance("semantic.verify"),
+                    },
+                }
+            )
+            assessment = SemanticEquivalenceAssessment.model_validate_json(
+                json.dumps(raw_assessment)
+            )
+        except (ValidationError, ValueError) as error:
+            raise self._invalid_response(error, operation="verify") from None
         assessment = assessment.model_copy(
             update={
                 "deltas": tuple(
@@ -1089,6 +1100,21 @@ class SemanticModelDeconstructor:
             ):
                 raise ValueError("semantic equivalence candidate evidence is invalid")
         return assessment
+
+    def _invalid_response(
+        self,
+        error: BaseException,
+        *,
+        operation: Literal["deconstruct", "render", "verify"],
+    ) -> ProviderDiagnosticError:
+        return ProviderDiagnosticError(
+            _provider_diagnostic(
+                error,
+                provider=self.provider.provider_id,
+                operation=operation,
+                endpoint_sha256=self.provider.endpoint_sha256,
+            )
+        )
 
     async def _request(
         self,
