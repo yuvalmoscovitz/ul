@@ -538,9 +538,13 @@ async def test_render_keeps_caller_instruction_out_of_the_system_prompt() -> Non
         assert body["max_tokens"] == 512
         assert body["temperature"] == 0.7
         assert body["top_p"] == 0.95
-        assert body["seed"] == int.from_bytes(
-            hashlib.sha256(f"{raw_input}\0{instruction}".encode()).digest()[:4],
-            "big",
+        assert (
+            body["seed"]
+            == int.from_bytes(
+                hashlib.sha256(f"{raw_input}\0{instruction}".encode()).digest()[:4],
+                "big",
+            )
+            & 0x7FFF_FFFF
         )
         assert "real person" in body["messages"][0]["content"]
         assert "not polished benchmark text" in body["messages"][0]["content"]
@@ -594,7 +598,8 @@ async def test_render_keeps_caller_instruction_out_of_the_system_prompt() -> Non
             "seed": int.from_bytes(
                 hashlib.sha256(f"{raw_input}\0{instruction}".encode()).digest()[:4],
                 "big",
-            ),
+            )
+            & 0x7FFF_FFFF,
             "max_tokens": 512,
         },
     }
