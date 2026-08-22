@@ -1,6 +1,8 @@
 {
   "version": 5,
   "environment_id": "replace-with-stable-environment-id",
+  "fixture_id": "standard-account",
+  "fixture_version": "v1",
   "headers_from_env": {
     "Authorization": "UL_ENVIRONMENT_AUTHORIZATION"
   },

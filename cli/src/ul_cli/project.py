@@ -159,6 +159,14 @@ def initialize_project(
         str | None,
         typer.Option(help="Stable evidence name; isolated mode defaults to the endpoint host."),
     ] = None,
+    fixture_id: Annotated[
+        str | None,
+        typer.Option(help="Stable stateful fixture name recorded with every run."),
+    ] = None,
+    fixture_version: Annotated[
+        str | None,
+        typer.Option(help="Version of the stateful fixture recorded with every run."),
+    ] = None,
     request_json_template: Annotated[
         str | None,
         typer.Option(help="JSON request template for an existing isolated endpoint."),
@@ -252,6 +260,8 @@ def initialize_project(
     generated_mapping_options_used = (
         isolated_preset != "generic-json"
         or environment_id is not None
+        or fixture_id is not None
+        or fixture_version is not None
         or request_json_template is not None
         or response_json_pointer is not None
         or agent_model is not None
@@ -259,7 +269,7 @@ def initialize_project(
     )
     if environment_config is not None and generated_mapping_options_used:
         raise typer.BadParameter(
-            "isolated adapter mapping options require --environment-url",
+            "generated adapter options require --environment-url",
             param_hint="--environment-url",
         )
     loaded_environment_config: JsonHttpTargetConfig | None = None
@@ -348,6 +358,8 @@ def initialize_project(
                 confirm_safe_test_target=confirm_safe_test_target,
                 isolated_preset=isolated_preset,
                 environment_id=environment_id,
+                fixture_id=fixture_id,
+                fixture_version=fixture_version,
                 request_json_template=request_json_template,
                 response_json_pointer=response_json_pointer,
                 agent_model=agent_model,
