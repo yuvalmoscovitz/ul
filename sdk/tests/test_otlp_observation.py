@@ -6,6 +6,7 @@ from typing import cast
 
 import pytest
 from pydantic import JsonValue
+from ul import otlp_observation as observation_module
 from ul.environment import evaluation_case_from_inputs
 from ul.otlp_observation import OtlpObservationConfig, OtlpObservationSource
 from ul.probe_execution import ComposedEnvironmentExecutor
@@ -91,7 +92,21 @@ def _openinference_family_payload(request: ProbeRequest) -> dict[str, JsonValue]
     parent_id = request.context["span_id"]
     spans: list[JsonValue] = []
     parent_span_id = parent_id
-    for index, kind in enumerate(("AGENT", "LLM", "TOOL", "GUARDRAIL", "EVALUATOR"), start=1):
+    for index, kind in enumerate(
+        (
+            "AGENT",
+            "CHAIN",
+            "LLM",
+            "TOOL",
+            "GUARDRAIL",
+            "EVALUATOR",
+            "RETRIEVER",
+            "EMBEDDING",
+            "RERANKER",
+            "UNKNOWN_FUTURE_KIND",
+        ),
+        start=1,
+    ):
         span_id = f"{index:x}" * 16
         attributes = [_attribute("openinference.span.kind", kind)]
         if index == 1:
@@ -159,6 +174,7 @@ class _ExportingInvoker:
 async def test_active_probe_joins_late_otlp_spans_with_redacted_raw_provenance() -> None:
     observer = OtlpObservationSource(
         OtlpObservationConfig(
+            retain_raw_spans=True,
             settle_window_seconds=0.03,
             observation_timeout_seconds=0.2,
             poll_interval_seconds=0.005,
@@ -327,10 +343,9 @@ async def test_same_otlp_export_can_feed_ul_and_an_independent_receiver() -> Non
     assert first_observation.traces == second_observation.traces
 
 
-async def test_raw_span_retention_can_be_disabled_before_evidence_is_built() -> None:
+async def test_raw_span_retention_is_disabled_by_default() -> None:
     observer = OtlpObservationSource(
         OtlpObservationConfig(
-            retain_raw_spans=False,
             settle_window_seconds=0.01,
             observation_timeout_seconds=0.1,
         )
@@ -357,6 +372,158 @@ async def test_raw_span_retention_can_be_disabled_before_evidence_is_built() -> 
     assert isinstance(trajectory, dict)
     assert trajectory["raw_spans"] == []
     assert observation.metadata["raw_spans_retained"] is False
+
+
+async def test_expected_trace_id_cannot_be_overridden_by_matching_correlation() -> None:
+    observer = OtlpObservationSource(
+        OtlpObservationConfig(
+            settle_window_seconds=0.01,
+            observation_timeout_seconds=0.02,
+            poll_interval_seconds=0.002,
+        )
+    )
+    exported_request = ProbeRequest(
+        case_id="case-1",
+        session_id="session-1",
+        correlation_id="shared-correlation",
+        turn=ProbeTurn(id="turn-1", input="hello"),
+        context={"trace_id": "b" * 32, "span_id": "c" * 16},
+    )
+    observer.export(_payload(exported_request, include_child=False))
+
+    mismatched = await observer.observe(
+        ObservationRequest(
+            case_id="case-1",
+            session_id="session-1",
+            correlation_id="shared-correlation",
+            context={"trace_id": "a" * 32, "span_id": "c" * 16},
+        )
+    )
+    fallback = await observer.observe(
+        ObservationRequest(
+            case_id="case-1",
+            session_id="session-1",
+            correlation_id="shared-correlation",
+            context={"span_id": "c" * 16},
+        )
+    )
+
+    assert mismatched.status == "missing"
+    assert fallback.status == "complete"
+
+
+async def test_rejection_markers_are_bounded_by_span_retention(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = [100.0]
+    monkeypatch.setattr(observation_module.time, "monotonic", lambda: now[0])
+    observer = OtlpObservationSource(
+        OtlpObservationConfig(
+            maximum_spans=1,
+            retention_seconds=1,
+            settle_window_seconds=0.01,
+            observation_timeout_seconds=0.1,
+        )
+    )
+    request = ProbeRequest(
+        case_id="case-1",
+        session_id="session-1",
+        correlation_id="correlation-1",
+        turn=ProbeTurn(id="turn-1", input="hello"),
+        context={"trace_id": "a" * 32, "span_id": "b" * 16},
+    )
+
+    first_receipt = observer.export(_payload(request))
+    assert first_receipt.rejected_spans == 1
+    assert observer._rejected_trace_ids == {"a" * 32: 100.0}
+
+    now[0] = 102.0
+    observer.export(_payload(request, include_child=False))
+    assert observer._rejected_trace_ids == {}
+    assert observer._rejected_correlations == {}
+    now[0] = 102.02
+    observation = await observer.observe(
+        ObservationRequest(
+            case_id=request.case_id,
+            session_id=request.session_id,
+            correlation_id=request.correlation_id,
+            context=request.context,
+        )
+    )
+
+    assert observation.status == "complete"
+
+
+async def test_rejection_markers_stay_bounded_under_distinct_hostile_traces() -> None:
+    observer = OtlpObservationSource(OtlpObservationConfig(maximum_spans=1))
+    retained_request = ProbeRequest(
+        case_id="case-1",
+        session_id="session-1",
+        correlation_id="retained",
+        turn=ProbeTurn(id="turn-1", input="hello"),
+        context={"trace_id": "a" * 32, "span_id": "b" * 16},
+    )
+    observer.export(_payload(retained_request, include_child=False))
+
+    for index in range(1, 21):
+        hostile_request = ProbeRequest(
+            case_id="case-1",
+            session_id="session-1",
+            correlation_id=f"hostile-{index}",
+            turn=ProbeTurn(id="turn-1", input="hello"),
+            context={"trace_id": f"{index:032x}", "span_id": "b" * 16},
+        )
+        receipt = observer.export(_payload(hostile_request, include_child=False))
+        assert receipt.rejected_spans == 1
+
+    assert len(observer._rejected_trace_ids) == 1
+    assert len(observer._rejected_correlations) == 1
+    assert set(observer._rejected_trace_ids) == {f"{20:032x}"}
+    assert set(observer._rejected_correlations) == {"hostile-20"}
+
+
+async def test_span_limit_is_enforced_before_shared_otlp_envelopes_are_copied(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observer = OtlpObservationSource(OtlpObservationConfig(maximum_spans=1))
+    request = ProbeRequest(
+        case_id="case-1",
+        session_id="session-1",
+        correlation_id="correlation-1",
+        turn=ProbeTurn(id="turn-1", input="hello"),
+        context={"trace_id": "a" * 32, "span_id": "b" * 16},
+    )
+    payload = _payload(request, include_child=False)
+    scope_spans = payload["resourceSpans"][0]["scopeSpans"]
+    assert isinstance(scope_spans, list)
+    spans = scope_spans[0]["spans"]
+    assert isinstance(spans, list)
+    root = spans[0]
+    assert isinstance(root, dict)
+    spans.extend(
+        {
+            **root,
+            "spanId": f"{index:016x}",
+            "attributes": [],
+        }
+        for index in range(2, 102)
+    )
+    redact_calls = 0
+    original_redact = observation_module._redact
+
+    def counted_redact(value: JsonValue, terms: tuple[str, ...], key: str = "") -> JsonValue:
+        nonlocal redact_calls
+        if isinstance(value, dict) and set(value) == {"resource", "scope", "span"}:
+            redact_calls += 1
+        return original_redact(value, terms, key)
+
+    monkeypatch.setattr(observation_module, "_redact", counted_redact)
+
+    receipt = observer.export(payload)
+
+    assert receipt.accepted_spans == 1
+    assert receipt.rejected_spans == 100
+    assert redact_calls == 1
 
 
 async def test_bounded_receiver_reports_dropped_spans_as_incomplete() -> None:
@@ -406,7 +573,7 @@ async def test_receiver_rejects_non_json_and_recursive_payloads_without_retainin
     assert recursive_receipt.partial_success is True
 
 
-async def test_openinference_agent_llm_tool_guardrail_and_evaluator_spans_normalize() -> None:
+async def test_full_openinference_span_kind_family_preserves_provenance() -> None:
     observer = OtlpObservationSource(
         OtlpObservationConfig(
             settle_window_seconds=0.01,
@@ -440,10 +607,83 @@ async def test_openinference_agent_llm_tool_guardrail_and_evaluator_spans_normal
     assert isinstance(spans, list)
     assert [span["kind"] for span in spans if isinstance(span, dict)] == [
         "agent",
+        "agent",
         "llm",
         "tool",
         "guardrail",
         "evaluator",
+        "retriever",
+        "embedding",
+        "reranker",
+        "span",
+    ]
+    assert all(span["standard"] == "openinference" for span in spans if isinstance(span, dict))
+
+
+async def test_span_order_uses_numeric_timestamps_with_malformed_values_last() -> None:
+    observer = OtlpObservationSource(
+        OtlpObservationConfig(
+            settle_window_seconds=0.01,
+            observation_timeout_seconds=0.1,
+        )
+    )
+    request = ProbeRequest(
+        case_id="case-1",
+        session_id="session-1",
+        correlation_id="correlation-1",
+        turn=ProbeTurn(id="turn-1", input="hello"),
+        context={"trace_id": "a" * 32, "span_id": "b" * 16},
+    )
+    payload = _payload(request, include_child=False)
+    scope_spans = payload["resourceSpans"][0]["scopeSpans"]
+    assert isinstance(scope_spans, list)
+    spans = scope_spans[0]["spans"]
+    assert isinstance(spans, list)
+    root = spans[0]
+    assert isinstance(root, dict)
+    root["startTimeUnixNano"] = "10"
+    spans.extend(
+        [
+            {**root, "spanId": "2" * 16, "parentSpanId": "1" * 16, "startTimeUnixNano": "9"},
+            {
+                **root,
+                "spanId": "3" * 16,
+                "parentSpanId": "1" * 16,
+                "startTimeUnixNano": "bad",
+            },
+            {
+                key: value
+                for key, value in {
+                    **root,
+                    "spanId": "4" * 16,
+                    "parentSpanId": "1" * 16,
+                }.items()
+                if key != "startTimeUnixNano"
+            },
+        ]
+    )
+    observer.export(payload)
+
+    observation = await observer.observe(
+        ObservationRequest(
+            case_id=request.case_id,
+            session_id=request.session_id,
+            correlation_id=request.correlation_id,
+            context=request.context,
+        )
+    )
+
+    trajectory = observation.traces[0]
+    assert isinstance(trajectory, dict)
+    normalized = trajectory["normalized"]
+    assert isinstance(normalized, dict)
+    normalized_spans = normalized["spans"]
+    assert isinstance(normalized_spans, list)
+    assert [span["span_id"] for span in normalized_spans if isinstance(span, dict)] == [
+        "2" * 16,
+        "1" * 16,
+        "3" * 16,
+        "4" * 16,
     ]
 
 

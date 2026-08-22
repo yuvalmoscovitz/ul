@@ -683,3 +683,38 @@ async def test_timed_out_sync_invocation_is_not_retried_while_still_running() ->
     assert follow_up.lifecycle.terminal_status == "failed"
     assert follow_up.lifecycle.failure_reason == "probe invocation failed"
     assert later_follow_up.lifecycle.terminal_status == "failed"
+
+
+@pytest.mark.asyncio
+async def test_sync_runner_is_reusable_before_result_callback_runs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from ul.probe_execution import _SyncAdapterRunner
+
+    loop = asyncio.get_running_loop()
+    original_call_soon_threadsafe = loop.call_soon_threadsafe
+    first_result_scheduled = threading.Event()
+    release_first_worker = threading.Event()
+    scheduled_calls = 0
+
+    def block_first_worker_after_scheduling(callback: object, *args: object) -> object:
+        nonlocal scheduled_calls
+        scheduled_calls += 1
+        handle = original_call_soon_threadsafe(callback, *args)
+        if scheduled_calls == 1:
+            first_result_scheduled.set()
+            release_first_worker.wait(timeout=1)
+        return handle
+
+    monkeypatch.setattr(loop, "call_soon_threadsafe", block_first_worker_after_scheduling)
+    runner = _SyncAdapterRunner("test-sync-order")
+
+    try:
+        first = await runner.call(lambda value: value, "first")
+        assert first_result_scheduled.is_set()
+        second = await runner.call(lambda value: value, "second")
+    finally:
+        release_first_worker.set()
+
+    assert first == "first"
+    assert second == "second"
