@@ -31,6 +31,8 @@ from ul.dataset_augmentation import DatasetAugmentationCandidate
 from ul.dataset_invariants import DatasetInvariantSuite, JsonValuesEqualInvariant
 from ul_cli import dataset_review
 from ul_cli import report as report_module
+from ul_cli.dataset.evaluation import command as dataset_command
+from ul_cli.dataset.evaluation import runner as dataset_runner
 from ul_cli.main import app
 from ul_cli.report_contract import FindingSummary, UnifiedReport
 
@@ -1341,9 +1343,9 @@ def test_report_and_review_make_no_model_or_network_calls(
     def unexpected_call(*args: object, **kwargs: object) -> None:
         raise AssertionError("report/review attempted an external call")
 
-    monkeypatch.setattr("ul_cli.dataset.load_dataset_semantic_settings", unexpected_call)
-    monkeypatch.setattr("ul_cli.dataset.create_semantic_model_deconstructor", unexpected_call)
-    monkeypatch.setattr("ul_cli.dataset.JsonHttpEnvironmentConnection", unexpected_call)
+    monkeypatch.setattr(dataset_command, "load_dataset_semantic_settings", unexpected_call)
+    monkeypatch.setattr(dataset_runner, "create_semantic_model_deconstructor", unexpected_call)
+    monkeypatch.setattr(dataset_command, "JsonHttpEnvironmentConnection", unexpected_call)
 
     report = runner.invoke(app, ["dataset", "report", str(evidence)])
     review = runner.invoke(app, _review_arguments(evidence))

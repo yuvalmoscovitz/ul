@@ -6,7 +6,9 @@ from threading import Barrier
 
 import pytest
 from typer.testing import CliRunner
-from ul_cli import augmentations, dataset
+from ul_cli import augmentations
+from ul_cli.dataset.evaluation import command as dataset_command
+from ul_cli.dataset.evaluation import runner as dataset_runner
 from ul_cli.main import app
 
 runner = CliRunner()
@@ -366,9 +368,13 @@ def test_plan_reads_declared_capabilities_without_constructing_external_clients(
     def unexpected_external_client(*args: object, **kwargs: object) -> None:
         raise AssertionError("readiness planning constructed an external client")
 
-    monkeypatch.setattr(dataset, "create_semantic_model_deconstructor", unexpected_external_client)
     monkeypatch.setattr(
-        dataset.JsonHttpEnvironmentConnection,
+        dataset_runner,
+        "create_semantic_model_deconstructor",
+        unexpected_external_client,
+    )
+    monkeypatch.setattr(
+        dataset_command.JsonHttpEnvironmentConnection,
         "from_config",
         unexpected_external_client,
     )

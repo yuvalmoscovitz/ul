@@ -28,7 +28,7 @@ from ul.redaction import (
     RedactionPolicy,
     RedactionRule,
 )
-from ul_cli.dataset import _customer_evidence_record
+from ul_cli.dataset.evidence.customer import build_customer_evidence_record
 from ul_core.contracts import EnvironmentExecutor, SemanticDeconstructor
 from ul_core.dataset import (
     CommunicationAct,
@@ -824,7 +824,7 @@ async def test_redacted_runner_evidence_never_persists_environment_secrets(tmp_p
     assert isinstance(source, InteractionRecord)
 
     result = await runner.run(source, operator_ids=("input.tone.frustrated",))
-    evidence = _customer_evidence_record(
+    evidence = build_customer_evidence_record(
         result,
         repetitions=1,
         max_environment_api_calls=10,
