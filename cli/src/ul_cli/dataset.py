@@ -952,6 +952,20 @@ def evaluate_dataset(
             f"set {settings.api_key_environment_variable} to run an evaluation"
         )
 
+    evaluator_preflight: EvaluatorModelPreflight | None = None
+    evaluator_preflight_receipt: Path | None = None
+    if resume is not None:
+        try:
+            evaluator_preflight, evaluator_preflight_receipt = asyncio.run(
+                _load_evaluator_preflight(output, settings)
+            )
+        except ValueError as error:
+            raise typer.BadParameter(
+                f"cannot reuse evaluator preflight receipt ({error}); restore the matching "
+                "receipt and semantic settings, or start a new run with a new --output",
+                param_hint="--resume",
+            ) from None
+
     try:
         assert loaded_target_config is not None
         if not allow_environment_network:
@@ -968,20 +982,22 @@ def evaluate_dataset(
             param_hint="--environment-config",
         ) from None
 
-    try:
-        evaluator_preflight = asyncio.run(_preflight_evaluator(settings))
-        evaluator_preflight_receipt = _persist_evaluator_preflight(output, evaluator_preflight)
-    except EvaluatorModelCompatibilityError as error:
-        asyncio.run(target.aclose())
-        _print_dataset_plain(f"Evaluation stopped before campaign execution: {error}")
-        raise typer.Exit(code=2) from None
-    except (OSError, ValueError) as error:
-        asyncio.run(target.aclose())
-        message = str(error) if isinstance(error, ValueError) else error.__class__.__name__
-        raise typer.BadParameter(
-            f"cannot safely persist evaluator preflight ({message})",
-            param_hint="--output",
-        ) from None
+    if evaluator_preflight is None:
+        try:
+            evaluator_preflight = asyncio.run(_preflight_evaluator(settings))
+            evaluator_preflight_receipt = _persist_evaluator_preflight(output, evaluator_preflight)
+        except EvaluatorModelCompatibilityError as error:
+            asyncio.run(target.aclose())
+            _print_dataset_plain(f"Evaluation stopped before campaign execution: {error}")
+            raise typer.Exit(code=2) from None
+        except (OSError, ValueError) as error:
+            asyncio.run(target.aclose())
+            message = str(error) if isinstance(error, ValueError) else error.__class__.__name__
+            raise typer.BadParameter(
+                f"cannot safely persist evaluator preflight ({message})",
+                param_hint="--output",
+            ) from None
+    assert evaluator_preflight_receipt is not None
     _print_evaluator_preflight(evaluator_preflight, evaluator_preflight_receipt)
 
     augmentation_ledger: DatasetAugmentationLedger | None = None
@@ -1562,6 +1578,25 @@ async def _preflight_evaluator(settings: DatasetSemanticSettings) -> EvaluatorMo
         return await deconstructor.preflight()
 
 
+async def _load_evaluator_preflight(
+    evidence_output: Path,
+    settings: DatasetSemanticSettings,
+) -> tuple[EvaluatorModelPreflight, Path]:
+    receipt_path = _evaluator_preflight_output(evidence_output)
+    try:
+        result = _read_evaluator_preflight(receipt_path)
+    except FileNotFoundError:
+        raise ValueError(f"required receipt {receipt_path.name} is missing") from None
+    except OSError as error:
+        raise ValueError(
+            f"required receipt {receipt_path.name} cannot be safely read "
+            f"({error.__class__.__name__})"
+        ) from None
+    async with create_semantic_model_deconstructor(settings) as deconstructor:
+        deconstructor.reuse_preflight(result)
+    return result, receipt_path
+
+
 def _evaluator_preflight_output(evidence_output: Path) -> Path:
     return evidence_output.with_name(f"{evidence_output.name}.preflight.json")
 
@@ -1572,16 +1607,7 @@ def _persist_evaluator_preflight(
 ) -> Path:
     receipt_path = _evaluator_preflight_output(evidence_output)
     if receipt_path.exists():
-        descriptor = _open_resume_descriptor(receipt_path, writable=False)
-        try:
-            size = os.fstat(descriptor).st_size
-            if size > _MAXIMUM_PREFLIGHT_RECEIPT_BYTES:
-                raise ValueError("existing evaluator preflight receipt exceeds its size limit")
-            existing = EvaluatorModelPreflight.model_validate_json(os.read(descriptor, size))
-        except ValidationError:
-            raise ValueError("existing evaluator preflight receipt is invalid") from None
-        finally:
-            os.close(descriptor)
+        existing = _read_evaluator_preflight(receipt_path)
         if existing != result:
             raise ValueError("existing evaluator preflight receipt does not match this run")
         return receipt_path
@@ -1591,6 +1617,23 @@ def _persist_evaluator_preflight(
         output_stream.flush()
         os.fsync(output_stream.fileno())
     return receipt_path
+
+
+def _read_evaluator_preflight(receipt_path: Path) -> EvaluatorModelPreflight:
+    descriptor = _open_resume_descriptor(receipt_path, writable=False)
+    try:
+        descriptor_status = os.fstat(descriptor)
+        if sys.platform != "win32" and stat.S_IMODE(descriptor_status.st_mode) & 0o077:
+            raise ValueError("evaluator preflight receipt permissions are not private")
+        size = descriptor_status.st_size
+        if size > _MAXIMUM_PREFLIGHT_RECEIPT_BYTES:
+            raise ValueError("evaluator preflight receipt exceeds its size limit")
+        try:
+            return EvaluatorModelPreflight.model_validate_json(os.read(descriptor, size))
+        except ValidationError:
+            raise ValueError("evaluator preflight receipt is invalid") from None
+    finally:
+        os.close(descriptor)
 
 
 def _print_evaluator_preflight(result: EvaluatorModelPreflight, receipt: Path) -> None:

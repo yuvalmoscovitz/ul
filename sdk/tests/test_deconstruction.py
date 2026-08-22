@@ -197,6 +197,15 @@ async def test_evaluator_preflight_proves_required_capabilities_and_records_poli
     client = mock_client(handler)
     async with create_semantic_model_deconstructor(settings(), client=client) as deconstructor:
         result = await deconstructor.preflight()
+        with pytest.raises(ValueError, match="does not match"):
+            deconstructor.reuse_preflight(result.model_copy(update={"endpoint_sha256": "b" * 64}))
+        mismatched_profile = result.profiles[0].model_copy(
+            update={"request_options_sha256": "b" * 64}
+        )
+        with pytest.raises(ValueError, match="does not match"):
+            deconstructor.reuse_preflight(
+                result.model_copy(update={"profiles": (mismatched_profile, *result.profiles[1:])})
+            )
         frame = await deconstructor.deconstruct(interaction())
 
     assert [request["model"] for request in requests[:3]] == [
@@ -241,6 +250,7 @@ async def test_evaluator_preflight_proves_required_capabilities_and_records_poli
         ("render",),
         ("equivalence",),
     )
+    assert result.endpoint_sha256 == settings().semantic_endpoint_sha256
     assert all(profile.routed_model == "provider/resolved-model" for profile in result.profiles)
     assert result.verified_capabilities == (
         "routing",
