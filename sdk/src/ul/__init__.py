@@ -150,6 +150,7 @@ from ul.deconstruction import (
     create_semantic_model_deconstructor,
     load_dataset_semantic_settings,
     plan_evaluator_preflight_profiles,
+    validate_evaluator_preflight,
 )
 from ul.event_stress import (
     CorrectionAfterFirstResponseCase,
@@ -443,5 +444,6 @@ __all__ = [
     "run_trace_replay",
     "run_trace_replay_campaign",
     "select_trace_replay_case",
+    "validate_evaluator_preflight",
     "write_augmentation_qualification_report",
 ]

@@ -58,8 +58,16 @@ class CampaignMoneyRange(_StrictModel):
     maximum: float = Field(ge=0)
 
 
+class CampaignFixturePlan(_StrictModel):
+    status: Literal["configured", "missing", "not_required"]
+    id: str | None = None
+    version: str | None = None
+
+
 class DatasetCampaignPlan(_StrictModel):
-    schema_version: Literal["1.0.0"] = "1.0.0"
+    schema_version: Literal["1.1.0"] = "1.1.0"
+    evaluation_mode: Literal["variance"] = "variance"
+    fixture: CampaignFixturePlan | None = None
     examples: tuple[CampaignExamplePlan, ...]
     calls: CampaignCallCounts
     preflight_profiles: tuple[EvaluatorPreflightProfilePlan, ...]
@@ -86,6 +94,10 @@ def create_dataset_campaign_plan(
     saved_augmentations: dict[str, DatasetAugmentationResult] | None = None,
     show_sensitive_values: bool = False,
     requires_preflight: bool = True,
+    evaluation_mode: Literal["variance"] = "variance",
+    fixture_status: Literal["configured", "missing", "not_required"] | None = None,
+    fixture_id: str | None = None,
+    fixture_version: str | None = None,
 ) -> DatasetCampaignPlan:
     saved = saved_augmentations or {}
     selected_ids = {reference.partition("@")[0] for reference in selected_operator_ids}
@@ -179,7 +191,22 @@ def create_dataset_campaign_plan(
     warnings.append(
         "No trusted model pricing is configured, so a monetary estimate is unavailable."
     )
+    if fixture_status == "missing":
+        warnings.append(
+            "stateful target has no fixture identity; add fixture_id and fixture_version so "
+            "findings can be reproduced."
+        )
     return DatasetCampaignPlan(
+        evaluation_mode=evaluation_mode,
+        fixture=(
+            CampaignFixturePlan(
+                status=fixture_status,
+                id=fixture_id,
+                version=fixture_version,
+            )
+            if fixture_status is not None
+            else None
+        ),
         examples=examples,
         calls=CampaignCallCounts(
             baseline=baseline_calls,
@@ -243,7 +270,9 @@ def _operator_plan(
             candidate_input_available=True,
             candidate_input=(candidate.augmented_input if show_sensitive_values else None),
         )
-    if saved_augmentation is not None:
+    if saved_augmentation is not None and any(
+        reference.id == operator.ref.id for reference in saved_augmentation.operator_references
+    ):
         return CampaignOperatorPlan(
             id=operator.ref.id,
             version=operator.ref.version,

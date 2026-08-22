@@ -39,6 +39,7 @@ from ul import (
     load_dataset_semantic_settings,
     load_redaction_policy,
     resolve_dataset_augmentation_operator,
+    validate_evaluator_preflight,
 )
 from ul.dataset_invariants import (
     DatasetInvariantArrayUniqueTrialEvaluation,
@@ -880,6 +881,21 @@ def evaluate_dataset(
         )
         skipped_count = len(resume_evidence.processed_ids)
 
+    evaluator_preflight: EvaluatorModelPreflight | None = None
+    evaluator_preflight_receipt: Path | None = None
+    if resume is not None and selected_records:
+        assert output is not None
+        try:
+            evaluator_preflight, evaluator_preflight_receipt = asyncio.run(
+                _load_evaluator_preflight(output, settings)
+            )
+        except ValueError as error:
+            raise typer.BadParameter(
+                f"cannot reuse evaluator preflight receipt ({error}); restore the matching "
+                "receipt and semantic settings, or start a new run with a new --output",
+                param_hint="--resume",
+            ) from None
+
     campaign_plan = create_dataset_campaign_plan(
         records=selected_records,
         selected_operator_ids=selected_operators,
@@ -888,7 +904,23 @@ def evaluate_dataset(
         settings=settings,
         saved_augmentations=saved_augmentations,
         show_sensitive_values=show_sensitive_values,
-        requires_preflight=resume is None,
+        requires_preflight=evaluator_preflight is None,
+        evaluation_mode=evaluation_mode,
+        fixture_status=(
+            run_context.fixture.status
+            if run_context is not None and run_context.fixture is not None
+            else None
+        ),
+        fixture_id=(
+            run_context.fixture.id
+            if run_context is not None and run_context.fixture is not None
+            else None
+        ),
+        fixture_version=(
+            run_context.fixture.version
+            if run_context is not None and run_context.fixture is not None
+            else None
+        ),
     )
     potential_target_calls = campaign_plan.calls.total_environment_api
     if potential_target_calls > max_environment_api_calls:
@@ -1034,20 +1066,6 @@ def evaluate_dataset(
         raise typer.BadParameter(
             f"set {settings.api_key_environment_variable} to run an evaluation"
         )
-
-    evaluator_preflight: EvaluatorModelPreflight | None = None
-    evaluator_preflight_receipt: Path | None = None
-    if resume is not None:
-        try:
-            evaluator_preflight, evaluator_preflight_receipt = asyncio.run(
-                _load_evaluator_preflight(output, settings)
-            )
-        except ValueError as error:
-            raise typer.BadParameter(
-                f"cannot reuse evaluator preflight receipt ({error}); restore the matching "
-                "receipt and semantic settings, or start a new run with a new --output",
-                param_hint="--resume",
-            ) from None
 
     try:
         assert loaded_target_config is not None
@@ -1652,7 +1670,7 @@ def _print_dataset_plan(
             f"{unselected_ineligible} ineligible "
             "(use --json for full detail)"
         )
-    if fixture_status is not None:
+    if fixture_status is not None and fixture_status != "missing":
         _print_fixture_identity(
             fixture_status,
             fixture_id=fixture_id,
@@ -1768,8 +1786,7 @@ async def _load_evaluator_preflight(
             f"required receipt {receipt_path.name} cannot be safely read "
             f"({error.__class__.__name__})"
         ) from None
-    async with create_semantic_model_deconstructor(settings) as deconstructor:
-        deconstructor.reuse_preflight(result)
+    validate_evaluator_preflight(settings, result)
     return result, receipt_path
 
 

@@ -1023,6 +1023,10 @@ def test_dry_run_json_exposes_per_example_campaign_and_exact_call_plan(
 
     assert result.exit_code == 0, result.output
     payload = json.loads(result.output)
+    assert payload["schema_version"] == "1.1.0"
+    assert payload["evaluation_mode"] == "variance"
+    assert payload["fixture"] == {"status": "missing", "id": None, "version": None}
+    assert any("no fixture identity" in warning.casefold() for warning in payload["warnings"])
     assert payload["inspection_model_calls"] == 0
     assert payload["inspection_environment_calls"] == 0
     assert payload["calls"] == {
@@ -1081,6 +1085,42 @@ def test_sensitive_candidate_output_requires_dry_run(tmp_path: Path) -> None:
     normalized_output = " ".join(_ANSI_ESCAPE_PATTERN.sub("", result.output).split())
     assert "--show-sensitive-values requires" in normalized_output
     assert "--dry-run" in normalized_output
+
+
+@pytest.mark.parametrize(
+    ("status", "fixture_id", "fixture_version"),
+    [
+        ("configured", "standard-account", "v3"),
+        ("missing", None, None),
+        ("not_required", None, None),
+    ],
+)
+def test_campaign_plan_json_preserves_fixture_contract(
+    status: str,
+    fixture_id: str | None,
+    fixture_version: str | None,
+) -> None:
+    plan = main.create_dataset_campaign_plan(
+        records=(_evaluation_result("interaction-1").source,),
+        selected_operator_ids=("input.surface.rephrase",),
+        repetitions=1,
+        target_calls_per_execution=1,
+        settings=cast(Any, _settings()),
+        fixture_status=cast(Any, status),
+        fixture_id=fixture_id,
+        fixture_version=fixture_version,
+    )
+
+    payload = plan.model_dump(mode="json")
+    assert payload["evaluation_mode"] == "variance"
+    assert payload["fixture"] == {
+        "status": status,
+        "id": fixture_id,
+        "version": fixture_version,
+    }
+    assert any("no fixture identity" in warning.casefold() for warning in payload["warnings"]) == (
+        status == "missing"
+    )
 
 
 def test_campaign_plan_exposes_precomputed_candidate_without_new_generation() -> None:
@@ -1150,6 +1190,30 @@ def test_campaign_plan_does_not_count_known_non_executable_variations(
     assert plan.calls.evaluators == 3
     assert plan.calls.total_semantic_model == 6
     assert plan.calls.total_environment_api == 15
+
+
+def test_campaign_plan_keeps_unattempted_operators_conditional() -> None:
+    evaluation_result = _evaluation_result("interaction-1")
+    saved_augmentation = evaluation_result.augmentation.model_copy(update={"candidates": ()})
+
+    plan = main.create_dataset_campaign_plan(
+        records=(evaluation_result.source,),
+        selected_operator_ids=("input.surface.rephrase",),
+        repetitions=1,
+        target_calls_per_execution=1,
+        settings=main.load_dataset_semantic_settings(),
+        saved_augmentations={evaluation_result.source.id: saved_augmentation},
+    )
+
+    operators = {operator.id: operator for operator in plan.examples[0].operators}
+    attempted_operator = operators["input.surface.rephrase"]
+    assert attempted_operator.status == "ineligible"
+    assert attempted_operator.reasons == ("saved semantic qualification produced no candidate",)
+
+    unattempted_operator = operators["input.surface.typing_noise"]
+    assert unattempted_operator.status == "conditional"
+    assert unattempted_operator.selected is False
+    assert "operator was not selected" in unattempted_operator.reasons
 
 
 def test_human_dry_run_escapes_untrusted_ids_and_summarizes_unselected_catalog(
@@ -3420,26 +3484,8 @@ def test_resume_skips_already_processed_interaction_ids(
     ]
     dry_run = runner.invoke(root_app, [*command, "--dry-run"])
 
-    assert dry_run.exit_code == 0, dry_run.output
-    assert "Resume compatible: 1 complete interaction(s) skipped; 1 remaining" in dry_run.output
-    assert "preflight=0" in dry_run.output
-    assert "Evaluator preflight profile:" not in dry_run.output
-    assert "Evidence destination:" in dry_run.output
-    assert evidence.name in dry_run.output
-    assert f"Augmentations destination: {augmentations}" in " ".join(
-        _ANSI_ESCAPE_PATTERN.sub("", dry_run.output).split()
-    )
-    assert "Please transfer 100 to Alice." not in dry_run.output
-    assert "Candidate input: omitted (sensitive)" in dry_run.output
-
-    sensitive_dry_run = runner.invoke(
-        root_app,
-        [*command, "--dry-run", "--show-sensitive-values"],
-    )
-    assert sensitive_dry_run.exit_code == 0, sensitive_dry_run.output
-    warning_position = sensitive_dry_run.output.index("may contain sensitive data")
-    candidate_position = sensitive_dry_run.output.index("Please transfer 100 to Alice.")
-    assert warning_position < candidate_position
+    assert dry_run.exit_code == 2
+    assert "required receipt evidence.jsonl.preflight.json is missing" in dry_run.output
 
     missing_result = runner.invoke(root_app, command)
 
@@ -3452,8 +3498,11 @@ def test_resume_skips_already_processed_interaction_ids(
 
     mismatched_preflight = _evaluator_preflight().model_copy(update={"endpoint_sha256": "b" * 64})
     receipt.write_text(mismatched_preflight.model_dump_json() + "\n", encoding="utf-8")
+    mismatch_dry_run = runner.invoke(root_app, [*command, "--dry-run"])
     mismatch_result = runner.invoke(root_app, command)
 
+    assert mismatch_dry_run.exit_code == 2
+    assert "cannot reuse evaluator preflight receipt" in mismatch_dry_run.output
     assert mismatch_result.exit_code == 2
     assert "cannot reuse evaluator preflight receipt" in mismatch_result.output
     assert "restore the matching receipt and semantic settings" in mismatch_result.output
@@ -3461,6 +3510,31 @@ def test_resume_skips_already_processed_interaction_ids(
     assert evaluated_ids == []
 
     receipt.write_text(_evaluator_preflight().model_dump_json() + "\n", encoding="utf-8")
+
+    valid_dry_run = runner.invoke(root_app, [*command, "--dry-run"])
+
+    assert valid_dry_run.exit_code == 0, valid_dry_run.output
+    assert (
+        "Resume compatible: 1 complete interaction(s) skipped; 1 remaining" in valid_dry_run.output
+    )
+    assert "preflight=0" in valid_dry_run.output
+    assert "Evaluator preflight profile:" not in valid_dry_run.output
+    assert "Evidence destination:" in valid_dry_run.output
+    assert evidence.name in valid_dry_run.output
+    assert f"Augmentations destination: {augmentations}" in " ".join(
+        _ANSI_ESCAPE_PATTERN.sub("", valid_dry_run.output).split()
+    )
+    assert "Please transfer 100 to Alice." not in valid_dry_run.output
+    assert "Candidate input: omitted (sensitive)" in valid_dry_run.output
+
+    sensitive_dry_run = runner.invoke(
+        root_app,
+        [*command, "--dry-run", "--show-sensitive-values"],
+    )
+    assert sensitive_dry_run.exit_code == 0, sensitive_dry_run.output
+    warning_position = sensitive_dry_run.output.index("may contain sensitive data")
+    candidate_position = sensitive_dry_run.output.index("Please transfer 100 to Alice.")
+    assert warning_position < candidate_position
 
     result = runner.invoke(root_app, command)
 

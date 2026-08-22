@@ -831,55 +831,7 @@ class SemanticModelDeconstructor:
         return self._preflight_result
 
     def reuse_preflight(self, result: EvaluatorModelPreflight) -> None:
-        expected_profiles = self._preflight_profiles()
-        expected_profile_bindings = tuple(
-            (
-                profile.roles,
-                profile.model,
-                profile.required_parameters,
-                self._profile_request_options_sha256(profile),
-            )
-            for profile in expected_profiles
-        )
-        actual_profile_bindings = tuple(
-            (
-                profile.roles,
-                profile.requested_model,
-                profile.required_parameters,
-                profile.request_options_sha256,
-            )
-            for profile in result.profiles
-        )
-        routing_enforced = self.provider.enforces_parameter_support
-        expected_verified_capabilities = (
-            ("routing", "structured_output", "required_parameters")
-            if routing_enforced
-            else ("routing", "structured_output")
-        )
-        expected_unverified_options = tuple(
-            dict.fromkeys(
-                option
-                for profile in result.profiles
-                for option in (() if routing_enforced else profile.required_parameters)
-            )
-        )
-        if (
-            result.provider != self.provider.provider_id
-            or result.endpoint_sha256 != self.provider.endpoint_sha256
-            or actual_profile_bindings != expected_profile_bindings
-            or result.verified_capabilities != expected_verified_capabilities
-            or result.ignored_or_unsupported_options
-            or result.unverified_options != expected_unverified_options
-            or result.data_policy != self.provider.preflight_data_policy()
-            or any(
-                profile.parameter_support
-                != ("routing_enforced" if routing_enforced else "endpoint_accepted_unverified")
-                or profile.unverified_options
-                != (() if routing_enforced else profile.required_parameters)
-                for profile in result.profiles
-            )
-        ):
-            raise ValueError("evaluator preflight does not match the configured semantic profiles")
+        _validate_evaluator_preflight(self.provider, self._preflight_profiles(), result)
         self._preflight_result = result
 
     def _preflight_profiles(self) -> tuple[_EvaluatorPreflightProfile, ...]:
@@ -1559,6 +1511,18 @@ def plan_evaluator_preflight_profiles(
     )
 
 
+def validate_evaluator_preflight(
+    settings: DatasetSemanticSettings,
+    result: EvaluatorModelPreflight,
+) -> None:
+    provider = _semantic_completion_provider(settings)
+    _validate_evaluator_preflight(
+        provider,
+        _evaluator_preflight_profiles(settings, provider),
+        result,
+    )
+
+
 def _semantic_completion_provider(
     settings: DatasetSemanticSettings,
 ) -> SemanticCompletionProvider:
@@ -1646,6 +1610,61 @@ def _evaluator_preflight_profiles(
                 roles=(*existing.roles, *candidate.roles),
             )
     return tuple(profiles_by_signature.values())
+
+
+def _validate_evaluator_preflight(
+    provider: SemanticCompletionProvider,
+    expected_profiles: tuple[_EvaluatorPreflightProfile, ...],
+    result: EvaluatorModelPreflight,
+) -> None:
+    expected_profile_bindings = tuple(
+        (
+            profile.roles,
+            profile.model,
+            profile.required_parameters,
+            _profile_request_options_sha256(provider, profile),
+        )
+        for profile in expected_profiles
+    )
+    actual_profile_bindings = tuple(
+        (
+            profile.roles,
+            profile.requested_model,
+            profile.required_parameters,
+            profile.request_options_sha256,
+        )
+        for profile in result.profiles
+    )
+    routing_enforced = provider.enforces_parameter_support
+    expected_verified_capabilities = (
+        ("routing", "structured_output", "required_parameters")
+        if routing_enforced
+        else ("routing", "structured_output")
+    )
+    expected_unverified_options = tuple(
+        dict.fromkeys(
+            option
+            for profile in result.profiles
+            for option in (() if routing_enforced else profile.required_parameters)
+        )
+    )
+    if (
+        result.provider != provider.provider_id
+        or result.endpoint_sha256 != provider.endpoint_sha256
+        or actual_profile_bindings != expected_profile_bindings
+        or result.verified_capabilities != expected_verified_capabilities
+        or result.ignored_or_unsupported_options
+        or result.unverified_options != expected_unverified_options
+        or result.data_policy != provider.preflight_data_policy()
+        or any(
+            profile.parameter_support
+            != ("routing_enforced" if routing_enforced else "endpoint_accepted_unverified")
+            or profile.unverified_options
+            != (() if routing_enforced else profile.required_parameters)
+            for profile in result.profiles
+        )
+    ):
+        raise ValueError("evaluator preflight does not match the configured semantic profiles")
 
 
 def _profile_request_options_sha256(
