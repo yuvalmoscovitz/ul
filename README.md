@@ -159,9 +159,10 @@ augmentation ledger already contains a deterministic candidate, the candidate in
 inspection only with the explicit `--show-sensitive-values` opt-in; monetary estimates stay
 unavailable unless trusted model pricing is configured.
 
-During a run, successful identical semantic requests reuse a bounded, private in-memory cache that
-is cleared when the evaluator closes. Complete evidence and terminal output report actual semantic
-provider calls separately from private cache hits.
+During a run, successful identical semantic requests reuse a private in-memory cache bounded to 256
+entries and 16 MiB of serialized responses, then cleared when the evaluator closes. Complete
+evidence and terminal output report actual semantic provider calls separately from private cache
+hits.
 
 ## How it works
 

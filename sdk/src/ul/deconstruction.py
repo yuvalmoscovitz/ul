@@ -38,6 +38,7 @@ from ul_core.prompts import PromptManager, prompt_provenance
 _PROMPTS = PromptManager.instance()
 _SEMANTIC_CACHE_VERSION = "semantic-request-cache/1"
 _MAXIMUM_SEMANTIC_CACHE_ENTRIES = 256
+_MAXIMUM_SEMANTIC_CACHE_BYTES = 16 * 1024 * 1024
 
 
 def _sha256_text(value: str) -> str:
@@ -759,7 +760,10 @@ class SemanticModelDeconstructor:
             trust_env=self.provider.trust_environment_transport,
         )
         self._preflight_result: EvaluatorModelPreflight | None = None
-        self._semantic_response_cache: OrderedDict[str, _ChatCompletionResponse] = OrderedDict()
+        self._semantic_response_cache: OrderedDict[str, tuple[_ChatCompletionResponse, int]] = (
+            OrderedDict()
+        )
+        self._semantic_response_cache_bytes = 0
         self._semantic_actual_calls = 0
         self._semantic_cache_hits = 0
 
@@ -783,6 +787,7 @@ class SemanticModelDeconstructor:
 
     async def aclose(self) -> None:
         self._semantic_response_cache.clear()
+        self._semantic_response_cache_bytes = 0
         if self._owns_client:
             await self._client.aclose()
 
@@ -1119,12 +1124,12 @@ class SemanticModelDeconstructor:
             system_prompt=system_prompt,
             untrusted_payload=untrusted_payload,
         )
-        cached_response = self._semantic_response_cache.get(cache_key)
-        if operation != "preflight" and cached_response is not None:
+        cached_entry = self._semantic_response_cache.get(cache_key)
+        if operation != "preflight" and cached_entry is not None:
             self._semantic_response_cache.move_to_end(cache_key)
             self._semantic_cache_hits += 1
             return _SemanticCompletion(
-                response=cached_response,
+                response=cached_entry[0],
                 cache_hit=True,
                 cache_key=cache_key,
             )
@@ -1160,9 +1165,7 @@ class SemanticModelDeconstructor:
                 )
             ) from None
         if operation != "preflight":
-            self._semantic_response_cache[cache_key] = response
-            if len(self._semantic_response_cache) > _MAXIMUM_SEMANTIC_CACHE_ENTRIES:
-                self._semantic_response_cache.popitem(last=False)
+            self._cache_semantic_response(cache_key, response)
         return _SemanticCompletion(
             response=response,
             cache_hit=False,
@@ -1171,7 +1174,29 @@ class SemanticModelDeconstructor:
 
     def _discard_cached_completion(self, completion: _SemanticCompletion) -> None:
         if completion.cache_key is not None:
-            self._semantic_response_cache.pop(completion.cache_key, None)
+            cached_entry = self._semantic_response_cache.pop(completion.cache_key, None)
+            if cached_entry is not None:
+                self._semantic_response_cache_bytes -= cached_entry[1]
+
+    def _cache_semantic_response(
+        self,
+        cache_key: str,
+        response: _ChatCompletionResponse,
+    ) -> None:
+        response_size = len(response.model_dump_json().encode("utf-8"))
+        replaced_entry = self._semantic_response_cache.pop(cache_key, None)
+        if replaced_entry is not None:
+            self._semantic_response_cache_bytes -= replaced_entry[1]
+        if response_size > _MAXIMUM_SEMANTIC_CACHE_BYTES:
+            return
+        self._semantic_response_cache[cache_key] = (response, response_size)
+        self._semantic_response_cache_bytes += response_size
+        while (
+            len(self._semantic_response_cache) > _MAXIMUM_SEMANTIC_CACHE_ENTRIES
+            or self._semantic_response_cache_bytes > _MAXIMUM_SEMANTIC_CACHE_BYTES
+        ):
+            _, (_, evicted_size) = self._semantic_response_cache.popitem(last=False)
+            self._semantic_response_cache_bytes -= evicted_size
 
     def _semantic_cache_key(
         self,

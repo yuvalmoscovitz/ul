@@ -607,6 +607,76 @@ async def test_private_semantic_cache_materially_reduces_calls_without_changing_
     await client.aclose()
 
 
+async def test_private_semantic_cache_enforces_aggregate_byte_budget_and_lru() -> None:
+    request_count = 0
+    large_rendered_input = "x" * 600_000
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal request_count
+        request_count += 1
+        return completion(json.dumps({"rendered_input": large_rendered_input}))
+
+    client = mock_client(handler)
+    async with create_semantic_model_deconstructor(
+        settings(max_input_chars=1_000_000),
+        client=client,
+    ) as deconstructor:
+        for index in range(40):
+            await deconstructor.render("Pay INV-104", f"Rephrase variant {index}.")
+
+        assert len(deconstructor._semantic_response_cache) < 40
+        assert deconstructor._semantic_response_cache_bytes <= 16 * 1024 * 1024
+        assert deconstructor._semantic_response_cache_bytes == sum(
+            response_size for _, response_size in deconstructor._semantic_response_cache.values()
+        )
+        latest_key, latest_entry = next(reversed(deconstructor._semantic_response_cache.items()))
+        bytes_before_replacement = deconstructor._semantic_response_cache_bytes
+        deconstructor._cache_semantic_response(latest_key, latest_entry[0])
+        assert deconstructor._semantic_response_cache_bytes == bytes_before_replacement
+
+        await deconstructor.render("Pay INV-104", "Rephrase variant 39.")
+        await deconstructor.render("Pay INV-104", "Rephrase variant 0.")
+
+        assert deconstructor.semantic_call_metrics == SemanticCallMetrics(
+            actual_calls=41,
+            cache_hits=1,
+        )
+        assert deconstructor._semantic_response_cache_bytes <= 16 * 1024 * 1024
+
+    assert not deconstructor._semantic_response_cache
+    assert deconstructor._semantic_response_cache_bytes == 0
+    await client.aclose()
+
+
+async def test_private_semantic_cache_enforces_entry_count_lru() -> None:
+    request_count = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal request_count
+        request_count += 1
+        return completion(json.dumps({"rendered_input": "Please pay INV-104."}))
+
+    client = mock_client(handler)
+    async with create_semantic_model_deconstructor(settings(), client=client) as deconstructor:
+        for index in range(300):
+            await deconstructor.render("Pay INV-104", f"Rephrase variant {index}.")
+
+        assert len(deconstructor._semantic_response_cache) == 256
+        await deconstructor.render("Pay INV-104", "Rephrase variant 299.")
+        await deconstructor.render("Pay INV-104", "Rephrase variant 0.")
+
+        assert deconstructor.semantic_call_metrics == SemanticCallMetrics(
+            actual_calls=301,
+            cache_hits=1,
+        )
+        assert len(deconstructor._semantic_response_cache) == 256
+        assert deconstructor._semantic_response_cache_bytes == sum(
+            response_size for _, response_size in deconstructor._semantic_response_cache.values()
+        )
+
+    await client.aclose()
+
+
 async def test_openai_compatible_deconstruction_uses_generic_chat_contract() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         assert request.url == "https://models.example.test/openai/v1/chat/completions"
@@ -1498,6 +1568,8 @@ async def test_request_content_and_rendered_output_are_bounded() -> None:
     ) as deconstructor:
         with pytest.raises(ValueError, match="rendered input exceeds"):
             await deconstructor.render("x", "Rephrase.")
+        assert not deconstructor._semantic_response_cache
+        assert deconstructor._semantic_response_cache_bytes == 0
     await second_client.aclose()
 
 
