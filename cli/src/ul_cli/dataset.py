@@ -1081,9 +1081,16 @@ def evaluate_dataset(
                 has_review_findings |= _result_needs_review(result)
     except (TimeoutError, RuntimeError, ValueError, httpx.HTTPError) as error:
         if isinstance(error, ProviderDiagnosticError):
-            diagnostic_output = _write_provider_diagnostic(output, error)
             console.print(str(error))
-            _print_dataset_plain(f"Sanitized provider diagnostics: {diagnostic_output}")
+            try:
+                diagnostic_output = _write_provider_diagnostic(output, error)
+            except OSError as diagnostic_error:
+                _print_dataset_plain(
+                    "Sanitized provider diagnostics could not be written "
+                    f"({diagnostic_error.__class__.__name__})."
+                )
+            else:
+                _print_dataset_plain(f"Sanitized provider diagnostics: {diagnostic_output}")
         else:
             console.print(f"Evaluation stopped ({error.__class__.__name__}).")
         console.print(f"Complete results written before the error remain in {output}.")
@@ -1508,18 +1515,25 @@ def _default_augmentations_output(evidence_output: Path) -> Path:
 
 
 def _write_provider_diagnostic(output: Path, error: ProviderDiagnosticError) -> Path:
-    diagnostic_output = output.with_name(f"{output.name}.debug.json")
     payload = {
         "schema_version": _PROVIDER_DIAGNOSTIC_SCHEMA_VERSION,
         "record_type": "provider_diagnostic",
         "diagnostic": error.diagnostic.model_dump(mode="json"),
     }
-    with _create_private_output(diagnostic_output) as output_stream:
-        json.dump(payload, output_stream, ensure_ascii=False, sort_keys=True)
-        output_stream.write("\n")
-        output_stream.flush()
-        os.fsync(output_stream.fileno())
-    return diagnostic_output
+    for sequence in range(1, 101):
+        sequence_suffix = "" if sequence == 1 else f".{sequence}"
+        diagnostic_output = output.with_name(f"{output.name}.debug{sequence_suffix}.json")
+        try:
+            output_stream = _create_private_output(diagnostic_output)
+        except FileExistsError:
+            continue
+        with output_stream:
+            json.dump(payload, output_stream, ensure_ascii=False, sort_keys=True)
+            output_stream.write("\n")
+            output_stream.flush()
+            os.fsync(output_stream.fileno())
+        return diagnostic_output
+    raise FileExistsError("provider diagnostic receipt slots are occupied")
 
 
 def _create_private_output(path: Path) -> TextIO:

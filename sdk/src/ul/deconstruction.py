@@ -852,7 +852,12 @@ class SemanticModelDeconstructor:
                 system_prompt=system_prompt,
                 untrusted_payload=untrusted_payload,
             )
-        except (TimeoutError, httpx.RequestError, httpx.HTTPStatusError) as error:
+        except (
+            TimeoutError,
+            ValidationError,
+            httpx.RequestError,
+            httpx.HTTPStatusError,
+        ) as error:
             raise ProviderDiagnosticError(
                 _provider_diagnostic(
                     error,

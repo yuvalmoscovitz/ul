@@ -445,9 +445,10 @@ async def test_provider_provenance_strings_are_bounded(
     async with create_semantic_model_deconstructor(
         openai_compatible_settings(), client=client
     ) as deconstructor:
-        with pytest.raises(ValidationError) as error:
+        with pytest.raises(ProviderDiagnosticError) as error:
             await deconstructor.deconstruct(interaction())
 
+    assert error.value.diagnostic.category == "invalid_response"
     assert field_value not in str(error.value)
     await client.aclose()
 
@@ -479,8 +480,9 @@ async def test_provider_usage_values_are_size_and_type_bounded(
     async with create_semantic_model_deconstructor(
         openai_compatible_settings(), client=client
     ) as deconstructor:
-        with pytest.raises(ValidationError):
+        with pytest.raises(ProviderDiagnosticError) as provider_error:
             await deconstructor.deconstruct(interaction())
+    assert provider_error.value.diagnostic.category == "invalid_response"
     await client.aclose()
 
 
@@ -1244,6 +1246,27 @@ async def test_provider_error_is_normalized_without_response_secrets() -> None:
     assert secret not in serialized_diagnostic
     assert secret not in str(provider_error.value)
     assert "retryable: yes" in str(provider_error.value)
+    await client.aclose()
+
+
+async def test_malformed_successful_provider_envelope_is_normalized() -> None:
+    secret = "malformed-provider-response-secret"
+    client = mock_client(lambda request: httpx.Response(200, content=secret))
+
+    async with create_semantic_model_deconstructor(
+        openai_compatible_settings(), client=client
+    ) as deconstructor:
+        with pytest.raises(ProviderDiagnosticError) as provider_error:
+            await deconstructor.verify("Pay INV-104", "Please pay INV-104")
+
+    diagnostic = provider_error.value.diagnostic
+    assert diagnostic.provider == "customer-model-gateway"
+    assert diagnostic.operation == "verify"
+    assert diagnostic.category == "invalid_response"
+    assert diagnostic.retryable is False
+    assert diagnostic.http_status is None
+    assert secret not in str(provider_error.value)
+    assert secret not in diagnostic.model_dump_json()
     await client.aclose()
 
 

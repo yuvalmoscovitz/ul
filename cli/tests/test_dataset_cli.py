@@ -2110,6 +2110,74 @@ def test_provider_failure_has_concise_output_and_private_sanitized_diagnostics(
         },
     }
 
+    def fail_diagnostic_write(*_args: object, **_kwargs: object) -> None:
+        raise OSError("private filesystem detail")
+
+    failed_output = tmp_path / "failed-receipt-results.jsonl"
+    monkeypatch.setattr(main, "_write_provider_diagnostic", fail_diagnostic_write)
+    failed_receipt_result = runner.invoke(
+        root_app,
+        [
+            "dataset",
+            "evaluate",
+            str(dataset),
+            "--environment-config",
+            str(target_config),
+            "--allow-insecure-http",
+            "--allow-environment-network",
+            "--confirm-test-environment",
+            "--output",
+            str(failed_output),
+            "--no-save-augmentations",
+        ],
+    )
+    failed_receipt_output = " ".join(
+        _ANSI_ESCAPE_PATTERN.sub("", failed_receipt_result.output).split()
+    )
+    assert failed_receipt_result.exit_code == 2
+    assert "customer-gateway failed during verify" in failed_receipt_output
+    assert "diagnostics could not be written (OSError)" in failed_receipt_output
+    assert "private filesystem detail" not in failed_receipt_output
+
+
+def test_provider_diagnostic_receipts_preserve_collisions_and_reject_symlinks(
+    tmp_path: Path,
+) -> None:
+    output = tmp_path / "results.jsonl"
+    diagnostic_error = ProviderDiagnosticError(
+        ProviderDiagnostic(
+            provider="customer-gateway",
+            operation="render",
+            category="rate_limit",
+            retryable=True,
+            suggested_action="wait, then resume the run.",
+            endpoint_sha256="b" * 64,
+            http_status=429,
+        )
+    )
+
+    first = main._write_provider_diagnostic(output, diagnostic_error)
+    second = main._write_provider_diagnostic(output, diagnostic_error)
+
+    assert first == tmp_path / "results.jsonl.debug.json"
+    assert second == tmp_path / "results.jsonl.debug.2.json"
+    assert first.read_text(encoding="utf-8") == second.read_text(encoding="utf-8")
+    assert stat.S_IMODE(first.stat().st_mode) == 0o600
+    assert stat.S_IMODE(second.stat().st_mode) == 0o600
+
+    if sys.platform == "win32":
+        return
+    symlink_output = tmp_path / "symlink-results.jsonl"
+    protected_file = tmp_path / "protected.txt"
+    protected_file.write_text("unchanged", encoding="utf-8")
+    symlink_receipt = tmp_path / "symlink-results.jsonl.debug.json"
+    symlink_receipt.symlink_to(protected_file)
+
+    collision_receipt = main._write_provider_diagnostic(symlink_output, diagnostic_error)
+
+    assert collision_receipt == tmp_path / "symlink-results.jsonl.debug.2.json"
+    assert protected_file.read_text(encoding="utf-8") == "unchanged"
+
 
 def test_execution_wires_redaction_into_records_pipeline_and_run_context(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
