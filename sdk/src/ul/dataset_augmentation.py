@@ -1077,18 +1077,14 @@ def _add_punctuation_noise(
     if insertion is None:
         raise AssertionError("punctuation noise requires an unprotected insertion point")
     position, punctuation, algorithm = insertion
-    rendered_text = (
-        f"{record.raw_input[:position]}{punctuation}{record.raw_input[position:]}"
-    )
+    rendered_text = f"{record.raw_input[:position]}{punctuation}{record.raw_input[position:]}"
     return RenderedUserInput(
         text=rendered_text,
         metadata=_deterministic_renderer_metadata(record, operator, algorithm),
     )
 
 
-def _punctuation_insertion(
-    text: str, frame: SemanticFrame
-) -> tuple[int, str, str] | None:
+def _punctuation_insertion(text: str, frame: SemanticFrame) -> tuple[int, str, str] | None:
     protected_spans = _protected_input_spans(text, frame)
     safe_punctuation = next(
         (

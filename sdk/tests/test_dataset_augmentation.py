@@ -1234,9 +1234,7 @@ async def test_punctuation_noise_skips_when_every_insertion_point_is_protected()
         update={
             "value": "$1,000",
             "evidence": (
-                EvidenceReference(
-                    source="input", json_pointer="/raw_input", text_quote="$1,000"
-                ),
+                EvidenceReference(source="input", json_pointer="/raw_input", text_quote="$1,000"),
             ),
         }
     )
