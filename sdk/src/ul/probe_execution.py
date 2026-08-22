@@ -283,6 +283,23 @@ class ComposedEnvironmentExecutor:
         if required_calls > case.max_environment_api_calls:
             raise ValueError("evaluation case exceeds its environment API call budget")
         async with self._lock:
+            probe_context = case.probe_context
+            context_variation_id = probe_context.get("ul.variation.id")
+            context_repetition = probe_context.get("ul.repetition")
+            variation_id = (
+                context_variation_id
+                if isinstance(context_variation_id, str)
+                else self._variation_id
+            )
+            repetition = (
+                context_repetition
+                if isinstance(context_repetition, int) and not isinstance(context_repetition, bool)
+                else self._repetition
+            )
+            if variation_id is not None and not 1 <= len(variation_id) <= 500:
+                raise ValueError("case variation ID must contain between 1 and 500 characters")
+            if repetition is not None and repetition < 1:
+                raise ValueError("case repetition must be a positive integer")
             execution_context = _ProbeExecutionContext(
                 campaign_id=self._campaign_id,
                 case_id=case.id,
@@ -290,9 +307,9 @@ class ComposedEnvironmentExecutor:
                 attempt_id=f"ul-attempt-{secrets.token_hex(16)}",
                 session_id=f"ul-session-{secrets.token_hex(16)}",
                 trace_id=secrets.token_hex(16),
-                variation_id=self._variation_id,
-                repetition=self._repetition,
-                probe_context=cast(dict[str, JsonValue], getattr(case, "probe_context", {})),
+                variation_id=variation_id,
+                repetition=repetition,
+                probe_context=probe_context,
             )
             async with asyncio.timeout(case.timeout_seconds):
                 if self._state_environment is None:

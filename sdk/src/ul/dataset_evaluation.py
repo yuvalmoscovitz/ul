@@ -359,6 +359,7 @@ class DatasetEvaluationRunner:
                 reference_frame=source_frame,
                 source=source,
                 subject="current baseline",
+                variation_id="current_baseline",
             )
             baseline_trials.append(baseline_trial)
             for candidate in accepted_candidates:
@@ -384,6 +385,7 @@ class DatasetEvaluationRunner:
                         reference_frame=reference_frame,
                         source=source,
                         subject="variation",
+                        variation_id=candidate.operator_id,
                     )
                 )
 
@@ -509,6 +511,7 @@ class DatasetEvaluationRunner:
         reference_frame: SemanticFrame,
         source: InteractionRecord,
         subject: Literal["current baseline", "variation"],
+        variation_id: str,
     ) -> DatasetEvaluationTrial:
         if self._target_state_uncertain:
             return DatasetEvaluationTrial(
@@ -521,7 +524,7 @@ class DatasetEvaluationRunner:
         try:
             async with asyncio.timeout(self._target_timeout_seconds):
                 evaluation_case = EvaluationCase(
-                    id=f"ul-case-{secrets.token_hex(16)}",
+                    id=source.id,
                     turns=(
                         ConversationTurn(
                             id=f"turn-{secrets.token_hex(12)}",
@@ -531,7 +534,11 @@ class DatasetEvaluationRunner:
                     ),
                     max_environment_api_calls=1,
                     timeout_seconds=self._target_timeout_seconds,
-                    probe_context=source.probe_context(raw_input),
+                    probe_context={
+                        **source.probe_context(raw_input),
+                        "ul.variation.id": variation_id,
+                        "ul.repetition": repetition,
+                    },
                 )
                 environment_api_calls = self._environment.api_calls_for_case(evaluation_case)
                 if type(environment_api_calls) is not int or environment_api_calls < 1:

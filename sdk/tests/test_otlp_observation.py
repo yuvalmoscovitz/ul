@@ -4,11 +4,16 @@ import asyncio
 from dataclasses import dataclass, field
 from typing import cast
 
+import httpx
 import pytest
 from pydantic import JsonValue
 from ul import otlp_observation as observation_module
 from ul.environment import evaluation_case_from_inputs
-from ul.otlp_observation import OtlpObservationConfig, OtlpObservationSource
+from ul.otlp_observation import (
+    OtlpJsonHttpReceiver,
+    OtlpObservationConfig,
+    OtlpObservationSource,
+)
 from ul.probe_execution import ComposedEnvironmentExecutor
 from ul_core.evaluation import (
     ObservationRequest,
@@ -341,6 +346,67 @@ async def test_same_otlp_export_can_feed_ul_and_an_independent_receiver() -> Non
         second.observe(observation_request),
     )
     assert first_observation.traces == second_observation.traces
+
+
+async def test_standard_otlp_http_json_stream_reaches_ul_and_parallel_backend() -> None:
+    config = OtlpObservationConfig(
+        settle_window_seconds=0.01,
+        observation_timeout_seconds=0.1,
+    )
+    first = OtlpObservationSource(config)
+    second = OtlpObservationSource(config)
+    request = ProbeRequest(
+        case_id="case-1",
+        session_id="session-1",
+        correlation_id="correlation-1",
+        turn=ProbeTurn(id="turn-1", input="hello"),
+        context={"trace_id": "a" * 32, "span_id": "b" * 16},
+    )
+    payload = _payload(request)
+
+    with (
+        OtlpJsonHttpReceiver(first) as first_receiver,
+        OtlpJsonHttpReceiver(second) as second_receiver,
+    ):
+        async with httpx.AsyncClient() as client:
+            first_response, second_response = await asyncio.gather(
+                client.post(first_receiver.endpoint, json=payload),
+                client.post(second_receiver.endpoint, json=payload),
+            )
+
+    assert first_response.status_code == 200
+    assert second_response.status_code == 200
+    assert first_response.json()["partialSuccess"]["rejectedSpans"] == 0
+    observation_request = ObservationRequest(
+        case_id=request.case_id,
+        session_id=request.session_id,
+        correlation_id=request.correlation_id,
+        context=request.context,
+    )
+    first_observation, second_observation = await asyncio.gather(
+        first.observe(observation_request),
+        second.observe(observation_request),
+    )
+    assert first_observation.status == "complete"
+    assert first_observation.traces == second_observation.traces
+
+
+async def test_otlp_http_json_receiver_rejects_oversized_body_before_export() -> None:
+    observer = OtlpObservationSource(OtlpObservationConfig(maximum_payload_bytes=100))
+
+    with OtlpJsonHttpReceiver(observer) as receiver:
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                receiver.endpoint,
+                content=b"x" * 101,
+                headers={"Content-Type": "application/json"},
+            )
+
+    assert response.status_code == 413
+    assert observer._spans == []
+
+    with pytest.raises(ValueError, match="loopback"):
+        OtlpJsonHttpReceiver(observer, host="0.0.0.0")
 
 
 async def test_raw_span_retention_is_disabled_by_default() -> None:
@@ -744,6 +810,45 @@ async def test_worker_flush_hook_runs_before_observation() -> None:
 
     assert flusher.requests == invoker.requests
     assert evidence.observations[0].status == "complete"
+
+
+async def test_case_context_supplies_variation_and_repetition_identity() -> None:
+    observer = OtlpObservationSource(
+        OtlpObservationConfig(
+            settle_window_seconds=0.01,
+            observation_timeout_seconds=0.1,
+        )
+    )
+    invoker = _PassiveInvoker()
+    executor = ComposedEnvironmentExecutor(
+        invoker,
+        config_sha256=_CONFIG_SHA256,
+        observation_source=observer,
+        worker_trace_flusher=_FlushExporter(observer),
+        observation_timeout_seconds=0.2,
+    )
+    case = evaluation_case_from_inputs(
+        case_id="dataset-record-1",
+        raw_inputs=("help me",),
+        max_environment_api_calls=2,
+        timeout_seconds=1,
+    ).model_copy(
+        update={
+            "probe_context": {
+                "ul.variation.id": "input.surface.rephrase",
+                "ul.repetition": 3,
+            }
+        }
+    )
+
+    evidence = await executor.execute(case)
+
+    assert invoker.requests[0].context["ul.case.id"] == "dataset-record-1"
+    assert invoker.requests[0].context["ul.variation.id"] == "input.surface.rephrase"
+    assert invoker.requests[0].context["ul.repetition"] == 3
+    assert evidence.probe_identity is not None
+    assert evidence.probe_identity.variation_id == "input.surface.rephrase"
+    assert evidence.probe_identity.repetition == 3
 
 
 async def test_multi_turn_probe_uses_distinct_trace_ids_and_correlates_each_turn() -> None:

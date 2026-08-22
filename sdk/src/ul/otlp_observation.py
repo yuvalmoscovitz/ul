@@ -4,6 +4,7 @@ import asyncio
 import base64
 import binascii
 import hashlib
+import http.server
 import json
 import math
 import re
@@ -72,6 +73,141 @@ class OtlpExportReceipt(BaseModel):
     accepted_spans: int = Field(ge=0)
     rejected_spans: int = Field(ge=0)
     partial_success: bool
+
+
+class OtlpJsonHttpReceiver:
+    def __init__(
+        self,
+        observation_source: OtlpObservationSource,
+        *,
+        host: str = "127.0.0.1",
+        port: int = 0,
+        request_timeout_seconds: float = 5,
+    ) -> None:
+        if host != "127.0.0.1":
+            raise ValueError("OTLP JSON receiver only binds to the IPv4 loopback address")
+        if isinstance(port, bool) or not 0 <= port <= 65_535:
+            raise ValueError("OTLP JSON receiver port must be between 0 and 65535")
+        if (
+            isinstance(request_timeout_seconds, bool)
+            or not math.isfinite(request_timeout_seconds)
+            or request_timeout_seconds <= 0
+        ):
+            raise ValueError("OTLP JSON receiver timeout must be finite and positive")
+        self._observation_source = observation_source
+        self._host = host
+        self._port = port
+        self._request_timeout_seconds = request_timeout_seconds
+        self._server: http.server.ThreadingHTTPServer | None = None
+        self._thread: threading.Thread | None = None
+
+    @property
+    def endpoint(self) -> str:
+        server = self._server
+        if server is None:
+            raise RuntimeError("OTLP JSON receiver is not running")
+        return f"http://{self._host}:{server.server_port}/v1/traces"
+
+    def start(self) -> OtlpJsonHttpReceiver:
+        if self._server is not None:
+            raise RuntimeError("OTLP JSON receiver is already running")
+        observation_source = self._observation_source
+        request_timeout_seconds = self._request_timeout_seconds
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def do_POST(self) -> None:
+                self.connection.settimeout(request_timeout_seconds)
+                if self.path != "/v1/traces":
+                    self._respond(404, {"error": "not found"})
+                    return
+                if self.headers.get("Transfer-Encoding") is not None:
+                    self._respond(400, {"error": "chunked requests are not supported"})
+                    return
+                content_type = self.headers.get("Content-Type", "").partition(";")[0].strip()
+                if content_type.casefold() != "application/json":
+                    self._respond(415, {"error": "content type must be application/json"})
+                    return
+                raw_content_length = self.headers.get("Content-Length")
+                try:
+                    content_length = int(raw_content_length or "")
+                except ValueError:
+                    self._respond(400, {"error": "valid content length is required"})
+                    return
+                if content_length < 0:
+                    self._respond(400, {"error": "valid content length is required"})
+                    return
+                if content_length > observation_source.config.maximum_payload_bytes:
+                    self._respond(413, {"error": "OTLP payload exceeds the size limit"})
+                    return
+                encoded_payload = self.rfile.read(content_length)
+                if len(encoded_payload) != content_length:
+                    self._respond(400, {"error": "OTLP payload was truncated"})
+                    return
+                try:
+                    payload = json.loads(encoded_payload.decode("utf-8"))
+                except (UnicodeDecodeError, json.JSONDecodeError, RecursionError):
+                    self._respond(400, {"error": "OTLP payload must be valid UTF-8 JSON"})
+                    return
+                receipt = observation_source.export(payload)
+                self._respond(
+                    200,
+                    {
+                        "partialSuccess": {
+                            "rejectedSpans": receipt.rejected_spans,
+                            "errorMessage": (
+                                "one or more spans were rejected" if receipt.partial_success else ""
+                            ),
+                        }
+                    },
+                )
+
+            def do_GET(self) -> None:
+                self._respond(405, {"error": "method not allowed"})
+
+            def log_message(self, format: str, *args: object) -> None:
+                del format, args
+
+            def _respond(self, status: int, payload: dict[str, JsonValue]) -> None:
+                body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+                self.send_response(status)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Connection", "close")
+                self.end_headers()
+                self.wfile.write(body)
+
+        server = http.server.ThreadingHTTPServer((self._host, self._port), Handler)
+        server.daemon_threads = True
+        thread = threading.Thread(
+            target=server.serve_forever,
+            name="ul-otlp-json-receiver",
+            daemon=True,
+        )
+        self._server = server
+        self._thread = thread
+        thread.start()
+        return self
+
+    def close(self) -> None:
+        server = self._server
+        thread = self._thread
+        self._server = None
+        self._thread = None
+        if server is None:
+            return
+        server.shutdown()
+        server.server_close()
+        if thread is not None:
+            thread.join(timeout=self._request_timeout_seconds)
+
+    def __enter__(self) -> OtlpJsonHttpReceiver:
+        return self.start()
+
+    def __exit__(self, *exc_info: object) -> None:
+        del exc_info
+        self.close()
 
 
 @dataclass(frozen=True)
