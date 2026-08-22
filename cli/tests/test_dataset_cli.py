@@ -1356,6 +1356,12 @@ def test_invariant_evaluation_reuses_results_without_extra_runner_calls(
         async def __aexit__(self, *args: object) -> None:
             pass
 
+        async def preflight(self) -> object:
+            return SimpleNamespace(
+                parameter_verification="endpoint_accepted",
+                data_policy={},
+            )
+
     class FakeRunner:
         def __init__(self, *args: object, **kwargs: object) -> None:
             pass

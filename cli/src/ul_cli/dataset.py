@@ -1665,6 +1665,14 @@ async def _evaluate_interaction_records(
 ) -> tuple[DatasetEvaluationResult, ...]:
     results: list[DatasetEvaluationResult] = []
     async with create_semantic_model_deconstructor(settings) as deconstructor, target:
+        evaluator_preflight = await deconstructor.preflight()
+        _print_dataset_plain(
+            "Evaluator preflight passed: routing, structured output, and seed; "
+            f"parameter verification={evaluator_preflight.parameter_verification}."
+        )
+        data_policy_implication = evaluator_preflight.data_policy.get("implication")
+        if isinstance(data_policy_implication, str):
+            _print_dataset_plain(f"Evaluator data policy: {data_policy_implication}")
         semantic_pipeline = (
             RedactedSemanticPipeline(deconstructor, redaction_engine)
             if redaction_engine is not None

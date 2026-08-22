@@ -115,6 +115,8 @@ from ul.dataset_regression import (
 )
 from ul.deconstruction import (
     DatasetSemanticSettings,
+    EvaluatorModelCompatibilityError,
+    EvaluatorModelPreflight,
     OpenAICompatibleDatasetSettings,
     OpenRouterDatasetSettings,
     ProviderDiagnostic,
@@ -267,6 +269,8 @@ __all__ = [
     "EnvironmentStateEvidence",
     "EnvironmentTurnEvidence",
     "EvaluationCase",
+    "EvaluatorModelCompatibilityError",
+    "EvaluatorModelPreflight",
     "ExactlyOneNewEffectInvariant",
     "ExecutionEvidence",
     "ExecutionMode",

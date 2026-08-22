@@ -530,6 +530,30 @@ class _RenderedInput(BaseModel):
     rendered_input: str = Field(min_length=1)
 
 
+class _EvaluatorPreflightSample(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    compatible: Literal[True]
+
+
+class EvaluatorModelPreflight(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    requested_model: str = Field(min_length=1, max_length=200)
+    routed_model: str = Field(min_length=1, max_length=200)
+    provider: str = Field(min_length=1, max_length=100)
+    upstream_provider: str | None = Field(default=None, max_length=200)
+    verified_capabilities: tuple[Literal["routing", "structured_output", "seed"], ...]
+    required_parameters: tuple[Literal["response_format", "seed"], ...]
+    ignored_or_unsupported_options: tuple[str, ...] = ()
+    parameter_verification: Literal["endpoint_accepted", "routing_enforced"]
+    data_policy: dict[str, JsonValue]
+
+
+class EvaluatorModelCompatibilityError(ValueError):
+    pass
+
+
 class SemanticCompletionProvider(Protocol):
     @property
     def provider_id(self) -> str: ...
@@ -563,6 +587,11 @@ class SemanticCompletionProvider(Protocol):
         response: _ChatCompletionResponse,
     ) -> dict[str, JsonValue]: ...
 
+    def preflight_data_policy(self) -> dict[str, JsonValue]: ...
+
+    @property
+    def enforces_parameter_support(self) -> bool: ...
+
 
 @dataclass(frozen=True)
 class OpenAICompatibleSemanticProvider:
@@ -573,6 +602,10 @@ class OpenAICompatibleSemanticProvider:
     equivalence_verifier_version: str = "semantic-equivalence-verifier/2.0.0"
     requires_api_key: bool = False
     trust_environment_transport: bool = False
+
+    @property
+    def enforces_parameter_support(self) -> bool:
+        return False
 
     def add_request_options(
         self,
@@ -596,6 +629,16 @@ class OpenAICompatibleSemanticProvider:
             "semantic_usage": usage,
         }
 
+    def preflight_data_policy(self) -> dict[str, JsonValue]:
+        return {
+            "external_processing": True,
+            "provider_policy_declared": False,
+            "implication": (
+                "The configured endpoint receives evaluator prompts and sample data; UL cannot "
+                "verify its retention or training policy."
+            ),
+        }
+
 
 @dataclass(frozen=True)
 class OpenRouterSemanticProvider(OpenAICompatibleSemanticProvider):
@@ -604,6 +647,10 @@ class OpenRouterSemanticProvider(OpenAICompatibleSemanticProvider):
     endpoint_sha256: str = _sha256_text("https://openrouter.ai/api/v1")
     requires_api_key: bool = True
     trust_environment_transport: bool = True
+
+    @property
+    def enforces_parameter_support(self) -> bool:
+        return True
 
     def add_request_options(
         self,
@@ -615,6 +662,18 @@ class OpenRouterSemanticProvider(OpenAICompatibleSemanticProvider):
             "require_parameters": True,
             "data_collection": "deny",
             "zdr": True,
+        }
+
+    def preflight_data_policy(self) -> dict[str, JsonValue]:
+        return {
+            "external_processing": True,
+            "provider_policy_declared": True,
+            "data_collection": "deny",
+            "zero_data_retention_required": True,
+            "implication": (
+                "The configured route requires data collection to be denied and zero data "
+                "retention; the evaluator request is still processed externally."
+            ),
         }
 
 
@@ -634,6 +693,7 @@ class SemanticModelDeconstructor:
             follow_redirects=False,
             trust_env=self.provider.trust_environment_transport,
         )
+        self._preflight_result: EvaluatorModelPreflight | None = None
 
     async def __aenter__(self) -> Self:
         return self
@@ -649,6 +709,55 @@ class SemanticModelDeconstructor:
     async def aclose(self) -> None:
         if self._owns_client:
             await self._client.aclose()
+
+    async def preflight(self) -> EvaluatorModelPreflight:
+        try:
+            response = await self._request(
+                model=self.settings.model,
+                reasoning={"effort": "minimal"},
+                max_tokens=16,
+                temperature=0,
+                seed=0,
+                top_p=None,
+                schema_name="evaluator_preflight",
+                schema=_EvaluatorPreflightSample.model_json_schema(mode="validation"),
+                strict_schema=True,
+                system_prompt=_PROMPTS.get_prompt("semantic.preflight"),
+                untrusted_payload="{}",
+            )
+        except TimeoutError:
+            raise self._compatibility_error("timeout") from None
+        except httpx.HTTPStatusError as error:
+            raise self._compatibility_error(
+                _preflight_http_capability(error.response)
+            ) from None
+        except httpx.HTTPError:
+            raise self._compatibility_error("routing") from None
+        try:
+            _EvaluatorPreflightSample.model_validate_json(response.choices[0].message.content)
+        except (ValidationError, ValueError):
+            raise self._compatibility_error("structured output") from None
+        self._preflight_result = EvaluatorModelPreflight(
+            requested_model=self.settings.model,
+            routed_model=response.model,
+            provider=self.provider.provider_id,
+            upstream_provider=response.provider,
+            verified_capabilities=("routing", "structured_output", "seed"),
+            required_parameters=("response_format", "seed"),
+            parameter_verification=(
+                "routing_enforced"
+                if self.provider.enforces_parameter_support
+                else "endpoint_accepted"
+            ),
+            data_policy=self.provider.preflight_data_policy(),
+        )
+        return self._preflight_result
+
+    def _compatibility_error(self, capability: str) -> EvaluatorModelCompatibilityError:
+        return EvaluatorModelCompatibilityError(
+            f"evaluator model is incompatible with required {capability} capability; "
+            "choose another configured evaluator model or verify the configured route and retry"
+        )
 
     async def deconstruct(
         self,
@@ -1241,7 +1350,12 @@ class SemanticModelDeconstructor:
         self,
         response: _ChatCompletionResponse,
     ) -> dict[str, JsonValue]:
-        return self.provider.generation_metadata(response)
+        metadata = self.provider.generation_metadata(response)
+        if self._preflight_result is not None:
+            metadata["evaluator_preflight"] = cast(
+                JsonValue, self._preflight_result.model_dump(mode="json")
+            )
+        return metadata
 
 
 def create_semantic_model_deconstructor(
@@ -1278,3 +1392,17 @@ def _contains_secret(value: object, secret: str) -> bool:
         sequence = cast(list[object], value)
         return any(_contains_secret(item, secret) for item in sequence)
     return False
+
+
+def _preflight_http_capability(response: httpx.Response) -> str:
+    if response.status_code == 404:
+        return "model availability or routing"
+    try:
+        detail = response.text[:4_096].lower()
+    except httpx.ResponseNotRead:
+        detail = ""
+    if "response_format" in detail or "json_schema" in detail or "structured" in detail:
+        return "structured output"
+    if "seed" in detail:
+        return "seed"
+    return "provider routing"

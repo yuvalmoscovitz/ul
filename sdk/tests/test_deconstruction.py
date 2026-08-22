@@ -13,6 +13,7 @@ from ul.dataset_augmentation import (
     builtin_dataset_augmentation_operators,
 )
 from ul.deconstruction import (
+    EvaluatorModelCompatibilityError,
     OpenAICompatibleDatasetSettings,
     OpenRouterDatasetSettings,
     ProviderDiagnosticError,
@@ -180,6 +181,122 @@ def completion(content: str) -> httpx.Response:
             },
         },
     )
+
+
+async def test_evaluator_preflight_proves_required_capabilities_and_records_policy() -> None:
+    requests: list[dict[str, object]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = cast(dict[str, object], json.loads(request.content))
+        requests.append(body)
+        if len(requests) == 1:
+            return completion('{"compatible":true}')
+        return completion(json.dumps(frame_payload()))
+
+    client = mock_client(handler)
+    async with create_semantic_model_deconstructor(settings(), client=client) as deconstructor:
+        result = await deconstructor.preflight()
+        frame = await deconstructor.deconstruct(interaction())
+
+    preflight_request = requests[0]
+    assert preflight_request["seed"] == 0
+    assert preflight_request["max_tokens"] == 16
+    assert preflight_request["temperature"] == 0
+    assert preflight_request["response_format"] == {
+        "type": "json_schema",
+        "json_schema": {
+            "name": "evaluator_preflight",
+            "strict": True,
+            "schema": {
+                "additionalProperties": False,
+                "properties": {
+                    "compatible": {
+                        "const": True,
+                        "title": "Compatible",
+                        "type": "boolean",
+                    }
+                },
+                "required": ["compatible"],
+                "title": "_EvaluatorPreflightSample",
+                "type": "object",
+            },
+        },
+    }
+    assert result.routed_model == "provider/resolved-model"
+    assert result.verified_capabilities == ("routing", "structured_output", "seed")
+    assert result.parameter_verification == "routing_enforced"
+    assert result.ignored_or_unsupported_options == ()
+    assert result.data_policy == {
+        "external_processing": True,
+        "provider_policy_declared": True,
+        "data_collection": "deny",
+        "zero_data_retention_required": True,
+        "implication": (
+            "The configured route requires data collection to be denied and zero data retention; "
+            "the evaluator request is still processed externally."
+        ),
+    }
+    assert frame.metadata["evaluator_preflight"] == result.model_dump(mode="json")
+    await client.aclose()
+
+
+async def test_evaluator_preflight_rejects_invalid_structured_output() -> None:
+    client = mock_client(lambda request: completion('{"compatible":false}'))
+    async with create_semantic_model_deconstructor(settings(), client=client) as deconstructor:
+        with pytest.raises(EvaluatorModelCompatibilityError, match="structured output capability"):
+            await deconstructor.preflight()
+    await client.aclose()
+
+
+async def test_evaluator_preflight_names_seed_rejection() -> None:
+    client = mock_client(
+        lambda request: httpx.Response(400, json={"error": {"param": "seed"}})
+    )
+    async with create_semantic_model_deconstructor(settings(), client=client) as deconstructor:
+        with pytest.raises(EvaluatorModelCompatibilityError, match="seed capability") as error:
+            await deconstructor.preflight()
+    assert "choose another configured evaluator model" in str(error.value)
+    await client.aclose()
+
+
+async def test_evaluator_preflight_names_unavailable_model_route() -> None:
+    client = mock_client(lambda request: httpx.Response(404, json={"error": "not found"}))
+    async with create_semantic_model_deconstructor(settings(), client=client) as deconstructor:
+        with pytest.raises(
+            EvaluatorModelCompatibilityError, match="model availability or routing capability"
+        ):
+            await deconstructor.preflight()
+    await client.aclose()
+
+
+async def test_evaluator_preflight_normalizes_provider_error() -> None:
+    client = mock_client(
+        lambda request: httpx.Response(
+            503,
+            json={"error": "secret provider diagnostic must not be surfaced"},
+        )
+    )
+    async with create_semantic_model_deconstructor(settings(), client=client) as deconstructor:
+        with pytest.raises(
+            EvaluatorModelCompatibilityError, match="provider routing capability"
+        ) as error:
+            await deconstructor.preflight()
+    assert "secret provider diagnostic" not in str(error.value)
+    await client.aclose()
+
+
+async def test_evaluator_preflight_has_a_bounded_timeout() -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        await asyncio.sleep(0.02)
+        return completion('{"compatible":true}')
+
+    client = mock_client(handler)
+    async with create_semantic_model_deconstructor(
+        settings(timeout_seconds=0.001), client=client
+    ) as deconstructor:
+        with pytest.raises(EvaluatorModelCompatibilityError, match="timeout capability"):
+            await deconstructor.preflight()
+    await client.aclose()
 
 
 def semantic_frame() -> SemanticFrame:
