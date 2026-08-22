@@ -22,6 +22,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+          fetch-depth: 0
 
       - name: Install uv and Python
         uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
@@ -32,6 +33,13 @@ jobs:
 
       - name: Install locked dependencies
         run: uv sync --locked
+
+      - name: Warn about long changed Python files
+        if: github.event_name == 'pull_request'
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: uv run --frozen python scripts/check_python_file_lengths.py "$BASE_SHA" "$HEAD_SHA" --merge-base
 
       - name: Lint
         run: uv run --frozen ruff check .

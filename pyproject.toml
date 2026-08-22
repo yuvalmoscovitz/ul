@@ -36,6 +36,7 @@ dev = [
 [tool.pytest.ini_options]
 addopts = "-ra"
 testpaths = [
+    "scripts/tests",
     "core/tests",
     "sdk/tests",
     "cli/tests",
@@ -57,6 +58,7 @@ select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
 pythonVersion = "3.12"
 typeCheckingMode = "strict"
 include = [
+    "scripts",
     "core/src",
     "sdk/src",
     "cli/src",
