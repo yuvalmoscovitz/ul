@@ -3650,23 +3650,26 @@ def test_resume_exits_early_when_all_records_already_processed(
     )
     monkeypatch.setattr(main, "load_dataset_semantic_settings", _settings)
 
-    result = runner.invoke(
-        root_app,
-        [
-            "dataset",
-            "evaluate",
-            str(dataset),
-            "--environment-config",
-            str(target_config),
-            "--allow-environment-network",
-            "--confirm-test-environment",
-            "--repetitions",
-            "1",
-            "--resume",
-            str(evidence),
-        ],
-    )
+    command = [
+        "dataset",
+        "evaluate",
+        str(dataset),
+        "--environment-config",
+        str(target_config),
+        "--allow-environment-network",
+        "--confirm-test-environment",
+        "--repetitions",
+        "1",
+        "--resume",
+        str(evidence),
+    ]
+    dry_run = runner.invoke(root_app, [*command, "--dry-run"])
+    result = runner.invoke(root_app, command)
 
+    assert dry_run.exit_code == 0, dry_run.output
+    assert "Potential semantic model calls: up to 0" in dry_run.output
+    assert "preflight=0" in dry_run.output
+    assert "Estimated completion tokens: 0..0" in dry_run.output
     assert result.exit_code == 0, result.output
     assert "Nothing to do" in result.output
 

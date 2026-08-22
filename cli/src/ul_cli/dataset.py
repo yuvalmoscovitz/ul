@@ -904,7 +904,7 @@ def evaluate_dataset(
         settings=settings,
         saved_augmentations=saved_augmentations,
         show_sensitive_values=show_sensitive_values,
-        requires_preflight=evaluator_preflight is None,
+        requires_preflight=evaluator_preflight is None and bool(selected_records),
         evaluation_mode=evaluation_mode,
         fixture_status=(
             run_context.fixture.status
