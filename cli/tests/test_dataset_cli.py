@@ -620,7 +620,8 @@ def test_init_rejects_partial_fixture_identity(tmp_path: Path) -> None:
     )
 
     assert result.exit_code == 2
-    assert "--fixture-id and --fixture-version" in result.output
+    normalized_output = " ".join(_ANSI_ESCAPE_PATTERN.sub("", result.output).split())
+    assert "--fixture-id and --fixture-version" in normalized_output
     assert not target_config.exists()
 
 
