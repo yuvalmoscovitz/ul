@@ -15,6 +15,7 @@ from ul.dataset_augmentation import (
 from ul.deconstruction import (
     OpenAICompatibleDatasetSettings,
     OpenRouterDatasetSettings,
+    ProviderDiagnosticError,
     SemanticModelDeconstructor,
     create_semantic_model_deconstructor,
     load_dataset_semantic_settings,
@@ -1207,8 +1208,42 @@ async def test_complete_request_has_a_wall_clock_deadline() -> None:
     async with create_semantic_model_deconstructor(
         settings(timeout_seconds=0.01), client=client
     ) as deconstructor:
-        with pytest.raises(TimeoutError):
+        with pytest.raises(ProviderDiagnosticError) as provider_error:
             await deconstructor.deconstruct(interaction())
+    assert provider_error.value.diagnostic.category == "timeout"
+    assert provider_error.value.diagnostic.retryable is True
+    assert provider_error.value.diagnostic.operation == "deconstruct"
+    await client.aclose()
+
+
+async def test_provider_error_is_normalized_without_response_secrets() -> None:
+    secret = "provider-secret-response-detail"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            429,
+            json={"error": {"message": secret}},
+            headers={"x-request-id": secret, "retry-after": "17"},
+        )
+
+    client = mock_client(handler)
+    async with create_semantic_model_deconstructor(
+        openai_compatible_settings(), client=client
+    ) as deconstructor:
+        with pytest.raises(ProviderDiagnosticError) as provider_error:
+            await deconstructor.render("Pay INV-104", "Rephrase.")
+
+    diagnostic = provider_error.value.diagnostic
+    serialized_diagnostic = diagnostic.model_dump_json()
+    assert diagnostic.provider == "customer-model-gateway"
+    assert diagnostic.operation == "render"
+    assert diagnostic.category == "rate_limit"
+    assert diagnostic.http_status == 429
+    assert diagnostic.retryable is True
+    assert diagnostic.retry_status == "not_retried"
+    assert secret not in serialized_diagnostic
+    assert secret not in str(provider_error.value)
+    assert "retryable: yes" in str(provider_error.value)
     await client.aclose()
 
 

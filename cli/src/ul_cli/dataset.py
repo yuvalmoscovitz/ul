@@ -29,6 +29,7 @@ from ul import (
     DatasetTargetLifecycleFailure,
     InteractionRecord,
     LocalPseudonymStore,
+    ProviderDiagnosticError,
     RedactedSemanticPipeline,
     RedactionEngine,
     create_semantic_model_deconstructor,
@@ -102,6 +103,7 @@ _MAXIMUM_DATASET_RECORDS = 100
 _MAXIMUM_EVIDENCE_BYTES = 128_000_000
 _DEFAULT_MAXIMUM_ENVIRONMENT_API_CALLS = 100
 _REDACTION_KEY_ENVIRONMENT_VARIABLE = "UL_DATASET_REDACTION_KEY"
+_PROVIDER_DIAGNOSTIC_SCHEMA_VERSION = "1.0.0"
 _CUSTOMER_STATUSES = {
     "augmentation_rejected": "VARIATION DISCARDED",
     "inconclusive": "COULDN'T DETERMINE",
@@ -1078,10 +1080,13 @@ def evaluate_dataset(
             for result in results:
                 has_review_findings |= _result_needs_review(result)
     except (TimeoutError, RuntimeError, ValueError, httpx.HTTPError) as error:
-        console.print(
-            f"Evaluation stopped ({error.__class__.__name__}). "
-            f"Complete results written before the error remain in {output}."
-        )
+        if isinstance(error, ProviderDiagnosticError):
+            diagnostic_output = _write_provider_diagnostic(output, error)
+            console.print(str(error))
+            _print_dataset_plain(f"Sanitized provider diagnostics: {diagnostic_output}")
+        else:
+            console.print(f"Evaluation stopped ({error.__class__.__name__}).")
+        console.print(f"Complete results written before the error remain in {output}.")
         if augmentations_output is not None:
             _print_dataset_plain(
                 f"Generated augmentations remain in {augmentations_output} and will be reused "
@@ -1500,6 +1505,21 @@ def _default_augmentations_output(evidence_output: Path) -> Path:
     if evidence_output.suffix:
         return evidence_output.with_name(f"{evidence_output.stem}.augmentations.jsonl")
     return evidence_output.with_name(f"{evidence_output.name}.augmentations.jsonl")
+
+
+def _write_provider_diagnostic(output: Path, error: ProviderDiagnosticError) -> Path:
+    diagnostic_output = output.with_name(f"{output.name}.debug.json")
+    payload = {
+        "schema_version": _PROVIDER_DIAGNOSTIC_SCHEMA_VERSION,
+        "record_type": "provider_diagnostic",
+        "diagnostic": error.diagnostic.model_dump(mode="json"),
+    }
+    with _create_private_output(diagnostic_output) as output_stream:
+        json.dump(payload, output_stream, ensure_ascii=False, sort_keys=True)
+        output_stream.write("\n")
+        output_stream.flush()
+        os.fsync(output_stream.fileno())
+    return diagnostic_output
 
 
 def _create_private_output(path: Path) -> TextIO:
