@@ -32,7 +32,7 @@ QualificationDimension = Literal[
     "repeatability",
 ]
 QualificationGateComparison = Literal["at_least", "at_most"]
-QualificationStatus = Literal["qualified", "blocked"]
+QualificationStatus = Literal["thresholds_met", "blocked"]
 
 _CORPUS_SEGMENTS: tuple[QualificationCorpusSegment, ...] = (
     "short",
@@ -213,6 +213,7 @@ class AugmentationQualificationReport(_StrictQualificationModel):
     applicability_profile: QualificationApplicabilityProfile
     thresholds: AugmentationQualificationThresholds
     qualification_input_sha256: str = Field(pattern=_SHA256_PATTERN)
+    evidence_status: Literal["caller_supplied_unverified"] = "caller_supplied_unverified"
     status: QualificationStatus
     metrics: AugmentationQualificationMetrics
     gates: tuple[AugmentationQualificationGate, ...] = Field(min_length=8)
@@ -259,7 +260,7 @@ class AugmentationQualificationReport(_StrictQualificationModel):
         if self.qualification_input_sha256 != expected_input_sha256:
             raise ValueError("qualification input digest must match the report evidence")
         expected_status: QualificationStatus = (
-            "qualified" if all(gate.passed for gate in self.gates) else "blocked"
+            "thresholds_met" if all(gate.passed for gate in self.gates) else "blocked"
         )
         if self.status != expected_status:
             raise ValueError("qualification status must match its gates")
@@ -343,7 +344,9 @@ def create_augmentation_qualification_report(
         thresholds=selected_thresholds,
         attempts=attempts,
     )
-    status: QualificationStatus = "qualified" if all(gate.passed for gate in gates) else "blocked"
+    status: QualificationStatus = (
+        "thresholds_met" if all(gate.passed for gate in gates) else "blocked"
+    )
     report_content = {
         "schema_version": "1.0.0",
         "operator": operator_reference.model_dump(mode="json"),
@@ -354,6 +357,7 @@ def create_augmentation_qualification_report(
         "applicability_profile": applicability_profile,
         "thresholds": selected_thresholds.model_dump(mode="json"),
         "qualification_input_sha256": qualification_input_sha256,
+        "evidence_status": "caller_supplied_unverified",
         "status": status,
         "metrics": metrics.model_dump(mode="json"),
         "gates": [gate.model_dump(mode="json") for gate in gates],
@@ -370,6 +374,7 @@ def create_augmentation_qualification_report(
         applicability_profile=applicability_profile,
         thresholds=selected_thresholds,
         qualification_input_sha256=qualification_input_sha256,
+        evidence_status="caller_supplied_unverified",
         status=status,
         metrics=metrics,
         gates=gates,

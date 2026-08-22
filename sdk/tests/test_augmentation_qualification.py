@@ -114,7 +114,8 @@ def test_every_dataset_operator_version_produces_a_reproducible_report() -> None
         )
 
         assert report == repeated_report
-        assert report.status == "qualified"
+        assert report.status == "thresholds_met"
+        assert report.evidence_status == "caller_supplied_unverified"
         assert report.operator.id == operator.id
         assert report.operator.version == operator.version
         assert {gate.dimension for gate in report.gates} == {
