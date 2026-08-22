@@ -29,6 +29,8 @@ from ul import (
     JsonHttpIsolatedResponseConfig,
     ObservedAgentOutput,
     OpenAICompatibleDatasetSettings,
+    ProviderDiagnostic,
+    ProviderDiagnosticError,
     SemanticFrame,
 )
 from ul.dataset_augmentation import DatasetAugmentationCandidate
@@ -2200,6 +2202,152 @@ def test_execution_creates_private_explicit_output(
     assert "Complete evidence" in result.output
     assert "Next: ul dataset report" in result.output
     assert "Transfer 100" not in result.output
+
+
+def test_provider_failure_has_concise_output_and_private_sanitized_diagnostics(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    dataset = tmp_path / "interactions.jsonl"
+    output = tmp_path / "results.jsonl"
+    target_config = tmp_path / "target.json"
+    secret = "private-provider-response"
+    _write_dataset(dataset, [_record()])
+    _write_target_config(target_config, url="http://127.0.0.1:8765/execute")
+
+    class FakeTarget:
+        @classmethod
+        def from_config(cls, *_args: object, **_kwargs: object) -> FakeTarget:
+            return cls()
+
+    async def fail_evaluation(*_args: object, **_kwargs: object) -> tuple[object, ...]:
+        error = ProviderDiagnosticError(
+            ProviderDiagnostic(
+                provider="customer-gateway",
+                operation="verify",
+                category="provider_unavailable",
+                retryable=True,
+                suggested_action="check provider status, then resume the run.",
+                endpoint_sha256="a" * 64,
+                http_status=503,
+            )
+        )
+        error.add_note(secret)
+        raise error
+
+    monkeypatch.setattr(main, "load_dataset_semantic_settings", _settings)
+    monkeypatch.setattr(main, "JsonHttpEnvironmentConnection", FakeTarget)
+    monkeypatch.setattr(main, "_evaluate_interaction_records", fail_evaluation)
+
+    result = runner.invoke(
+        root_app,
+        [
+            "dataset",
+            "evaluate",
+            str(dataset),
+            "--environment-config",
+            str(target_config),
+            "--allow-insecure-http",
+            "--allow-environment-network",
+            "--confirm-test-environment",
+            "--output",
+            str(output),
+            "--no-save-augmentations",
+        ],
+    )
+
+    diagnostics = tmp_path / "results.jsonl.debug.json"
+    normalized_output = " ".join(_ANSI_ESCAPE_PATTERN.sub("", result.output).split())
+    assert result.exit_code == 2
+    assert "customer-gateway failed during verify" in normalized_output
+    assert "provider_unavailable; retryable: yes" in normalized_output
+    assert "Next: check provider status" in normalized_output
+    assert secret not in normalized_output
+    assert diagnostics.exists()
+    assert stat.S_IMODE(diagnostics.stat().st_mode) == 0o600
+    serialized_diagnostics = diagnostics.read_text(encoding="utf-8")
+    assert secret not in serialized_diagnostics
+    assert json.loads(serialized_diagnostics) == {
+        "schema_version": "1.0.0",
+        "record_type": "provider_diagnostic",
+        "diagnostic": {
+            "provider": "customer-gateway",
+            "operation": "verify",
+            "category": "provider_unavailable",
+            "retryable": True,
+            "retry_status": "not_retried",
+            "suggested_action": "check provider status, then resume the run.",
+            "endpoint_sha256": "a" * 64,
+            "http_status": 503,
+        },
+    }
+
+    def fail_diagnostic_write(*_args: object, **_kwargs: object) -> None:
+        raise OSError("private filesystem detail")
+
+    failed_output = tmp_path / "failed-receipt-results.jsonl"
+    monkeypatch.setattr(main, "_write_provider_diagnostic", fail_diagnostic_write)
+    failed_receipt_result = runner.invoke(
+        root_app,
+        [
+            "dataset",
+            "evaluate",
+            str(dataset),
+            "--environment-config",
+            str(target_config),
+            "--allow-insecure-http",
+            "--allow-environment-network",
+            "--confirm-test-environment",
+            "--output",
+            str(failed_output),
+            "--no-save-augmentations",
+        ],
+    )
+    failed_receipt_output = " ".join(
+        _ANSI_ESCAPE_PATTERN.sub("", failed_receipt_result.output).split()
+    )
+    assert failed_receipt_result.exit_code == 2
+    assert "customer-gateway failed during verify" in failed_receipt_output
+    assert "diagnostics could not be written (OSError)" in failed_receipt_output
+    assert "private filesystem detail" not in failed_receipt_output
+
+
+def test_provider_diagnostic_receipts_preserve_collisions_and_reject_symlinks(
+    tmp_path: Path,
+) -> None:
+    output = tmp_path / "results.jsonl"
+    diagnostic_error = ProviderDiagnosticError(
+        ProviderDiagnostic(
+            provider="customer-gateway",
+            operation="render",
+            category="rate_limit",
+            retryable=True,
+            suggested_action="wait, then resume the run.",
+            endpoint_sha256="b" * 64,
+            http_status=429,
+        )
+    )
+
+    first = main._write_provider_diagnostic(output, diagnostic_error)
+    second = main._write_provider_diagnostic(output, diagnostic_error)
+
+    assert first == tmp_path / "results.jsonl.debug.json"
+    assert second == tmp_path / "results.jsonl.debug.2.json"
+    assert first.read_text(encoding="utf-8") == second.read_text(encoding="utf-8")
+    assert stat.S_IMODE(first.stat().st_mode) == 0o600
+    assert stat.S_IMODE(second.stat().st_mode) == 0o600
+
+    if sys.platform == "win32":
+        return
+    symlink_output = tmp_path / "symlink-results.jsonl"
+    protected_file = tmp_path / "protected.txt"
+    protected_file.write_text("unchanged", encoding="utf-8")
+    symlink_receipt = tmp_path / "symlink-results.jsonl.debug.json"
+    symlink_receipt.symlink_to(protected_file)
+
+    collision_receipt = main._write_provider_diagnostic(symlink_output, diagnostic_error)
+
+    assert collision_receipt == tmp_path / "symlink-results.jsonl.debug.2.json"
+    assert protected_file.read_text(encoding="utf-8") == "unchanged"
 
 
 def test_execution_wires_redaction_into_records_pipeline_and_run_context(

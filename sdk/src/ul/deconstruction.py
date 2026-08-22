@@ -40,6 +40,84 @@ def _sha256_text(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
+class ProviderDiagnostic(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    provider: str
+    operation: Literal["deconstruct", "render", "verify"]
+    category: Literal[
+        "authentication",
+        "bad_request",
+        "connection",
+        "invalid_response",
+        "provider_unavailable",
+        "rate_limit",
+        "timeout",
+    ]
+    retryable: bool
+    retry_status: Literal["not_retried"] = "not_retried"
+    suggested_action: str
+    endpoint_sha256: str
+    http_status: int | None = None
+
+
+class ProviderDiagnosticError(RuntimeError):
+    def __init__(self, diagnostic: ProviderDiagnostic) -> None:
+        self.diagnostic = diagnostic
+        super().__init__(
+            f"Semantic provider {diagnostic.provider} failed during {diagnostic.operation} "
+            f"({diagnostic.category}; retryable: {'yes' if diagnostic.retryable else 'no'}). "
+            f"Next: {diagnostic.suggested_action}"
+        )
+
+
+def _provider_diagnostic(
+    error: BaseException,
+    *,
+    provider: str,
+    operation: Literal["deconstruct", "render", "verify"],
+    endpoint_sha256: str,
+) -> ProviderDiagnostic:
+    http_status = error.response.status_code if isinstance(error, httpx.HTTPStatusError) else None
+    if http_status in {401, 403}:
+        category = "authentication"
+        retryable = False
+        suggested_action = "check the provider credential and account access, then retry."
+    elif http_status == 429:
+        category = "rate_limit"
+        retryable = True
+        suggested_action = "wait for the provider rate limit to reset, then resume the run."
+    elif http_status == 408 or isinstance(error, (TimeoutError, httpx.TimeoutException)):
+        category = "timeout"
+        retryable = True
+        suggested_action = "check provider availability, then resume the run."
+    elif isinstance(error, httpx.RequestError):
+        category = "connection"
+        retryable = True
+        suggested_action = "check provider connectivity, then resume the run."
+    elif http_status is not None and http_status >= 500:
+        category = "provider_unavailable"
+        retryable = True
+        suggested_action = "check provider status, then resume the run."
+    elif http_status is not None:
+        category = "bad_request"
+        retryable = False
+        suggested_action = "check the configured provider and model settings before retrying."
+    else:
+        category = "invalid_response"
+        retryable = False
+        suggested_action = "check that the provider supports the configured response format."
+    return ProviderDiagnostic(
+        provider=provider,
+        operation=operation,
+        category=category,
+        retryable=retryable,
+        suggested_action=suggested_action,
+        endpoint_sha256=endpoint_sha256,
+        http_status=http_status,
+    )
+
+
 class OpenRouterDatasetSettings(BaseSettings):
     model_config = SettingsConfigDict(
         env_file=".env",
@@ -588,6 +666,7 @@ class SemanticModelDeconstructor:
             request_payload["reference_vocabulary"] = self._reference_vocabulary(reference_frame)
         untrusted_record = self._bounded_json(request_payload)
         response = await self._request(
+            operation="deconstruct",
             model=self.settings.model,
             reasoning={"effort": "minimal"},
             max_tokens=self.settings.max_output_tokens,
@@ -600,19 +679,22 @@ class SemanticModelDeconstructor:
             system_prompt=_PROMPTS.get_prompt("semantic.deconstruct"),
             untrusted_payload=untrusted_record,
         )
-        raw_frame = self._decode_object(response.choices[0].message.content)
-        raw_frame.update(
-            {
-                "schema_version": "1.0.0",
-                "interaction_id": record.id,
-                "extractor_version": self.provider.extractor_version,
-                "metadata": {
-                    **self._generation_metadata(response),
-                    "prompts": prompt_provenance("semantic.deconstruct"),
-                },
-            }
-        )
-        frame = SemanticFrame.model_validate_json(json.dumps(raw_frame))
+        try:
+            raw_frame = self._decode_object(response.choices[0].message.content)
+            raw_frame.update(
+                {
+                    "schema_version": "1.0.0",
+                    "interaction_id": record.id,
+                    "extractor_version": self.provider.extractor_version,
+                    "metadata": {
+                        **self._generation_metadata(response),
+                        "prompts": prompt_provenance("semantic.deconstruct"),
+                    },
+                }
+            )
+            frame = SemanticFrame.model_validate_json(json.dumps(raw_frame))
+        except (ValidationError, ValueError) as error:
+            raise self._invalid_response(error, operation="deconstruct") from None
         frame = self._expand_unambiguous_evidence_quotes(record, frame)
         frame = self._ground_self_correction_evidence(record, frame)
         self._validate_evidence(record, frame)
@@ -638,6 +720,7 @@ class SemanticModelDeconstructor:
         )
         temporary_value_rule = _PROMPTS.get_prompt(temporary_value_prompt)
         response = await self._request(
+            operation="render",
             model=self.settings.render_model,
             reasoning={"effort": "none"},
             max_tokens=self.settings.max_render_tokens,
@@ -653,9 +736,12 @@ class SemanticModelDeconstructor:
             ),
             untrusted_payload=untrusted_payload,
         )
-        rendered = _RenderedInput.model_validate_json(
-            response.choices[0].message.content
-        ).rendered_input
+        try:
+            rendered = _RenderedInput.model_validate_json(
+                response.choices[0].message.content
+            ).rendered_input
+        except (ValidationError, ValueError) as error:
+            raise self._invalid_response(error, operation="render") from None
         if len(rendered) > self.settings.max_input_chars:
             raise ValueError("rendered input exceeds max_input_chars")
         return RenderedUserInput(
@@ -682,6 +768,7 @@ class SemanticModelDeconstructor:
             {"source_input": source_input, "candidate_input": candidate_input}
         )
         response = await self._request(
+            operation="verify",
             model=self.settings.equivalence_model,
             reasoning={"effort": "low"},
             max_tokens=min(self.settings.max_output_tokens, 1_024),
@@ -694,19 +781,24 @@ class SemanticModelDeconstructor:
             system_prompt=_PROMPTS.get_prompt("semantic.verify"),
             untrusted_payload=untrusted_payload,
         )
-        raw_assessment = self._decode_object(response.choices[0].message.content)
-        raw_assessment.update(
-            {
-                "schema_version": "1.0.0",
-                "verifier_version": self.provider.equivalence_verifier_version,
-                "metadata": {
-                    **self._generation_metadata(response),
-                    "requested_model": self.settings.equivalence_model,
-                    "prompts": prompt_provenance("semantic.verify"),
-                },
-            }
-        )
-        assessment = SemanticEquivalenceAssessment.model_validate_json(json.dumps(raw_assessment))
+        try:
+            raw_assessment = self._decode_object(response.choices[0].message.content)
+            raw_assessment.update(
+                {
+                    "schema_version": "1.0.0",
+                    "verifier_version": self.provider.equivalence_verifier_version,
+                    "metadata": {
+                        **self._generation_metadata(response),
+                        "requested_model": self.settings.equivalence_model,
+                        "prompts": prompt_provenance("semantic.verify"),
+                    },
+                }
+            )
+            assessment = SemanticEquivalenceAssessment.model_validate_json(
+                json.dumps(raw_assessment)
+            )
+        except (ValidationError, ValueError) as error:
+            raise self._invalid_response(error, operation="verify") from None
         assessment = assessment.model_copy(
             update={
                 "deltas": tuple(
@@ -739,9 +831,25 @@ class SemanticModelDeconstructor:
                 raise ValueError("semantic equivalence candidate evidence is invalid")
         return assessment
 
+    def _invalid_response(
+        self,
+        error: BaseException,
+        *,
+        operation: Literal["deconstruct", "render", "verify"],
+    ) -> ProviderDiagnosticError:
+        return ProviderDiagnosticError(
+            _provider_diagnostic(
+                error,
+                provider=self.provider.provider_id,
+                operation=operation,
+                endpoint_sha256=self.provider.endpoint_sha256,
+            )
+        )
+
     async def _request(
         self,
         *,
+        operation: Literal["deconstruct", "render", "verify"],
         model: str,
         reasoning: dict[str, JsonValue],
         max_tokens: int,
@@ -755,6 +863,52 @@ class SemanticModelDeconstructor:
         untrusted_payload: str,
     ) -> _ChatCompletionResponse:
         api_key = self._require_live_access()
+        try:
+            return await self._request_completion(
+                api_key=api_key,
+                model=model,
+                reasoning=reasoning,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                seed=seed,
+                top_p=top_p,
+                schema_name=schema_name,
+                schema=schema,
+                strict_schema=strict_schema,
+                system_prompt=system_prompt,
+                untrusted_payload=untrusted_payload,
+            )
+        except (
+            TimeoutError,
+            ValidationError,
+            httpx.RequestError,
+            httpx.HTTPStatusError,
+        ) as error:
+            raise ProviderDiagnosticError(
+                _provider_diagnostic(
+                    error,
+                    provider=self.provider.provider_id,
+                    operation=operation,
+                    endpoint_sha256=self.provider.endpoint_sha256,
+                )
+            ) from None
+
+    async def _request_completion(
+        self,
+        *,
+        api_key: str | None,
+        model: str,
+        reasoning: dict[str, JsonValue],
+        max_tokens: int,
+        temperature: float,
+        seed: int,
+        top_p: float | None,
+        schema_name: str,
+        schema: dict[str, Any],
+        strict_schema: bool,
+        system_prompt: str,
+        untrusted_payload: str,
+    ) -> _ChatCompletionResponse:
         async with asyncio.timeout(self.settings.timeout_seconds):
             request_body: dict[str, Any] = {
                 "model": model,
