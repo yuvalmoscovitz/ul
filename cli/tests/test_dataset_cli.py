@@ -1091,6 +1091,9 @@ def test_evaluator_preflight_failure_surfaces_capability_and_safe_action(
         def from_config(cls, *args: object, **kwargs: object) -> FakeTarget:
             return cls()
 
+        async def aclose(self) -> None:
+            return None
+
     async def fail_preflight(*args: object, **kwargs: object) -> EvaluatorModelPreflight:
         raise EvaluatorModelCompatibilityError(
             "evaluator model is incompatible with required seed capability; "
