@@ -11,6 +11,7 @@ from collections.abc import Awaitable, Callable
 from contextlib import suppress
 from typing import Literal, cast, get_args
 
+from pydantic import JsonValue
 from ul_core.contracts import ObservationSource, ProbeInvoker, StateEnvironment
 from ul_core.evaluation import (
     EnvironmentCapabilities,
@@ -268,6 +269,7 @@ class ComposedEnvironmentExecutor:
                     case,
                     turn.id,
                     turn.content,
+                    turn.metadata,
                     correlation_id,
                     execution_id,
                 )
@@ -394,6 +396,7 @@ class ComposedEnvironmentExecutor:
                     case,
                     turn.id,
                     turn.content,
+                    turn.metadata,
                     correlation_id,
                     execution_id,
                 )
@@ -511,6 +514,7 @@ class ComposedEnvironmentExecutor:
         case: EvaluationCase,
         turn_id: str,
         content: str,
+        metadata: dict[str, JsonValue],
         correlation_id: str,
         session_id: str,
     ) -> ProbeResult:
@@ -521,7 +525,7 @@ class ComposedEnvironmentExecutor:
                     case_id=case.id,
                     session_id=session_id,
                     correlation_id=correlation_id,
-                    turn=ProbeTurn(id=turn_id, input=content),
+                    turn=ProbeTurn(id=turn_id, input=content, metadata=metadata),
                 ),
                 self._invoker_sync_runner,
             )
