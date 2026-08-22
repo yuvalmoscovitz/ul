@@ -21,6 +21,7 @@ from ul.deconstruction import (
     SemanticModelDeconstructor,
     create_semantic_model_deconstructor,
     load_dataset_semantic_settings,
+    plan_evaluator_preflight_profiles,
 )
 from ul_core.dataset import InteractionRecord, SemanticFrame, UserInputRecord
 from ul_core.prompts import prompt_provenance
@@ -199,6 +200,12 @@ async def test_evaluator_preflight_proves_required_capabilities_and_records_poli
         result = await deconstructor.preflight()
         frame = await deconstructor.deconstruct(interaction())
 
+    planned_profiles = plan_evaluator_preflight_profiles(settings())
+    assert len(planned_profiles) == len(result.profiles) == len(requests) - 1
+    assert tuple(profile.roles for profile in planned_profiles) == tuple(
+        profile.roles for profile in result.profiles
+    )
+    assert sum(profile.max_completion_tokens for profile in planned_profiles) == 48
     assert [request["model"] for request in requests[:3]] == [
         "google/gemini-2.5-flash",
         "x-ai/grok-4.3",
@@ -277,7 +284,12 @@ async def test_generic_endpoint_deduplicates_without_claiming_parameter_support(
     ) as deconstructor:
         result = await deconstructor.preflight()
 
-    assert len(request_bodies) == 2
+    planned_profiles = plan_evaluator_preflight_profiles(openai_compatible_settings())
+    assert len(request_bodies) == len(planned_profiles) == len(result.profiles) == 2
+    assert tuple(profile.roles for profile in planned_profiles) == tuple(
+        profile.roles for profile in result.profiles
+    )
+    assert sum(profile.max_completion_tokens for profile in planned_profiles) == 32
     assert tuple(profile.roles for profile in result.profiles) == (
         ("deconstruct", "equivalence"),
         ("render",),

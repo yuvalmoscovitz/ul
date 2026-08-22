@@ -41,6 +41,11 @@ def _sha256_text(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
+def _render_seed(raw_input: str, instruction: str) -> int:
+    digest = hashlib.sha256(f"{raw_input}\0{instruction}".encode()).digest()
+    return int.from_bytes(digest[:4], "big") & 0x7FFF_FFFF
+
+
 class ProviderDiagnostic(BaseModel):
     model_config = ConfigDict(frozen=True)
 
@@ -562,6 +567,15 @@ class EvaluatorModelPreflight(BaseModel):
     data_policy: dict[str, JsonValue]
 
 
+class EvaluatorPreflightProfilePlan(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    roles: tuple[Literal["deconstruct", "render", "equivalence"], ...] = Field(min_length=1)
+    requested_model: str = Field(min_length=1, max_length=200)
+    max_completion_tokens: int = Field(ge=1)
+    required_parameters: tuple[str, ...]
+
+
 class EvaluatorModelCompatibilityError(ValueError):
     pass
 
@@ -827,86 +841,7 @@ class SemanticModelDeconstructor:
         self._preflight_result = result
 
     def _preflight_profiles(self) -> tuple[_EvaluatorPreflightProfile, ...]:
-        render_seed = self._render_seed("UL evaluator preflight", "Check renderer compatibility.")
-        candidates = (
-            self._preflight_profile(
-                role="deconstruct",
-                model=self.settings.model,
-                reasoning={"effort": "minimal"},
-                max_tokens=min(self.settings.max_output_tokens, 16),
-                temperature=0,
-                seed=0,
-                top_p=None,
-            ),
-            self._preflight_profile(
-                role="render",
-                model=self.settings.render_model,
-                reasoning={"effort": "none"},
-                max_tokens=min(self.settings.max_render_tokens, 16),
-                temperature=0.7,
-                seed=render_seed,
-                top_p=0.95,
-            ),
-            self._preflight_profile(
-                role="equivalence",
-                model=self.settings.equivalence_model,
-                reasoning={"effort": "low"},
-                max_tokens=min(self.settings.max_output_tokens, 1_024, 16),
-                temperature=0,
-                seed=0,
-                top_p=None,
-            ),
-        )
-        profiles_by_signature: dict[str, _EvaluatorPreflightProfile] = {}
-        for candidate in candidates:
-            signature_body: dict[str, Any] = {
-                "model": candidate.model,
-                "max_tokens": candidate.max_tokens,
-                "temperature": candidate.temperature,
-                "seed": candidate.seed,
-            }
-            self.provider.add_request_options(signature_body, candidate.reasoning)
-            if candidate.top_p is not None:
-                signature_body["top_p"] = candidate.top_p
-            signature = json.dumps(signature_body, sort_keys=True, separators=(",", ":"))
-            existing = profiles_by_signature.get(signature)
-            if existing is None:
-                profiles_by_signature[signature] = candidate
-            else:
-                profiles_by_signature[signature] = dataclass_replace(
-                    existing,
-                    roles=(*existing.roles, *candidate.roles),
-                )
-        return tuple(profiles_by_signature.values())
-
-    def _preflight_profile(
-        self,
-        *,
-        role: Literal["deconstruct", "render", "equivalence"],
-        model: str,
-        reasoning: dict[str, JsonValue],
-        max_tokens: int,
-        temperature: float,
-        seed: int,
-        top_p: float | None,
-    ) -> _EvaluatorPreflightProfile:
-        request_options: dict[str, Any] = {}
-        self.provider.add_request_options(request_options, reasoning)
-        required_parameters = ["response_format", "seed", "temperature", "max_tokens"]
-        if "reasoning" in request_options:
-            required_parameters.append("reasoning")
-        if top_p is not None:
-            required_parameters.append("top_p")
-        return _EvaluatorPreflightProfile(
-            roles=(role,),
-            model=model,
-            reasoning=reasoning,
-            max_tokens=max_tokens,
-            temperature=temperature,
-            seed=seed,
-            top_p=top_p,
-            required_parameters=tuple(required_parameters),
-        )
+        return _evaluator_preflight_profiles(self.settings, self.provider)
 
     def _compatibility_error(
         self,
@@ -1258,8 +1193,7 @@ class SemanticModelDeconstructor:
 
     @staticmethod
     def _render_seed(raw_input: str, instruction: str) -> int:
-        digest = hashlib.sha256(f"{raw_input}\0{instruction}".encode()).digest()
-        return int.from_bytes(digest[:4], "big") & 0x7FFF_FFFF
+        return _render_seed(raw_input, instruction)
 
     def _require_live_access(self) -> str | None:
         if not self.settings.live_calls:
@@ -1561,15 +1495,121 @@ def create_semantic_model_deconstructor(
     *,
     client: httpx.AsyncClient | None = None,
 ) -> SemanticModelDeconstructor:
+    provider = _semantic_completion_provider(settings)
+    return SemanticModelDeconstructor(settings, provider, client=client)
+
+
+def plan_evaluator_preflight_profiles(
+    settings: DatasetSemanticSettings,
+) -> tuple[EvaluatorPreflightProfilePlan, ...]:
+    provider = _semantic_completion_provider(settings)
+    return tuple(
+        EvaluatorPreflightProfilePlan(
+            roles=profile.roles,
+            requested_model=profile.model,
+            max_completion_tokens=profile.max_tokens,
+            required_parameters=profile.required_parameters,
+        )
+        for profile in _evaluator_preflight_profiles(settings, provider)
+    )
+
+
+def _semantic_completion_provider(
+    settings: DatasetSemanticSettings,
+) -> SemanticCompletionProvider:
     if isinstance(settings, OpenAICompatibleDatasetSettings):
-        provider: SemanticCompletionProvider = OpenAICompatibleSemanticProvider(
+        return OpenAICompatibleSemanticProvider(
             provider_id=settings.semantic_provider_id,
             base_url=settings.semantic_base_url,
             endpoint_sha256=settings.semantic_endpoint_sha256,
         )
-    else:
-        provider = OpenRouterSemanticProvider()
-    return SemanticModelDeconstructor(settings, provider, client=client)
+    return OpenRouterSemanticProvider()
+
+
+def _evaluator_preflight_profiles(
+    settings: DatasetSemanticSettings,
+    provider: SemanticCompletionProvider,
+) -> tuple[_EvaluatorPreflightProfile, ...]:
+    render_seed = _render_seed("UL evaluator preflight", "Check renderer compatibility.")
+
+    def profile(
+        *,
+        role: Literal["deconstruct", "render", "equivalence"],
+        model: str,
+        reasoning: dict[str, JsonValue],
+        max_tokens: int,
+        temperature: float,
+        seed: int,
+        top_p: float | None,
+    ) -> _EvaluatorPreflightProfile:
+        request_options: dict[str, Any] = {}
+        provider.add_request_options(request_options, reasoning)
+        required_parameters = ["response_format", "seed", "temperature", "max_tokens"]
+        if "reasoning" in request_options:
+            required_parameters.append("reasoning")
+        if top_p is not None:
+            required_parameters.append("top_p")
+        return _EvaluatorPreflightProfile(
+            roles=(role,),
+            model=model,
+            reasoning=reasoning,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            seed=seed,
+            top_p=top_p,
+            required_parameters=tuple(required_parameters),
+        )
+
+    candidates = (
+        profile(
+            role="deconstruct",
+            model=settings.model,
+            reasoning={"effort": "minimal"},
+            max_tokens=min(settings.max_output_tokens, 16),
+            temperature=0,
+            seed=0,
+            top_p=None,
+        ),
+        profile(
+            role="render",
+            model=settings.render_model,
+            reasoning={"effort": "none"},
+            max_tokens=min(settings.max_render_tokens, 16),
+            temperature=0.7,
+            seed=render_seed,
+            top_p=0.95,
+        ),
+        profile(
+            role="equivalence",
+            model=settings.equivalence_model,
+            reasoning={"effort": "low"},
+            max_tokens=min(settings.max_output_tokens, 1_024, 16),
+            temperature=0,
+            seed=0,
+            top_p=None,
+        ),
+    )
+    profiles_by_signature: dict[str, _EvaluatorPreflightProfile] = {}
+    for candidate in candidates:
+        signature_body: dict[str, Any] = {
+            "model": candidate.model,
+            "max_tokens": candidate.max_tokens,
+            "temperature": candidate.temperature,
+            "seed": candidate.seed,
+        }
+        provider.add_request_options(signature_body, candidate.reasoning)
+        if candidate.top_p is not None:
+            signature_body["top_p"] = candidate.top_p
+        signature = json.dumps(signature_body, sort_keys=True, separators=(",", ":"))
+        existing = profiles_by_signature.get(signature)
+        if existing is None:
+            profiles_by_signature[signature] = candidate
+        else:
+            profiles_by_signature[signature] = dataclass_replace(
+                existing,
+                roles=(*existing.roles, *candidate.roles),
+            )
+    return tuple(profiles_by_signature.values())
 
 
 def _same_origin(left: httpx.URL, right: httpx.URL) -> bool:

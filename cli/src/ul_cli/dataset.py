@@ -1558,8 +1558,15 @@ def _print_dataset_plan(
         f"repetition_executions={campaign_plan.calls.repetition_executions}, "
         f"repetition_rounds={campaign_plan.calls.repetitions}, "
         f"retries={campaign_plan.calls.retries}, "
+        f"preflight={campaign_plan.calls.preflight}, "
         f"evaluators={campaign_plan.calls.evaluators}"
     )
+    for profile in campaign_plan.preflight_profiles:
+        _print_dataset_plain(
+            "Evaluator preflight profile: "
+            f"roles={','.join(profile.roles)}, model={profile.requested_model}, "
+            f"max_completion_tokens={profile.max_completion_tokens}"
+        )
     console.print(
         "Estimated completion tokens: "
         f"{campaign_plan.tokens.minimum}..{campaign_plan.tokens.maximum}"

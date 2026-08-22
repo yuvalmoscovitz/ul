@@ -950,6 +950,18 @@ def test_dry_run_json_exposes_per_example_campaign_and_exact_call_plan(
         "total_semantic_model": 10,
         "total_environment_api": 20,
     }
+    assert payload["calls"]["preflight"] == len(payload["preflight_profiles"])
+    assert [profile["roles"] for profile in payload["preflight_profiles"]] == [
+        ["deconstruct"],
+        ["render"],
+        ["equivalence"],
+    ]
+    assert sum(profile["max_completion_tokens"] for profile in payload["preflight_profiles"]) == 48
+    assert payload["calls"]["total_semantic_model"] == (
+        payload["calls"]["preflight"]
+        + payload["calls"]["evaluators"]
+        + payload["calls"]["variation_generation"]
+    )
     planned_operator = next(
         operator
         for operator in payload["examples"][0]["operators"]
