@@ -1,13 +1,16 @@
 from __future__ import annotations
 
+import asyncio
 import io
 import json
 
+import pytest
 from rich.console import Console
 from ul import DatasetTrialProgress
 from ul_cli.dataset.progress import (
     CampaignControl,
     CampaignProgressTracker,
+    CampaignSignalControl,
     JsonCampaignProgressRenderer,
     SafeCampaignProgressPublisher,
     TerminalCampaignProgressRenderer,
@@ -147,3 +150,32 @@ def test_renderer_failure_cannot_affect_campaign_execution() -> None:
     tracker = _tracker(publisher.publish, lambda: next(clock_values))
 
     tracker.emit(status="running", stage="preflight")
+
+
+def test_signal_requests_pause_at_safe_boundary() -> None:
+    control = CampaignControl()
+    signal_control = CampaignSignalControl(control)
+
+    signal_control.interrupt()
+
+    assert control.requested_action() == "pause"
+
+
+async def _wait_for_cancellation() -> None:
+    await asyncio.Event().wait()
+
+
+def test_signal_cancels_inflight_target_call_for_uncertainty_handling() -> None:
+    async def run() -> None:
+        control = CampaignControl()
+        signal_control = CampaignSignalControl(control)
+        target_task = asyncio.create_task(_wait_for_cancellation())
+        signal_control.target_call_started(target_task)
+
+        signal_control.interrupt()
+        with pytest.raises(asyncio.CancelledError):
+            await target_task
+
+        assert control.requested_action() is None
+
+    asyncio.run(run())

@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import math
+import signal
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Generator
+from contextlib import contextmanager
+from types import FrameType
 from typing import Literal, Protocol
 
 from pydantic import ConfigDict, Field, model_validator
@@ -184,6 +188,42 @@ class CampaignControl:
     def requested_action(self) -> Literal["pause", "cancel"] | None:
         with self._lock:
             return self._request
+
+
+class CampaignSignalControl:
+    def __init__(self, control: CampaignControl) -> None:
+        self._control = control
+        self._target_task: asyncio.Task[object] | None = None
+
+    def target_call_started(self, task: asyncio.Task[object]) -> None:
+        self._target_task = task
+
+    def target_call_finished(self) -> None:
+        self._target_task = None
+
+    def interrupt(self) -> None:
+        target_task = self._target_task
+        if target_task is None or target_task.done():
+            self._control.request_pause()
+            return
+        target_task.get_loop().call_soon_threadsafe(target_task.cancel)
+
+    @contextmanager
+    def installed(self) -> Generator[None]:
+        if threading.current_thread() is not threading.main_thread():
+            yield
+            return
+        previous_handler = signal.getsignal(signal.SIGINT)
+
+        def handle_sigint(signal_number: int, frame: FrameType | None) -> None:
+            del signal_number, frame
+            self.interrupt()
+
+        signal.signal(signal.SIGINT, handle_sigint)
+        try:
+            yield
+        finally:
+            signal.signal(signal.SIGINT, previous_handler)
 
 
 class CampaignProgressTracker:
