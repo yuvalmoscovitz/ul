@@ -159,6 +159,35 @@ async def test_invoker_only_produces_response_evidence_with_provenance() -> None
 
 
 @pytest.mark.asyncio
+async def test_executor_forwards_structured_case_context_unchanged() -> None:
+    invoker = _Invoker()
+    executor = ComposedEnvironmentExecutor(invoker, config_sha256=_CONFIG_SHA256)
+    probe_context = {
+        "schema_version": "1.0.0",
+        "source_interaction_id": "cancel-order",
+        "inputs": {"order_id": "ord-9", "message": "Please cancel it."},
+        "context": [
+            {"id": "user-1", "role": "user", "content": "Cancel my order."},
+            {"id": "assistant-1", "role": "assistant", "content": "Are you sure?"},
+            {"id": "user-2", "role": "user", "content": "Please cancel it."},
+        ],
+        "augmentation_target": {
+            "id": "confirmation",
+            "kind": "conversation_turn",
+            "turn_id": "user-2",
+            "json_pointer": None,
+        },
+        "fixture": {"id": "orders", "version": "9"},
+    }
+
+    await executor.execute(
+        _case("Please cancel it.").model_copy(update={"probe_context": probe_context})
+    )
+
+    assert invoker.requests[0].context == probe_context
+
+
+@pytest.mark.asyncio
 async def test_missing_observation_does_not_block_probe_execution() -> None:
     executor = ComposedEnvironmentExecutor(
         _Invoker(),
@@ -683,3 +712,38 @@ async def test_timed_out_sync_invocation_is_not_retried_while_still_running() ->
     assert follow_up.lifecycle.terminal_status == "failed"
     assert follow_up.lifecycle.failure_reason == "probe invocation failed"
     assert later_follow_up.lifecycle.terminal_status == "failed"
+
+
+@pytest.mark.asyncio
+async def test_sync_runner_is_reusable_before_result_callback_runs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from ul.probe_execution import _SyncAdapterRunner
+
+    loop = asyncio.get_running_loop()
+    original_call_soon_threadsafe = loop.call_soon_threadsafe
+    first_result_scheduled = threading.Event()
+    release_first_worker = threading.Event()
+    scheduled_calls = 0
+
+    def block_first_worker_after_scheduling(callback: object, *args: object) -> object:
+        nonlocal scheduled_calls
+        scheduled_calls += 1
+        handle = original_call_soon_threadsafe(callback, *args)
+        if scheduled_calls == 1:
+            first_result_scheduled.set()
+            release_first_worker.wait(timeout=1)
+        return handle
+
+    monkeypatch.setattr(loop, "call_soon_threadsafe", block_first_worker_after_scheduling)
+    runner = _SyncAdapterRunner("test-sync-order")
+
+    try:
+        first = await runner.call(lambda value: value, "first")
+        assert first_result_scheduled.is_set()
+        second = await runner.call(lambda value: value, "second")
+    finally:
+        release_first_worker.set()
+
+    assert first == "first"
+    assert second == "second"

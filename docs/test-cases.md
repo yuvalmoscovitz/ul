@@ -9,6 +9,41 @@ A UL test case has three parts:
 UL can discover that behavior changed without an evaluator. It cannot infer that a historical answer
 was correct or prove that an arbitrary input is compatible with an arbitrary environment.
 
+## Structured and multi-turn cases
+
+The three-field `{id, input, output}` JSONL record remains the shortest format. Use a structured
+case when an interaction depends on typed inputs, visible conversation history, or an explicit
+augmentation location. For example, [the cancellation-confirmation case](../examples/quickstart/rich-cancellation.jsonl)
+changes only the final user confirmation while retaining the order input and preceding turns.
+
+Each structured case declares one or more `augmentation_targets`. An `input_field` target uses an
+RFC 6901 pointer below `/inputs`; a `conversation_turn` target names a non-empty user turn. UL
+projects one evaluation record per target and records the source case and target in its evidence.
+The complete encoded case is limited to 1 MB, with at most 100 context turns, 100 targets, and 100
+evidence references.
+
+HTTP request templates can copy typed values into a target request with a complete leaf placeholder:
+
+```json
+{
+  "input": "{{input}}",
+  "order": "{{context:/inputs/order}}",
+  "conversation": "{{context:/context}}",
+  "fixture": "{{context:/fixture}}",
+  "target": "{{context:/augmentation_target}}"
+}
+```
+
+Context placeholders preserve the selected JSON type; they are not string interpolation. Pointers
+are bounded by the case and request limits and may select only `inputs`, `context`, `fixture`,
+`augmentation_target`, or `source_interaction_id`. They cannot expose metadata, observed evidence,
+evaluators, or historical output to the target.
+
+The structured case's fixture reference is available to the execute request through this context.
+Stateful reset, setup, snapshot, and cleanup still use the single fixture configured for the
+campaign. Per-case state-lifecycle fixture routing is planned in YUV-22; until then, split stateful
+datasets into campaigns when their lifecycle fixtures differ.
+
 ## Stateless response agents
 
 An isolated-response target starts every request from fresh, isolated state. It does not need a

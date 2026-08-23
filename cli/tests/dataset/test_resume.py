@@ -32,6 +32,7 @@ from ._factories import (
     _evaluation_result,
     _evaluator_preflight,
     _invariant_evaluation,
+    _rich_evaluation_result,
     _run_context,
     _settings,
 )
@@ -604,6 +605,35 @@ def test_resume_snapshot_detects_same_summary_content_change() -> None:
     assert first_snapshot.has_review_findings == changed_snapshot.has_review_findings
     assert first_snapshot.raw_evidence_sha256 != changed_snapshot.raw_evidence_sha256
     assert first_snapshot != changed_snapshot
+
+
+def test_resume_accepts_rich_evidence_schema_1_9() -> None:
+    evaluation_result = _rich_evaluation_result()
+    selected_records = (evaluation_result.source,)
+    run_context = _run_context(selected_records)
+    raw_evidence = (
+        json.dumps(
+            customer_module.build_customer_evidence_record(
+                evaluation_result,
+                repetitions=1,
+                max_environment_api_calls=2,
+                planned_target_calls=2,
+                run_context=cast(Any, run_context),
+            )
+        )
+        + "\n"
+    ).encode()
+
+    snapshot = dataset_review.validate_dataset_resume_evidence(
+        raw_evidence,
+        expected_context=cast(Any, run_context),
+        selected_records=selected_records,
+        invariant_suite=None,
+        evidence_projector=customer_module.build_customer_evidence_record,
+    )
+
+    assert snapshot.processed_ids == frozenset({evaluation_result.source.id})
+    assert snapshot.technical_results == (evaluation_result,)
 
 
 def test_resume_accepts_empty_evidence_as_zero_progress() -> None:

@@ -94,14 +94,15 @@ class _SyncAdapterRunner:
             try:
                 value = operation(request)
             except BaseException as error:
+                with self._lock:
+                    self._running = False
                 with suppress(RuntimeError):
                     loop.call_soon_threadsafe(deliver_error, error)
             else:
-                with suppress(RuntimeError):
-                    loop.call_soon_threadsafe(deliver_result, value)
-            finally:
                 with self._lock:
                     self._running = False
+                with suppress(RuntimeError):
+                    loop.call_soon_threadsafe(deliver_result, value)
 
         threading.Thread(
             target=run,
@@ -522,6 +523,7 @@ class ComposedEnvironmentExecutor:
                     session_id=session_id,
                     correlation_id=correlation_id,
                     turn=ProbeTurn(id=turn_id, input=content),
+                    context=case.probe_context,
                 ),
                 self._invoker_sync_runner,
             )

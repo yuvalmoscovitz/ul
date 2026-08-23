@@ -37,6 +37,7 @@ def test_help_explains_dataset_environment_and_operator_contract() -> None:
     assert "--environment-config" in normalized_help
     assert "configuration" in normalized_help
     help_text = " ".join(normalized_help.replace("│", "").split())
+    assert "structured multi-turn cases" in help_text
     assert "customer's agent environment API" in help_text
 
     init_help = runner.invoke(root_app, ["dataset", "init", "--help"])

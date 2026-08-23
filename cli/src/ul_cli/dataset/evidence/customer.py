@@ -41,12 +41,22 @@ def build_customer_evidence_record(
     invariant_evaluation: DatasetInvariantEvaluation | None = None,
 ) -> dict[str, JsonValue]:
     evaluation_mode = cast(Literal["variance"], getattr(result, "evaluation_mode", "variance"))
+    augmentation_target = getattr(result.source, "augmentation_target", None)
     cases: list[JsonValue] = []
     for case in result.cases:
         cases.append(
             {
                 "operator_id": case.candidate.operator_id,
                 "operator_version": case.candidate.operator_version,
+                **(
+                    {
+                        "source_record_id": result.source.source_interaction_id,
+                        "augmentation_target": augmentation_target.model_dump(mode="json"),
+                        "original_value": result.source.raw_input,
+                    }
+                    if augmentation_target is not None
+                    else {}
+                ),
                 "augmented_input": case.candidate.augmented_input,
                 "status": case_customer_status(result, case),
                 "variation_accepted": case.candidate.passed,
@@ -71,9 +81,17 @@ def build_customer_evidence_record(
     if uses_extended_invariants and run_context is None:
         raise ValueError("extended invariant evidence requires a resumable run context")
     evidence: dict[str, JsonValue] = {
-        "schema_version": "1.8.0",
+        "schema_version": "1.9.0" if augmentation_target is not None else "1.8.0",
         "evaluation_mode": evaluation_mode,
         "interaction_id": result.source.id,
+        **(
+            {
+                "source_record_id": result.source.source_interaction_id,
+                "augmentation_target": augmentation_target.model_dump(mode="json"),
+            }
+            if augmentation_target is not None
+            else {}
+        ),
         "original_input": result.source.raw_input,
         "execution_plan": {
             "repetitions": repetitions,

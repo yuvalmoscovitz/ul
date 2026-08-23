@@ -8,7 +8,16 @@ from pathlib import Path
 
 import pytest
 from pydantic import ValidationError
-from ul import DatasetAugmentationResult, InteractionRecord, SemanticFrame
+from ul import (
+    AugmentationTarget,
+    CaseFixtureReference,
+    DatasetAugmentationResult,
+    InteractionRecord,
+    RichInteractionCase,
+    SemanticFrame,
+    VisibleContextTurn,
+    project_rich_interaction_case,
+)
 from ul.dataset_augmentation import DatasetAugmentationCandidate
 from ul_cli import dataset_augmentation_ledger as ledger_module
 from ul_cli.dataset_augmentation_ledger import (
@@ -29,6 +38,25 @@ def _source(identifier: str = "interaction-1") -> InteractionRecord:
         raw_input="Transfer 100 to Alice.",
         raw_observed_output={"status": "approved"},
     )
+
+
+def _rich_source(
+    *,
+    fixture_version: str = "1",
+    context_text: str = "Confirm?",
+    target_id: str = "message",
+) -> InteractionRecord:
+    source_case = RichInteractionCase(
+        id="cancel-order",
+        inputs={"message": "Cancel order ord-9."},
+        context=(VisibleContextTurn(id="assistant-1", role="assistant", content=context_text),),
+        augmentation_targets=(
+            AugmentationTarget(id=target_id, kind="input_field", json_pointer="/inputs/message"),
+        ),
+        fixture=CaseFixtureReference(id="orders", version=fixture_version),
+        observed_output={"status": "cancelled"},
+    )
+    return project_rich_interaction_case(source_case)[0]
 
 
 def _augmentation(source: InteractionRecord) -> DatasetAugmentationResult:
@@ -132,6 +160,17 @@ def test_private_ledger_never_overwrites_existing_file(tmp_path: Path) -> None:
         )
 
     assert path.read_text(encoding="utf-8") == "keep me"
+
+
+def test_generation_context_hash_binds_rich_fixture_context_and_target() -> None:
+    baseline = _context((_rich_source(),))
+    changed_fixture = _context((_rich_source(fixture_version="2"),))
+    changed_context = _context((_rich_source(context_text="Please confirm."),))
+    changed_target = _context((_rich_source(target_id="customer-message"),))
+
+    assert baseline.context_sha256 != changed_fixture.context_sha256
+    assert baseline.context_sha256 != changed_context.context_sha256
+    assert baseline.context_sha256 != changed_target.context_sha256
 
 
 def test_resume_rejects_truncated_record(tmp_path: Path) -> None:
