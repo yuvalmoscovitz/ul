@@ -104,6 +104,7 @@ def test_dataset_terminal_actions_are_opaque_private_and_executable(
             (
                 (
                     progress_action_module.sys.executable,
+                    "-I",
                     "-m",
                     "ul_cli.main",
                     *expected_argv[1:],
@@ -149,10 +150,73 @@ def test_windows_action_store_uses_hardened_path_fallback(
         lambda: tmp_path / "action-state",
     )
     public_argv = progress_action_module.create_progress_action(
-        ("ul", "dataset", "report", str(tmp_path / "evidence.jsonl"))
+        "dataset_report", ("ul", "dataset", "report", str(tmp_path / "evidence.jsonl"))
     )
 
     receipt = progress_action_module._read_progress_action(public_argv[-1])
 
     assert receipt.argv[:3] == ("ul", "dataset", "report")
     assert receipt.working_directory == str(Path.cwd().resolve())
+
+
+def test_action_content_address_rejects_in_place_receipt_tampering(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    receipt_directory = tmp_path / "action-state"
+    monkeypatch.setattr(
+        progress_action_module,
+        "_action_receipt_directory",
+        lambda: receipt_directory,
+    )
+    public_argv = progress_action_module.create_progress_action(
+        "dataset_report",
+        ("ul", "dataset", "report", str(tmp_path / "evidence.jsonl")),
+    )
+    receipt_path = receipt_directory / f"{public_argv[-1]}.json"
+    payload = json.loads(receipt_path.read_text(encoding="utf-8"))
+    payload["argv"][-1] = str(tmp_path / "PRIVATE_TAMPER_CANARY.jsonl")
+    receipt_path.write_text(json.dumps(payload) + "\n", encoding="utf-8")
+
+    result = CliRunner().invoke(root_app, ["action", public_argv[-1]])
+
+    assert result.exit_code == 1
+    assert "Unable to resolve the progress action safely." in result.output
+    assert "PRIVATE_TAMPER_CANARY" not in result.output
+
+
+def test_isolated_action_interpreter_ignores_captured_cwd_ul_cli_shadow(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        progress_action_module,
+        "_action_receipt_directory",
+        lambda: tmp_path / "action-state",
+    )
+    shadow_directory = tmp_path / "ul_cli"
+    shadow_directory.mkdir()
+    (shadow_directory / "__init__.py").write_text("", encoding="utf-8")
+    marker = tmp_path / "PRIVATE_SHADOW_EXECUTED"
+    (shadow_directory / "main.py").write_text(
+        f"from pathlib import Path\nPath({str(marker)!r}).write_text('executed')\n",
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(tmp_path)
+    public_argv = progress_action_module.create_progress_action(
+        "dataset_report",
+        ("ul", "dataset", "report", str(tmp_path / "missing-evidence.jsonl")),
+    )
+
+    result = CliRunner().invoke(root_app, ["action", public_argv[-1]])
+
+    assert result.exit_code != 0
+    assert not marker.exists()
+
+
+def test_action_kind_rejects_cross_boundary_command_substitution() -> None:
+    with pytest.raises(ValueError, match="action kind"):
+        progress_action_module.create_progress_action(
+            "dataset_report",
+            ("ul", "probe", "PRIVATE_DATA", "--target", "PRIVATE_TARGET"),
+        )

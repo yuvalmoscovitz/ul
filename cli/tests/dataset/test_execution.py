@@ -112,7 +112,7 @@ def test_safe_boundary_pause_flushes_a_resumable_campaign(
     assert result.output.count(" next_action=") == 1
     assert "next_action=resume" in result.output
     assert re.search(
-        r'next_argv=\["ul","action","[A-Za-z0-9_-]{32}"\]',
+        r'next_argv=\["ul","action","[0-9a-f]{64}"\]',
         result.output,
     )
     assert str(output) not in result.output.split("next_action=", 1)[1]

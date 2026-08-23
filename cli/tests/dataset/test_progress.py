@@ -168,7 +168,7 @@ def test_control_flushes_before_single_terminal_resume_command() -> None:
     assert actions[0].next_command is not None
     assert actions[0].next_command.action == "resume"
     assert actions[0].next_command.argv[:2] == ("ul", "action")
-    assert len(actions[0].next_command.argv[2]) == 32
+    assert len(actions[0].next_command.argv[2]) == 64
 
 
 def test_renderer_failure_cannot_affect_campaign_execution() -> None:

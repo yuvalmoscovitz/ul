@@ -527,6 +527,8 @@ class CampaignProgressTracker:
         self,
         control: CampaignControl,
         durable_flush: Callable[[], None],
+        *,
+        stopped_environment: Literal["reusable", "quarantined", "awaiting_cleanup"] | None = None,
     ) -> bool:
         action = control.requested_action()
         if action is None:
@@ -535,6 +537,7 @@ class CampaignProgressTracker:
         self.emit(
             status="paused" if action == "pause" else "cancelled",
             stage="terminal",
+            environment=stopped_environment,
         )
         return False
 
@@ -544,17 +547,22 @@ def create_campaign_next_commands(evidence_path: Path) -> CampaignNextCommands:
     return CampaignNextCommands(
         inspect_findings=CampaignNextCommand(
             action="inspect_findings",
-            argv=create_progress_action(("ul", "dataset", "report", str(resolved_evidence_path))),
+            argv=create_progress_action(
+                "dataset_report",
+                ("ul", "dataset", "report", str(resolved_evidence_path)),
+            ),
         ),
         resume=CampaignNextCommand(
             action="resume",
             argv=create_progress_action(
-                ("ul", "dataset", "evaluate", "--resume", str(resolved_evidence_path))
+                "dataset_resume",
+                ("ul", "dataset", "evaluate", "--resume", str(resolved_evidence_path)),
             ),
         ),
         diagnose=CampaignNextCommand(
             action="diagnose",
             argv=create_progress_action(
+                "dataset_diagnose",
                 (
                     "ul",
                     "dataset",
@@ -562,7 +570,7 @@ def create_campaign_next_commands(evidence_path: Path) -> CampaignNextCommands:
                     "--resume",
                     str(resolved_evidence_path),
                     "--dry-run",
-                )
+                ),
             ),
         ),
     )
@@ -572,20 +580,22 @@ def create_probe_next_commands(
     *,
     evidence_path: Path,
     resume_argv: tuple[str, ...],
-    diagnose_argv: tuple[str, ...],
 ) -> CampaignNextCommands:
     return CampaignNextCommands(
         inspect_findings=CampaignNextCommand(
             action="inspect_findings",
-            argv=create_progress_action(("ul", "report", str(evidence_path.resolve()))),
+            argv=create_progress_action(
+                "probe_report",
+                ("ul", "report", str(evidence_path.resolve())),
+            ),
         ),
         resume=CampaignNextCommand(
             action="resume",
-            argv=create_progress_action(resume_argv),
+            argv=create_progress_action("probe_resume", resume_argv),
         ),
         diagnose=CampaignNextCommand(
             action="diagnose",
-            argv=create_progress_action(diagnose_argv),
+            argv=create_progress_action("probe_diagnose", ("ul", "probe-diagnose")),
         ),
     )
 

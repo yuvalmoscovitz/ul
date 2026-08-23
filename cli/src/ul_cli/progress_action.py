@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import os
 import re
 import stat
@@ -7,14 +8,14 @@ import subprocess
 import sys
 from contextlib import suppress
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Literal
 
 import typer
 from platformdirs import user_state_path
 from pydantic import ConfigDict, Field
 from ul_core.models import ULModel
 
-_ACTION_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{32}$")
+_ACTION_ID_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 _MAXIMUM_RECEIPT_BYTES = 16 * 1024
 _WINDOWS = sys.platform == "win32"
 
@@ -23,8 +24,17 @@ class _ProgressActionReceipt(ULModel):
     model_config = ConfigDict(strict=True, extra="forbid")
 
     schema_version: str = Field(pattern=r"^ul\.progress-action\.v1$")
+    action_kind: Literal[
+        "dataset_report",
+        "dataset_resume",
+        "dataset_diagnose",
+        "probe_report",
+        "probe_resume",
+        "probe_diagnose",
+    ]
     argv: tuple[str, ...] = Field(min_length=2, max_length=32)
     working_directory: str = Field(min_length=1)
+    nonce: str = Field(pattern=r"^[0-9a-f]{32}$")
 
 
 def _action_receipt_directory() -> Path:
@@ -66,17 +76,85 @@ def _open_action_directory() -> tuple[Path, int | None]:
         raise
 
 
-def _validate_action_argv(argv: tuple[str, ...]) -> None:
-    allowed_prefixes = (
-        ("ul", "dataset", "evaluate"),
-        ("ul", "dataset", "report"),
-        ("ul", "probe"),
-        ("ul", "report"),
-    )
-    if not any(argv[: len(prefix)] == prefix for prefix in allowed_prefixes):
-        raise ValueError("progress actions must use a supported UL command")
+def _validate_action_argv(
+    action_kind: Literal[
+        "dataset_report",
+        "dataset_resume",
+        "dataset_diagnose",
+        "probe_report",
+        "probe_resume",
+        "probe_diagnose",
+    ],
+    argv: tuple[str, ...],
+) -> None:
     if any("\x00" in argument for argument in argv):
         raise ValueError("progress action arguments cannot contain null bytes")
+    fixed_shapes = {
+        "dataset_report": ("ul", "dataset", "report"),
+        "dataset_resume": ("ul", "dataset", "evaluate", "--resume"),
+        "dataset_diagnose": (
+            "ul",
+            "dataset",
+            "evaluate",
+            "--resume",
+        ),
+        "probe_report": ("ul", "report"),
+    }
+    if action_kind in fixed_shapes:
+        prefix = fixed_shapes[action_kind]
+        expected_length = len(prefix) + 1 + (action_kind == "dataset_diagnose")
+        if argv[: len(prefix)] != prefix or len(argv) != expected_length:
+            raise ValueError("progress action arguments do not match their action kind")
+        if action_kind == "dataset_diagnose" and argv[-1] != "--dry-run":
+            raise ValueError("dataset diagnosis must be a dry run")
+        return
+    if action_kind == "probe_resume":
+        if argv[:2] != ("ul", "probe") or len(argv) < 13 or argv[2].startswith("--"):
+            raise ValueError("probe resume arguments are invalid")
+        value_options = {
+            "--target",
+            "--output",
+            "--confirm-target",
+            "--confirm-paid-execution",
+            "--resume-checkpoint",
+            "--target-artifact",
+            "--diagnostic-artifact",
+        }
+        flag_options = {
+            "--confirmation-run",
+            "--allow-insecure-http",
+            "--show-smoke-response",
+            "--progress-json",
+        }
+        required = {
+            "--target",
+            "--output",
+            "--confirm-target",
+            "--confirm-paid-execution",
+            "--resume-checkpoint",
+        }
+        seen_required: set[str] = set()
+        index = 3
+        while index < len(argv):
+            option = argv[index]
+            if option in value_options:
+                if index + 1 >= len(argv) or argv[index + 1].startswith("--"):
+                    raise ValueError("probe resume option is missing its value")
+                if option in required:
+                    if option in seen_required:
+                        raise ValueError("probe resume repeats a required option")
+                    seen_required.add(option)
+                index += 2
+                continue
+            if option in flag_options:
+                index += 1
+                continue
+            raise ValueError("probe resume contains an unsupported option")
+        if seen_required != required:
+            raise ValueError("probe resume is missing a required bound option")
+        return
+    if argv != ("ul", "probe-diagnose"):
+        raise ValueError("probe diagnosis must be the read-only built-in action")
 
 
 def _validate_working_directory(working_directory: str) -> None:
@@ -84,19 +162,31 @@ def _validate_working_directory(working_directory: str) -> None:
         raise ValueError("progress action working directory must be an absolute path")
 
 
-def create_progress_action(argv: tuple[str, ...]) -> tuple[str, ...]:
-    _validate_action_argv(argv)
+def create_progress_action(
+    action_kind: Literal[
+        "dataset_report",
+        "dataset_resume",
+        "dataset_diagnose",
+        "probe_report",
+        "probe_resume",
+        "probe_diagnose",
+    ],
+    argv: tuple[str, ...],
+) -> tuple[str, ...]:
+    _validate_action_argv(action_kind, argv)
     _directory, directory_descriptor = _open_action_directory()
     try:
         _validate_working_directory(str(Path.cwd().resolve()))
         while True:
-            action_id = os.urandom(24).hex()[:32]
             receipt = _ProgressActionReceipt(
                 schema_version="ul.progress-action.v1",
+                action_kind=action_kind,
                 argv=argv,
                 working_directory=str(Path.cwd().resolve()),
+                nonce=os.urandom(16).hex(),
             )
             encoded = receipt.model_dump_json().encode("utf-8") + b"\n"
+            action_id = hashlib.sha256(encoded).hexdigest()
             if len(encoded) > _MAXIMUM_RECEIPT_BYTES:
                 raise ValueError("progress action receipt exceeds its size limit")
             try:
@@ -172,11 +262,13 @@ def _read_progress_action(action_id: str) -> _ProgressActionReceipt:
             os.close(directory_descriptor)
     if len(encoded) > _MAXIMUM_RECEIPT_BYTES:
         raise ValueError("progress action receipt exceeds its size limit")
+    if hashlib.sha256(encoded).hexdigest() != action_id:
+        raise ValueError("progress action receipt integrity check failed")
     try:
         receipt = _ProgressActionReceipt.model_validate_json(encoded)
     except Exception:
         raise ValueError("progress action receipt is invalid") from None
-    _validate_action_argv(receipt.argv)
+    _validate_action_argv(receipt.action_kind, receipt.argv)
     _validate_working_directory(receipt.working_directory)
     return receipt
 
@@ -189,8 +281,14 @@ def execute_progress_action(
 ) -> None:
     try:
         receipt = _read_progress_action(action_id)
+        if receipt.action_kind == "probe_diagnose":
+            typer.echo(
+                "Probe target calls are stopped. Inspect the private probe diagnostic and "
+                "safety state; restart only after an explicit environment reset or replacement."
+            )
+            return
         completed = subprocess.run(
-            (sys.executable, "-m", "ul_cli.main", *receipt.argv[1:]),
+            (sys.executable, "-I", "-m", "ul_cli.main", *receipt.argv[1:]),
             check=False,
             cwd=receipt.working_directory,
         )

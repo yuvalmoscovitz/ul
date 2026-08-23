@@ -29,6 +29,7 @@ from ul import (
     DatasetEvaluationResult,
     DatasetSemanticSettings,
     EvaluationCase,
+    EvaluatorModelPreflight,
     ExecutionEvidence,
     InteractionRecord,
     load_dataset_semantic_settings,
@@ -64,6 +65,10 @@ from ul_cli.dataset.evaluation.records import (
     validate_model_input_bounds,
 )
 from ul_cli.dataset.evaluation.runner import evaluate_interaction_records
+from ul_cli.dataset.evidence.persistence import (
+    load_evaluator_preflight,
+    persist_evaluator_preflight,
+)
 from ul_cli.dataset.presentation.evaluation import print_dataset_results
 from ul_cli.dataset.presentation.runtime import console, print_dataset_plain
 from ul_cli.dataset.progress import (
@@ -73,7 +78,7 @@ from ul_cli.dataset.progress import (
     create_campaign_progress_runtime,
     create_probe_next_commands,
 )
-from ul_cli.dataset.storage.private_files import create_private_output
+from ul_cli.dataset.storage.private_files import create_private_output, open_resume_descriptor
 from ul_cli.dataset_campaign import DatasetCampaignPlan, create_dataset_campaign_plan
 from ul_cli.dataset_review import (
     DatasetEvidenceRunContext,
@@ -168,6 +173,19 @@ class _ProbeSafetyState(_StrictModel):
     reason_code: str = Field(min_length=1, max_length=100)
 
 
+class _ProbeCheckpoint(_StrictModel):
+    schema_version: Literal[1] = 1
+    target_confirmation_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    campaign_confirmation_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    records_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    output_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    smoke_evidence: ExecutionEvidence
+    smoke_elapsed_seconds: float = Field(ge=0)
+    smoke_case_id: str = Field(min_length=1)
+    smoke_turn_id: str = Field(min_length=1)
+    smoke_request_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
 @dataclass(frozen=True)
 class _ResolvedTarget:
     reference: str
@@ -223,6 +241,140 @@ def _json_sha256(value: object) -> str:
         value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False
     ).encode()
     return hashlib.sha256(encoded).hexdigest()
+
+
+def _probe_checkpoint_path(output: Path) -> Path:
+    return output.with_name(f"{output.name}.probe-checkpoint.json")
+
+
+def _probe_checkpoint_binding(
+    *,
+    records: tuple[InteractionRecord, ...],
+    resolved_target: _ResolvedTarget,
+    campaign_confirmation: _CampaignConfirmation,
+    output: Path,
+) -> tuple[str, str, str, str]:
+    return (
+        resolved_target.confirmation_sha256,
+        _model_sha256(campaign_confirmation),
+        _json_sha256([record.model_dump(mode="json") for record in records]),
+        hashlib.sha256(str(output.resolve()).encode()).hexdigest(),
+    )
+
+
+def _persist_probe_checkpoint(
+    path: Path,
+    *,
+    records: tuple[InteractionRecord, ...],
+    resolved_target: _ResolvedTarget,
+    campaign_confirmation: _CampaignConfirmation,
+    output: Path,
+    smoke_result: _SmokeResult,
+) -> None:
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    _ensure_private_project_directory(path.parent)
+    target_digest, campaign_digest, records_digest, output_digest = _probe_checkpoint_binding(
+        records=records,
+        resolved_target=resolved_target,
+        campaign_confirmation=campaign_confirmation,
+        output=output,
+    )
+    checkpoint = _ProbeCheckpoint(
+        target_confirmation_sha256=target_digest,
+        campaign_confirmation_sha256=campaign_digest,
+        records_sha256=records_digest,
+        output_sha256=output_digest,
+        smoke_evidence=smoke_result.evidence,
+        smoke_elapsed_seconds=smoke_result.elapsed_seconds,
+        smoke_case_id=smoke_result.case_id,
+        smoke_turn_id=smoke_result.turn_id,
+        smoke_request_sha256=smoke_result.request_sha256,
+    )
+    with create_private_output(path) as stream:
+        stream.write(checkpoint.model_dump_json() + "\n")
+        stream.flush()
+        os.fsync(stream.fileno())
+    _fsync_probe_project_directory(path.parent)
+
+
+def _remove_probe_checkpoint(path: Path) -> None:
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        return
+    _fsync_probe_project_directory(path.parent)
+
+
+def _load_probe_checkpoint(
+    path: Path,
+    *,
+    records: tuple[InteractionRecord, ...],
+    resolved_target: _ResolvedTarget,
+    campaign_confirmation: _CampaignConfirmation,
+    output: Path,
+) -> _SmokeResult:
+    descriptor = open_resume_descriptor(path, writable=False)
+    try:
+        status = os.fstat(descriptor)
+        if (
+            status.st_nlink != 1
+            or status.st_size > 10_000_000
+            or (sys.platform != "win32" and stat.S_IMODE(status.st_mode) & 0o077)
+            or (hasattr(os, "getuid") and status.st_uid != os.getuid())
+        ):
+            raise ValueError("probe checkpoint must be a private owner-only file")
+        encoded = os.read(descriptor, 10_000_001)
+    finally:
+        os.close(descriptor)
+    checkpoint = _ProbeCheckpoint.model_validate_json(encoded)
+    expected_binding = _probe_checkpoint_binding(
+        records=records,
+        resolved_target=resolved_target,
+        campaign_confirmation=campaign_confirmation,
+        output=output,
+    )
+    recorded_binding = (
+        checkpoint.target_confirmation_sha256,
+        checkpoint.campaign_confirmation_sha256,
+        checkpoint.records_sha256,
+        checkpoint.output_sha256,
+    )
+    if recorded_binding != expected_binding:
+        raise ValueError("probe checkpoint does not match this target, plan, data, and output")
+    expected_case = _smoke_case(records[0], resolved_target)
+    expected_request_sha256 = _json_sha256(
+        {
+            "case_id": expected_case.id,
+            "turn": expected_case.turns[0].model_dump(mode="json"),
+            "probe_context": expected_case.probe_context,
+        }
+    )
+    if (
+        checkpoint.smoke_case_id != expected_case.id
+        or checkpoint.smoke_turn_id != expected_case.turns[0].id
+        or checkpoint.smoke_request_sha256 != expected_request_sha256
+        or checkpoint.smoke_evidence.lifecycle.terminal_status != "succeeded"
+    ):
+        raise ValueError("probe checkpoint smoke identity or lifecycle is invalid")
+    validation_connection = resolved_target.create_connection(
+        resolved_target.calls_per_execution,
+        resolved_target.maximum_active_target_seconds,
+    )
+    try:
+        validate_execution_evidence(
+            expected_case,
+            validation_connection,
+            checkpoint.smoke_evidence,
+        )
+    finally:
+        asyncio.run(validation_connection.aclose())
+    return _SmokeResult(
+        evidence=checkpoint.smoke_evidence,
+        elapsed_seconds=checkpoint.smoke_elapsed_seconds,
+        case_id=checkpoint.smoke_case_id,
+        turn_id=checkpoint.smoke_turn_id,
+        request_sha256=checkpoint.smoke_request_sha256,
+    )
 
 
 def _probe_quarantine_path(resolved_target: _ResolvedTarget) -> Path:
@@ -713,6 +865,16 @@ def probe(
             help="Attest that an operator reset or replaced a quarantined test environment.",
         ),
     ] = None,
+    resume_checkpoint: Annotated[
+        Path | None,
+        typer.Option(
+            "--resume-checkpoint",
+            exists=True,
+            dir_okay=False,
+            readable=True,
+            hidden=True,
+        ),
+    ] = None,
 ) -> None:
     """Smoke a real target, then optionally run one bounded active-probe pilot."""
     progress_runtime: CampaignProgressRuntime | None = None
@@ -777,9 +939,10 @@ def probe(
                 settings=settings,
             )
             campaign_confirmation = _campaign_confirmation(plan, settings, resolved_target)
+            checkpoint_path = _probe_checkpoint_path(output)
             target_path = Path(target)
             action_target = str(target_path.resolve()) if target_path.is_file() else target
-            rerun_arguments = [
+            resume_argv = [
                 "ul",
                 "probe",
                 str(data.resolve()),
@@ -789,27 +952,23 @@ def probe(
                 str(output.resolve()),
                 "--confirm-target",
                 resolved_target.confirmation_sha256,
-            ]
-            for artifact in target_artifact or ():
-                rerun_arguments.extend(("--target-artifact", str(artifact.resolve())))
-            if confirmation_run:
-                rerun_arguments.append("--confirmation-run")
-            if allow_insecure_http:
-                rerun_arguments.append("--allow-insecure-http")
-            if diagnostic_artifact is not None:
-                rerun_arguments.extend(
-                    ("--diagnostic-artifact", str(diagnostic_artifact.resolve()))
-                )
-            if show_smoke_response:
-                rerun_arguments.append("--show-smoke-response")
-            if progress_json:
-                rerun_arguments.append("--progress-json")
-            diagnose_argv = tuple(rerun_arguments)
-            resume_argv = (
-                *diagnose_argv,
                 "--confirm-paid-execution",
                 _model_sha256(campaign_confirmation),
-            )
+                "--resume-checkpoint",
+                str(checkpoint_path.resolve()),
+            ]
+            for artifact in target_artifact or ():
+                resume_argv.extend(("--target-artifact", str(artifact.resolve())))
+            if confirmation_run:
+                resume_argv.append("--confirmation-run")
+            if allow_insecure_http:
+                resume_argv.append("--allow-insecure-http")
+            if diagnostic_artifact is not None:
+                resume_argv.extend(("--diagnostic-artifact", str(diagnostic_artifact.resolve())))
+            if show_smoke_response:
+                resume_argv.append("--show-smoke-response")
+            if progress_json:
+                resume_argv.append("--progress-json")
             run_context = create_dataset_evidence_run_context(
                 selected_records=records,
                 operators=tuple(
@@ -834,8 +993,7 @@ def probe(
                 maximum_wall_time_seconds=campaign_confirmation.maximum_wall_seconds,
                 next_commands=create_probe_next_commands(
                     evidence_path=output,
-                    resume_argv=resume_argv,
-                    diagnose_argv=diagnose_argv,
+                    resume_argv=tuple(resume_argv),
                 ),
                 json_output=progress_json,
             )
@@ -849,31 +1007,78 @@ def probe(
                 "Review semantic settings and target limits, then rerun.",
                 target_safe_to_reuse=True,
             ) from None
-        progress_runtime.tracker.emit(status="running", stage="smoke")
-        with progress_runtime.signal_control.installed():
-            smoke_result = asyncio.run(
-                _run_smoke(
-                    records[0],
-                    resolved_target,
-                    signal_control=progress_runtime.signal_control,
-                )
-            )
         progress_runtime.tracker.record_usage(
             target_calls=1,
             semantic_calls=None,
             environment_calls=resolved_target.calls_per_execution,
             tokens=None,
         )
-        _print_smoke(
-            smoke_result,
-            resolved_target,
-            show_response=show_smoke_response,
-        )
-        _save_probe_config(
-            data=data,
-            resolved_target=resolved_target,
-            existing_config=existing_config,
-        )
+        progress_runtime.tracker.emit(status="running", stage="smoke")
+        evaluator_preflight: EvaluatorModelPreflight | None = None
+        if resume_checkpoint is not None:
+            try:
+                smoke_result = _load_probe_checkpoint(
+                    resume_checkpoint,
+                    records=records,
+                    resolved_target=resolved_target,
+                    campaign_confirmation=campaign_confirmation,
+                    output=output,
+                )
+            except (OSError, ValidationError, ValueError):
+                raise ProbeFailure(
+                    "target load",
+                    "PROBE_CHECKPOINT_INVALID",
+                    "The private bound smoke checkpoint is invalid.",
+                    "Keep the target stopped and inspect the private smoke checkpoint.",
+                    target_safe_to_reuse=True,
+                ) from None
+            try:
+                evaluator_preflight, _ = asyncio.run(load_evaluator_preflight(output, settings))
+            except (OSError, ValidationError, ValueError):
+                raise ProbeFailure(
+                    "target load",
+                    "PROBE_PREFLIGHT_CHECKPOINT_INVALID",
+                    "The private bound evaluator preflight checkpoint is invalid.",
+                    "Keep the target stopped and inspect the private preflight checkpoint.",
+                    target_safe_to_reuse=True,
+                ) from None
+            console.print("Reusing durable smoke and evaluator preflight checkpoints.")
+        else:
+            with progress_runtime.signal_control.installed():
+                smoke_result = asyncio.run(
+                    _run_smoke(
+                        records[0],
+                        resolved_target,
+                        signal_control=progress_runtime.signal_control,
+                    )
+                )
+            _print_smoke(
+                smoke_result,
+                resolved_target,
+                show_response=show_smoke_response,
+            )
+            _save_probe_config(
+                data=data,
+                resolved_target=resolved_target,
+                existing_config=existing_config,
+            )
+            try:
+                _persist_probe_checkpoint(
+                    checkpoint_path,
+                    records=records,
+                    resolved_target=resolved_target,
+                    campaign_confirmation=campaign_confirmation,
+                    output=output,
+                    smoke_result=smoke_result,
+                )
+            except (OSError, ValueError):
+                raise ProbeFailure(
+                    "output",
+                    "PROBE_CHECKPOINT_WRITE_FAILED",
+                    "The successful smoke checkpoint could not be persisted durably.",
+                    "Do not continue to paid campaign work; fix private output storage first.",
+                    target_safe_to_reuse=True,
+                ) from None
         remaining_target_seconds = _validate_campaign_target_budget(
             plan, resolved_target, smoke_result.elapsed_seconds
         )
@@ -883,6 +1088,7 @@ def probe(
             confirmed_digest=confirm_paid_execution,
         ):
             console.print("Stopped after smoke. No semantic-model calls were made.")
+            _remove_probe_checkpoint(checkpoint_path)
             progress_runtime.tracker.emit(status="cancelled", stage="terminal")
             return
         _validate_paid_execution_settings(settings)
@@ -897,6 +1103,7 @@ def probe(
             remaining_target_seconds=remaining_target_seconds,
             run_context=run_context,
             progress_runtime=progress_runtime,
+            evaluator_preflight=evaluator_preflight,
         )
         projection_failure = _campaign_projection_failure(results, output)
         if projection_failure is not None:
@@ -950,7 +1157,8 @@ def probe(
                 environment="reusable" if failure.target_safe_to_reuse else "quarantined",
             )
         _print_failure(failure, diagnostic_artifact=diagnostic_artifact)
-        raise typer.Exit(code=2) from None
+        exit_code = 130 if failure.reason_code == "PROBE_PAUSED_AFTER_PREFLIGHT" else 2
+        raise typer.Exit(code=exit_code) from None
     finally:
         if target_lock_descriptor is not None:
             _close_probe_target_lock(target_lock_descriptor)
@@ -1125,18 +1333,11 @@ def _confirm_target(resolved_target: _ResolvedTarget, *, confirmed_digest: str |
         )
 
 
-async def _run_smoke(
+def _smoke_case(
     record: InteractionRecord,
     resolved_target: _ResolvedTarget,
-    *,
-    signal_control: CampaignSignalControl | None = None,
-) -> _SmokeResult:
-    resolved_target.revalidate_identity()
-    connection = resolved_target.create_connection(
-        resolved_target.calls_per_execution,
-        resolved_target.maximum_active_target_seconds,
-    )
-    case = EvaluationCase(
+) -> EvaluationCase:
+    return EvaluationCase(
         id=f"{record.id}:smoke",
         turns=(
             ConversationTurn(
@@ -1149,6 +1350,20 @@ async def _run_smoke(
         timeout_seconds=_TARGET_TIMEOUT_SECONDS,
         probe_context=record.probe_context(record.raw_input),
     )
+
+
+async def _run_smoke(
+    record: InteractionRecord,
+    resolved_target: _ResolvedTarget,
+    *,
+    signal_control: CampaignSignalControl | None = None,
+) -> _SmokeResult:
+    resolved_target.revalidate_identity()
+    connection = resolved_target.create_connection(
+        resolved_target.calls_per_execution,
+        resolved_target.maximum_active_target_seconds,
+    )
+    case = _smoke_case(record, resolved_target)
     try:
         started_at = time.monotonic()
         async with connection:
@@ -1629,6 +1844,7 @@ def _run_campaign(
     remaining_target_seconds: float | None,
     run_context: DatasetEvidenceRunContext,
     progress_runtime: CampaignProgressRuntime,
+    evaluator_preflight: EvaluatorModelPreflight | None,
 ) -> tuple[DatasetEvaluationResult, ...]:
     resolved_target.revalidate_identity()
     if output.exists():
@@ -1651,8 +1867,10 @@ def _run_campaign(
         ) from None
     progress_runtime.tracker.emit(status="running", stage="preflight")
     try:
-        with progress_runtime.signal_control.installed():
-            evaluator_preflight = asyncio.run(preflight_evaluator(settings))
+        if evaluator_preflight is None:
+            with progress_runtime.signal_control.installed():
+                evaluator_preflight = asyncio.run(preflight_evaluator(settings))
+            persist_evaluator_preflight(output, evaluator_preflight)
         if not progress_runtime.tracker.safe_boundary(
             progress_runtime.control,
             lambda: None,
@@ -1665,7 +1883,7 @@ def _run_campaign(
             "augmentation preparation",
             "PROBE_PAUSED_AFTER_PREFLIGHT",
             "The campaign paused at the durable boundary after evaluator preflight.",
-            "Rerun the same confirmed probe after reviewing the progress next action.",
+            "Run the opaque resume action to reuse completed smoke and preflight checkpoints.",
             target_safe_to_reuse=True,
         ) from None
     except Exception:

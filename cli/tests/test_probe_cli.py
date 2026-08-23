@@ -10,9 +10,11 @@ import stat
 import sys
 import threading
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import typer
+from dataset._factories import _evaluator_preflight
 from typer.testing import CliRunner
 from ul import (
     DatasetEvaluationResult,
@@ -711,6 +713,8 @@ def test_failed_smoke_has_staged_safe_diagnostic_and_does_not_save_config(
     assert "Reason: PROBE_SMOKE_INCONCLUSIVE" in result.output
     assert "private target detail" not in result.output
     assert "Target safe to reuse: no" in result.output
+    assert "target_calls=1" in result.output
+    assert "environment_calls=1" in result.output
     assert not (tmp_path / ".ul" / "probe.json").exists()
     assert json.loads(diagnostic.read_text())["reason_code"] == "PROBE_SMOKE_INCONCLUSIVE"
     if os.name != "nt":
@@ -834,6 +838,111 @@ def test_probe_quarantine_fsyncs_private_state_and_directory(
     assert stat.S_IFDIR in synced_file_types
     safety_state = next((tmp_path / ".ul").glob("probe-quarantine-*.json"))
     assert json.loads(safety_state.read_text())["status"] == "quarantined"
+
+
+def test_paused_probe_action_blocks_before_repeating_completed_smoke(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (tmp_path / "agent.py").write_text(
+        "import json\n"
+        "from pathlib import Path\n\n"
+        "def run(value):\n"
+        "    with Path('target-invocations.jsonl').open('a') as stream:\n"
+        "        stream.write(json.dumps(value) + '\\n')\n"
+        "    return {'action': 'lookup', 'ticket': 42}\n",
+        encoding="utf-8",
+    )
+    dataset = tmp_path / "examples.jsonl"
+    dataset.write_text(
+        '{"id":"case-1","input":"Return ticket 42.","output":{"action":"lookup","ticket":42}}\n',
+        encoding="utf-8",
+    )
+    output = tmp_path / "evidence.jsonl"
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("UL_LIVE", "true")
+    monkeypatch.setenv("OPEN_ROUTER_API_KEY", "test-key")
+
+    preflight_calls = 0
+
+    async def clean_room_preflight(_settings: object) -> object:
+        nonlocal preflight_calls
+        preflight_calls += 1
+        return _evaluator_preflight()
+
+    async def load_clean_room_preflight(_output: Path, _settings: object) -> tuple[object, Path]:
+        return _evaluator_preflight(), _output.with_name(f"{_output.name}.preflight.json")
+
+    create_runtime = probe_module.create_campaign_progress_runtime
+    runtime_calls = 0
+
+    def create_paused_runtime(**arguments: object) -> object:
+        nonlocal runtime_calls
+        runtime_calls += 1
+        runtime = create_runtime(**arguments)
+        if runtime_calls == 1:
+            runtime.control.request_pause()
+        return runtime
+
+    monkeypatch.setattr(probe_module, "preflight_evaluator", clean_room_preflight)
+    monkeypatch.setattr(probe_module, "load_evaluator_preflight", load_clean_room_preflight)
+    monkeypatch.setattr(
+        probe_module,
+        "create_campaign_progress_runtime",
+        create_paused_runtime,
+    )
+    semantic_model = _CleanRoomSemanticModel()
+    monkeypatch.setattr(
+        campaign_runner_module,
+        "create_semantic_model_deconstructor",
+        lambda _settings: semantic_model,
+    )
+    result = runner.invoke(
+        app,
+        [
+            "probe",
+            str(dataset),
+            "--target",
+            "agent:run",
+            "--output",
+            str(output),
+        ],
+        input="y\ny\n",
+    )
+
+    assert result.exit_code == 130, result.output
+    assert "Reason: PROBE_PAUSED_AFTER_PREFLIGHT" in result.output
+    assert "environment=reusable" in result.output
+    assert "next_action=resume" in result.output
+    action_match = re.search(
+        r'next_argv=\["ul","action","([0-9a-f]{64})"\]',
+        result.output,
+    )
+    assert action_match is not None
+    invocations = tmp_path / "target-invocations.jsonl"
+    assert len(invocations.read_text().splitlines()) == 1
+    nested_results = []
+
+    def invoke_trusted_cli(
+        argv: tuple[str, ...],
+        *,
+        check: bool,
+        cwd: str,
+    ) -> SimpleNamespace:
+        assert check is False
+        assert Path(cwd) == tmp_path
+        nested = runner.invoke(app, list(argv[4:]))
+        nested_results.append(nested)
+        return SimpleNamespace(returncode=nested.exit_code)
+
+    monkeypatch.setattr(progress_action_module.subprocess, "run", invoke_trusted_cli)
+    action_result = runner.invoke(app, ["action", action_match.group(1)])
+
+    assert action_result.exit_code == 0, nested_results[0].output
+    assert nested_results[0].exit_code == 0, nested_results[0].output
+    assert "Reusing durable smoke and evaluator preflight checkpoints" in nested_results[0].output
+    assert preflight_calls == 1
+    assert len(invocations.read_text().splitlines()) == 3
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="symlink creation requires privileges")
@@ -1025,7 +1134,7 @@ def test_public_documentation_flow_runs_real_callable_campaign_and_report(
 
     async def clean_room_preflight(settings: object) -> object:
         del settings
-        return object()
+        return _evaluator_preflight()
 
     def clean_room_model(settings: object) -> _CleanRoomSemanticModel:
         del settings
@@ -1070,7 +1179,7 @@ def test_public_documentation_flow_runs_real_callable_campaign_and_report(
     assert result.output.count(" next_action=") == 1
     assert "next_action=inspect_findings" in result.output
     action_match = re.search(
-        r'next_argv=\["ul","action","([A-Za-z0-9_-]{32})"\]',
+        r'next_argv=\["ul","action","([0-9a-f]{64})"\]',
         result.output,
     )
     assert action_match is not None
