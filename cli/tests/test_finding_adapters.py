@@ -21,7 +21,14 @@ from ul import (
     ObservedAgentOutput,
     SemanticFrame,
 )
-from ul.dataset_augmentation import (
+from ul.augmentations.conversation import (
+    CorrectionAfterFirstResponseCase,
+    CorrectionDivergence,
+    CorrectionStressResult,
+    CorrectionStressTrial,
+    CorrectionTurnObservation,
+)
+from ul.augmentations.dataset import (
     DatasetAugmentationCandidate,
     DatasetAugmentationOperatorReference,
 )
@@ -31,13 +38,6 @@ from ul.dataset_invariants import (
     DatasetInvariantEvaluation,
     DatasetInvariantRuleEvaluation,
     JsonValuesEqualInvariant,
-)
-from ul.event_stress import (
-    CorrectionAfterFirstResponseCase,
-    CorrectionDivergence,
-    CorrectionStressResult,
-    CorrectionStressTrial,
-    CorrectionTurnObservation,
 )
 from ul_cli.event_stress import write_stateful_finding_packages
 from ul_cli.finding_adapters import (

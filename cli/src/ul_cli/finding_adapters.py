@@ -9,6 +9,10 @@ from typing import Literal, cast
 
 from pydantic import BaseModel, JsonValue
 from ul import DatasetEvaluationResult
+from ul.augmentations.conversation import (
+    CorrectionStressResult,
+    RetryAfterSuccessfulCommitStressResult,
+)
 from ul.dataset_evaluation import (
     DatasetEvaluationCase,
     DatasetEvaluationFinding,
@@ -21,10 +25,6 @@ from ul.dataset_invariants import (
     DatasetInvariantRuleResult,
     evaluate_dataset_invariant_rule_trials,
     evaluate_dataset_invariant_rules,
-)
-from ul.event_stress import (
-    CorrectionStressResult,
-    RetryAfterSuccessfulCommitStressResult,
 )
 from ul_core.dataset import ObservedAgentOutput, ObservedOutcome, SemanticFrame
 from ul_core.evaluation import EnvironmentStateEvidence, ExecutionEvidence
