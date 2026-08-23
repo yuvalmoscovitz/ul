@@ -243,6 +243,18 @@ from ul.http_environment import (
     json_http_environment_config_sha256,
     load_json_http_environment_config,
 )
+from ul.local_target import (
+    CommandTargetConfig,
+    LocalTargetConfig,
+    LocalTargetConnection,
+    LocalTargetDryRunPlan,
+    LocalTargetLimits,
+    PythonCallableTargetConfig,
+    create_local_target_dry_run_plan,
+    load_local_target_config,
+    local_target_config_sha256,
+    validate_local_target_config,
+)
 from ul.otlp_ingest import OtlpIngestResult, OtlpInteractionRecord, parse_otlp_traces
 from ul.probe_execution import ComposedEnvironmentExecutor
 from ul.redaction import (
@@ -321,6 +333,7 @@ __all__ = [
     "CallableEvaluator",
     "CaseEvaluatorReference",
     "CaseFixtureReference",
+    "CommandTargetConfig",
     "ComposedEnvironmentExecutor",
     "CorrectionAfterFirstResponseCase",
     "CorrectionDivergence",
@@ -415,6 +428,10 @@ __all__ = [
     "JsonValuesEqualInvariant",
     "JudgeRequest",
     "LocalPseudonymStore",
+    "LocalTargetConfig",
+    "LocalTargetConnection",
+    "LocalTargetDryRunPlan",
+    "LocalTargetLimits",
     "MaterializedScenario",
     "MultiTurnRegressionCase",
     "NoNewEffectInvariant",
@@ -446,6 +463,7 @@ __all__ = [
     "PromptTemplateInfo",
     "ProviderDiagnostic",
     "ProviderDiagnosticError",
+    "PythonCallableTargetConfig",
     "RedactedSemanticPipeline",
     "RedactionBoundaryError",
     "RedactionCoverage",
@@ -509,6 +527,7 @@ __all__ = [
     "builtin_dataset_augmentation_operators",
     "create_augmentation_qualification_report",
     "create_dataset_regression_case",
+    "create_local_target_dry_run_plan",
     "create_multi_turn_regression_case",
     "create_semantic_model_deconstructor",
     "dataset_regression_target_config_sha256",
@@ -527,6 +546,7 @@ __all__ = [
     "load_dataset_regression_case",
     "load_dataset_semantic_settings",
     "load_json_http_environment_config",
+    "load_local_target_config",
     "load_multi_turn_regression_case",
     "load_redaction_policy",
     "load_retry_after_successful_commit_case",
@@ -534,6 +554,7 @@ __all__ = [
     "load_trace_replay_bundle",
     "load_trace_replay_result",
     "load_trace_replay_results",
+    "local_target_config_sha256",
     "materialize_trace_replay_bundle",
     "parse_otlp_traces",
     "plan_correction_stress_test",
@@ -555,5 +576,6 @@ __all__ = [
     "run_trace_replay_campaign",
     "select_trace_replay_case",
     "validate_evaluator_preflight",
+    "validate_local_target_config",
     "write_augmentation_qualification_report",
 ]
