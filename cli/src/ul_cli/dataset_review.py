@@ -43,7 +43,9 @@ from ul.dataset_invariants import (
     evaluate_dataset_invariants,
 )
 from ul.dataset_regression import dataset_regression_target_config_sha256
+from ul.environment import validate_outcome_projection_evidence
 from ul.http_environment import JsonHttpIsolatedResponseConfig, JsonHttpTargetConfig
+from ul.outcome_projection import OutcomeProjection
 from ul_core.augmentations.definitions import builtin_augmentation_catalog
 
 from ul_cli.pattern_identity import pattern_mechanism_pseudonym
@@ -546,6 +548,7 @@ def validate_dataset_resume_evidence(
             )
         except (ValidationError, ValueError):
             raise ValueError("resume evidence contains invalid technical details") from None
+        _validate_resumed_outcome_projections(technical_result, expected_context.target)
         technical_results.append(technical_result)
         if technical_result.evaluation_mode != evidence.evaluation_mode:
             raise ValueError("resume evidence evaluation mode does not match technical details")
@@ -602,6 +605,34 @@ def validate_dataset_resume_evidence(
         technical_results=tuple(technical_results),
         raw_evidence_sha256=hashlib.sha256(raw_evidence).hexdigest(),
     )
+
+
+def _validate_resumed_outcome_projections(
+    result: DatasetEvaluationResult,
+    target: DatasetEvidenceTarget,
+) -> None:
+    if target.kind == "environment_http":
+        if target.config is None:
+            raise AssertionError("validated HTTP target requires its config")
+        projection = target.config.outcome
+    else:
+        if target.receipt is None:
+            raise AssertionError("validated probe target requires its receipt")
+        raw_projection = target.receipt.get("outcome_projection")
+        projection = (
+            OutcomeProjection.model_validate_json(json.dumps(raw_projection))
+            if raw_projection is not None
+            else None
+        )
+    trial_sets = [result.baseline.trial_set]
+    trial_sets.extend(case.trial_set for case in result.cases if case.trial_set is not None)
+    for trial_set in trial_sets:
+        for trial in trial_set.trials:
+            if trial.execution_evidence is not None:
+                validate_outcome_projection_evidence(
+                    trial.execution_evidence,
+                    projection,
+                )
 
 
 def _canonical_json_sha256(value: object) -> str:

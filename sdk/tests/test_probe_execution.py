@@ -9,7 +9,11 @@ from dataclasses import dataclass, field
 
 import pytest
 from pydantic import JsonValue
-from ul.environment import evaluation_case_from_inputs, observed_outputs_from_evidence
+from ul.environment import (
+    evaluation_case_from_inputs,
+    observed_outputs_from_evidence,
+    validate_execution_evidence,
+)
 from ul.outcome_projection import OutcomeProjection
 from ul.probe_execution import CapabilityExecutionError, ComposedEnvironmentExecutor
 from ul_core.evaluation import (
@@ -298,6 +302,7 @@ async def test_projection_preserves_raw_normalized_trace_and_state_channels() ->
     assert evidence.final_response == {"echo": "hello", "secret": "never disclose"}
     assert evidence.normalized_result == {"echo": "hello", "secret": "never disclose"}
     assert evidence.public_normalized_result == {"echo": "hello", "secret": "[PRIVATE]"}
+    assert evidence.outcome_projection == executor._outcome_projection.model_dump(mode="json")  # pyright: ignore[reportPrivateUsage,reportOptionalMemberAccess]
     assert evidence.turns[0].response == {"echo": "hello", "secret": "never disclose"}
     assert evidence.turns[0].normalized_response == {
         "echo": "hello",
@@ -315,6 +320,77 @@ async def test_projection_preserves_raw_normalized_trace_and_state_channels() ->
         "secret": "[PRIVATE]",
     }
     assert evidence.outcome_projection_sha256 == executor._outcome_projection.digest  # pyright: ignore[reportPrivateUsage,reportOptionalMemberAccess]
+
+
+@pytest.mark.asyncio
+async def test_validation_rejects_forged_projected_evidence() -> None:
+    projection = OutcomeProjection(action="/result/action")
+
+    class _ProjectedInvoker(_Invoker):
+        def invoke(self, request: ProbeRequest) -> ProbeResult:
+            self.requests.append(request)
+            return ProbeResult(
+                id="result-1",
+                correlation_id=request.correlation_id,
+                response={"result": {"action": "refund"}},
+            )
+
+    executor = ComposedEnvironmentExecutor(
+        _ProjectedInvoker(),
+        config_sha256=_CONFIG_SHA256,
+        outcome_projection=projection,
+    )
+    case = _case("hello")
+    evidence = await executor.execute(case)
+    forged_digest = evidence.model_copy(update={"outcome_projection_sha256": "b" * 64})
+
+    with pytest.raises(ValueError, match="digest does not match its definition"):
+        validate_execution_evidence(case, executor, forged_digest)
+
+    forged_turn = evidence.turns[0].model_copy(
+        update={
+            "normalized_response": {"action": "approve"},
+            "public_normalized_response": {"action": "approve"},
+        }
+    )
+    forged = evidence.model_copy(
+        update={
+            "turns": (forged_turn,),
+            "normalized_result": {"action": "approve"},
+            "public_normalized_result": {"action": "approve"},
+        }
+    )
+
+    with pytest.raises(ValueError, match="normalized response does not match"):
+        validate_execution_evidence(case, executor, forged)
+
+
+@pytest.mark.asyncio
+async def test_validation_rejects_projection_not_bound_to_environment() -> None:
+    executor = ComposedEnvironmentExecutor(_Invoker(), config_sha256=_CONFIG_SHA256)
+    case = _case("hello")
+    evidence = await executor.execute(case)
+    projection = OutcomeProjection(complete_result="")
+    normalized = projection.project(evidence.final_response)
+    forged_turn = evidence.turns[0].model_copy(
+        update={
+            "normalized_response": normalized,
+            "public_normalized_response": normalized,
+            "outcome_projection_sha256": projection.digest,
+        }
+    )
+    forged = evidence.model_copy(
+        update={
+            "turns": (forged_turn,),
+            "normalized_result": normalized,
+            "public_normalized_result": normalized,
+            "outcome_projection": projection.model_dump(mode="json"),
+            "outcome_projection_sha256": projection.digest,
+        }
+    )
+
+    with pytest.raises(ValueError, match="unconfigured outcome projection"):
+        validate_execution_evidence(case, executor, forged)
 
 
 def test_composition_rejects_partial_state_lifecycle() -> None:

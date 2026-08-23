@@ -254,6 +254,10 @@ class ComposedEnvironmentExecutor:
         return self._config_sha256
 
     @property
+    def outcome_projection(self) -> OutcomeProjection | None:
+        return self._outcome_projection
+
+    @property
     def state_uncertain(self) -> bool:
         return self._state_uncertain
 
@@ -844,6 +848,11 @@ class ComposedEnvironmentExecutor:
             public_normalized_result=(
                 turns[-1].public_normalized_response if turns and error is None else None
             ),
+            outcome_projection=(
+                self._outcome_projection.model_dump(mode="json")
+                if self._outcome_projection is not None and turns and error is None
+                else None
+            ),
             outcome_projection_sha256=(
                 turns[-1].outcome_projection_sha256 if turns and error is None else None
             ),
@@ -909,6 +918,11 @@ class ComposedEnvironmentExecutor:
             public_normalized_result=(
                 final_turn.public_normalized_response
                 if final_turn is not None and error is None
+                else None
+            ),
+            outcome_projection=(
+                self._outcome_projection.model_dump(mode="json")
+                if self._outcome_projection is not None and final_turn is not None and error is None
                 else None
             ),
             outcome_projection_sha256=(

@@ -55,6 +55,13 @@ class OutcomeProjection(BaseModel):
             for pointer in self.private_json_pointers
         ):
             raise ValueError("private outcome pointers must identify nested RFC 6901 values")
+        private_tokens = tuple(_pointer_tokens(pointer) for pointer in self.private_json_pointers)
+        if any(
+            left == right[: len(left)] or right == left[: len(right)]
+            for index, left in enumerate(private_tokens)
+            for right in private_tokens[index + 1 :]
+        ):
+            raise ValueError("private outcome pointers must not overlap")
         return self
 
     @property
@@ -114,7 +121,15 @@ class OutcomeProjection(BaseModel):
     def public_result(self, normalized: dict[str, JsonValue]) -> dict[str, JsonValue]:
         public = copy.deepcopy(normalized)
         for pointer in self.private_json_pointers:
-            _replace_with_private_marker(public, pointer)
+            try:
+                _resolve(public, pointer, field="private_json_pointers")
+                _replace_with_private_marker(public, pointer)
+            except OutcomeProjectionError:
+                raise
+            except (AssertionError, IndexError, KeyError, TypeError, ValueError):
+                raise OutcomeProjectionError(
+                    "private_json_pointers", pointer, "does not resolve"
+                ) from None
         return public
 
 
@@ -135,6 +150,10 @@ def _resolve(value: JsonValue, pointer: str, *, field: str) -> JsonValue:
         else:
             raise OutcomeProjectionError(field, pointer, "does not resolve")
     return current
+
+
+def _pointer_tokens(pointer: str) -> tuple[str, ...]:
+    return tuple(token.replace("~1", "/").replace("~0", "~") for token in pointer[1:].split("/"))
 
 
 def _validate_common_roles(normalized: dict[str, JsonValue], selectors: dict[str, str]) -> None:

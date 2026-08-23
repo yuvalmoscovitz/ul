@@ -633,6 +633,7 @@ class ExecutionEvidence(_StrictModel):
     final_response: JsonValue | None = None
     normalized_result: dict[str, JsonValue] | None = None
     public_normalized_result: dict[str, JsonValue] | None = None
+    outcome_projection: dict[str, JsonValue] | None = None
     outcome_projection_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
     final_state: EnvironmentStateEvidence | None = None
     timeout_after_commit_event: TimeoutAfterCommitEventEvidence | None = None
@@ -645,6 +646,8 @@ class ExecutionEvidence(_StrictModel):
     def validate_successful_evidence(self) -> Self:
         if (self.normalized_result is None) != (self.outcome_projection_sha256 is None):
             raise ValueError("normalized result and outcome projection digest must be paired")
+        if (self.normalized_result is None) != (self.outcome_projection is None):
+            raise ValueError("normalized result and outcome projection definition must be paired")
         if (self.normalized_result is None) != (self.public_normalized_result is None):
             raise ValueError("private and public normalized results must be paired")
         if self.probe_identity is not None:

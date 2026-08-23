@@ -799,6 +799,10 @@ class LocalTargetConnection:
     def config_sha256(self) -> str:
         return self._executor.config_sha256
 
+    @property
+    def outcome_projection(self) -> OutcomeProjection | None:
+        return self._executor.outcome_projection
+
     def api_calls_for_case(self, case: EvaluationCase) -> int:
         return self._executor.api_calls_for_case(case)
 

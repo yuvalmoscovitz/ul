@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import pytest
+from pydantic import ValidationError
 from ul.outcome_projection import OutcomeProjection, OutcomeProjectionError
 
 
@@ -99,3 +100,24 @@ def test_projection_rejects_oversized_normalized_result() -> None:
 
     with pytest.raises(OutcomeProjectionError, match="64000-byte normalized-result limit"):
         projection.project({"result": {"value": "x" * 64_001}})
+
+
+def test_projection_rejects_overlapping_private_pointers() -> None:
+    with pytest.raises(ValidationError, match="private outcome pointers must not overlap"):
+        OutcomeProjection(
+            complete_result="/result",
+            private_json_pointers=("/customer", "/customer/email"),
+        )
+
+
+def test_public_projection_normalizes_unresolved_redaction_failure() -> None:
+    projection = OutcomeProjection(
+        complete_result="/result",
+        private_json_pointers=("/customer/email",),
+    )
+
+    with pytest.raises(
+        OutcomeProjectionError,
+        match="'private_json_pointers' at selector '/customer/email' does not resolve",
+    ):
+        projection.public_result({"customer": {}})

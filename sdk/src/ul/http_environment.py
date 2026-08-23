@@ -645,6 +645,10 @@ class JsonHttpEnvironmentConnection:
         return self._config_sha256
 
     @property
+    def outcome_projection(self) -> OutcomeProjection | None:
+        return self._composed_executor.outcome_projection
+
+    @property
     def probe_capabilities(self) -> ProbeCapabilities:
         return self._composed_executor.probe_capabilities
 
