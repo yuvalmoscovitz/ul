@@ -1,8 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import socket
+import threading
+from collections import OrderedDict
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 from typing import cast
+from urllib.parse import urlsplit
 
 import httpx
 import pytest
@@ -409,6 +414,91 @@ async def test_otlp_http_json_receiver_rejects_oversized_body_before_export() ->
         OtlpJsonHttpReceiver(observer, host="0.0.0.0")
 
 
+async def test_otlp_http_json_receiver_bounds_concurrent_handlers() -> None:
+    observer = OtlpObservationSource()
+    entered = threading.Event()
+    release = threading.Event()
+    active_exports = 0
+    maximum_active_exports = 0
+    export_lock = threading.Lock()
+    original_export = observer.export
+
+    def blocking_export(payload: object) -> object:
+        nonlocal active_exports, maximum_active_exports
+        with export_lock:
+            active_exports += 1
+            maximum_active_exports = max(maximum_active_exports, active_exports)
+        entered.set()
+        release.wait(timeout=2)
+        try:
+            return original_export(payload)
+        finally:
+            with export_lock:
+                active_exports -= 1
+
+    observer.export = blocking_export  # type: ignore[method-assign]
+    payload = _payload(
+        ProbeRequest(
+            case_id="case-1",
+            session_id="session-1",
+            correlation_id="correlation-1",
+            turn=ProbeTurn(id="turn-1", input="hello"),
+            context={"trace_id": "a" * 32, "span_id": "b" * 16},
+        )
+    )
+
+    with OtlpJsonHttpReceiver(observer, maximum_concurrent_requests=1) as receiver:
+        async with httpx.AsyncClient() as client:
+            first_request = asyncio.create_task(client.post(receiver.endpoint, json=payload))
+            try:
+                assert await asyncio.to_thread(entered.wait, 1)
+                with pytest.raises(httpx.TransportError):
+                    await client.post(receiver.endpoint, json=payload)
+                server = receiver._server
+                assert server is not None
+                assert server.active_request_count == 1
+                assert server.rejected_request_count == 1
+                assert maximum_active_exports == 1
+            finally:
+                release.set()
+            assert (await first_request).status_code == 200
+
+
+async def test_otlp_http_json_receiver_times_out_before_headers_arrive() -> None:
+    observer = OtlpObservationSource()
+
+    def withhold_headers(endpoint: str) -> bytes:
+        parsed = urlsplit(endpoint)
+        assert parsed.hostname is not None
+        assert parsed.port is not None
+        with socket.create_connection((parsed.hostname, parsed.port), timeout=1) as connection:
+            connection.settimeout(1)
+            return connection.recv(1)
+
+    with OtlpJsonHttpReceiver(observer, request_timeout_seconds=0.05) as receiver:
+        assert await asyncio.to_thread(withhold_headers, receiver.endpoint) == b""
+
+
+class _CountingList[T](list[T]):
+    def __init__(self, values: list[T]) -> None:
+        super().__init__(values)
+        self.iteration_count = 0
+
+    def __iter__(self) -> Iterator[T]:
+        self.iteration_count += 1
+        return super().__iter__()
+
+
+class _CountingOrderedDict(OrderedDict[str, float]):
+    def __init__(self) -> None:
+        super().__init__()
+        self.iteration_count = 0
+
+    def __iter__(self) -> Iterator[str]:
+        self.iteration_count += 1
+        return super().__iter__()
+
+
 async def test_raw_span_retention_is_disabled_by_default() -> None:
     observer = OtlpObservationSource(
         OtlpObservationConfig(
@@ -546,6 +636,58 @@ async def test_rejection_markers_stay_bounded_under_distinct_hostile_traces() ->
     assert len(observer._rejected_correlations) == 1
     assert set(observer._rejected_trace_ids) == {f"{20:032x}"}
     assert set(observer._rejected_correlations) == {"hostile-20"}
+
+
+async def test_rejection_marker_eviction_does_not_scan_the_bounded_collection() -> None:
+    observer = OtlpObservationSource(OtlpObservationConfig(maximum_spans=500))
+    markers = _CountingOrderedDict()
+    for index in range(500):
+        markers[f"old-{index}"] = float(index)
+    observer._rejected_trace_ids = markers
+
+    for index in range(500):
+        observer._remember_rejection(
+            observer._rejected_trace_ids,
+            f"new-{index}",
+            float(500 + index),
+        )
+
+    assert len(markers) == 500
+    assert markers.iteration_count == 0
+    assert next(iter(markers.items())) == ("new-0", 500.0)
+    assert next(reversed(markers.items())) == ("new-499", 999.0)
+
+
+async def test_existing_span_updates_use_the_identity_index_without_repeated_scans(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observer = OtlpObservationSource(OtlpObservationConfig(maximum_spans=500))
+    request = ProbeRequest(
+        case_id="case-1",
+        session_id="session-1",
+        correlation_id="correlation-1",
+        turn=ProbeTurn(id="turn-1", input="hello"),
+        context={"trace_id": "a" * 32, "span_id": "b" * 16},
+    )
+    payload = _payload(request, include_child=False)
+    scope_spans = payload["resourceSpans"][0]["scopeSpans"]
+    assert isinstance(scope_spans, list)
+    spans = scope_spans[0]["spans"]
+    assert isinstance(spans, list)
+    root = spans[0]
+    assert isinstance(root, dict)
+    spans.extend({**root, "spanId": f"{index:016x}", "attributes": []} for index in range(2, 501))
+    assert observer.export(payload).accepted_spans == 500
+    counted_spans = _CountingList(observer._spans)
+    observer._spans = counted_spans
+    monkeypatch.setattr(observer, "_prune", lambda now: None)
+
+    receipt = observer.export(payload)
+
+    assert receipt.accepted_spans == 500
+    assert receipt.rejected_spans == 0
+    assert counted_spans.iteration_count == 1
+    assert len(observer._span_indexes) == 500
 
 
 async def test_span_limit_is_enforced_before_shared_otlp_envelopes_are_copied(

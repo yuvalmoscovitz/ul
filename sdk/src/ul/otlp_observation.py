@@ -8,8 +8,10 @@ import http.server
 import json
 import math
 import re
+import socket
 import threading
 import time
+from collections import OrderedDict
 from collections.abc import Iterator
 from dataclasses import dataclass
 from typing import cast
@@ -83,6 +85,7 @@ class OtlpJsonHttpReceiver:
         host: str = "127.0.0.1",
         port: int = 0,
         request_timeout_seconds: float = 5,
+        maximum_concurrent_requests: int = 16,
     ) -> None:
         if host != "127.0.0.1":
             raise ValueError("OTLP JSON receiver only binds to the IPv4 loopback address")
@@ -94,10 +97,16 @@ class OtlpJsonHttpReceiver:
             or request_timeout_seconds <= 0
         ):
             raise ValueError("OTLP JSON receiver timeout must be finite and positive")
+        if (
+            type(maximum_concurrent_requests) is not int
+            or not 1 <= maximum_concurrent_requests <= 1_000
+        ):
+            raise ValueError("OTLP JSON receiver concurrency must be between 1 and 1000")
         self._observation_source = observation_source
         self._host = host
         self._port = port
         self._request_timeout_seconds = request_timeout_seconds
+        self._maximum_concurrent_requests = maximum_concurrent_requests
         self._server: http.server.ThreadingHTTPServer | None = None
         self._thread: threading.Thread | None = None
 
@@ -118,7 +127,6 @@ class OtlpJsonHttpReceiver:
             protocol_version = "HTTP/1.1"
 
             def do_POST(self) -> None:
-                self.connection.settimeout(request_timeout_seconds)
                 if self.path != "/v1/traces":
                     self._respond(404, {"error": "not found"})
                     return
@@ -178,7 +186,56 @@ class OtlpJsonHttpReceiver:
                 self.end_headers()
                 self.wfile.write(body)
 
-        server = http.server.ThreadingHTTPServer((self._host, self._port), Handler)
+        class BoundedThreadingHTTPServer(http.server.ThreadingHTTPServer):
+            def __init__(self) -> None:
+                self._request_slots = threading.BoundedSemaphore(
+                    self_receiver._maximum_concurrent_requests
+                )
+                self._request_count_lock = threading.Lock()
+                self.active_request_count = 0
+                self.rejected_request_count = 0
+                super().__init__((self_receiver._host, self_receiver._port), Handler)
+
+            def get_request(self) -> tuple[socket.socket, tuple[str, int]]:
+                request, client_address = super().get_request()
+                request.settimeout(request_timeout_seconds)
+                return request, client_address
+
+            def process_request(
+                self,
+                request: socket.socket | tuple[bytes, socket.socket],
+                client_address: str | tuple[str, int],
+            ) -> None:
+                if not self._request_slots.acquire(blocking=False):
+                    with self._request_count_lock:
+                        self.rejected_request_count += 1
+                    self.shutdown_request(request)
+                    return
+                with self._request_count_lock:
+                    self.active_request_count += 1
+                try:
+                    super().process_request(request, client_address)
+                except BaseException:
+                    self._release_request_slot()
+                    raise
+
+            def process_request_thread(
+                self,
+                request: socket.socket | tuple[bytes, socket.socket],
+                client_address: str | tuple[str, int],
+            ) -> None:
+                try:
+                    super().process_request_thread(request, client_address)
+                finally:
+                    self._release_request_slot()
+
+            def _release_request_slot(self) -> None:
+                with self._request_count_lock:
+                    self.active_request_count -= 1
+                self._request_slots.release()
+
+        self_receiver = self
+        server = BoundedThreadingHTTPServer()
         server.daemon_threads = True
         thread = threading.Thread(
             target=server.serve_forever,
@@ -238,8 +295,9 @@ class OtlpObservationSource:
         )
         self._lock = threading.Lock()
         self._spans: list[_BufferedSpan] = []
-        self._rejected_correlations: dict[str, float] = {}
-        self._rejected_trace_ids: dict[str, float] = {}
+        self._span_indexes: dict[tuple[str, str], int] = {}
+        self._rejected_correlations: OrderedDict[str, float] = OrderedDict()
+        self._rejected_trace_ids: OrderedDict[str, float] = OrderedDict()
 
     def export(self, payload: object) -> OtlpExportReceipt:
         try:
@@ -266,16 +324,7 @@ class OtlpObservationSource:
             for raw_span in exported_spans:
                 span_identity = _span_identity(raw_span)
                 existing_index = (
-                    next(
-                        (
-                            index
-                            for index, existing_span in enumerate(self._spans)
-                            if (existing_span.trace_id, existing_span.span_id) == span_identity[:2]
-                        ),
-                        None,
-                    )
-                    if span_identity is not None
-                    else None
+                    self._span_indexes.get(span_identity[:2]) if span_identity is not None else None
                 )
                 if existing_index is None and len(self._spans) >= self.config.maximum_spans:
                     rejected += 1
@@ -304,6 +353,9 @@ class OtlpObservationSource:
                     )
                     continue
                 if existing_index is None:
+                    self._span_indexes[(buffered_span.trace_id, buffered_span.span_id)] = len(
+                        self._spans
+                    )
                     self._spans.append(buffered_span)
                 else:
                     self._spans[existing_index] = buffered_span
@@ -354,7 +406,14 @@ class OtlpObservationSource:
             rejected = request.correlation_id in self._rejected_correlations or any(
                 span.trace_id in self._rejected_trace_ids for span in selected
             )
-            self._spans = [span for span in self._spans if span not in matched]
+            matched_identities = {(span.trace_id, span.span_id) for span in matched}
+            self._set_spans(
+                [
+                    span
+                    for span in self._spans
+                    if (span.trace_id, span.span_id) not in matched_identities
+                ]
+            )
             self._rejected_correlations.pop(request.correlation_id, None)
             for span in selected:
                 self._rejected_trace_ids.pop(span.trace_id, None)
@@ -409,26 +468,32 @@ class OtlpObservationSource:
             self._remember_rejection(self._rejected_correlations, correlation_id, received_at)
 
     def _remember_rejection(
-        self, markers: dict[str, float], identifier: str, received_at: float
+        self, markers: OrderedDict[str, float], identifier: str, received_at: float
     ) -> None:
         markers[identifier] = received_at
+        markers.move_to_end(identifier)
         while len(markers) > self.config.maximum_spans:
-            oldest_identifier = min(markers, key=lambda key: (markers[key], key))
-            del markers[oldest_identifier]
+            markers.popitem(last=False)
 
     def _prune(self, now: float) -> None:
         oldest = now - self.config.retention_seconds
-        self._spans = [span for span in self._spans if span.received_at >= oldest]
-        self._rejected_correlations = {
-            correlation_id: rejected_at
-            for correlation_id, rejected_at in self._rejected_correlations.items()
-            if rejected_at >= oldest
+        self._set_spans([span for span in self._spans if span.received_at >= oldest])
+        self._prune_rejections(self._rejected_correlations, oldest)
+        self._prune_rejections(self._rejected_trace_ids, oldest)
+
+    def _set_spans(self, spans: list[_BufferedSpan]) -> None:
+        self._spans = spans
+        self._span_indexes = {
+            (span.trace_id, span.span_id): index for index, span in enumerate(spans)
         }
-        self._rejected_trace_ids = {
-            trace_id: rejected_at
-            for trace_id, rejected_at in self._rejected_trace_ids.items()
-            if rejected_at >= oldest
-        }
+
+    @staticmethod
+    def _prune_rejections(markers: OrderedDict[str, float], oldest: float) -> None:
+        while markers:
+            identifier, rejected_at = next(iter(markers.items()))
+            if rejected_at >= oldest:
+                return
+            del markers[identifier]
 
 
 def _exported_spans(payload: object) -> Iterator[dict[str, JsonValue]]:
