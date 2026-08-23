@@ -22,6 +22,7 @@ from ul_cli.dataset_review import (
     report_dataset_evidence,
     summarize_dataset_evidence,
 )
+from ul_cli.pattern_identity import PatternIdentityKeyError, load_pattern_identity_key
 from ul_cli.report_contract import (
     FindingSummary,
     ReportEvidenceType,
@@ -93,9 +94,18 @@ def report_evidence(
         raise typer.Exit(code=report.exit_code)
 
 
-def load_unified_report(evidence: Path, *, reviews: Path | None = None) -> UnifiedReport:
+def load_unified_report(
+    evidence: Path,
+    *,
+    reviews: Path | None = None,
+    pattern_identity_key: bytes | None = None,
+) -> UnifiedReport:
     if is_reportable_dataset_evidence(evidence):
-        return summarize_dataset_evidence(evidence, reviews)
+        try:
+            identity_key = pattern_identity_key or load_pattern_identity_key(evidence)
+        except PatternIdentityKeyError as error:
+            raise ReportInputError(str(error)) from None
+        return summarize_dataset_evidence(evidence, reviews, pattern_identity_key=identity_key)
 
     result = _load_stateful_stress_result(evidence)
     if reviews is not None:
@@ -246,8 +256,17 @@ def _print_human_report(report: UnifiedReport, evidence: Path) -> None:
         for index, pattern in enumerate(report.patterns, start=1):
             typer.echo("")
             typer.echo(f"Pattern {index}: {pattern.summary}")
-            typer.echo(f"  Pattern ID: {pattern.pattern_id}")
+            typer.echo(f"  Pattern fingerprint: {pattern.pattern_fingerprint}")
+            typer.echo(f"  Snapshot ID: {pattern.pattern_snapshot_id}")
             typer.echo(f"  Priority: {pattern.severity}")
+            typer.echo(
+                "  Evidence authority: "
+                + ", ".join(
+                    authority.replace("_", " ") for authority in pattern.evidence_authorities
+                )
+            )
+            for limitation in pattern.evidence_limitations:
+                typer.echo(f"  Evidence limitation: {limitation.replace('_', ' ')}")
             if pattern.rule_id is not None:
                 typer.echo(
                     f"  Customer rule: {pattern.rule_id}@{pattern.rule_version} "
@@ -269,7 +288,15 @@ def _print_human_report(report: UnifiedReport, evidence: Path) -> None:
                 f"{pattern.needs_review_count} needs review; "
                 f"{pattern.confirmed_count} confirmed"
             )
-            typer.echo(f"  Finding IDs: {', '.join(pattern.finding_ids)}")
+            typer.echo("  Members:")
+            for member in pattern.members:
+                reasons = ", ".join(
+                    reason.replace("_", " ") for reason in member.membership_reasons
+                )
+                typer.echo(
+                    f"    - {member.finding_id}: {reasons}; "
+                    f"review={member.review_status}/{member.review_severity}"
+                )
             typer.echo("  Next: use the per-finding review commands below.")
     grouped_finding_count = sum(pattern.finding_count for pattern in report.patterns)
     ungrouped_actionable_count = report.summary.actionable_finding_count - grouped_finding_count

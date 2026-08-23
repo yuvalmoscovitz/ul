@@ -46,6 +46,7 @@ from ul.dataset_regression import dataset_regression_target_config_sha256
 from ul.http_environment import JsonHttpIsolatedResponseConfig, JsonHttpTargetConfig
 from ul_core.augmentations.definitions import builtin_augmentation_catalog
 
+from ul_cli.pattern_identity import pattern_mechanism_pseudonym
 from ul_cli.report_contract import (
     FailurePattern,
     FindingCategory,
@@ -53,10 +54,14 @@ from ul_cli.report_contract import (
     FindingSeverity,
     FindingSummary,
     FindingSummaryText,
+    PatternEvidenceAuthority,
+    PatternHorizontalFacets,
+    PatternMember,
     PatternOperator,
     ReportInputError,
     ReportReviewStatus,
     UnifiedReport,
+    build_failure_pattern,
     build_report_summary,
 )
 
@@ -83,6 +88,7 @@ _DATASET_EVALUATION_PIPELINE_VERSION = "1.4.0"
 _MAXIMUM_PATTERN_EFFECTS = 100
 _MAXIMUM_PATTERN_FIELDS = 100
 _MAXIMUM_PATTERN_LABEL_CHARACTERS = 500
+_MAXIMUM_PATTERN_IDENTITY_BYTES = 64_000
 _PATTERN_SEVERITY_RANK: dict[FindingSeverity, int] = {
     "unrated": 0,
     "low": 1,
@@ -107,6 +113,20 @@ class _FindingIdHash(Protocol):
 
 class _StrictModel(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+
+@dataclass(frozen=True)
+class _PatternContext:
+    private_mechanism_key: str
+    source_case_id: str
+    operator_id: str
+    evidence_authorities: tuple[PatternEvidenceAuthority, ...]
+
+    def __post_init__(self) -> None:
+        if len(self.private_mechanism_key) != 64 or any(
+            character not in "0123456789abcdef" for character in self.private_mechanism_key
+        ):
+            raise ValueError("private pattern mechanism key must be a lowercase SHA-256 digest")
 
 
 class _EvidenceReference(_StrictModel):
@@ -687,9 +707,15 @@ _BEHAVIOR_FINDING_SUMMARIES: dict[str, FindingSummaryText] = {
 def summarize_dataset_evidence(
     evidence: Path,
     reviews: Path | None = None,
+    *,
+    pattern_identity_key: bytes,
 ) -> UnifiedReport:
     try:
-        return _summarize_dataset_evidence(evidence, reviews)
+        return _summarize_dataset_evidence(
+            evidence,
+            reviews,
+            pattern_identity_key=pattern_identity_key,
+        )
     except _ReviewInputError as error:
         raise ReportInputError(str(error)) from None
     except (ValidationError, ValueError):
@@ -699,6 +725,8 @@ def summarize_dataset_evidence(
 def _summarize_dataset_evidence(
     evidence: Path,
     reviews: Path | None,
+    *,
+    pattern_identity_key: bytes,
 ) -> UnifiedReport:
     evidence_records = _load_evidence(evidence)
     evaluation_mode = _dataset_evaluation_mode(evidence_records)
@@ -708,7 +736,7 @@ def _summarize_dataset_evidence(
     active_reviews = _active_reviews(review_records)
 
     finding_summaries: list[FindingSummary] = []
-    pattern_contexts: dict[str, tuple[str, str, str]] = {}
+    pattern_contexts: dict[str, _PatternContext] = {}
     indexed_invariant_keys: set[tuple[str, str, str, str]] = set()
     for indexed_finding in indexed_findings.values():
         active_review = active_reviews.get(indexed_finding.finding_id)
@@ -744,6 +772,8 @@ def _summarize_dataset_evidence(
                     conclusive_repetitions=observations.observed_repetitions,
                     inconclusive_repetitions=observations.inconclusive_repetitions,
                     stability=observations.stability,
+                    evidence_authorities=("model_derived_unverified",),
+                    evidence_limitations=("semantic_model_output_not_independently_verified",),
                     next_action=next_action,
                     summary=summary,
                 )
@@ -752,10 +782,11 @@ def _summarize_dataset_evidence(
                 semantic_finding = indexed_finding.semantic_finding
                 pattern_signature = _behavior_pattern_signature(semantic_finding)
                 if pattern_signature is not None:
-                    pattern_contexts[indexed_finding.finding_id] = (
-                        pattern_signature,
-                        indexed_finding.evidence_record.evidence.interaction_id,
-                        indexed_finding.case.operator_id,
+                    pattern_contexts[indexed_finding.finding_id] = _PatternContext(
+                        private_mechanism_key=pattern_signature,
+                        source_case_id=indexed_finding.evidence_record.evidence.interaction_id,
+                        operator_id=indexed_finding.case.operator_id,
+                        evidence_authorities=("model_derived_unverified",),
                     )
             continue
 
@@ -786,6 +817,10 @@ def _summarize_dataset_evidence(
                 conclusive_repetitions=observations.observed_repetitions,
                 inconclusive_repetitions=observations.inconclusive_repetitions,
                 stability=observations.stability,
+                evidence_authorities=(
+                    "customer_declared",
+                    "deterministic_evaluator",
+                ),
                 violated_repetitions=sum(
                     trial.status == "violated" for trial in variation_rule.trials
                 ),
@@ -801,10 +836,11 @@ def _summarize_dataset_evidence(
                     "rule_version": variation_rule.rule_version,
                 }
             )
-            pattern_contexts[indexed_finding.finding_id] = (
-                pattern_signature,
-                indexed_finding.evidence_record.evidence.interaction_id,
-                indexed_finding.case.operator_id,
+            pattern_contexts[indexed_finding.finding_id] = _PatternContext(
+                private_mechanism_key=pattern_signature,
+                source_case_id=indexed_finding.evidence_record.evidence.interaction_id,
+                operator_id=indexed_finding.case.operator_id,
+                evidence_authorities=("customer_declared", "deterministic_evaluator"),
             )
 
     for loaded_record in evidence_records:
@@ -889,7 +925,11 @@ def _summarize_dataset_evidence(
                 )
 
     findings = tuple(finding_summaries)
-    patterns = _build_failure_patterns(findings, pattern_contexts)
+    patterns = _build_failure_patterns(
+        findings,
+        pattern_contexts,
+        pattern_identity_key=pattern_identity_key,
+    )
     summary = build_report_summary(findings)
     if summary.actionable_finding_count:
         report_review_status: ReportReviewStatus = "action_required"
@@ -963,15 +1003,24 @@ def _behavior_pattern_signature(finding: _Finding) -> str | None:
     observed_effects = _bounded_effect_mechanisms(finding.observed_effects)
     if reference_effects is None or observed_effects is None:
         return None
-    return _canonical_json_sha256(
-        {
-            "kind": "behavior_difference",
-            "category": finding.category,
-            "grounded_field_names": sorted(finding.grounded_field_names),
-            "reference_effects": reference_effects,
-            "observed_effects": observed_effects,
-        }
-    )
+    identity = {
+        "kind": "behavior_difference",
+        "category": finding.category,
+        "grounded_field_names": sorted(
+            unicodedata.normalize("NFC", field_name) for field_name in finding.grounded_field_names
+        ),
+        "reference_effects": reference_effects,
+        "observed_effects": observed_effects,
+    }
+    canonical_identity = json.dumps(
+        identity,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    if len(canonical_identity) > _MAXIMUM_PATTERN_IDENTITY_BYTES:
+        return None
+    return hashlib.sha256(canonical_identity).hexdigest()
 
 
 def _bounded_effect_mechanisms(effects: list[_Effect]) -> list[dict[str, object]] | None:
@@ -981,6 +1030,7 @@ def _bounded_effect_mechanisms(effects: list[_Effect]) -> list[dict[str, object]
         len(effect.fields) > _MAXIMUM_PATTERN_FIELDS
         or len(effect.kind) > _MAXIMUM_PATTERN_LABEL_CHARACTERS
         or len(effect.predicate) > _MAXIMUM_PATTERN_LABEL_CHARACTERS
+        or len(effect.status) > _MAXIMUM_PATTERN_LABEL_CHARACTERS
         or any(len(field_name) > _MAXIMUM_PATTERN_LABEL_CHARACTERS for field_name in effect.fields)
         for effect in effects
     ):
@@ -988,10 +1038,12 @@ def _bounded_effect_mechanisms(effects: list[_Effect]) -> list[dict[str, object]
     return sorted(
         (
             {
-                "kind": effect.kind,
-                "predicate": effect.predicate,
-                "status": effect.status,
-                "field_names": sorted(effect.fields),
+                "kind": unicodedata.normalize("NFC", effect.kind),
+                "predicate": unicodedata.normalize("NFC", effect.predicate),
+                "status": unicodedata.normalize("NFC", effect.status),
+                "field_names": sorted(
+                    unicodedata.normalize("NFC", field_name) for field_name in effect.fields
+                ),
             }
             for effect in effects
         ),
@@ -1001,25 +1053,45 @@ def _bounded_effect_mechanisms(effects: list[_Effect]) -> list[dict[str, object]
 
 def _build_failure_patterns(
     findings: tuple[FindingSummary, ...],
-    contexts: dict[str, tuple[str, str, str]],
+    contexts: dict[str, _PatternContext],
+    *,
+    pattern_identity_key: bytes,
 ) -> tuple[FailurePattern, ...]:
     findings_by_id = {
         finding.finding_id: finding for finding in findings if finding.finding_id is not None
     }
-    grouped: dict[str, list[tuple[FindingSummary, str, str]]] = {}
-    for finding_id, (signature, source_case_id, operator_id) in contexts.items():
-        grouped.setdefault(signature, []).append(
-            (findings_by_id[finding_id], source_case_id, operator_id)
+    grouped: dict[str, list[tuple[FindingSummary, _PatternContext]]] = {}
+    for finding_id, context in contexts.items():
+        finding = findings_by_id[finding_id]
+        grouping_key = _canonical_json_sha256(
+            {
+                "private_mechanism_key": context.private_mechanism_key,
+                "kind": finding.kind,
+                "category": finding.category,
+                "rule_id": finding.rule_id,
+                "rule_version": finding.rule_version,
+                "stability": finding.stability,
+                "evidence_authorities": context.evidence_authorities,
+                "evidence_limitations": finding.evidence_limitations,
+            }
         )
+        grouped.setdefault(grouping_key, []).append((finding, context))
 
     catalog = builtin_augmentation_catalog()
     patterns: list[FailurePattern] = []
     for members in grouped.values():
         first = members[0][0]
+        first_context = members[0][1]
+        if (
+            first.stability is None
+            or first.review_status not in {"needs_review", "confirmed"}
+            or first.review_severity is None
+        ):
+            raise AssertionError("pattern members require reviewable outcomes")
         operator_keys = sorted(
             {
-                (operator_id, finding.operator_version)
-                for finding, _, operator_id in members
+                (context.operator_id, finding.operator_version)
+                for finding, context in members
                 if finding.operator_version is not None
             }
         )
@@ -1036,10 +1108,8 @@ def _build_failure_patterns(
                     summary=operator_summary,
                 )
             )
-        finding_ids = tuple(sorted(cast(str, finding.finding_id) for finding, _, _ in members))
-        public_pattern_digest = _canonical_json_sha256({"finding_ids": finding_ids})
         member_severities: list[FindingSeverity] = []
-        for finding, _, _ in members:
+        for finding, _ in members:
             if finding.review_status == "confirmed":
                 if finding.review_severity is None:
                     raise AssertionError("validated confirmed finding requires review severity")
@@ -1050,25 +1120,80 @@ def _build_failure_patterns(
             member_severities,
             key=_PATTERN_SEVERITY_RANK.__getitem__,
         )[-1]
+        membership_reasons = tuple(
+            sorted(
+                (
+                    "same_finding_kind",
+                    "same_finding_category",
+                    (
+                        "same_customer_rule"
+                        if first.kind == "customer_invariant_violation"
+                        else "same_action_shape"
+                    ),
+                    "same_outcome_stability",
+                    "same_evidence_authority",
+                    "same_evidence_limitation",
+                )
+            )
+        )
         patterns.append(
-            FailurePattern(
-                pattern_id=f"ulp_v1_{public_pattern_digest}",
+            build_failure_pattern(
                 kind=first.kind,
                 category=first.category,
                 rule_id=first.rule_id,
                 rule_version=first.rule_version,
                 summary=first.summary,
                 severity=pattern_severity,
+                stability=first.stability,
+                evidence_authorities=first_context.evidence_authorities,
+                evidence_limitations=first.evidence_limitations,
+                horizontal_facets=PatternHorizontalFacets(
+                    failure_type=first.category,
+                    affected_subject=(
+                        "rule"
+                        if first.kind == "customer_invariant_violation"
+                        else "outcome"
+                        if first.category == "unstable_behavior"
+                        else "action"
+                    ),
+                    evidence_level=(
+                        "evaluated_rule"
+                        if first.kind == "customer_invariant_violation"
+                        else "model_derived_outcome"
+                        if first.category == "unstable_behavior"
+                        and "model_derived_unverified" in first.evidence_authorities
+                        else "model_derived_action"
+                        if "model_derived_unverified" in first.evidence_authorities
+                        else "observed_outcome"
+                        if first.category == "unstable_behavior"
+                        else "observed_action"
+                    ),
+                    mechanism_pseudonym=pattern_mechanism_pseudonym(
+                        pattern_identity_key,
+                        first_context.private_mechanism_key,
+                    ),
+                ),
                 finding_count=len(members),
-                source_case_count=len({source_case_id for _, source_case_id, _ in members}),
+                source_case_count=len({context.source_case_id for _, context in members}),
                 operators=tuple(operators),
                 needs_review_count=sum(
-                    finding.review_status == "needs_review" for finding, _, _ in members
+                    finding.review_status == "needs_review" for finding, _ in members
                 ),
-                confirmed_count=sum(
-                    finding.review_status == "confirmed" for finding, _, _ in members
+                confirmed_count=sum(finding.review_status == "confirmed" for finding, _ in members),
+                members=tuple(
+                    PatternMember(
+                        finding_id=finding_id,
+                        membership_reasons=membership_reasons,
+                        review_status=cast(
+                            Literal["needs_review", "confirmed"],
+                            finding.review_status,
+                        ),
+                        review_severity=cast(FindingSeverity, finding.review_severity),
+                    )
+                    for finding_id, finding in sorted(
+                        ((cast(str, finding.finding_id), finding) for finding, _ in members)
+                    )
                 ),
-                finding_ids=finding_ids,
             )
         )
     return tuple(
@@ -1076,7 +1201,7 @@ def _build_failure_patterns(
             patterns,
             key=lambda pattern: (
                 -_PATTERN_SEVERITY_RANK[pattern.severity],
-                pattern.pattern_id,
+                pattern.pattern_snapshot_id,
             ),
         )
     )

@@ -52,14 +52,25 @@ FindingSummaryText = Literal[
     "The changed input produced inconsistent behavior across repetitions.",
     "The agent violated a customer-defined rule.",
 ]
+PatternEvidenceAuthority = Literal[
+    "customer_declared",
+    "deterministic_evaluator",
+    "independent_observer",
+    "model_derived_unverified",
+]
+PatternEvidenceLimitation = Literal["semantic_model_output_not_independently_verified"]
 
 _IDENTIFIER_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$"
 _VERSION_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9._+-]{0,49}$"
 _FINDING_ID_PATTERN = r"^ulf_v1_[0-9a-f]{64}$"
-_PATTERN_ID_PATTERN = r"^ulp_v1_[0-9a-f]{64}$"
+_PATTERN_FINGERPRINT_PATTERN = r"^ulpf_v1_[0-9a-f]{64}$"
+_PATTERN_SNAPSHOT_ID_PATTERN = r"^ulps_v1_[0-9a-f]{64}$"
+_PATTERN_MECHANISM_PSEUDONYM_PATTERN = r"^ulpm_v1_[0-9a-f]{64}$"
 _SHA256_PATTERN = r"^[0-9a-f]{64}$"
 _JSON_POINTER_PATTERN = re.compile(r"(?:/(?:[^~/]|~[01])*)*")
 _MAXIMUM_RUN_RECEIPT_BYTES = 1_000_000
+_MAXIMUM_PATTERN_FINGERPRINT_BYTES = 16_000
+_MAXIMUM_PATTERN_SNAPSHOT_BYTES = 1_000_000
 _FindingReferenceCode = Annotated[str, Field(pattern=_IDENTIFIER_PATTERN)]
 _SEVERITY_RANK: dict[FindingSeverity, int] = {
     "unrated": 0,
@@ -727,6 +738,22 @@ def build_finding_occurrence(**values: object) -> FindingOccurrence:
     return FindingOccurrence.model_validate(values)
 
 
+def build_failure_pattern(**values: object) -> FailurePattern:
+    values["pattern_fingerprint"] = f"ulpf_v1_{'0' * 64}"
+    values["pattern_snapshot_id"] = f"ulps_v1_{'0' * 64}"
+    pattern = FailurePattern.model_validate(
+        values,
+        context={"building_pattern": True},
+    )
+    values["pattern_fingerprint"] = _pattern_fingerprint(pattern)
+    pattern = FailurePattern.model_validate(
+        values,
+        context={"building_pattern": True},
+    )
+    values["pattern_snapshot_id"] = _pattern_snapshot_id(pattern)
+    return FailurePattern.model_validate(values)
+
+
 def parse_run_receipt(serialized: str | bytes) -> RunReceipt:
     return RunReceipt.model_validate_json(serialized)
 
@@ -782,6 +809,37 @@ def _finding_occurrence_id(occurrence: FindingOccurrence) -> str:
     )
     digest = hashlib.sha256(_canonical_json(claims).encode("utf-8"))
     return f"ulf_v1_{digest.hexdigest()}"
+
+
+def _pattern_fingerprint(pattern: FailurePattern) -> str:
+    grouping_facets = pattern.model_dump(
+        mode="json",
+        include={
+            "kind",
+            "category",
+            "rule_id",
+            "rule_version",
+            "stability",
+            "evidence_authorities",
+            "evidence_limitations",
+            "horizontal_facets",
+        },
+    )
+    canonical_grouping_facets = _canonical_json(grouping_facets).encode("utf-8")
+    if len(canonical_grouping_facets) > _MAXIMUM_PATTERN_FINGERPRINT_BYTES:
+        raise ValueError("pattern fingerprint input exceeds the size limit")
+    digest = hashlib.sha256(canonical_grouping_facets)
+    return f"ulpf_v1_{digest.hexdigest()}"
+
+
+def _pattern_snapshot_id(pattern: FailurePattern) -> str:
+    snapshot = _canonical_json(
+        pattern.model_dump(mode="json", exclude={"pattern_snapshot_id"})
+    ).encode("utf-8")
+    if len(snapshot) > _MAXIMUM_PATTERN_SNAPSHOT_BYTES:
+        raise ValueError("pattern snapshot input exceeds the size limit")
+    digest = hashlib.sha256(snapshot)
+    return f"ulps_v1_{digest.hexdigest()}"
 
 
 def _validate_sorted_unique(values: tuple[str, ...], label: str) -> None:
@@ -996,12 +1054,23 @@ class FindingSummary(_StrictModel):
     conclusive_repetitions: int = Field(ge=0)
     inconclusive_repetitions: int = Field(ge=0)
     stability: Literal["stable", "unstable", "inconclusive"] | None = None
+    evidence_authorities: tuple[PatternEvidenceAuthority, ...] = ()
+    evidence_limitations: tuple[PatternEvidenceLimitation, ...] = ()
     violated_repetitions: int | None = Field(default=None, ge=0)
     next_action: FindingNextAction
     summary: FindingSummaryText
 
     @model_validator(mode="after")
     def validate_finding(self) -> Self:
+        if self.evidence_authorities != tuple(sorted(set(self.evidence_authorities))):
+            raise ValueError("finding evidence authorities must be sorted and unique")
+        if self.evidence_limitations != tuple(sorted(set(self.evidence_limitations))):
+            raise ValueError("finding evidence limitations must be sorted and unique")
+        model_derived = "model_derived_unverified" in self.evidence_authorities
+        if model_derived != (
+            self.evidence_limitations == ("semantic_model_output_not_independently_verified",)
+        ):
+            raise ValueError("model-derived evidence requires its explicit limitation")
         if (self.operator_id is None) != (self.operator_version is None):
             raise ValueError("operator ID and version must be present together")
         if (self.rule_id is None) != (self.rule_version is None):
@@ -1045,6 +1114,45 @@ class PatternOperator(_StrictModel):
     summary: str | None = Field(default=None, min_length=1, max_length=500)
 
 
+PatternMembershipReason = Literal[
+    "same_action_shape",
+    "same_customer_rule",
+    "same_evidence_authority",
+    "same_evidence_limitation",
+    "same_finding_category",
+    "same_finding_kind",
+    "same_outcome_stability",
+]
+
+
+class PatternHorizontalFacets(_StrictModel):
+    failure_type: FindingCategory
+    affected_subject: Literal["action", "outcome", "rule"]
+    evidence_level: Literal[
+        "observed_action",
+        "observed_outcome",
+        "model_derived_action",
+        "model_derived_outcome",
+        "evaluated_rule",
+    ]
+    mechanism_pseudonym: str = Field(pattern=_PATTERN_MECHANISM_PSEUDONYM_PATTERN)
+
+
+class PatternMember(_StrictModel):
+    finding_id: str = Field(pattern=_FINDING_ID_PATTERN)
+    membership_reasons: tuple[PatternMembershipReason, ...] = Field(min_length=1)
+    review_status: Literal["needs_review", "confirmed"]
+    review_severity: FindingSeverity
+
+    @model_validator(mode="after")
+    def validate_member(self) -> Self:
+        if self.membership_reasons != tuple(sorted(set(self.membership_reasons))):
+            raise ValueError("pattern membership reasons must be sorted and unique")
+        if self.review_status != "confirmed" and self.review_severity != "unrated":
+            raise ValueError("only confirmed members can have a rated review severity")
+        return self
+
+
 def _effective_finding_severity(finding: FindingSummary) -> FindingSeverity:
     if finding.review_status == "confirmed":
         if finding.review_severity is None:
@@ -1054,41 +1162,104 @@ def _effective_finding_severity(finding: FindingSummary) -> FindingSeverity:
 
 
 class FailurePattern(_StrictModel):
-    pattern_id: str = Field(pattern=_PATTERN_ID_PATTERN)
+    pattern_fingerprint: str = Field(pattern=_PATTERN_FINGERPRINT_PATTERN)
+    pattern_snapshot_id: str = Field(pattern=_PATTERN_SNAPSHOT_ID_PATTERN)
     kind: FindingKind
     category: FindingCategory
     rule_id: str | None = Field(default=None, pattern=_IDENTIFIER_PATTERN)
     rule_version: str | None = Field(default=None, pattern=_VERSION_PATTERN)
     summary: FindingSummaryText
     severity: FindingSeverity
+    stability: Literal["stable", "unstable", "inconclusive"]
+    evidence_authorities: tuple[PatternEvidenceAuthority, ...] = Field(min_length=1)
+    evidence_limitations: tuple[PatternEvidenceLimitation, ...] = ()
+    horizontal_facets: PatternHorizontalFacets
     finding_count: int = Field(ge=1)
     source_case_count: int = Field(ge=1)
-    operators: tuple[PatternOperator, ...] = Field(min_length=1)
+    operators: tuple[PatternOperator, ...] = Field(min_length=1, max_length=100)
     needs_review_count: int = Field(ge=0)
     confirmed_count: int = Field(ge=0)
-    finding_ids: tuple[str, ...] = Field(min_length=1)
+    members: tuple[PatternMember, ...] = Field(min_length=1, max_length=10_000)
 
     @model_validator(mode="after")
-    def validate_pattern(self) -> Self:
+    def validate_pattern(self, info: ValidationInfo) -> Self:
         if (self.rule_id is None) != (self.rule_version is None):
             raise ValueError("pattern rule ID and version must be present together")
         if self.kind == "behavior_difference" and self.rule_id is not None:
             raise ValueError("behavior patterns cannot reference a customer rule")
         if self.kind == "customer_invariant_violation" and self.rule_id is None:
             raise ValueError("invariant patterns require a customer rule")
-        if self.finding_count != len(self.finding_ids):
-            raise ValueError("pattern finding count must match finding IDs")
+        if self.finding_count != len(self.members):
+            raise ValueError("pattern finding count must match members")
         if self.source_case_count > self.finding_count:
             raise ValueError("pattern source case count cannot exceed finding count")
-        if self.finding_ids != tuple(sorted(set(self.finding_ids))):
-            raise ValueError("pattern finding IDs must be sorted and unique")
+        member_ids = tuple(member.finding_id for member in self.members)
+        if member_ids != tuple(sorted(set(member_ids))):
+            raise ValueError("pattern members must be sorted and unique")
         if self.needs_review_count + self.confirmed_count != self.finding_count:
             raise ValueError("pattern review counts must match finding count")
+        if self.needs_review_count != sum(
+            member.review_status == "needs_review" for member in self.members
+        ) or self.confirmed_count != sum(
+            member.review_status == "confirmed" for member in self.members
+        ):
+            raise ValueError("pattern review counts must match member snapshots")
         operator_keys = tuple(
             (operator.operator_id, operator.operator_version) for operator in self.operators
         )
         if operator_keys != tuple(sorted(set(operator_keys))):
             raise ValueError("pattern operators must be sorted and unique")
+        if self.evidence_authorities != tuple(sorted(set(self.evidence_authorities))):
+            raise ValueError("pattern evidence authorities must be sorted and unique")
+        if self.evidence_limitations != tuple(sorted(set(self.evidence_limitations))):
+            raise ValueError("pattern evidence limitations must be sorted and unique")
+        model_derived = "model_derived_unverified" in self.evidence_authorities
+        if model_derived != (
+            self.evidence_limitations == ("semantic_model_output_not_independently_verified",)
+        ):
+            raise ValueError("model-derived patterns require their explicit limitation")
+        action_evidence_level = "model_derived_action" if model_derived else "observed_action"
+        outcome_evidence_level = "model_derived_outcome" if model_derived else "observed_outcome"
+        expected_horizontal_scope = {
+            "duplicate_effect": ("action", action_evidence_level),
+            "unexpected_effect": ("action", action_evidence_level),
+            "missing_effect": ("action", action_evidence_level),
+            "changed_grounded_effect_argument": ("action", action_evidence_level),
+            "unstable_behavior": ("outcome", outcome_evidence_level),
+            "customer_invariant_violation": ("rule", "evaluated_rule"),
+        }[self.category]
+        if (
+            self.horizontal_facets.failure_type != self.category
+            or (
+                self.horizontal_facets.affected_subject,
+                self.horizontal_facets.evidence_level,
+            )
+            != expected_horizontal_scope
+        ):
+            raise ValueError("horizontal facets must match the pattern finding type")
+        expected_reasons: tuple[PatternMembershipReason, ...] = tuple(
+            sorted(
+                (
+                    "same_finding_kind",
+                    "same_finding_category",
+                    (
+                        "same_customer_rule"
+                        if self.kind == "customer_invariant_violation"
+                        else "same_action_shape"
+                    ),
+                    "same_outcome_stability",
+                    "same_evidence_authority",
+                    "same_evidence_limitation",
+                )
+            )
+        )
+        if any(member.membership_reasons != expected_reasons for member in self.members):
+            raise ValueError("pattern members require the exact deterministic grouping reasons")
+        if info.context != {"building_pattern": True}:
+            if self.pattern_fingerprint != _pattern_fingerprint(self):
+                raise ValueError("pattern fingerprint must match its grouping facets")
+            if self.pattern_snapshot_id != _pattern_snapshot_id(self):
+                raise ValueError("pattern snapshot ID must match its exact snapshot")
         return self
 
 
@@ -1123,7 +1294,7 @@ def build_report_summary(findings: tuple[FindingSummary, ...]) -> ReportSummary:
 
 
 class UnifiedReport(_StrictModel):
-    schema_version: Literal["1.5.0"] = "1.5.0"
+    schema_version: Literal["1.6.0"] = "1.6.0"
     evidence_type: ReportEvidenceType
     evidence_schema_versions: tuple[str, ...] = Field(min_length=1)
     evidence_scope: ReportEvidenceScope
@@ -1158,12 +1329,15 @@ class UnifiedReport(_StrictModel):
             raise ValueError("exit code must match report review status")
         if self.summary.finding_count != len(self.findings):
             raise ValueError("finding count must match report findings")
-        pattern_ids = tuple(pattern.pattern_id for pattern in self.patterns)
+        pattern_ids = tuple(pattern.pattern_snapshot_id for pattern in self.patterns)
         expected_pattern_order = tuple(
-            pattern.pattern_id
+            pattern.pattern_snapshot_id
             for pattern in sorted(
                 self.patterns,
-                key=lambda pattern: (-_SEVERITY_RANK[pattern.severity], pattern.pattern_id),
+                key=lambda pattern: (
+                    -_SEVERITY_RANK[pattern.severity],
+                    pattern.pattern_snapshot_id,
+                ),
             )
         )
         if len(pattern_ids) != len(set(pattern_ids)) or pattern_ids != expected_pattern_order:
@@ -1176,7 +1350,8 @@ class UnifiedReport(_StrictModel):
         patterned_findings: set[str] = set()
         for pattern in self.patterns:
             pattern_findings: list[FindingSummary] = []
-            for finding_id in pattern.finding_ids:
+            for member in pattern.members:
+                finding_id = member.finding_id
                 finding = known_findings.get(finding_id)
                 if finding is None:
                     raise ValueError("pattern references an unknown finding")
@@ -1188,7 +1363,11 @@ class UnifiedReport(_StrictModel):
                     or finding.rule_id != pattern.rule_id
                     or finding.rule_version != pattern.rule_version
                     or finding.summary != pattern.summary
-                    or finding.review_status not in {"needs_review", "confirmed"}
+                    or finding.stability != pattern.stability
+                    or finding.evidence_authorities != pattern.evidence_authorities
+                    or finding.evidence_limitations != pattern.evidence_limitations
+                    or finding.review_status != member.review_status
+                    or finding.review_severity != member.review_severity
                 ):
                     raise ValueError("pattern fields must match its actionable findings")
                 patterned_findings.add(finding_id)

@@ -66,6 +66,7 @@ from ul_cli.dataset_review import (
     DatasetEvidenceSemanticSettings,
     create_dataset_evidence_run_context,
 )
+from ul_cli.pattern_identity import ensure_project_pattern_identity_key
 from ul_cli.report import report_evidence
 
 _PILOT_LIMIT = 10
@@ -824,9 +825,11 @@ def _save_probe_config(
             target_confirmation_sha256=resolved_target.confirmation_sha256,
         )
         if existing_config is not None:
+            ensure_project_pattern_identity_key(project_directory)
             console.print(f"  Using saved project config: {config_path}")
             return
         _ensure_private_project_directory(project_directory)
+        ensure_project_pattern_identity_key(project_directory)
         with create_private_output(config_path) as stream:
             json.dump(config.model_dump(mode="json"), stream, ensure_ascii=False, indent=2)
             stream.write("\n")
