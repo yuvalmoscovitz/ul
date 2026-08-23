@@ -816,6 +816,7 @@ class ComposedEnvironmentExecutor:
             session_id=session_id,
             correlation_id=correlation_id,
             turn_id=turn_id,
+            configuration=case.probe_context,
         )
 
     def _response_only_evidence(

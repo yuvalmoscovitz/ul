@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 
+from pydantic import JsonValue
 from ul_core.contracts import EnvironmentExecutor
 from ul_core.dataset import ObservedAgentOutput
 from ul_core.evaluation import (
@@ -11,6 +12,8 @@ from ul_core.evaluation import (
     StateObservationAuthority,
 )
 from ul_core.models import ConversationRole, ConversationTurn
+
+from ul.state_hooks import diff_json_states
 
 
 def evaluation_case_from_inputs(
@@ -144,12 +147,33 @@ def observed_outputs_from_evidence(
                         if before_turn_state_present
                         else {}
                     ),
+                    **(
+                        _state_difference_metadata(before_turn_state, turn.state_snapshot)
+                        if before_turn_state_present and turn.state_snapshot is not None
+                        else {}
+                    ),
                 },
             )
         )
         before_turn_state_present = turn.state_snapshot is not None
         before_turn_state = turn.state_snapshot
     return tuple(outputs)
+
+
+def _state_difference_metadata(
+    before: JsonValue,
+    after: JsonValue,
+) -> dict[str, JsonValue]:
+    try:
+        differences = diff_json_states(before, after, max_differences=1_000)
+    except ValueError:
+        return {
+            "committed_state_diff": [],
+            "committed_state_diff_truncated": True,
+        }
+    return {
+        "committed_state_diff": [difference.model_dump(mode="json") for difference in differences]
+    }
 
 
 def execution_evidence_requires_quarantine(evidence: ExecutionEvidence) -> bool:

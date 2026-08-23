@@ -26,7 +26,7 @@ from pydantic import (
     field_validator,
     model_validator,
 )
-from ul_core.contracts import ObservationSource, WorkerTraceFlusher
+from ul_core.contracts import ObservationSource, StateEnvironment, WorkerTraceFlusher
 from ul_core.evaluation import (
     EnvironmentCapabilities,
     EnvironmentLifecycleEvidence,
@@ -51,6 +51,7 @@ from ul_core.evaluation import (
 )
 
 from ul.probe_execution import CapabilityExecutionError, ComposedEnvironmentExecutor
+from ul.state_hooks import CallbackStateEnvironment
 
 _HEADER_NAME_PATTERN = re.compile(r"[!#$%&'*+.^_`|~0-9A-Za-z-]+")
 _ENVIRONMENT_VARIABLE_PATTERN = re.compile(r"UL_ENVIRONMENT_[A-Z][A-Z0-9_]*")
@@ -527,6 +528,8 @@ class JsonHttpEnvironmentConnection:
         max_environment_api_calls: int | None = None,
         observation_source: ObservationSource | None = None,
         worker_trace_flusher: WorkerTraceFlusher | None = None,
+        state_environment: StateEnvironment | None = None,
+        state_fixture_id: str | None = None,
         observation_timeout_seconds: float = 1.0,
         campaign_id: str | None = None,
         client: httpx.AsyncClient | None = None,
@@ -553,13 +556,22 @@ class JsonHttpEnvironmentConnection:
         self._max_response_bytes = max_response_bytes
         self._remaining_environment_api_calls = max_environment_api_calls
         self._config = config
-        self._config_sha256 = json_http_environment_config_sha256(config)
+        if state_environment is not None and isinstance(config, JsonHttpEnvironmentConfig):
+            raise ValueError(
+                "an external state environment can only compose with an isolated-response target"
+            )
+        if state_fixture_id is not None and state_environment is None:
+            raise ValueError("state_fixture_id requires an external state environment")
+        self._config_sha256 = _composed_environment_config_sha256(
+            config,
+            state_environment=state_environment,
+            state_fixture_id=state_fixture_id,
+        )
         self._lifecycle_lock = asyncio.Lock()
         self._last_reset_generation: str | int | None = None
         self._lifecycle_state_uncertain = False
         self._owns_client = client is None
         self._client = client or httpx.AsyncClient(follow_redirects=False, trust_env=False)
-        self.capabilities = json_http_environment_capabilities(config)
         self._probe_invoker = _JsonHttpProbeInvoker(
             ProbeInvokerCapabilities(
                 invoker_id=config.environment_id,
@@ -576,7 +588,7 @@ class JsonHttpEnvironmentConnection:
             ),
             self._invoke_probe,
         )
-        self._state_environment = (
+        self._state_environment: StateEnvironment | None = (
             _JsonHttpStateEnvironment(
                 StateEnvironmentCapabilities(
                     environment_id=config.environment_id,
@@ -595,7 +607,7 @@ class JsonHttpEnvironmentConnection:
                 cleanup=self._state_cleanup,
             )
             if isinstance(config, JsonHttpEnvironmentConfig)
-            else None
+            else state_environment
         )
         self._composed_executor = ComposedEnvironmentExecutor(
             self._probe_invoker,
@@ -606,15 +618,20 @@ class JsonHttpEnvironmentConnection:
             fixture_id=(
                 config.fixture_id or config.environment_id
                 if isinstance(config, JsonHttpEnvironmentConfig)
-                else None
+                else state_fixture_id
             ),
             observation_timeout_seconds=observation_timeout_seconds,
             campaign_id=campaign_id,
         )
+        self.capabilities = (
+            json_http_environment_capabilities(config)
+            if isinstance(config, JsonHttpEnvironmentConfig)
+            else self._composed_executor.capabilities
+        )
 
     @property
     def environment_id(self) -> str:
-        return self._config.environment_id
+        return self._composed_executor.environment_id
 
     @property
     def config_sha256(self) -> str:
@@ -641,6 +658,8 @@ class JsonHttpEnvironmentConnection:
         max_environment_api_calls: int | None = None,
         observation_source: ObservationSource | None = None,
         worker_trace_flusher: WorkerTraceFlusher | None = None,
+        state_environment: StateEnvironment | None = None,
+        state_fixture_id: str | None = None,
         observation_timeout_seconds: float = 1.0,
         campaign_id: str | None = None,
         client: httpx.AsyncClient | None = None,
@@ -655,6 +674,8 @@ class JsonHttpEnvironmentConnection:
             max_environment_api_calls=max_environment_api_calls,
             observation_source=observation_source,
             worker_trace_flusher=worker_trace_flusher,
+            state_environment=state_environment,
+            state_fixture_id=state_fixture_id,
             observation_timeout_seconds=observation_timeout_seconds,
             campaign_id=campaign_id,
             client=client,
@@ -679,11 +700,14 @@ class JsonHttpEnvironmentConnection:
         if isinstance(self._config, JsonHttpIsolatedResponseConfig):
             if len(case.turns) != 1:
                 raise ValueError("isolated-response targets do not support conversations")
-            if case.required_state_observation_authority is not None:
+            if (
+                self._state_environment is None
+                and case.required_state_observation_authority is not None
+            ):
                 raise ValueError("isolated-response targets do not support state observation")
             if case.timeout_after_commit_event is not None:
                 raise ValueError("isolated-response targets do not support stress events")
-            return 1
+            return self._composed_executor.api_calls_for_case(case)
         calls = json_http_environment_calls_per_conversation(self._config, len(case.turns))
         if case.timeout_after_commit_event is not None:
             if self._config.timeout_after_commit is None:
@@ -700,7 +724,9 @@ class JsonHttpEnvironmentConnection:
         async with self._lifecycle_lock:
             async with asyncio.timeout(case.timeout_seconds):
                 if isinstance(self._config, JsonHttpIsolatedResponseConfig):
-                    self._reserve_environment_api_calls(required_calls)
+                    if self._composed_executor.state_uncertain:
+                        return await self._composed_executor.execute(case)
+                    self._reserve_environment_api_calls(len(case.turns))
                     return await self._composed_executor.execute(case)
                 if case.timeout_after_commit_event is None:
                     if self._composed_executor.state_uncertain:
@@ -1710,6 +1736,34 @@ def json_http_environment_calls_per_execution(
 def json_http_environment_config_sha256(config: JsonHttpTargetConfig) -> str:
     canonical_config = json.dumps(
         config.model_dump(mode="json", exclude_none=True),
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(canonical_config).hexdigest()
+
+
+def _composed_environment_config_sha256(
+    config: JsonHttpTargetConfig,
+    *,
+    state_environment: StateEnvironment | None,
+    state_fixture_id: str | None,
+) -> str:
+    if state_environment is None:
+        return json_http_environment_config_sha256(config)
+    canonical_config = json.dumps(
+        {
+            "http_target_sha256": json_http_environment_config_sha256(config),
+            "state_capabilities": state_environment.capabilities.model_dump(
+                mode="json", exclude_none=True
+            ),
+            "state_config_sha256": (
+                state_environment.config_sha256
+                if isinstance(state_environment, CallbackStateEnvironment)
+                else None
+            ),
+            "state_fixture_id": state_fixture_id,
+        },
         ensure_ascii=True,
         sort_keys=True,
         separators=(",", ":"),
