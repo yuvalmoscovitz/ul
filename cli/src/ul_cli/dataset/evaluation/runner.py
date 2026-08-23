@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import json
 import os
-from pathlib import Path
 from typing import TextIO
 
 from ul import (
@@ -73,16 +72,17 @@ async def evaluate_interaction_records(
     progress_next_commands: CampaignNextCommands | None = None,
     progress_runtime: CampaignProgressRuntime | None = None,
     complete_progress: bool = True,
+    environment_calls_per_target_call: int = 1,
 ) -> tuple[DatasetEvaluationResult, ...]:
+    if environment_calls_per_target_call < 1:
+        raise ValueError("environment calls per target call must be positive")
     results: list[DatasetEvaluationResult] = []
     work_upper_bound = len(records) * repetitions * (1 + len(operator_ids))
     semantic_call_budget = progress_plan.calls.total_semantic_model if progress_plan else 0
     token_budget = progress_plan.tokens.maximum if progress_plan else 0
     timeout_seconds = settings.timeout_seconds if progress_plan else 1
     if progress_next_commands is None:
-        progress_next_commands = create_campaign_next_commands(
-            Path(str(getattr(output_stream, "name", "evidence.jsonl")))
-        )
+        progress_next_commands = create_campaign_next_commands()
     if progress_runtime is None:
         progress_runtime = create_campaign_progress_runtime(
             case_count=len(records),
@@ -100,6 +100,7 @@ async def evaluate_interaction_records(
     progress_tracker = progress_runtime.tracker
     campaign_control = progress_runtime.control
     signal_control = progress_runtime.signal_control
+    initial_target_calls, _, initial_environment_calls, _ = progress_tracker.actual_usage
     actual_target_calls = 0
     active_trial: tuple[int, DatasetTrialUnit] | None = None
 
@@ -244,7 +245,7 @@ async def evaluate_interaction_records(
                         trial_started_callback=trial_started,
                         trial_terminal_callback=trial_terminal,
                     )
-                except DatasetTargetDeliveryUncertain:
+                except (DatasetTargetDeliveryUncertain, asyncio.CancelledError):
                     signal_control.target_call_finished()
                     durable_flush()
                     assert active_trial is not None
@@ -254,7 +255,10 @@ async def evaluate_interaction_records(
                         unit=active_unit,
                     )
                     active_trial = None
-                    raise
+                    raise DatasetTargetDeliveryUncertain(
+                        "target delivery is uncertain; environment quarantined and trial not "
+                        "retried"
+                    ) from None
                 invariant_evaluation = (
                     evaluate_dataset_invariants(result, invariant_suite)
                     if invariant_suite is not None
@@ -263,12 +267,14 @@ async def evaluate_interaction_records(
                 if invariant_evaluation is not None and invariant_evaluations is not None:
                     invariant_evaluations.append(invariant_evaluation)
                 progress_tracker.record_usage(
-                    target_calls=actual_target_calls,
-                    semantic_calls=sum(
-                        getattr(getattr(item, "semantic_calls", None), "actual_calls", 0)
-                        for item in (*results, result)
+                    target_calls=(initial_target_calls or 0) + actual_target_calls,
+                    semantic_calls=None,
+                    environment_calls=(
+                        None
+                        if initial_environment_calls is None
+                        else initial_environment_calls
+                        + actual_target_calls * environment_calls_per_target_call
                     ),
-                    environment_calls=None,
                     tokens=None,
                 )
                 progress_tracker.emit(

@@ -62,10 +62,11 @@ from ul_cli.dataset.evaluation.runner import evaluate_interaction_records
 from ul_cli.dataset.presentation.evaluation import print_dataset_results
 from ul_cli.dataset.presentation.runtime import console, print_dataset_plain
 from ul_cli.dataset.progress import (
+    CampaignControlRequested,
     CampaignProgressRuntime,
     CampaignSignalControl,
-    create_campaign_next_commands,
     create_campaign_progress_runtime,
+    create_probe_next_commands,
 )
 from ul_cli.dataset.storage.private_files import create_private_output
 from ul_cli.dataset_campaign import DatasetCampaignPlan, create_dataset_campaign_plan
@@ -84,6 +85,7 @@ _PILOT_OPERATOR = "input.surface.typing_noise"
 _TARGET_TIMEOUT_SECONDS = 30.0
 _PROJECT_DIRECTORY = ".ul"
 _PROBE_CONFIG = "probe.json"
+_PROBE_QUARANTINE_PREFIX = "probe-quarantine"
 _DEFAULT_EVIDENCE = ".ul/runs/probe-evidence.jsonl"
 
 type ProbeTargetConnection = JsonHttpEnvironmentConnection | LocalTargetConnection
@@ -154,6 +156,13 @@ class _CampaignConfirmation(_StrictModel):
     maximum_cost_usd: float | None = None
 
 
+class _ProbeQuarantineReceipt(_StrictModel):
+    schema_version: Literal[1] = 1
+    target_confirmation_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    reason_code: str = Field(min_length=1, max_length=100)
+    independently_verified: Literal[False] = False
+
+
 @dataclass(frozen=True)
 class _ResolvedTarget:
     reference: str
@@ -209,6 +218,94 @@ def _json_sha256(value: object) -> str:
         value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False
     ).encode()
     return hashlib.sha256(encoded).hexdigest()
+
+
+def _probe_quarantine_path(resolved_target: _ResolvedTarget) -> Path:
+    return (
+        Path.cwd()
+        / _PROJECT_DIRECTORY
+        / (f"{_PROBE_QUARANTINE_PREFIX}-{resolved_target.confirmation_sha256[:16]}.json")
+    )
+
+
+def _enforce_probe_quarantine(
+    resolved_target: _ResolvedTarget,
+    resolution: Literal["environment-reset", "environment-replacement"] | None,
+) -> None:
+    path = _probe_quarantine_path(resolved_target)
+    if not path.exists():
+        return
+    try:
+        path_status = os.lstat(path)
+        if (
+            not stat.S_ISREG(path_status.st_mode)
+            or path_status.st_size > 10_000
+            or (sys.platform != "win32" and stat.S_IMODE(path_status.st_mode) & 0o077)
+        ):
+            raise ValueError("quarantine receipt exceeds its size limit")
+        descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        try:
+            descriptor_status = os.fstat(descriptor)
+            if not os.path.samestat(path_status, descriptor_status):
+                raise ValueError("quarantine receipt changed while opening")
+            raw = os.read(descriptor, 10_001)
+        finally:
+            os.close(descriptor)
+        receipt = _ProbeQuarantineReceipt.model_validate_json(raw)
+    except (OSError, ValidationError, ValueError):
+        raise ProbeFailure(
+            "target load",
+            "PROBE_QUARANTINE_RECEIPT_INVALID",
+            "The bound target quarantine receipt is invalid or unreadable.",
+            "Restore the private receipt before making any further call to this target.",
+            target_safe_to_reuse=False,
+        ) from None
+    if receipt.target_confirmation_sha256 != resolved_target.confirmation_sha256:
+        raise ProbeFailure(
+            "target load",
+            "PROBE_QUARANTINE_RECEIPT_MISMATCH",
+            "The quarantine receipt does not match the resolved target identity.",
+            "Restore the matching target and receipt; do not call the uncertain target.",
+            target_safe_to_reuse=False,
+        )
+    if resolution is None:
+        raise ProbeFailure(
+            "target load",
+            "PROBE_TARGET_QUARANTINED",
+            "A previous probe may have reached the target with uncertain delivery.",
+            "After an operator resets or replaces the test environment, rerun with "
+            "--resolve-quarantine-after environment-reset (or environment-replacement).",
+            target_safe_to_reuse=False,
+        )
+    try:
+        path.unlink()
+    except OSError:
+        raise ProbeFailure(
+            "target load",
+            "PROBE_QUARANTINE_RESOLUTION_FAILED",
+            "The operator cleanup attestation could not clear the private quarantine receipt.",
+            "Fix the .ul directory permissions and retry without calling the target.",
+            target_safe_to_reuse=False,
+        ) from None
+    console.print(
+        "Recorded target quarantine cleared after operator attestation; the receipt was removed."
+    )
+
+
+def _persist_probe_quarantine(
+    resolved_target: _ResolvedTarget,
+    reason_code: str,
+) -> None:
+    path = _probe_quarantine_path(resolved_target)
+    if path.exists():
+        return
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    receipt = _ProbeQuarantineReceipt(
+        target_confirmation_sha256=resolved_target.confirmation_sha256,
+        reason_code=reason_code,
+    )
+    with create_private_output(path) as stream:
+        stream.write(receipt.model_dump_json() + "\n")
 
 
 def _semantic_settings_snapshot(
@@ -459,9 +556,17 @@ def probe(
             help="Write stable privacy-safe progress JSON Lines to stderr.",
         ),
     ] = False,
+    resolve_quarantine_after: Annotated[
+        Literal["environment-reset", "environment-replacement"] | None,
+        typer.Option(
+            "--resolve-quarantine-after",
+            help="Attest that an operator reset or replaced a quarantined test environment.",
+        ),
+    ] = None,
 ) -> None:
     """Smoke a real target, then optionally run one bounded active-probe pilot."""
     progress_runtime: CampaignProgressRuntime | None = None
+    resolved_target: _ResolvedTarget | None = None
     try:
         records = _load_pilot_records(data)
         resolved_target = _resolve_target(
@@ -469,6 +574,7 @@ def probe(
             allow_insecure_http=allow_insecure_http,
             explicit_artifacts=tuple(target_artifact or ()),
         )
+        _enforce_probe_quarantine(resolved_target, resolve_quarantine_after)
         existing_config = _check_probe_config_binding(data, resolved_target)
         _confirm_target(resolved_target, confirmed_digest=confirm_target)
         try:
@@ -506,7 +612,7 @@ def probe(
                 ),
                 token_budget=plan.tokens.maximum,
                 maximum_wall_time_seconds=campaign_confirmation.maximum_wall_seconds,
-                next_commands=create_campaign_next_commands(output),
+                next_commands=create_probe_next_commands(),
                 json_output=progress_json,
             )
         except ProbeFailure:
@@ -529,10 +635,10 @@ def probe(
                 )
             )
         progress_runtime.tracker.record_usage(
-            target_calls=resolved_target.calls_per_execution,
-            semantic_calls=0,
+            target_calls=1,
+            semantic_calls=None,
             environment_calls=resolved_target.calls_per_execution,
-            tokens=0,
+            tokens=None,
         )
         _print_smoke(
             smoke_result,
@@ -553,6 +659,7 @@ def probe(
             confirmed_digest=confirm_paid_execution,
         ):
             console.print("Stopped after smoke. No semantic-model calls were made.")
+            progress_runtime.tracker.emit(status="cancelled", stage="terminal")
             return
         _validate_paid_execution_settings(settings)
         results = _run_campaign(
@@ -601,6 +708,17 @@ def probe(
                 target_safe_to_reuse=True,
             ) from None
     except ProbeFailure as failure:
+        if not failure.target_safe_to_reuse and resolved_target is not None:
+            try:
+                _persist_probe_quarantine(resolved_target, failure.reason_code)
+            except (OSError, ValueError):
+                failure = ProbeFailure(
+                    "output",
+                    "PROBE_QUARANTINE_PERSIST_FAILED",
+                    "UL could not persist the target quarantine receipt after an unsafe stop.",
+                    "Do not call this target; fix the private .ul directory before retrying.",
+                    target_safe_to_reuse=False,
+                )
         if progress_runtime is not None and not progress_runtime.tracker.terminal_emitted:
             progress_runtime.tracker.emit(
                 status="failed",
@@ -1305,6 +1423,21 @@ def _run_campaign(
     try:
         with progress_runtime.signal_control.installed():
             evaluator_preflight = asyncio.run(preflight_evaluator(settings))
+        if not progress_runtime.tracker.safe_boundary(
+            progress_runtime.control,
+            lambda: None,
+        ):
+            action = progress_runtime.control.requested_action()
+            assert action is not None
+            raise CampaignControlRequested(action)
+    except CampaignControlRequested:
+        raise ProbeFailure(
+            "augmentation preparation",
+            "PROBE_PAUSED_AFTER_PREFLIGHT",
+            "The campaign paused at the durable boundary after evaluator preflight.",
+            "Rerun the same confirmed probe after reviewing the progress next action.",
+            target_safe_to_reuse=True,
+        ) from None
     except Exception:
         raise ProbeFailure(
             "augmentation preparation",
@@ -1342,6 +1475,7 @@ def _run_campaign(
                         progress_plan=plan,
                         progress_runtime=progress_runtime,
                         complete_progress=False,
+                        environment_calls_per_target_call=(resolved_target.calls_per_execution),
                         run_context=run_context,
                         evaluator_preflight=evaluator_preflight,
                     )

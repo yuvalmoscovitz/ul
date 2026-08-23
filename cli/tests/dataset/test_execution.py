@@ -96,8 +96,10 @@ def test_safe_boundary_pause_flushes_a_resumable_campaign(
     )
 
     assert result.exit_code == 130, result.output
-    assert result.output.count(" next=") == 1
-    assert f"next=ul dataset evaluate --resume {output}" in result.output
+    assert result.output.count(" next_action=") == 1
+    assert "next_action=resume" in result.output
+    assert 'next_argv=["ul","dataset","evaluate","--resume","EVIDENCE"]' in result.output
+    assert str(output) not in result.output.split("next_action=", 1)[1]
     manifest = read_dataset_run_manifest(manifest_path(output))
     journal = open_dataset_trial_journal(journal_path(output), manifest)
     journal.close()
@@ -385,6 +387,39 @@ def test_execution_creates_private_explicit_output(
     assert "Complete evidence" in result.output
     assert "Next: ul dataset report" in result.output
     assert "Transfer 100" not in result.output
+    report_position = result.output.index("stage=report")
+    completion_position = result.output.index("completed stage=terminal")
+    assert report_position < completion_position
+    assert result.output.count("next_action=") == 1
+
+    def fail_presentation(*args: object, **kwargs: object) -> None:
+        del args, kwargs
+        raise RuntimeError("private-presentation-canary")
+
+    failed_output = tmp_path / "failed-results.jsonl"
+    monkeypatch.setattr(command_module, "print_dataset_results", fail_presentation)
+    failed = runner.invoke(
+        root_app,
+        [
+            "dataset",
+            "evaluate",
+            str(dataset),
+            "--operator",
+            "input.surface.disfluency_repeat",
+            "--environment-config",
+            str(target_config),
+            "--allow-insecure-http",
+            "--allow-environment-network",
+            "--confirm-test-environment",
+            "--output",
+            str(failed_output),
+        ],
+    )
+
+    assert failed.exit_code == 1
+    assert "completed stage=terminal" not in failed.output
+    assert "failed stage=terminal" in failed.output
+    assert "private-presentation-canary" not in failed.output
 
 
 def test_provider_failure_has_concise_output_and_private_sanitized_diagnostics(

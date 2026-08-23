@@ -610,6 +610,7 @@ def evaluate_dataset(
         raise typer.BadParameter(str(error)) from None
 
     trial_journal: DatasetTrialJournal | None = None
+    expected_manifest: DatasetRunManifest | None = None
     if recorded_manifest_for_resume is not None:
         assert resume is not None
         try:
@@ -1018,8 +1019,12 @@ def evaluate_dataset(
         ) from None
 
     progress_runtime = create_campaign_progress_runtime(
-        case_count=len(selected_records),
-        work_upper_bound=(len(selected_records) * repetitions * (1 + len(selected_operators))),
+        case_count=len(all_selected_records),
+        work_upper_bound=(
+            len(expected_manifest.work_plan)
+            if expected_manifest is not None
+            else len(selected_records) * repetitions * (1 + len(selected_operators))
+        ),
         target_call_budget=campaign_plan.calls.total_environment_api,
         semantic_call_budget=campaign_plan.calls.total_semantic_model,
         environment_call_budget=max_environment_api_calls,
@@ -1032,9 +1037,22 @@ def evaluate_dataset(
             )
             * settings.timeout_seconds
         ),
-        next_commands=create_campaign_next_commands(output),
+        next_commands=create_campaign_next_commands(),
         json_output=progress_json,
     )
+    if trial_journal is not None:
+        terminal_states = trial_journal.snapshot.terminal_states
+        progress_runtime.tracker.hydrate_terminal_states(terminal_states)
+        attempted_target_calls = sum(
+            state in {"completed", "errored", "inconclusive", "quarantined"}
+            for state in terminal_states.values()
+        )
+        progress_runtime.tracker.record_usage(
+            target_calls=attempted_target_calls,
+            semantic_calls=None,
+            environment_calls=0 if not terminal_states else None,
+            tokens=None,
+        )
 
     def flush_progress_boundary() -> None:
         if trial_journal is not None:
@@ -1174,6 +1192,13 @@ def evaluate_dataset(
                 durable_arguments["progress_plan"] = campaign_plan
             if "progress_runtime" in evaluation_parameters or accepts_extra_arguments:
                 durable_arguments["progress_runtime"] = progress_runtime
+            if "complete_progress" in evaluation_parameters or accepts_extra_arguments:
+                durable_arguments["complete_progress"] = False
+            if (
+                "environment_calls_per_target_call" in evaluation_parameters
+                or accepts_extra_arguments
+            ):
+                durable_arguments["environment_calls_per_target_call"] = target_calls_per_execution
             if trial_journal is not None and (
                 "trial_journal" in evaluation_parameters or accepts_extra_arguments
             ):
@@ -1293,13 +1318,19 @@ def evaluate_dataset(
             f"Resumed: {skipped_count} interaction(s) skipped (already in evidence), "
             f"{len(results)} newly evaluated."
         )
-    print_dataset_results(
-        results,
-        output,
-        augmentations_output=augmentations_output,
-        invariant_evaluations=tuple(invariant_evaluations),
-        show_report_guidance=show_report_guidance,
-    )
+    progress_runtime.tracker.emit(status="running", stage="report")
+    try:
+        print_dataset_results(
+            results,
+            output,
+            augmentations_output=augmentations_output,
+            invariant_evaluations=tuple(invariant_evaluations),
+            show_report_guidance=show_report_guidance,
+        )
+    except Exception:
+        progress_runtime.tracker.emit(status="failed", stage="terminal")
+        raise
+    progress_runtime.tracker.emit(status="completed", stage="terminal")
     prior_invariant_evaluations = (
         resume_evidence.invariant_evaluations if resume_evidence is not None else ()
     )

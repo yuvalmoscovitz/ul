@@ -3,17 +3,13 @@ from __future__ import annotations
 import asyncio
 import json
 import math
-import os
-import shlex
 import signal
-import subprocess
 import sys
 import threading
 import time
-from collections.abc import Callable, Generator
+from collections.abc import Callable, Generator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
-from pathlib import Path
 from types import FrameType
 from typing import Literal, Protocol
 
@@ -70,10 +66,15 @@ class CampaignTiming(_ProgressModel):
     maximum_wall_time_seconds: float = Field(gt=0)
 
 
+class CampaignNextCommand(_ProgressModel):
+    action: Literal["inspect_findings", "resume", "diagnose"]
+    argv: tuple[str, ...] = Field(min_length=1)
+
+
 class CampaignNextCommands(_ProgressModel):
-    inspect_findings: str = Field(min_length=1)
-    resume: str = Field(min_length=1)
-    diagnose: str = Field(min_length=1)
+    inspect_findings: CampaignNextCommand
+    resume: CampaignNextCommand
+    diagnose: CampaignNextCommand
 
 
 class CampaignPosition(_ProgressModel):
@@ -96,7 +97,7 @@ class CampaignProgressEvent(_ProgressModel):
     timing: CampaignTiming
     environment: Literal["reusable", "quarantined", "awaiting_cleanup"]
     delivery_uncertain: bool = False
-    next_command: str | None = Field(default=None, min_length=1)
+    next_command: CampaignNextCommand | None = None
 
     @model_validator(mode="after")
     def validate_terminal_command(self) -> CampaignProgressEvent:
@@ -155,7 +156,14 @@ class TerminalCampaignProgressRenderer:
                 "remaining_token_budget",
             )
         )
-        next_command = f" next={event.next_command}" if event.next_command is not None else ""
+        next_command = (
+            " next_action="
+            + event.next_command.action
+            + " next_argv="
+            + json.dumps(list(event.next_command.argv), separators=(",", ":"))
+            if event.next_command is not None
+            else ""
+        )
         self._console.print(
             f"[{event.sequence}] schema={event.schema_version} {event.status} "
             f"stage={position['stage']} case={case} "
@@ -305,6 +313,7 @@ class CampaignProgressTracker:
         self._failed = 0
         self._terminal_emitted = False
         self._environment: Literal["reusable", "quarantined", "awaiting_cleanup"] = "reusable"
+        self._comparable_started_at: float | None = None
         self._actual_usage: tuple[int | None, int | None, int | None, int | None] = (
             None,
             None,
@@ -398,6 +407,24 @@ class CampaignProgressTracker:
             raise ValueError("campaign usage cannot be negative")
         self._actual_usage = values
 
+    @property
+    def actual_usage(self) -> tuple[int | None, int | None, int | None, int | None]:
+        return self._actual_usage
+
+    def hydrate_terminal_states(self, terminal_states: Mapping[str, str]) -> None:
+        skipped_states = {"skipped", "inapplicable", "rejected", "discarded"}
+        failed_states = {"errored", "inconclusive", "quarantined"}
+        completed = sum(state == "completed" for state in terminal_states.values())
+        skipped = sum(state in skipped_states for state in terminal_states.values())
+        failed = sum(state in failed_states for state in terminal_states.values())
+        if completed + skipped + failed > self._work_upper_bound:
+            raise ValueError("durable progress exceeds the campaign work plan")
+        self._completed = completed
+        self._skipped = skipped
+        self._failed = failed
+        if any(state == "quarantined" for state in terminal_states.values()):
+            self._environment = "quarantined"
+
     def emit(
         self,
         *,
@@ -413,15 +440,21 @@ class CampaignProgressTracker:
     ) -> CampaignProgressEvent:
         if status != "running":
             self._terminal_emitted = True
-        if environment is not None:
+        if environment is not None and (
+            environment == "quarantined" or self._environment != "quarantined"
+        ):
             self._environment = environment
         self._sequence += 1
-        elapsed = max(0.0, self._clock() - self._started_at)
+        now = self._clock()
+        elapsed = max(0.0, now - self._started_at)
+        if trial_kind is not None and self._comparable_started_at is None:
+            self._comparable_started_at = now
         terminal_count = self._completed + self._skipped + self._failed
         remaining = max(0, self._work_upper_bound - terminal_count - self._running)
         eta = None
-        if terminal_count >= 3 and remaining > 0:
-            eta = elapsed / terminal_count * remaining
+        if terminal_count >= 3 and remaining > 0 and self._comparable_started_at is not None:
+            comparable_elapsed = max(0.0, now - self._comparable_started_at)
+            eta = comparable_elapsed / terminal_count * remaining
         actual_target, actual_semantic, actual_environment, actual_tokens = self._actual_usage
         target_budget, semantic_budget, environment_budget, token_budget = self._budgets
         next_command = None
@@ -503,21 +536,51 @@ class CampaignProgressTracker:
         return False
 
 
-def create_campaign_next_commands(evidence_path: Path) -> CampaignNextCommands:
-    def command(*arguments: str) -> str:
-        return subprocess.list2cmdline(arguments) if os.name == "nt" else shlex.join(arguments)
-
-    evidence = str(evidence_path)
+def create_campaign_next_commands() -> CampaignNextCommands:
     return CampaignNextCommands(
-        inspect_findings=command("ul", "report", evidence),
-        resume=command("ul", "dataset", "evaluate", "--resume", evidence),
-        diagnose=command(
-            "ul",
-            "dataset",
-            "evaluate",
-            "--resume",
-            evidence,
-            "--dry-run",
+        inspect_findings=CampaignNextCommand(
+            action="inspect_findings",
+            argv=("ul", "report", "EVIDENCE"),
+        ),
+        resume=CampaignNextCommand(
+            action="resume",
+            argv=("ul", "dataset", "evaluate", "--resume", "EVIDENCE"),
+        ),
+        diagnose=CampaignNextCommand(
+            action="diagnose",
+            argv=(
+                "ul",
+                "dataset",
+                "evaluate",
+                "--resume",
+                "EVIDENCE",
+                "--dry-run",
+            ),
+        ),
+    )
+
+
+def create_probe_next_commands() -> CampaignNextCommands:
+    return CampaignNextCommands(
+        inspect_findings=CampaignNextCommand(
+            action="inspect_findings",
+            argv=("ul", "report", "EVIDENCE"),
+        ),
+        resume=CampaignNextCommand(
+            action="resume",
+            argv=("ul", "probe", "DATA", "--target", "TARGET", "--output", "EVIDENCE"),
+        ),
+        diagnose=CampaignNextCommand(
+            action="diagnose",
+            argv=(
+                "ul",
+                "probe",
+                "DATA",
+                "--target",
+                "TARGET",
+                "--resolve-quarantine-after",
+                "ACTION",
+            ),
         ),
     )
 

@@ -688,6 +688,33 @@ def test_failed_smoke_has_staged_safe_diagnostic_and_does_not_save_config(
     assert json.loads(diagnostic.read_text())["reason_code"] == "PROBE_SMOKE_INCONCLUSIVE"
     if os.name != "nt":
         assert stat.S_IMODE(diagnostic.stat().st_mode) == 0o600
+    quarantine_receipts = list((tmp_path / ".ul").glob("probe-quarantine-*.json"))
+    assert len(quarantine_receipts) == 1
+    if os.name != "nt":
+        assert stat.S_IMODE(quarantine_receipts[0].stat().st_mode) == 0o600
+    blocked = runner.invoke(
+        app,
+        ["probe", str(dataset), "--target", "customer_agent:run"],
+    )
+
+    assert blocked.exit_code == 2
+    assert "Reason: PROBE_TARGET_QUARANTINED" in blocked.output
+
+    resolved = runner.invoke(
+        app,
+        [
+            "probe",
+            str(dataset),
+            "--target",
+            "customer_agent:run",
+            "--resolve-quarantine-after",
+            "environment-reset",
+        ],
+        input="y\n",
+    )
+
+    assert resolved.exit_code == 2
+    assert "Reason: PROBE_SMOKE_INCONCLUSIVE" in resolved.output
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="symlink creation requires privileges")
@@ -921,8 +948,13 @@ def test_public_documentation_flow_runs_real_callable_campaign_and_report(
         "terminal",
     ):
         assert f"stage={stage}" in result.output
-    assert result.output.count(" next=") == 1
-    assert f"next=ul report {output}" in result.output
+    assert result.output.count(" next_action=") == 1
+    assert "next_action=inspect_findings" in result.output
+    assert 'next_argv=["ul","report","EVIDENCE"]' in result.output
+    assert "target_calls=3" in result.output
+    assert "environment_calls=3" in result.output
+    assert "semantic_calls=unknown" in result.output
+    assert "tokens=unknown" in result.output
     evidence = json.loads(output.read_text().splitlines()[0])
     assert evidence["execution_plan"]["repetitions"] == 1
     assert evidence["execution_plan"]["dataset_planned_target_calls"] == 2
@@ -1064,5 +1096,7 @@ done
     assert result.exit_code == 0, result.output
     assert "Response structure: dict;" in result.output
     assert "transport" not in result.output
+    assert result.output.count("next_action=") == 1
+    assert "next_action=resume" in result.output
     saved = json.loads((tmp_path / ".ul" / "probe.json").read_text())
     assert saved["target_kind"] == "command"
