@@ -1,8 +1,10 @@
 from __future__ import annotations
 
-from typing import Literal, Self
+import re
+from datetime import datetime
+from typing import Annotated, Literal, Self
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, JsonValue, model_validator
 
 ReportEvidenceType = Literal[
     "dataset_evaluation",
@@ -53,6 +55,11 @@ _IDENTIFIER_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$"
 _VERSION_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9._+-]{0,49}$"
 _FINDING_ID_PATTERN = r"^ulf_v1_[0-9a-f]{64}$"
 _PATTERN_ID_PATTERN = r"^ulp_v1_[0-9a-f]{64}$"
+_RUN_RECEIPT_ID_PATTERN = r"^ulrr_v1_[A-Za-z0-9][A-Za-z0-9._-]{0,90}$"
+_SHA256_PATTERN = r"^[0-9a-f]{64}$"
+_JSON_POINTER_PATTERN = re.compile(r"(?:/(?:[^~/]|~[01])*)*")
+_MAXIMUM_RUN_RECEIPT_BYTES = 1_000_000
+_FindingReferenceCode = Annotated[str, Field(pattern=_IDENTIFIER_PATTERN)]
 _SEVERITY_RANK: dict[FindingSeverity, int] = {
     "unrated": 0,
     "low": 1,
@@ -75,6 +82,449 @@ class ReportInputError(ValueError):
 
 class _StrictModel(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+
+class VersionedReference(_StrictModel):
+    id: str = Field(pattern=_IDENTIFIER_PATTERN)
+    version: str = Field(pattern=_VERSION_PATTERN)
+
+
+class EvidencePointer(_StrictModel):
+    pointer_id: str = Field(pattern=_IDENTIFIER_PATTERN)
+    kind: Literal[
+        "input",
+        "response",
+        "action",
+        "rule",
+        "state",
+        "tool_call",
+        "tool_result",
+        "lifecycle",
+        "trace",
+    ]
+    artifact_sha256: str = Field(pattern=_SHA256_PATTERN)
+    record_id: str | None = Field(default=None, min_length=1, max_length=500)
+    json_pointer: str = Field(max_length=2_000)
+    arm: Literal["source", "probe", "shared"]
+    authority: Literal[
+        "customer_declared",
+        "deterministic_evaluator",
+        "invoker_self_reported",
+        "source_self_reported",
+        "environment_self_reported",
+        "independent_observer",
+    ]
+    source_id: str = Field(min_length=1, max_length=500)
+
+    @model_validator(mode="after")
+    def validate_json_pointer(self) -> Self:
+        if _JSON_POINTER_PATTERN.fullmatch(self.json_pointer) is None:
+            raise ValueError("evidence pointer must be an RFC 6901 JSON pointer")
+        return self
+
+
+class ProbeChange(_StrictModel):
+    kind: Literal["input", "context", "turn_sequence", "state_setup", "event_behavior"]
+    source_evidence_pointer_ids: tuple[str, ...] = Field(min_length=1, max_length=100)
+    probe_evidence_pointer_ids: tuple[str, ...] = Field(min_length=1, max_length=100)
+
+    @model_validator(mode="after")
+    def validate_pointer_ids(self) -> Self:
+        for pointer_ids in (
+            self.source_evidence_pointer_ids,
+            self.probe_evidence_pointer_ids,
+        ):
+            if pointer_ids != tuple(sorted(set(pointer_ids))):
+                raise ValueError("probe change evidence pointer IDs must be sorted and unique")
+        return self
+
+
+class ObservedDelta(_StrictModel):
+    kind: Literal["response", "action", "rule", "state"]
+    change: Literal["added", "removed", "changed", "violated", "unstable"]
+    subject: str | None = Field(default=None, pattern=_IDENTIFIER_PATTERN)
+    evidence_pointer_ids: tuple[str, ...] = Field(min_length=1, max_length=100)
+
+    @model_validator(mode="after")
+    def validate_pointer_ids(self) -> Self:
+        if self.evidence_pointer_ids != tuple(sorted(set(self.evidence_pointer_ids))):
+            raise ValueError("delta evidence pointer IDs must be sorted and unique")
+        return self
+
+
+class RepetitionEvidence(_StrictModel):
+    requested: int = Field(ge=1)
+    conclusive: int = Field(ge=0)
+    violated: int = Field(ge=0)
+    inconclusive: int = Field(ge=0)
+    stability: Literal["stable", "unstable", "inconclusive"]
+    reproducibility: Literal[
+        "reproduced",
+        "intermittent",
+        "not_reproduced",
+        "not_established",
+    ]
+
+    @model_validator(mode="after")
+    def validate_counts(self) -> Self:
+        if self.conclusive + self.inconclusive != self.requested:
+            raise ValueError("repetition counts must match requested repetitions")
+        if self.violated > self.conclusive:
+            raise ValueError("violated repetitions cannot exceed conclusive repetitions")
+        expected_reproducibility = (
+            "not_established"
+            if self.conclusive == 0
+            else "not_reproduced"
+            if self.violated == 0
+            else "reproduced"
+            if self.violated == self.conclusive
+            else "intermittent"
+        )
+        if self.reproducibility != expected_reproducibility:
+            raise ValueError("reproducibility must match observed repetition counts")
+        if self.conclusive == 0 and self.stability != "inconclusive":
+            raise ValueError("evidence without a conclusive repetition is inconclusive")
+        if self.reproducibility == "intermittent" and self.stability != "unstable":
+            raise ValueError("intermittent reproduction is unstable")
+        return self
+
+
+class FindingOccurrence(_StrictModel):
+    schema_version: Literal["1.0.0"] = "1.0.0"
+    occurrence_id: str = Field(pattern=_FINDING_ID_PATTERN)
+    kind: FindingKind
+    category: FindingCategory
+    campaign_id: str | None = Field(default=None, min_length=1, max_length=500)
+    source_interaction_id: str | None = Field(default=None, min_length=1, max_length=500)
+    fixture: VersionedReference | None = None
+    case_id: str = Field(min_length=1, max_length=500)
+    operator: VersionedReference
+    bundle: VersionedReference | None = None
+    probe_change: ProbeChange
+    observed_deltas: tuple[ObservedDelta, ...] = Field(min_length=1, max_length=100)
+    violated_rule: VersionedReference | None = None
+    evidence_pointers: tuple[EvidencePointer, ...] = Field(min_length=1, max_length=500)
+    repetitions: RepetitionEvidence
+    required_capabilities: tuple[_FindingReferenceCode, ...] = Field(default=(), max_length=100)
+    limitations: tuple[_FindingReferenceCode, ...] = Field(default=(), max_length=100)
+    inconclusive_reasons: tuple[_FindingReferenceCode, ...] = Field(default=(), max_length=100)
+    review_history_ids: tuple[_FindingReferenceCode, ...] = Field(default=(), max_length=1_000)
+    run_receipt_id: str | None = Field(default=None, pattern=_RUN_RECEIPT_ID_PATTERN)
+    next_action: FindingNextAction
+
+    @model_validator(mode="after")
+    def validate_occurrence(self) -> Self:
+        if self.kind == "behavior_difference":
+            if self.category == "customer_invariant_violation" or self.violated_rule is not None:
+                raise ValueError("behavior occurrences cannot claim a customer rule violation")
+        elif self.category != "customer_invariant_violation" or self.violated_rule is None:
+            raise ValueError("invariant occurrences require a violated customer rule")
+        pointer_ids = tuple(pointer.pointer_id for pointer in self.evidence_pointers)
+        if pointer_ids != tuple(sorted(set(pointer_ids))):
+            raise ValueError("evidence pointers must be sorted and unique")
+        referenced_pointer_ids = {
+            *self.probe_change.source_evidence_pointer_ids,
+            *self.probe_change.probe_evidence_pointer_ids,
+            *(
+                pointer_id
+                for delta in self.observed_deltas
+                for pointer_id in delta.evidence_pointer_ids
+            ),
+        }
+        if not referenced_pointer_ids.issubset(pointer_ids):
+            raise ValueError("finding occurrence references an unknown evidence pointer")
+        if referenced_pointer_ids != set(pointer_ids):
+            raise ValueError("finding occurrence contains unused evidence pointers")
+        pointers_by_id = {pointer.pointer_id: pointer for pointer in self.evidence_pointers}
+        source_pointer_ids = set(self.probe_change.source_evidence_pointer_ids)
+        probe_pointer_ids = set(self.probe_change.probe_evidence_pointer_ids)
+        if source_pointer_ids & probe_pointer_ids:
+            raise ValueError("source and probe evidence pointers must be disjoint")
+        if any(pointers_by_id[pointer_id].arm != "source" for pointer_id in source_pointer_ids):
+            raise ValueError("source change evidence must reference the source arm")
+        if any(pointers_by_id[pointer_id].arm != "probe" for pointer_id in probe_pointer_ids):
+            raise ValueError("probe change evidence must reference the probe arm")
+        change_pointer_kinds = {
+            "input": {"input"},
+            "context": {"input"},
+            "turn_sequence": {"input"},
+            "state_setup": {"state"},
+            "event_behavior": {"action", "tool_call", "tool_result", "lifecycle"},
+        }[self.probe_change.kind]
+        if any(
+            pointers_by_id[pointer_id].kind not in change_pointer_kinds
+            for pointer_id in source_pointer_ids | probe_pointer_ids
+        ):
+            raise ValueError("probe change references incompatible evidence")
+        delta_pointer_kinds = {
+            "response": {"response"},
+            "action": {"action", "tool_call", "tool_result"},
+            "rule": {"rule"},
+            "state": {"state"},
+        }
+        if any(
+            pointers_by_id[pointer_id].kind not in delta_pointer_kinds[delta.kind]
+            for delta in self.observed_deltas
+            for pointer_id in delta.evidence_pointer_ids
+        ):
+            raise ValueError("observed delta references incompatible evidence")
+        for delta in self.observed_deltas:
+            delta_arms = {
+                pointers_by_id[pointer_id].arm for pointer_id in delta.evidence_pointer_ids
+            }
+            if delta.change == "changed" and not {"source", "probe"}.issubset(delta_arms):
+                raise ValueError("changed deltas require source and probe evidence")
+            if delta.change in {"added", "violated", "unstable"} and "probe" not in delta_arms:
+                raise ValueError(f"{delta.change} deltas require probe evidence")
+            if delta.change == "removed" and "source" not in delta_arms:
+                raise ValueError("removed deltas require source evidence")
+        required_category_delta = {
+            "duplicate_effect": ("action", "added"),
+            "unexpected_effect": ("action", "added"),
+            "missing_effect": ("action", "removed"),
+            "changed_grounded_effect_argument": ("action", "changed"),
+            "unstable_behavior": (None, "unstable"),
+            "customer_invariant_violation": ("rule", "violated"),
+        }[self.category]
+        if not any(
+            (required_category_delta[0] is None or delta.kind == required_category_delta[0])
+            and delta.change == required_category_delta[1]
+            for delta in self.observed_deltas
+        ):
+            raise ValueError("finding category must match its observed delta")
+        if self.category == "unstable_behavior" and self.repetitions.stability != "unstable":
+            raise ValueError("unstable findings require unstable repetition evidence")
+        rule_violation_deltas = tuple(
+            delta
+            for delta in self.observed_deltas
+            if delta.kind == "rule" and delta.change == "violated"
+        )
+        if self.violated_rule is None and rule_violation_deltas:
+            raise ValueError("violated rules require an exact rule violation delta")
+        if self.violated_rule is not None and (
+            len(rule_violation_deltas) != 1
+            or rule_violation_deltas[0].subject != self.violated_rule.id
+        ):
+            raise ValueError("violated rule identity must match one exact rule violation delta")
+        for values, label in (
+            (self.required_capabilities, "required capabilities"),
+            (self.limitations, "limitations"),
+            (self.inconclusive_reasons, "inconclusive reasons"),
+            (self.review_history_ids, "review history IDs"),
+        ):
+            if values != tuple(sorted(set(values))):
+                raise ValueError(f"{label} must be sorted and unique")
+        if self.repetitions.inconclusive == 0 and self.inconclusive_reasons:
+            raise ValueError("conclusive occurrences cannot declare inconclusive reasons")
+        if self.repetitions.inconclusive > 0 and not self.inconclusive_reasons:
+            raise ValueError("inconclusive repetitions require at least one reason")
+        return self
+
+
+class ToolExchangeReceipt(_StrictModel):
+    sequence: int = Field(ge=1)
+    call: JsonValue
+    result: JsonValue | None = None
+    authority: Literal[
+        "invoker_self_reported",
+        "source_self_reported",
+        "environment_self_reported",
+        "independent_observer",
+    ]
+    source_id: str = Field(min_length=1, max_length=500)
+
+
+class StateReceipt(_StrictModel):
+    value: JsonValue
+    authority: Literal["environment_self_reported", "independent_observer"]
+    observer_id: str | None = Field(default=None, min_length=1, max_length=500)
+
+    @model_validator(mode="after")
+    def validate_observer(self) -> Self:
+        if (self.authority == "independent_observer") != (self.observer_id is not None):
+            raise ValueError("only independent state evidence names an observer")
+        return self
+
+
+class LifecycleReceipt(_StrictModel):
+    phase: Literal["initial_reset", "setup", "execution", "cleanup_reset"]
+    status: Literal["succeeded", "failed", "not_attempted", "unknown"]
+    evidence_pointer_ids: tuple[str, ...] = Field(default=(), max_length=100)
+    limitation: str | None = Field(default=None, min_length=1, max_length=500)
+
+    @model_validator(mode="after")
+    def validate_lifecycle(self) -> Self:
+        if self.evidence_pointer_ids != tuple(sorted(set(self.evidence_pointer_ids))):
+            raise ValueError("lifecycle evidence pointer IDs must be sorted and unique")
+        if (self.status != "succeeded") != (self.limitation is not None):
+            raise ValueError("unverified lifecycle phases require one limitation")
+        return self
+
+
+class ProvenanceReceipt(_StrictModel):
+    role: Literal["target", "model", "evaluator", "environment", "observer"]
+    id: str = Field(min_length=1, max_length=500)
+    version: str | None = Field(default=None, min_length=1, max_length=100)
+    config_sha256: str | None = Field(default=None, pattern=_SHA256_PATTERN)
+
+
+class UsageReceipt(_StrictModel):
+    input_tokens: int | None = Field(default=None, ge=0)
+    output_tokens: int | None = Field(default=None, ge=0)
+    total_tokens: int | None = Field(default=None, ge=0)
+    cost: float | None = Field(default=None, ge=0, allow_inf_nan=False)
+    duration_ms: float | None = Field(default=None, ge=0, allow_inf_nan=False)
+
+    @model_validator(mode="after")
+    def validate_tokens(self) -> Self:
+        if (
+            self.total_tokens is not None
+            and self.input_tokens is not None
+            and self.output_tokens is not None
+            and self.total_tokens != self.input_tokens + self.output_tokens
+        ):
+            raise ValueError("total tokens must equal input plus output tokens")
+        return self
+
+
+class RedactionReceipt(_StrictModel):
+    policy_sha256: str = Field(pattern=_SHA256_PATTERN)
+    matched_value_count: int = Field(ge=0)
+    redacted_value_count: int = Field(ge=0)
+    retained_private_value_count: int = Field(ge=0)
+
+    @model_validator(mode="after")
+    def validate_counts(self) -> Self:
+        if (
+            self.redacted_value_count + self.retained_private_value_count
+            != self.matched_value_count
+        ):
+            raise ValueError("redaction accounting must cover every matched value")
+        return self
+
+
+class RunReceipt(_StrictModel):
+    schema_version: Literal["1.0.0"] = "1.0.0"
+    receipt_id: str = Field(pattern=_RUN_RECEIPT_ID_PATTERN)
+    disclosure: Literal["private"] = "private"
+    evidence_scope: ReportEvidenceScope
+    source_input: JsonValue
+    probe_input: JsonValue
+    source_response: JsonValue
+    probe_response: JsonValue
+    tool_exchanges: tuple[ToolExchangeReceipt, ...] = Field(default=(), max_length=1_000)
+    state_before: StateReceipt | None = None
+    state_after: StateReceipt | None = None
+    lifecycle: tuple[LifecycleReceipt, ...] = Field(default=(), max_length=10)
+    provenance: tuple[ProvenanceReceipt, ...] = Field(default=(), max_length=100)
+    trace_references: tuple[str, ...] = Field(default=(), max_length=1_000)
+    usage: UsageReceipt | None = None
+    redaction: RedactionReceipt
+    evidence_pointers: tuple[EvidencePointer, ...] = Field(min_length=1, max_length=500)
+    limitations: tuple[str, ...] = Field(default=(), max_length=100)
+    recorded_at: datetime
+
+    @model_validator(mode="after")
+    def validate_receipt(self) -> Self:
+        sequences = tuple(exchange.sequence for exchange in self.tool_exchanges)
+        if sequences != tuple(range(1, len(sequences) + 1)):
+            raise ValueError("tool exchanges must be contiguous and ordered")
+        pointer_ids = tuple(pointer.pointer_id for pointer in self.evidence_pointers)
+        if pointer_ids != tuple(sorted(set(pointer_ids))):
+            raise ValueError("receipt evidence pointers must be sorted and unique")
+        known_pointer_ids = set(pointer_ids)
+        if any(
+            not set(phase.evidence_pointer_ids).issubset(known_pointer_ids)
+            for phase in self.lifecycle
+        ):
+            raise ValueError("lifecycle references an unknown evidence pointer")
+        pointers_by_id = {pointer.pointer_id: pointer for pointer in self.evidence_pointers}
+        if any(
+            pointers_by_id[pointer_id].kind != "lifecycle"
+            for phase in self.lifecycle
+            for pointer_id in phase.evidence_pointer_ids
+        ):
+            raise ValueError("lifecycle phases require lifecycle evidence pointers")
+        if any(
+            phase.status == "succeeded" and not phase.evidence_pointer_ids
+            for phase in self.lifecycle
+        ):
+            raise ValueError("successful lifecycle phases require exact evidence")
+        lifecycle_phases = tuple(phase.phase for phase in self.lifecycle)
+        if len(lifecycle_phases) != len(set(lifecycle_phases)):
+            raise ValueError("lifecycle phases must be unique")
+        lifecycle_order = {
+            "initial_reset": 0,
+            "setup": 1,
+            "execution": 2,
+            "cleanup_reset": 3,
+        }
+        if lifecycle_phases != tuple(sorted(lifecycle_phases, key=lifecycle_order.__getitem__)):
+            raise ValueError("lifecycle phases must preserve execution order")
+        if self.evidence_scope == "response_only":
+            if self.state_before is not None or self.state_after is not None:
+                raise ValueError("response-only receipts cannot contain state evidence")
+            if any(pointer.kind == "state" for pointer in self.evidence_pointers):
+                raise ValueError("response-only receipts cannot reference state evidence")
+        elif self.state_before is None or self.state_after is None:
+            raise ValueError("response-and-state receipts require before and after state")
+        core_evidence_roles = {
+            (pointer.kind, pointer.arm)
+            for pointer in self.evidence_pointers
+            if pointer.kind in {"input", "response"}
+        }
+        if not {
+            ("input", "source"),
+            ("input", "probe"),
+            ("response", "source"),
+            ("response", "probe"),
+        }.issubset(core_evidence_roles):
+            raise ValueError("run receipts require source and probe input and response evidence")
+        for values, label in (
+            (self.trace_references, "trace references"),
+            (self.limitations, "receipt limitations"),
+        ):
+            if values != tuple(sorted(set(values))):
+                raise ValueError(f"{label} must be sorted and unique")
+            if any(not value or len(value) > 500 for value in values):
+                raise ValueError(f"{label} must contain bounded non-empty values")
+        provenance_keys = tuple((item.role, item.id, item.version) for item in self.provenance)
+        expected_provenance_keys = tuple(
+            sorted(
+                set(provenance_keys),
+                key=lambda item: (item[0], item[1], item[2] or ""),
+            )
+        )
+        if provenance_keys != expected_provenance_keys:
+            raise ValueError("provenance must be sorted and unique")
+        observer_ids = {item.id for item in self.provenance if item.role == "observer"}
+        independent_source_ids = {
+            pointer.source_id
+            for pointer in self.evidence_pointers
+            if pointer.authority == "independent_observer"
+        } | {
+            exchange.source_id
+            for exchange in self.tool_exchanges
+            if exchange.authority == "independent_observer"
+        }
+        if self.state_before is not None and self.state_before.authority == "independent_observer":
+            assert self.state_before.observer_id is not None
+            independent_source_ids.add(self.state_before.observer_id)
+        if self.state_after is not None and self.state_after.authority == "independent_observer":
+            assert self.state_after.observer_id is not None
+            independent_source_ids.add(self.state_after.observer_id)
+        if not independent_source_ids.issubset(observer_ids):
+            raise ValueError("independent evidence requires matching observer provenance")
+        if self.recorded_at.tzinfo is None or self.recorded_at.utcoffset() is None:
+            raise ValueError("receipt timestamp must include a UTC offset")
+        if len(self.model_dump_json().encode("utf-8")) > _MAXIMUM_RUN_RECEIPT_BYTES:
+            raise ValueError("run receipt exceeds the 1 MB JSON limit")
+        return self
+
+
+def serialize_run_receipt(receipt: RunReceipt) -> str:
+    serialized = receipt.model_dump_json()
+    return RunReceipt.model_validate_json(serialized).model_dump_json()
 
 
 class FindingSummary(_StrictModel):
