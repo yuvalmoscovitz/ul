@@ -29,7 +29,7 @@ CampaignStage = Literal[
 
 
 class ProgressTextStream(Protocol):
-    def write(self, value: str) -> object: ...
+    def write(self, value: str, /) -> object: ...
 
     def flush(self) -> object: ...
 
@@ -190,6 +190,12 @@ class CampaignControl:
             return self._request
 
 
+class CampaignControlRequested(RuntimeError):
+    def __init__(self, action: Literal["pause", "cancel"]) -> None:
+        super().__init__(f"campaign {action} requested at a durable safe boundary")
+        self.action = action
+
+
 class CampaignSignalControl:
     def __init__(self, control: CampaignControl) -> None:
         self._control = control
@@ -303,6 +309,34 @@ class CampaignProgressTracker:
             )
 
         return report
+
+    def trial_skipped(self, *, case_number: int, unit: DatasetTrialUnit) -> None:
+        self._skipped += 1
+        self.emit(
+            status="running",
+            stage=unit.arm,
+            case_number=case_number,
+            operator_id=None if unit.arm == "original" else unit.operator_id,
+            trial_kind=unit.arm,
+            repetition=unit.repetition,
+            attempt=unit.attempt,
+            environment="reusable",
+        )
+
+    def trial_delivery_uncertain(self, *, case_number: int, unit: DatasetTrialUnit) -> None:
+        self._running = 0
+        self._failed += 1
+        self.emit(
+            status="failed",
+            stage=unit.arm,
+            case_number=case_number,
+            operator_id=None if unit.arm == "original" else unit.operator_id,
+            trial_kind=unit.arm,
+            repetition=unit.repetition,
+            attempt=unit.attempt,
+            environment="quarantined",
+            delivery_uncertain=True,
+        )
 
     def record_usage(
         self,

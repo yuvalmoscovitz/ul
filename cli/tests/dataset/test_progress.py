@@ -179,3 +179,27 @@ def test_signal_cancels_inflight_target_call_for_uncertainty_handling() -> None:
         assert control.requested_action() is None
 
     asyncio.run(run())
+
+
+def test_uncertain_delivery_is_terminal_and_quarantined() -> None:
+    clock_values = iter((20.0, 21.0, 22.0))
+    events = []
+    tracker = _tracker(events.append, lambda: next(clock_values))
+    unit = DatasetTrialUnit(
+        interaction_id="PRIVATE_CASE_ID",
+        operator_id="input.surface.rephrase",
+        arm="probe",
+        repetition=2,
+    )
+    tracker.trial_started(case_number=3, unit=unit)
+
+    tracker.trial_delivery_uncertain(case_number=3, unit=unit)
+
+    event = events[-1]
+    assert event.status == "failed"
+    assert event.work.running == 0
+    assert event.work.failed == 1
+    assert event.environment == "quarantined"
+    assert event.delivery_uncertain is True
+    assert event.next_command == "ul diagnose"
+    assert "PRIVATE_CASE_ID" not in event.model_dump_json()

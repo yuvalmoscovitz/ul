@@ -217,6 +217,13 @@ def evaluate_dataset(
         bool,
         typer.Option("--json", help="Emit the dry-run campaign plan as stable JSON."),
     ] = False,
+    progress_json: Annotated[
+        bool,
+        typer.Option(
+            "--progress-json",
+            help="Emit versioned campaign progress JSON lines on stderr.",
+        ),
+    ] = False,
     show_sensitive_values: Annotated[
         bool,
         typer.Option(
@@ -1067,6 +1074,12 @@ def evaluate_dataset(
                         )
         failure_parameter = "--resume" if resume is not None else "--output"
         if resume is None:
+            assert expected_manifest is not None
+            assert run_manifest_path is not None
+            assert run_journal_path is not None
+            persist_dataset_run_manifest(run_manifest_path, expected_manifest)
+            trial_journal = create_dataset_trial_journal(run_journal_path, expected_manifest)
+            create_private_output(output).close()
             output_stream, initial_evidence = open_resume_output(
                 output,
                 expected_context=run_context,
@@ -1126,6 +1139,8 @@ def evaluate_dataset(
                 if trial_journal is not None and accepts_trial_journal
                 else {}
             )
+            if progress_json:
+                durable_arguments["progress_json"] = True
             evaluation_runner = cast(Any, evaluate_interaction_records)
             if invariant_suite is not None:
                 evaluation_coroutine = evaluation_runner(

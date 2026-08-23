@@ -265,6 +265,7 @@ def test_execution_creates_private_explicit_output(
         saved_augmentations: object,
         redaction_engine: object,
         evaluator_preflight: object,
+        trial_journal: object,
     ) -> tuple[object, ...]:
         del settings, target, run_context, augmentation_ledger, saved_augmentations
         assert evaluator_preflight == _evaluator_preflight()
@@ -516,6 +517,7 @@ def test_execution_wires_redaction_into_records_pipeline_and_run_context(
         saved_augmentations: object,
         redaction_engine: object,
         evaluator_preflight: object,
+        trial_journal: object,
     ) -> tuple[object, ...]:
         del (
             repetitions,
@@ -670,6 +672,7 @@ def test_target_config_runs_nested_request_and_response_against_loopback(
             saved_augmentations: object,
             redaction_engine: object,
             evaluator_preflight: object,
+            trial_journal: object,
         ) -> tuple[object, ...]:
             del (
                 operator_ids,
