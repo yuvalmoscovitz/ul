@@ -19,6 +19,8 @@ from ul.dataset_invariants import (
     DatasetInvariantEvaluation,
     DatasetInvariantRule,
     DatasetInvariantRuleResult,
+    evaluate_dataset_invariant_rule_trials,
+    evaluate_dataset_invariant_rules,
 )
 from ul.event_stress import (
     CorrectionStressResult,
@@ -97,6 +99,15 @@ class _ReceiptBuild:
     category_pointer_ids: tuple[str, ...]
     rule_definition_pointer_id: str | None = None
     artifacts: tuple[EvidenceArtifact, ...] = ()
+    execution_available: bool = True
+
+
+@dataclass(frozen=True)
+class _BehaviorRepetitionEvidence:
+    source_value: JsonValue | None
+    probe_value: JsonValue | None
+    outcome: Literal["finding_observed", "finding_not_observed", "inconclusive"]
+    inconclusive_reason: str | None = None
 
 
 def adapt_dataset_behavior_finding(
@@ -113,14 +124,16 @@ def adapt_dataset_behavior_finding(
     _validate_repetition_bound(baseline_trials, trial_set.trials)
     source_receipts: list[_ReceiptBuild] = []
     probe_receipts: list[_ReceiptBuild] = []
+    repetition_evidence: list[_BehaviorRepetitionEvidence] = []
     for baseline_trial, probe_trial in zip(baseline_trials, trial_set.trials, strict=True):
-        source_category_value, probe_category_value = _behavior_repetition_evidence(
+        evidence = _behavior_repetition_evidence(
             finding,
             baseline_trial,
             probe_trial,
             result.source.raw_input,
             result.augmentation.source_frames[0],
         )
+        repetition_evidence.append(evidence)
         source_receipts.append(
             _dataset_receipt(
                 repetition=baseline_trial.repetition,
@@ -128,8 +141,8 @@ def adapt_dataset_behavior_finding(
                 input_value=result.source.raw_input,
                 target_output=baseline_trial.target_output,
                 execution_evidence=baseline_trial.execution_evidence,
-                category=finding.category,
-                category_value=source_category_value,
+                category=finding.category if evidence.source_value is not None else None,
+                category_value=evidence.source_value,
                 context=context,
             )
         )
@@ -140,8 +153,8 @@ def adapt_dataset_behavior_finding(
                 input_value=case.candidate.augmented_input,
                 target_output=probe_trial.target_output,
                 execution_evidence=probe_trial.execution_evidence,
-                category=finding.category,
-                category_value=probe_category_value,
+                category=finding.category if evidence.probe_value is not None else None,
+                category_value=evidence.probe_value,
                 context=context,
             )
         )
@@ -154,6 +167,7 @@ def adapt_dataset_behavior_finding(
         operator_version=case.candidate.operator_version,
         source_receipts=source_receipts,
         probe_receipts=probe_receipts,
+        repetition_evidence=repetition_evidence,
         context=context,
     )
 
@@ -236,6 +250,18 @@ def adapt_dataset_invariant_finding(
         source_evaluation.trials,
         probe_evaluation.trials,
     )
+    _require_dataset_recomputed_rule(
+        rule_definition,
+        baseline_trials,
+        evaluation.observation_authority,
+        source_evaluation,
+    )
+    _require_dataset_recomputed_rule(
+        rule_definition,
+        trial_set.trials,
+        evaluation.observation_authority,
+        probe_evaluation,
+    )
     source_receipts: list[_ReceiptBuild] = []
     probe_receipts: list[_ReceiptBuild] = []
     for baseline_trial, probe_trial, source_rule_trial, probe_rule_trial in zip(
@@ -297,6 +323,7 @@ def adapt_stateful_invariant_finding(
     result: StatefulFindingResult,
     rule_definition: DatasetInvariantRule,
     *,
+    observation_authority: Literal["agent_response", "committed_state_snapshot"],
     context: FindingAdapterContext,
 ) -> FindingEvidencePackage:
     source_evaluation, probe_evaluation = _stateful_rule_pair(result, rule_definition)
@@ -304,6 +331,13 @@ def adapt_stateful_invariant_finding(
         result.trials,
         source_evaluation.trials,
         probe_evaluation.trials,
+    )
+    source_outputs, probe_outputs = _stateful_rule_outputs(result)
+    _require_stateful_recomputed_rule(
+        rule_definition, source_outputs, observation_authority, source_evaluation
+    )
+    _require_stateful_recomputed_rule(
+        rule_definition, probe_outputs, observation_authority, probe_evaluation
     )
     source_receipts: list[_ReceiptBuild] = []
     probe_receipts: list[_ReceiptBuild] = []
@@ -313,10 +347,8 @@ def adapt_stateful_invariant_finding(
         probe_evaluation.trials,
         strict=True,
     ):
-        if trial.baseline_execution_evidence is None or trial.variation_execution_evidence is None:
-            raise ValueError("stateful invariant findings require both execution arms")
         source_receipts.append(
-            _execution_receipt(
+            _stateful_receipt(
                 repetition=trial.repetition,
                 arm="source",
                 input_value=_stateful_input(result, "source"),
@@ -329,7 +361,7 @@ def adapt_stateful_invariant_finding(
             )
         )
         probe_receipts.append(
-            _execution_receipt(
+            _stateful_receipt(
                 repetition=trial.repetition,
                 arm="probe",
                 input_value=_stateful_input(result, "probe"),
@@ -354,6 +386,47 @@ def adapt_stateful_invariant_finding(
         context=context,
         fixture_id=result.case.id,
         fixture_version=result.schema_version,
+        inconclusive_reasons={
+            trial.repetition: reason
+            for trial in result.trials
+            if (reason := _stateful_inconclusive_reason(trial.inconclusive_reason)) is not None
+        },
+    )
+
+
+def _stateful_receipt(
+    *,
+    repetition: int,
+    arm: Literal["source", "probe"],
+    input_value: JsonValue,
+    execution_evidence: ExecutionEvidence | None,
+    context: FindingAdapterContext,
+    category: FindingCategory,
+    category_value: JsonValue,
+    category_json_pointer: str,
+    rule_definition: DatasetInvariantRule | None = None,
+) -> _ReceiptBuild:
+    if execution_evidence is None:
+        return _unavailable_receipt(
+            repetition=repetition,
+            arm=arm,
+            input_value=input_value,
+            category=category,
+            category_value=category_value,
+            category_json_pointer=category_json_pointer,
+            context=context,
+            rule_definition=rule_definition,
+        )
+    return _execution_receipt(
+        repetition=repetition,
+        arm=arm,
+        input_value=input_value,
+        execution_evidence=execution_evidence,
+        context=context,
+        category=category,
+        category_value=category_value,
+        category_json_pointer=category_json_pointer,
+        rule_definition=rule_definition,
     )
 
 
@@ -361,6 +434,7 @@ def adapt_stateful_finding_packages(
     result: StatefulFindingResult,
     *,
     invariant_rules: tuple[DatasetInvariantRule, ...],
+    observation_authority: Literal["agent_response", "committed_state_snapshot"],
     context: FindingAdapterContext,
 ) -> tuple[FindingEvidencePackage, ...]:
     probe_rules = (
@@ -378,6 +452,7 @@ def adapt_stateful_finding_packages(
         adapt_stateful_invariant_finding(
             result,
             rules_by_id[rule_id],
+            observation_authority=observation_authority,
             context=context,
         )
         for rule_id in sorted(violated_rule_ids)
@@ -410,7 +485,16 @@ def _dataset_receipt(
             rule_definition=rule_definition,
         )
     if target_output is None:
-        raise ValueError("conclusive dataset findings require execution output")
+        return _unavailable_receipt(
+            repetition=repetition,
+            arm=arm,
+            input_value=input_value,
+            category=category,
+            category_value=category_value,
+            category_json_pointer=category_json_pointer,
+            context=context,
+            rule_definition=rule_definition,
+        )
     return _receipt_from_values(
         repetition=repetition,
         arm=arm,
@@ -437,6 +521,49 @@ def _dataset_receipt(
         category_json_pointer=category_json_pointer,
         rule_definition=rule_definition,
         limitations=("model_provenance_unavailable",),
+    )
+
+
+def _unavailable_receipt(
+    *,
+    repetition: int,
+    arm: Literal["source", "probe"],
+    input_value: JsonValue,
+    category: FindingCategory | None,
+    category_value: JsonValue | None,
+    category_json_pointer: str,
+    context: FindingAdapterContext,
+    rule_definition: DatasetInvariantRule | None = None,
+) -> _ReceiptBuild:
+    unavailable_limitation = (
+        "source_execution_unavailable" if arm == "source" else "probe_execution_unavailable"
+    )
+    return _receipt_from_values(
+        repetition=repetition,
+        arm=arm,
+        evidence_scope="response_only",
+        input_value=input_value,
+        response_value=None,
+        state_before=None,
+        state_after=None,
+        lifecycle_status="not_attempted",
+        lifecycle_limitation=unavailable_limitation,
+        response_source_id=context.invoker_source_id,
+        response_authority="invoker_self_reported",
+        state_before_source_id=context.invoker_source_id,
+        state_before_authority="invoker_self_reported",
+        state_after_source_id=context.invoker_source_id,
+        state_after_authority="invoker_self_reported",
+        environment_source_id=context.invoker_source_id,
+        artifact=input_value,
+        context=context,
+        category=category,
+        category_value=category_value,
+        category_json_pointer=category_json_pointer,
+        rule_definition=rule_definition,
+        lifecycle_json_pointer=None,
+        limitations=("model_provenance_unavailable", unavailable_limitation),
+        execution_available=False,
     )
 
 
@@ -468,6 +595,15 @@ def _execution_receipt(
         if lifecycle_status == "succeeded"
         else execution_evidence.lifecycle.failure_code or "execution_failed"
     )
+    execution_available = (
+        execution_evidence.lifecycle.terminal_status == "succeeded"
+        and execution_evidence.final_response is not None
+    )
+    receipt_limitations = ["model_provenance_unavailable"]
+    if not execution_available:
+        receipt_limitations.append(
+            "source_execution_unavailable" if arm == "source" else "probe_execution_unavailable"
+        )
     state_before_source_id, state_before_authority = _state_provenance(
         execution_evidence.initial_state,
         execution_evidence.environment_id,
@@ -479,7 +615,13 @@ def _execution_receipt(
     return _receipt_from_values(
         repetition=repetition,
         arm=arm,
-        evidence_scope=execution_evidence.evidence_scope,
+        evidence_scope=(
+            "response_and_state"
+            if execution_evidence.evidence_scope == "response_and_state"
+            and state_before is not None
+            and state_after is not None
+            else "response_only"
+        ),
         input_value=input_value,
         response_value=execution_evidence.final_response,
         state_before=state_before,
@@ -504,7 +646,8 @@ def _execution_receipt(
         state_before_json_pointer="/initial_state/value",
         state_after_json_pointer="/final_state/value",
         lifecycle_json_pointer="/lifecycle",
-        limitations=("model_provenance_unavailable",),
+        limitations=tuple(receipt_limitations),
+        execution_available=execution_available,
     )
 
 
@@ -560,6 +703,7 @@ def _receipt_from_values(
     state_after_json_pointer: str = "/state_after",
     lifecycle_json_pointer: str | None = "/lifecycle",
     limitations: tuple[str, ...] = (),
+    execution_available: bool = True,
 ) -> _ReceiptBuild:
     pointers: list[EvidencePointer] = []
     retained_artifacts: dict[str, EvidenceArtifact] = {}
@@ -780,6 +924,7 @@ def _receipt_from_values(
         category_pointer_ids=category_pointer_ids,
         rule_definition_pointer_id=rule_definition_pointer_id,
         artifacts=tuple(sorted(retained_artifacts.values(), key=lambda item: item.artifact_sha256)),
+        execution_available=execution_available,
     )
 
 
@@ -793,26 +938,31 @@ def _build_behavior_package(
     operator_version: str,
     source_receipts: list[_ReceiptBuild],
     probe_receipts: list[_ReceiptBuild],
+    repetition_evidence: list[_BehaviorRepetitionEvidence],
     context: FindingAdapterContext,
 ) -> FindingEvidencePackage:
     repetitions: list[FindingRepetition] = []
     delta_pointer_ids: list[str] = []
-    for repetition, (source, probe) in enumerate(
-        zip(source_receipts, probe_receipts, strict=True), start=1
+    for repetition, (source, probe, evidence) in enumerate(
+        zip(source_receipts, probe_receipts, repetition_evidence, strict=True), start=1
     ):
         evidence_pointer_ids = tuple(
             sorted({*source.category_pointer_ids, *probe.category_pointer_ids})
         )
-        delta_pointer_ids.extend(evidence_pointer_ids)
+        if evidence.outcome == "finding_observed":
+            delta_pointer_ids.extend(evidence_pointer_ids)
         repetitions.append(
             FindingRepetition(
                 repetition=repetition,
-                outcome="finding_observed",
+                outcome=evidence.outcome,
                 source_receipt_id=source.receipt.receipt_id,
                 probe_receipt_id=probe.receipt.receipt_id,
                 evidence_pointer_ids=evidence_pointer_ids,
+                inconclusive_reason=evidence.inconclusive_reason,
             )
         )
+    if not delta_pointer_ids:
+        raise ValueError("behavior finding adapter requires one observed repetition")
     if category in {"duplicate_effect", "unexpected_effect"}:
         change: Literal["added", "removed", "changed"] = "added"
     elif category == "missing_effect":
@@ -868,6 +1018,7 @@ def _build_invariant_package(
     context: FindingAdapterContext,
     fixture_id: str | None = None,
     fixture_version: str | None = None,
+    inconclusive_reasons: dict[int, str] | None = None,
 ) -> FindingEvidencePackage:
     repetitions: list[FindingRepetition] = []
     violated_pointer_ids: list[str] = []
@@ -889,7 +1040,10 @@ def _build_invariant_package(
                 "inconclusive"
             )
             inconclusive_reason = (
-                source_trial.reason_code
+                inconclusive_reasons.get(probe_trial.repetition)
+                if inconclusive_reasons is not None
+                and probe_trial.repetition in inconclusive_reasons
+                else source_trial.reason_code
                 if source_trial.status == "not_evaluable"
                 else probe_trial.reason_code
             )
@@ -1022,6 +1176,8 @@ def _package(
         limitations.add("correctness_not_verified")
     if inconclusive:
         limitations.add("one_or_more_repetitions_inconclusive")
+    if any(not receipt.execution_available for receipt in source_receipts):
+        limitations.add("source_execution_unavailable")
     occurrence = build_finding_occurrence(
         kind=kind,
         category=category,
@@ -1116,29 +1272,48 @@ def _behavior_repetition_evidence(
     probe_trial: DatasetEvaluationTrial,
     source_input: str,
     grounding_frame: SemanticFrame,
-) -> tuple[JsonValue, JsonValue]:
+) -> _BehaviorRepetitionEvidence:
     if source_trial.observed_frame is None or probe_trial.observed_frame is None:
-        raise ValueError("behavior findings require category evidence from every repetition")
+        unavailable_arm = "source" if source_trial.observed_frame is None else "probe"
+        execution_missing = (
+            source_trial.target_output is None
+            if unavailable_arm == "source"
+            else probe_trial.target_output is None
+        )
+        reason = (
+            f"{unavailable_arm}_execution_unavailable"
+            if execution_missing
+            else f"{unavailable_arm}_evaluation_unavailable"
+        )
+        return _BehaviorRepetitionEvidence(
+            source_value=_action_values(source_trial.observed_frame),
+            probe_value=_action_values(probe_trial.observed_frame),
+            outcome="inconclusive",
+            inconclusive_reason=reason,
+        )
     recomputed_findings = compare_action_outcomes(
         source_trial.observed_frame,
         probe_trial.observed_frame,
         source_input,
         grounding_frame=grounding_frame,
     )
-    if not any(
+    finding_observed = any(
         _behavior_finding_signature(candidate) == _behavior_finding_signature(finding)
         for candidate in recomputed_findings
-    ):
-        raise ValueError("behavior finding does not match its exact execution repetition")
-    source_actions = tuple(
-        outcome for outcome in source_trial.observed_frame.outcomes if outcome.kind == "action"
     )
-    probe_actions = tuple(
-        outcome for outcome in probe_trial.observed_frame.outcomes if outcome.kind == "action"
+    return _BehaviorRepetitionEvidence(
+        source_value=_action_values(source_trial.observed_frame),
+        probe_value=_action_values(probe_trial.observed_frame),
+        outcome="finding_observed" if finding_observed else "finding_not_observed",
     )
-    return (
-        cast(JsonValue, [outcome.model_dump(mode="json") for outcome in source_actions]),
-        cast(JsonValue, [outcome.model_dump(mode="json") for outcome in probe_actions]),
+
+
+def _action_values(frame: SemanticFrame | None) -> JsonValue | None:
+    if frame is None:
+        return None
+    return cast(
+        JsonValue,
+        [outcome.model_dump(mode="json") for outcome in frame.outcomes if outcome.kind == "action"],
     )
 
 
@@ -1197,6 +1372,75 @@ def _stateful_rule_pair(
         _matching_rule(source_rules, rule_definition),
         _matching_rule(probe_rules, rule_definition),
     )
+
+
+def _require_dataset_recomputed_rule(
+    rule_definition: DatasetInvariantRule,
+    trials: tuple[DatasetEvaluationTrial, ...],
+    observation_authority: Literal["agent_response", "committed_state_snapshot"],
+    supplied_evaluation: DatasetInvariantRuleResult,
+) -> None:
+    recomputed = evaluate_dataset_invariant_rule_trials(
+        rule_definition,
+        trials,
+        observation_authority=observation_authority,
+    )
+    if recomputed != supplied_evaluation:
+        raise ValueError("invariant evaluation does not match its exact captured evidence")
+
+
+def _stateful_rule_outputs(
+    result: StatefulFindingResult,
+) -> tuple[
+    tuple[ObservedAgentOutput | None, ...],
+    tuple[ObservedAgentOutput | None, ...],
+]:
+    if isinstance(result, CorrectionStressResult):
+        source_outputs = tuple(
+            trial.baseline[-1].target_output if trial.baseline else None for trial in result.trials
+        )
+    else:
+        source_outputs = tuple(
+            trial.variation[0].target_output
+            if trial.inconclusive_reason is None and len(trial.variation) == 2
+            else None
+            for trial in result.trials
+        )
+    probe_outputs = tuple(
+        trial.variation[-1].target_output
+        if trial.inconclusive_reason is None and len(trial.variation) == 2
+        else None
+        for trial in result.trials
+    )
+    return source_outputs, probe_outputs
+
+
+def _stateful_inconclusive_reason(reason: str | None) -> str | None:
+    if reason is None:
+        return None
+    return {
+        "environment lifecycle failed": "environment_lifecycle_failed",
+        "environment execution timed out": "environment_execution_timed_out",
+        "environment execution failed": "environment_execution_failed",
+        (
+            "environment not called because prior execution left state uncertain"
+        ): "prior_execution_left_state_uncertain",
+    }.get(reason, "workflow_execution_inconclusive")
+
+
+def _require_stateful_recomputed_rule(
+    rule_definition: DatasetInvariantRule,
+    outputs: tuple[ObservedAgentOutput | None, ...],
+    observation_authority: Literal["agent_response", "committed_state_snapshot"],
+    supplied_evaluation: DatasetInvariantRuleResult,
+) -> None:
+    (recomputed_evaluation,) = evaluate_dataset_invariant_rules(
+        (rule_definition,),
+        outputs,
+        observation_authority=observation_authority,
+    )
+    if supplied_evaluation != recomputed_evaluation:
+        raise ValueError("invariant evaluation does not match its exact captured evidence")
 
 
 def _matching_rule(

@@ -112,7 +112,20 @@ def _dataset_result() -> DatasetEvaluationResult:
             trials=tuple(
                 DatasetEvaluationTrial(
                     repetition=repetition,
-                    target_output=ObservedAgentOutput(raw_output={"status": output}),
+                    target_output=ObservedAgentOutput(
+                        raw_output={
+                            "status": output,
+                            "amount": 100 if arm == "current_baseline" else 200,
+                            "requested_amount": 100,
+                        },
+                        metadata={
+                            "committed_state_snapshot": {
+                                "amount": 100 if arm == "current_baseline" else 200,
+                                "requested_amount": 100,
+                            },
+                            "state_observation_authority": "environment_self_reported",
+                        },
+                    ),
                     observed_frame=SemanticFrame(
                         interaction_id=f"{source.id}:{arm}:round-{repetition}",
                         outcomes=outcomes,
@@ -259,7 +272,11 @@ def _execution(case_id: str, turn_ids: tuple[str, ...], amount: int) -> Executio
         reset_env_requested=True,
         reset_env_acknowledged=True,
     )
-    state: JsonValue = {"amount": amount, "private": _PRIVATE_SECRET}
+    state: JsonValue = {
+        "amount": amount,
+        "requested_amount": 100,
+        "private": _PRIVATE_SECRET,
+    }
     turns = tuple(
         EnvironmentTurnEvidence(
             turn_id=turn_id,
@@ -274,7 +291,11 @@ def _execution(case_id: str, turn_ids: tuple[str, ...], amount: int) -> Executio
         environment_id="payments-environment",
         environment_config_sha256=_SHA256,
         initial_state=EnvironmentStateEvidence(
-            value={"amount": 0, "private": _PRIVATE_SECRET},
+            value={
+                "amount": 0,
+                "requested_amount": 100,
+                "private": _PRIVATE_SECRET,
+            },
             authority="environment_self_reported",
         ),
         turns=turns,
@@ -341,10 +362,17 @@ def _stateful_result() -> CorrectionStressResult:
     )
 
     def observation(turn: ConversationTurn, amount: int) -> CorrectionTurnObservation:
+        committed_state: JsonValue = {"amount": amount, "requested_amount": 100}
         return CorrectionTurnObservation(
             turn=turn,
-            target_output=ObservedAgentOutput(raw_output={"amount": amount}),
-            committed_state_snapshot={"amount": amount},
+            target_output=ObservedAgentOutput(
+                raw_output=committed_state,
+                metadata={
+                    "committed_state_snapshot": committed_state,
+                    "state_observation_authority": "environment_self_reported",
+                },
+            ),
+            committed_state_snapshot=committed_state,
         )
 
     divergence = CorrectionDivergence(
@@ -469,6 +497,7 @@ def test_dataset_and_stateful_adapters_emit_the_same_validated_package() -> None
         adapt_stateful_invariant_finding(
             _stateful_result(),
             _rule(),
+            observation_authority="committed_state_snapshot",
             context=_context(),
         ),
     )
@@ -494,6 +523,7 @@ def test_public_occurrences_do_not_disclose_private_workflow_values() -> None:
     stateful_package = adapt_stateful_invariant_finding(
         _stateful_result(),
         _rule(),
+        observation_authority="committed_state_snapshot",
         context=_context(),
     )
 
@@ -561,6 +591,7 @@ def test_stateful_adapter_rejects_a_rule_definition_from_another_authority() -> 
         adapt_stateful_invariant_finding(
             _stateful_result(),
             wrong_rule,
+            observation_authority="committed_state_snapshot",
             context=_context(),
         )
 
@@ -622,6 +653,7 @@ def test_opaque_references_resist_plain_hash_dictionary_guesses() -> None:
 
 
 def test_dataset_invariant_adapter_preserves_exact_mixed_repetitions() -> None:
+    result = _dataset_result()
     evaluation = _dataset_invariant_evaluation()
     probe_rule = evaluation.variations[0].rules[0]
     satisfied_trial = probe_rule.trials[1].model_copy(
@@ -641,9 +673,50 @@ def test_dataset_invariant_adapter_preserves_exact_mixed_repetitions() -> None:
             )
         }
     )
+    probe_trial_set = result.cases[0].trial_set
+    assert probe_trial_set is not None
+    satisfied_output = probe_trial_set.trials[1].target_output
+    assert satisfied_output is not None
+    satisfied_output = satisfied_output.model_copy(
+        update={
+            "raw_output": {
+                "status": "changed",
+                "amount": 100,
+                "requested_amount": 100,
+            },
+            "metadata": {
+                "committed_state_snapshot": {"amount": 100, "requested_amount": 100},
+                "state_observation_authority": "environment_self_reported",
+            },
+        }
+    )
+    mixed_result = result.model_copy(
+        update={
+            "cases": (
+                result.cases[0].model_copy(
+                    update={
+                        "trial_set": probe_trial_set.model_copy(
+                            update={
+                                "trials": (
+                                    probe_trial_set.trials[0],
+                                    probe_trial_set.trials[1].model_copy(
+                                        update={"target_output": satisfied_output}
+                                    ),
+                                )
+                            }
+                        )
+                    }
+                ),
+            )
+        }
+    )
+    mixed_result = DatasetEvaluationResult.model_validate_json(mixed_result.model_dump_json())
+    mixed_evaluation = DatasetInvariantEvaluation.model_validate_json(
+        mixed_evaluation.model_dump_json()
+    )
 
     package = adapt_dataset_invariant_finding(
-        _dataset_result(),
+        mixed_result,
         mixed_evaluation,
         _rule(),
         case_index=0,
@@ -802,7 +875,12 @@ def test_initial_and_final_state_authorities_are_preserved_independently() -> No
             )
         }
     )
-    package = adapt_stateful_invariant_finding(result, _rule(), context=_context())
+    package = adapt_stateful_invariant_finding(
+        result,
+        _rule(),
+        observation_authority="committed_state_snapshot",
+        context=_context(),
+    )
 
     for receipt in package.receipts:
         state_pointers = {
@@ -813,6 +891,245 @@ def test_initial_and_final_state_authorities_are_preserved_independently() -> No
         assert state_pointers["/initial_state/value"].authority == "independent_observer"
         assert state_pointers["/initial_state/value"].source_id == "before-state-observer"
         assert state_pointers["/final_state/value"].authority == "environment_self_reported"
+
+
+def test_dataset_mixed_missing_probe_repetition_remains_persistable() -> None:
+    result = _dataset_result()
+    probe_trial_set = result.cases[0].trial_set
+    assert probe_trial_set is not None
+    mixed_result = result.model_copy(
+        update={
+            "cases": (
+                result.cases[0].model_copy(
+                    update={
+                        "verdict": "inconclusive",
+                        "findings": (),
+                        "inconclusive_reasons": ("target_output_missing",),
+                        "trial_set": probe_trial_set.model_copy(
+                            update={
+                                "stability": "inconclusive",
+                                "trials": (
+                                    probe_trial_set.trials[0],
+                                    probe_trial_set.trials[1].model_copy(
+                                        update={
+                                            "target_output": None,
+                                            "observed_frame": None,
+                                            "inconclusive_reasons": ("target_output_missing",),
+                                        }
+                                    ),
+                                ),
+                                "outcome_groups": (
+                                    probe_trial_set.outcome_groups[0].model_copy(
+                                        update={"repetitions": (1,)}
+                                    ),
+                                ),
+                            }
+                        ),
+                    }
+                ),
+            )
+        }
+    )
+    evaluation = _dataset_invariant_evaluation()
+    probe_rule = evaluation.variations[0].rules[0]
+    missing_trial = probe_rule.trials[1].model_copy(
+        update={
+            "status": "not_evaluable",
+            "reason_code": "target_output_missing",
+            "resolved_values": {},
+        }
+    )
+    mixed_evaluation = evaluation.model_copy(
+        update={
+            "variations": (
+                evaluation.variations[0].model_copy(
+                    update={
+                        "rules": (
+                            probe_rule.model_copy(
+                                update={"trials": (probe_rule.trials[0], missing_trial)}
+                            ),
+                        )
+                    }
+                ),
+            )
+        }
+    )
+    mixed_result = DatasetEvaluationResult.model_validate_json(mixed_result.model_dump_json())
+    mixed_evaluation = DatasetInvariantEvaluation.model_validate_json(
+        mixed_evaluation.model_dump_json()
+    )
+
+    packages = adapt_dataset_finding_packages(
+        mixed_result,
+        invariant_evaluation=mixed_evaluation,
+        invariant_rules=(_rule(),),
+        context=_context(),
+    )
+
+    assert len(packages) == 1
+    package = packages[0]
+    assert package.occurrence.kind == "customer_invariant_violation"
+    assert package.occurrence.repetition_summary.inconclusive == 1
+    assert package.occurrence.repetitions[1].outcome == "inconclusive"
+    assert package.occurrence.repetitions[1].inconclusive_reason == "target_output_missing"
+
+
+def test_stateful_mixed_missing_arms_write_canonical_sidecar(tmp_path: Path) -> None:
+    result = _stateful_result()
+    missing_trial = CorrectionStressTrial(
+        repetition=2,
+        inconclusive_reason="environment execution timed out",
+    )
+    source_rule = result.baseline_invariant_rules[0]
+    probe_rule = result.corrected_invariant_rules[0]
+    source_missing = source_rule.trials[0].model_copy(
+        update={
+            "repetition": 2,
+            "status": "not_evaluable",
+            "reason_code": "target_output_missing",
+            "resolved_values": {},
+        }
+    )
+    probe_missing = probe_rule.trials[0].model_copy(
+        update={
+            "repetition": 2,
+            "status": "not_evaluable",
+            "reason_code": "target_output_missing",
+            "resolved_values": {},
+        }
+    )
+    mixed_result = result.model_copy(
+        update={
+            "requested_repetitions": 2,
+            "required_target_calls": 6,
+            "status": "inconclusive",
+            "trials": (result.trials[0], missing_trial),
+            "baseline_invariant_rules": (
+                source_rule.model_copy(
+                    update={
+                        "status": "not_evaluable",
+                        "reason_code": "one_or_more_trials_not_evaluable",
+                        "trials": (source_rule.trials[0], source_missing),
+                    }
+                ),
+            ),
+            "corrected_invariant_rules": (
+                probe_rule.model_copy(update={"trials": (probe_rule.trials[0], probe_missing)}),
+            ),
+        }
+    )
+    mixed_result = CorrectionStressResult.model_validate_json(mixed_result.model_dump_json())
+    evidence_output = tmp_path / "mixed-correction.json"
+    evidence_output.write_text("{}\n", encoding="utf-8")
+
+    finding_output = write_stateful_finding_packages(
+        evidence_output,
+        mixed_result,
+        (_rule(),),
+        observation_authority="committed_state_snapshot",
+    )
+    (package,) = tuple(
+        FindingEvidencePackage.model_validate_json(line)
+        for line in finding_output.read_text(encoding="utf-8").splitlines()
+    )
+
+    assert tuple(item.outcome for item in package.occurrence.repetitions) == (
+        "finding_observed",
+        "inconclusive",
+    )
+    second_repetition = package.occurrence.repetitions[1]
+    assert second_repetition.inconclusive_reason == "environment_execution_timed_out"
+    assert "source_execution_unavailable" in package.occurrence.limitations
+    unavailable_receipts = tuple(
+        receipt for receipt in package.receipts if receipt.content.repetition == 2
+    )
+    assert len(unavailable_receipts) == 2
+    assert all(receipt.content.response is None for receipt in unavailable_receipts)
+
+
+def test_dataset_adapter_rejects_supplied_evaluation_that_disagrees_with_output() -> None:
+    result = _dataset_result()
+    probe_trial_set = result.cases[0].trial_set
+    assert probe_trial_set is not None
+    output = probe_trial_set.trials[0].target_output
+    assert output is not None
+    adversarial_result = result.model_copy(
+        update={
+            "cases": (
+                result.cases[0].model_copy(
+                    update={
+                        "trial_set": probe_trial_set.model_copy(
+                            update={
+                                "trials": (
+                                    probe_trial_set.trials[0].model_copy(
+                                        update={
+                                            "target_output": output.model_copy(
+                                                update={
+                                                    "raw_output": {
+                                                        "amount": 999,
+                                                        "requested_amount": 100,
+                                                    }
+                                                }
+                                            )
+                                        }
+                                    ),
+                                    probe_trial_set.trials[1],
+                                )
+                            }
+                        )
+                    }
+                ),
+            )
+        }
+    )
+    response_evaluation = _dataset_invariant_evaluation().model_copy(
+        update={"observation_authority": "agent_response"}
+    )
+
+    with pytest.raises(ValueError, match="exact captured evidence"):
+        adapt_dataset_invariant_finding(
+            adversarial_result,
+            response_evaluation,
+            _rule(),
+            case_index=0,
+            context=_context(),
+        )
+
+
+def test_stateful_adapter_rejects_supplied_evaluation_that_disagrees_with_state() -> None:
+    result = _stateful_result()
+    trial = result.trials[0]
+    changed_observation = trial.variation[-1].model_copy(
+        update={
+            "target_output": trial.variation[-1].target_output.model_copy(
+                update={
+                    "metadata": {
+                        "committed_state_snapshot": {
+                            "amount": 999,
+                            "requested_amount": 100,
+                        },
+                        "state_observation_authority": "environment_self_reported",
+                    }
+                }
+            ),
+            "committed_state_snapshot": {"amount": 999, "requested_amount": 100},
+        }
+    )
+    adversarial_result = result.model_copy(
+        update={
+            "trials": (
+                trial.model_copy(update={"variation": (trial.variation[0], changed_observation)}),
+            )
+        }
+    )
+
+    with pytest.raises(ValueError, match="exact captured evidence"):
+        adapt_stateful_invariant_finding(
+            adversarial_result,
+            _rule(),
+            observation_authority="committed_state_snapshot",
+            context=_context(),
+        )
 
 
 def test_real_workflow_collectors_emit_canonical_packages_without_calls(tmp_path: Path) -> None:
@@ -828,6 +1145,7 @@ def test_real_workflow_collectors_emit_canonical_packages_without_calls(tmp_path
         evidence_output,
         _stateful_result(),
         (_rule(),),
+        observation_authority="committed_state_snapshot",
     )
     stateful_packages = tuple(
         FindingEvidencePackage.model_validate_json(line)

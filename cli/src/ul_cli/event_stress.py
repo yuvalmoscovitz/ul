@@ -574,7 +574,12 @@ def run_correction_after_first_response(
         output_stream.write("\n")
         output_stream.flush()
         os.fsync(output_stream.fileno())
-    write_stateful_finding_packages(output, result, invariant_suite.rules)
+    write_stateful_finding_packages(
+        output,
+        result,
+        invariant_suite.rules,
+        observation_authority=invariant_suite.observation_authority,
+    )
     _print_result(result, output)
 
 
@@ -671,7 +676,12 @@ def run_retry_after_successful_commit(
         output_stream.write("\n")
         output_stream.flush()
         os.fsync(output_stream.fileno())
-    write_stateful_finding_packages(output, result, invariant_suite.rules)
+    write_stateful_finding_packages(
+        output,
+        result,
+        invariant_suite.rules,
+        observation_authority=invariant_suite.observation_authority,
+    )
     _print_retry_result(result, output)
 
 
@@ -860,10 +870,13 @@ def write_stateful_finding_packages(
     output: Path,
     result: StatefulFindingResult,
     invariant_rules: tuple[DatasetInvariantRule, ...],
+    *,
+    observation_authority: ObservationAuthority,
 ) -> Path:
     packages = adapt_stateful_finding_packages(
         result,
         invariant_rules=invariant_rules,
+        observation_authority=observation_authority,
         context=FindingAdapterContext(
             campaign_id=result.case.id,
             recorded_at=datetime.now(UTC),

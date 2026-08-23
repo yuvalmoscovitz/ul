@@ -908,6 +908,22 @@ def evaluate_dataset_invariant_rules(
     )
 
 
+def evaluate_dataset_invariant_rule_trials(
+    rule: DatasetInvariantRule,
+    trials: tuple[DatasetEvaluationTrial, ...],
+    *,
+    observation_authority: ObservationAuthority = "agent_response",
+) -> DatasetInvariantRuleResult:
+    if not trials:
+        raise ValueError("invariant evaluation requires at least one trial")
+    return _evaluate_rule(
+        rule,
+        trials,
+        observation_authority=observation_authority,
+        array_work_budget=_ArrayInvariantWorkBudget(_MAXIMUM_ARRAY_INVARIANT_WORK_UNITS),
+    )
+
+
 def _evaluate_arm(
     suite: DatasetInvariantSuite,
     trials: tuple[DatasetEvaluationTrial, ...],
