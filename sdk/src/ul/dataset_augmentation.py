@@ -6,7 +6,7 @@ import re
 from collections.abc import Iterable
 from decimal import Decimal
 from itertools import islice, pairwise
-from typing import Any, Literal, Self
+from typing import Any, Literal, Self, cast
 
 from pydantic import Field, JsonValue, model_validator
 from ul_core.contracts import (
@@ -26,6 +26,11 @@ from ul_core.models import ULModel
 from ul_core.prompts import PromptManager, prompt_provenance
 
 _PROMPTS = PromptManager.instance()
+
+
+def _is_none(value: object) -> bool:
+    return value is None
+
 
 OperatorId = Literal[
     "input.surface.rephrase",
@@ -203,11 +208,9 @@ def resolve_dataset_augmentation_operator(reference: str) -> DatasetAugmentation
 
 class DatasetAugmentationCandidate(ULModel):
     source_interaction_id: str = Field(min_length=1)
-    source_record_id: str | None = Field(
-        default=None, min_length=1, exclude_if=lambda value: value is None
-    )
-    augmentation_target_id: str | None = Field(
-        default=None, min_length=1, exclude_if=lambda value: value is None
+    source_record_id: str | None = cast(Any, Field)(default=None, min_length=1, exclude_if=_is_none)
+    augmentation_target_id: str | None = cast(Any, Field)(
+        default=None, min_length=1, exclude_if=_is_none
     )
     operator_id: OperatorId = "input.surface.rephrase"
     operator_version: str = Field(

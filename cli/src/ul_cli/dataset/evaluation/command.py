@@ -78,7 +78,10 @@ def evaluate_dataset(
             exists=True,
             dir_okay=False,
             readable=True,
-            help='JSONL containing one {"id": ..., "input": ..., "output": ...} object per line.',
+            help=(
+                'Interaction JSONL: shorthand {"id": ..., "input": ..., "output": ...} '
+                "records or structured multi-turn cases."
+            ),
         ),
     ],
     environment_config: Annotated[
