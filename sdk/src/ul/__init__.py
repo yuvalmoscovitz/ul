@@ -1,7 +1,6 @@
 """Public Python SDK for UL."""
 
-from ul_core.augmentation import builtin_augmentation_registry
-from ul_core.augmentation_catalog import (
+from ul_core.augmentations.definitions import (
     AugmentationApplicabilityProfile,
     AugmentationBinding,
     AugmentationExecutionOwner,
@@ -11,6 +10,7 @@ from ul_core.augmentation_catalog import (
     BuiltinAugmentationSpec,
     builtin_augmentation_catalog,
 )
+from ul_core.augmentations.registry import builtin_augmentation_registry
 from ul_core.contracts import (
     ObservationSource,
     ProbeInvoker,
@@ -120,7 +120,45 @@ from ul_core.models import (
 )
 from ul_core.prompts import PromptManager, PromptTemplateInfo
 
-from ul.augmentation_qualification import (
+from ul.augmentations.conversation import (
+    CorrectionAfterFirstResponseCase,
+    CorrectionDivergence,
+    CorrectionStressPlan,
+    CorrectionStressResult,
+    CorrectionStressTrial,
+    CorrectionTurnObservation,
+    MultiTurnRegressionCase,
+    RetryAfterSuccessfulCommitCase,
+    RetryAfterSuccessfulCommitStressPlan,
+    RetryAfterSuccessfulCommitStressResult,
+    create_multi_turn_regression_case,
+    load_correction_after_first_response_case,
+    load_multi_turn_regression_case,
+    load_retry_after_successful_commit_case,
+    plan_correction_stress_test,
+    plan_retry_after_successful_commit_stress_test,
+    replay_multi_turn_regression,
+    run_correction_stress_test,
+    run_retry_after_successful_commit_stress_test,
+)
+from ul.augmentations.dataset import (
+    DatasetAugmentationEngine,
+    DatasetAugmentationOperator,
+    DatasetAugmentationResult,
+    DatasetAugmentationSkip,
+    builtin_dataset_augmentation_operators,
+    resolve_dataset_augmentation_operator,
+)
+from ul.augmentations.environment_fault import (
+    TimeoutAfterCommitCase,
+    TimeoutAfterCommitStressPlan,
+    TimeoutAfterCommitStressResult,
+    TimeoutAfterCommitStressTrial,
+    load_timeout_after_commit_case,
+    plan_timeout_after_commit_stress_test,
+    run_timeout_after_commit_stress_test,
+)
+from ul.augmentations.qualification import (
     AugmentationQualificationAttempt,
     AugmentationQualificationCorpus,
     AugmentationQualificationCorpusCase,
@@ -140,14 +178,6 @@ from ul.augmentation_qualification import (
     load_augmentation_qualification_report,
     replay_augmentation_qualification,
     write_augmentation_qualification_report,
-)
-from ul.dataset_augmentation import (
-    DatasetAugmentationEngine,
-    DatasetAugmentationOperator,
-    DatasetAugmentationResult,
-    DatasetAugmentationSkip,
-    builtin_dataset_augmentation_operators,
-    resolve_dataset_augmentation_operator,
 )
 from ul.dataset_evaluation import (
     DatasetEvaluationBaseline,
@@ -182,6 +212,7 @@ from ul.dataset_invariants import (
     JsonValuesEqualInvariant,
     NoNewEffectInvariant,
     UnchangedBetweenCheckpointsInvariant,
+    evaluate_dataset_invariant_rule_trials,
     evaluate_dataset_invariant_rules,
     evaluate_dataset_invariants,
     load_dataset_invariant_suite,
@@ -229,27 +260,6 @@ from ul.evaluators import (
     OpenAICompatibleJudgeConfig,
     evaluate,
     evaluate_case,
-)
-from ul.event_stress import (
-    CorrectionAfterFirstResponseCase,
-    CorrectionDivergence,
-    CorrectionStressPlan,
-    CorrectionStressResult,
-    CorrectionStressTrial,
-    CorrectionTurnObservation,
-    MultiTurnRegressionCase,
-    RetryAfterSuccessfulCommitCase,
-    RetryAfterSuccessfulCommitStressPlan,
-    RetryAfterSuccessfulCommitStressResult,
-    create_multi_turn_regression_case,
-    load_correction_after_first_response_case,
-    load_multi_turn_regression_case,
-    load_retry_after_successful_commit_case,
-    plan_correction_stress_test,
-    plan_retry_after_successful_commit_stress_test,
-    replay_multi_turn_regression,
-    run_correction_stress_test,
-    run_retry_after_successful_commit_stress_test,
 )
 from ul.finding_export import (
     FindingExportInputError,
@@ -330,15 +340,6 @@ from ul.state_hooks import (
     diff_json_states,
     json_state_digest,
     normalize_json_state,
-)
-from ul.timeout_after_commit import (
-    TimeoutAfterCommitCase,
-    TimeoutAfterCommitStressPlan,
-    TimeoutAfterCommitStressResult,
-    TimeoutAfterCommitStressTrial,
-    load_timeout_after_commit_case,
-    plan_timeout_after_commit_stress_test,
-    run_timeout_after_commit_stress_test,
 )
 from ul.trace_replay import (
     TraceReplayBundle,
@@ -636,6 +637,7 @@ __all__ = [
     "diff_json_states",
     "evaluate",
     "evaluate_case",
+    "evaluate_dataset_invariant_rule_trials",
     "evaluate_dataset_invariant_rules",
     "evaluate_dataset_invariants",
     "evidence_profile_from_capabilities",

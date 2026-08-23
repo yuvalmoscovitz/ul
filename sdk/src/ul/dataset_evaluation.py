@@ -20,7 +20,7 @@ from ul_core.dataset import InteractionRecord, ObservedAgentOutput, ObservedOutc
 from ul_core.evaluation import EvaluationCase, ExecutionEvidence
 from ul_core.models import ConversationRole, ConversationTurn, ULModel
 
-from ul.dataset_augmentation import (
+from ul.augmentations.dataset import (
     DatasetAugmentationCandidate,
     DatasetAugmentationEngine,
     DatasetAugmentationResult,
@@ -1132,6 +1132,21 @@ def _compare_action_outcomes(
                 )
             )
     return tuple(findings)
+
+
+def compare_action_outcomes(
+    expected_frame: SemanticFrame,
+    observed_frame: SemanticFrame,
+    source_input: str,
+    *,
+    grounding_frame: SemanticFrame | None = None,
+) -> tuple[DatasetEvaluationFinding, ...]:
+    return _compare_action_outcomes(
+        expected_frame,
+        observed_frame,
+        source_input,
+        grounding_frame=grounding_frame,
+    )
 
 
 def _action_outcomes_by_key(

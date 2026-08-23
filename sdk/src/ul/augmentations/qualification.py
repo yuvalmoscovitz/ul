@@ -1,3 +1,5 @@
+"""Qualification corpus, thresholds, reports, persistence, and replay."""
+
 from __future__ import annotations
 
 import hashlib
@@ -12,7 +14,7 @@ from pydantic import ConfigDict, Field, model_validator
 from ul_core.dataset import InteractionRecord
 from ul_core.models import ULModel
 
-from ul.dataset_augmentation import DatasetAugmentationOperator
+from ul.augmentations.dataset import DatasetAugmentationOperator
 
 QualificationCorpusSegment = Literal[
     "short",

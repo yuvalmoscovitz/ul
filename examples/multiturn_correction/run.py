@@ -13,7 +13,7 @@ from typing import TextIO, cast
 
 import typer
 from pydantic import ValidationError
-from ul.event_stress import CorrectionStressResult
+from ul.augmentations.conversation import CorrectionStressResult
 
 from examples.multiturn_correction.defective_agent import create_server
 

@@ -1,6 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import os
+import secrets
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Annotated, TextIO
 
@@ -38,6 +42,7 @@ from ul_cli.dataset_augmentation_ledger import (
 from ul_cli.dataset_campaign import create_dataset_campaign_plan
 from ul_cli.dataset_review import DatasetResumeEvidence
 from ul_cli.environment import TEST_ENVIRONMENT_CONFIRMATION_MESSAGE
+from ul_cli.finding_adapters import FindingAdapterContext, adapt_dataset_finding_packages
 
 from ..evidence.context import build_dataset_evidence_run_context
 from ..evidence.persistence import (
@@ -57,7 +62,7 @@ from ..presentation.evaluation import (
     result_needs_review,
 )
 from ..presentation.runtime import console, print_dataset_plain
-from ..storage.private_files import create_private_output
+from ..storage.private_files import create_private_output, open_private_append_output
 from .operators import dataset_operator_identity, validate_operator_ids
 from .records import DatasetInputError, load_interaction_records, validate_model_input_bounds
 from .redaction import (
@@ -705,6 +710,9 @@ def evaluate_dataset(
     augmentation_ledger: DatasetAugmentationLedger | None = None
     augmentation_ledger_was_created = False
     output_stream: TextIO | None = None
+    finding_output_stream: TextIO | None = None
+    finding_output = output.with_name(f"{output.name}.findings.jsonl")
+    finding_reference_key = secrets.token_bytes(32)
     failure_parameter = "--augmentations-output"
     try:
         if augmentations_output is not None:
@@ -740,6 +748,7 @@ def evaluate_dataset(
         failure_parameter = "--resume" if resume is not None else "--output"
         if resume is None:
             output_stream = create_private_output(output)
+            finding_output_stream = create_private_output(finding_output)
         else:
             assert resume_evidence is not None
             output_stream, locked_resume_evidence = open_resume_output(
@@ -751,6 +760,11 @@ def evaluate_dataset(
             if locked_resume_evidence != resume_evidence:
                 output_stream.close()
                 raise ValueError("resume evidence changed after preflight")
+            finding_output_stream = (
+                open_private_append_output(finding_output)
+                if finding_output.exists()
+                else create_private_output(finding_output)
+            )
     except (OSError, ValueError) as error:
         if augmentation_ledger is not None:
             if augmentation_ledger_was_created:
@@ -759,6 +773,8 @@ def evaluate_dataset(
             augmentation_ledger.close()
         if output_stream is not None and not output_stream.closed:
             output_stream.close()
+        if finding_output_stream is not None and not finding_output_stream.closed:
+            finding_output_stream.close()
         asyncio.run(target.aclose())
         message = str(error) if isinstance(error, ValueError) else error.__class__.__name__
         raise typer.BadParameter(
@@ -767,10 +783,11 @@ def evaluate_dataset(
         ) from None
 
     assert output_stream is not None
+    assert finding_output_stream is not None
     has_review_findings = False
     invariant_evaluations: list[DatasetInvariantEvaluation] = []
     try:
-        with output_stream:
+        with output_stream, finding_output_stream:
             if invariant_suite is not None:
                 evaluation_coroutine = evaluate_interaction_records(
                     selected_records,
@@ -816,8 +833,33 @@ def evaluate_dataset(
                     evaluator_preflight=evaluator_preflight,
                 )
             results = asyncio.run(evaluation_coroutine)
+            invariant_evaluation_by_interaction = {
+                evaluation.interaction_id: evaluation for evaluation in invariant_evaluations
+            }
             for result in results:
+                packages = adapt_dataset_finding_packages(
+                    result,
+                    invariant_evaluation=invariant_evaluation_by_interaction.get(result.source.id),
+                    invariant_rules=invariant_suite.rules if invariant_suite is not None else (),
+                    context=FindingAdapterContext(
+                        campaign_id=run_context.context_sha256,
+                        recorded_at=datetime.now(UTC),
+                        reference_key=finding_reference_key,
+                    ),
+                )
+                for package in packages:
+                    finding_output_stream.write(
+                        json.dumps(
+                            package.model_dump(mode="json"),
+                            ensure_ascii=False,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        )
+                        + "\n"
+                    )
                 has_review_findings |= result_needs_review(result)
+            finding_output_stream.flush()
+            os.fsync(finding_output_stream.fileno())
     except (TimeoutError, RuntimeError, ValueError, httpx.HTTPError) as error:
         if isinstance(error, ProviderDiagnosticError):
             console.print(str(error))

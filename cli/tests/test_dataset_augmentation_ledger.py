@@ -18,7 +18,7 @@ from ul import (
     VisibleContextTurn,
     project_rich_interaction_case,
 )
-from ul.dataset_augmentation import DatasetAugmentationCandidate
+from ul.augmentations.dataset import DatasetAugmentationCandidate
 from ul_cli import dataset_augmentation_ledger as ledger_module
 from ul_cli.dataset_augmentation_ledger import (
     DatasetAugmentationLedgerSemanticSettings,

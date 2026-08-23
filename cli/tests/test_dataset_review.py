@@ -27,7 +27,7 @@ from ul import (
     ObservedAgentOutput,
     SemanticFrame,
 )
-from ul.dataset_augmentation import DatasetAugmentationCandidate
+from ul.augmentations.dataset import DatasetAugmentationCandidate
 from ul.dataset_invariants import DatasetInvariantSuite, JsonValuesEqualInvariant
 from ul_cli import dataset_review
 from ul_cli import report as report_module

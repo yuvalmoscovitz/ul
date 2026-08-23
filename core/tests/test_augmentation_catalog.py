@@ -1,6 +1,6 @@
 import pytest
 from pydantic import ValidationError
-from ul_core.augmentation_catalog import (
+from ul_core.augmentations.definitions import (
     AugmentationBinding,
     AugmentationRef,
     AugmentationRequirements,
@@ -91,8 +91,10 @@ def test_dataset_applicability_contracts_are_discoverable_before_execution() -> 
 def test_catalog_rejects_duplicate_references() -> None:
     spec = BuiltinAugmentationSpec(
         ref=AugmentationRef(id="input.example", version="1.0.0"),
+        surface="task_semantics",
         scope="input",
         summary="Example augmentation.",
+        expected_relation="Only the declared example change may differ.",
         applicability_profile="conditional",
         applicability_rule="Applies to examples.",
         bindings=(
@@ -100,6 +102,7 @@ def test_catalog_rejects_duplicate_references() -> None:
                 mode="scenario_materialization",
                 stages=("materialization",),
                 execution_owner="augmentation_registry",
+                runtime="example.module:ExampleAugmentation",
             ),
         ),
     )
@@ -125,8 +128,8 @@ def test_augmentation_reference_requires_canonical_bounded_values(
         AugmentationRef.model_validate(reference)
 
 
-def test_requirements_reject_capabilities_without_a_environment() -> None:
-    with pytest.raises(ValidationError, match="capabilities require a environment"):
+def test_requirements_reject_capabilities_without_an_environment() -> None:
+    with pytest.raises(ValidationError, match="capabilities require an environment"):
         AugmentationRequirements(environment_capabilities=("tool.timeout@1.0.0",))
 
 
@@ -136,13 +139,15 @@ def test_binding_rejects_owner_mode_mismatch_and_unsafe_environment_fault() -> N
             mode="environment_fault",
             stages=("execution",),
             execution_owner="dataset_cli",
+            runtime="example.module:run",
             command="ul dataset evaluate",
         )
-    with pytest.raises(ValidationError, match="require a environment capability"):
+    with pytest.raises(ValidationError, match="require an environment capability"):
         AugmentationBinding(
             mode="environment_fault",
             stages=("execution",),
             execution_owner="stress_cli",
+            runtime="example.module:run",
             command="ul stress timeout-after-commit",
         )
 
@@ -168,8 +173,10 @@ def test_mode_and_cli_filters_apply_to_the_same_binding() -> None:
 def test_latest_version_is_selected_before_cli_and_mode_filters() -> None:
     version_one = BuiltinAugmentationSpec(
         ref=AugmentationRef(id="input.example", version="1.0.0"),
+        surface="task_semantics",
         scope="input",
         summary="Old CLI-backed implementation.",
+        expected_relation="Only the declared example change may differ.",
         applicability_profile="broad",
         applicability_rule="Applies to nonempty inputs.",
         bindings=(
@@ -177,14 +184,17 @@ def test_latest_version_is_selected_before_cli_and_mode_filters() -> None:
                 mode="dataset_variation",
                 stages=("materialization",),
                 execution_owner="dataset_cli",
+                runtime="example.module:resolve",
                 command="ul dataset evaluate --operator input.example",
             ),
         ),
     )
     version_two = BuiltinAugmentationSpec(
         ref=AugmentationRef(id="input.example", version="2.0.0"),
+        surface="task_semantics",
         scope="input",
         summary="Current SDK-only implementation.",
+        expected_relation="Only the declared example change may differ.",
         applicability_profile="conditional",
         applicability_rule="Applies to example scenarios.",
         bindings=(
@@ -192,6 +202,7 @@ def test_latest_version_is_selected_before_cli_and_mode_filters() -> None:
                 mode="scenario_materialization",
                 stages=("materialization",),
                 execution_owner="augmentation_registry",
+                runtime="example.module:ExampleAugmentation",
             ),
         ),
     )

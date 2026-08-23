@@ -9,7 +9,7 @@ import zipfile
 from pathlib import Path
 
 from typer.testing import CliRunner
-from ul.event_stress import RetryAfterSuccessfulCommitStressResult
+from ul.augmentations.conversation import RetryAfterSuccessfulCommitStressResult
 from ul_cli.main import app
 
 _PROJECT_ROOT = Path(__file__).parents[3]
