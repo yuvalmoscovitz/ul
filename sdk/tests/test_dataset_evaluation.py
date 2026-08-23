@@ -18,6 +18,7 @@ from ul.dataset_evaluation import (
     DatasetEvaluationResult,
     DatasetEvaluationTrial,
     DatasetEvaluationTrialSet,
+    DatasetTargetDeliveryUncertain,
     DatasetTrialUnit,
 )
 from ul.dataset_evaluation import DatasetEvaluationRunner as _DatasetEvaluationRunner
@@ -2273,3 +2274,46 @@ async def test_runner_preserves_projection_failure_and_quarantines_unknown_targe
         "remain",
     )
     assert target.raw_inputs == ["Transfer 100 to Alice."]
+
+
+async def test_cancellation_during_target_call_quarantines_without_retry() -> None:
+    semantic_pipeline = DeterministicSemanticPipeline((_source_outcomes()[0],))
+    target = DeterministicEnvironment(cancellation_guarantee="best_effort")
+    execution_started = asyncio.Event()
+    execution_release = asyncio.Event()
+    execution_count = 0
+
+    async def uncertain_execute(case: EvaluationCase) -> ExecutionEvidence:
+        nonlocal execution_count
+        execution_count += 1
+        execution_started.set()
+        await execution_release.wait()
+        return target._successful_evidence(case, target.raw_output)
+
+    target.execute = uncertain_execute  # type: ignore[method-assign]
+    started_units: list[DatasetTrialUnit] = []
+    terminal_units: list[DatasetTrialUnit] = []
+    campaign_runner = _DatasetEvaluationRunner(
+        DatasetAugmentationEngine(semantic_pipeline, semantic_pipeline),
+        semantic_pipeline,
+        target,
+        allow_network_egress=True,
+    )
+    task = asyncio.create_task(
+        campaign_runner.run(
+            _source(),
+            trial_started_callback=started_units.append,
+            trial_terminal_callback=lambda unit, trial: terminal_units.append(unit),
+        )
+    )
+    await execution_started.wait()
+
+    task.cancel()
+    with pytest.raises(DatasetTargetDeliveryUncertain):
+        await task
+
+    assert execution_count == 1
+    assert len(started_units) == 1
+    assert terminal_units == []
+    assert started_units[0].arm == "original"
+    assert "Transfer 100 to Alice." not in str(task.exception())

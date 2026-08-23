@@ -189,6 +189,7 @@ from ul.dataset_evaluation import (
     DatasetEvaluationRunner,
     DatasetEvaluationTrial,
     DatasetEvaluationTrialSet,
+    DatasetTargetDeliveryUncertain,
     DatasetTargetLifecycleFailure,
     DatasetTrialUnit,
 )
@@ -444,6 +445,7 @@ __all__ = [
     "DatasetRegressionTargetSnapshot",
     "DatasetRegressionVariation",
     "DatasetSemanticSettings",
+    "DatasetTargetDeliveryUncertain",
     "DatasetTargetLifecycleFailure",
     "DatasetTrialUnit",
     "EnvironmentCapabilities",

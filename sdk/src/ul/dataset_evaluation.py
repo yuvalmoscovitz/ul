@@ -58,6 +58,10 @@ class _StrictULModel(ULModel):
     model_config = ConfigDict(strict=True)
 
 
+class DatasetTargetDeliveryUncertain(RuntimeError):
+    """Execution was interrupted after target delivery may have begun."""
+
+
 class DatasetEvaluationFinding(_StrictULModel):
     category: FindingCategory
     severity: Literal["unrated"] = "unrated"
@@ -611,6 +615,11 @@ class DatasetEvaluationRunner:
                 cleanup_reset_failed=error.cleanup_reset_failed,
                 target_safe_to_reuse=error.target_safe_to_reuse,
             )
+        except asyncio.CancelledError:
+            self._target_state_uncertain = True
+            raise DatasetTargetDeliveryUncertain(
+                "target delivery is uncertain; environment quarantined and trial not retried"
+            ) from None
         except TimeoutError:
             if environment_timeout_requires_quarantine(self._environment.capabilities):
                 self._target_state_uncertain = True

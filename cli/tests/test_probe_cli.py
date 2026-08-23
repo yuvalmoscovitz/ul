@@ -5,18 +5,23 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import stat
 import sys
+import threading
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import typer
+from dataset._factories import _evaluator_preflight
 from typer.testing import CliRunner
 from ul import (
     DatasetEvaluationResult,
     InteractionRecord,
 )
 from ul_cli import probe as probe_module
+from ul_cli import progress_action as progress_action_module
 from ul_cli.dataset.evaluation import runner as campaign_runner_module
 from ul_cli.main import app
 from ul_core.dataset import (
@@ -30,6 +35,30 @@ from ul_core.dataset import (
 )
 
 runner = CliRunner()
+
+
+@pytest.fixture(autouse=True)
+def _private_progress_action_directory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        progress_action_module,
+        "_action_receipt_directory",
+        lambda: tmp_path / "action-state",
+    )
+
+
+@pytest.fixture(autouse=True)
+def isolate_progress_action_receipts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        progress_action_module,
+        "_action_receipt_directory",
+        lambda: tmp_path / "action-state",
+    )
 
 
 def _write_dataset(path: Path, count: int = 1) -> Path:
@@ -323,7 +352,8 @@ def test_invalid_smoke_projection_names_selector_and_makes_zero_semantic_calls(
     assert "Restore a known-safe fixture before retrying" in result.output
     assert "Target safe to reuse: no" in result.output
     assert semantic_calls == 0
-    assert not (tmp_path / ".ul").exists()
+    safety_state = next((tmp_path / ".ul").glob("probe-quarantine-*.json"))
+    assert json.loads(safety_state.read_text())["status"] == "quarantined"
 
 
 def test_saved_probe_binding_rejects_altered_projection_digest(
@@ -684,10 +714,433 @@ def test_failed_smoke_has_staged_safe_diagnostic_and_does_not_save_config(
     assert "Reason: PROBE_SMOKE_INCONCLUSIVE" in result.output
     assert "private target detail" not in result.output
     assert "Target safe to reuse: no" in result.output
+    assert "target_calls=1" in result.output
+    assert "environment_calls=1" in result.output
     assert not (tmp_path / ".ul" / "probe.json").exists()
     assert json.loads(diagnostic.read_text())["reason_code"] == "PROBE_SMOKE_INCONCLUSIVE"
     if os.name != "nt":
         assert stat.S_IMODE(diagnostic.stat().st_mode) == 0o600
+    quarantine_receipts = list((tmp_path / ".ul").glob("probe-quarantine-*.json"))
+    assert len(quarantine_receipts) == 1
+    if os.name != "nt":
+        assert stat.S_IMODE(quarantine_receipts[0].stat().st_mode) == 0o600
+    blocked = runner.invoke(
+        app,
+        ["probe", str(dataset), "--target", "customer_agent:run"],
+    )
+
+    assert blocked.exit_code == 2
+    assert "Reason: PROBE_TARGET_QUARANTINED" in blocked.output
+
+    resolved = runner.invoke(
+        app,
+        [
+            "probe",
+            str(dataset),
+            "--target",
+            "customer_agent:run",
+            "--resolve-quarantine-after",
+            "environment-reset",
+        ],
+        input="y\n",
+    )
+
+    assert resolved.exit_code == 2
+    assert "Reason: PROBE_SMOKE_INCONCLUSIVE" in resolved.output
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="symlink creation requires privileges")
+def test_probe_safety_state_deletion_and_dangling_symlink_fail_closed_before_target_call(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _write_callable(tmp_path)
+    dataset = _write_dataset(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    arguments = ["probe", str(dataset), "--target", "customer_agent:run"]
+
+    first = runner.invoke(app, arguments, input="y\nn\n")
+
+    assert first.exit_code == 0, first.output
+    invocations = tmp_path / "target-invocations.jsonl"
+    assert len(invocations.read_text().splitlines()) == 1
+    safety_state = next((tmp_path / ".ul").glob("probe-quarantine-*.json"))
+    safety_state.unlink()
+
+    missing = runner.invoke(app, arguments)
+
+    assert missing.exit_code == 2
+    assert "Reason: PROBE_QUARANTINE_RECEIPT_MISSING" in missing.output
+    assert len(invocations.read_text().splitlines()) == 1
+    safety_state.unlink()
+    safety_state.symlink_to(tmp_path / "missing-safety-state.json")
+
+    dangling = runner.invoke(app, arguments)
+
+    assert dangling.exit_code == 2
+    assert "Reason: PROBE_QUARANTINE_RECEIPT_INVALID" in dangling.output
+    assert len(invocations.read_text().splitlines()) == 1
+
+
+def test_target_lock_serializes_probe_safety_check_through_target_lifecycle(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _write_callable(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.syspath_prepend(str(tmp_path))
+    resolved_target = probe_module._resolve_target(
+        "customer_agent:run",
+        allow_insecure_http=False,
+    )
+    first_descriptor, _ = probe_module._open_probe_target_lock(resolved_target)
+    second_acquired = threading.Event()
+    second_descriptor: list[int] = []
+
+    def acquire_same_target() -> None:
+        descriptor, _ = probe_module._open_probe_target_lock(resolved_target)
+        second_descriptor.append(descriptor)
+        second_acquired.set()
+
+    thread = threading.Thread(target=acquire_same_target)
+    thread.start()
+    try:
+        assert not second_acquired.wait(0.1)
+    finally:
+        probe_module._close_probe_target_lock(first_descriptor)
+    assert second_acquired.wait(2)
+    probe_module._close_probe_target_lock(second_descriptor.pop())
+    thread.join(timeout=2)
+    assert not thread.is_alive()
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="directory fsync is POSIX-specific")
+def test_probe_quarantine_fsyncs_private_state_and_directory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _write_callable(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.syspath_prepend(str(tmp_path))
+    resolved_target = probe_module._resolve_target(
+        "customer_agent:run",
+        allow_insecure_http=False,
+    )
+    synced_file_types: list[int] = []
+
+    def record_fsync(descriptor: int) -> None:
+        synced_file_types.append(stat.S_IFMT(os.fstat(descriptor).st_mode))
+
+    monkeypatch.setattr(probe_module.os, "fsync", record_fsync)
+
+    probe_module._persist_probe_quarantine(resolved_target, "delivery_uncertain")
+
+    assert stat.S_IFREG in synced_file_types
+    assert stat.S_IFDIR in synced_file_types
+    safety_state = next((tmp_path / ".ul").glob("probe-quarantine-*.json"))
+    assert json.loads(safety_state.read_text())["status"] == "quarantined"
+
+
+@pytest.mark.parametrize(
+    "checkpoint_tamper",
+    (None, "elapsed", "evidence", "marker", "running", "running_marker"),
+)
+def test_paused_probe_action_blocks_before_repeating_completed_smoke(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    checkpoint_tamper: str | None,
+) -> None:
+    (tmp_path / "agent.py").write_text(
+        "import json\n"
+        "from pathlib import Path\n\n"
+        "def run(value):\n"
+        "    with Path('target-invocations.jsonl').open('a') as stream:\n"
+        "        stream.write(json.dumps(value) + '\\n')\n"
+        "    return {'action': 'lookup', 'ticket': 42}\n",
+        encoding="utf-8",
+    )
+    dataset = tmp_path / "examples.jsonl"
+    dataset.write_text(
+        '{"id":"case-1","input":"Return ticket 42.","output":{"action":"lookup","ticket":42}}\n',
+        encoding="utf-8",
+    )
+    output = tmp_path / "evidence.jsonl"
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("UL_LIVE", "true")
+    monkeypatch.setenv("OPEN_ROUTER_API_KEY", "test-key")
+
+    preflight_calls = 0
+
+    async def clean_room_preflight(_settings: object) -> object:
+        nonlocal preflight_calls
+        preflight_calls += 1
+        return _evaluator_preflight()
+
+    async def load_clean_room_preflight(_output: Path, _settings: object) -> tuple[object, Path]:
+        return _evaluator_preflight(), _output.with_name(f"{_output.name}.preflight.json")
+
+    create_runtime = probe_module.create_campaign_progress_runtime
+    runtime_calls = 0
+
+    def create_paused_runtime(**arguments: object) -> object:
+        nonlocal runtime_calls
+        runtime_calls += 1
+        runtime = create_runtime(**arguments)
+        if runtime_calls == 1:
+            runtime.control.request_pause()
+        return runtime
+
+    monkeypatch.setattr(probe_module, "preflight_evaluator", clean_room_preflight)
+    monkeypatch.setattr(probe_module, "load_evaluator_preflight", load_clean_room_preflight)
+    monkeypatch.setattr(
+        probe_module,
+        "create_campaign_progress_runtime",
+        create_paused_runtime,
+    )
+    semantic_model = _CleanRoomSemanticModel()
+    monkeypatch.setattr(
+        campaign_runner_module,
+        "create_semantic_model_deconstructor",
+        lambda _settings: semantic_model,
+    )
+    probe_arguments = [
+        "probe",
+        str(dataset),
+        "--target",
+        "agent:run",
+        "--output",
+        str(output),
+    ]
+    if checkpoint_tamper == "running":
+        probe_arguments.append("--confirmation-run")
+    result = runner.invoke(app, probe_arguments, input="y\ny\n")
+
+    assert result.exit_code == 130, result.output
+    assert "Reason: PROBE_PAUSED_AFTER_PREFLIGHT" in result.output
+    assert "environment=reusable" in result.output
+    assert "next_action=resume" in result.output
+    action_match = re.search(
+        r'next_argv=\["ul","action","([0-9a-f]{64})"\]',
+        result.output,
+    )
+    assert action_match is not None
+    invocations = tmp_path / "target-invocations.jsonl"
+    assert len(invocations.read_text().splitlines()) == 1
+    if checkpoint_tamper in {"elapsed", "evidence"}:
+        checkpoint_path = tmp_path / "evidence.jsonl.probe-checkpoint.json"
+        checkpoint = json.loads(checkpoint_path.read_text(encoding="utf-8"))
+        if checkpoint_tamper == "elapsed":
+            checkpoint["smoke_elapsed_seconds"] = 0
+        else:
+            checkpoint["smoke_evidence"]["final_response"] = {
+                "structurally_valid": "PRIVATE_FORGED_EVIDENCE"
+            }
+        checkpoint_path.write_text(json.dumps(checkpoint) + "\n", encoding="utf-8")
+    elif checkpoint_tamper == "marker":
+        marker = json.loads(output.read_text(encoding="utf-8"))
+        marker["manifest_sha256"] = "0" * 64
+        output.write_text(json.dumps(marker) + "\n", encoding="utf-8")
+    elif checkpoint_tamper in {"running", "running_marker"}:
+        manifest = probe_module.read_dataset_run_manifest(
+            output.with_name(f"{output.name}.manifest.json")
+        )
+        journal = probe_module.open_dataset_trial_journal(
+            output.with_name(f"{output.name}.trials.jsonl"),
+            manifest,
+        )
+        journal.start(manifest.work_plan[-1])
+        journal.close()
+        if checkpoint_tamper == "running_marker":
+            marker = json.loads(output.read_text(encoding="utf-8"))
+            marker["manifest_sha256"] = "0" * 64
+            output.write_text(json.dumps(marker) + "\n", encoding="utf-8")
+    nested_results = []
+
+    def invoke_trusted_cli(
+        argv: tuple[str, ...],
+        *,
+        check: bool,
+        cwd: str,
+    ) -> SimpleNamespace:
+        assert check is False
+        assert Path(cwd) == tmp_path
+        nested = runner.invoke(app, list(argv[4:]))
+        nested_results.append(nested)
+        return SimpleNamespace(returncode=nested.exit_code)
+
+    monkeypatch.setattr(progress_action_module.subprocess, "run", invoke_trusted_cli)
+    action_result = runner.invoke(app, ["action", action_match.group(1)])
+
+    assert preflight_calls == 1
+    if checkpoint_tamper is None:
+        assert action_result.exit_code == 0, nested_results[0].output
+        assert nested_results[0].exit_code == 0, nested_results[0].output
+        assert (
+            "Reusing durable smoke and evaluator preflight checkpoints" in nested_results[0].output
+        )
+        assert len(invocations.read_text().splitlines()) == 3
+    elif checkpoint_tamper in {"elapsed", "evidence"}:
+        assert action_result.exit_code == 2
+        assert "Reason: PROBE_CHECKPOINT_INVALID" in nested_results[0].output
+        assert "PRIVATE_FORGED_EVIDENCE" not in nested_results[0].output
+        assert len(invocations.read_text().splitlines()) == 1
+    elif checkpoint_tamper == "marker":
+        assert action_result.exit_code == 2
+        assert "Reason: PROBE_DURABLE_STATE_INVALID" in nested_results[0].output
+        assert len(invocations.read_text().splitlines()) == 1
+    elif checkpoint_tamper == "running_marker":
+        assert action_result.exit_code == 2
+        assert "Reason: PROBE_TARGET_QUARANTINED" in nested_results[0].output
+        assert "environment=quarantined" in nested_results[0].output
+        assert len(invocations.read_text().splitlines()) == 1
+        safety_state = next((tmp_path / ".ul").glob("probe-quarantine-*.json"))
+        assert json.loads(safety_state.read_text())["status"] == "quarantined"
+    else:
+        assert action_result.exit_code == 2
+        assert "Reason: PROBE_TARGET_QUARANTINED" in nested_results[0].output
+        assert "environment=quarantined" in nested_results[0].output
+        assert len(invocations.read_text().splitlines()) == 1
+        resumed_action = runner.invoke(
+            app,
+            [
+                "action",
+                action_match.group(1),
+                "--resolve-quarantine-after",
+                "environment-reset",
+            ],
+        )
+        assert resumed_action.exit_code == 2
+        assert "Reason: PROBE_REPORT_FAILED" in nested_results[1].output
+        assert (
+            "Reusing durable smoke and evaluator preflight checkpoints" in nested_results[1].output
+        )
+        assert len(invocations.read_text().splitlines()) == 6
+
+
+def test_paused_probe_action_resumes_after_terminal_trial_without_replay(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (tmp_path / "agent.py").write_text(
+        "import json\n"
+        "from pathlib import Path\n\n"
+        "def run(value):\n"
+        "    with Path('target-invocations.jsonl').open('a') as stream:\n"
+        "        stream.write(json.dumps(value) + '\\n')\n"
+        "    return {'action': 'lookup', 'ticket': 42}\n",
+        encoding="utf-8",
+    )
+    dataset = tmp_path / "examples.jsonl"
+    dataset.write_text(
+        '{"id":"case-1","input":"Return ticket 42.","output":{"action":"lookup","ticket":42}}\n',
+        encoding="utf-8",
+    )
+    output = tmp_path / "evidence.jsonl"
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("UL_LIVE", "true")
+    monkeypatch.setenv("OPEN_ROUTER_API_KEY", "test-key")
+
+    preflight_calls = 0
+
+    async def clean_room_preflight(_settings: object) -> object:
+        nonlocal preflight_calls
+        preflight_calls += 1
+        return _evaluator_preflight()
+
+    async def load_clean_room_preflight(_output: Path, _settings: object) -> tuple[object, Path]:
+        return _evaluator_preflight(), _output.with_name(f"{_output.name}.preflight.json")
+
+    create_runtime = probe_module.create_campaign_progress_runtime
+    runtime_calls = 0
+
+    def create_trial_paused_runtime(**arguments: object) -> object:
+        nonlocal runtime_calls
+        runtime_calls += 1
+        runtime = create_runtime(**arguments)
+        if runtime_calls == 1:
+            original_trial_terminal = runtime.tracker.trial_terminal
+
+            def pause_after_original_trial(**terminal_arguments: object) -> None:
+                original_trial_terminal(**terminal_arguments)
+                unit = terminal_arguments["unit"]
+                if unit.arm == "original":
+                    runtime.control.request_pause()
+
+            monkeypatch.setattr(runtime.tracker, "trial_terminal", pause_after_original_trial)
+        return runtime
+
+    monkeypatch.setattr(probe_module, "preflight_evaluator", clean_room_preflight)
+    monkeypatch.setattr(probe_module, "load_evaluator_preflight", load_clean_room_preflight)
+    monkeypatch.setattr(
+        probe_module,
+        "create_campaign_progress_runtime",
+        create_trial_paused_runtime,
+    )
+    monkeypatch.setattr(
+        campaign_runner_module,
+        "create_semantic_model_deconstructor",
+        lambda _settings: _CleanRoomSemanticModel(),
+    )
+    result = runner.invoke(
+        app,
+        [
+            "probe",
+            str(dataset),
+            "--target",
+            "agent:run",
+            "--output",
+            str(output),
+        ],
+        input="y\ny\n",
+    )
+
+    assert result.exit_code == 130, result.output
+    assert "Reason: PROBE_PAUSED_DURING_CAMPAIGN" in result.output
+    assert "environment=reusable" in result.output
+    assert "next_action=resume" in result.output
+    action_match = re.search(
+        r'next_argv=\["ul","action","([0-9a-f]{64})"\]',
+        result.output,
+    )
+    assert action_match is not None
+    invocations = tmp_path / "target-invocations.jsonl"
+    assert len(invocations.read_text().splitlines()) == 2
+    nested_results = []
+
+    def invoke_trusted_cli(
+        argv: tuple[str, ...],
+        *,
+        check: bool,
+        cwd: str,
+    ) -> SimpleNamespace:
+        assert check is False
+        assert Path(cwd) == tmp_path
+        nested = runner.invoke(app, list(argv[4:]))
+        nested_results.append(nested)
+        return SimpleNamespace(returncode=nested.exit_code)
+
+    monkeypatch.setattr(progress_action_module.subprocess, "run", invoke_trusted_cli)
+    action_result = runner.invoke(app, ["action", action_match.group(1)])
+
+    assert action_result.exit_code == 0, nested_results[0].output
+    assert nested_results[0].exit_code == 0, nested_results[0].output
+    assert "Reusing durable smoke and evaluator preflight checkpoints" in nested_results[0].output
+    assert "UL run report" in nested_results[0].output
+    assert "stage=terminal" in nested_results[0].output
+    assert preflight_calls == 1
+    assert len(invocations.read_text().splitlines()) == 3
+    evidence_lines = [json.loads(line) for line in output.read_text().splitlines()]
+    assert len(evidence_lines) == 2
+    assert evidence_lines[0]["record_type"] == "dataset_durable_run"
+    assert evidence_lines[1]["execution_plan"]["repetitions"] == 1
+    journal_records = [
+        json.loads(line)
+        for line in output.with_name(f"{output.name}.trials.jsonl").read_text().splitlines()
+    ]
+    completed_units = {
+        record["unit"]["arm"] for record in journal_records if record["state"] == "completed"
+    }
+    assert completed_units == {"original", "probe"}
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="symlink creation requires privileges")
@@ -879,7 +1332,7 @@ def test_public_documentation_flow_runs_real_callable_campaign_and_report(
 
     async def clean_room_preflight(settings: object) -> object:
         del settings
-        return object()
+        return _evaluator_preflight()
 
     def clean_room_model(settings: object) -> _CleanRoomSemanticModel:
         del settings
@@ -910,7 +1363,32 @@ def test_public_documentation_flow_runs_real_callable_campaign_and_report(
     assert "UL run report" in result.output
     assert "Evidence type: dataset evaluation" in result.output
     assert "Stronger confirmation:" in result.output
-    evidence = json.loads(output.read_text().splitlines()[0])
+    for stage in (
+        "smoke",
+        "preflight",
+        "augmentation",
+        "original",
+        "probe",
+        "evidence",
+        "report",
+        "terminal",
+    ):
+        assert f"stage={stage}" in result.output
+    assert result.output.count(" next_action=") == 1
+    assert "next_action=inspect_findings" in result.output
+    action_match = re.search(
+        r'next_argv=\["ul","action","([0-9a-f]{64})"\]',
+        result.output,
+    )
+    assert action_match is not None
+    assert str(output) not in result.output.split("next_action=", 1)[1]
+    assert "target_calls=3" in result.output
+    assert "environment_calls=3" in result.output
+    assert "semantic_calls=unknown" in result.output
+    assert "tokens=unknown" in result.output
+    evidence_lines = [json.loads(line) for line in output.read_text().splitlines()]
+    assert evidence_lines[0]["record_type"] == "dataset_durable_run"
+    evidence = evidence_lines[1]
     assert evidence["execution_plan"]["repetitions"] == 1
     assert evidence["execution_plan"]["dataset_planned_target_calls"] == 2
     assert evidence["run_context"]["semantic_settings"]["provider"] == "openrouter"
@@ -927,6 +1405,16 @@ def test_public_documentation_flow_runs_real_callable_campaign_and_report(
         ]["customer"]["email"]
         == "[PRIVATE]"
     )
+    assert (
+        evidence["technical_details"]["baseline"]["trial_set"]["trials"][0]["execution_evidence"][
+            "environment_id"
+        ]
+        == "projected-agent"
+    )
+    assert output.with_name(f"{output.name}.manifest.json").is_file()
+    assert output.with_name(f"{output.name}.trials.jsonl").is_file()
+    assert output.with_name(f"{output.name}.trials.jsonl.anchor.json").is_file()
+    assert output.with_name(f"{output.stem}.augmentations.jsonl").is_file()
 
 
 def test_campaign_projection_failure_retains_exact_reason_and_partial_work(
@@ -961,7 +1449,7 @@ def test_campaign_projection_failure_retains_exact_reason_and_partial_work(
 
     async def clean_room_preflight(settings: object) -> object:
         del settings
-        return object()
+        return _evaluator_preflight()
 
     def clean_room_model(settings: object) -> _CleanRoomSemanticModel:
         del settings
@@ -987,7 +1475,7 @@ def test_campaign_projection_failure_retains_exact_reason_and_partial_work(
     assert f"partial evidence remains in {output}" in result.output
     assert "Target safe to reuse: no" in result.output
     assert "PROBE_EVALUATION_FAILED" not in result.output
-    evidence = json.loads(output.read_text().splitlines()[0])
+    evidence = json.loads(output.read_text().splitlines()[1])
     failure = evidence["technical_details"]["baseline"]["trial_set"]["trials"][0]
     assert failure["lifecycle_failure"]["failed_phase"] == "outcome_projection"
     assert failure["lifecycle_failure"]["environment_state_may_remain"] is True
@@ -1051,5 +1539,7 @@ done
     assert result.exit_code == 0, result.output
     assert "Response structure: dict;" in result.output
     assert "transport" not in result.output
+    assert result.output.count("next_action=") == 1
+    assert "next_action=diagnose" in result.output
     saved = json.loads((tmp_path / ".ul" / "probe.json").read_text())
     assert saved["target_kind"] == "command"

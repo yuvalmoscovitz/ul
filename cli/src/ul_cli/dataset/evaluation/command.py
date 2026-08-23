@@ -36,6 +36,11 @@ from ul.http_environment import (
     validate_json_http_environment_configuration,
 )
 
+from ul_cli.dataset.progress import (
+    CampaignControlRequested,
+    create_campaign_next_commands,
+    create_campaign_progress_runtime,
+)
 from ul_cli.dataset_augmentation_ledger import (
     DatasetAugmentationLedger,
     DatasetAugmentationLedgerSemanticSettings,
@@ -216,6 +221,13 @@ def evaluate_dataset(
     json_output: Annotated[
         bool,
         typer.Option("--json", help="Emit the dry-run campaign plan as stable JSON."),
+    ] = False,
+    progress_json: Annotated[
+        bool,
+        typer.Option(
+            "--progress-json",
+            help="Emit versioned campaign progress JSON lines on stderr.",
+        ),
     ] = False,
     show_sensitive_values: Annotated[
         bool,
@@ -598,6 +610,7 @@ def evaluate_dataset(
         raise typer.BadParameter(str(error)) from None
 
     trial_journal: DatasetTrialJournal | None = None
+    expected_manifest: DatasetRunManifest | None = None
     if recorded_manifest_for_resume is not None:
         assert resume is not None
         try:
@@ -1005,17 +1018,69 @@ def evaluate_dataset(
             param_hint="--environment-config",
         ) from None
 
+    progress_runtime = create_campaign_progress_runtime(
+        case_count=len(all_selected_records),
+        work_upper_bound=(
+            len(expected_manifest.work_plan)
+            if expected_manifest is not None
+            else len(selected_records) * repetitions * (1 + len(selected_operators))
+        ),
+        target_call_budget=campaign_plan.calls.total_environment_api,
+        semantic_call_budget=campaign_plan.calls.total_semantic_model,
+        environment_call_budget=max_environment_api_calls,
+        token_budget=campaign_plan.tokens.maximum,
+        maximum_wall_time_seconds=(
+            max(
+                1,
+                campaign_plan.calls.total_environment_api
+                + campaign_plan.calls.total_semantic_model,
+            )
+            * settings.timeout_seconds
+        ),
+        next_commands=create_campaign_next_commands(output),
+        json_output=progress_json,
+    )
+    if trial_journal is not None:
+        terminal_states = trial_journal.snapshot.terminal_states
+        progress_runtime.tracker.hydrate_terminal_states(terminal_states)
+        attempted_target_calls = sum(
+            state in {"completed", "errored", "inconclusive", "quarantined"}
+            for state in terminal_states.values()
+        )
+        progress_runtime.tracker.record_usage(
+            target_calls=attempted_target_calls,
+            semantic_calls=None,
+            environment_calls=0 if not terminal_states else None,
+            tokens=None,
+        )
+
+    def flush_progress_boundary() -> None:
+        if trial_journal is not None:
+            trial_journal.flush()
+
+    progress_runtime.tracker.emit(status="running", stage="preflight")
     if evaluator_preflight is None:
         try:
-            evaluator_preflight = asyncio.run(preflight_evaluator(settings))
+            with progress_runtime.signal_control.installed():
+                evaluator_preflight = asyncio.run(preflight_evaluator(settings))
             evaluator_preflight_receipt = persist_evaluator_preflight(output, evaluator_preflight)
+            if not progress_runtime.tracker.safe_boundary(
+                progress_runtime.control,
+                flush_progress_boundary,
+            ):
+                asyncio.run(target.aclose())
+                if trial_journal is not None:
+                    trial_journal.close()
+                raise typer.Exit(code=130)
         except EvaluatorModelCompatibilityError as error:
+            progress_runtime.tracker.emit(status="failed", stage="terminal")
             if trial_journal is not None:
                 trial_journal.close()
             asyncio.run(target.aclose())
             print_dataset_plain(f"Evaluation stopped before campaign execution: {error}")
             raise typer.Exit(code=2) from None
         except (OSError, ValueError) as error:
+            progress_runtime.tracker.emit(status="failed", stage="terminal")
             if trial_journal is not None:
                 trial_journal.close()
             asyncio.run(target.aclose())
@@ -1067,6 +1132,7 @@ def evaluate_dataset(
                         )
         failure_parameter = "--resume" if resume is not None else "--output"
         if resume is None:
+            assert trial_journal is not None
             output_stream, initial_evidence = open_resume_output(
                 output,
                 expected_context=run_context,
@@ -1117,15 +1183,30 @@ def evaluate_dataset(
     try:
         with output_stream, finding_output_stream:
             evaluation_parameters = inspect.signature(evaluate_interaction_records).parameters
-            accepts_trial_journal = "trial_journal" in evaluation_parameters or any(
+            accepts_extra_arguments = any(
                 parameter.kind is inspect.Parameter.VAR_KEYWORD
                 for parameter in evaluation_parameters.values()
             )
-            durable_arguments = (
-                {"trial_journal": trial_journal}
-                if trial_journal is not None and accepts_trial_journal
-                else {}
-            )
+            durable_arguments: dict[str, object] = {}
+            if "progress_plan" in evaluation_parameters or accepts_extra_arguments:
+                durable_arguments["progress_plan"] = campaign_plan
+            if "progress_runtime" in evaluation_parameters or accepts_extra_arguments:
+                durable_arguments["progress_runtime"] = progress_runtime
+            if "complete_progress" in evaluation_parameters or accepts_extra_arguments:
+                durable_arguments["complete_progress"] = False
+            if (
+                "environment_calls_per_target_call" in evaluation_parameters
+                or accepts_extra_arguments
+            ):
+                durable_arguments["environment_calls_per_target_call"] = target_calls_per_execution
+            if trial_journal is not None and (
+                "trial_journal" in evaluation_parameters or accepts_extra_arguments
+            ):
+                durable_arguments["trial_journal"] = trial_journal
+            if progress_json and (
+                "progress_json" in evaluation_parameters or accepts_extra_arguments
+            ):
+                durable_arguments["progress_json"] = True
             evaluation_runner = cast(Any, evaluate_interaction_records)
             if invariant_suite is not None:
                 evaluation_coroutine = evaluation_runner(
@@ -1201,7 +1282,11 @@ def evaluate_dataset(
                 has_review_findings |= result_needs_review(result)
             finding_output_stream.flush()
             os.fsync(finding_output_stream.fileno())
+    except CampaignControlRequested:
+        raise typer.Exit(code=130) from None
     except (TimeoutError, RuntimeError, ValueError, httpx.HTTPError) as error:
+        if not progress_runtime.tracker.terminal_emitted:
+            progress_runtime.tracker.emit(status="failed", stage="terminal")
         if isinstance(error, ProviderDiagnosticError):
             console.print(str(error))
             try:
@@ -1233,13 +1318,19 @@ def evaluate_dataset(
             f"Resumed: {skipped_count} interaction(s) skipped (already in evidence), "
             f"{len(results)} newly evaluated."
         )
-    print_dataset_results(
-        results,
-        output,
-        augmentations_output=augmentations_output,
-        invariant_evaluations=tuple(invariant_evaluations),
-        show_report_guidance=show_report_guidance,
-    )
+    progress_runtime.tracker.emit(status="running", stage="report")
+    try:
+        print_dataset_results(
+            results,
+            output,
+            augmentations_output=augmentations_output,
+            invariant_evaluations=tuple(invariant_evaluations),
+            show_report_guidance=show_report_guidance,
+        )
+    except Exception:
+        progress_runtime.tracker.emit(status="failed", stage="terminal")
+        raise
+    progress_runtime.tracker.emit(status="completed", stage="terminal")
     prior_invariant_evaluations = (
         resume_evidence.invariant_evaluations if resume_evidence is not None else ()
     )

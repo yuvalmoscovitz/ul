@@ -9,6 +9,7 @@ from ul_cli.demo import run_demo
 from ul_cli.environment import app as environment_app
 from ul_cli.event_stress import app as stress_app
 from ul_cli.probe import probe
+from ul_cli.progress_action import execute_progress_action
 from ul_cli.project import initialize_project, report_project, run_project
 
 app = typer.Typer(
@@ -26,6 +27,7 @@ app.command("init")(initialize_project)
 app.command("run")(run_project)
 app.command("report")(report_project)
 app.command("probe")(probe)
+app.command("action")(execute_progress_action)
 
 if __name__ == "__main__":
     app()

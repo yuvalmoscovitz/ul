@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import json
 import os
+import re
 import shlex
 import shutil
 import stat
@@ -16,6 +17,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Annotated, Literal, cast
 
+if sys.platform == "win32":
+    import msvcrt
+else:
+    import fcntl
+
 import httpx
 import typer
 import ul.local_target as local_target_module
@@ -24,6 +30,7 @@ from ul import (
     DatasetEvaluationResult,
     DatasetSemanticSettings,
     EvaluationCase,
+    EvaluatorModelPreflight,
     ExecutionEvidence,
     InteractionRecord,
     load_dataset_semantic_settings,
@@ -59,14 +66,46 @@ from ul_cli.dataset.evaluation.records import (
     validate_model_input_bounds,
 )
 from ul_cli.dataset.evaluation.runner import evaluate_interaction_records
+from ul_cli.dataset.evidence.persistence import (
+    create_durable_evidence_output,
+    default_augmentations_output,
+    durable_evidence_marker_manifest_sha256,
+    load_evaluator_preflight,
+    open_resume_output,
+    persist_evaluator_preflight,
+)
 from ul_cli.dataset.presentation.evaluation import print_dataset_results
 from ul_cli.dataset.presentation.runtime import console, print_dataset_plain
-from ul_cli.dataset.storage.private_files import create_private_output
+from ul_cli.dataset.progress import (
+    CampaignControlRequested,
+    CampaignProgressRuntime,
+    CampaignSignalControl,
+    create_campaign_progress_runtime,
+    create_probe_next_commands,
+)
+from ul_cli.dataset.storage.private_files import create_private_output, open_resume_descriptor
+from ul_cli.dataset_augmentation_ledger import (
+    DatasetAugmentationLedger,
+    DatasetAugmentationLedgerSemanticSettings,
+    create_dataset_augmentation_generation_context,
+    create_private_augmentation_ledger,
+    open_augmentation_ledger_for_resume,
+)
 from ul_cli.dataset_campaign import DatasetCampaignPlan, create_dataset_campaign_plan
 from ul_cli.dataset_review import (
     DatasetEvidenceRunContext,
     DatasetEvidenceSemanticSettings,
     create_dataset_evidence_run_context,
+)
+from ul_cli.dataset_trial_journal import (
+    DatasetTrialJournal,
+    create_dataset_run_manifest,
+    create_dataset_trial_journal,
+    journal_path,
+    manifest_path,
+    open_dataset_trial_journal,
+    persist_dataset_run_manifest,
+    read_dataset_run_manifest,
 )
 from ul_cli.pattern_identity import ensure_project_pattern_identity_key
 from ul_cli.report import report_evidence
@@ -78,6 +117,7 @@ _PILOT_OPERATOR = "input.surface.typing_noise"
 _TARGET_TIMEOUT_SECONDS = 30.0
 _PROJECT_DIRECTORY = ".ul"
 _PROBE_CONFIG = "probe.json"
+_PROBE_QUARANTINE_PREFIX = "probe-quarantine"
 _DEFAULT_EVIDENCE = ".ul/runs/probe-evidence.jsonl"
 
 type ProbeTargetConnection = JsonHttpEnvironmentConnection | LocalTargetConnection
@@ -148,6 +188,26 @@ class _CampaignConfirmation(_StrictModel):
     maximum_cost_usd: float | None = None
 
 
+class _ProbeSafetyState(_StrictModel):
+    schema_version: Literal[1] = 1
+    target_confirmation_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    status: Literal["reusable", "quarantined"]
+    reason_code: str = Field(min_length=1, max_length=100)
+
+
+class _ProbeCheckpoint(_StrictModel):
+    schema_version: Literal[1] = 1
+    target_confirmation_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    campaign_confirmation_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    records_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    output_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    smoke_evidence: ExecutionEvidence
+    smoke_elapsed_seconds: float = Field(ge=0)
+    smoke_case_id: str = Field(min_length=1)
+    smoke_turn_id: str = Field(min_length=1)
+    smoke_request_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
 @dataclass(frozen=True)
 class _ResolvedTarget:
     reference: str
@@ -203,6 +263,380 @@ def _json_sha256(value: object) -> str:
         value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False
     ).encode()
     return hashlib.sha256(encoded).hexdigest()
+
+
+def _probe_checkpoint_path(output: Path) -> Path:
+    return output.with_name(f"{output.name}.probe-checkpoint.json")
+
+
+def _probe_checkpoint_binding(
+    *,
+    records: tuple[InteractionRecord, ...],
+    resolved_target: _ResolvedTarget,
+    campaign_confirmation: _CampaignConfirmation,
+    output: Path,
+) -> tuple[str, str, str, str]:
+    return (
+        resolved_target.confirmation_sha256,
+        _model_sha256(campaign_confirmation),
+        _json_sha256([record.model_dump(mode="json") for record in records]),
+        hashlib.sha256(str(output.resolve()).encode()).hexdigest(),
+    )
+
+
+def _persist_probe_checkpoint(
+    path: Path,
+    *,
+    records: tuple[InteractionRecord, ...],
+    resolved_target: _ResolvedTarget,
+    campaign_confirmation: _CampaignConfirmation,
+    output: Path,
+    smoke_result: _SmokeResult,
+) -> str:
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    _ensure_private_project_directory(path.parent)
+    target_digest, campaign_digest, records_digest, output_digest = _probe_checkpoint_binding(
+        records=records,
+        resolved_target=resolved_target,
+        campaign_confirmation=campaign_confirmation,
+        output=output,
+    )
+    checkpoint = _ProbeCheckpoint(
+        target_confirmation_sha256=target_digest,
+        campaign_confirmation_sha256=campaign_digest,
+        records_sha256=records_digest,
+        output_sha256=output_digest,
+        smoke_evidence=smoke_result.evidence,
+        smoke_elapsed_seconds=smoke_result.elapsed_seconds,
+        smoke_case_id=smoke_result.case_id,
+        smoke_turn_id=smoke_result.turn_id,
+        smoke_request_sha256=smoke_result.request_sha256,
+    )
+    encoded = (checkpoint.model_dump_json() + "\n").encode()
+    with create_private_output(path) as stream:
+        stream.write(encoded.decode())
+        stream.flush()
+        os.fsync(stream.fileno())
+    _fsync_probe_project_directory(path.parent)
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _remove_probe_checkpoint(path: Path) -> None:
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        return
+    _fsync_probe_project_directory(path.parent)
+
+
+def _load_probe_checkpoint(
+    path: Path,
+    *,
+    expected_sha256: str,
+    records: tuple[InteractionRecord, ...],
+    resolved_target: _ResolvedTarget,
+    campaign_confirmation: _CampaignConfirmation,
+    output: Path,
+) -> _SmokeResult:
+    descriptor = open_resume_descriptor(path, writable=False)
+    try:
+        status = os.fstat(descriptor)
+        if (
+            status.st_nlink != 1
+            or status.st_size > 10_000_000
+            or (sys.platform != "win32" and stat.S_IMODE(status.st_mode) & 0o077)
+            or (hasattr(os, "getuid") and status.st_uid != os.getuid())
+        ):
+            raise ValueError("probe checkpoint must be a private owner-only file")
+        encoded = os.read(descriptor, 10_000_001)
+    finally:
+        os.close(descriptor)
+    if not re.fullmatch(r"[0-9a-f]{64}", expected_sha256):
+        raise ValueError("probe checkpoint digest is invalid")
+    if hashlib.sha256(encoded).hexdigest() != expected_sha256:
+        raise ValueError("probe checkpoint integrity check failed")
+    checkpoint = _ProbeCheckpoint.model_validate_json(encoded)
+    expected_binding = _probe_checkpoint_binding(
+        records=records,
+        resolved_target=resolved_target,
+        campaign_confirmation=campaign_confirmation,
+        output=output,
+    )
+    recorded_binding = (
+        checkpoint.target_confirmation_sha256,
+        checkpoint.campaign_confirmation_sha256,
+        checkpoint.records_sha256,
+        checkpoint.output_sha256,
+    )
+    if recorded_binding != expected_binding:
+        raise ValueError("probe checkpoint does not match this target, plan, data, and output")
+    expected_case = _smoke_case(records[0], resolved_target)
+    expected_request_sha256 = _json_sha256(
+        {
+            "case_id": expected_case.id,
+            "turn": expected_case.turns[0].model_dump(mode="json"),
+            "probe_context": expected_case.probe_context,
+        }
+    )
+    if (
+        checkpoint.smoke_case_id != expected_case.id
+        or checkpoint.smoke_turn_id != expected_case.turns[0].id
+        or checkpoint.smoke_request_sha256 != expected_request_sha256
+        or checkpoint.smoke_evidence.lifecycle.terminal_status != "succeeded"
+    ):
+        raise ValueError("probe checkpoint smoke identity or lifecycle is invalid")
+    validation_connection = resolved_target.create_connection(
+        resolved_target.calls_per_execution,
+        resolved_target.maximum_active_target_seconds,
+    )
+    try:
+        validate_execution_evidence(
+            expected_case,
+            validation_connection,
+            checkpoint.smoke_evidence,
+        )
+    finally:
+        asyncio.run(validation_connection.aclose())
+    return _SmokeResult(
+        evidence=checkpoint.smoke_evidence,
+        elapsed_seconds=checkpoint.smoke_elapsed_seconds,
+        case_id=checkpoint.smoke_case_id,
+        turn_id=checkpoint.smoke_turn_id,
+        request_sha256=checkpoint.smoke_request_sha256,
+    )
+
+
+def _probe_quarantine_path(resolved_target: _ResolvedTarget) -> Path:
+    return (
+        Path.cwd()
+        / _PROJECT_DIRECTORY
+        / (f"{_PROBE_QUARANTINE_PREFIX}-{resolved_target.confirmation_sha256[:16]}.json")
+    )
+
+
+def _probe_target_lock_path(resolved_target: _ResolvedTarget) -> Path:
+    return _probe_quarantine_path(resolved_target).with_suffix(".lock")
+
+
+def _open_probe_target_lock(resolved_target: _ResolvedTarget) -> tuple[int, bool]:
+    project_directory = Path.cwd() / _PROJECT_DIRECTORY
+    _ensure_private_project_directory(project_directory)
+    path = _probe_target_lock_path(resolved_target)
+    no_follow = getattr(os, "O_NOFOLLOW", 0)
+    created = False
+    while True:
+        try:
+            path_status = os.lstat(path)
+        except FileNotFoundError:
+            try:
+                descriptor = os.open(path, os.O_RDWR | os.O_CREAT | os.O_EXCL | no_follow, 0o600)
+                created = True
+                path_status = os.lstat(path)
+                _fsync_probe_project_directory(project_directory)
+                break
+            except FileExistsError:
+                continue
+        if not stat.S_ISREG(path_status.st_mode):
+            raise OSError("probe target lock must be a regular private file")
+        descriptor = os.open(path, os.O_RDWR | no_follow)
+        break
+    try:
+        descriptor_status = os.fstat(descriptor)
+        if (
+            not os.path.samestat(path_status, descriptor_status)
+            or not stat.S_ISREG(descriptor_status.st_mode)
+            or descriptor_status.st_nlink != 1
+            or (sys.platform != "win32" and stat.S_IMODE(descriptor_status.st_mode) & 0o077)
+            or (hasattr(os, "getuid") and descriptor_status.st_uid != os.getuid())
+        ):
+            raise OSError("probe target lock must be a regular private owner-only file")
+        if sys.platform == "win32" and descriptor_status.st_size == 0:
+            os.write(descriptor, b"0")
+            os.fsync(descriptor)
+        if sys.platform == "win32":
+            os.lseek(descriptor, 0, os.SEEK_SET)
+            msvcrt.locking(descriptor, msvcrt.LK_LOCK, 1)
+        else:
+            fcntl.flock(descriptor, fcntl.LOCK_EX)
+        return descriptor, created
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _close_probe_target_lock(descriptor: int) -> None:
+    try:
+        if sys.platform == "win32":
+            os.lseek(descriptor, 0, os.SEEK_SET)
+            msvcrt.locking(descriptor, msvcrt.LK_UNLCK, 1)
+        else:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+    finally:
+        os.close(descriptor)
+
+
+def _fsync_probe_project_directory(project_directory: Path) -> None:
+    if sys.platform == "win32":
+        return
+    descriptor = os.open(
+        project_directory,
+        os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
+    )
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _load_probe_safety_state(path: Path) -> _ProbeSafetyState:
+    path_status = os.lstat(path)
+    if (
+        not stat.S_ISREG(path_status.st_mode)
+        or path_status.st_size > 10_000
+        or path_status.st_nlink != 1
+        or (sys.platform != "win32" and stat.S_IMODE(path_status.st_mode) & 0o077)
+        or (hasattr(os, "getuid") and path_status.st_uid != os.getuid())
+    ):
+        raise ValueError("probe safety state must be a regular private owner-only file")
+    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    try:
+        descriptor_status = os.fstat(descriptor)
+        if (
+            not os.path.samestat(path_status, descriptor_status)
+            or not stat.S_ISREG(descriptor_status.st_mode)
+            or descriptor_status.st_nlink != 1
+        ):
+            raise ValueError("probe safety state changed while opening")
+        raw = os.read(descriptor, 10_001)
+    finally:
+        os.close(descriptor)
+    if len(raw) > 10_000:
+        raise ValueError("probe safety state exceeds its size limit")
+    return _ProbeSafetyState.model_validate_json(raw)
+
+
+def _persist_probe_safety_state(
+    resolved_target: _ResolvedTarget,
+    *,
+    status: Literal["reusable", "quarantined"],
+    reason_code: str,
+) -> None:
+    project_directory = Path.cwd() / _PROJECT_DIRECTORY
+    _ensure_private_project_directory(project_directory)
+    path = _probe_quarantine_path(resolved_target)
+    temporary_path = path.with_name(path.name + f".tmp-{os.getpid()}-{time.time_ns()}")
+    state = _ProbeSafetyState(
+        target_confirmation_sha256=resolved_target.confirmation_sha256,
+        status=status,
+        reason_code=reason_code,
+    )
+    descriptor = os.open(
+        temporary_path,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+        0o600,
+    )
+    try:
+        encoded = (state.model_dump_json() + "\n").encode()
+        os.write(descriptor, encoded)
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+    try:
+        os.replace(temporary_path, path)
+        _fsync_probe_project_directory(project_directory)
+    except BaseException:
+        with suppress(OSError):
+            temporary_path.unlink()
+        raise
+
+
+def _enforce_probe_quarantine(
+    resolved_target: _ResolvedTarget,
+    resolution: Literal["environment-reset", "environment-replacement"] | None,
+    *,
+    lock_created: bool,
+) -> None:
+    path = _probe_quarantine_path(resolved_target)
+    try:
+        state = _load_probe_safety_state(path)
+    except FileNotFoundError:
+        if lock_created:
+            _persist_probe_safety_state(
+                resolved_target,
+                status="reusable",
+                reason_code="target_safety_initialized",
+            )
+            return
+        if resolution is not None:
+            _persist_probe_safety_state(
+                resolved_target,
+                status="reusable",
+                reason_code=f"operator_attested_{resolution.replace('-', '_')}",
+            )
+            return
+        raise ProbeFailure(
+            "target load",
+            "PROBE_QUARANTINE_RECEIPT_MISSING",
+            "The durable target safety state is missing after a prior probe attempt.",
+            "After an operator resets or replaces the test environment, rerun with the matching "
+            "--resolve-quarantine-after attestation.",
+            target_safe_to_reuse=False,
+        ) from None
+    except (OSError, ValidationError, ValueError):
+        if resolution is not None:
+            _persist_probe_safety_state(
+                resolved_target,
+                status="reusable",
+                reason_code=f"operator_attested_{resolution.replace('-', '_')}",
+            )
+            return
+        raise ProbeFailure(
+            "target load",
+            "PROBE_QUARANTINE_RECEIPT_INVALID",
+            "The bound target safety state is invalid or unreadable.",
+            "After an operator resets or replaces the test environment, restore safety with the "
+            "matching --resolve-quarantine-after attestation.",
+            target_safe_to_reuse=False,
+        ) from None
+    if state.target_confirmation_sha256 != resolved_target.confirmation_sha256:
+        raise ProbeFailure(
+            "target load",
+            "PROBE_QUARANTINE_RECEIPT_MISMATCH",
+            "The target safety state does not match the resolved target identity.",
+            "Do not call the target; restore its matching private safety state.",
+            target_safe_to_reuse=False,
+        )
+    if state.status == "reusable":
+        return
+    if resolution is None:
+        raise ProbeFailure(
+            "target load",
+            "PROBE_TARGET_QUARANTINED",
+            "A previous probe may have reached the target with uncertain delivery.",
+            "After an operator resets or replaces the test environment, rerun with "
+            "--resolve-quarantine-after environment-reset (or environment-replacement).",
+            target_safe_to_reuse=False,
+        )
+    _persist_probe_safety_state(
+        resolved_target,
+        status="reusable",
+        reason_code=f"operator_attested_{resolution.replace('-', '_')}",
+    )
+    console.print(
+        "Recorded target quarantine cleared after operator attestation; durable safety state "
+        "was updated."
+    )
+
+
+def _persist_probe_quarantine(
+    resolved_target: _ResolvedTarget,
+    reason_code: str,
+) -> None:
+    _persist_probe_safety_state(
+        resolved_target,
+        status="quarantined",
+        reason_code=reason_code,
+    )
 
 
 def _semantic_settings_snapshot(
@@ -446,8 +880,39 @@ def probe(
         bool,
         typer.Option(help="Print private smoke response content instead of only its digest."),
     ] = False,
+    progress_json: Annotated[
+        bool,
+        typer.Option(
+            "--progress-json",
+            help="Write stable privacy-safe progress JSON Lines to stderr.",
+        ),
+    ] = False,
+    resolve_quarantine_after: Annotated[
+        Literal["environment-reset", "environment-replacement"] | None,
+        typer.Option(
+            "--resolve-quarantine-after",
+            help="Attest that an operator reset or replaced a quarantined test environment.",
+        ),
+    ] = None,
+    resume_checkpoint: Annotated[
+        Path | None,
+        typer.Option(
+            "--resume-checkpoint",
+            exists=True,
+            dir_okay=False,
+            readable=True,
+            hidden=True,
+        ),
+    ] = None,
+    resume_checkpoint_sha256: Annotated[
+        str | None,
+        typer.Option("--resume-checkpoint-sha256", hidden=True),
+    ] = None,
 ) -> None:
     """Smoke a real target, then optionally run one bounded active-probe pilot."""
+    progress_runtime: CampaignProgressRuntime | None = None
+    resolved_target: _ResolvedTarget | None = None
+    target_lock_descriptor: int | None = None
     try:
         records = _load_pilot_records(data)
         resolved_target = _resolve_target(
@@ -456,18 +921,44 @@ def probe(
             explicit_artifacts=tuple(target_artifact or ()),
         )
         existing_config = _check_probe_config_binding(data, resolved_target)
+        try:
+            os.lstat(_probe_target_lock_path(resolved_target))
+            target_lock_preexists = True
+        except FileNotFoundError:
+            target_lock_preexists = False
+        if target_lock_preexists:
+            try:
+                target_lock_descriptor, lock_created = _open_probe_target_lock(resolved_target)
+            except OSError:
+                raise ProbeFailure(
+                    "target load",
+                    "PROBE_TARGET_LOCK_UNAVAILABLE",
+                    "The private target safety lock could not be acquired.",
+                    "Fix the private .ul directory before making any target call.",
+                    target_safe_to_reuse=True,
+                ) from None
+            _enforce_probe_quarantine(
+                resolved_target,
+                resolve_quarantine_after,
+                lock_created=lock_created,
+            )
         _confirm_target(resolved_target, confirmed_digest=confirm_target)
-        smoke_result = asyncio.run(_run_smoke(records[0], resolved_target))
-        _print_smoke(
-            smoke_result,
-            resolved_target,
-            show_response=show_smoke_response,
-        )
-        _save_probe_config(
-            data=data,
-            resolved_target=resolved_target,
-            existing_config=existing_config,
-        )
+        if target_lock_descriptor is None:
+            try:
+                target_lock_descriptor, lock_created = _open_probe_target_lock(resolved_target)
+            except OSError:
+                raise ProbeFailure(
+                    "target load",
+                    "PROBE_TARGET_LOCK_UNAVAILABLE",
+                    "The private target safety lock could not be acquired.",
+                    "Fix the private .ul directory before making any target call.",
+                    target_safe_to_reuse=True,
+                ) from None
+            _enforce_probe_quarantine(
+                resolved_target,
+                resolve_quarantine_after,
+                lock_created=lock_created,
+            )
         try:
             settings = load_dataset_semantic_settings()
             validate_model_input_bounds(records, settings.max_input_chars)
@@ -480,10 +971,37 @@ def probe(
                 target_calls_per_execution=resolved_target.calls_per_execution,
                 settings=settings,
             )
-            remaining_target_seconds = _validate_campaign_target_budget(
-                plan, resolved_target, smoke_result.elapsed_seconds
-            )
             campaign_confirmation = _campaign_confirmation(plan, settings, resolved_target)
+            checkpoint_path = _probe_checkpoint_path(output)
+            target_path = Path(target)
+            action_target = str(target_path.resolve()) if target_path.is_file() else target
+            resume_argv = [
+                "ul",
+                "probe",
+                str(data.resolve()),
+                "--target",
+                action_target,
+                "--output",
+                str(output.resolve()),
+                "--confirm-target",
+                resolved_target.confirmation_sha256,
+                "--confirm-paid-execution",
+                _model_sha256(campaign_confirmation),
+                "--resume-checkpoint",
+                str(checkpoint_path.resolve()),
+            ]
+            for artifact in target_artifact or ():
+                resume_argv.extend(("--target-artifact", str(artifact.resolve())))
+            if confirmation_run:
+                resume_argv.append("--confirmation-run")
+            if allow_insecure_http:
+                resume_argv.append("--allow-insecure-http")
+            if diagnostic_artifact is not None:
+                resume_argv.extend(("--diagnostic-artifact", str(diagnostic_artifact.resolve())))
+            if show_smoke_response:
+                resume_argv.append("--show-smoke-response")
+            if progress_json:
+                resume_argv.append("--progress-json")
             run_context = create_dataset_evidence_run_context(
                 selected_records=records,
                 operators=tuple(
@@ -493,6 +1011,21 @@ def probe(
                 invariant_suite_sha256=None,
                 target_receipt=_target_evidence_receipt(resolved_target),
                 semantic_settings=_semantic_settings_snapshot(settings),
+            )
+            progress_runtime = create_campaign_progress_runtime(
+                case_count=len(records),
+                work_upper_bound=(len(records) * repetitions * (1 + len(selected_operator_ids))),
+                target_call_budget=(
+                    resolved_target.calls_per_execution + plan.calls.total_environment_api
+                ),
+                semantic_call_budget=plan.calls.total_semantic_model,
+                environment_call_budget=(
+                    resolved_target.calls_per_execution + plan.calls.total_environment_api
+                ),
+                token_budget=plan.tokens.maximum,
+                maximum_wall_time_seconds=campaign_confirmation.maximum_wall_seconds,
+                next_commands=create_probe_next_commands(evidence_path=output),
+                json_output=progress_json,
             )
         except ProbeFailure:
             raise
@@ -504,12 +1037,114 @@ def probe(
                 "Review semantic settings and target limits, then rerun.",
                 target_safe_to_reuse=True,
             ) from None
+        progress_runtime.tracker.record_usage(
+            target_calls=1,
+            semantic_calls=None,
+            environment_calls=resolved_target.calls_per_execution,
+            tokens=None,
+        )
+        progress_runtime.tracker.emit(status="running", stage="smoke")
+        evaluator_preflight: EvaluatorModelPreflight | None = None
+        if resume_checkpoint is not None:
+            if resume_checkpoint_sha256 is None:
+                raise ProbeFailure(
+                    "target load",
+                    "PROBE_CHECKPOINT_DIGEST_MISSING",
+                    "The private probe checkpoint digest is required for resume.",
+                    "Use only the opaque resume action emitted by the paused campaign.",
+                    target_safe_to_reuse=True,
+                )
+            try:
+                smoke_result = _load_probe_checkpoint(
+                    resume_checkpoint,
+                    expected_sha256=resume_checkpoint_sha256,
+                    records=records,
+                    resolved_target=resolved_target,
+                    campaign_confirmation=campaign_confirmation,
+                    output=output,
+                )
+            except (OSError, ValidationError, ValueError):
+                raise ProbeFailure(
+                    "target load",
+                    "PROBE_CHECKPOINT_INVALID",
+                    "The private bound smoke checkpoint is invalid.",
+                    "Keep the target stopped and inspect the private smoke checkpoint.",
+                    target_safe_to_reuse=True,
+                ) from None
+            try:
+                evaluator_preflight, _ = asyncio.run(load_evaluator_preflight(output, settings))
+            except (OSError, ValidationError, ValueError):
+                raise ProbeFailure(
+                    "target load",
+                    "PROBE_PREFLIGHT_CHECKPOINT_INVALID",
+                    "The private bound evaluator preflight checkpoint is invalid.",
+                    "Keep the target stopped and inspect the private preflight checkpoint.",
+                    target_safe_to_reuse=True,
+                ) from None
+            console.print("Reusing durable smoke and evaluator preflight checkpoints.")
+            checkpoint_sha256 = resume_checkpoint_sha256
+        else:
+            if resume_checkpoint_sha256 is not None:
+                raise ProbeFailure(
+                    "target load",
+                    "PROBE_CHECKPOINT_PATH_MISSING",
+                    "A probe checkpoint digest cannot be used without its private checkpoint.",
+                    "Use only the opaque resume action emitted by the paused campaign.",
+                    target_safe_to_reuse=True,
+                )
+            with progress_runtime.signal_control.installed():
+                smoke_result = asyncio.run(
+                    _run_smoke(
+                        records[0],
+                        resolved_target,
+                        signal_control=progress_runtime.signal_control,
+                    )
+                )
+            _print_smoke(
+                smoke_result,
+                resolved_target,
+                show_response=show_smoke_response,
+            )
+            _save_probe_config(
+                data=data,
+                resolved_target=resolved_target,
+                existing_config=existing_config,
+            )
+            try:
+                checkpoint_sha256 = _persist_probe_checkpoint(
+                    checkpoint_path,
+                    records=records,
+                    resolved_target=resolved_target,
+                    campaign_confirmation=campaign_confirmation,
+                    output=output,
+                    smoke_result=smoke_result,
+                )
+            except (OSError, ValueError):
+                raise ProbeFailure(
+                    "output",
+                    "PROBE_CHECKPOINT_WRITE_FAILED",
+                    "The successful smoke checkpoint could not be persisted durably.",
+                    "Do not continue to paid campaign work; fix private output storage first.",
+                    target_safe_to_reuse=True,
+                ) from None
+        resume_argv.extend(("--resume-checkpoint-sha256", checkpoint_sha256))
+        progress_runtime.tracker.replace_next_commands(
+            create_probe_next_commands(
+                evidence_path=output,
+                resume_argv=tuple(resume_argv),
+            )
+        )
+        remaining_target_seconds = _validate_campaign_target_budget(
+            plan, resolved_target, smoke_result.elapsed_seconds
+        )
         _print_pilot_budget(plan, campaign_confirmation)
         if not _confirm_paid_execution(
             confirmation=campaign_confirmation,
             confirmed_digest=confirm_paid_execution,
         ):
             console.print("Stopped after smoke. No semantic-model calls were made.")
+            _remove_probe_checkpoint(checkpoint_path)
+            progress_runtime.tracker.emit(status="cancelled", stage="terminal")
             return
         _validate_paid_execution_settings(settings)
         results = _run_campaign(
@@ -522,11 +1157,17 @@ def probe(
             repetitions=repetitions,
             remaining_target_seconds=remaining_target_seconds,
             run_context=run_context,
+            progress_runtime=progress_runtime,
+            evaluator_preflight=evaluator_preflight,
+            resume_campaign=resume_checkpoint is not None,
+            allow_insecure_http=allow_insecure_http,
+            resolve_quarantine_after=resolve_quarantine_after,
         )
         projection_failure = _campaign_projection_failure(results, output)
         if projection_failure is not None:
             raise projection_failure
         try:
+            progress_runtime.tracker.emit(status="running", stage="report")
             print_dataset_results(results, output, show_report_guidance=False)
         except Exception:
             raise ProbeFailure(
@@ -546,6 +1187,7 @@ def probe(
             )
             console.print("")
             report_evidence(output)
+            progress_runtime.tracker.emit(status="completed", stage="terminal")
         except Exception:
             raise ProbeFailure(
                 "analysis",
@@ -555,8 +1197,34 @@ def probe(
                 target_safe_to_reuse=True,
             ) from None
     except ProbeFailure as failure:
+        if not failure.target_safe_to_reuse and resolved_target is not None:
+            try:
+                _persist_probe_quarantine(resolved_target, failure.reason_code)
+            except (OSError, ValueError):
+                failure = ProbeFailure(
+                    "output",
+                    "PROBE_QUARANTINE_PERSIST_FAILED",
+                    "UL could not persist the target quarantine receipt after an unsafe stop.",
+                    "Do not call this target; fix the private .ul directory before retrying.",
+                    target_safe_to_reuse=False,
+                )
+        if progress_runtime is not None and not progress_runtime.tracker.terminal_emitted:
+            progress_runtime.tracker.emit(
+                status="failed",
+                stage="terminal",
+                environment="reusable" if failure.target_safe_to_reuse else "quarantined",
+            )
         _print_failure(failure, diagnostic_artifact=diagnostic_artifact)
-        raise typer.Exit(code=2) from None
+        exit_code = (
+            130
+            if failure.reason_code
+            in {"PROBE_PAUSED_AFTER_PREFLIGHT", "PROBE_PAUSED_DURING_CAMPAIGN"}
+            else 2
+        )
+        raise typer.Exit(code=exit_code) from None
+    finally:
+        if target_lock_descriptor is not None:
+            _close_probe_target_lock(target_lock_descriptor)
 
 
 def _load_pilot_records(data: Path) -> tuple[InteractionRecord, ...]:
@@ -728,16 +1396,11 @@ def _confirm_target(resolved_target: _ResolvedTarget, *, confirmed_digest: str |
         )
 
 
-async def _run_smoke(
+def _smoke_case(
     record: InteractionRecord,
     resolved_target: _ResolvedTarget,
-) -> _SmokeResult:
-    resolved_target.revalidate_identity()
-    connection = resolved_target.create_connection(
-        resolved_target.calls_per_execution,
-        resolved_target.maximum_active_target_seconds,
-    )
-    case = EvaluationCase(
+) -> EvaluationCase:
+    return EvaluationCase(
         id=f"{record.id}:smoke",
         turns=(
             ConversationTurn(
@@ -750,10 +1413,29 @@ async def _run_smoke(
         timeout_seconds=_TARGET_TIMEOUT_SECONDS,
         probe_context=record.probe_context(record.raw_input),
     )
+
+
+async def _run_smoke(
+    record: InteractionRecord,
+    resolved_target: _ResolvedTarget,
+    *,
+    signal_control: CampaignSignalControl | None = None,
+) -> _SmokeResult:
+    resolved_target.revalidate_identity()
+    connection = resolved_target.create_connection(
+        resolved_target.calls_per_execution,
+        resolved_target.maximum_active_target_seconds,
+    )
+    case = _smoke_case(record, resolved_target)
     try:
         started_at = time.monotonic()
         async with connection:
+            task = asyncio.current_task()
+            if signal_control is not None and task is not None:
+                signal_control.target_call_started(task)
             evidence = await connection.execute(case)
+            if signal_control is not None:
+                signal_control.target_call_finished()
         elapsed_seconds = time.monotonic() - started_at
     except OutcomeProjectionExecutionError as error:
         raise ProbeFailure(
@@ -762,6 +1444,16 @@ async def _run_smoke(
             str(error),
             _projection_failure_remediation(error, error.target_safe_to_reuse),
             target_safe_to_reuse=error.target_safe_to_reuse,
+        ) from None
+    except asyncio.CancelledError:
+        if signal_control is not None:
+            signal_control.target_call_finished()
+        raise ProbeFailure(
+            "smoke invocation",
+            "PROBE_SMOKE_DELIVERY_UNCERTAIN",
+            "Smoke delivery may have begun before interruption; UL did not retry it.",
+            "Quarantine the target until an operator resets or replaces the test environment.",
+            target_safe_to_reuse=False,
         ) from None
     except (OSError, RuntimeError, TimeoutError, ValueError, httpx.HTTPError) as error:
         raise ProbeFailure(
@@ -1007,8 +1699,9 @@ def _check_probe_config_binding(
 def _ensure_private_project_directory(path: Path) -> None:
     with suppress(FileExistsError):
         os.mkdir(path, 0o700)
+    path_status = os.lstat(path)
     if os.name == "nt":
-        if not stat.S_ISDIR(os.lstat(path).st_mode):
+        if not stat.S_ISDIR(path_status.st_mode):
             raise OSError("project path is not a directory")
         return
     descriptor = os.open(
@@ -1016,10 +1709,12 @@ def _ensure_private_project_directory(path: Path) -> None:
         os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
     )
     try:
-        path_status = os.fstat(descriptor)
-        if not stat.S_ISDIR(path_status.st_mode):
+        descriptor_status = os.fstat(descriptor)
+        if not stat.S_ISDIR(descriptor_status.st_mode) or not os.path.samestat(
+            path_status, descriptor_status
+        ):
             raise OSError("project path is not a directory")
-        if hasattr(os, "getuid") and path_status.st_uid != os.getuid():
+        if hasattr(os, "getuid") and descriptor_status.st_uid != os.getuid():
             raise OSError("project directory is not owned by the current user")
         if os.name != "nt":
             os.fchmod(descriptor, 0o700)
@@ -1211,9 +1906,14 @@ def _run_campaign(
     repetitions: int,
     remaining_target_seconds: float | None,
     run_context: DatasetEvidenceRunContext,
+    progress_runtime: CampaignProgressRuntime,
+    evaluator_preflight: EvaluatorModelPreflight | None,
+    resume_campaign: bool,
+    allow_insecure_http: bool,
+    resolve_quarantine_after: Literal["environment-reset", "environment-replacement"] | None,
 ) -> tuple[DatasetEvaluationResult, ...]:
     resolved_target.revalidate_identity()
-    if output.exists():
+    if output.exists() and not resume_campaign:
         raise ProbeFailure(
             "output",
             "PROBE_EVIDENCE_EXISTS",
@@ -1231,9 +1931,157 @@ def _run_campaign(
             "Check the output path and permissions, then rerun.",
             target_safe_to_reuse=True,
         ) from None
+    augmentations_output = default_augmentations_output(output)
+    augmentation_generation_context = create_dataset_augmentation_generation_context(
+        selected_records=records,
+        operators=tuple(
+            dataset_operator_identity(operator_reference)
+            for operator_reference in selected_operator_ids
+        ),
+        semantic_settings=DatasetAugmentationLedgerSemanticSettings(
+            provider=settings.semantic_provider_id,
+            endpoint_sha256=settings.semantic_endpoint_sha256,
+            model=settings.model,
+            render_model=settings.render_model,
+            equivalence_model=settings.equivalence_model,
+            max_input_chars=settings.max_input_chars,
+            max_output_tokens=settings.max_output_tokens,
+            max_render_tokens=settings.max_render_tokens,
+            max_response_bytes=settings.max_response_bytes,
+            timeout_seconds=settings.timeout_seconds,
+        ),
+    )
+    expected_manifest = create_dataset_run_manifest(
+        run_context=run_context,
+        selected_records=records,
+        selected_operator_ids=selected_operator_ids,
+        repetitions=repetitions,
+        max_environment_api_calls=plan.calls.total_environment_api,
+        allow_environment_network=True,
+        confirm_test_environment=True,
+        allow_insecure_http=allow_insecure_http,
+        save_augmentations=True,
+        semantic_provider_type=settings.semantic_provider_type,
+        semantic_base_url=settings.semantic_base_url,
+        semantic_live_calls=settings.live_calls,
+        semantic_allow_external_data_processing=settings.allow_external_data_processing,
+        augmentations_output_path=str(augmentations_output.resolve()),
+    )
+    trial_journal: DatasetTrialJournal | None = None
+    augmentation_ledger: DatasetAugmentationLedger | None = None
     try:
-        evaluator_preflight = asyncio.run(preflight_evaluator(settings))
+        if resume_campaign:
+            recorded_manifest = read_dataset_run_manifest(manifest_path(output))
+            if recorded_manifest != expected_manifest:
+                raise ValueError("probe campaign manifest does not match the resumed campaign")
+            trial_journal = open_dataset_trial_journal(journal_path(output), recorded_manifest)
+            if trial_journal.snapshot.quarantined_unit_ids:
+                if resolve_quarantine_after is None:
+                    try:
+                        _persist_probe_quarantine(
+                            resolved_target,
+                            "target_delivery_or_cleanup_uncertain",
+                        )
+                    except (OSError, ValueError):
+                        raise ProbeFailure(
+                            "output",
+                            "PROBE_QUARANTINE_PERSIST_FAILED",
+                            "UL could not persist target quarantine after interrupted delivery.",
+                            "Do not call this target; fix the private .ul directory first.",
+                            target_safe_to_reuse=False,
+                        ) from None
+                    raise ProbeFailure(
+                        "target load",
+                        "PROBE_TARGET_QUARANTINED",
+                        "An interrupted probe trial has uncertain target delivery.",
+                        "After an operator resets or replaces the test environment, rerun with "
+                        "--resolve-quarantine-after environment-reset (or "
+                        "environment-replacement).",
+                        target_safe_to_reuse=False,
+                    )
+                _persist_probe_safety_state(
+                    resolved_target,
+                    status="reusable",
+                    reason_code=(f"operator_attested_{resolve_quarantine_after.replace('-', '_')}"),
+                )
+            if durable_evidence_marker_manifest_sha256(output) != recorded_manifest.manifest_sha256:
+                raise ValueError("probe evidence marker does not match the resumed campaign")
+            augmentation_ledger = open_augmentation_ledger_for_resume(
+                augmentations_output,
+                expected_context=augmentation_generation_context,
+                selected_records=records,
+            )
+        else:
+            persist_dataset_run_manifest(manifest_path(output), expected_manifest)
+            trial_journal = create_dataset_trial_journal(journal_path(output), expected_manifest)
+            create_durable_evidence_output(output, expected_manifest.manifest_sha256)
+            augmentation_ledger = create_private_augmentation_ledger(
+                augmentations_output,
+                generation_context=augmentation_generation_context,
+                selected_records=records,
+            )
+    except ProbeFailure:
+        if trial_journal is not None:
+            trial_journal.close()
+        raise
+    except (OSError, ValueError):
+        if augmentation_ledger is not None:
+            augmentation_ledger.close()
+        if trial_journal is not None:
+            trial_journal.close()
+        raise ProbeFailure(
+            "output",
+            "PROBE_DURABLE_STATE_INVALID",
+            "The durable campaign manifest, journal, or evidence output could not be "
+            "opened safely.",
+            "Keep the target stopped and inspect the private campaign artifacts.",
+            target_safe_to_reuse=not resume_campaign,
+        ) from None
+
+    terminal_states = trial_journal.snapshot.terminal_states
+    if terminal_states:
+        progress_runtime.tracker.hydrate_terminal_states(terminal_states)
+        attempted_target_calls = sum(
+            state in {"completed", "errored", "inconclusive", "quarantined"}
+            for state in terminal_states.values()
+        )
+        progress_runtime.tracker.record_usage(
+            target_calls=1 + attempted_target_calls,
+            semantic_calls=None,
+            environment_calls=(resolved_target.calls_per_execution * (1 + attempted_target_calls)),
+            tokens=None,
+        )
+
+    def flush_progress_boundary() -> None:
+        assert trial_journal is not None
+        trial_journal.flush()
+
+    progress_runtime.tracker.emit(status="running", stage="preflight")
+    try:
+        if evaluator_preflight is None:
+            with progress_runtime.signal_control.installed():
+                evaluator_preflight = asyncio.run(preflight_evaluator(settings))
+            persist_evaluator_preflight(output, evaluator_preflight)
+        if not progress_runtime.tracker.safe_boundary(
+            progress_runtime.control,
+            flush_progress_boundary,
+        ):
+            action = progress_runtime.control.requested_action()
+            assert action is not None
+            raise CampaignControlRequested(action)
+    except CampaignControlRequested:
+        augmentation_ledger.close()
+        trial_journal.close()
+        raise ProbeFailure(
+            "augmentation preparation",
+            "PROBE_PAUSED_AFTER_PREFLIGHT",
+            "The campaign paused at the durable boundary after evaluator preflight.",
+            "Run the opaque resume action to reuse completed smoke and preflight checkpoints.",
+            target_safe_to_reuse=True,
+        ) from None
     except Exception:
+        augmentation_ledger.close()
+        trial_journal.close()
         raise ProbeFailure(
             "augmentation preparation",
             "PROBE_AUGMENTATION_PREPARATION_FAILED",
@@ -1247,6 +2095,8 @@ def _run_campaign(
             remaining_target_seconds,
         )
     except Exception:
+        augmentation_ledger.close()
+        trial_journal.close()
         raise ProbeFailure(
             "probe execution",
             "PROBE_TARGET_CONNECTION_FAILED",
@@ -1255,11 +2105,32 @@ def _run_campaign(
             target_safe_to_reuse=True,
         ) from None
     try:
-        with create_private_output(output) as output_stream:
+        try:
+            output_stream, resume_evidence = open_resume_output(
+                output,
+                expected_context=run_context,
+                selected_records=records,
+                invariant_suite=None,
+            )
+        except (OSError, ValueError):
+            raise ProbeFailure(
+                "output",
+                "PROBE_EVIDENCE_WRITE_FAILED",
+                "The durable evidence output could not be opened safely.",
+                "Keep the target stopped and inspect the private campaign artifacts.",
+                target_safe_to_reuse=True,
+            ) from None
+        campaign_records = tuple(
+            record for record in records if record.id not in resume_evidence.processed_ids
+        )
+        saved_augmentations = {
+            record.source.id: record.augmentation for record in augmentation_ledger.snapshot.records
+        }
+        with output_stream:
             try:
                 results = asyncio.run(
                     evaluate_interaction_records(
-                        records,
+                        campaign_records,
                         selected_operator_ids,
                         settings,
                         connection,
@@ -1267,10 +2138,25 @@ def _run_campaign(
                         repetitions=repetitions,
                         max_environment_api_calls=plan.calls.total_environment_api,
                         planned_target_calls=plan.calls.total_environment_api,
+                        progress_plan=plan,
+                        progress_runtime=progress_runtime,
+                        complete_progress=False,
+                        environment_calls_per_target_call=(resolved_target.calls_per_execution),
                         run_context=run_context,
                         evaluator_preflight=evaluator_preflight,
+                        trial_journal=trial_journal,
+                        augmentation_ledger=augmentation_ledger,
+                        saved_augmentations=saved_augmentations,
                     )
                 )
+            except CampaignControlRequested:
+                raise ProbeFailure(
+                    "evaluation",
+                    "PROBE_PAUSED_DURING_CAMPAIGN",
+                    "The campaign paused at a durable trial boundary.",
+                    "Run the opaque resume action to continue only unfinished trials.",
+                    target_safe_to_reuse=True,
+                ) from None
             except Exception:
                 raise ProbeFailure(
                     "evaluation",
@@ -1291,6 +2177,9 @@ def _run_campaign(
             "Check disk space and permissions; inspect any retained evidence before retrying.",
             target_safe_to_reuse=False,
         ) from None
+    finally:
+        augmentation_ledger.close()
+        trial_journal.close()
     return results
 
 

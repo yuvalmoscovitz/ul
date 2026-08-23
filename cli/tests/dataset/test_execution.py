@@ -18,10 +18,16 @@ from ul import (
     ProviderDiagnosticError,
 )
 from ul.environment import evaluation_case_from_inputs
+from ul_cli import progress_action as progress_action_module
 from ul_cli.dataset.evaluation import command as command_module
 from ul_cli.dataset.evaluation import runner as runner_module
 from ul_cli.dataset.evidence import persistence as persistence_module
-from ul_cli.dataset_trial_journal import manifest_path, read_dataset_run_manifest
+from ul_cli.dataset_trial_journal import (
+    journal_path,
+    manifest_path,
+    open_dataset_trial_journal,
+    read_dataset_run_manifest,
+)
 from ul_cli.main import app as root_app
 
 from ._factories import (
@@ -36,6 +42,88 @@ from ._files import (
 
 runner = CliRunner()
 _ANSI_ESCAPE_PATTERN = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+
+
+@pytest.fixture(autouse=True)
+def isolate_progress_action_receipts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        progress_action_module,
+        "_action_receipt_directory",
+        lambda: tmp_path / "action-state",
+    )
+
+
+def test_safe_boundary_pause_flushes_a_resumable_campaign(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    dataset = tmp_path / "interactions.jsonl"
+    output = tmp_path / "results.jsonl"
+    target_config = tmp_path / "target.json"
+    _write_dataset(dataset, [_record()])
+    _write_target_config(target_config)
+
+    class FakeTarget:
+        @classmethod
+        def from_config(cls, *_args: object, **_kwargs: object) -> FakeTarget:
+            return cls()
+
+        async def aclose(self) -> None:
+            pass
+
+    async def successful_preflight(_settings: object) -> object:
+        return _evaluator_preflight()
+
+    create_runtime = command_module.create_campaign_progress_runtime
+
+    def create_paused_runtime(**arguments: object) -> object:
+        runtime = create_runtime(**arguments)
+        runtime.control.request_pause()
+        return runtime
+
+    monkeypatch.setattr(command_module, "load_dataset_semantic_settings", _settings)
+    monkeypatch.setattr(command_module, "JsonHttpEnvironmentConnection", FakeTarget)
+    monkeypatch.setattr(command_module, "preflight_evaluator", successful_preflight)
+    monkeypatch.setattr(
+        command_module,
+        "create_campaign_progress_runtime",
+        create_paused_runtime,
+    )
+
+    result = runner.invoke(
+        root_app,
+        [
+            "dataset",
+            "evaluate",
+            str(dataset),
+            "--environment-config",
+            str(target_config),
+            "--allow-environment-network",
+            "--confirm-test-environment",
+            "--output",
+            str(output),
+        ],
+    )
+
+    assert result.exit_code == 130, result.output
+    assert result.output.count(" next_action=") == 1
+    assert "next_action=resume" in result.output
+    assert re.search(
+        r'next_argv=\["ul","action","[0-9a-f]{64}"\]',
+        result.output,
+    )
+    assert str(output) not in result.output.split("next_action=", 1)[1]
+    manifest = read_dataset_run_manifest(manifest_path(output))
+    journal = open_dataset_trial_journal(journal_path(output), manifest)
+    journal.close()
+    resume_check = runner.invoke(
+        root_app,
+        ["dataset", "evaluate", "--resume", str(output), "--dry-run"],
+    )
+    assert resume_check.exit_code == 0, resume_check.output
 
 
 def test_execution_requires_config_network_confirmation_environment_and_output(
@@ -265,6 +353,8 @@ def test_execution_creates_private_explicit_output(
         saved_augmentations: object,
         redaction_engine: object,
         evaluator_preflight: object,
+        trial_journal: object,
+        progress_plan: Any,
     ) -> tuple[object, ...]:
         del settings, target, run_context, augmentation_ledger, saved_augmentations
         assert evaluator_preflight == _evaluator_preflight()
@@ -274,6 +364,7 @@ def test_execution_creates_private_explicit_output(
         assert repetitions == 3
         assert max_environment_api_calls == 100
         assert planned_target_calls == 30
+        assert progress_plan.calls.total_environment_api == 30
         output_stream.write('{"saved":true}\n')
         output_stream.flush()
         return ()
@@ -312,6 +403,39 @@ def test_execution_creates_private_explicit_output(
     assert "Complete evidence" in result.output
     assert "Next: ul dataset report" in result.output
     assert "Transfer 100" not in result.output
+    report_position = result.output.index("stage=report")
+    completion_position = result.output.index("completed stage=terminal")
+    assert report_position < completion_position
+    assert result.output.count("next_action=") == 1
+
+    def fail_presentation(*args: object, **kwargs: object) -> None:
+        del args, kwargs
+        raise RuntimeError("private-presentation-canary")
+
+    failed_output = tmp_path / "failed-results.jsonl"
+    monkeypatch.setattr(command_module, "print_dataset_results", fail_presentation)
+    failed = runner.invoke(
+        root_app,
+        [
+            "dataset",
+            "evaluate",
+            str(dataset),
+            "--operator",
+            "input.surface.disfluency_repeat",
+            "--environment-config",
+            str(target_config),
+            "--allow-insecure-http",
+            "--allow-environment-network",
+            "--confirm-test-environment",
+            "--output",
+            str(failed_output),
+        ],
+    )
+
+    assert failed.exit_code == 1
+    assert "completed stage=terminal" not in failed.output
+    assert "failed stage=terminal" in failed.output
+    assert "private-presentation-canary" not in failed.output
 
 
 def test_provider_failure_has_concise_output_and_private_sanitized_diagnostics(
@@ -516,6 +640,8 @@ def test_execution_wires_redaction_into_records_pipeline_and_run_context(
         saved_augmentations: object,
         redaction_engine: object,
         evaluator_preflight: object,
+        trial_journal: object,
+        progress_plan: object,
     ) -> tuple[object, ...]:
         del (
             repetitions,
@@ -523,6 +649,7 @@ def test_execution_wires_redaction_into_records_pipeline_and_run_context(
             planned_target_calls,
             augmentation_ledger,
             saved_augmentations,
+            progress_plan,
         )
         assert redaction_engine is not None
         assert evaluator_preflight == _evaluator_preflight()
@@ -670,6 +797,8 @@ def test_target_config_runs_nested_request_and_response_against_loopback(
             saved_augmentations: object,
             redaction_engine: object,
             evaluator_preflight: object,
+            trial_journal: object,
+            progress_plan: object,
         ) -> tuple[object, ...]:
             del (
                 operator_ids,
@@ -680,6 +809,7 @@ def test_target_config_runs_nested_request_and_response_against_loopback(
                 run_context,
                 augmentation_ledger,
                 saved_augmentations,
+                progress_plan,
             )
             assert redaction_engine is None
             assert evaluator_preflight == _evaluator_preflight()
