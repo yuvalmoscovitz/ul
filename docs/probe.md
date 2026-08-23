@@ -44,12 +44,17 @@ ul probe interactions.jsonl --target local-target.json
 ul probe interactions.jsonl --target http-target.json
 ```
 
+UL automatically binds command arguments that resolve to files. When a generic interpreter hides
+its worker artifact, repeat `--target-artifact PATH` for every script or bundle that will execute.
+
 Plain local HTTP also requires `--allow-insecure-http`. HTTP is never the implicit default.
 
 ## 3. Inspect the smoke proof
 
-The first result includes the live normalized target response, response-only or response-and-state
-evidence level, available trajectory observations, and state-summary availability. Only after a
+The first result includes a bounded structural summary and digest of the live normalized target
+response, response-only or response-and-state evidence level, available trajectory observations,
+and state-summary availability. Use `--show-smoke-response` only when private response content is
+safe to print. Only after a
 successful smoke does UL save private target/dataset bindings in `.ul/probe.json`.
 
 UL then selects at most ten examples, recommends the low-risk
@@ -73,15 +78,17 @@ Confirm the paid/network campaign prompt. The pilot runs one original and one ac
 each of at most ten examples, with one repetition. It writes the normal private UL evidence JSONL
 and prints the normal unified report. A hosted UL account is not required.
 
-For automation, the two explicit confirmations can be supplied as flags after reviewing the bound
-target and campaign:
+For automation, bind both confirmations to the exact digests printed by a prior dry review:
 
 ```bash
 ul probe interactions.jsonl \
   --target agent:run \
-  --confirm-target \
-  --confirm-paid-execution
+  --confirm-target TARGET_CONFIRMATION_SHA256 \
+  --confirm-paid-execution CAMPAIGN_CONFIRMATION_SHA256
 ```
+
+Changing executable/module bytes, target configuration, semantic provider endpoint, data policy,
+or the bounded campaign invalidates the corresponding digest.
 
 After reviewing the pilot, use the copy-ready command printed by UL with `--confirmation-run` to
 repeat every original/probe arm three times under a newly displayed budget and a new evidence path.

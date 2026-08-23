@@ -5,9 +5,11 @@ import hashlib
 import json
 import os
 import shlex
+import shutil
 import stat
 import subprocess
 import sys
+import time
 from collections.abc import Callable
 from contextlib import suppress
 from dataclasses import dataclass
@@ -16,6 +18,7 @@ from typing import Annotated, Literal, cast
 
 import httpx
 import typer
+import ul.local_target as local_target_module
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from ul import (
     DatasetEvaluationResult,
@@ -37,6 +40,7 @@ from ul.http_environment import (
     validate_json_http_environment_configuration,
 )
 from ul.local_target import (
+    CommandTargetConfig,
     LocalTargetConfig,
     LocalTargetConnection,
     PythonCallableTargetConfig,
@@ -86,14 +90,43 @@ class _StrictModel(BaseModel):
 
 
 class ProbeProjectConfig(_StrictModel):
-    schema_version: Literal[1] = 1
+    schema_version: Literal[2] = 2
     dataset: str = Field(min_length=1)
     target: str = Field(min_length=1)
     target_kind: Literal["python_callable", "command", "http"]
     target_config_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    target_confirmation_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     operator: Literal["input.surface.typing_noise"] = _PILOT_OPERATOR
     limit: Literal[10] = _PILOT_LIMIT
     repetitions: Literal[1] = _PILOT_REPETITIONS
+
+
+class _ArtifactIdentity(_StrictModel):
+    path: str
+    sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
+class _TargetConfirmation(_StrictModel):
+    schema_version: Literal[1] = 1
+    kind: Literal["python_callable", "command", "http"]
+    reference: str
+    config_sha256: str
+    executable: _ArtifactIdentity | None = None
+    artifacts: tuple[_ArtifactIdentity, ...] = ()
+    callable: str | None = None
+
+
+class _CampaignConfirmation(_StrictModel):
+    schema_version: Literal[1] = 1
+    target_confirmation_sha256: str
+    semantic_provider_id: str
+    semantic_provider_type: str
+    semantic_endpoint_sha256: str
+    data_policy: dict[str, object]
+    command_environment_api_requests: int
+    semantic_model_calls: int
+    maximum_completion_tokens: int
+    maximum_wall_seconds: float
 
 
 @dataclass(frozen=True)
@@ -106,7 +139,16 @@ class _ResolvedTarget:
     maximum_executions: int
     maximum_active_target_seconds: float | None
     supports_state_observation: bool
-    create_connection: Callable[[int], ProbeTargetConnection]
+    confirmation: _TargetConfirmation
+    confirmation_sha256: str
+    create_connection: Callable[[int, float | None], ProbeTargetConnection]
+    revalidate_identity: Callable[[], None]
+
+
+@dataclass(frozen=True)
+class _SmokeResult:
+    evidence: ExecutionEvidence
+    elapsed_seconds: float
 
 
 class ProbeFailure(RuntimeError):
@@ -127,6 +169,140 @@ class ProbeFailure(RuntimeError):
         self.target_safe_to_reuse = target_safe_to_reuse
 
 
+def _model_sha256(model: BaseModel) -> str:
+    encoded = json.dumps(
+        model.model_dump(mode="json"), sort_keys=True, separators=(",", ":")
+    ).encode()
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _artifact_identity(path: Path) -> _ArtifactIdentity:
+    resolved = path.resolve(strict=True)
+    path_status = os.lstat(resolved)
+    descriptor = os.open(resolved, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    try:
+        descriptor_status = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(descriptor_status.st_mode)
+            or descriptor_status.st_size > 256 * 1024 * 1024
+            or not os.path.samestat(path_status, descriptor_status)
+        ):
+            raise ValueError("target artifact must be a stable bounded regular file")
+        digest = hashlib.sha256()
+        while chunk := os.read(descriptor, 1024 * 1024):
+            digest.update(chunk)
+    finally:
+        os.close(descriptor)
+    return _ArtifactIdentity(path=str(resolved), sha256=digest.hexdigest())
+
+
+def _resolve_executable(value: Path | str, working_directory: Path) -> Path:
+    candidate = Path(value)
+    if not candidate.is_absolute() and candidate.parent != Path("."):
+        candidate = working_directory / candidate
+    if candidate.parent == Path("."):
+        found = shutil.which(str(candidate))
+        if found is None:
+            raise ValueError("target executable was not found")
+        candidate = Path(found)
+    return candidate.resolve(strict=True)
+
+
+def _python_module_artifacts(config: PythonCallableTargetConfig) -> tuple[_ArtifactIdentity, ...]:
+    module_name = config.target.partition(":")[0]
+    current = config.working_directory.resolve(strict=True)
+    paths: list[Path] = []
+    parts = module_name.split(".")
+    for index, part in enumerate(parts):
+        module_file = current / f"{part}.py"
+        package = current / part
+        final = index == len(parts) - 1
+        if final and module_file.is_file():
+            paths.append(module_file)
+            break
+        init_file = package / "__init__.py"
+        if not init_file.is_file():
+            raise ValueError("Python target module must resolve to source inside working_directory")
+        paths.append(init_file)
+        current = package
+    worker = Path(local_target_module.__file__).with_name("_local_worker.py")
+    paths.append(worker)
+    return tuple(_artifact_identity(path) for path in paths)
+
+
+def _command_artifacts(
+    config: CommandTargetConfig, explicit_artifacts: tuple[Path, ...]
+) -> tuple[_ArtifactIdentity, ...]:
+    executable = _resolve_executable(config.argv[0], config.working_directory)
+    artifacts = [_artifact_identity(executable)]
+    for argument in config.argv[1:]:
+        candidate = Path(argument)
+        if not candidate.is_absolute():
+            candidate = config.working_directory / candidate
+        if candidate.is_file():
+            identity = _artifact_identity(candidate)
+            if identity not in artifacts:
+                artifacts.append(identity)
+    for path in explicit_artifacts:
+        candidate = path if path.is_absolute() else config.working_directory / path
+        identity = _artifact_identity(candidate)
+        if identity not in artifacts:
+            artifacts.append(identity)
+    generic_prefixes = ("bash", "node", "python", "ruby", "sh")
+    if executable.name.startswith(generic_prefixes) and len(artifacts) == 1:
+        raise ValueError(
+            "generic command workers require --target-artifact for their script or artifact"
+        )
+    return tuple(artifacts)
+
+
+def _local_target_confirmation(
+    reference: str,
+    config: LocalTargetConfig,
+    digest: str,
+    explicit_artifacts: tuple[Path, ...] = (),
+) -> _TargetConfirmation:
+    if isinstance(config, PythonCallableTargetConfig):
+        executable = _artifact_identity(
+            _resolve_executable(config.interpreter, config.working_directory)
+        )
+        artifacts = _python_module_artifacts(config)
+        callable_name = config.target
+    else:
+        artifacts = _command_artifacts(config, explicit_artifacts)
+        executable = artifacts[0]
+        callable_name = None
+    return _TargetConfirmation(
+        kind=config.kind,
+        reference=reference,
+        config_sha256=digest,
+        executable=executable,
+        artifacts=artifacts,
+        callable=callable_name,
+    )
+
+
+def _require_same_confirmation(
+    expected: _TargetConfirmation,
+    reference: str,
+    config: LocalTargetConfig,
+    digest: str,
+    explicit_artifacts: tuple[Path, ...],
+) -> None:
+    try:
+        current = _local_target_confirmation(reference, config, digest, explicit_artifacts)
+    except (OSError, ValueError):
+        current = None
+    if current != expected:
+        raise ProbeFailure(
+            "target load",
+            "PROBE_TARGET_IDENTITY_CHANGED",
+            "A confirmed executable or target artifact changed before launch.",
+            "Review the new target identity and rerun the command.",
+            target_safe_to_reuse=True,
+        )
+
+
 def probe(
     data: Annotated[
         Path,
@@ -142,20 +318,24 @@ def probe(
         Path,
         typer.Option(help="New normal UL evidence JSONL file."),
     ] = Path(_DEFAULT_EVIDENCE),
+    target_artifact: Annotated[
+        list[Path] | None,
+        typer.Option(help="Additional command worker artifact to hash and bind; repeat as needed."),
+    ] = None,
     confirm_target: Annotated[
-        bool,
+        str | None,
         typer.Option(
             "--confirm-target",
-            help="Confirm the displayed digest identifies a safe dedicated test target.",
+            help="Non-interactively confirm this exact displayed target digest.",
         ),
-    ] = False,
+    ] = None,
     confirm_paid_execution: Annotated[
-        bool,
+        str | None,
         typer.Option(
             "--confirm-paid-execution",
-            help="Authorize the displayed semantic/network campaign budget.",
+            help="Non-interactively authorize this exact displayed campaign digest.",
         ),
-    ] = False,
+    ] = None,
     confirmation_run: Annotated[
         bool,
         typer.Option(
@@ -173,6 +353,10 @@ def probe(
             help="Opt in to a private JSON diagnostic that may contain customer input/output."
         ),
     ] = None,
+    show_smoke_response: Annotated[
+        bool,
+        typer.Option(help="Print private smoke response content instead of only its digest."),
+    ] = False,
 ) -> None:
     """Smoke a real target, then optionally run one bounded active-probe pilot."""
     try:
@@ -180,28 +364,52 @@ def probe(
         resolved_target = _resolve_target(
             target,
             allow_insecure_http=allow_insecure_http,
+            explicit_artifacts=tuple(target_artifact or ()),
         )
-        _confirm_target(resolved_target, confirmed=confirm_target)
-        smoke_evidence = asyncio.run(_run_smoke(records[0], resolved_target))
-        _print_smoke(smoke_evidence, resolved_target)
+        existing_config = _check_probe_config_binding(data, resolved_target)
+        _confirm_target(resolved_target, confirmed_digest=confirm_target)
+        smoke_result = asyncio.run(_run_smoke(records[0], resolved_target))
+        _print_smoke(
+            smoke_result.evidence,
+            resolved_target,
+            show_response=show_smoke_response,
+        )
         _save_probe_config(
             data=data,
             resolved_target=resolved_target,
+            existing_config=existing_config,
         )
-        settings = load_dataset_semantic_settings()
-        validate_model_input_bounds(records, settings.max_input_chars)
-        selected_operator_ids = validate_operator_ids([_PILOT_OPERATOR])
-        repetitions = _CONFIRMATION_REPETITIONS if confirmation_run else _PILOT_REPETITIONS
-        plan = create_dataset_campaign_plan(
-            records=records,
-            selected_operator_ids=selected_operator_ids,
-            repetitions=repetitions,
-            target_calls_per_execution=resolved_target.calls_per_execution,
-            settings=settings,
-        )
-        _validate_campaign_target_budget(plan, resolved_target)
-        _print_pilot_budget(plan, settings, resolved_target)
-        if not _confirm_paid_execution(confirmed=confirm_paid_execution):
+        try:
+            settings = load_dataset_semantic_settings()
+            validate_model_input_bounds(records, settings.max_input_chars)
+            selected_operator_ids = validate_operator_ids([_PILOT_OPERATOR])
+            repetitions = _CONFIRMATION_REPETITIONS if confirmation_run else _PILOT_REPETITIONS
+            plan = create_dataset_campaign_plan(
+                records=records,
+                selected_operator_ids=selected_operator_ids,
+                repetitions=repetitions,
+                target_calls_per_execution=resolved_target.calls_per_execution,
+                settings=settings,
+            )
+            remaining_target_seconds = _validate_campaign_target_budget(
+                plan, resolved_target, smoke_result.elapsed_seconds
+            )
+            campaign_confirmation = _campaign_confirmation(plan, settings, resolved_target)
+        except ProbeFailure:
+            raise
+        except (OSError, RuntimeError, ValidationError, ValueError):
+            raise ProbeFailure(
+                "augmentation preparation",
+                "PROBE_AUGMENTATION_PREPARATION_FAILED",
+                "The bounded campaign could not be prepared safely.",
+                "Review semantic settings and target limits, then rerun.",
+                target_safe_to_reuse=True,
+            ) from None
+        _print_pilot_budget(plan, settings, campaign_confirmation)
+        if not _confirm_paid_execution(
+            confirmation=campaign_confirmation,
+            confirmed_digest=confirm_paid_execution,
+        ):
             console.print("Stopped after smoke. No semantic-model calls were made.")
             return
         _validate_paid_execution_settings(settings)
@@ -213,6 +421,7 @@ def probe(
             plan=plan,
             output=output,
             repetitions=repetitions,
+            remaining_target_seconds=remaining_target_seconds,
         )
         print_dataset_results(results, output, show_report_guidance=False)
         _print_stronger_run(
@@ -220,6 +429,7 @@ def probe(
             target,
             output,
             allow_insecure_http=allow_insecure_http,
+            target_artifacts=tuple(target_artifact or ()),
         )
         console.print("")
         report_evidence(output)
@@ -241,11 +451,20 @@ def _load_pilot_records(data: Path) -> tuple[InteractionRecord, ...]:
         ) from None
 
 
-def _resolve_target(target: str, *, allow_insecure_http: bool) -> _ResolvedTarget:
+def _resolve_target(
+    target: str,
+    *,
+    allow_insecure_http: bool,
+    explicit_artifacts: tuple[Path, ...] = (),
+) -> _ResolvedTarget:
     try:
         target_path = Path(target)
         if target_path.is_file():
-            return _resolve_configured_target(target_path, allow_insecure_http=allow_insecure_http)
+            return _resolve_configured_target(
+                target_path,
+                allow_insecure_http=allow_insecure_http,
+                explicit_artifacts=explicit_artifacts,
+            )
         if ":" not in target:
             raise ValueError("target must be module:callable or a target configuration JSON file")
         config = PythonCallableTargetConfig(
@@ -255,7 +474,7 @@ def _resolve_target(target: str, *, allow_insecure_http: bool) -> _ResolvedTarge
             target=target,
         )
         plan = create_local_target_dry_run_plan(config)
-        return _local_target(target, config, plan.config_sha256)
+        return _local_target(target, config, plan.config_sha256, explicit_artifacts)
     except (OSError, RuntimeError, ValidationError, ValueError) as error:
         raise ProbeFailure(
             "target load",
@@ -267,7 +486,12 @@ def _resolve_target(target: str, *, allow_insecure_http: bool) -> _ResolvedTarge
         ) from None
 
 
-def _resolve_configured_target(path: Path, *, allow_insecure_http: bool) -> _ResolvedTarget:
+def _resolve_configured_target(
+    path: Path,
+    *,
+    allow_insecure_http: bool,
+    explicit_artifacts: tuple[Path, ...],
+) -> _ResolvedTarget:
     try:
         local_config = load_local_target_config(path)
     except ValueError:
@@ -278,6 +502,7 @@ def _resolve_configured_target(path: Path, *, allow_insecure_http: bool) -> _Res
             allow_insecure_http=allow_insecure_http,
         )
         digest = json_http_environment_config_sha256(http_config)
+        confirmation = _TargetConfirmation(kind="http", reference=str(path), config_sha256=digest)
         return _ResolvedTarget(
             reference=str(path),
             kind="http",
@@ -289,18 +514,29 @@ def _resolve_configured_target(path: Path, *, allow_insecure_http: bool) -> _Res
             supports_state_observation=json_http_environment_capabilities(
                 http_config
             ).supports_state_observation,
-            create_connection=lambda maximum_calls: JsonHttpEnvironmentConnection.from_config(
-                http_config,
-                test_environment_confirmed=True,
-                allow_insecure_http=allow_insecure_http,
-                max_environment_api_calls=maximum_calls,
+            confirmation=confirmation,
+            confirmation_sha256=_model_sha256(confirmation),
+            create_connection=lambda maximum_calls, maximum_seconds: (
+                JsonHttpEnvironmentConnection.from_config(
+                    http_config,
+                    test_environment_confirmed=True,
+                    allow_insecure_http=allow_insecure_http,
+                    max_environment_api_calls=maximum_calls,
+                )
             ),
+            revalidate_identity=lambda: None,
         )
     plan = create_local_target_dry_run_plan(local_config)
-    return _local_target(str(path), local_config, plan.config_sha256)
+    return _local_target(str(path), local_config, plan.config_sha256, explicit_artifacts)
 
 
-def _local_target(reference: str, config: LocalTargetConfig, digest: str) -> _ResolvedTarget:
+def _local_target(
+    reference: str,
+    config: LocalTargetConfig,
+    digest: str,
+    explicit_artifacts: tuple[Path, ...] = (),
+) -> _ResolvedTarget:
+    confirmation = _local_target_confirmation(reference, config, digest, explicit_artifacts)
     return _ResolvedTarget(
         reference=reference,
         kind=config.kind,
@@ -310,26 +546,54 @@ def _local_target(reference: str, config: LocalTargetConfig, digest: str) -> _Re
         maximum_executions=config.limits.max_executions,
         maximum_active_target_seconds=config.limits.total_execution_timeout_seconds,
         supports_state_observation=False,
-        create_connection=lambda maximum_calls: LocalTargetConnection.from_config(
+        confirmation=confirmation,
+        confirmation_sha256=_model_sha256(confirmation),
+        create_connection=lambda maximum_calls, maximum_seconds: LocalTargetConnection.from_config(
             config.model_copy(
                 update={
-                    "limits": config.limits.model_copy(update={"max_executions": maximum_calls})
+                    "limits": config.limits.model_copy(
+                        update={
+                            "max_executions": maximum_calls,
+                            "total_execution_timeout_seconds": (
+                                maximum_seconds
+                                if maximum_seconds is not None
+                                else config.limits.total_execution_timeout_seconds
+                            ),
+                        }
+                    )
                 }
             ),
             customer_code_execution_confirmed=True,
         ),
+        revalidate_identity=lambda: _require_same_confirmation(
+            confirmation, reference, config, digest, explicit_artifacts
+        ),
     )
 
 
-def _confirm_target(resolved_target: _ResolvedTarget, *, confirmed: bool) -> None:
+def _confirm_target(resolved_target: _ResolvedTarget, *, confirmed_digest: str | None) -> None:
     console.print("UL active-probe target")
     console.print(f"  Kind: {resolved_target.kind}")
     console.print(f"  Config sha256: {resolved_target.config_sha256}")
+    console.print(f"  Confirmation sha256: {resolved_target.confirmation_sha256}")
+    if resolved_target.confirmation.executable is not None:
+        executable = resolved_target.confirmation.executable
+        console.print(f"  Executable: {executable.path} ({executable.sha256})")
+    for artifact in resolved_target.confirmation.artifacts:
+        console.print(f"  Artifact: {artifact.path} ({artifact.sha256})")
     if resolved_target.kind == "http":
         http_config = cast(JsonHttpTargetConfig, resolved_target.config)
         console.print(f"  Endpoint: {json_http_environment_config_urls(http_config)[0]}")
     console.print("Use only a dedicated test target that cannot cause real-world effects.")
-    if confirmed:
+    if confirmed_digest is not None:
+        if confirmed_digest != resolved_target.confirmation_sha256:
+            raise ProbeFailure(
+                "target load",
+                "PROBE_TARGET_CONFIRMATION_CHANGED",
+                "The supplied target confirmation digest does not match the current target.",
+                "Review the newly displayed identity and confirm its exact digest.",
+                target_safe_to_reuse=True,
+            )
         return
     if not typer.confirm("Trust this exact target digest and continue with one smoke call?"):
         raise ProbeFailure(
@@ -344,8 +608,12 @@ def _confirm_target(resolved_target: _ResolvedTarget, *, confirmed: bool) -> Non
 async def _run_smoke(
     record: InteractionRecord,
     resolved_target: _ResolvedTarget,
-) -> ExecutionEvidence:
-    connection = resolved_target.create_connection(resolved_target.calls_per_execution)
+) -> _SmokeResult:
+    resolved_target.revalidate_identity()
+    connection = resolved_target.create_connection(
+        resolved_target.calls_per_execution,
+        resolved_target.maximum_active_target_seconds,
+    )
     case = EvaluationCase(
         id=f"{record.id}:smoke",
         turns=(
@@ -360,8 +628,10 @@ async def _run_smoke(
         probe_context=record.probe_context(record.raw_input),
     )
     try:
+        started_at = time.monotonic()
         async with connection:
             evidence = await connection.execute(case)
+        elapsed_seconds = time.monotonic() - started_at
         validate_execution_evidence(case, connection, evidence)
     except (OSError, RuntimeError, TimeoutError, ValueError, httpx.HTTPError) as error:
         raise ProbeFailure(
@@ -379,18 +649,29 @@ async def _run_smoke(
             "Inspect the target lifecycle and retry only after restoring a known-safe state.",
             target_safe_to_reuse=not evidence.lifecycle.environment_state_uncertain,
         )
-    return evidence
+    return _SmokeResult(evidence=evidence, elapsed_seconds=elapsed_seconds)
 
 
-def _print_smoke(evidence: ExecutionEvidence, resolved_target: _ResolvedTarget) -> None:
+def _print_smoke(
+    evidence: ExecutionEvidence,
+    resolved_target: _ResolvedTarget,
+    *,
+    show_response: bool,
+) -> None:
     console.print("")
     console.print("Smoke target invocation succeeded")
     console.print(f"  Target: {evidence.environment_id}")
     console.print(f"  Evidence level: {evidence.evidence_scope.replace('_', ' ')}")
+    encoded_response = json.dumps(
+        evidence.final_response, ensure_ascii=False, separators=(",", ":"), sort_keys=True
+    ).encode()
     console.print(
-        "  Normalized response: "
-        + json.dumps(evidence.final_response, ensure_ascii=False, separators=(",", ":"))
+        f"  Response structure: {type(evidence.final_response).__name__}; "
+        f"{len(encoded_response)} bytes"
     )
+    console.print(f"  Response sha256: {hashlib.sha256(encoded_response).hexdigest()}")
+    if show_response:
+        console.print("  Private normalized response: " + encoded_response.decode())
     observation_count = sum(
         observation.status != "missing" for observation in evidence.observations
     )
@@ -409,26 +690,22 @@ def _save_probe_config(
     *,
     data: Path,
     resolved_target: _ResolvedTarget,
+    existing_config: ProbeProjectConfig | None,
 ) -> None:
     project_directory = Path.cwd() / _PROJECT_DIRECTORY
     config_path = project_directory / _PROBE_CONFIG
     try:
-        _ensure_private_project_directory(project_directory)
         config = ProbeProjectConfig(
             dataset=str(data.resolve()),
             target=resolved_target.reference,
             target_kind=resolved_target.kind,
             target_config_sha256=resolved_target.config_sha256,
+            target_confirmation_sha256=resolved_target.confirmation_sha256,
         )
-        if config_path.exists():
-            try:
-                existing_config = _load_existing_probe_config(config_path)
-            except (OSError, ValidationError, ValueError):
-                raise FileExistsError from None
-            if existing_config != config:
-                raise FileExistsError
+        if existing_config is not None:
             console.print(f"  Using saved project config: {config_path}")
             return
+        _ensure_private_project_directory(project_directory)
         with create_private_output(config_path) as stream:
             json.dump(config.model_dump(mode="json"), stream, ensure_ascii=False, indent=2)
             stream.write("\n")
@@ -449,6 +726,43 @@ def _save_probe_config(
             target_safe_to_reuse=True,
         ) from None
     console.print(f"  Saved project config: {config_path}")
+
+
+def _check_probe_config_binding(
+    data: Path, resolved_target: _ResolvedTarget
+) -> ProbeProjectConfig | None:
+    project_directory = Path.cwd() / _PROJECT_DIRECTORY
+    path = project_directory / _PROBE_CONFIG
+    if project_directory.is_symlink():
+        raise ProbeFailure(
+            "target load",
+            "PROBE_CONFIG_EXISTS",
+            ".ul must be a private project directory, not a symbolic link.",
+            "Replace it with a private local directory before running a target.",
+            target_safe_to_reuse=True,
+        )
+    if not path.exists() and not path.is_symlink():
+        return None
+    expected = ProbeProjectConfig(
+        dataset=str(data.resolve()),
+        target=resolved_target.reference,
+        target_kind=resolved_target.kind,
+        target_config_sha256=resolved_target.config_sha256,
+        target_confirmation_sha256=resolved_target.confirmation_sha256,
+    )
+    try:
+        existing = _load_existing_probe_config(path)
+    except (OSError, ValidationError, ValueError):
+        existing = None
+    if existing != expected:
+        raise ProbeFailure(
+            "target load",
+            "PROBE_CONFIG_EXISTS",
+            ".ul/probe.json does not bind this exact target and dataset.",
+            "Move the existing config or run from a new project directory.",
+            target_safe_to_reuse=True,
+        )
+    return existing
 
 
 def _ensure_private_project_directory(path: Path) -> None:
@@ -502,8 +816,9 @@ def _load_existing_probe_config(path: Path) -> ProbeProjectConfig:
 def _validate_campaign_target_budget(
     plan: DatasetCampaignPlan,
     resolved_target: _ResolvedTarget,
-) -> None:
-    if plan.calls.total_environment_api > resolved_target.maximum_executions:
+    smoke_elapsed_seconds: float,
+) -> float | None:
+    if 1 + plan.calls.total_environment_api > resolved_target.maximum_executions:
         raise ProbeFailure(
             "augmentation preparation",
             "PROBE_TARGET_CALL_LIMIT_TOO_LOW",
@@ -511,22 +826,25 @@ def _validate_campaign_target_budget(
             "Raise the test target's max_executions or use fewer grounded examples.",
             target_safe_to_reuse=True,
         )
+    if resolved_target.maximum_active_target_seconds is None:
+        return None
+    remaining = resolved_target.maximum_active_target_seconds - smoke_elapsed_seconds
+    if remaining <= 0:
+        raise ProbeFailure(
+            "augmentation preparation",
+            "PROBE_TARGET_WALL_LIMIT_EXHAUSTED",
+            "The smoke call exhausted the command-wide target wall-time limit.",
+            "Raise total_execution_timeout_seconds and rerun.",
+            target_safe_to_reuse=True,
+        )
+    return remaining
 
 
 def _print_pilot_budget(
     plan: DatasetCampaignPlan,
     settings: DatasetSemanticSettings,
-    resolved_target: _ResolvedTarget,
+    confirmation: _CampaignConfirmation,
 ) -> None:
-    planned_target_seconds = plan.calls.repetition_executions * _TARGET_TIMEOUT_SECONDS
-    bounded_target_seconds = (
-        min(planned_target_seconds, resolved_target.maximum_active_target_seconds)
-        if resolved_target.maximum_active_target_seconds is not None
-        else planned_target_seconds
-    )
-    maximum_wall_seconds = (
-        bounded_target_seconds + plan.calls.total_semantic_model * settings.timeout_seconds
-    )
     console.print("")
     console.print("Bounded active-probe pilot")
     console.print(f"  Source interactions: {len(plan.examples)} (maximum {_PILOT_LIMIT})")
@@ -534,15 +852,81 @@ def _print_pilot_budget(
     console.print(f"  Repetitions: {plan.calls.repetitions}")
     console.print(f"  Original agent invocations: {plan.calls.baseline}")
     console.print(f"  Probe agent invocations: {plan.calls.variation}")
-    console.print(f"  Environment API requests: {plan.calls.total_environment_api}")
+    console.print(
+        "  Command-wide environment API requests: "
+        f"{confirmation.command_environment_api_requests} (includes smoke)"
+    )
     console.print(f"  Semantic-model calls: up to {plan.calls.total_semantic_model}")
     console.print(f"  Completion tokens: 0..{plan.tokens.maximum}")
     console.print("  Monetary cost: unavailable (no trusted pricing configured)")
-    console.print(f"  Maximum active wall time: {maximum_wall_seconds:.1f} seconds")
+    console.print(f"  Semantic provider: {confirmation.semantic_provider_id}")
+    console.print(f"  Semantic endpoint sha256: {confirmation.semantic_endpoint_sha256}")
+    console.print("  Data policy: " + json.dumps(confirmation.data_policy, sort_keys=True))
+    console.print(f"  Maximum active wall time: {confirmation.maximum_wall_seconds:.1f} seconds")
+    console.print(f"  Campaign confirmation sha256: {_model_sha256(confirmation)}")
 
 
-def _confirm_paid_execution(*, confirmed: bool) -> bool:
-    if confirmed:
+def _campaign_confirmation(
+    plan: DatasetCampaignPlan,
+    settings: DatasetSemanticSettings,
+    resolved_target: _ResolvedTarget,
+) -> _CampaignConfirmation:
+    planned_target_seconds = plan.calls.repetition_executions * _TARGET_TIMEOUT_SECONDS
+    bounded_target_seconds = (
+        resolved_target.maximum_active_target_seconds
+        if resolved_target.maximum_active_target_seconds is not None
+        else planned_target_seconds
+    )
+    if settings.semantic_provider_type == "openrouter":
+        data_policy: dict[str, object] = {
+            "external_processing": True,
+            "provider_policy_declared": True,
+            "data_collection": "deny",
+            "zero_data_retention_required": True,
+            "implication": (
+                "The configured route requires data collection to be denied and zero data "
+                "retention; the evaluator request is still processed externally."
+            ),
+        }
+    else:
+        data_policy = {
+            "external_processing": True,
+            "provider_policy_declared": False,
+            "implication": (
+                "The configured endpoint receives evaluator prompts and sample data; UL cannot "
+                "verify its retention or training policy."
+            ),
+        }
+    return _CampaignConfirmation(
+        target_confirmation_sha256=resolved_target.confirmation_sha256,
+        semantic_provider_id=settings.semantic_provider_id,
+        semantic_provider_type=settings.semantic_provider_type,
+        semantic_endpoint_sha256=settings.semantic_endpoint_sha256,
+        data_policy=data_policy,
+        command_environment_api_requests=(
+            resolved_target.calls_per_execution + plan.calls.total_environment_api
+        ),
+        semantic_model_calls=plan.calls.total_semantic_model,
+        maximum_completion_tokens=plan.tokens.maximum,
+        maximum_wall_seconds=(
+            bounded_target_seconds + plan.calls.total_semantic_model * settings.timeout_seconds
+        ),
+    )
+
+
+def _confirm_paid_execution(
+    *, confirmation: _CampaignConfirmation, confirmed_digest: str | None
+) -> bool:
+    digest = _model_sha256(confirmation)
+    if confirmed_digest is not None:
+        if confirmed_digest != digest:
+            raise ProbeFailure(
+                "augmentation preparation",
+                "PROBE_CAMPAIGN_CONFIRMATION_CHANGED",
+                "The supplied campaign digest does not match the current provider or budget.",
+                "Review the displayed provider, data policy, and budget; confirm its exact digest.",
+                target_safe_to_reuse=True,
+            )
         return True
     return typer.confirm("Run this exact paid/network campaign budget?", default=False)
 
@@ -577,7 +961,9 @@ def _run_campaign(
     plan: DatasetCampaignPlan,
     output: Path,
     repetitions: int,
+    remaining_target_seconds: float | None,
 ) -> tuple[DatasetEvaluationResult, ...]:
+    resolved_target.revalidate_identity()
     if output.exists():
         raise ProbeFailure(
             "analysis",
@@ -597,7 +983,10 @@ def _run_campaign(
             "Verify provider settings and model compatibility, then rerun.",
             target_safe_to_reuse=True,
         ) from None
-    connection = resolved_target.create_connection(plan.calls.total_environment_api)
+    connection = resolved_target.create_connection(
+        plan.calls.total_environment_api,
+        remaining_target_seconds,
+    )
     try:
         with create_private_output(output) as output_stream:
             results = asyncio.run(
@@ -630,6 +1019,7 @@ def _print_stronger_run(
     output: Path,
     *,
     allow_insecure_http: bool,
+    target_artifacts: tuple[Path, ...],
 ) -> None:
     arguments = [
         "ul",
@@ -639,12 +1029,12 @@ def _print_stronger_run(
         target,
         "--output",
         str(output.with_name(output.stem + "-confirmation.jsonl")),
-        "--confirm-target",
-        "--confirm-paid-execution",
         "--confirmation-run",
     ]
     if allow_insecure_http:
         arguments.append("--allow-insecure-http")
+    for artifact in target_artifacts:
+        arguments.extend(("--target-artifact", str(artifact)))
     command = subprocess.list2cmdline(arguments) if os.name == "nt" else shlex.join(arguments)
     console.print(f"Stronger confirmation: rerun after adding more grounded examples: {command}")
 

@@ -9,6 +9,7 @@ import sys
 from pathlib import Path
 
 import pytest
+import typer
 from typer.testing import CliRunner
 from ul import (
     DatasetEvaluationResult,
@@ -196,13 +197,15 @@ def test_callable_smoke_proves_target_call_and_decline_makes_zero_semantic_calls
     monkeypatch.setattr(probe_module, "preflight_evaluator", unexpected_preflight)
     result = runner.invoke(
         app,
-        ["probe", str(dataset), "--target", "customer_agent:run", "--confirm-target"],
-        input="n\n",
+        ["probe", str(dataset), "--target", "customer_agent:run"],
+        input="y\nn\n",
     )
 
     assert result.exit_code == 0, result.output
     assert "Smoke target invocation succeeded" in result.output
-    assert 'Normalized response: {"echo":"Echo grounded example 1."' in result.output
+    assert "Response structure: dict;" in result.output
+    assert "Response sha256:" in result.output
+    assert "Echo grounded example 1." not in result.output
     assert "Evidence level: response only" in result.output
     assert "Source interactions: 10 (maximum 10)" in result.output
     assert "Original agent invocations: 10" in result.output
@@ -210,10 +213,108 @@ def test_callable_smoke_proves_target_call_and_decline_makes_zero_semantic_calls
     assert "Repetitions: 1" in result.output
     assert "No semantic-model calls were made" in result.output
     assert len((tmp_path / "target-invocations.jsonl").read_text().splitlines()) == 1
+    assert not (tmp_path / "__pycache__").exists()
     saved = json.loads((tmp_path / ".ul" / "probe.json").read_text())
     assert saved["target_kind"] == "python_callable"
+    assert len(saved["target_confirmation_sha256"]) == 64
     assert saved["limit"] == 10
     assert saved["repetitions"] == 1
+
+
+def test_private_smoke_output_requires_explicit_flag(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _write_callable(tmp_path)
+    dataset = _write_dataset(tmp_path)
+    monkeypatch.chdir(tmp_path)
+
+    result = runner.invoke(
+        app,
+        [
+            "probe",
+            str(dataset),
+            "--target",
+            "customer_agent:run",
+            "--show-smoke-response",
+        ],
+        input="y\nn\n",
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "Private normalized response:" in result.output
+
+
+def test_changed_target_artifact_is_rejected_immediately_before_launch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _write_callable(tmp_path)
+    dataset = _write_dataset(tmp_path)
+    monkeypatch.chdir(tmp_path)
+
+    def mutate_then_confirm(*args: object, **kwargs: object) -> bool:
+        del args, kwargs
+        (tmp_path / "customer_agent.py").write_text(
+            "def run(value): return {'changed': value}\n", encoding="utf-8"
+        )
+        return True
+
+    monkeypatch.setattr(typer, "confirm", mutate_then_confirm)
+    result = runner.invoke(app, ["probe", str(dataset), "--target", "customer_agent:run"])
+
+    assert result.exit_code == 2
+    assert "Reason: PROBE_TARGET_IDENTITY_CHANGED" in result.output
+    assert not (tmp_path / "target-invocations.jsonl").exists()
+
+
+def test_existing_binding_is_checked_before_target_invocation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _write_callable(tmp_path)
+    dataset = _write_dataset(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    first = runner.invoke(
+        app,
+        ["probe", str(dataset), "--target", "customer_agent:run"],
+        input="y\nn\n",
+    )
+    assert first.exit_code == 0, first.output
+    saved = json.loads((tmp_path / ".ul" / "probe.json").read_text())
+    saved["dataset"] = str(tmp_path / "different.jsonl")
+    (tmp_path / ".ul" / "probe.json").write_text(json.dumps(saved), encoding="utf-8")
+    (tmp_path / ".ul" / "probe.json").chmod(0o600)
+
+    second = runner.invoke(
+        app,
+        ["probe", str(dataset), "--target", "customer_agent:run"],
+        input="y\n",
+    )
+
+    assert second.exit_code == 2
+    assert "Reason: PROBE_CONFIG_EXISTS" in second.output
+    assert len((tmp_path / "target-invocations.jsonl").read_text().splitlines()) == 1
+
+
+def test_post_smoke_preparation_failure_is_safe_and_staged(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _write_callable(tmp_path)
+    dataset = _write_dataset(tmp_path)
+    monkeypatch.chdir(tmp_path)
+
+    def fail_settings() -> None:
+        raise ValueError("private-provider-secret")
+
+    monkeypatch.setattr(probe_module, "load_dataset_semantic_settings", fail_settings)
+    result = runner.invoke(
+        app,
+        ["probe", str(dataset), "--target", "customer_agent:run"],
+        input="y\n",
+    )
+
+    assert result.exit_code == 2
+    assert "Stage: augmentation preparation" in result.output
+    assert "Reason: PROBE_AUGMENTATION_PREPARATION_FAILED" in result.output
+    assert "private-provider-secret" not in result.output
 
 
 def test_paid_precondition_failure_occurs_after_budget_without_semantic_calls(
@@ -238,9 +339,8 @@ def test_paid_precondition_failure_occurs_after_budget_without_semantic_calls(
             str(dataset),
             "--target",
             "customer_agent:run",
-            "--confirm-target",
-            "--confirm-paid-execution",
         ],
+        input="y\ny\n",
     )
 
     assert result.exit_code == 2
@@ -250,6 +350,63 @@ def test_paid_precondition_failure_occurs_after_budget_without_semantic_calls(
     assert "Reason: PROBE_SEMANTIC_CALLS_DISABLED" in result.output
     assert "Target safe to reuse: yes" in result.output
     assert calls == 0
+
+
+def test_command_wide_local_execution_limit_includes_smoke_and_campaign(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _write_callable(tmp_path)
+    dataset = _write_dataset(tmp_path)
+    config = tmp_path / "target.json"
+    config.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "kind": "python_callable",
+                "target_id": "bounded-agent",
+                "working_directory": str(tmp_path),
+                "interpreter": sys.executable,
+                "target": "customer_agent:run",
+                "environment_allowlist": [],
+                "limits": {"max_executions": 2},
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(tmp_path)
+    result = runner.invoke(app, ["probe", str(dataset), "--target", str(config)], input="y\n")
+
+    assert result.exit_code == 2
+    assert "Reason: PROBE_TARGET_CALL_LIMIT_TOO_LOW" in result.output
+    assert len((tmp_path / "target-invocations.jsonl").read_text().splitlines()) == 1
+
+
+def test_stale_campaign_digest_cannot_authorize_changed_environment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _write_callable(tmp_path)
+    dataset = _write_dataset(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    stale_digest = "0" * 64
+
+    result = runner.invoke(
+        app,
+        [
+            "probe",
+            str(dataset),
+            "--target",
+            "customer_agent:run",
+            "--confirm-paid-execution",
+            stale_digest,
+        ],
+        input="y\n",
+    )
+
+    assert result.exit_code == 2
+    assert "Semantic provider:" in result.output
+    assert "Semantic endpoint sha256:" in result.output
+    assert "Data policy:" in result.output
+    assert "Reason: PROBE_CAMPAIGN_CONFIRMATION_CHANGED" in result.output
 
 
 def test_copy_ready_confirmation_run_reuses_bound_config_and_rebudgets(
@@ -264,11 +421,10 @@ def test_copy_ready_confirmation_run_reuses_bound_config_and_rebudgets(
         str(dataset),
         "--target",
         "customer_agent:run",
-        "--confirm-target",
     ]
 
-    pilot = runner.invoke(app, base_arguments, input="n\n")
-    confirmation = runner.invoke(app, [*base_arguments, "--confirmation-run"], input="n\n")
+    pilot = runner.invoke(app, base_arguments, input="y\nn\n")
+    confirmation = runner.invoke(app, [*base_arguments, "--confirmation-run"], input="y\nn\n")
 
     assert pilot.exit_code == 0, pilot.output
     assert confirmation.exit_code == 0, confirmation.output
@@ -295,10 +451,10 @@ def test_failed_smoke_has_staged_safe_diagnostic_and_does_not_save_config(
             str(dataset),
             "--target",
             "customer_agent:run",
-            "--confirm-target",
             "--diagnostic-artifact",
             str(diagnostic),
         ],
+        input="y\n",
     )
 
     assert result.exit_code == 2
@@ -326,11 +482,13 @@ def test_successful_smoke_refuses_symlinked_project_directory(
 
     result = runner.invoke(
         app,
-        ["probe", str(dataset), "--target", "customer_agent:run", "--confirm-target"],
+        ["probe", str(dataset), "--target", "customer_agent:run"],
+        input="y\n",
     )
 
     assert result.exit_code == 2
-    assert "Reason: PROBE_CONFIG_WRITE_FAILED" in result.output
+    assert "Reason: PROBE_CONFIG_EXISTS" in result.output
+    assert not (tmp_path / "target-invocations.jsonl").exists()
     assert not (redirected / "probe.json").exists()
 
 
@@ -345,7 +503,7 @@ def test_invalid_observations_fail_before_target_or_project_state(
 
     result = runner.invoke(
         app,
-        ["probe", str(dataset), "--target", "customer_agent:run", "--confirm-target"],
+        ["probe", str(dataset), "--target", "customer_agent:run"],
     )
 
     assert result.exit_code == 2
@@ -398,9 +556,8 @@ def test_confirmed_flow_composes_campaign_and_normal_report(
             "customer_agent:run",
             "--output",
             str(output),
-            "--confirm-target",
-            "--confirm-paid-execution",
         ],
+        input="y\ny\n",
     )
 
     assert result.exit_code == 0, result.output
@@ -456,9 +613,8 @@ def test_public_documentation_flow_runs_real_callable_campaign_and_report(
             "agent:run",
             "--output",
             str(output),
-            "--confirm-target",
-            "--confirm-paid-execution",
         ],
+        input="y\ny\n",
     )
 
     assert result.exit_code == 0, result.output
@@ -525,11 +681,12 @@ done
 
     result = runner.invoke(
         app,
-        ["probe", str(dataset), "--target", str(config), "--confirm-target"],
-        input="n\n",
+        ["probe", str(dataset), "--target", str(config)],
+        input="y\nn\n",
     )
 
     assert result.exit_code == 0, result.output
-    assert 'Normalized response: {"transport":"command"}' in result.output
+    assert "Response structure: dict;" in result.output
+    assert "transport" not in result.output
     saved = json.loads((tmp_path / ".ul" / "probe.json").read_text())
     assert saved["target_kind"] == "command"
