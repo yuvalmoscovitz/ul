@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import json
 import os
+import re
 import shlex
 import shutil
 import stat
@@ -270,7 +271,7 @@ def _persist_probe_checkpoint(
     campaign_confirmation: _CampaignConfirmation,
     output: Path,
     smoke_result: _SmokeResult,
-) -> None:
+) -> str:
     path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     _ensure_private_project_directory(path.parent)
     target_digest, campaign_digest, records_digest, output_digest = _probe_checkpoint_binding(
@@ -290,11 +291,13 @@ def _persist_probe_checkpoint(
         smoke_turn_id=smoke_result.turn_id,
         smoke_request_sha256=smoke_result.request_sha256,
     )
+    encoded = (checkpoint.model_dump_json() + "\n").encode()
     with create_private_output(path) as stream:
-        stream.write(checkpoint.model_dump_json() + "\n")
+        stream.write(encoded.decode())
         stream.flush()
         os.fsync(stream.fileno())
     _fsync_probe_project_directory(path.parent)
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def _remove_probe_checkpoint(path: Path) -> None:
@@ -308,6 +311,7 @@ def _remove_probe_checkpoint(path: Path) -> None:
 def _load_probe_checkpoint(
     path: Path,
     *,
+    expected_sha256: str,
     records: tuple[InteractionRecord, ...],
     resolved_target: _ResolvedTarget,
     campaign_confirmation: _CampaignConfirmation,
@@ -326,6 +330,10 @@ def _load_probe_checkpoint(
         encoded = os.read(descriptor, 10_000_001)
     finally:
         os.close(descriptor)
+    if not re.fullmatch(r"[0-9a-f]{64}", expected_sha256):
+        raise ValueError("probe checkpoint digest is invalid")
+    if hashlib.sha256(encoded).hexdigest() != expected_sha256:
+        raise ValueError("probe checkpoint integrity check failed")
     checkpoint = _ProbeCheckpoint.model_validate_json(encoded)
     expected_binding = _probe_checkpoint_binding(
         records=records,
@@ -875,6 +883,10 @@ def probe(
             hidden=True,
         ),
     ] = None,
+    resume_checkpoint_sha256: Annotated[
+        str | None,
+        typer.Option("--resume-checkpoint-sha256", hidden=True),
+    ] = None,
 ) -> None:
     """Smoke a real target, then optionally run one bounded active-probe pilot."""
     progress_runtime: CampaignProgressRuntime | None = None
@@ -991,10 +1003,7 @@ def probe(
                 ),
                 token_budget=plan.tokens.maximum,
                 maximum_wall_time_seconds=campaign_confirmation.maximum_wall_seconds,
-                next_commands=create_probe_next_commands(
-                    evidence_path=output,
-                    resume_argv=tuple(resume_argv),
-                ),
+                next_commands=create_probe_next_commands(evidence_path=output),
                 json_output=progress_json,
             )
         except ProbeFailure:
@@ -1016,9 +1025,18 @@ def probe(
         progress_runtime.tracker.emit(status="running", stage="smoke")
         evaluator_preflight: EvaluatorModelPreflight | None = None
         if resume_checkpoint is not None:
+            if resume_checkpoint_sha256 is None:
+                raise ProbeFailure(
+                    "target load",
+                    "PROBE_CHECKPOINT_DIGEST_MISSING",
+                    "The private probe checkpoint digest is required for resume.",
+                    "Use only the opaque resume action emitted by the paused campaign.",
+                    target_safe_to_reuse=True,
+                )
             try:
                 smoke_result = _load_probe_checkpoint(
                     resume_checkpoint,
+                    expected_sha256=resume_checkpoint_sha256,
                     records=records,
                     resolved_target=resolved_target,
                     campaign_confirmation=campaign_confirmation,
@@ -1043,7 +1061,16 @@ def probe(
                     target_safe_to_reuse=True,
                 ) from None
             console.print("Reusing durable smoke and evaluator preflight checkpoints.")
+            checkpoint_sha256 = resume_checkpoint_sha256
         else:
+            if resume_checkpoint_sha256 is not None:
+                raise ProbeFailure(
+                    "target load",
+                    "PROBE_CHECKPOINT_PATH_MISSING",
+                    "A probe checkpoint digest cannot be used without its private checkpoint.",
+                    "Use only the opaque resume action emitted by the paused campaign.",
+                    target_safe_to_reuse=True,
+                )
             with progress_runtime.signal_control.installed():
                 smoke_result = asyncio.run(
                     _run_smoke(
@@ -1063,7 +1090,7 @@ def probe(
                 existing_config=existing_config,
             )
             try:
-                _persist_probe_checkpoint(
+                checkpoint_sha256 = _persist_probe_checkpoint(
                     checkpoint_path,
                     records=records,
                     resolved_target=resolved_target,
@@ -1079,6 +1106,13 @@ def probe(
                     "Do not continue to paid campaign work; fix private output storage first.",
                     target_safe_to_reuse=True,
                 ) from None
+        resume_argv.extend(("--resume-checkpoint-sha256", checkpoint_sha256))
+        progress_runtime.tracker.replace_next_commands(
+            create_probe_next_commands(
+                evidence_path=output,
+                resume_argv=tuple(resume_argv),
+            )
+        )
         remaining_target_seconds = _validate_campaign_target_budget(
             plan, resolved_target, smoke_result.elapsed_seconds
         )

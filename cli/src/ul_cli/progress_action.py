@@ -117,6 +117,7 @@ def _validate_action_argv(
             "--confirm-target",
             "--confirm-paid-execution",
             "--resume-checkpoint",
+            "--resume-checkpoint-sha256",
             "--target-artifact",
             "--diagnostic-artifact",
         }
@@ -132,6 +133,7 @@ def _validate_action_argv(
             "--confirm-target",
             "--confirm-paid-execution",
             "--resume-checkpoint",
+            "--resume-checkpoint-sha256",
         }
         seen_required: set[str] = set()
         index = 3

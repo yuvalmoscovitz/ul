@@ -428,6 +428,11 @@ class CampaignProgressTracker:
         if any(state == "quarantined" for state in terminal_states.values()):
             self._environment = "quarantined"
 
+    def replace_next_commands(self, next_commands: CampaignNextCommands) -> None:
+        if self._terminal_emitted:
+            raise ValueError("terminal campaign progress cannot replace its next actions")
+        self._next_commands = next_commands
+
     def emit(
         self,
         *,
@@ -579,7 +584,7 @@ def create_campaign_next_commands(evidence_path: Path) -> CampaignNextCommands:
 def create_probe_next_commands(
     *,
     evidence_path: Path,
-    resume_argv: tuple[str, ...],
+    resume_argv: tuple[str, ...] | None = None,
 ) -> CampaignNextCommands:
     return CampaignNextCommands(
         inspect_findings=CampaignNextCommand(
@@ -589,9 +594,16 @@ def create_probe_next_commands(
                 ("ul", "report", str(evidence_path.resolve())),
             ),
         ),
-        resume=CampaignNextCommand(
-            action="resume",
-            argv=create_progress_action("probe_resume", resume_argv),
+        resume=(
+            CampaignNextCommand(
+                action="resume",
+                argv=create_progress_action("probe_resume", resume_argv),
+            )
+            if resume_argv is not None
+            else CampaignNextCommand(
+                action="diagnose",
+                argv=create_progress_action("probe_diagnose", ("ul", "probe-diagnose")),
+            )
         ),
         diagnose=CampaignNextCommand(
             action="diagnose",

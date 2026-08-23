@@ -840,9 +840,11 @@ def test_probe_quarantine_fsyncs_private_state_and_directory(
     assert json.loads(safety_state.read_text())["status"] == "quarantined"
 
 
+@pytest.mark.parametrize("checkpoint_tamper", (None, "elapsed", "evidence"))
 def test_paused_probe_action_blocks_before_repeating_completed_smoke(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    checkpoint_tamper: str | None,
 ) -> None:
     (tmp_path / "agent.py").write_text(
         "import json\n"
@@ -921,6 +923,16 @@ def test_paused_probe_action_blocks_before_repeating_completed_smoke(
     assert action_match is not None
     invocations = tmp_path / "target-invocations.jsonl"
     assert len(invocations.read_text().splitlines()) == 1
+    if checkpoint_tamper is not None:
+        checkpoint_path = tmp_path / "evidence.jsonl.probe-checkpoint.json"
+        checkpoint = json.loads(checkpoint_path.read_text(encoding="utf-8"))
+        if checkpoint_tamper == "elapsed":
+            checkpoint["smoke_elapsed_seconds"] = 0
+        else:
+            checkpoint["smoke_evidence"]["final_response"] = {
+                "structurally_valid": "PRIVATE_FORGED_EVIDENCE"
+            }
+        checkpoint_path.write_text(json.dumps(checkpoint) + "\n", encoding="utf-8")
     nested_results = []
 
     def invoke_trusted_cli(
@@ -938,11 +950,19 @@ def test_paused_probe_action_blocks_before_repeating_completed_smoke(
     monkeypatch.setattr(progress_action_module.subprocess, "run", invoke_trusted_cli)
     action_result = runner.invoke(app, ["action", action_match.group(1)])
 
-    assert action_result.exit_code == 0, nested_results[0].output
-    assert nested_results[0].exit_code == 0, nested_results[0].output
-    assert "Reusing durable smoke and evaluator preflight checkpoints" in nested_results[0].output
     assert preflight_calls == 1
-    assert len(invocations.read_text().splitlines()) == 3
+    if checkpoint_tamper is None:
+        assert action_result.exit_code == 0, nested_results[0].output
+        assert nested_results[0].exit_code == 0, nested_results[0].output
+        assert (
+            "Reusing durable smoke and evaluator preflight checkpoints" in nested_results[0].output
+        )
+        assert len(invocations.read_text().splitlines()) == 3
+    else:
+        assert action_result.exit_code == 2
+        assert "Reason: PROBE_CHECKPOINT_INVALID" in nested_results[0].output
+        assert "PRIVATE_FORGED_EVIDENCE" not in nested_results[0].output
+        assert len(invocations.read_text().splitlines()) == 1
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="symlink creation requires privileges")
