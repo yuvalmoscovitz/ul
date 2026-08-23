@@ -131,8 +131,8 @@ def observed_outputs_from_evidence(
         outputs.append(
             ObservedAgentOutput(
                 raw_output=(
-                    turn.normalized_response
-                    if turn.normalized_response is not None
+                    turn.public_normalized_response
+                    if turn.public_normalized_response is not None
                     else turn.response
                 ),
                 metadata={

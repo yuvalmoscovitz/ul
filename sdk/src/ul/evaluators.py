@@ -335,8 +335,8 @@ def _subject_from_execution_evidence(evidence: ExecutionEvidence) -> EvaluationS
     return EvaluationSubject(
         agent_status="succeeded",
         answer=(
-            evidence.normalized_result
-            if evidence.normalized_result is not None
+            evidence.public_normalized_result
+            if evidence.public_normalized_result is not None
             else evidence.final_response
         ),
         initial_state=evidence.initial_state.value if evidence.initial_state is not None else None,

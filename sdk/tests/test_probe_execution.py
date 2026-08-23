@@ -273,25 +273,47 @@ async def test_all_capabilities_preserve_response_trace_and_state_provenance() -
 
 @pytest.mark.asyncio
 async def test_projection_preserves_raw_normalized_trace_and_state_channels() -> None:
+    class _PrivateInvoker(_Invoker):
+        def invoke(self, request: ProbeRequest) -> ProbeResult:
+            self.requests.append(request)
+            return ProbeResult(
+                id="result-1",
+                correlation_id=request.correlation_id,
+                response={"echo": request.turn.input, "secret": "never disclose"},
+            )
+
     executor = ComposedEnvironmentExecutor(
-        _Invoker(),
+        _PrivateInvoker(),
         config_sha256=_CONFIG_SHA256,
         observation_source=_Observer(),
         state_environment=_StateEnvironment(),
         fixture_id="fixture-1",
-        outcome_projection=OutcomeProjection(complete_result=""),
+        outcome_projection=OutcomeProjection(
+            complete_result="", private_json_pointers=("/secret",)
+        ),
     )
 
     evidence = await executor.execute(_case("hello"))
 
-    assert evidence.final_response == {"echo": "hello"}
-    assert evidence.normalized_result == {"echo": "hello"}
-    assert evidence.turns[0].response == {"echo": "hello"}
-    assert evidence.turns[0].normalized_response == {"echo": "hello"}
+    assert evidence.final_response == {"echo": "hello", "secret": "never disclose"}
+    assert evidence.normalized_result == {"echo": "hello", "secret": "never disclose"}
+    assert evidence.public_normalized_result == {"echo": "hello", "secret": "[PRIVATE]"}
+    assert evidence.turns[0].response == {"echo": "hello", "secret": "never disclose"}
+    assert evidence.turns[0].normalized_response == {
+        "echo": "hello",
+        "secret": "never disclose",
+    }
+    assert evidence.turns[0].public_normalized_response == {
+        "echo": "hello",
+        "secret": "[PRIVATE]",
+    }
     assert evidence.observations[0].traces == ({"span": "agent"},)
     assert evidence.final_state is not None
     assert evidence.final_state.value == {"turn_id": "case-1:turn-1"}
-    assert observed_outputs_from_evidence(evidence)[0].raw_output == {"echo": "hello"}
+    assert observed_outputs_from_evidence(evidence)[0].raw_output == {
+        "echo": "hello",
+        "secret": "[PRIVATE]",
+    }
     assert evidence.outcome_projection_sha256 == executor._outcome_projection.digest  # pyright: ignore[reportPrivateUsage,reportOptionalMemberAccess]
 
 

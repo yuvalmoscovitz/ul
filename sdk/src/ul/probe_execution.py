@@ -841,6 +841,9 @@ class ComposedEnvironmentExecutor:
             turns=turns,
             final_response=turns[-1].response if turns and error is None else None,
             normalized_result=(turns[-1].normalized_response if turns and error is None else None),
+            public_normalized_result=(
+                turns[-1].public_normalized_response if turns and error is None else None
+            ),
             outcome_projection_sha256=(
                 turns[-1].outcome_projection_sha256 if turns and error is None else None
             ),
@@ -903,6 +906,11 @@ class ComposedEnvironmentExecutor:
             normalized_result=(
                 final_turn.normalized_response if final_turn is not None and error is None else None
             ),
+            public_normalized_result=(
+                final_turn.public_normalized_response
+                if final_turn is not None and error is None
+                else None
+            ),
             outcome_projection_sha256=(
                 final_turn.outcome_projection_sha256
                 if final_turn is not None and error is None
@@ -960,15 +968,19 @@ class ComposedEnvironmentExecutor:
         projection = self._outcome_projection
         if projection is None:
             return turns
-        return tuple(
-            turn.model_copy(
-                update={
-                    "normalized_response": projection.project(turn.response),
-                    "outcome_projection_sha256": projection.digest,
-                }
+        projected_turns: list[EnvironmentTurnEvidence] = []
+        for turn in turns:
+            normalized_response = projection.project(turn.response)
+            projected_turns.append(
+                turn.model_copy(
+                    update={
+                        "normalized_response": normalized_response,
+                        "public_normalized_response": projection.public_result(normalized_response),
+                        "outcome_projection_sha256": projection.digest,
+                    }
+                )
             )
-            for turn in turns
-        )
+        return tuple(projected_turns)
 
 
 def _correlation_id(execution_id: str, turn_id: str) -> str:

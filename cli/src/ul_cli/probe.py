@@ -817,7 +817,9 @@ def _print_smoke(
     if projection is not None:
         if evidence.normalized_result is None:
             raise AssertionError("successful projected smoke evidence requires a normalized result")
-        public_result = projection.public_result(evidence.normalized_result)
+        public_result = evidence.public_normalized_result
+        if public_result is None:
+            raise AssertionError("projected smoke evidence requires a public normalized result")
         console.print(f"  Outcome projection sha256: {projection.digest}")
         console.print(
             "  Normalized result preview: "

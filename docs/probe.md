@@ -112,7 +112,9 @@ calls.
 Raw target response, normalized result, trajectory/tool observations, and independently observed
 state remain four separate evidence channels. A target-declared outcome is authoritative only as a
 reported business result; it is never committed-state proof. Semantic deconstruction uses the
-normalized result when present and retains its existing fallback for targets without a projection.
+public-safe normalized view when present and retains its existing fallback for targets without a
+projection. The private normalized evidence remains independently inspectable and is not used to
+reintroduce prohibited fields into derived public summaries.
 
 The campaign receipt binds the semantic provider and endpoint, model, render model, equivalence
 model, input/output/token/response/time bounds, data policy, target receipt, and command-wide call,
