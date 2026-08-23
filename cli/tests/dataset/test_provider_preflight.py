@@ -175,7 +175,10 @@ def test_evaluator_preflight_failure_surfaces_capability_and_safe_action(
     assert "required seed capability" in result.output
     assert "choose another configured evaluator model" in result.output
     assert "before campaign execution" in result.output
-    assert not output.exists()
+    assert output.exists()
+    assert output.read_bytes() == b""
+    assert (tmp_path / "results.jsonl.manifest.json").exists()
+    assert (tmp_path / "results.jsonl.trials.jsonl").exists()
     assert not (tmp_path / "results.augmentations.jsonl").exists()
     assert not (tmp_path / "results.jsonl.preflight.json").exists()
 

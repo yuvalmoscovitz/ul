@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import cast
 
 import pytest
 from ul import DatasetTrialUnit
+from ul_cli.dataset.evidence.context import build_dataset_evidence_run_context
+from ul_cli.dataset_review import DatasetEvidenceRunContext
 from ul_cli.dataset_trial_journal import (
     create_dataset_run_manifest,
     create_dataset_trial_journal,
@@ -12,7 +15,7 @@ from ul_cli.dataset_trial_journal import (
     read_dataset_run_manifest,
 )
 
-from ._factories import _evaluation_result, _run_context
+from ._factories import _evaluation_result, _run_context, _settings
 
 
 def _manifest():
@@ -100,3 +103,58 @@ def test_truncated_journal_is_preserved_and_rejected(tmp_path: Path) -> None:
         open_dataset_trial_journal(path, manifest)
 
     assert path.read_bytes() == corrupted
+
+
+def test_repeated_recovery_of_ten_by_eleven_by_three_plan_never_duplicates_mutations(
+    tmp_path: Path,
+) -> None:
+    records = tuple(_evaluation_result(f"interaction-{index}").source for index in range(10))
+    operator_ids = (
+        "input.surface.rephrase",
+        "input.surface.typing_noise",
+        "input.surface.case_variation",
+        "input.surface.punctuation_noise",
+        "input.surface.grammar_error",
+        "input.surface.disfluency_repeat",
+        "input.surface.fragmented_syntax",
+        "input.style.terse",
+        "input.style.verbose",
+        "input.tone.frustrated",
+        "input.intent.self_correction",
+    )
+    target_config = cast(DatasetEvidenceRunContext, _run_context((records[0],))).target.config
+    run_context = build_dataset_evidence_run_context(
+        selected_records=records,
+        selected_operator_ids=operator_ids,
+        repetitions=3,
+        invariant_suite=None,
+        target_config=target_config,
+        settings=_settings(),
+    )
+    manifest = create_dataset_run_manifest(
+        run_context=run_context,
+        selected_records=records,
+        selected_operator_ids=operator_ids,
+        repetitions=3,
+        max_environment_api_calls=2_000,
+        allow_environment_network=True,
+        confirm_test_environment=True,
+        allow_insecure_http=False,
+        save_augmentations=True,
+    )
+    path = tmp_path / "trials.jsonl"
+    journal = create_dataset_trial_journal(path, manifest)
+    mutations_by_unit: dict[str, int] = {}
+    template_trial = _evaluation_result("interaction-0").baseline.trial_set.trials[0]
+
+    for unit in manifest.work_plan:
+        journal.start(unit)
+        mutations_by_unit[unit.id] = mutations_by_unit.get(unit.id, 0) + 1
+        journal.finish(unit, template_trial.model_copy(update={"repetition": unit.repetition}))
+        journal.close()
+        journal = open_dataset_trial_journal(path, manifest)
+
+    assert len(manifest.work_plan) == 10 * (1 + 11) * 3
+    assert set(mutations_by_unit.values()) == {1}
+    assert len(journal.snapshot.terminal_states) == len(manifest.work_plan)
+    journal.close()

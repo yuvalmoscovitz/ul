@@ -72,6 +72,14 @@ class DatasetRunManifest(_StrictModel):
             raise ValueError("manifest contains duplicate interaction ids")
         if len(set(self.selected_operator_ids)) != len(self.selected_operator_ids):
             raise ValueError("manifest contains duplicate operators")
+        recorded_operator_ids = tuple(operator.id for operator in self.run_context.operators)
+        selected_operator_ids = tuple(
+            operator_id.partition("@")[0] for operator_id in self.selected_operator_ids
+        )
+        if selected_operator_ids != recorded_operator_ids:
+            raise ValueError("manifest operators do not match its run context")
+        if self.effective_command.repetitions != self.run_context.repetitions:
+            raise ValueError("manifest repetitions do not match its run context")
         unit_ids = tuple(unit.id for unit in self.work_plan)
         if len(set(unit_ids)) != len(unit_ids):
             raise ValueError("manifest contains duplicate trial units")

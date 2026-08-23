@@ -25,7 +25,7 @@ from ul.dataset_invariants import (
     JsonValueEqualsLiteralInvariant,
 )
 from ul_cli import dataset_augmentation_ledger as augmentation_ledger_module
-from ul_cli import dataset_review
+from ul_cli import dataset_review, dataset_trial_journal
 from ul_cli.dataset.evaluation import command as command_module
 from ul_cli.dataset.evaluation import runner as runner_module
 from ul_cli.dataset.evidence import customer as customer_module
@@ -49,6 +49,43 @@ from ._files import (
 
 runner = CliRunner()
 _ANSI_ESCAPE_PATTERN = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+
+
+def test_resume_reuses_manifest_without_original_data_config_or_overrides(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    evidence = tmp_path / "evidence.jsonl"
+    source = _evaluation_result("interaction-1").source
+    run_context = _run_context((source,))
+    manifest = dataset_trial_journal.create_dataset_run_manifest(
+        run_context=run_context,
+        selected_records=(source,),
+        selected_operator_ids=("input.surface.rephrase",),
+        repetitions=1,
+        max_environment_api_calls=10,
+        allow_environment_network=True,
+        confirm_test_environment=True,
+        allow_insecure_http=False,
+        save_augmentations=True,
+    )
+    evidence.write_bytes(b"")
+    dataset_trial_journal.persist_dataset_run_manifest(
+        dataset_trial_journal.manifest_path(evidence), manifest
+    )
+    dataset_trial_journal.create_dataset_trial_journal(
+        dataset_trial_journal.journal_path(evidence), manifest
+    ).close()
+    persistence_module.persist_evaluator_preflight(evidence, _evaluator_preflight())
+    monkeypatch.setattr(command_module, "load_dataset_semantic_settings", _settings)
+
+    result = runner.invoke(
+        root_app,
+        ["dataset", "evaluate", "--resume", str(evidence), "--dry-run"],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "Selected interactions: 1" in result.output
+    assert "input.surface.rephrase" in result.output
 
 
 def test_resume_skips_already_processed_interaction_ids(

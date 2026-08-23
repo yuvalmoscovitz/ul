@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import os
 import secrets
@@ -551,6 +552,11 @@ def evaluate_dataset(
     if not dry_run:
         assert output is not None
         assert run_context is not None
+        if augmentations_output is not None and not augmentations_output.parent.is_dir():
+            raise typer.BadParameter(
+                "cannot safely open augmentations output (FileNotFoundError)",
+                param_hint="--augmentations-output",
+            )
         expected_manifest = create_dataset_run_manifest(
             run_context=run_context,
             selected_records=all_selected_records,
@@ -751,12 +757,6 @@ def evaluate_dataset(
         )
     if output is None:
         raise typer.BadParameter("execution requires --output", param_hint="--output")
-    if output.exists() and resume is None:
-        raise typer.BadParameter(
-            "output already exists; UL will not overwrite it",
-            param_hint="--output",
-        )
-
     assert run_context is not None
     assert run_context.fixture is not None
     print_fixture_identity(
@@ -907,8 +907,15 @@ def evaluate_dataset(
     invariant_evaluations: list[DatasetInvariantEvaluation] = []
     try:
         with output_stream, finding_output_stream:
+            evaluation_parameters = inspect.signature(evaluate_interaction_records).parameters
+            accepts_trial_journal = "trial_journal" in evaluation_parameters or any(
+                parameter.kind is inspect.Parameter.VAR_KEYWORD
+                for parameter in evaluation_parameters.values()
+            )
             durable_arguments = (
-                {"trial_journal": trial_journal} if trial_journal is not None else {}
+                {"trial_journal": trial_journal}
+                if trial_journal is not None and accepts_trial_journal
+                else {}
             )
             evaluation_runner = cast(Any, evaluate_interaction_records)
             if invariant_suite is not None:
