@@ -51,7 +51,7 @@ from ul_core.evaluation import (
 )
 
 from ul.probe_execution import CapabilityExecutionError, ComposedEnvironmentExecutor
-from ul.state_hooks import CallbackStateEnvironment
+from ul.state_hooks import CallbackStateEnvironment, require_state_adapter_identity
 
 _HEADER_NAME_PATTERN = re.compile(r"[!#$%&'*+.^_`|~0-9A-Za-z-]+")
 _ENVIRONMENT_VARIABLE_PATTERN = re.compile(r"UL_ENVIRONMENT_[A-Z][A-Z0-9_]*")
@@ -529,7 +529,6 @@ class JsonHttpEnvironmentConnection:
         observation_source: ObservationSource | None = None,
         worker_trace_flusher: WorkerTraceFlusher | None = None,
         state_environment: StateEnvironment | None = None,
-        state_fixture_id: str | None = None,
         observation_timeout_seconds: float = 1.0,
         campaign_id: str | None = None,
         client: httpx.AsyncClient | None = None,
@@ -560,12 +559,14 @@ class JsonHttpEnvironmentConnection:
             raise ValueError(
                 "an external state environment can only compose with an isolated-response target"
             )
-        if state_fixture_id is not None and state_environment is None:
-            raise ValueError("state_fixture_id requires an external state environment")
+        state_identity = (
+            require_state_adapter_identity(state_environment)
+            if state_environment is not None
+            else None
+        )
         self._config_sha256 = _composed_environment_config_sha256(
             config,
             state_environment=state_environment,
-            state_fixture_id=state_fixture_id,
         )
         self._lifecycle_lock = asyncio.Lock()
         self._last_reset_generation: str | int | None = None
@@ -618,7 +619,9 @@ class JsonHttpEnvironmentConnection:
             fixture_id=(
                 config.fixture_id or config.environment_id
                 if isinstance(config, JsonHttpEnvironmentConfig)
-                else state_fixture_id
+                else state_identity.fixture_id
+                if state_identity is not None
+                else None
             ),
             observation_timeout_seconds=observation_timeout_seconds,
             campaign_id=campaign_id,
@@ -659,7 +662,6 @@ class JsonHttpEnvironmentConnection:
         observation_source: ObservationSource | None = None,
         worker_trace_flusher: WorkerTraceFlusher | None = None,
         state_environment: StateEnvironment | None = None,
-        state_fixture_id: str | None = None,
         observation_timeout_seconds: float = 1.0,
         campaign_id: str | None = None,
         client: httpx.AsyncClient | None = None,
@@ -675,7 +677,6 @@ class JsonHttpEnvironmentConnection:
             observation_source=observation_source,
             worker_trace_flusher=worker_trace_flusher,
             state_environment=state_environment,
-            state_fixture_id=state_fixture_id,
             observation_timeout_seconds=observation_timeout_seconds,
             campaign_id=campaign_id,
             client=client,
@@ -1747,22 +1748,22 @@ def _composed_environment_config_sha256(
     config: JsonHttpTargetConfig,
     *,
     state_environment: StateEnvironment | None,
-    state_fixture_id: str | None,
 ) -> str:
     if state_environment is None:
         return json_http_environment_config_sha256(config)
+    state_identity = require_state_adapter_identity(state_environment)
     canonical_config = json.dumps(
         {
             "http_target_sha256": json_http_environment_config_sha256(config),
             "state_capabilities": state_environment.capabilities.model_dump(
                 mode="json", exclude_none=True
             ),
-            "state_config_sha256": (
-                state_environment.config_sha256
+            "state_identity": state_identity.model_dump(mode="json"),
+            **(
+                {"state_config_sha256": state_environment.config_sha256}
                 if isinstance(state_environment, CallbackStateEnvironment)
-                else None
+                else {}
             ),
-            "state_fixture_id": state_fixture_id,
         },
         ensure_ascii=True,
         sort_keys=True,

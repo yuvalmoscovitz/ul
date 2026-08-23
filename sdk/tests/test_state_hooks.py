@@ -2,13 +2,14 @@ from __future__ import annotations
 
 import asyncio
 import json
-from collections.abc import AsyncIterator
+import threading
+from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass, field
 from typing import cast
 
 import httpx
 import pytest
-from pydantic import JsonValue
+from pydantic import JsonValue, ValidationError
 from ul.environment import evaluation_case_from_inputs, validate_execution_evidence
 from ul.http_environment import (
     JsonHttpEnvironmentConnection,
@@ -18,7 +19,9 @@ from ul.probe_execution import ComposedEnvironmentExecutor
 from ul.state_hooks import (
     CallbackStateEnvironment,
     JsonStateNormalization,
+    StateAdapterIdentity,
     StateCallbackContext,
+    _SyncCallbackRunner,  # pyright: ignore[reportPrivateUsage]
     check_deterministic_reset,
     diff_json_states,
     json_state_digest,
@@ -29,10 +32,46 @@ from ul_core.evaluation import (
     ProbeInvokerCapabilities,
     ProbeRequest,
     ProbeResult,
+    StateEnvironmentCapabilities,
     StateFixtureRequest,
+    StateOperationResult,
+    StateSnapshot,
 )
 
 _CONFIG_SHA256 = "a" * 64
+
+
+def _identity(
+    *,
+    fixture_id: str = "orders-v1",
+    fixture_version: str = "1",
+) -> StateAdapterIdentity:
+    return StateAdapterIdentity(
+        adapter_id="test-state-adapter",
+        adapter_version="1.0.0",
+        fixture_id=fixture_id,
+        fixture_version=fixture_version,
+    )
+
+
+def _state_request() -> StateFixtureRequest:
+    return StateFixtureRequest(
+        fixture_id="orders-v1",
+        case_id="case-1",
+        session_id="session-1",
+        correlation_id="correlation-1",
+    )
+
+
+def _callback_context() -> StateCallbackContext:
+    return StateCallbackContext(
+        phase="snapshot",
+        fixture_id="orders-v1",
+        case_id="case-1",
+        session_id="session-1",
+        correlation_id="correlation-1",
+        generation=1,
+    )
 
 
 class _StaticResponseStream(httpx.AsyncByteStream):
@@ -69,6 +108,28 @@ class _MutableStateInvoker:
             correlation_id=request.correlation_id,
             response={"handled": request.turn.input},
         )
+
+
+class _UnidentifiedStateEnvironment:
+    capabilities = StateEnvironmentCapabilities(
+        environment_id="unidentified-state",
+        supports_reset=True,
+        supports_snapshot=True,
+        supports_cleanup=True,
+        state_observation_authority="environment_self_reported",
+    )
+
+    def reset(self, request: StateFixtureRequest) -> StateOperationResult:
+        raise AssertionError("identity validation must happen before state execution")
+
+    def setup(self, request: StateFixtureRequest) -> StateOperationResult:
+        raise AssertionError("identity validation must happen before state execution")
+
+    def snapshot(self, request: StateFixtureRequest) -> StateSnapshot:
+        raise AssertionError("identity validation must happen before state execution")
+
+    def cleanup(self, request: StateFixtureRequest) -> StateOperationResult:
+        raise AssertionError("identity validation must happen before state execution")
 
 
 def _case(action: str) -> EvaluationCase:
@@ -134,6 +195,7 @@ async def test_callback_state_evidence_exposes_domain_failures(
 
     state_environment = CallbackStateEnvironment(
         environment_id="orders-observer",
+        identity=_identity(),
         reset=reset,
         snapshot=snapshot,
         authority="independent_observer",
@@ -193,23 +255,151 @@ def test_normalization_digest_and_diff_are_deterministic() -> None:
     assert diff_json_states(first, second, normalization) == ()
 
 
+@pytest.mark.asyncio
+async def test_callback_snapshot_rejects_cycle_before_normalization() -> None:
+    cyclic: list[object] = []
+    cyclic.append(cyclic)
+    environment = CallbackStateEnvironment(
+        environment_id="state-source",
+        identity=_identity(),
+        reset=lambda context: None,
+        snapshot=lambda context: cast(JsonValue, cyclic),
+    )
+
+    with pytest.raises(ValueError, match="cycles"):
+        await environment.snapshot(_state_request())
+
+
+@pytest.mark.asyncio
+async def test_callback_snapshot_rejects_excessive_depth_before_clone() -> None:
+    deeply_nested: object = None
+    for _ in range(102):
+        deeply_nested = [deeply_nested]
+    environment = CallbackStateEnvironment(
+        environment_id="state-source",
+        identity=_identity(),
+        reset=lambda context: None,
+        snapshot=lambda context: cast(JsonValue, deeply_nested),
+    )
+
+    with pytest.raises(ValueError, match="depth"):
+        await environment.snapshot(_state_request())
+
+
+@pytest.mark.asyncio
+async def test_callback_snapshot_rejects_excessive_nodes_before_clone() -> None:
+    environment = CallbackStateEnvironment(
+        environment_id="state-source",
+        identity=_identity(),
+        reset=lambda context: None,
+        snapshot=lambda context: list(range(20)),
+        snapshot_node_limit=10,
+    )
+
+    with pytest.raises(ValueError, match="node count"):
+        await environment.snapshot(_state_request())
+
+
+@pytest.mark.asyncio
+async def test_volatile_snapshot_value_cannot_bypass_raw_size_limit() -> None:
+    environment = CallbackStateEnvironment(
+        environment_id="state-source",
+        identity=_identity(),
+        reset=lambda context: None,
+        snapshot=lambda context: {"volatile": "x" * 1_000},
+        normalization=JsonStateNormalization(volatile_json_pointers=("/volatile",)),
+        snapshot_size_limit_bytes=100,
+    )
+
+    with pytest.raises(ValueError, match="size limit"):
+        await environment.snapshot(_state_request())
+
+
 def test_callback_state_identity_includes_normalization_and_defaults_conservatively() -> None:
     default_environment = CallbackStateEnvironment(
         environment_id="state-source",
+        identity=_identity(),
         reset=lambda context: None,
         snapshot=lambda context: {},
     )
     normalized_environment = CallbackStateEnvironment(
         environment_id="state-source",
+        identity=_identity(),
         reset=lambda context: None,
         snapshot=lambda context: {},
         normalization=JsonStateNormalization(volatile_json_pointers=("/updated_at",)),
+    )
+    versioned_environment = CallbackStateEnvironment(
+        environment_id="state-source",
+        identity=_identity(fixture_version="2"),
+        reset=lambda context: None,
+        snapshot=lambda context: {},
     )
 
     assert default_environment.capabilities.state_observation_authority == (
         "environment_self_reported"
     )
     assert default_environment.config_sha256 != normalized_environment.config_sha256
+    assert default_environment.config_sha256 != versioned_environment.config_sha256
+
+
+def test_state_adapter_identity_rejects_unstable_values() -> None:
+    with pytest.raises(ValidationError, match="adapter_id"):
+        StateAdapterIdentity(
+            adapter_id="contains whitespace",
+            adapter_version="1",
+            fixture_id="orders",
+            fixture_version="1",
+        )
+
+
+@pytest.mark.asyncio
+async def test_sync_callback_runner_clears_running_before_result_publication(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    loop = asyncio.get_running_loop()
+    original_call_soon_threadsafe = loop.call_soon_threadsafe
+    release_first_publisher = threading.Event()
+    publication_lock = threading.Lock()
+    publication_count = 0
+
+    def delayed_first_publication(callback: Callable[..., object], *args: object) -> None:
+        nonlocal publication_count
+        with publication_lock:
+            current_publication = publication_count
+            publication_count += 1
+        original_call_soon_threadsafe(callback, *args)
+        if current_publication == 0:
+            assert release_first_publisher.wait(1)
+
+    monkeypatch.setattr(loop, "call_soon_threadsafe", delayed_first_publication)
+    runner = _SyncCallbackRunner()
+    try:
+        assert await runner.call(lambda context: "first", _callback_context()) == "first"
+        assert await runner.call(lambda context: "second", _callback_context()) == "second"
+    finally:
+        release_first_publisher.set()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_sync_callback_runner_is_permanently_unavailable() -> None:
+    runner = _SyncCallbackRunner()
+    callback_started = threading.Event()
+    release_callback = threading.Event()
+
+    def blocking_callback(context: StateCallbackContext) -> str:
+        callback_started.set()
+        assert release_callback.wait(1)
+        return "late"
+
+    task = asyncio.create_task(runner.call(blocking_callback, _callback_context()))
+    await asyncio.to_thread(callback_started.wait, 1)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    with pytest.raises(RuntimeError, match="unavailable"):
+        await runner.call(lambda context: "retry", _callback_context())
+    release_callback.set()
 
 
 @pytest.mark.asyncio
@@ -231,6 +421,7 @@ async def test_double_reset_conformance_uses_normalized_clean_state_digest() -> 
 
     environment = CallbackStateEnvironment(
         environment_id="conformance-observer",
+        identity=_identity(fixture_id="fixture-1"),
         reset=reset,
         snapshot=lambda context: _snapshot_state(state),
         authority="independent_observer",
@@ -267,6 +458,7 @@ async def test_cleanup_failure_quarantines_callback_environment() -> None:
 
     environment = CallbackStateEnvironment(
         environment_id="orders-observer",
+        identity=_identity(),
         reset=reset,
         snapshot=lambda context: _snapshot_state(state),
         cleanup=cleanup,
@@ -276,6 +468,7 @@ async def test_cleanup_failure_quarantines_callback_environment() -> None:
         _MutableStateInvoker(state),
         config_sha256=_CONFIG_SHA256,
         state_environment=environment,
+        fixture_id="orders-v1",
     )
 
     failed = await executor.execute(_case("missing-write"))
@@ -307,6 +500,7 @@ async def test_optional_callback_setup_runs_before_initial_snapshot() -> None:
 
     environment = CallbackStateEnvironment(
         environment_id="orders-observer",
+        identity=_identity(),
         reset=reset,
         setup=setup,
         snapshot=snapshot,
@@ -316,6 +510,7 @@ async def test_optional_callback_setup_runs_before_initial_snapshot() -> None:
         _MutableStateInvoker(state),
         config_sha256=_CONFIG_SHA256,
         state_environment=environment,
+        fixture_id="orders-v1",
     )
 
     evidence = await executor.execute(_case("missing-write"))
@@ -346,6 +541,7 @@ async def test_isolated_http_agent_composes_with_local_state_observer() -> None:
 
     observer = CallbackStateEnvironment(
         environment_id="orders-observer",
+        identity=_identity(),
         reset=reset,
         snapshot=lambda context: _snapshot_state(state),
         authority="independent_observer",
@@ -369,7 +565,6 @@ async def test_isolated_http_agent_composes_with_local_state_observer() -> None:
             config,
             test_environment_confirmed=True,
             state_environment=observer,
-            state_fixture_id="orders-v1",
             client=client,
         )
         evidence = await environment.execute(_case("cancel-order"))
@@ -433,3 +628,27 @@ async def test_http_target_without_state_hooks_remains_explicitly_response_only(
     assert evidence.initial_state is None
     assert evidence.final_state is None
     assert environment.evidence_profile.available_facts == frozenset({"response_observed"})
+
+
+def test_http_composition_rejects_state_environment_without_stable_identity() -> None:
+    config = JsonHttpIsolatedResponseConfig.model_validate(
+        {
+            "version": 1,
+            "adapter_tier": "isolated_response",
+            "environment_id": "response-only-agent",
+            "request_isolation_attested": True,
+            "safe_test_target_attested": True,
+            "execute": {
+                "url": "https://agent.example.test/execute",
+                "request_json_template": {"input": "{{input}}"},
+                "response_json_pointer": "/response",
+            },
+        }
+    )
+
+    with pytest.raises(ValueError, match="StateAdapterIdentity"):
+        JsonHttpEnvironmentConnection.from_config(
+            config,
+            test_environment_confirmed=True,
+            state_environment=_UnidentifiedStateEnvironment(),
+        )

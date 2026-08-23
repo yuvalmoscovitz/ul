@@ -10,6 +10,7 @@ from collections.abc import Awaitable, Callable
 from typing import Literal, cast
 
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, field_validator
+from ul_core.contracts import StateEnvironment
 from ul_core.evaluation import (
     StateEnvironmentCapabilities,
     StateFixtureRequest,
@@ -19,6 +20,8 @@ from ul_core.evaluation import (
 )
 
 _MAXIMUM_JSON_DEPTH = 100
+_DEFAULT_MAXIMUM_JSON_NODES = 100_000
+_STABLE_ID_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,499}$"
 _VOLATILE_VALUE: dict[str, JsonValue] = {"__ul_volatile__": True}
 
 
@@ -59,6 +62,14 @@ class JsonStateDifference(_StrictModel):
     kind: Literal["added", "removed", "changed"]
     before: JsonValue = None
     after: JsonValue = None
+
+
+class StateAdapterIdentity(_StrictModel):
+    schema_version: Literal["1.0.0"] = "1.0.0"
+    adapter_id: str = Field(pattern=_STABLE_ID_PATTERN)
+    adapter_version: str = Field(pattern=_STABLE_ID_PATTERN)
+    fixture_id: str = Field(pattern=_STABLE_ID_PATTERN)
+    fixture_version: str = Field(pattern=_STABLE_ID_PATTERN)
 
 
 class StateCallbackContext(_StrictModel):
@@ -116,12 +127,13 @@ class _SyncCallbackRunner:
             try:
                 value = callback(context)
             except BaseException as error:
-                loop.call_soon_threadsafe(deliver_error, error)
-            else:
-                loop.call_soon_threadsafe(deliver_result, value)
-            finally:
                 with self._lock:
                     self._running = False
+                loop.call_soon_threadsafe(deliver_error, error)
+            else:
+                with self._lock:
+                    self._running = False
+                loop.call_soon_threadsafe(deliver_result, value)
 
         threading.Thread(target=run, name="ul-state-callback", daemon=True).start()
         try:
@@ -137,6 +149,7 @@ class CallbackStateEnvironment:
         self,
         *,
         environment_id: str,
+        identity: StateAdapterIdentity,
         reset: StateLifecycleCallback,
         snapshot: StateSnapshotCallback,
         setup: StateLifecycleCallback | None = None,
@@ -145,7 +158,10 @@ class CallbackStateEnvironment:
         observer_id: str | None = None,
         normalization: JsonStateNormalization | None = None,
         snapshot_size_limit_bytes: int = 1_000_000,
+        snapshot_node_limit: int = _DEFAULT_MAXIMUM_JSON_NODES,
     ) -> None:
+        if type(snapshot_node_limit) is not int or not 1 <= snapshot_node_limit <= 1_000_000:
+            raise ValueError("snapshot_node_limit must be an integer between 1 and 1000000")
         if authority == "environment_self_reported" and observer_id is not None:
             raise ValueError("self-reported callback state cannot name an independent observer")
         resolved_observer_id = (
@@ -162,11 +178,13 @@ class CallbackStateEnvironment:
             state_observer_id=resolved_observer_id,
             supports_deterministic_replay=False,
         )
+        self.identity = identity
         self._reset_callback = reset
         self._setup_callback = setup
         self._snapshot_callback = snapshot
         self._cleanup_callback = cleanup or reset
         self._normalization = normalization or JsonStateNormalization()
+        self._snapshot_node_limit = snapshot_node_limit
         self._generation = 0
         self._generation_lock = threading.Lock()
         self._sync_runner = _SyncCallbackRunner()
@@ -181,7 +199,9 @@ class CallbackStateEnvironment:
             _canonical_json(
                 {
                     "capabilities": self.capabilities.model_dump(mode="json", exclude_none=True),
+                    "identity": self.identity.model_dump(mode="json"),
                     "normalization": self._normalization.model_dump(mode="json"),
+                    "snapshot_node_limit": self._snapshot_node_limit,
                 }
             )
         ).hexdigest()
@@ -201,9 +221,12 @@ class CallbackStateEnvironment:
     async def snapshot(self, request: StateFixtureRequest) -> StateSnapshot:
         context = self._context(request, "snapshot", self._current_generation())
         value = await self._call(self._snapshot_callback, context)
-        normalized = normalize_json_state(value, self._normalization)
-        if len(_canonical_json(normalized)) > self.capabilities.snapshot_size_limit_bytes:
-            raise ValueError("state callback snapshot exceeds its configured size limit")
+        normalized = normalize_json_state(
+            value,
+            self._normalization,
+            max_bytes=self.capabilities.snapshot_size_limit_bytes,
+            max_nodes=self._snapshot_node_limit,
+        )
         return StateSnapshot(
             id=f"{request.correlation_id}:snapshot",
             fixture_id=request.fixture_id,
@@ -251,6 +274,10 @@ class CallbackStateEnvironment:
         phase: Literal["reset", "setup", "snapshot", "cleanup"],
         generation: int,
     ) -> StateCallbackContext:
+        if request.fixture_id != self.identity.fixture_id:
+            raise ValueError(
+                "state callback request does not match its configured fixture identity"
+            )
         return StateCallbackContext(
             phase=phase,
             fixture_id=request.fixture_id,
@@ -272,18 +299,35 @@ class CallbackStateEnvironment:
             return self._generation
 
 
+def require_state_adapter_identity(
+    environment: StateEnvironment,
+) -> StateAdapterIdentity:
+    identity = getattr(environment, "identity", None)
+    if not isinstance(identity, StateAdapterIdentity):
+        raise ValueError(
+            "composed state environments must provide a validated StateAdapterIdentity"
+        )
+    return identity
+
+
 def normalize_json_state(
     value: JsonValue,
     normalization: JsonStateNormalization | None = None,
+    *,
+    max_bytes: int = 1_000_000,
+    max_nodes: int = _DEFAULT_MAXIMUM_JSON_NODES,
 ) -> JsonValue:
+    _validate_json_limits(value, max_bytes=max_bytes, max_nodes=max_nodes)
     configuration = normalization or JsonStateNormalization()
-    return _normalize_json_value(
+    normalized = _normalize_json_value(
         value,
         path="",
         depth=0,
         volatile_paths=frozenset(configuration.volatile_json_pointers),
         unordered_paths=frozenset(configuration.unordered_json_pointers),
     )
+    bounded_json_size(normalized, max_bytes=max_bytes)
+    return normalized
 
 
 def json_state_digest(
@@ -472,6 +516,151 @@ def _append_difference(
     if len(differences) >= maximum:
         raise ValueError("state difference exceeds max_differences")
     differences.append(JsonStateDifference(path=path, kind=kind, before=before, after=after))
+
+
+def bounded_json_size(value: object, *, max_bytes: int) -> int:
+    if type(max_bytes) is not int or max_bytes < 1:
+        raise ValueError("max_bytes must be a positive integer")
+    total_bytes = 0
+    active_containers: set[int] = set()
+
+    def add_bytes(amount: int) -> None:
+        nonlocal total_bytes
+        total_bytes += amount
+        if total_bytes > max_bytes:
+            raise ValueError("JSON value exceeds its configured size limit")
+
+    def add_string(value: str) -> None:
+        add_bytes(2)
+        for character in value:
+            if character in {'"', "\\"} or character in {"\b", "\f", "\n", "\r", "\t"}:
+                add_bytes(2)
+            elif ord(character) < 0x20:
+                add_bytes(6)
+            else:
+                add_bytes(len(character.encode("utf-8")))
+
+    def visit(item: object, depth: int) -> None:
+        if depth > _MAXIMUM_JSON_DEPTH:
+            raise ValueError("JSON value exceeds the maximum depth")
+        item_type = type(item)
+        if item is None:
+            add_bytes(4)
+            return
+        if item_type is bool:
+            add_bytes(4 if item else 5)
+            return
+        if item_type is str:
+            add_string(cast(str, item))
+            return
+        if item_type is int:
+            try:
+                add_bytes(len(str(item)))
+            except ValueError:
+                raise ValueError("value must contain bounded standard JSON") from None
+            return
+        if item_type is float:
+            float_item = cast(float, item)
+            if not math.isfinite(float_item):
+                raise ValueError("value must contain bounded standard JSON")
+            add_bytes(len(json.dumps(float_item)))
+            return
+        if item_type not in {list, dict}:
+            raise ValueError("value must contain bounded standard JSON")
+        container_id = id(item)
+        if container_id in active_containers:
+            raise ValueError("value must contain bounded standard JSON")
+        active_containers.add(container_id)
+        try:
+            if item_type is list:
+                list_item = cast(list[object], item)
+                add_bytes(2 + max(0, len(list_item) - 1))
+                for child in list_item:
+                    visit(child, depth + 1)
+                return
+            dict_item = cast(dict[object, object], item)
+            add_bytes(2 + max(0, len(dict_item) - 1))
+            for key, child in dict_item.items():
+                if type(key) is not str:
+                    raise ValueError("value must contain bounded standard JSON")
+                add_string(key)
+                add_bytes(1)
+                visit(child, depth + 1)
+        finally:
+            active_containers.remove(container_id)
+
+    visit(value, 0)
+    return total_bytes
+
+
+def _validate_json_limits(
+    value: object,
+    *,
+    max_bytes: int,
+    max_nodes: int,
+) -> None:
+    if type(max_nodes) is not int or max_nodes < 1:
+        raise ValueError("max_nodes must be a positive integer")
+    node_count = [0]
+    _validate_json_structure(
+        value,
+        depth=0,
+        active_containers=set(),
+        node_count=node_count,
+        max_nodes=max_nodes,
+    )
+    bounded_json_size(value, max_bytes=max_bytes)
+
+
+def _validate_json_structure(
+    value: object,
+    *,
+    depth: int,
+    active_containers: set[int],
+    node_count: list[int],
+    max_nodes: int,
+) -> None:
+    if depth > _MAXIMUM_JSON_DEPTH:
+        raise ValueError("state snapshot exceeds the maximum JSON depth")
+    node_count[0] += 1
+    if node_count[0] > max_nodes:
+        raise ValueError("state snapshot exceeds the maximum JSON node count")
+    value_type = type(value)
+    if value is None or value_type in {str, bool, int}:
+        return
+    if value_type is float:
+        if not math.isfinite(cast(float, value)):
+            raise ValueError("state snapshots cannot contain non-finite numbers")
+        return
+    if value_type not in {list, dict}:
+        raise TypeError("state snapshots must contain standard JSON values")
+    container_id = id(value)
+    if container_id in active_containers:
+        raise ValueError("state snapshots cannot contain cycles")
+    active_containers.add(container_id)
+    try:
+        if value_type is list:
+            for item in cast(list[object], value):
+                _validate_json_structure(
+                    item,
+                    depth=depth + 1,
+                    active_containers=active_containers,
+                    node_count=node_count,
+                    max_nodes=max_nodes,
+                )
+            return
+        for key, item in cast(dict[object, object], value).items():
+            if type(key) is not str:
+                raise TypeError("state snapshot object keys must be strings")
+            _validate_json_structure(
+                item,
+                depth=depth + 1,
+                active_containers=active_containers,
+                node_count=node_count,
+                max_nodes=max_nodes,
+            )
+    finally:
+        active_containers.remove(container_id)
 
 
 def _canonical_json(value: JsonValue) -> bytes:

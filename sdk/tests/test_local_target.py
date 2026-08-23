@@ -26,7 +26,7 @@ from ul.local_target import (
     create_local_target_dry_run_plan,
     load_local_target_config,
 )
-from ul.state_hooks import CallbackStateEnvironment, StateCallbackContext
+from ul.state_hooks import CallbackStateEnvironment, StateAdapterIdentity, StateCallbackContext
 from ul_core.evaluation import ProbeRequest, ProbeTurn
 
 
@@ -174,6 +174,12 @@ async def test_local_process_target_composes_with_callback_state_without_http(
 
     state_environment = CallbackStateEnvironment(
         environment_id="local-state-observer",
+        identity=StateAdapterIdentity(
+            adapter_id="local-state-adapter",
+            adapter_version="1.0.0",
+            fixture_id="fixture-local",
+            fixture_version="1",
+        ),
         reset=reset,
         snapshot=lambda context: dict(state),
         authority="independent_observer",
@@ -189,7 +195,6 @@ async def test_local_process_target_composes_with_callback_state_without_http(
         _python_config(tmp_path, "customer_agent:sync_agent"),
         customer_code_execution_confirmed=True,
         state_environment=state_environment,
-        state_fixture_id="fixture-local",
     ) as connection:
         evidence = await connection.execute(case)
 

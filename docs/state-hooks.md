@@ -9,7 +9,7 @@ Use only disposable test fixtures. Reset and cleanup callbacks are allowed to mu
 snapshot callbacks should only read it.
 
 ```python
-from ul import CallbackStateEnvironment, StateCallbackContext
+from ul import CallbackStateEnvironment, StateAdapterIdentity, StateCallbackContext
 
 
 def reset_orders(context: StateCallbackContext) -> None:
@@ -22,6 +22,12 @@ async def snapshot_orders(context: StateCallbackContext):
 
 state = CallbackStateEnvironment(
     environment_id="orders-sandbox-observer",
+    identity=StateAdapterIdentity(
+        adapter_id="orders-state-adapter",
+        adapter_version="1.0.0",
+        fixture_id="orders-v1",
+        fixture_version="2026-08-23",
+    ),
     reset=reset_orders,
     snapshot=snapshot_orders,
     authority="independent_observer",
@@ -33,6 +39,12 @@ separate `cleanup` callback when the fixture requires it. Optional setup runs af
 the initial snapshot. Lifecycle callbacks return `None`; the snapshot callback returns JSON. UL
 constructs the operation receipts and snapshot envelope.
 
+`StateAdapterIdentity` is required. Its adapter and fixture IDs and versions must be stable across
+processes and machines. Change a version whenever callback behavior, fixture construction, or
+normalization rules change. UL includes this identity in evidence configuration digests. It never
+derives identity from function source, `repr`, or memory addresses. Custom `StateEnvironment`
+implementations attached to HTTP or local targets must expose the same validated `identity` value.
+
 Every callback receives a frozen `StateCallbackContext` with:
 
 - `phase`: reset, setup, snapshot, or cleanup;
@@ -43,6 +55,11 @@ Every callback receives a frozen `StateCallbackContext` with:
 The conservative default authority is `environment_self_reported`. Set
 `authority="independent_observer"` when the callback directly inspects state outside the agent; the
 environment ID is then the default observer ID.
+
+Synchronous callbacks run serially on one dedicated daemon runner per adapter. They do not run
+concurrently. Async callbacks run on the campaign event loop, while the composed executor still
+serializes cases. If a synchronous callback is cancelled or times out, UL permanently disables that
+runner because the abandoned thread may still mutate fixture state.
 
 ## Normalize and compare snapshots
 
@@ -63,6 +80,12 @@ normalization = JsonStateNormalization(
 
 state = CallbackStateEnvironment(
     environment_id="orders-sandbox-observer",
+    identity=StateAdapterIdentity(
+        adapter_id="orders-state-adapter",
+        adapter_version="1.0.0",
+        fixture_id="orders-v1",
+        fixture_version="2026-08-23",
+    ),
     reset=reset_orders,
     snapshot=snapshot_orders,
     authority="independent_observer",
@@ -110,7 +133,6 @@ environment = JsonHttpEnvironmentConnection.from_config(
     http_config,
     test_environment_confirmed=True,
     state_environment=state,
-    state_fixture_id="orders-v1",
 )
 ```
 
@@ -118,6 +140,11 @@ UL resets the local fixture, records the initial snapshot, invokes the HTTP agen
 correlated snapshot after the turn, and cleans the fixture. An exception, timeout, or uncertain
 cleanup quarantines the composed environment, preventing another case from running against state
 that may be dirty.
+
+Quarantine has no in-place recovery. Stop using the affected adapter and connection. Confirm the
+abandoned callback has stopped, inspect and reset the disposable fixture out of band, then create a
+new `CallbackStateEnvironment` and target connection. This replacement rule prevents later cases
+from trusting an instance whose state or callback thread remains uncertain.
 
 Without `state_environment`, the same HTTP adapter remains response-only. Its evidence profile does
 not claim committed-state verification, and state-dependent cases are rejected without blocking

@@ -32,7 +32,7 @@ from ul_core.evaluation import (
 )
 
 from ul.probe_execution import CapabilityExecutionError, ComposedEnvironmentExecutor
-from ul.state_hooks import CallbackStateEnvironment
+from ul.state_hooks import CallbackStateEnvironment, require_state_adapter_identity
 
 _PROTOCOL_VERSION = "1.0.0"
 _MAXIMUM_CONFIG_BYTES = 1_000_000
@@ -259,22 +259,22 @@ def _composed_local_target_config_sha256(
     config: LocalTargetConfig,
     *,
     state_environment: StateEnvironment | None,
-    state_fixture_id: str | None,
 ) -> str:
     if state_environment is None:
         return local_target_config_sha256(config)
+    state_identity = require_state_adapter_identity(state_environment)
     encoded = json.dumps(
         {
             "local_target_sha256": local_target_config_sha256(config),
             "state_capabilities": state_environment.capabilities.model_dump(
                 mode="json", exclude_none=True
             ),
-            "state_config_sha256": (
-                state_environment.config_sha256
+            "state_identity": state_identity.model_dump(mode="json"),
+            **(
+                {"state_config_sha256": state_environment.config_sha256}
                 if isinstance(state_environment, CallbackStateEnvironment)
-                else None
+                else {}
             ),
-            "state_fixture_id": state_fixture_id,
         },
         ensure_ascii=False,
         sort_keys=True,
@@ -749,7 +749,6 @@ class LocalTargetConnection:
         *,
         customer_code_execution_confirmed: bool,
         state_environment: StateEnvironment | None = None,
-        state_fixture_id: str | None = None,
     ) -> None:
         if customer_code_execution_confirmed is not True:
             raise ValueError(
@@ -758,17 +757,19 @@ class LocalTargetConnection:
         validate_local_target_config(config)
         self._config = config
         self._invoker = _LocalTargetInvoker(config)
-        if state_fixture_id is not None and state_environment is None:
-            raise ValueError("state_fixture_id requires a state environment")
+        state_identity = (
+            require_state_adapter_identity(state_environment)
+            if state_environment is not None
+            else None
+        )
         self._executor = ComposedEnvironmentExecutor(
             self._invoker,
             config_sha256=_composed_local_target_config_sha256(
                 config,
                 state_environment=state_environment,
-                state_fixture_id=state_fixture_id,
             ),
             state_environment=state_environment,
-            fixture_id=state_fixture_id,
+            fixture_id=state_identity.fixture_id if state_identity is not None else None,
         )
         self.capabilities: EnvironmentCapabilities = self._executor.capabilities
 
@@ -779,13 +780,11 @@ class LocalTargetConnection:
         *,
         customer_code_execution_confirmed: bool,
         state_environment: StateEnvironment | None = None,
-        state_fixture_id: str | None = None,
     ) -> Self:
         return cls(
             config,
             customer_code_execution_confirmed=customer_code_execution_confirmed,
             state_environment=state_environment,
-            state_fixture_id=state_fixture_id,
         )
 
     @property
