@@ -3,10 +3,11 @@
 UL findings have two neutral, versioned export forms:
 
 - `finding_otlp_json(bundle)` and `safe_finding_bundle_json/jsonl(bundle)` are safe by
-  default. They contain operational identifiers, category, review state, severity, exact
-  evidence facts and authorities, hashes, and W3C trace/span linkage. They omit finding
+  default. They contain the allowlisted campaign, case, probe, attempt, session, turn,
+  variation, repetition, and fixture identifiers; category; review state; severity; exact
+  evidence facts and authorities; hashes; and W3C trace/span linkage. They omit finding
   content, prompts, secrets, raw traces, state, private metadata, source IDs, locators, and
-  review explanations.
+  review explanations. Operational ID fields must contain IDs, never private content.
 - `private_finding_bundle_json/jsonl(bundle, private_export_confirmed=True)` preserves the
   complete validated record. Treat this output as sensitive evidence and store it only in an
   access-controlled location. The explicit confirmation prevents selecting it accidentally.
@@ -22,11 +23,14 @@ should not convert those facts into an invented confidence score.
 
 Each safe finding becomes an OTLP/HTTP JSON evaluator carrier span:
 
-- The carrier has a deterministic W3C trace ID and span ID.
+- The carrier has a deterministic W3C trace ID and span ID. An appended review emits a new
+  carrier identity at the review time; it never changes the identity or timestamp of an
+  already-exported carrier.
 - Its single span link points to the agent span identified by `target_trace`.
 - `openinference.span.kind=EVALUATOR` and flattened
   `evaluations.0.evaluation.*` attributes make the post-hoc evaluation discoverable by
-  OpenInference-compatible tooling.
+  OpenInference-compatible tooling. The annotator kind is `HUMAN`, `LLM`, or `CODE` from the
+  effective review state.
 - The `gen_ai.evaluation.result` event and `underlayer.finding.*` attributes provide a
   generic OpenTelemetry mapping without using vendor fields.
 
@@ -80,6 +84,58 @@ Keep messages, expected/observed outputs, explanations, and raw evaluator payloa
 `private_payload` or separately hashed artifacts. Do not copy them into category, IDs, or
 OTLP attributes. Existing evidence JSONL and report pipelines can map into this API later;
 finding export does not change or depend on those artifact schemas.
+
+This minimal example is directly constructible:
+
+```python
+from datetime import UTC, datetime
+
+from ul import (
+    FindingEvidenceLevel,
+    FindingProvenance,
+    W3CTraceReference,
+    create_finding_bundle,
+    create_finding_evidence_reference,
+    create_finding_record,
+    safe_finding_bundle_json,
+)
+
+recorded_at = datetime(2026, 8, 23, 7, 0, tzinfo=UTC)
+evidence = create_finding_evidence_reference(
+    kind="response",
+    source_id="probe-invoker-1",
+    authority="invoker_self_reported",
+    sha256="a" * 64,
+)
+finding = create_finding_record(
+    conclusion="observed_variance",
+    category="changed_grounded_effect_argument",
+    review_status="needs_review",
+    severity="unrated",
+    evidence_level=FindingEvidenceLevel(
+        facts=("response_observed",),
+        sources={"response_observed": "probe-invoker-1"},
+        authorities={"response_observed": "invoker_self_reported"},
+    ),
+    target_trace=W3CTraceReference(trace_id="1" * 32, span_id="2" * 16),
+    evidence_references=(evidence,),
+    recorded_at=recorded_at,
+    provenance=FindingProvenance(
+        producer_name="my-exporter",
+        producer_version="1.0.0",
+        config_sha256="b" * 64,
+        source_finding_id="finding-17",
+        campaign_id="campaign-4",
+        case_id="case-9",
+        probe_id="probe-2",
+        attempt_id="attempt-1",
+        session_id="session-3",
+        turn_ids=("turn-1",),
+    ),
+)
+bundle = create_finding_bundle((finding,), created_at=recorded_at)
+safe_json = safe_finding_bundle_json(bundle)
+```
 
 The wire choices follow the [OTLP specification](https://opentelemetry.io/docs/specs/otlp/),
 [W3C Trace Context](https://www.w3.org/TR/trace-context/), the

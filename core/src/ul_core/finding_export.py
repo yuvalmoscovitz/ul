@@ -204,12 +204,7 @@ class FindingRecord(_StrictModel):
             raise ValueError("finding evidence references must be sorted and unique")
         if artifact_ids != tuple(sorted(set(artifact_ids))):
             raise ValueError("finding artifact references must be sorted and unique")
-        if self.finding_id != finding_record_id(
-            category=self.category,
-            target_trace=self.target_trace,
-            provenance=self.provenance,
-            evidence_reference_ids=evidence_ids,
-        ):
+        if self.finding_id != finding_record_id(self):
             raise ValueError("finding ID is not deterministic")
         if len(_canonical_json(self.model_dump(mode="json"))) > _MAXIMUM_PRIVATE_RECORD_BYTES:
             raise ValueError("private finding record exceeds the 10 MB limit")
@@ -287,6 +282,8 @@ class FindingBundle(_StrictModel):
                     raise ValueError("finding has multiple active annotations")
             elif active is None or annotation.supersedes_annotation_id != active.annotation_id:
                 raise ValueError("finding annotation supersession target is not active")
+            if active is not None and annotation.reviewed_at <= active.reviewed_at:
+                raise ValueError("superseding annotation time must increase")
             annotations_by_id[annotation.annotation_id] = annotation
             active_annotations[annotation.finding_id] = annotation
         return self
@@ -305,6 +302,35 @@ class SafeFindingRecord(_StrictModel):
     evidence_reference_ids: tuple[str, ...] = Field(min_length=1)
     artifact_reference_ids: tuple[str, ...] = ()
     recorded_at: datetime
+    campaign_id: str = Field(min_length=1, max_length=500)
+    case_id: str = Field(min_length=1, max_length=500)
+    probe_id: str | None = Field(default=None, min_length=1, max_length=500)
+    attempt_id: str | None = Field(default=None, min_length=1, max_length=500)
+    session_id: str | None = Field(default=None, min_length=1, max_length=500)
+    turn_ids: tuple[str, ...] = ()
+    variation_id: str | None = Field(default=None, min_length=1, max_length=500)
+    repetition: int | None = Field(default=None, ge=1)
+    fixture_id: str | None = Field(default=None, min_length=1, max_length=500)
+    fixture_version: str | None = Field(default=None, min_length=1, max_length=500)
+
+    @model_validator(mode="after")
+    def validate_safe_record(self) -> Self:
+        _validate_utc(self.recorded_at, "recorded_at")
+        if self.evidence_facts != tuple(sorted(set(self.evidence_facts))):
+            raise ValueError("safe finding evidence facts must be sorted and unique")
+        if len(self.evidence_facts) != len(self.evidence_authorities):
+            raise ValueError("safe finding evidence facts and authorities must align")
+        if self.evidence_reference_ids != tuple(sorted(set(self.evidence_reference_ids))):
+            raise ValueError("safe finding evidence reference IDs must be sorted and unique")
+        if self.artifact_reference_ids != tuple(sorted(set(self.artifact_reference_ids))):
+            raise ValueError("safe finding artifact reference IDs must be sorted and unique")
+        if self.turn_ids != tuple(dict.fromkeys(self.turn_ids)):
+            raise ValueError("safe finding turn IDs must be unique and ordered")
+        if any(not 1 <= len(turn_id) <= 500 for turn_id in self.turn_ids):
+            raise ValueError("safe finding turn IDs must contain 1 to 500 characters")
+        if (self.fixture_id is None) != (self.fixture_version is None):
+            raise ValueError("safe finding fixture ID and version must be provided together")
+        return self
 
 
 class SafeFindingAnnotation(_StrictModel):
@@ -315,6 +341,12 @@ class SafeFindingAnnotation(_StrictModel):
     severity: FindingExportSeverity
     annotator_kind: FindingAnnotatorKind
     reviewed_at: datetime
+    supersedes_annotation_id: str | None = Field(default=None, pattern=_ANNOTATION_ID_PATTERN)
+
+    @model_validator(mode="after")
+    def validate_reviewed_at(self) -> Self:
+        _validate_utc(self.reviewed_at, "reviewed_at")
+        return self
 
 
 class SafeFindingBundle(_StrictModel):
@@ -327,7 +359,40 @@ class SafeFindingBundle(_StrictModel):
 
     @model_validator(mode="after")
     def validate_bundle_id(self) -> Self:
-        expected = safe_finding_bundle_id(self.findings, self.annotations)
+        finding_ids = tuple(finding.finding_id for finding in self.findings)
+        if finding_ids != tuple(sorted(set(finding_ids))):
+            raise ValueError("safe bundle finding IDs must be sorted and unique")
+        if self.source_bundle_id != finding_bundle_id(finding_ids):
+            raise ValueError("safe source bundle ID does not match its findings")
+        finding_id_set = set(finding_ids)
+        active_annotations: dict[str, SafeFindingAnnotation] = {}
+        annotation_ids: set[str] = set()
+        annotation_order = tuple(
+            (annotation.reviewed_at, annotation.annotation_id) for annotation in self.annotations
+        )
+        if annotation_order != tuple(sorted(annotation_order)):
+            raise ValueError("safe finding annotations must be ordered by time and ID")
+        for annotation in self.annotations:
+            if annotation.finding_id not in finding_id_set:
+                raise ValueError("safe finding annotation references an unknown finding")
+            if annotation.annotation_id in annotation_ids:
+                raise ValueError("safe finding bundle contains a duplicate annotation ID")
+            active = active_annotations.get(annotation.finding_id)
+            if annotation.supersedes_annotation_id is None:
+                if active is not None:
+                    raise ValueError("safe finding has multiple active annotations")
+            elif active is None or annotation.supersedes_annotation_id != active.annotation_id:
+                raise ValueError("safe finding annotation supersession target is not active")
+            if active is not None and annotation.reviewed_at <= active.reviewed_at:
+                raise ValueError("superseding annotation time must increase")
+            annotation_ids.add(annotation.annotation_id)
+            active_annotations[annotation.finding_id] = annotation
+        expected = safe_finding_bundle_id(
+            source_bundle_id=self.source_bundle_id,
+            created_at=self.created_at,
+            findings=self.findings,
+            annotations=self.annotations,
+        )
         if self.bundle_id != expected:
             raise ValueError("safe finding bundle ID is not deterministic")
         return self
@@ -347,6 +412,18 @@ class FindingOtlpEvent(_StrictModel):
     evidence_authorities: tuple[EvidenceAuthority, ...] = Field(min_length=1)
     evidence_reference_ids: tuple[str, ...] = Field(min_length=1)
     artifact_reference_ids: tuple[str, ...] = ()
+    campaign_id: str
+    case_id: str
+    probe_id: str | None = None
+    attempt_id: str | None = None
+    session_id: str | None = None
+    turn_ids: tuple[str, ...] = ()
+    variation_id: str | None = None
+    repetition: int | None = None
+    fixture_id: str | None = None
+    fixture_version: str | None = None
+    effective_annotation_id: str | None = None
+    annotator_kind: FindingAnnotatorKind
 
 
 def finding_evidence_reference_id(
@@ -378,29 +455,8 @@ def finding_artifact_reference_id(
     )
 
 
-def finding_record_id(
-    *,
-    category: str,
-    target_trace: W3CTraceReference,
-    provenance: FindingProvenance,
-    evidence_reference_ids: tuple[str, ...],
-) -> str:
-    return _digest(
-        "ulf_export_v1_",
-        {
-            "category": category,
-            "target_trace": target_trace.model_dump(mode="json"),
-            "source_finding_id": provenance.source_finding_id,
-            "campaign_id": provenance.campaign_id,
-            "case_id": provenance.case_id,
-            "source_interaction_id": provenance.source_interaction_id,
-            "probe_id": provenance.probe_id,
-            "attempt_id": provenance.attempt_id,
-            "variation_id": provenance.variation_id,
-            "repetition": provenance.repetition,
-            "evidence_reference_ids": evidence_reference_ids,
-        },
-    )
+def finding_record_id(finding: FindingRecord) -> str:
+    return _digest("ulf_export_v1_", finding.model_dump(mode="json", exclude={"finding_id"}))
 
 
 def finding_record_sha256(finding: FindingRecord) -> str:
@@ -420,11 +476,17 @@ def finding_bundle_id(finding_ids: tuple[str, ...]) -> str:
 
 
 def safe_finding_bundle_id(
-    findings: tuple[SafeFindingRecord, ...], annotations: tuple[SafeFindingAnnotation, ...]
+    *,
+    source_bundle_id: str,
+    created_at: datetime,
+    findings: tuple[SafeFindingRecord, ...],
+    annotations: tuple[SafeFindingAnnotation, ...],
 ) -> str:
     return _digest(
         "ulfs_v1_",
         {
+            "source_bundle_id": source_bundle_id,
+            "created_at": created_at.isoformat(),
             "findings": [finding.model_dump(mode="json") for finding in findings],
             "annotations": [annotation.model_dump(mode="json") for annotation in annotations],
         },

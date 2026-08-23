@@ -106,14 +106,22 @@ def create_finding_record(
 ) -> FindingRecord:
     ordered_evidence = tuple(sorted(evidence_references, key=lambda item: item.reference_id))
     ordered_artifacts = tuple(sorted(artifact_references, key=lambda item: item.reference_id))
-    finding_id = finding_record_id(
+    provisional = FindingRecord.model_construct(
+        finding_id=f"ulf_export_v1_{'0' * 64}",
+        conclusion=conclusion,
         category=category,
+        review_status=review_status,
+        severity=severity,
+        evidence_level=evidence_level,
         target_trace=target_trace,
+        evidence_references=ordered_evidence,
+        artifact_references=ordered_artifacts,
+        recorded_at=recorded_at,
         provenance=provenance,
-        evidence_reference_ids=tuple(item.reference_id for item in ordered_evidence),
+        private_payload=private_payload,
     )
     return FindingRecord(
-        finding_id=finding_id,
+        finding_id=finding_record_id(provisional),
         conclusion=conclusion,
         category=category,
         review_status=review_status,
@@ -188,11 +196,17 @@ def safe_finding_bundle(bundle: FindingBundle) -> SafeFindingBundle:
             severity=annotation.severity,
             annotator_kind=annotation.annotator_kind,
             reviewed_at=annotation.reviewed_at,
+            supersedes_annotation_id=annotation.supersedes_annotation_id,
         )
         for annotation in bundle.annotations
     )
     return SafeFindingBundle(
-        bundle_id=safe_finding_bundle_id(findings, annotations),
+        bundle_id=safe_finding_bundle_id(
+            source_bundle_id=bundle.bundle_id,
+            created_at=bundle.created_at,
+            findings=findings,
+            annotations=annotations,
+        ),
         source_bundle_id=bundle.bundle_id,
         created_at=bundle.created_at,
         findings=findings,
@@ -305,7 +319,13 @@ def parse_finding_annotations_jsonl(value: str | bytes) -> tuple[FindingAnnotati
 
 def finding_otlp_events(bundle: FindingBundle) -> tuple[FindingOtlpEvent, ...]:
     safe_bundle = safe_finding_bundle(bundle)
-    return tuple(_finding_otlp_event(finding) for finding in safe_bundle.findings)
+    active_annotations: dict[str, SafeFindingAnnotation] = {}
+    for annotation in safe_bundle.annotations:
+        active_annotations[annotation.finding_id] = annotation
+    return tuple(
+        _finding_otlp_event(finding, active_annotations.get(finding.finding_id))
+        for finding in safe_bundle.findings
+    )
 
 
 def finding_otlp_json(bundle: FindingBundle) -> dict[str, JsonValue]:
@@ -368,18 +388,36 @@ def _safe_finding(
         evidence_reference_ids=tuple(item.reference_id for item in finding.evidence_references),
         artifact_reference_ids=tuple(item.reference_id for item in finding.artifact_references),
         recorded_at=finding.recorded_at,
+        campaign_id=finding.provenance.campaign_id,
+        case_id=finding.provenance.case_id,
+        probe_id=finding.provenance.probe_id,
+        attempt_id=finding.provenance.attempt_id,
+        session_id=finding.provenance.session_id,
+        turn_ids=finding.provenance.turn_ids,
+        variation_id=finding.provenance.variation_id,
+        repetition=finding.provenance.repetition,
+        fixture_id=finding.provenance.fixture_id,
+        fixture_version=finding.provenance.fixture_version,
     )
 
 
-def _finding_otlp_event(finding: SafeFindingRecord) -> FindingOtlpEvent:
-    trace_id = hashlib.sha256(f"ul-finding-trace:{finding.finding_id}".encode()).hexdigest()[:32]
-    span_id = hashlib.sha256(f"ul-finding-span:{finding.finding_id}".encode()).hexdigest()[:16]
+def _finding_otlp_event(
+    finding: SafeFindingRecord, annotation: SafeFindingAnnotation | None
+) -> FindingOtlpEvent:
+    export_state_id = annotation.annotation_id if annotation is not None else "original"
+    trace_id = hashlib.sha256(
+        f"ul-finding-trace:{finding.finding_id}:{export_state_id}".encode()
+    ).hexdigest()[:32]
+    span_id = hashlib.sha256(
+        f"ul-finding-span:{finding.finding_id}:{export_state_id}".encode()
+    ).hexdigest()[:16]
     if set(trace_id) == {"0"}:
         trace_id = f"1{trace_id[1:]}"
     if set(span_id) == {"0"}:
         span_id = f"1{span_id[1:]}"
-    seconds = int(finding.recorded_at.timestamp())
-    time_unix_nano = seconds * 1_000_000_000 + finding.recorded_at.microsecond * 1_000
+    exported_at = annotation.reviewed_at if annotation is not None else finding.recorded_at
+    seconds = int(exported_at.timestamp())
+    time_unix_nano = seconds * 1_000_000_000 + exported_at.microsecond * 1_000
     return FindingOtlpEvent(
         finding_id=finding.finding_id,
         carrier_trace=W3CTraceReference(trace_id=trace_id, span_id=span_id),
@@ -393,6 +431,18 @@ def _finding_otlp_event(finding: SafeFindingRecord) -> FindingOtlpEvent:
         evidence_authorities=finding.evidence_authorities,
         evidence_reference_ids=finding.evidence_reference_ids,
         artifact_reference_ids=finding.artifact_reference_ids,
+        campaign_id=finding.campaign_id,
+        case_id=finding.case_id,
+        probe_id=finding.probe_id,
+        attempt_id=finding.attempt_id,
+        session_id=finding.session_id,
+        turn_ids=finding.turn_ids,
+        variation_id=finding.variation_id,
+        repetition=finding.repetition,
+        fixture_id=finding.fixture_id,
+        fixture_version=finding.fixture_version,
+        effective_annotation_id=annotation.annotation_id if annotation is not None else None,
+        annotator_kind=annotation.annotator_kind if annotation is not None else "CODE",
     )
 
 
@@ -401,7 +451,7 @@ def _otlp_span(event: FindingOtlpEvent) -> dict[str, JsonValue]:
         _otlp_attribute("openinference.span.kind", "EVALUATOR"),
         _otlp_attribute("evaluations.0.evaluation.name", "ul.finding"),
         _otlp_attribute("evaluations.0.evaluation.label", event.conclusion),
-        _otlp_attribute("evaluations.0.evaluation.annotator_kind", "CODE"),
+        _otlp_attribute("evaluations.0.evaluation.annotator_kind", event.annotator_kind),
         _otlp_attribute("evaluations.0.evaluation.identifier", event.finding_id),
         _otlp_attribute("underlayer.finding.schema_version", event.schema_version),
         _otlp_attribute("underlayer.finding.id", event.finding_id),
@@ -413,7 +463,22 @@ def _otlp_span(event: FindingOtlpEvent) -> dict[str, JsonValue]:
         _otlp_attribute("underlayer.finding.evidence.authorities", event.evidence_authorities),
         _otlp_attribute("underlayer.finding.evidence.reference_ids", event.evidence_reference_ids),
         _otlp_attribute("underlayer.finding.artifact.reference_ids", event.artifact_reference_ids),
+        _otlp_attribute("underlayer.finding.campaign.id", event.campaign_id),
+        _otlp_attribute("underlayer.finding.case.id", event.case_id),
+        _otlp_attribute("underlayer.finding.turn.ids", event.turn_ids),
     ]
+    for key, value in (
+        ("underlayer.finding.probe.id", event.probe_id),
+        ("underlayer.finding.attempt.id", event.attempt_id),
+        ("underlayer.finding.session.id", event.session_id),
+        ("underlayer.finding.variation.id", event.variation_id),
+        ("underlayer.finding.repetition", event.repetition),
+        ("underlayer.finding.fixture.id", event.fixture_id),
+        ("underlayer.finding.fixture.version", event.fixture_version),
+        ("underlayer.finding.annotation.id", event.effective_annotation_id),
+    ):
+        if value is not None:
+            attributes.append(_otlp_attribute(key, value))
     generic_event_attributes = [
         _otlp_attribute("gen_ai.evaluation.name", "ul.finding"),
         _otlp_attribute("gen_ai.evaluation.score.label", event.conclusion),
