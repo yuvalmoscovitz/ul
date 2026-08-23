@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import re
 from datetime import datetime
 from typing import Annotated, Literal, Self
 
-from pydantic import BaseModel, ConfigDict, Field, JsonValue, model_validator
+from pydantic import BaseModel, ConfigDict, Field, JsonValue, ValidationInfo, model_validator
 
 ReportEvidenceType = Literal[
     "dataset_evaluation",
@@ -55,7 +57,6 @@ _IDENTIFIER_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$"
 _VERSION_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9._+-]{0,49}$"
 _FINDING_ID_PATTERN = r"^ulf_v1_[0-9a-f]{64}$"
 _PATTERN_ID_PATTERN = r"^ulp_v1_[0-9a-f]{64}$"
-_RUN_RECEIPT_ID_PATTERN = r"^ulrr_v1_[A-Za-z0-9][A-Za-z0-9._-]{0,90}$"
 _SHA256_PATTERN = r"^[0-9a-f]{64}$"
 _JSON_POINTER_PATTERN = re.compile(r"(?:/(?:[^~/]|~[01])*)*")
 _MAXIMUM_RUN_RECEIPT_BYTES = 1_000_000
@@ -81,16 +82,44 @@ class ReportInputError(ValueError):
 
 
 class _StrictModel(BaseModel):
-    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+    model_config = ConfigDict(
+        extra="forbid",
+        frozen=True,
+        strict=True,
+        allow_inf_nan=False,
+    )
+
+
+_PUBLIC_REFERENCE_PATTERN = r"^ulref_v1_[0-9a-f]{64}$"
+_EVIDENCE_POINTER_ID_PATTERN = r"^ulep_v1_[0-9a-f]{64}$"
+_RUN_RECEIPT_ID_PATTERN = r"^ulrr_v1_[0-9a-f]{64}$"
+_REVIEW_REFERENCE_PATTERN = r"^ulreview_v1_[0-9a-f]{64}$"
+_CAPTURED_JSON_BYTES = 250_000
+OccurrenceCapability = Literal[
+    "cleanup_verification",
+    "conversation_replay",
+    "response_observation",
+    "state_observation",
+    "tool_observation",
+    "trace_observation",
+]
+OccurrenceLimitation = Literal[
+    "correctness_not_verified",
+    "evaluator_provenance_unavailable",
+    "model_provenance_unavailable",
+    "one_or_more_repetitions_inconclusive",
+    "production_prevalence_not_measured",
+    "source_execution_unavailable",
+]
 
 
 class VersionedReference(_StrictModel):
-    id: str = Field(pattern=_IDENTIFIER_PATTERN)
-    version: str = Field(pattern=_VERSION_PATTERN)
+    id: str = Field(pattern=_PUBLIC_REFERENCE_PATTERN)
+    version: str = Field(pattern=_PUBLIC_REFERENCE_PATTERN)
 
 
 class EvidencePointer(_StrictModel):
-    pointer_id: str = Field(pattern=_IDENTIFIER_PATTERN)
+    pointer_id: str = Field(pattern=_EVIDENCE_POINTER_ID_PATTERN)
     kind: Literal[
         "input",
         "response",
@@ -125,6 +154,20 @@ class EvidencePointer(_StrictModel):
 
 class ProbeChange(_StrictModel):
     kind: Literal["input", "context", "turn_sequence", "state_setup", "event_behavior"]
+    source_descriptor: Literal[
+        "baseline_context",
+        "baseline_turn_sequence",
+        "declared_state_setup",
+        "recorded_input",
+        "unmodified_event_behavior",
+    ]
+    probe_descriptor: Literal[
+        "augmented_context",
+        "augmented_input",
+        "augmented_turn_sequence",
+        "injected_event_behavior",
+        "modified_state_setup",
+    ]
     source_evidence_pointer_ids: tuple[str, ...] = Field(min_length=1, max_length=100)
     probe_evidence_pointer_ids: tuple[str, ...] = Field(min_length=1, max_length=100)
 
@@ -134,28 +177,89 @@ class ProbeChange(_StrictModel):
             self.source_evidence_pointer_ids,
             self.probe_evidence_pointer_ids,
         ):
-            if pointer_ids != tuple(sorted(set(pointer_ids))):
-                raise ValueError("probe change evidence pointer IDs must be sorted and unique")
+            _validate_sorted_unique(pointer_ids, "probe change evidence pointer IDs")
+        if set(self.source_evidence_pointer_ids) & set(self.probe_evidence_pointer_ids):
+            raise ValueError("source and probe evidence pointers must be disjoint")
         return self
 
 
 class ObservedDelta(_StrictModel):
     kind: Literal["response", "action", "rule", "state"]
     change: Literal["added", "removed", "changed", "violated", "unstable"]
-    subject: str | None = Field(default=None, pattern=_IDENTIFIER_PATTERN)
+    subject_ref: str = Field(pattern=_PUBLIC_REFERENCE_PATTERN)
+    rule: VersionedReference | None = None
+    source_state: Literal[
+        "observed",
+        "not_observed",
+        "satisfied",
+        "violated",
+        "stable",
+        "unstable",
+        "unknown",
+    ]
+    probe_state: Literal[
+        "observed",
+        "not_observed",
+        "satisfied",
+        "violated",
+        "stable",
+        "unstable",
+        "unknown",
+    ]
     evidence_pointer_ids: tuple[str, ...] = Field(min_length=1, max_length=100)
 
     @model_validator(mode="after")
-    def validate_pointer_ids(self) -> Self:
-        if self.evidence_pointer_ids != tuple(sorted(set(self.evidence_pointer_ids))):
-            raise ValueError("delta evidence pointer IDs must be sorted and unique")
+    def validate_delta(self) -> Self:
+        _validate_sorted_unique(self.evidence_pointer_ids, "delta evidence pointer IDs")
+        if (self.kind == "rule") != (self.rule is not None):
+            raise ValueError("only rule deltas carry a versioned rule reference")
+        if self.change == "added" and (
+            self.source_state != "not_observed" or self.probe_state != "observed"
+        ):
+            raise ValueError("added deltas require absent source and observed probe facts")
+        if self.change == "removed" and (
+            self.source_state != "observed" or self.probe_state != "not_observed"
+        ):
+            raise ValueError("removed deltas require observed source and absent probe facts")
+        if self.change == "changed" and (
+            self.source_state != "observed" or self.probe_state != "observed"
+        ):
+            raise ValueError("changed deltas require observed source and probe facts")
+        if self.change == "violated" and self.probe_state != "violated":
+            raise ValueError("violated deltas require a violated probe fact")
+        if self.change == "unstable" and self.probe_state != "unstable":
+            raise ValueError("unstable deltas require an unstable probe fact")
         return self
 
 
-class RepetitionEvidence(_StrictModel):
+class FindingRepetition(_StrictModel):
+    repetition: int = Field(ge=1)
+    outcome: Literal["finding_observed", "finding_not_observed", "inconclusive"]
+    source_receipt_id: str | None = Field(default=None, pattern=_RUN_RECEIPT_ID_PATTERN)
+    probe_receipt_id: str | None = Field(default=None, pattern=_RUN_RECEIPT_ID_PATTERN)
+    evidence_pointer_ids: tuple[str, ...] = Field(default=(), max_length=500)
+    inconclusive_reason: str | None = Field(default=None, pattern=_IDENTIFIER_PATTERN)
+
+    @model_validator(mode="after")
+    def validate_repetition(self) -> Self:
+        _validate_sorted_unique(self.evidence_pointer_ids, "repetition evidence pointer IDs")
+        if self.outcome == "inconclusive":
+            if self.inconclusive_reason is None:
+                raise ValueError("inconclusive repetitions require a reason")
+        elif (
+            self.probe_receipt_id is None
+            or not self.evidence_pointer_ids
+            or self.inconclusive_reason is not None
+        ):
+            raise ValueError("conclusive repetitions require probe evidence and no reason")
+        return self
+
+
+class RepetitionSummary(_StrictModel):
     requested: int = Field(ge=1)
     conclusive: int = Field(ge=0)
-    violated: int = Field(ge=0)
+    observed: int = Field(ge=0)
+    violated: int | None = Field(default=None, ge=0)
     inconclusive: int = Field(ge=0)
     stability: Literal["stable", "unstable", "inconclusive"]
     reproducibility: Literal[
@@ -165,204 +269,171 @@ class RepetitionEvidence(_StrictModel):
         "not_established",
     ]
 
-    @model_validator(mode="after")
-    def validate_counts(self) -> Self:
-        if self.conclusive + self.inconclusive != self.requested:
-            raise ValueError("repetition counts must match requested repetitions")
-        if self.violated > self.conclusive:
-            raise ValueError("violated repetitions cannot exceed conclusive repetitions")
-        expected_reproducibility = (
-            "not_established"
-            if self.conclusive == 0
-            else "not_reproduced"
-            if self.violated == 0
-            else "reproduced"
-            if self.violated == self.conclusive
-            else "intermittent"
-        )
-        if self.reproducibility != expected_reproducibility:
-            raise ValueError("reproducibility must match observed repetition counts")
-        if self.conclusive == 0 and self.stability != "inconclusive":
-            raise ValueError("evidence without a conclusive repetition is inconclusive")
-        if self.reproducibility == "intermittent" and self.stability != "unstable":
-            raise ValueError("intermittent reproduction is unstable")
-        return self
-
 
 class FindingOccurrence(_StrictModel):
     schema_version: Literal["1.0.0"] = "1.0.0"
     occurrence_id: str = Field(pattern=_FINDING_ID_PATTERN)
     kind: FindingKind
     category: FindingCategory
-    campaign_id: str | None = Field(default=None, min_length=1, max_length=500)
-    source_interaction_id: str | None = Field(default=None, min_length=1, max_length=500)
+    campaign_ref: str = Field(pattern=_PUBLIC_REFERENCE_PATTERN)
+    source_interaction_ref: str | None = Field(default=None, pattern=_PUBLIC_REFERENCE_PATTERN)
     fixture: VersionedReference | None = None
-    case_id: str = Field(min_length=1, max_length=500)
+    case_ref: str = Field(pattern=_PUBLIC_REFERENCE_PATTERN)
     operator: VersionedReference
     bundle: VersionedReference | None = None
     probe_change: ProbeChange
     observed_deltas: tuple[ObservedDelta, ...] = Field(min_length=1, max_length=100)
     violated_rule: VersionedReference | None = None
-    evidence_pointers: tuple[EvidencePointer, ...] = Field(min_length=1, max_length=500)
-    repetitions: RepetitionEvidence
-    required_capabilities: tuple[_FindingReferenceCode, ...] = Field(default=(), max_length=100)
-    limitations: tuple[_FindingReferenceCode, ...] = Field(default=(), max_length=100)
-    inconclusive_reasons: tuple[_FindingReferenceCode, ...] = Field(default=(), max_length=100)
-    review_history_ids: tuple[_FindingReferenceCode, ...] = Field(default=(), max_length=1_000)
-    run_receipt_id: str | None = Field(default=None, pattern=_RUN_RECEIPT_ID_PATTERN)
+    rule_definition_evidence_pointer_ids: tuple[str, ...] = Field(default=(), max_length=100)
+    evidence_pointer_ids: tuple[str, ...] = Field(min_length=1, max_length=1_000)
+    repetitions: tuple[FindingRepetition, ...] = Field(min_length=1, max_length=1_000)
+    repetition_summary: RepetitionSummary
+    required_capabilities: tuple[OccurrenceCapability, ...] = Field(default=(), max_length=100)
+    limitations: tuple[OccurrenceLimitation, ...] = Field(default=(), max_length=100)
+    review_history_ids: tuple[str, ...] = Field(
+        default=(),
+        max_length=1_000,
+    )
     next_action: FindingNextAction
 
     @model_validator(mode="after")
-    def validate_occurrence(self) -> Self:
+    def validate_occurrence(self, info: ValidationInfo) -> Self:
         if self.kind == "behavior_difference":
             if self.category == "customer_invariant_violation" or self.violated_rule is not None:
                 raise ValueError("behavior occurrences cannot claim a customer rule violation")
-        elif self.category != "customer_invariant_violation" or self.violated_rule is None:
-            raise ValueError("invariant occurrences require a violated customer rule")
-        pointer_ids = tuple(pointer.pointer_id for pointer in self.evidence_pointers)
-        if pointer_ids != tuple(sorted(set(pointer_ids))):
-            raise ValueError("evidence pointers must be sorted and unique")
+            if self.rule_definition_evidence_pointer_ids:
+                raise ValueError("behavior occurrences cannot cite a customer rule definition")
+        elif (
+            self.category != "customer_invariant_violation"
+            or self.violated_rule is None
+            or not self.rule_definition_evidence_pointer_ids
+        ):
+            raise ValueError("invariant occurrences require a customer rule and its definition")
+        _validate_sorted_unique(self.evidence_pointer_ids, "occurrence evidence pointer IDs")
+        _validate_sorted_unique(
+            self.rule_definition_evidence_pointer_ids,
+            "rule definition evidence pointer IDs",
+        )
+        for values, label in (
+            (self.required_capabilities, "required capabilities"),
+            (self.limitations, "limitations"),
+            (self.review_history_ids, "review history IDs"),
+        ):
+            _validate_sorted_unique(values, label)
+        if any(
+            re.fullmatch(_REVIEW_REFERENCE_PATTERN, value) is None
+            for value in self.review_history_ids
+        ):
+            raise ValueError("review history IDs must be privacy-safe references")
+        repetition_numbers = tuple(item.repetition for item in self.repetitions)
+        if repetition_numbers != tuple(range(1, len(self.repetitions) + 1)):
+            raise ValueError("finding repetitions must be contiguous and ordered")
         referenced_pointer_ids = {
             *self.probe_change.source_evidence_pointer_ids,
             *self.probe_change.probe_evidence_pointer_ids,
+            *self.rule_definition_evidence_pointer_ids,
             *(
                 pointer_id
                 for delta in self.observed_deltas
                 for pointer_id in delta.evidence_pointer_ids
             ),
+            *(pointer_id for item in self.repetitions for pointer_id in item.evidence_pointer_ids),
         }
-        if not referenced_pointer_ids.issubset(pointer_ids):
-            raise ValueError("finding occurrence references an unknown evidence pointer")
-        if referenced_pointer_ids != set(pointer_ids):
-            raise ValueError("finding occurrence contains unused evidence pointers")
-        pointers_by_id = {pointer.pointer_id: pointer for pointer in self.evidence_pointers}
-        source_pointer_ids = set(self.probe_change.source_evidence_pointer_ids)
-        probe_pointer_ids = set(self.probe_change.probe_evidence_pointer_ids)
-        if source_pointer_ids & probe_pointer_ids:
-            raise ValueError("source and probe evidence pointers must be disjoint")
-        if any(pointers_by_id[pointer_id].arm != "source" for pointer_id in source_pointer_ids):
-            raise ValueError("source change evidence must reference the source arm")
-        if any(pointers_by_id[pointer_id].arm != "probe" for pointer_id in probe_pointer_ids):
-            raise ValueError("probe change evidence must reference the probe arm")
-        change_pointer_kinds = {
-            "input": {"input"},
-            "context": {"input"},
-            "turn_sequence": {"input"},
-            "state_setup": {"state"},
-            "event_behavior": {"action", "tool_call", "tool_result", "lifecycle"},
-        }[self.probe_change.kind]
-        if any(
-            pointers_by_id[pointer_id].kind not in change_pointer_kinds
-            for pointer_id in source_pointer_ids | probe_pointer_ids
-        ):
-            raise ValueError("probe change references incompatible evidence")
-        delta_pointer_kinds = {
-            "response": {"response"},
-            "action": {"action", "tool_call", "tool_result"},
-            "rule": {"rule"},
-            "state": {"state"},
-        }
-        if any(
-            pointers_by_id[pointer_id].kind not in delta_pointer_kinds[delta.kind]
-            for delta in self.observed_deltas
-            for pointer_id in delta.evidence_pointer_ids
-        ):
-            raise ValueError("observed delta references incompatible evidence")
-        for delta in self.observed_deltas:
-            delta_arms = {
-                pointers_by_id[pointer_id].arm for pointer_id in delta.evidence_pointer_ids
-            }
-            if delta.change == "changed" and not {"source", "probe"}.issubset(delta_arms):
-                raise ValueError("changed deltas require source and probe evidence")
-            if delta.change in {"added", "violated", "unstable"} and "probe" not in delta_arms:
-                raise ValueError(f"{delta.change} deltas require probe evidence")
-            if delta.change == "removed" and "source" not in delta_arms:
-                raise ValueError("removed deltas require source evidence")
-        required_category_delta = {
-            "duplicate_effect": ("action", "added"),
-            "unexpected_effect": ("action", "added"),
-            "missing_effect": ("action", "removed"),
-            "changed_grounded_effect_argument": ("action", "changed"),
-            "unstable_behavior": (None, "unstable"),
-            "customer_invariant_violation": ("rule", "violated"),
-        }[self.category]
-        if not any(
-            (required_category_delta[0] is None or delta.kind == required_category_delta[0])
-            and delta.change == required_category_delta[1]
-            for delta in self.observed_deltas
-        ):
-            raise ValueError("finding category must match its observed delta")
-        if self.category == "unstable_behavior" and self.repetitions.stability != "unstable":
-            raise ValueError("unstable findings require unstable repetition evidence")
-        rule_violation_deltas = tuple(
-            delta
-            for delta in self.observed_deltas
-            if delta.kind == "rule" and delta.change == "violated"
+        if referenced_pointer_ids != set(self.evidence_pointer_ids):
+            raise ValueError("occurrence evidence pointers must exactly match its claims")
+        observed = sum(item.outcome == "finding_observed" for item in self.repetitions)
+        inconclusive = sum(item.outcome == "inconclusive" for item in self.repetitions)
+        conclusive = len(self.repetitions) - inconclusive
+        expected_reproducibility = (
+            "not_established"
+            if conclusive == 0
+            else "not_reproduced"
+            if observed == 0
+            else "reproduced"
+            if observed == conclusive
+            else "intermittent"
         )
-        if self.violated_rule is None and rule_violation_deltas:
-            raise ValueError("violated rules require an exact rule violation delta")
-        if self.violated_rule is not None and (
-            len(rule_violation_deltas) != 1
-            or rule_violation_deltas[0].subject != self.violated_rule.id
+        expected_violated = observed if self.kind == "customer_invariant_violation" else None
+        expected_summary = self.repetition_summary.model_copy(
+            update={
+                "requested": len(self.repetitions),
+                "conclusive": conclusive,
+                "observed": observed,
+                "violated": expected_violated,
+                "inconclusive": inconclusive,
+                "reproducibility": expected_reproducibility,
+            }
+        )
+        if self.repetition_summary != expected_summary:
+            raise ValueError("repetition summary must match exact repetition evidence")
+        if conclusive == 0 and self.repetition_summary.stability != "inconclusive":
+            raise ValueError("evidence without conclusive repetitions is inconclusive")
+        if (
+            expected_reproducibility == "intermittent"
+            and self.repetition_summary.stability != "unstable"
         ):
-            raise ValueError("violated rule identity must match one exact rule violation delta")
-        for values, label in (
-            (self.required_capabilities, "required capabilities"),
-            (self.limitations, "limitations"),
-            (self.inconclusive_reasons, "inconclusive reasons"),
-            (self.review_history_ids, "review history IDs"),
+            raise ValueError("intermittent reproduction is unstable")
+        _validate_category_delta(self)
+        if info.context != {"building_occurrence": True} and (
+            self.occurrence_id != _finding_occurrence_id(self)
         ):
-            if values != tuple(sorted(set(values))):
-                raise ValueError(f"{label} must be sorted and unique")
-        if self.repetitions.inconclusive == 0 and self.inconclusive_reasons:
-            raise ValueError("conclusive occurrences cannot declare inconclusive reasons")
-        if self.repetitions.inconclusive > 0 and not self.inconclusive_reasons:
-            raise ValueError("inconclusive repetitions require at least one reason")
+            raise ValueError("finding occurrence ID must match its canonical claims")
         return self
+
+
+class CapturedJson(_StrictModel):
+    canonical_json: str = Field(min_length=1, max_length=_CAPTURED_JSON_BYTES)
+    sha256: str = Field(pattern=_SHA256_PATTERN)
+
+    @model_validator(mode="after")
+    def validate_capture(self) -> Self:
+        encoded = self.canonical_json.encode("utf-8")
+        if len(encoded) > _CAPTURED_JSON_BYTES:
+            raise ValueError("captured JSON exceeds its byte limit")
+        try:
+            value = json.loads(self.canonical_json, parse_constant=_reject_json_constant)
+        except (json.JSONDecodeError, ValueError):
+            raise ValueError("captured value must be finite JSON") from None
+        if self.canonical_json != _canonical_json(value):
+            raise ValueError("captured JSON must use the canonical representation")
+        if hashlib.sha256(encoded).hexdigest() != self.sha256:
+            raise ValueError("captured JSON digest does not match its content")
+        return self
+
+
+class ReceiptEvidenceValue(_StrictModel):
+    evidence_pointer_id: str = Field(pattern=_EVIDENCE_POINTER_ID_PATTERN)
+    value: CapturedJson
 
 
 class ToolExchangeReceipt(_StrictModel):
     sequence: int = Field(ge=1)
-    call: JsonValue
-    result: JsonValue | None = None
-    authority: Literal[
-        "invoker_self_reported",
-        "source_self_reported",
-        "environment_self_reported",
-        "independent_observer",
-    ]
-    source_id: str = Field(min_length=1, max_length=500)
+    call: ReceiptEvidenceValue
+    result: ReceiptEvidenceValue | None = None
 
 
 class StateReceipt(_StrictModel):
-    value: JsonValue
-    authority: Literal["environment_self_reported", "independent_observer"]
-    observer_id: str | None = Field(default=None, min_length=1, max_length=500)
-
-    @model_validator(mode="after")
-    def validate_observer(self) -> Self:
-        if (self.authority == "independent_observer") != (self.observer_id is not None):
-            raise ValueError("only independent state evidence names an observer")
-        return self
+    evidence: ReceiptEvidenceValue
 
 
 class LifecycleReceipt(_StrictModel):
     phase: Literal["initial_reset", "setup", "execution", "cleanup_reset"]
     status: Literal["succeeded", "failed", "not_attempted", "unknown"]
     evidence_pointer_ids: tuple[str, ...] = Field(default=(), max_length=100)
-    limitation: str | None = Field(default=None, min_length=1, max_length=500)
+    limitation: str | None = Field(default=None, pattern=_IDENTIFIER_PATTERN)
 
     @model_validator(mode="after")
     def validate_lifecycle(self) -> Self:
-        if self.evidence_pointer_ids != tuple(sorted(set(self.evidence_pointer_ids))):
-            raise ValueError("lifecycle evidence pointer IDs must be sorted and unique")
+        _validate_sorted_unique(self.evidence_pointer_ids, "lifecycle evidence pointer IDs")
         if (self.status != "succeeded") != (self.limitation is not None):
             raise ValueError("unverified lifecycle phases require one limitation")
+        if self.status == "succeeded" and not self.evidence_pointer_ids:
+            raise ValueError("successful lifecycle phases require exact evidence")
         return self
 
 
 class ProvenanceReceipt(_StrictModel):
-    role: Literal["target", "model", "evaluator", "environment", "observer"]
+    role: Literal["customer", "invoker", "target", "model", "evaluator", "environment", "observer"]
     id: str = Field(min_length=1, max_length=500)
     version: str | None = Field(default=None, min_length=1, max_length=100)
     config_sha256: str | None = Field(default=None, pattern=_SHA256_PATTERN)
@@ -372,8 +443,8 @@ class UsageReceipt(_StrictModel):
     input_tokens: int | None = Field(default=None, ge=0)
     output_tokens: int | None = Field(default=None, ge=0)
     total_tokens: int | None = Field(default=None, ge=0)
-    cost: float | None = Field(default=None, ge=0, allow_inf_nan=False)
-    duration_ms: float | None = Field(default=None, ge=0, allow_inf_nan=False)
+    cost: float | None = Field(default=None, ge=0)
+    duration_ms: float | None = Field(default=None, ge=0)
 
     @model_validator(mode="after")
     def validate_tokens(self) -> Self:
@@ -403,128 +474,448 @@ class RedactionReceipt(_StrictModel):
         return self
 
 
-class RunReceipt(_StrictModel):
-    schema_version: Literal["1.0.0"] = "1.0.0"
-    receipt_id: str = Field(pattern=_RUN_RECEIPT_ID_PATTERN)
+class RunReceiptContent(_StrictModel):
     disclosure: Literal["private"] = "private"
+    repetition: int = Field(ge=1)
+    arm: Literal["source", "probe"]
     evidence_scope: ReportEvidenceScope
-    source_input: JsonValue
-    probe_input: JsonValue
-    source_response: JsonValue
-    probe_response: JsonValue
+    input: ReceiptEvidenceValue
+    response: ReceiptEvidenceValue | None = None
     tool_exchanges: tuple[ToolExchangeReceipt, ...] = Field(default=(), max_length=1_000)
     state_before: StateReceipt | None = None
     state_after: StateReceipt | None = None
-    lifecycle: tuple[LifecycleReceipt, ...] = Field(default=(), max_length=10)
-    provenance: tuple[ProvenanceReceipt, ...] = Field(default=(), max_length=100)
-    trace_references: tuple[str, ...] = Field(default=(), max_length=1_000)
+    lifecycle: tuple[LifecycleReceipt, ...] = Field(min_length=1, max_length=10)
+    provenance: tuple[ProvenanceReceipt, ...] = Field(min_length=1, max_length=100)
+    trace_evidence_pointer_ids: tuple[str, ...] = Field(default=(), max_length=1_000)
     usage: UsageReceipt | None = None
     redaction: RedactionReceipt
-    evidence_pointers: tuple[EvidencePointer, ...] = Field(min_length=1, max_length=500)
-    limitations: tuple[str, ...] = Field(default=(), max_length=100)
+    evidence_pointers: tuple[EvidencePointer, ...] = Field(min_length=1, max_length=1_000)
+    limitations: tuple[_FindingReferenceCode, ...] = Field(default=(), max_length=100)
     recorded_at: datetime
 
     @model_validator(mode="after")
-    def validate_receipt(self) -> Self:
+    def validate_content(self) -> Self:
+        pointer_ids = tuple(pointer.pointer_id for pointer in self.evidence_pointers)
+        _validate_sorted_unique(pointer_ids, "receipt evidence pointers")
+        pointers = {pointer.pointer_id: pointer for pointer in self.evidence_pointers}
+        referenced = {self.input.evidence_pointer_id, *self.trace_evidence_pointer_ids}
+        _validate_receipt_value_pointer(self.input, pointers, "input", self.arm)
+        if self.response is None:
+            if "response_missing" not in self.limitations:
+                raise ValueError("missing responses require an explicit limitation")
+        else:
+            referenced.add(self.response.evidence_pointer_id)
+            _validate_receipt_value_pointer(self.response, pointers, "response", self.arm)
         sequences = tuple(exchange.sequence for exchange in self.tool_exchanges)
         if sequences != tuple(range(1, len(sequences) + 1)):
             raise ValueError("tool exchanges must be contiguous and ordered")
-        pointer_ids = tuple(pointer.pointer_id for pointer in self.evidence_pointers)
-        if pointer_ids != tuple(sorted(set(pointer_ids))):
-            raise ValueError("receipt evidence pointers must be sorted and unique")
-        known_pointer_ids = set(pointer_ids)
-        if any(
-            not set(phase.evidence_pointer_ids).issubset(known_pointer_ids)
-            for phase in self.lifecycle
-        ):
-            raise ValueError("lifecycle references an unknown evidence pointer")
-        pointers_by_id = {pointer.pointer_id: pointer for pointer in self.evidence_pointers}
-        if any(
-            pointers_by_id[pointer_id].kind != "lifecycle"
-            for phase in self.lifecycle
-            for pointer_id in phase.evidence_pointer_ids
-        ):
-            raise ValueError("lifecycle phases require lifecycle evidence pointers")
-        if any(
-            phase.status == "succeeded" and not phase.evidence_pointer_ids
-            for phase in self.lifecycle
-        ):
-            raise ValueError("successful lifecycle phases require exact evidence")
-        lifecycle_phases = tuple(phase.phase for phase in self.lifecycle)
-        if len(lifecycle_phases) != len(set(lifecycle_phases)):
-            raise ValueError("lifecycle phases must be unique")
-        lifecycle_order = {
-            "initial_reset": 0,
-            "setup": 1,
-            "execution": 2,
-            "cleanup_reset": 3,
-        }
-        if lifecycle_phases != tuple(sorted(lifecycle_phases, key=lifecycle_order.__getitem__)):
-            raise ValueError("lifecycle phases must preserve execution order")
+        for exchange in self.tool_exchanges:
+            referenced.add(exchange.call.evidence_pointer_id)
+            _validate_receipt_value_pointer(exchange.call, pointers, "tool_call", self.arm)
+            if exchange.result is not None:
+                referenced.add(exchange.result.evidence_pointer_id)
+                _validate_receipt_value_pointer(exchange.result, pointers, "tool_result", self.arm)
+        for state in (self.state_before, self.state_after):
+            if state is not None:
+                referenced.add(state.evidence.evidence_pointer_id)
+                _validate_receipt_value_pointer(state.evidence, pointers, "state", self.arm)
         if self.evidence_scope == "response_only":
             if self.state_before is not None or self.state_after is not None:
                 raise ValueError("response-only receipts cannot contain state evidence")
-            if any(pointer.kind == "state" for pointer in self.evidence_pointers):
-                raise ValueError("response-only receipts cannot reference state evidence")
         elif self.state_before is None or self.state_after is None:
             raise ValueError("response-and-state receipts require before and after state")
-        core_evidence_roles = {
-            (pointer.kind, pointer.arm)
-            for pointer in self.evidence_pointers
-            if pointer.kind in {"input", "response"}
-        }
-        if not {
-            ("input", "source"),
-            ("input", "probe"),
-            ("response", "source"),
-            ("response", "probe"),
-        }.issubset(core_evidence_roles):
-            raise ValueError("run receipts require source and probe input and response evidence")
-        for values, label in (
-            (self.trace_references, "trace references"),
-            (self.limitations, "receipt limitations"),
-        ):
-            if values != tuple(sorted(set(values))):
-                raise ValueError(f"{label} must be sorted and unique")
-            if any(not value or len(value) > 500 for value in values):
-                raise ValueError(f"{label} must contain bounded non-empty values")
-        provenance_keys = tuple((item.role, item.id, item.version) for item in self.provenance)
-        expected_provenance_keys = tuple(
+        lifecycle_phases = tuple(phase.phase for phase in self.lifecycle)
+        expected_lifecycle = tuple(
             sorted(
-                set(provenance_keys),
-                key=lambda item: (item[0], item[1], item[2] or ""),
+                set(lifecycle_phases),
+                key=("initial_reset", "setup", "execution", "cleanup_reset").index,
             )
         )
-        if provenance_keys != expected_provenance_keys:
+        if lifecycle_phases != expected_lifecycle or "execution" not in lifecycle_phases:
+            raise ValueError("lifecycle phases must be unique, ordered, and include execution")
+        for phase in self.lifecycle:
+            referenced.update(phase.evidence_pointer_ids)
+            for pointer_id in phase.evidence_pointer_ids:
+                _validate_pointer(pointers, pointer_id, "lifecycle", self.arm)
+        for pointer_id in self.trace_evidence_pointer_ids:
+            _validate_pointer(pointers, pointer_id, "trace", self.arm)
+        for values, label in (
+            (self.trace_evidence_pointer_ids, "trace evidence pointer IDs"),
+            (self.limitations, "receipt limitations"),
+        ):
+            _validate_sorted_unique(values, label)
+        provenance_keys = tuple((item.role, item.id, item.version) for item in self.provenance)
+        expected_provenance = tuple(
+            sorted(set(provenance_keys), key=lambda item: (item[0], item[1], item[2] or ""))
+        )
+        if provenance_keys != expected_provenance:
             raise ValueError("provenance must be sorted and unique")
-        observer_ids = {item.id for item in self.provenance if item.role == "observer"}
-        independent_source_ids = {
-            pointer.source_id
-            for pointer in self.evidence_pointers
-            if pointer.authority == "independent_observer"
-        } | {
-            exchange.source_id
-            for exchange in self.tool_exchanges
-            if exchange.authority == "independent_observer"
-        }
-        if self.state_before is not None and self.state_before.authority == "independent_observer":
-            assert self.state_before.observer_id is not None
-            independent_source_ids.add(self.state_before.observer_id)
-        if self.state_after is not None and self.state_after.authority == "independent_observer":
-            assert self.state_after.observer_id is not None
-            independent_source_ids.add(self.state_after.observer_id)
-        if not independent_source_ids.issubset(observer_ids):
-            raise ValueError("independent evidence requires matching observer provenance")
+        provenance_roles = {item.role for item in self.provenance}
+        if (
+            "model" not in provenance_roles
+            and "model_provenance_unavailable" not in self.limitations
+        ):
+            raise ValueError("missing model provenance requires an explicit limitation")
+        if (
+            "evaluator" not in provenance_roles
+            and "evaluator_provenance_unavailable" not in self.limitations
+        ):
+            raise ValueError("missing evaluator provenance requires an explicit limitation")
+        _validate_pointer_provenance(self.evidence_pointers, self.provenance)
         if self.recorded_at.tzinfo is None or self.recorded_at.utcoffset() is None:
             raise ValueError("receipt timestamp must include a UTC offset")
-        if len(self.model_dump_json().encode("utf-8")) > _MAXIMUM_RUN_RECEIPT_BYTES:
+        if not referenced.issubset(pointers):
+            raise ValueError("receipt references an unknown evidence pointer")
+        return self
+
+
+class RunReceipt(_StrictModel):
+    schema_version: Literal["1.0.0"] = "1.0.0"
+    receipt_id: str = Field(pattern=_RUN_RECEIPT_ID_PATTERN)
+    content: RunReceiptContent
+
+    @model_validator(mode="after")
+    def validate_receipt_id(self) -> Self:
+        if self.receipt_id != _run_receipt_id(self.content):
+            raise ValueError("run receipt ID must match its canonical content")
+        if len(serialize_run_receipt(self).encode("utf-8")) > _MAXIMUM_RUN_RECEIPT_BYTES:
             raise ValueError("run receipt exceeds the 1 MB JSON limit")
         return self
 
 
+class FindingEvidencePackage(_StrictModel):
+    schema_version: Literal["1.0.0"] = "1.0.0"
+    disclosure: Literal["private"] = "private"
+    occurrence: FindingOccurrence
+    receipts: tuple[RunReceipt, ...] = Field(min_length=1, max_length=2_000)
+
+    @model_validator(mode="after")
+    def validate_package(self) -> Self:
+        receipt_ids = tuple(receipt.receipt_id for receipt in self.receipts)
+        if receipt_ids != tuple(sorted(set(receipt_ids))):
+            raise ValueError("package receipts must be sorted and unique")
+        referenced_receipt_ids = {
+            receipt_id
+            for repetition in self.occurrence.repetitions
+            for receipt_id in (repetition.source_receipt_id, repetition.probe_receipt_id)
+            if receipt_id is not None
+        }
+        if referenced_receipt_ids != set(receipt_ids):
+            raise ValueError("package receipts must exactly match repetition references")
+        receipts_by_id = {receipt.receipt_id: receipt for receipt in self.receipts}
+        pointers: dict[str, EvidencePointer] = {}
+        pointers_by_receipt: dict[str, set[str]] = {}
+        for receipt in self.receipts:
+            receipt_pointer_ids = {
+                pointer.pointer_id for pointer in receipt.content.evidence_pointers
+            }
+            pointers_by_receipt[receipt.receipt_id] = receipt_pointer_ids
+            for pointer in receipt.content.evidence_pointers:
+                if pointer.pointer_id in pointers:
+                    raise ValueError("evidence pointer IDs must be unique across package receipts")
+                pointers[pointer.pointer_id] = pointer
+        if not set(self.occurrence.evidence_pointer_ids).issubset(pointers):
+            raise ValueError("package does not contain every public evidence reference")
+        for repetition in self.occurrence.repetitions:
+            allowed_pointer_ids: set[str] = set()
+            for expected_arm, receipt_id in (
+                ("source", repetition.source_receipt_id),
+                ("probe", repetition.probe_receipt_id),
+            ):
+                if receipt_id is not None:
+                    receipt_content = receipts_by_id[receipt_id].content
+                    if (
+                        receipt_content.arm != expected_arm
+                        or receipt_content.repetition != repetition.repetition
+                    ):
+                        raise ValueError(
+                            "repetition receipt must match its declared arm and repetition"
+                        )
+                    allowed_pointer_ids.update(pointers_by_receipt[receipt_id])
+            if not set(repetition.evidence_pointer_ids).issubset(allowed_pointer_ids):
+                raise ValueError("repetition evidence must come from its referenced receipts")
+            if repetition.outcome != "inconclusive" and not any(
+                _repetition_supports_category(
+                    self.occurrence,
+                    delta,
+                    repetition,
+                    pointers,
+                )
+                for delta in _category_supporting_deltas(self.occurrence)
+            ):
+                raise ValueError(
+                    "conclusive repetition requires category evidence from that execution"
+                )
+        observed_repetition_pointer_ids = {
+            pointer_id
+            for repetition in self.occurrence.repetitions
+            if repetition.outcome == "finding_observed"
+            for pointer_id in repetition.evidence_pointer_ids
+        }
+        supporting_delta_pointer_ids = {
+            pointer_id
+            for delta in _category_supporting_deltas(self.occurrence)
+            for pointer_id in delta.evidence_pointer_ids
+        }
+        if not supporting_delta_pointer_ids.issubset(observed_repetition_pointer_ids):
+            raise ValueError("aggregate observed deltas must come only from observed repetitions")
+        _validate_occurrence_evidence(self.occurrence, pointers)
+        return self
+
+
+def capture_json(value: JsonValue) -> CapturedJson:
+    canonical_json = _canonical_json(value)
+    return CapturedJson(
+        canonical_json=canonical_json,
+        sha256=hashlib.sha256(canonical_json.encode("utf-8")).hexdigest(),
+    )
+
+
+def build_run_receipt(content: RunReceiptContent) -> RunReceipt:
+    return RunReceipt(receipt_id=_run_receipt_id(content), content=content)
+
+
+def build_finding_occurrence(**values: object) -> FindingOccurrence:
+    values["occurrence_id"] = f"ulf_v1_{'0' * 64}"
+    occurrence = FindingOccurrence.model_validate(
+        values,
+        context={"building_occurrence": True},
+    )
+    values["occurrence_id"] = _finding_occurrence_id(occurrence)
+    return FindingOccurrence.model_validate(values)
+
+
+def parse_run_receipt(serialized: str | bytes) -> RunReceipt:
+    return RunReceipt.model_validate_json(serialized)
+
+
 def serialize_run_receipt(receipt: RunReceipt) -> str:
-    serialized = receipt.model_dump_json()
-    return RunReceipt.model_validate_json(serialized).model_dump_json()
+    return _canonical_json(receipt.model_dump(mode="json"))
+
+
+def _canonical_json(value: object) -> str:
+    return json.dumps(
+        value,
+        ensure_ascii=False,
+        allow_nan=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
+def _reject_json_constant(value: str) -> None:
+    raise ValueError(f"non-standard JSON constant: {value}")
+
+
+def _run_receipt_id(content: RunReceiptContent) -> str:
+    digest = hashlib.sha256(_canonical_json(content.model_dump(mode="json")).encode("utf-8"))
+    return f"ulrr_v1_{digest.hexdigest()}"
+
+
+def _finding_occurrence_id(occurrence: FindingOccurrence) -> str:
+    claims = occurrence.model_dump(
+        mode="json",
+        exclude={"occurrence_id", "review_history_ids"},
+    )
+    digest = hashlib.sha256(_canonical_json(claims).encode("utf-8"))
+    return f"ulf_v1_{digest.hexdigest()}"
+
+
+def _validate_sorted_unique(values: tuple[str, ...], label: str) -> None:
+    if values != tuple(sorted(set(values))):
+        raise ValueError(f"{label} must be sorted and unique")
+
+
+def _validate_receipt_value_pointer(
+    evidence: ReceiptEvidenceValue,
+    pointers: dict[str, EvidencePointer],
+    kind: str,
+    arm: str,
+) -> None:
+    _validate_pointer(pointers, evidence.evidence_pointer_id, kind, arm)
+
+
+def _validate_pointer(
+    pointers: dict[str, EvidencePointer],
+    pointer_id: str,
+    kind: str,
+    arm: str,
+) -> None:
+    pointer = pointers.get(pointer_id)
+    if pointer is None:
+        raise ValueError("receipt references an unknown evidence pointer")
+    if pointer.kind != kind or pointer.arm not in {arm, "shared"}:
+        raise ValueError("receipt value references incompatible evidence")
+
+
+def _validate_pointer_provenance(
+    pointers: tuple[EvidencePointer, ...],
+    provenance: tuple[ProvenanceReceipt, ...],
+) -> None:
+    roles_by_source: dict[str, set[str]] = {}
+    for item in provenance:
+        roles_by_source.setdefault(item.id, set()).add(item.role)
+    authority_roles = {
+        "customer_declared": {"customer"},
+        "deterministic_evaluator": {"evaluator"},
+        "invoker_self_reported": {"invoker"},
+        "source_self_reported": {"target"},
+        "environment_self_reported": {"environment"},
+        "independent_observer": {"observer"},
+    }
+    if any(
+        not (roles_by_source.get(pointer.source_id, set()) & authority_roles[pointer.authority])
+        for pointer in pointers
+    ):
+        raise ValueError("evidence authority requires compatible source provenance")
+
+
+def _validate_category_delta(occurrence: FindingOccurrence) -> None:
+    if not _category_supporting_deltas(occurrence):
+        raise ValueError("finding category must match its observed delta")
+    if (
+        occurrence.category == "unstable_behavior"
+        and occurrence.repetition_summary.stability != "unstable"
+    ):
+        raise ValueError("unstable findings require unstable repetition evidence")
+    rule_deltas = tuple(
+        delta
+        for delta in occurrence.observed_deltas
+        if delta.kind == "rule" and delta.change == "violated"
+    )
+    if occurrence.violated_rule is None and rule_deltas:
+        raise ValueError("behavior findings cannot contain rule-violation deltas")
+    if occurrence.violated_rule is not None and (
+        len(rule_deltas) != 1 or rule_deltas[0].rule != occurrence.violated_rule
+    ):
+        raise ValueError("violated rule identity must match one exact rule delta")
+
+
+def _category_supporting_deltas(
+    occurrence: FindingOccurrence,
+) -> tuple[ObservedDelta, ...]:
+    required_category_delta = {
+        "duplicate_effect": ("action", "added"),
+        "unexpected_effect": ("action", "added"),
+        "missing_effect": ("action", "removed"),
+        "changed_grounded_effect_argument": ("action", "changed"),
+        "unstable_behavior": (None, "unstable"),
+        "customer_invariant_violation": ("rule", "violated"),
+    }[occurrence.category]
+    return tuple(
+        delta
+        for delta in occurrence.observed_deltas
+        if (
+            (required_category_delta[0] is None or delta.kind == required_category_delta[0])
+            and delta.change == required_category_delta[1]
+        )
+    )
+
+
+def _repetition_supports_category(
+    occurrence: FindingOccurrence,
+    delta: ObservedDelta,
+    repetition: FindingRepetition,
+    pointers: dict[str, EvidencePointer],
+) -> bool:
+    repetition_pointer_ids = set(repetition.evidence_pointer_ids)
+    if repetition.outcome == "finding_observed":
+        supporting_pointer_ids = set(delta.evidence_pointer_ids) & repetition_pointer_ids
+    else:
+        all_observed_pointer_ids = {
+            pointer_id
+            for supporting_delta in _category_supporting_deltas(occurrence)
+            for pointer_id in supporting_delta.evidence_pointer_ids
+        }
+        expected_kinds = {
+            "response": {"response"},
+            "action": {"action", "tool_call", "tool_result"},
+            "rule": {"rule"},
+            "state": {"state"},
+        }[delta.kind]
+        supporting_pointer_ids = {
+            pointer_id
+            for pointer_id in repetition_pointer_ids - all_observed_pointer_ids
+            if pointers[pointer_id].kind in expected_kinds
+            and pointers[pointer_id].authority
+            in {"deterministic_evaluator", "independent_observer"}
+        }
+    arms = {pointers[pointer_id].arm for pointer_id in supporting_pointer_ids}
+    if occurrence.category == "duplicate_effect":
+        return {"source", "probe"}.issubset(arms)
+    if delta.change == "changed":
+        return {"source", "probe"}.issubset(arms)
+    if delta.change in {"added", "violated", "unstable"}:
+        return "probe" in arms
+    if delta.change == "removed":
+        return "source" in arms
+    return False
+
+
+def _validate_occurrence_evidence(
+    occurrence: FindingOccurrence,
+    pointers: dict[str, EvidencePointer],
+) -> None:
+    change_kinds = {
+        "input": {"input"},
+        "context": {"input"},
+        "turn_sequence": {"input"},
+        "state_setup": {"state"},
+        "event_behavior": {"action", "tool_call", "tool_result", "lifecycle"},
+    }[occurrence.probe_change.kind]
+    for pointer_id in occurrence.probe_change.source_evidence_pointer_ids:
+        pointer = pointers[pointer_id]
+        if pointer.arm != "source" or pointer.kind not in change_kinds:
+            raise ValueError("source change evidence is incompatible")
+    for pointer_id in occurrence.probe_change.probe_evidence_pointer_ids:
+        pointer = pointers[pointer_id]
+        if pointer.arm != "probe" or pointer.kind not in change_kinds:
+            raise ValueError("probe change evidence is incompatible")
+    delta_kinds = {
+        "response": {"response"},
+        "action": {"action", "tool_call", "tool_result"},
+        "rule": {"rule"},
+        "state": {"state"},
+    }
+    for delta in occurrence.observed_deltas:
+        delta_pointers = tuple(pointers[pointer_id] for pointer_id in delta.evidence_pointer_ids)
+        if any(pointer.kind not in delta_kinds[delta.kind] for pointer in delta_pointers):
+            raise ValueError("observed delta references incompatible evidence")
+        arms = {pointer.arm for pointer in delta_pointers}
+        if delta.change == "changed" and not {"source", "probe"}.issubset(arms):
+            raise ValueError("changed deltas require source and probe evidence")
+        if delta.change in {"added", "violated", "unstable"} and "probe" not in arms:
+            raise ValueError(f"{delta.change} deltas require probe evidence")
+        if delta.change == "removed" and "source" not in arms:
+            raise ValueError("removed deltas require source evidence")
+    if occurrence.category == "duplicate_effect":
+        duplicate_delta = next(
+            delta
+            for delta in occurrence.observed_deltas
+            if delta.kind == "action" and delta.change == "added"
+        )
+        if {pointers[pointer_id].arm for pointer_id in duplicate_delta.evidence_pointer_ids} != {
+            "source",
+            "probe",
+        }:
+            raise ValueError("duplicate effects require matching source and probe action evidence")
+    if occurrence.violated_rule is not None:
+        if any(
+            pointers[pointer_id].authority != "customer_declared"
+            for pointer_id in occurrence.rule_definition_evidence_pointer_ids
+        ):
+            raise ValueError("customer rule definitions require customer-declared evidence")
+        violation_delta = next(
+            delta
+            for delta in occurrence.observed_deltas
+            if delta.kind == "rule" and delta.change == "violated"
+        )
+        if any(
+            pointers[pointer_id].authority
+            not in {"deterministic_evaluator", "independent_observer"}
+            for pointer_id in violation_delta.evidence_pointer_ids
+        ):
+            raise ValueError("rule violations require evaluator or independent evidence")
 
 
 class FindingSummary(_StrictModel):

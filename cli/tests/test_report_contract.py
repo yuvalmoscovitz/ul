@@ -1,505 +1,663 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from datetime import UTC, datetime
+from typing import Literal
 
 import pytest
-from pydantic import ValidationError
+from pydantic import JsonValue, ValidationError
 from ul_cli.report_contract import (
+    CapturedJson,
     EvidencePointer,
+    FindingEvidencePackage,
     FindingOccurrence,
+    FindingRepetition,
     LifecycleReceipt,
     ObservedDelta,
     ProbeChange,
     ProvenanceReceipt,
+    ReceiptEvidenceValue,
     RedactionReceipt,
-    RepetitionEvidence,
+    RepetitionSummary,
     RunReceipt,
+    RunReceiptContent,
     StateReceipt,
-    ToolExchangeReceipt,
     UsageReceipt,
     VersionedReference,
+    build_finding_occurrence,
+    build_run_receipt,
+    capture_json,
+    parse_run_receipt,
     serialize_run_receipt,
 )
 
-_ARTIFACT_SHA256 = "a" * 64
-_OCCURRENCE_ID = f"ulf_v1_{'b' * 64}"
-_RECEIPT_ID = f"ulrr_v1_{'c' * 64}"
-_POLICY_SHA256 = "d" * 64
-_PRIVATE_CANARY = "account-secret-canary"
+_PRIVATE_CANARY = "customer@example.com:account-secret-canary"
+
+
+def _sha(value: str) -> str:
+    return hashlib.sha256(value.encode()).hexdigest()
+
+
+def _public_ref(value: str) -> str:
+    return f"ulref_v1_{_sha(value)}"
+
+
+def _versioned_ref(identifier: str, version: str) -> VersionedReference:
+    return VersionedReference(
+        id=_public_ref(f"id:{identifier}"),
+        version=_public_ref(f"version:{version}"),
+    )
+
+
+_RULE = _versioned_ref("final-amount-matches-corrected", "1.0.0")
+
+
+def _rebind_occurrence(payload: dict[str, object]) -> None:
+    occurrence = FindingOccurrence.model_validate_json(
+        json.dumps(payload["occurrence"]),
+        context={"building_occurrence": True},
+    )
+    values = occurrence.model_dump()
+    values.pop("occurrence_id")
+    payload["occurrence"] = build_finding_occurrence(**values).model_dump(mode="json")
+
+
+def _pointer_id(value: str) -> str:
+    return f"ulep_v1_{_sha(value)}"
 
 
 def _pointer(
-    pointer_id: str,
+    label: str,
     kind: str,
-    json_pointer: str,
+    arm: Literal["source", "probe", "shared"],
     *,
     authority: str = "independent_observer",
+    source_id: str = "observer",
 ) -> EvidencePointer:
     return EvidencePointer.model_validate(
         {
-            "pointer_id": pointer_id,
+            "pointer_id": _pointer_id(label),
             "kind": kind,
-            "artifact_sha256": _ARTIFACT_SHA256,
-            "record_id": "case-record",
-            "json_pointer": json_pointer,
-            "arm": (
-                "source"
-                if pointer_id.endswith(".source")
-                else "probe"
-                if pointer_id.endswith(".probe")
-                else "shared"
-            ),
+            "artifact_sha256": _sha(f"artifact:{label}"),
+            "record_id": f"private-record:{label}",
+            "json_pointer": f"/private/{label}",
+            "arm": arm,
             "authority": authority,
-            "source_id": "test-observer",
+            "source_id": source_id,
         }
     )
 
 
-def _dataset_occurrence() -> FindingOccurrence:
-    pointers = (
-        _pointer("action.probe", "action", "/cases/0/findings/0/observed_effects"),
-        _pointer("action.source", "action", "/cases/0/findings/0/expected_effects"),
-        _pointer("input.probe", "input", "/cases/0/augmented_input"),
-        _pointer("input.source", "input", "/original_input"),
-        _pointer("response.probe", "response", "/technical_details/cases/0/trials/0"),
-        _pointer("response.source", "response", "/technical_details/baseline/trials/0"),
+def _evidence(pointer: EvidencePointer, value: JsonValue) -> ReceiptEvidenceValue:
+    return ReceiptEvidenceValue(
+        evidence_pointer_id=pointer.pointer_id,
+        value=capture_json(value),
     )
-    return FindingOccurrence(
-        occurrence_id=_OCCURRENCE_ID,
+
+
+def _receipt(
+    repetition: int,
+    arm: Literal["source", "probe"],
+    *,
+    stateful: bool = False,
+    rule_definition: bool = False,
+    rule_violation: bool = False,
+) -> RunReceipt:
+    prefix = f"r{repetition}.{arm}"
+    input_pointer = _pointer(f"{prefix}.input", "input", arm)
+    response_pointer = _pointer(f"{prefix}.response", "response", arm)
+    action_pointer = _pointer(f"{prefix}.action", "action", arm)
+    lifecycle_pointer = _pointer(f"{prefix}.lifecycle", "lifecycle", arm)
+    pointers = [input_pointer, response_pointer, action_pointer, lifecycle_pointer]
+    state_before = None
+    state_after = None
+    if stateful:
+        state_before_pointer = _pointer(
+            f"{prefix}.state.before",
+            "state",
+            arm,
+            authority="environment_self_reported",
+            source_id="environment",
+        )
+        state_after_pointer = _pointer(
+            f"{prefix}.state.after",
+            "state",
+            arm,
+            authority="environment_self_reported",
+            source_id="environment",
+        )
+        pointers.extend((state_before_pointer, state_after_pointer))
+        state_before = StateReceipt(evidence=_evidence(state_before_pointer, {"balance": 100}))
+        state_after = StateReceipt(
+            evidence=_evidence(
+                state_after_pointer,
+                {"balance": 200 if arm == "probe" else 100},
+            )
+        )
+    if rule_definition:
+        pointers.append(
+            _pointer(
+                f"{prefix}.rule.definition",
+                "rule",
+                "shared",
+                authority="customer_declared",
+                source_id="customer",
+            )
+        )
+    if rule_violation:
+        pointers.append(
+            _pointer(
+                f"{prefix}.rule.violation",
+                "rule",
+                "probe",
+                authority="deterministic_evaluator",
+                source_id="evaluator",
+            )
+        )
+    provenance = [
+        ProvenanceReceipt(role="model", id="agent-model", version="1.0.0"),
+        ProvenanceReceipt(role="observer", id="observer", version="1.0.0"),
+    ]
+    if stateful:
+        provenance.append(ProvenanceReceipt(role="environment", id="environment", version="1.0.0"))
+    if rule_definition:
+        provenance.append(ProvenanceReceipt(role="customer", id="customer"))
+    if rule_violation:
+        provenance.append(ProvenanceReceipt(role="evaluator", id="evaluator", version="1.0.0"))
+    limitations = () if rule_violation else ("evaluator_provenance_unavailable",)
+    content = RunReceiptContent(
+        repetition=repetition,
+        arm=arm,
+        evidence_scope="response_and_state" if stateful else "response_only",
+        input=_evidence(
+            input_pointer,
+            {"account": _PRIVATE_CANARY, "arm": arm, "repetition": repetition},
+        ),
+        response=_evidence(response_pointer, {"status": "observed", "arm": arm}),
+        state_before=state_before,
+        state_after=state_after,
+        lifecycle=(
+            LifecycleReceipt(
+                phase="execution",
+                status="succeeded",
+                evidence_pointer_ids=(lifecycle_pointer.pointer_id,),
+            ),
+        ),
+        provenance=tuple(
+            sorted(provenance, key=lambda item: (item.role, item.id, item.version or ""))
+        ),
+        usage=UsageReceipt(
+            input_tokens=10,
+            output_tokens=5,
+            total_tokens=15,
+            cost=0.01,
+            duration_ms=250.0,
+        ),
+        redaction=RedactionReceipt(
+            policy_sha256=_sha("redaction-policy"),
+            matched_value_count=1,
+            redacted_value_count=0,
+            retained_private_value_count=1,
+        ),
+        evidence_pointers=tuple(sorted(pointers, key=lambda pointer: pointer.pointer_id)),
+        limitations=limitations,
+        recorded_at=datetime(2026, 8, 23, repetition, tzinfo=UTC),
+    )
+    return build_run_receipt(content)
+
+
+def _dataset_package() -> FindingEvidencePackage:
+    receipts = tuple(
+        sorted(
+            (
+                _receipt(1, "source"),
+                _receipt(1, "probe"),
+                _receipt(2, "source"),
+                _receipt(2, "probe"),
+            ),
+            key=lambda receipt: receipt.receipt_id,
+        )
+    )
+    pointers = {
+        pointer.pointer_id: pointer
+        for receipt in receipts
+        for pointer in receipt.content.evidence_pointers
+    }
+
+    def ids(kind: str, arm: str) -> tuple[str, ...]:
+        return tuple(
+            sorted(
+                pointer_id
+                for pointer_id, pointer in pointers.items()
+                if pointer.kind == kind and pointer.arm == arm
+            )
+        )
+
+    source_inputs = ids("input", "source")
+    probe_inputs = ids("input", "probe")
+    action_ids = tuple(sorted((*ids("action", "source"), *ids("action", "probe"))))
+    response_ids = tuple(sorted((*ids("response", "source"), *ids("response", "probe"))))
+    receipt_by_execution = {
+        (receipt.content.repetition, receipt.content.arm): receipt for receipt in receipts
+    }
+    repetitions = tuple(
+        FindingRepetition(
+            repetition=repetition,
+            outcome="finding_observed",
+            source_receipt_id=receipt_by_execution[(repetition, "source")].receipt_id,
+            probe_receipt_id=receipt_by_execution[(repetition, "probe")].receipt_id,
+            evidence_pointer_ids=tuple(
+                sorted(
+                    pointer_id
+                    for pointer_id, pointer in pointers.items()
+                    if pointer.kind in {"action", "response"}
+                    and pointer.record_id is not None
+                    and f"r{repetition}." in pointer.record_id
+                )
+            ),
+        )
+        for repetition in (1, 2)
+    )
+    occurrence = build_finding_occurrence(
         kind="behavior_difference",
         category="changed_grounded_effect_argument",
-        campaign_id="campaign-2026-08-23",
-        source_interaction_id="invoice-payment",
-        fixture=VersionedReference(id="accounts-payable", version="1.0.0"),
-        case_id="invoice-payment:disfluency",
-        operator=VersionedReference(id="input.surface.disfluency_repeat", version="1.0.0"),
-        bundle=VersionedReference(id="surface-noise", version="1.0.0"),
+        campaign_ref=_public_ref("campaign"),
+        source_interaction_ref=_public_ref("source-interaction"),
+        fixture=_versioned_ref("accounts-payable", "1.0.0"),
+        case_ref=_public_ref("dataset-case"),
+        operator=_versioned_ref("input.surface.disfluency_repeat", "1.0.0"),
+        bundle=_versioned_ref("surface-noise", "1.0.0"),
         probe_change=ProbeChange(
             kind="input",
-            source_evidence_pointer_ids=("input.source",),
-            probe_evidence_pointer_ids=("input.probe",),
+            source_descriptor="recorded_input",
+            probe_descriptor="augmented_input",
+            source_evidence_pointer_ids=source_inputs,
+            probe_evidence_pointer_ids=probe_inputs,
         ),
         observed_deltas=(
             ObservedDelta(
                 kind="action",
                 change="changed",
-                subject="payment.invoice_reference",
-                evidence_pointer_ids=("action.probe", "action.source"),
+                subject_ref=_public_ref("payment.invoice_reference"),
+                source_state="observed",
+                probe_state="observed",
+                evidence_pointer_ids=action_ids,
             ),
             ObservedDelta(
                 kind="response",
                 change="changed",
-                subject="agent_response",
-                evidence_pointer_ids=("response.probe", "response.source"),
+                subject_ref=_public_ref("agent-response"),
+                source_state="observed",
+                probe_state="observed",
+                evidence_pointer_ids=response_ids,
             ),
         ),
-        evidence_pointers=pointers,
-        repetitions=RepetitionEvidence(
-            requested=3,
-            conclusive=3,
-            violated=3,
+        evidence_pointer_ids=tuple(
+            sorted({*source_inputs, *probe_inputs, *action_ids, *response_ids})
+        ),
+        repetitions=repetitions,
+        repetition_summary=RepetitionSummary(
+            requested=2,
+            conclusive=2,
+            observed=2,
             inconclusive=0,
             stability="stable",
             reproducibility="reproduced",
         ),
         required_capabilities=("response_observation",),
         limitations=("correctness_not_verified", "production_prevalence_not_measured"),
-        run_receipt_id=_RECEIPT_ID,
         next_action="review_dataset_finding",
     )
+    return FindingEvidencePackage(occurrence=occurrence, receipts=receipts)
 
 
-def _stateful_occurrence() -> FindingOccurrence:
-    pointers = (
-        _pointer("input.probe", "input", "/case/conversation/1"),
-        _pointer("input.source", "input", "/case/conversation/0"),
-        _pointer("rule.probe", "rule", "/corrected_invariant_rules/0/trials/0"),
-        _pointer("state.probe", "state", "/trials/0/variation/1/committed_state_snapshot"),
-        _pointer("state.source", "state", "/trials/0/baseline/0/committed_state_snapshot"),
+def _stateful_package() -> FindingEvidencePackage:
+    receipts = tuple(
+        sorted(
+            (
+                _receipt(1, "source", stateful=True, rule_definition=True),
+                _receipt(1, "probe", stateful=True, rule_violation=True),
+                _receipt(2, "source", stateful=True),
+                _receipt(2, "probe", stateful=True, rule_violation=True),
+            ),
+            key=lambda receipt: receipt.receipt_id,
+        )
     )
-    return FindingOccurrence(
-        occurrence_id=_OCCURRENCE_ID,
+    pointers = {
+        pointer.pointer_id: pointer
+        for receipt in receipts
+        for pointer in receipt.content.evidence_pointers
+    }
+
+    def ids(kind: str, arm: str | None = None) -> tuple[str, ...]:
+        return tuple(
+            sorted(
+                pointer_id
+                for pointer_id, pointer in pointers.items()
+                if pointer.kind == kind and (arm is None or pointer.arm == arm)
+            )
+        )
+
+    source_inputs = ids("input", "source")
+    probe_inputs = ids("input", "probe")
+    state_ids = ids("state")
+    rule_definition_ids = tuple(
+        sorted(
+            pointer_id
+            for pointer_id, pointer in pointers.items()
+            if pointer.kind == "rule" and pointer.authority == "customer_declared"
+        )
+    )
+    rule_violation_ids = tuple(
+        sorted(
+            pointer_id
+            for pointer_id, pointer in pointers.items()
+            if pointer.kind == "rule" and pointer.authority == "deterministic_evaluator"
+        )
+    )
+    receipt_by_execution = {
+        (receipt.content.repetition, receipt.content.arm): receipt for receipt in receipts
+    }
+    repetitions = tuple(
+        FindingRepetition(
+            repetition=repetition,
+            outcome="finding_observed",
+            source_receipt_id=receipt_by_execution[(repetition, "source")].receipt_id,
+            probe_receipt_id=receipt_by_execution[(repetition, "probe")].receipt_id,
+            evidence_pointer_ids=tuple(
+                sorted(
+                    pointer_id
+                    for pointer_id, pointer in pointers.items()
+                    if pointer.kind in {"rule", "state"}
+                    and pointer.record_id is not None
+                    and f"r{repetition}." in pointer.record_id
+                )
+            ),
+        )
+        for repetition in (1, 2)
+    )
+    occurrence = build_finding_occurrence(
         kind="customer_invariant_violation",
         category="customer_invariant_violation",
-        campaign_id="campaign-2026-08-23",
-        fixture=VersionedReference(id="accounts-payable", version="1.0.0"),
-        case_id="correction-after-first-response",
-        operator=VersionedReference(
-            id="conversation.correction_after_first_response",
-            version="1.0.0",
+        campaign_ref=_public_ref("campaign"),
+        fixture=_versioned_ref("accounts-payable", "1.0.0"),
+        case_ref=_public_ref("stateful-case"),
+        operator=_versioned_ref(
+            "conversation.correction_after_first_response",
+            "1.0.0",
         ),
         probe_change=ProbeChange(
             kind="turn_sequence",
-            source_evidence_pointer_ids=("input.source",),
-            probe_evidence_pointer_ids=("input.probe",),
+            source_descriptor="baseline_turn_sequence",
+            probe_descriptor="augmented_turn_sequence",
+            source_evidence_pointer_ids=source_inputs,
+            probe_evidence_pointer_ids=probe_inputs,
         ),
         observed_deltas=(
             ObservedDelta(
                 kind="rule",
                 change="violated",
-                subject="final-amount-matches-corrected",
-                evidence_pointer_ids=("rule.probe",),
+                subject_ref=_public_ref("customer-rule"),
+                rule=_RULE,
+                source_state="satisfied",
+                probe_state="violated",
+                evidence_pointer_ids=rule_violation_ids,
             ),
             ObservedDelta(
                 kind="state",
                 change="changed",
-                subject="final_amount",
-                evidence_pointer_ids=("state.probe", "state.source"),
+                subject_ref=_public_ref("final-amount"),
+                source_state="observed",
+                probe_state="observed",
+                evidence_pointer_ids=state_ids,
             ),
         ),
-        violated_rule=VersionedReference(
-            id="final-amount-matches-corrected",
-            version="1.0.0",
+        violated_rule=_RULE,
+        rule_definition_evidence_pointer_ids=rule_definition_ids,
+        evidence_pointer_ids=tuple(
+            sorted(
+                {
+                    *source_inputs,
+                    *probe_inputs,
+                    *state_ids,
+                    *rule_definition_ids,
+                    *rule_violation_ids,
+                }
+            )
         ),
-        evidence_pointers=pointers,
-        repetitions=RepetitionEvidence(
-            requested=3,
+        repetitions=repetitions,
+        repetition_summary=RepetitionSummary(
+            requested=2,
             conclusive=2,
+            observed=2,
             violated=2,
-            inconclusive=1,
+            inconclusive=0,
             stability="stable",
             reproducibility="reproduced",
         ),
         required_capabilities=("conversation_replay", "state_observation"),
-        limitations=("one_repetition_inconclusive",),
-        inconclusive_reasons=("cleanup_reset_failed",),
-        run_receipt_id=_RECEIPT_ID,
+        limitations=("production_prevalence_not_measured",),
         next_action="inspect_stateful_evidence",
     )
+    return FindingEvidencePackage(occurrence=occurrence, receipts=receipts)
 
 
-def _private_receipt(*, evidence_scope: str = "response_and_state") -> RunReceipt:
-    pointers = (
-        _pointer("input.probe", "input", "/probe_input"),
-        _pointer("input.source", "input", "/source_input"),
-        _pointer("lifecycle.cleanup", "lifecycle", "/lifecycle/1"),
-        _pointer("lifecycle.reset", "lifecycle", "/lifecycle/0"),
-        _pointer("response.probe", "response", "/probe_response"),
-        _pointer("response.source", "response", "/source_response"),
-    )
-    state = (
-        StateReceipt(value={"balance": 100}, authority="environment_self_reported")
-        if evidence_scope == "response_and_state"
-        else None
-    )
-    return RunReceipt.model_validate(
-        {
-            "receipt_id": _RECEIPT_ID,
-            "evidence_scope": evidence_scope,
-            "source_input": {"account": _PRIVATE_CANARY, "amount": 100},
-            "probe_input": {"account": _PRIVATE_CANARY, "amount": 200},
-            "source_response": {"status": "paid"},
-            "probe_response": {"status": "paid_twice"},
-            "tool_exchanges": (
-                ToolExchangeReceipt(
-                    sequence=1,
-                    call={"name": "pay_invoice", "arguments": {"amount": 200}},
-                    result={"status": "completed"},
-                    authority="source_self_reported",
-                    source_id="target-adapter",
-                ),
-            ),
-            "state_before": state,
-            "state_after": state,
-            "lifecycle": (
-                LifecycleReceipt(
-                    phase="initial_reset",
-                    status="succeeded",
-                    evidence_pointer_ids=("lifecycle.reset",),
-                ),
-                LifecycleReceipt(
-                    phase="cleanup_reset",
-                    status="succeeded",
-                    evidence_pointer_ids=("lifecycle.cleanup",),
-                ),
-            ),
-            "provenance": (
-                ProvenanceReceipt(
-                    role="environment",
-                    id="accounts-payable",
-                    version="1.0.0",
-                    config_sha256="e" * 64,
-                ),
-                ProvenanceReceipt(role="evaluator", id="json-values-equal", version="1.0.0"),
-                ProvenanceReceipt(role="observer", id="test-observer", version="1.0.0"),
-            ),
-            "trace_references": ("trace-01",),
-            "usage": UsageReceipt(
-                input_tokens=10,
-                output_tokens=5,
-                total_tokens=15,
-                cost=0.01,
-                duration_ms=250.0,
-            ),
-            "redaction": RedactionReceipt(
-                policy_sha256=_POLICY_SHA256,
-                matched_value_count=2,
-                redacted_value_count=0,
-                retained_private_value_count=2,
-            ),
-            "evidence_pointers": pointers,
-            "recorded_at": datetime(2026, 8, 23, tzinfo=UTC),
-        }
-    )
+def test_dataset_and_stateful_workflows_share_an_auditable_package_contract() -> None:
+    for package in (_dataset_package(), _stateful_package()):
+        round_trip = FindingEvidencePackage.model_validate_json(package.model_dump_json())
+        assert round_trip == package
+        assert len(package.occurrence.repetitions) == 2
+        assert all(item.evidence_pointer_ids for item in package.occurrence.repetitions)
 
 
-def test_dataset_and_stateful_evidence_share_one_occurrence_contract() -> None:
-    dataset_occurrence = _dataset_occurrence()
-    stateful_occurrence = _stateful_occurrence()
+def test_public_occurrence_contains_only_privacy_safe_references() -> None:
+    package = _dataset_package()
+    public_json = package.occurrence.model_dump_json()
 
-    assert type(dataset_occurrence) is FindingOccurrence
-    assert type(stateful_occurrence) is FindingOccurrence
-    assert FindingOccurrence.model_validate_json(dataset_occurrence.model_dump_json()) == (
-        dataset_occurrence
-    )
-    assert FindingOccurrence.model_validate_json(stateful_occurrence.model_dump_json()) == (
-        stateful_occurrence
-    )
+    assert _PRIVATE_CANARY in serialize_run_receipt(package.receipts[0])
+    assert _PRIVATE_CANARY not in public_json
+    assert "private-record" not in public_json
+    assert "json_pointer" not in public_json
+    assert "source_id" not in public_json
 
-
-def test_public_occurrence_references_private_receipt_without_copying_values() -> None:
-    occurrence = _dataset_occurrence()
-    receipt = _private_receipt()
-
-    assert occurrence.run_receipt_id == receipt.receipt_id
-    assert _PRIVATE_CANARY in receipt.model_dump_json()
-    assert _PRIVATE_CANARY not in occurrence.model_dump_json()
-    assert "source_input" not in occurrence.model_dump()
-    assert "probe_response" not in occurrence.model_dump()
-
-
-def test_occurrence_rejects_dangling_or_invalid_evidence_pointers() -> None:
-    payload = _dataset_occurrence().model_dump(mode="json")
-    payload["observed_deltas"][0]["evidence_pointer_ids"] = ["missing.pointer"]
-    with pytest.raises(ValidationError, match="unknown evidence pointer"):
-        FindingOccurrence.model_validate_json(json.dumps(payload))
-
-    pointer_payload = _pointer("input.source", "input", "/source").model_dump(mode="json")
-    pointer_payload["json_pointer"] = "/invalid~2escape"
-    with pytest.raises(ValidationError, match="RFC 6901"):
-        EvidencePointer.model_validate(pointer_payload)
-
-
-@pytest.mark.parametrize(
-    ("update", "message"),
-    [
-        ({"conclusive": 2}, "match requested repetitions"),
-        ({"violated": 4}, "cannot exceed conclusive"),
-        ({"violated": 1, "reproducibility": "reproduced"}, "match observed repetition counts"),
-        (
-            {"violated": 1, "reproducibility": "intermittent"},
-            "intermittent reproduction is unstable",
-        ),
-        (
-            {
-                "conclusive": 0,
-                "violated": 0,
-                "inconclusive": 3,
-                "stability": "stable",
-                "reproducibility": "not_established",
-            },
-            "is inconclusive",
-        ),
-    ],
-)
-def test_repetition_evidence_rejects_contradictory_claims(
-    update: dict[str, object],
-    message: str,
-) -> None:
-    payload = RepetitionEvidence(
-        requested=3,
-        conclusive=3,
-        violated=3,
-        inconclusive=0,
-        stability="stable",
-        reproducibility="reproduced",
-    ).model_dump(mode="json")
-    payload.update(update)
-
-    with pytest.raises(ValidationError, match=message):
-        RepetitionEvidence.model_validate(payload)
-
-
-def test_occurrence_requires_explicit_reasons_for_inconclusive_repetitions() -> None:
-    payload = _stateful_occurrence().model_dump(mode="json")
-    payload["inconclusive_reasons"] = []
-
-    with pytest.raises(ValidationError, match="require at least one reason"):
-        FindingOccurrence.model_validate_json(json.dumps(payload))
-
-
-def test_occurrence_keeps_behavior_and_customer_rule_claims_distinct() -> None:
-    behavior_payload = _dataset_occurrence().model_dump(mode="json")
-    behavior_payload["violated_rule"] = {
-        "id": "final-amount-matches-corrected",
-        "version": "1.0.0",
-    }
-    with pytest.raises(ValidationError, match="cannot claim a customer rule violation"):
-        FindingOccurrence.model_validate_json(json.dumps(behavior_payload))
-
-    invariant_payload = _stateful_occurrence().model_dump(mode="json")
-    invariant_payload["violated_rule"] = None
-    with pytest.raises(ValidationError, match="require a violated customer rule"):
-        FindingOccurrence.model_validate_json(json.dumps(invariant_payload))
-
-    invariant_payload = _stateful_occurrence().model_dump(mode="json")
-    invariant_payload["observed_deltas"][0]["subject"] = "different-customer-rule"
-    with pytest.raises(ValidationError, match="rule identity must match"):
-        FindingOccurrence.model_validate_json(json.dumps(invariant_payload))
-
-
-def test_occurrence_binds_claims_to_compatible_source_and_probe_evidence() -> None:
-    payload = _dataset_occurrence().model_dump(mode="json")
-    for pointer in payload["evidence_pointers"]:
-        if pointer["pointer_id"].startswith("action."):
-            pointer["kind"] = "response"
-    with pytest.raises(ValidationError, match="delta references incompatible evidence"):
-        FindingOccurrence.model_validate_json(json.dumps(payload))
-
-    payload = _dataset_occurrence().model_dump(mode="json")
-    source_pointer = next(
-        pointer
-        for pointer in payload["evidence_pointers"]
-        if pointer["pointer_id"] == "input.source"
-    )
-    source_pointer["arm"] = "probe"
-    with pytest.raises(ValidationError, match="must reference the source arm"):
-        FindingOccurrence.model_validate_json(json.dumps(payload))
-
-    payload = _dataset_occurrence().model_dump(mode="json")
-    action_source_pointer = next(
-        pointer
-        for pointer in payload["evidence_pointers"]
-        if pointer["pointer_id"] == "action.source"
-    )
-    action_source_pointer["arm"] = "shared"
-    with pytest.raises(ValidationError, match="require source and probe evidence"):
-        FindingOccurrence.model_validate_json(json.dumps(payload))
-
-    payload = _dataset_occurrence().model_dump(mode="json")
-    payload["category"] = "missing_effect"
-    with pytest.raises(ValidationError, match="category must match"):
-        FindingOccurrence.model_validate_json(json.dumps(payload))
-
-
-def test_response_only_receipt_rejects_state_evidence() -> None:
-    payload = _private_receipt().model_dump(mode="json")
-    payload["evidence_scope"] = "response_only"
-
-    with pytest.raises(ValidationError, match="cannot contain state evidence"):
-        RunReceipt.model_validate_json(json.dumps(payload))
-
-
-def test_response_and_state_receipt_requires_both_snapshots() -> None:
-    payload = _private_receipt().model_dump(mode="json")
-    payload["state_before"] = None
-    payload["state_after"] = None
-
-    with pytest.raises(ValidationError, match="require before and after state"):
-        RunReceipt.model_validate_json(json.dumps(payload))
-
-
-def test_state_receipt_requires_independent_observer_identity() -> None:
-    with pytest.raises(ValidationError, match="names an observer"):
-        StateReceipt(value={}, authority="independent_observer")
-
-    with pytest.raises(ValidationError, match="names an observer"):
-        StateReceipt(
-            value={},
-            authority="environment_self_reported",
-            observer_id="external-auditor",
-        )
-
-
-def test_independent_evidence_requires_matching_observer_provenance() -> None:
-    payload = _private_receipt().model_dump(mode="json")
-    payload["provenance"] = [item for item in payload["provenance"] if item["role"] != "observer"]
-
-    with pytest.raises(ValidationError, match="matching observer provenance"):
-        RunReceipt.model_validate_json(json.dumps(payload))
-
-
-def test_receipt_rejects_noncontiguous_tool_order_and_unknown_lifecycle_pointer() -> None:
-    payload = _private_receipt().model_dump(mode="json")
-    payload["tool_exchanges"][0]["sequence"] = 2
-    with pytest.raises(ValidationError, match="contiguous and ordered"):
-        RunReceipt.model_validate_json(json.dumps(payload))
-
-    payload = _private_receipt().model_dump(mode="json")
-    payload["lifecycle"][0]["evidence_pointer_ids"] = ["missing.pointer"]
-    with pytest.raises(ValidationError, match="unknown evidence pointer"):
-        RunReceipt.model_validate_json(json.dumps(payload))
-
-    payload = _private_receipt().model_dump(mode="json")
-    payload["lifecycle"].reverse()
-    with pytest.raises(ValidationError, match="preserve execution order"):
-        RunReceipt.model_validate_json(json.dumps(payload))
-
-    payload = _private_receipt().model_dump(mode="json")
-    payload["lifecycle"][0]["evidence_pointer_ids"] = ["input.source"]
-    with pytest.raises(ValidationError, match="require lifecycle evidence pointers"):
-        RunReceipt.model_validate_json(json.dumps(payload))
-
-    payload = _private_receipt().model_dump(mode="json")
-    payload["evidence_pointers"] = [
-        pointer
-        for pointer in payload["evidence_pointers"]
-        if pointer["pointer_id"] != "response.probe"
-    ]
-    with pytest.raises(ValidationError, match="source and probe input and response evidence"):
-        RunReceipt.model_validate_json(json.dumps(payload))
-
-
-def test_usage_and_redaction_accounting_reject_inconsistent_totals() -> None:
-    with pytest.raises(ValidationError, match="total tokens"):
-        UsageReceipt(input_tokens=10, output_tokens=5, total_tokens=14)
-
-    with pytest.raises(ValidationError, match="cover every matched value"):
-        RedactionReceipt(
-            policy_sha256=_POLICY_SHA256,
-            matched_value_count=3,
-            redacted_value_count=1,
-            retained_private_value_count=1,
-        )
-
-
-def test_receipt_requires_auditable_timestamp_and_bounded_private_values() -> None:
-    payload = _private_receipt().model_dump(mode="json")
-    payload["recorded_at"] = "2026-08-23T00:00:00"
-    with pytest.raises(ValidationError, match="must include a UTC offset"):
-        RunReceipt.model_validate_json(json.dumps(payload))
-
-
-def test_receipt_serialization_revalidates_mutable_private_values() -> None:
-    receipt = _private_receipt()
-    assert isinstance(receipt.source_input, dict)
-    receipt.source_input["oversized"] = "x" * 1_000_000
-
-    with pytest.raises(ValidationError, match="exceeds the 1 MB JSON limit"):
-        serialize_run_receipt(receipt)
-
-    payload = _private_receipt().model_dump(mode="json")
-    payload["source_input"] = {"oversized": "x" * 1_000_000}
-    with pytest.raises(ValidationError, match="exceeds the 1 MB JSON limit"):
-        RunReceipt.model_validate_json(json.dumps(payload))
-
-
-def test_contracts_are_strict_and_reject_unknown_fields() -> None:
-    payload = json.loads(_dataset_occurrence().model_dump_json())
-    payload["headline"] = "This prose belongs in a later presentation contract."
-
-    with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
-        FindingOccurrence.model_validate_json(json.dumps(payload))
-
+    payload = package.occurrence.model_dump(mode="json")
+    payload["case_ref"] = "acct-secret-canary"
     with pytest.raises(ValidationError):
-        RepetitionEvidence.model_validate(
+        FindingOccurrence.model_validate_json(json.dumps(payload))
+
+    payload = package.occurrence.model_dump(mode="json")
+    payload["operator"]["id"] = "patient_alice_secret"
+    with pytest.raises(ValidationError):
+        FindingOccurrence.model_validate_json(json.dumps(payload))
+
+
+def test_repetition_summary_is_derived_from_exact_repetition_evidence() -> None:
+    payload = _dataset_package().occurrence.model_dump(mode="json")
+    payload["repetition_summary"]["requested"] = 100
+
+    with pytest.raises(ValidationError, match="must match exact repetition evidence"):
+        FindingOccurrence.model_validate_json(json.dumps(payload))
+
+
+def test_package_binds_each_repetition_to_its_receipts() -> None:
+    package = _dataset_package()
+    payload = package.model_dump(mode="json")
+    for repetition in payload["occurrence"]["repetitions"]:
+        repetition["source_receipt_id"], repetition["probe_receipt_id"] = (
+            repetition["probe_receipt_id"],
+            repetition["source_receipt_id"],
+        )
+    _rebind_occurrence(payload)
+
+    with pytest.raises(
+        ValidationError,
+        match=r"declared arm and repetition",
+    ):
+        FindingEvidencePackage.model_validate_json(json.dumps(payload))
+
+
+def test_observed_repetitions_require_category_evidence_from_each_execution() -> None:
+    package = _dataset_package()
+    payload = package.model_dump(mode="json")
+    pointers = {
+        pointer.pointer_id: pointer
+        for receipt in package.receipts
+        for pointer in receipt.content.evidence_pointers
+    }
+    for repetition in payload["occurrence"]["repetitions"]:
+        repetition_number = repetition["repetition"]
+        repetition["evidence_pointer_ids"] = sorted(
+            pointer_id
+            for pointer_id, pointer in pointers.items()
+            if pointer.kind == "input"
+            and pointer.arm == "probe"
+            and f"r{repetition_number}." in (pointer.record_id or "")
+        )
+    _rebind_occurrence(payload)
+
+    with pytest.raises(ValidationError, match="category evidence from that execution"):
+        FindingEvidencePackage.model_validate_json(json.dumps(payload))
+
+
+def test_non_observed_repetitions_require_typed_counterevidence() -> None:
+    package = _dataset_package()
+    payload = package.model_dump(mode="json")
+    pointers = {
+        pointer.pointer_id: pointer
+        for receipt in package.receipts
+        for pointer in receipt.content.evidence_pointers
+    }
+    repetition = payload["occurrence"]["repetitions"][1]
+    repetition["outcome"] = "finding_not_observed"
+    repetition["evidence_pointer_ids"] = sorted(
+        pointer_id
+        for pointer_id, pointer in pointers.items()
+        if pointer.kind == "input" and pointer.arm == "probe" and "r2." in (pointer.record_id or "")
+    )
+    payload["occurrence"]["repetition_summary"].update(
+        observed=1,
+        stability="unstable",
+        reproducibility="intermittent",
+    )
+    _rebind_occurrence(payload)
+
+    with pytest.raises(ValidationError, match="conclusive repetition requires category evidence"):
+        FindingEvidencePackage.model_validate_json(json.dumps(payload))
+
+
+def test_rule_violation_requires_customer_definition_and_evaluator_evidence() -> None:
+    package = _stateful_package()
+    payload = package.model_dump(mode="json")
+    violation_pointer_id = package.occurrence.observed_deltas[0].evidence_pointer_ids[0]
+    for receipt in payload["receipts"]:
+        for pointer in receipt["content"]["evidence_pointers"]:
+            if pointer["pointer_id"] == violation_pointer_id:
+                pointer["authority"] = "source_self_reported"
+                pointer["source_id"] = "target"
+                receipt["content"]["provenance"].append(
+                    {"role": "target", "id": "target", "version": None, "config_sha256": None}
+                )
+                receipt["content"]["provenance"] = sorted(
+                    receipt["content"]["provenance"],
+                    key=lambda item: (item["role"], item["id"], item["version"] or ""),
+                )
+                content = RunReceiptContent.model_validate_json(json.dumps(receipt["content"]))
+                replacement = build_run_receipt(content)
+                old_receipt_id = receipt["receipt_id"]
+                receipt.update(replacement.model_dump(mode="json"))
+                for repetition in payload["occurrence"]["repetitions"]:
+                    if repetition["probe_receipt_id"] == old_receipt_id:
+                        repetition["probe_receipt_id"] = replacement.receipt_id
+    payload["receipts"] = sorted(payload["receipts"], key=lambda item: item["receipt_id"])
+    _rebind_occurrence(payload)
+
+    with pytest.raises(ValidationError, match="rule violations require evaluator"):
+        FindingEvidencePackage.model_validate_json(json.dumps(payload))
+
+
+def test_behavior_findings_reject_rule_violation_deltas() -> None:
+    occurrence = _dataset_package().occurrence
+    values = occurrence.model_dump()
+    values.pop("occurrence_id")
+    values["observed_deltas"] = (
+        *occurrence.observed_deltas,
+        ObservedDelta(
+            kind="rule",
+            change="violated",
+            subject_ref=_public_ref("customer-rule"),
+            rule=_RULE,
+            source_state="satisfied",
+            probe_state="violated",
+            evidence_pointer_ids=occurrence.observed_deltas[0].evidence_pointer_ids,
+        ),
+    )
+    values["evidence_pointer_ids"] = tuple(
+        sorted(
             {
-                "requested": "3",
-                "conclusive": 3,
-                "violated": 3,
-                "inconclusive": 0,
-                "stability": "stable",
-                "reproducibility": "reproduced",
+                *occurrence.evidence_pointer_ids,
+                *values["observed_deltas"][-1].evidence_pointer_ids,
             }
         )
+    )
+
+    with pytest.raises(ValidationError, match="cannot contain rule-violation deltas"):
+        build_finding_occurrence(**values)
+
+
+def test_occurrence_id_is_bound_to_canonical_claims() -> None:
+    payload = _dataset_package().occurrence.model_dump(mode="json")
+    payload["observed_deltas"][0]["subject_ref"] = _public_ref("different-action")
+
+    with pytest.raises(ValidationError, match="ID must match its canonical claims"):
+        FindingOccurrence.model_validate_json(json.dumps(payload))
+
+
+def test_receipt_values_are_finite_immutable_and_content_addressed() -> None:
+    with pytest.raises(ValueError):
+        capture_json({"invalid": float("nan")})
+
+    captured = capture_json({"b": 2, "a": 1})
+    assert captured == capture_json({"a": 1, "b": 2})
+    with pytest.raises(ValidationError):
+        CapturedJson(canonical_json='{"a":1}', sha256="0" * 64)
+    with pytest.raises(ValidationError):
+        captured.canonical_json = "null"
+
+    receipt = _receipt(1, "source")
+    payload = receipt.model_dump(mode="json")
+    payload["content"]["recorded_at"] = "2026-08-24T00:00:00Z"
+    with pytest.raises(ValidationError, match="ID must match"):
+        RunReceipt.model_validate_json(json.dumps(payload))
+
+
+def test_receipt_serialization_is_canonical_and_round_trips() -> None:
+    first = _receipt(1, "source")
+    serialized = serialize_run_receipt(first)
+
+    assert serialized == serialize_run_receipt(parse_run_receipt(serialized))
+    assert serialized == serialize_run_receipt(first)
+    assert len(serialized.encode()) < 1_000_000
+
+
+def test_receipt_values_must_point_to_matching_execution_evidence() -> None:
+    receipt = _receipt(1, "source")
+    payload = receipt.content.model_dump(mode="json")
+    action_pointer_id = next(
+        pointer.pointer_id
+        for pointer in receipt.content.evidence_pointers
+        if pointer.kind == "action"
+    )
+    payload["input"]["evidence_pointer_id"] = action_pointer_id
+
+    with pytest.raises(ValidationError, match="incompatible evidence"):
+        RunReceiptContent.model_validate_json(json.dumps(payload))
+
+
+def test_missing_provenance_requires_an_explicit_limitation() -> None:
+    receipt = _receipt(1, "source")
+    payload = receipt.content.model_dump(mode="json")
+    payload["provenance"] = [item for item in payload["provenance"] if item["role"] != "model"]
+
+    with pytest.raises(ValidationError, match="model provenance"):
+        RunReceiptContent.model_validate_json(json.dumps(payload))
