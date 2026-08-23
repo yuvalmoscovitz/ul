@@ -3,8 +3,10 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import secrets
 import shlex
 import stat
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Annotated, TextIO
 
@@ -65,6 +67,11 @@ from ul.trace_replay import (
 )
 
 from ul_cli.environment import TEST_ENVIRONMENT_CONFIRMATION_MESSAGE
+from ul_cli.finding_adapters import (
+    FindingAdapterContext,
+    StatefulFindingResult,
+    adapt_stateful_finding_packages,
+)
 
 app = typer.Typer(help="Stress stateful agents with ordered conversation events.")
 
@@ -544,6 +551,8 @@ def run_correction_after_first_response(
         raise typer.BadParameter("execution requires --output", param_hint="--output")
     if output.exists():
         raise typer.BadParameter("output already exists; UL will not overwrite it")
+    if stateful_finding_output(output).exists():
+        raise typer.BadParameter("finding output already exists; UL will not overwrite it")
     target = JsonHttpEnvironmentConnection.from_config(
         target_config,
         test_environment_confirmed=True,
@@ -565,6 +574,7 @@ def run_correction_after_first_response(
         output_stream.write("\n")
         output_stream.flush()
         os.fsync(output_stream.fileno())
+    write_stateful_finding_packages(output, result, invariant_suite.rules)
     _print_result(result, output)
 
 
@@ -638,6 +648,8 @@ def run_retry_after_successful_commit(
         raise typer.BadParameter("execution requires --output", param_hint="--output")
     if output.exists():
         raise typer.BadParameter("output already exists; UL will not overwrite it")
+    if stateful_finding_output(output).exists():
+        raise typer.BadParameter("finding output already exists; UL will not overwrite it")
     target = JsonHttpEnvironmentConnection.from_config(
         target_config,
         test_environment_confirmed=True,
@@ -659,6 +671,7 @@ def run_retry_after_successful_commit(
         output_stream.write("\n")
         output_stream.flush()
         os.fsync(output_stream.fileno())
+    write_stateful_finding_packages(output, result, invariant_suite.rules)
     _print_retry_result(result, output)
 
 
@@ -837,6 +850,41 @@ async def _replay_and_close(
         )
     finally:
         await target.aclose()
+
+
+def stateful_finding_output(output: Path) -> Path:
+    return output.with_name(f"{output.name}.findings.jsonl")
+
+
+def write_stateful_finding_packages(
+    output: Path,
+    result: StatefulFindingResult,
+    invariant_rules: tuple[DatasetInvariantRule, ...],
+) -> Path:
+    packages = adapt_stateful_finding_packages(
+        result,
+        invariant_rules=invariant_rules,
+        context=FindingAdapterContext(
+            campaign_id=result.case.id,
+            recorded_at=datetime.now(UTC),
+            reference_key=secrets.token_bytes(32),
+        ),
+    )
+    finding_output = stateful_finding_output(output)
+    with _create_private_output(finding_output) as output_stream:
+        for package in packages:
+            output_stream.write(
+                json.dumps(
+                    package.model_dump(mode="json"),
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+                + "\n"
+            )
+        output_stream.flush()
+        os.fsync(output_stream.fileno())
+    return finding_output
 
 
 def _print_result(result: CorrectionStressResult, output: Path) -> None:

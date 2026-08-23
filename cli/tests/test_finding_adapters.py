@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+import hashlib
+import json
+import stat
 from datetime import UTC, datetime
+from pathlib import Path
 
 import pytest
 from pydantic import JsonValue, ValidationError
@@ -21,7 +25,10 @@ from ul.dataset_augmentation import (
     DatasetAugmentationCandidate,
     DatasetAugmentationOperatorReference,
 )
+from ul.dataset_evaluation import compare_action_outcomes
 from ul.dataset_invariants import (
+    DatasetInvariantArmEvaluation,
+    DatasetInvariantEvaluation,
     DatasetInvariantRuleEvaluation,
     JsonValuesEqualInvariant,
 )
@@ -32,14 +39,17 @@ from ul.event_stress import (
     CorrectionStressTrial,
     CorrectionTurnObservation,
 )
+from ul_cli.event_stress import write_stateful_finding_packages
 from ul_cli.finding_adapters import (
     FindingAdapterContext,
     adapt_dataset_behavior_finding,
+    adapt_dataset_finding_packages,
     adapt_dataset_invariant_finding,
     adapt_stateful_invariant_finding,
 )
 from ul_cli.report_contract import (
     FindingEvidencePackage,
+    RedactionReceipt,
     build_finding_occurrence,
     serialize_run_receipt,
 )
@@ -61,7 +71,7 @@ def _context() -> FindingAdapterContext:
     return FindingAdapterContext(
         campaign_id=f"campaign-{_PRIVATE_SECRET}",
         recorded_at=datetime(2026, 8, 23, 12, tzinfo=UTC),
-        redaction_policy_sha256="b" * 64,
+        reference_key=b"test-only-opaque-reference-key-32-bytes",
     )
 
 
@@ -150,6 +160,95 @@ def _dataset_result() -> DatasetEvaluationResult:
                 ),
             ),
         ),
+    )
+
+
+def _dataset_category_result(category: str) -> DatasetEvaluationResult:
+    result = _dataset_result()
+    source_action = ObservedOutcome(
+        id="source-payment",
+        confidence=1,
+        status="observed",
+        position=0,
+        kind="action",
+        predicate="create_payment",
+        fields={"account": _PRIVATE_SECRET},
+    )
+    changed_action = source_action.model_copy(
+        update={"id": "changed-payment", "fields": {"account": "another-account"}}
+    )
+    duplicate_action = source_action.model_copy(update={"id": "duplicate-payment", "position": 1})
+    actions_by_category = {
+        "unexpected_effect": ((), (source_action,)),
+        "missing_effect": ((source_action,), ()),
+        "changed_grounded_effect_argument": ((source_action,), (changed_action,)),
+        "duplicate_effect": ((source_action,), (source_action, duplicate_action)),
+    }
+    source_actions, probe_actions = actions_by_category[category]
+
+    def trial_set(arm: str, actions: tuple[ObservedOutcome, ...]) -> DatasetEvaluationTrialSet:
+        return DatasetEvaluationTrialSet(
+            requested_repetitions=2,
+            stability="stable",
+            trials=tuple(
+                DatasetEvaluationTrial(
+                    repetition=repetition,
+                    target_output=ObservedAgentOutput(raw_output={"actions": []}),
+                    observed_frame=SemanticFrame(
+                        interaction_id=f"{result.source.id}:{arm}:round-{repetition}",
+                        outcomes=actions,
+                        extractor_version="test",
+                    ),
+                )
+                for repetition in (1, 2)
+            ),
+            outcome_groups=(
+                DatasetEvaluationOutcomeGroup(
+                    repetitions=(1, 2),
+                    representative_effects=actions,
+                ),
+            ),
+        )
+
+    grounding_frame = SemanticFrame(
+        interaction_id=result.source.id,
+        outcomes=source_actions,
+        extractor_version="test",
+    )
+    source_frame = trial_set("current_baseline", source_actions).representative_frame
+    probe_frame = trial_set(
+        result.cases[0].candidate.operator_id, probe_actions
+    ).representative_frame
+    assert source_frame is not None and probe_frame is not None
+    finding = next(
+        finding
+        for finding in compare_action_outcomes(
+            source_frame,
+            probe_frame,
+            result.source.raw_input,
+            grounding_frame=grounding_frame,
+        )
+        if finding.category == category
+    )
+    candidate = result.cases[0].candidate
+    return result.model_copy(
+        update={
+            "augmentation": result.augmentation.model_copy(
+                update={"source_frames": (grounding_frame,)}
+            ),
+            "baseline": DatasetEvaluationBaseline(
+                verdict="no_divergence",
+                trial_set=trial_set("current_baseline", source_actions),
+            ),
+            "cases": (
+                DatasetEvaluationCase(
+                    candidate=candidate,
+                    verdict="divergence_needs_review",
+                    trial_set=trial_set(candidate.operator_id, probe_actions),
+                    findings=(finding,),
+                ),
+            ),
+        }
     )
 
 
@@ -315,6 +414,43 @@ def _dataset_rule_evaluation() -> DatasetInvariantRuleEvaluation:
     )
 
 
+def _dataset_invariant_evaluation() -> DatasetInvariantEvaluation:
+    rule = _dataset_rule_evaluation()
+    return DatasetInvariantEvaluation(
+        interaction_id=f"source-{_PRIVATE_SECRET}",
+        suite_sha256="c" * 64,
+        observation_authority="committed_state_snapshot",
+        baseline=DatasetInvariantArmEvaluation(
+            arm="baseline",
+            rules=(
+                rule.model_copy(
+                    update={
+                        "status": "satisfied",
+                        "reason_code": "all_trials_satisfied",
+                        "trials": tuple(
+                            trial.model_copy(
+                                update={
+                                    "status": "satisfied",
+                                    "reason_code": "values_equal",
+                                    "resolved_values": {"left": 100, "right": 100},
+                                }
+                            )
+                            for trial in rule.trials
+                        ),
+                    }
+                ),
+            ),
+        ),
+        variations=(
+            DatasetInvariantArmEvaluation(
+                arm="variation",
+                operator_id="input.surface.rephrase",
+                rules=(rule,),
+            ),
+        ),
+    )
+
+
 def test_dataset_and_stateful_adapters_emit_the_same_validated_package() -> None:
     packages = (
         adapt_dataset_behavior_finding(
@@ -325,7 +461,7 @@ def test_dataset_and_stateful_adapters_emit_the_same_validated_package() -> None
         ),
         adapt_dataset_invariant_finding(
             _dataset_result(),
-            _dataset_rule_evaluation(),
+            _dataset_invariant_evaluation(),
             _rule(),
             case_index=0,
             context=_context(),
@@ -368,6 +504,36 @@ def test_public_occurrences_do_not_disclose_private_workflow_values() -> None:
         assert _PRIVATE_SECRET in package.model_dump_json()
 
 
+@pytest.mark.parametrize(
+    "category",
+    (
+        "unexpected_effect",
+        "missing_effect",
+        "changed_grounded_effect_argument",
+        "duplicate_effect",
+    ),
+)
+def test_behavior_categories_are_recomputed_from_each_exact_arm(category: str) -> None:
+    package = adapt_dataset_behavior_finding(
+        _dataset_category_result(category),
+        case_index=0,
+        finding_index=0,
+        context=_context(),
+    )
+    pointers = {
+        pointer.pointer_id: pointer
+        for receipt in package.receipts
+        for pointer in receipt.content.evidence_pointers
+    }
+
+    assert package.occurrence.category == category
+    assert all(
+        {pointers[pointer_id].arm for pointer_id in repetition.evidence_pointer_ids}
+        == {"source", "probe"}
+        for repetition in package.occurrence.repetitions
+    )
+
+
 def test_adapters_bind_every_repetition_to_its_exact_arm_receipts() -> None:
     package = adapt_dataset_behavior_finding(
         _dataset_result(),
@@ -397,3 +563,281 @@ def test_stateful_adapter_rejects_a_rule_definition_from_another_authority() -> 
             wrong_rule,
             context=_context(),
         )
+
+
+def test_packages_embed_every_publicly_cited_private_artifact() -> None:
+    package = adapt_dataset_invariant_finding(
+        _dataset_result(),
+        _dataset_invariant_evaluation(),
+        _rule(),
+        case_index=0,
+        context=_context(),
+    )
+    artifacts = {artifact.artifact_sha256 for artifact in package.artifacts}
+    pointers = {
+        pointer.pointer_id: pointer
+        for receipt in package.receipts
+        for pointer in receipt.content.evidence_pointers
+    }
+
+    assert package.artifact_retention == "embedded"
+    assert {
+        pointers[pointer_id].artifact_sha256
+        for pointer_id in package.occurrence.evidence_pointer_ids
+    }.issubset(artifacts)
+
+
+def test_opaque_references_resist_plain_hash_dictionary_guesses() -> None:
+    package = adapt_dataset_behavior_finding(
+        _dataset_result(),
+        case_index=0,
+        finding_index=0,
+        context=_context(),
+    )
+    public_json = package.occurrence.model_dump_json()
+    dictionary_guesses = (
+        _PRIVATE_SECRET,
+        f"source-{_PRIVATE_SECRET}",
+        f"campaign-{_PRIVATE_SECRET}",
+        "input.surface.rephrase",
+        "1.0.0",
+    )
+
+    assert all(
+        hashlib.sha256(value.encode()).hexdigest() not in public_json
+        for value in dictionary_guesses
+    )
+    other_context = FindingAdapterContext(
+        campaign_id=_context().campaign_id,
+        recorded_at=_context().recorded_at,
+        reference_key=b"a-different-private-reference-key-32-bytes",
+    )
+    other = adapt_dataset_behavior_finding(
+        _dataset_result(),
+        case_index=0,
+        finding_index=0,
+        context=other_context,
+    )
+    assert other.occurrence.case_ref != package.occurrence.case_ref
+
+
+def test_dataset_invariant_adapter_preserves_exact_mixed_repetitions() -> None:
+    evaluation = _dataset_invariant_evaluation()
+    probe_rule = evaluation.variations[0].rules[0]
+    satisfied_trial = probe_rule.trials[1].model_copy(
+        update={
+            "status": "satisfied",
+            "reason_code": "values_equal",
+            "resolved_values": {"left": 100, "right": 100},
+        }
+    )
+    mixed_probe_rule = probe_rule.model_copy(
+        update={"trials": (probe_rule.trials[0], satisfied_trial)}
+    )
+    mixed_evaluation = evaluation.model_copy(
+        update={
+            "variations": (
+                evaluation.variations[0].model_copy(update={"rules": (mixed_probe_rule,)}),
+            )
+        }
+    )
+
+    package = adapt_dataset_invariant_finding(
+        _dataset_result(),
+        mixed_evaluation,
+        _rule(),
+        case_index=0,
+        context=_context(),
+    )
+    pointers = {
+        pointer.pointer_id: pointer
+        for receipt in package.receipts
+        for pointer in receipt.content.evidence_pointers
+    }
+
+    assert tuple(item.outcome for item in package.occurrence.repetitions) == (
+        "finding_observed",
+        "finding_not_observed",
+    )
+    assert package.occurrence.repetition_summary.reproducibility == "intermittent"
+    assert all(
+        {pointers[pointer_id].arm for pointer_id in repetition.evidence_pointer_ids}
+        == {"source", "probe"}
+        for repetition in package.occurrence.repetitions
+    )
+
+
+def test_invariant_adapter_rejects_same_identity_with_changed_rule_semantics() -> None:
+    changed_rule = _rule().model_copy(update={"right_pointer": "/another_value"})
+
+    with pytest.raises(ValueError, match="full customer rule definition"):
+        adapt_dataset_invariant_finding(
+            _dataset_result(),
+            _dataset_invariant_evaluation(),
+            changed_rule,
+            case_index=0,
+            context=_context(),
+        )
+
+
+def test_adapter_rejects_oversized_values_before_package_construction() -> None:
+    result = _dataset_result()
+    oversized_input = "x" * 260_000
+    oversized = result.model_copy(
+        update={"source": result.source.model_copy(update={"raw_input": oversized_input})}
+    )
+
+    with pytest.raises(ValueError, match="captured JSON exceeds"):
+        adapt_dataset_behavior_finding(
+            oversized,
+            case_index=0,
+            finding_index=0,
+            context=_context(),
+        )
+
+
+def test_adapter_rejects_repetition_overflow_before_receipt_construction() -> None:
+    result = _dataset_result()
+    probe_trial_set = result.cases[0].trial_set
+    assert probe_trial_set is not None
+    baseline_trial = result.baseline.trial_set.trials[0]
+    probe_trial = probe_trial_set.trials[0]
+    baseline_trials = tuple(
+        baseline_trial.model_copy(update={"repetition": repetition})
+        for repetition in range(1, 1_002)
+    )
+    probe_trials = tuple(
+        probe_trial.model_copy(update={"repetition": repetition}) for repetition in range(1, 1_002)
+    )
+    oversized = result.model_copy(
+        update={
+            "baseline": result.baseline.model_copy(
+                update={
+                    "trial_set": result.baseline.trial_set.model_copy(
+                        update={"trials": baseline_trials}
+                    )
+                }
+            ),
+            "cases": (
+                result.cases[0].model_copy(
+                    update={
+                        "trial_set": probe_trial_set.model_copy(update={"trials": probe_trials})
+                    }
+                ),
+            ),
+        }
+    )
+
+    with pytest.raises(ValueError, match="1,000 repetition limit"):
+        adapt_dataset_behavior_finding(
+            oversized,
+            case_index=0,
+            finding_index=0,
+            context=_context(),
+        )
+
+
+def test_receipts_never_claim_false_zero_redaction_accounting() -> None:
+    unavailable = adapt_dataset_behavior_finding(
+        _dataset_result(), case_index=0, finding_index=0, context=_context()
+    )
+    accounted_context = FindingAdapterContext(
+        campaign_id=_context().campaign_id,
+        recorded_at=_context().recorded_at,
+        reference_key=_context().reference_key,
+        redaction=RedactionReceipt(
+            policy_sha256="d" * 64,
+            matched_value_count=2,
+            redacted_value_count=2,
+            retained_private_value_count=0,
+        ),
+    )
+    accounted = adapt_dataset_behavior_finding(
+        _dataset_result(), case_index=0, finding_index=0, context=accounted_context
+    )
+
+    assert all(
+        receipt.content.redaction is None
+        and "redaction_accounting_unavailable" in receipt.content.limitations
+        for receipt in unavailable.receipts
+    )
+    assert all(
+        receipt.content.redaction == accounted_context.redaction
+        and "redaction_accounting_unavailable" not in receipt.content.limitations
+        for receipt in accounted.receipts
+    )
+
+
+def test_initial_and_final_state_authorities_are_preserved_independently() -> None:
+    result = _stateful_result()
+    trial = result.trials[0]
+
+    def independent_before(evidence: ExecutionEvidence) -> ExecutionEvidence:
+        assert evidence.initial_state is not None
+        return evidence.model_copy(
+            update={
+                "initial_state": EnvironmentStateEvidence(
+                    value=evidence.initial_state.value,
+                    authority="independent_observer",
+                    observer_id="before-state-observer",
+                )
+            }
+        )
+
+    assert trial.baseline_execution_evidence is not None
+    assert trial.variation_execution_evidence is not None
+    result = result.model_copy(
+        update={
+            "trials": (
+                trial.model_copy(
+                    update={
+                        "baseline_execution_evidence": independent_before(
+                            trial.baseline_execution_evidence
+                        ),
+                        "variation_execution_evidence": independent_before(
+                            trial.variation_execution_evidence
+                        ),
+                    }
+                ),
+            )
+        }
+    )
+    package = adapt_stateful_invariant_finding(result, _rule(), context=_context())
+
+    for receipt in package.receipts:
+        state_pointers = {
+            pointer.json_pointer: pointer
+            for pointer in receipt.content.evidence_pointers
+            if pointer.kind == "state"
+        }
+        assert state_pointers["/initial_state/value"].authority == "independent_observer"
+        assert state_pointers["/initial_state/value"].source_id == "before-state-observer"
+        assert state_pointers["/final_state/value"].authority == "environment_self_reported"
+
+
+def test_real_workflow_collectors_emit_canonical_packages_without_calls(tmp_path: Path) -> None:
+    dataset_packages = adapt_dataset_finding_packages(
+        _dataset_result(),
+        invariant_evaluation=_dataset_invariant_evaluation(),
+        invariant_rules=(_rule(),),
+        context=_context(),
+    )
+    evidence_output = tmp_path / "correction.json"
+    evidence_output.write_text("{}\n", encoding="utf-8")
+    stateful_output = write_stateful_finding_packages(
+        evidence_output,
+        _stateful_result(),
+        (_rule(),),
+    )
+    stateful_packages = tuple(
+        FindingEvidencePackage.model_validate_json(line)
+        for line in stateful_output.read_text(encoding="utf-8").splitlines()
+    )
+
+    assert len(dataset_packages) == 2
+    assert len(stateful_packages) == 1
+    assert all(package.artifact_retention == "embedded" for package in dataset_packages)
+    assert all(package.artifact_retention == "embedded" for package in stateful_packages)
+    assert stat.S_IMODE(stateful_output.stat().st_mode) == 0o600
+    all_packages = (*dataset_packages, *stateful_packages)
+    assert all(json.loads(package.model_dump_json()) for package in all_packages)

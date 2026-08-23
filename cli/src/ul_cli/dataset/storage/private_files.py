@@ -19,6 +19,14 @@ def create_private_output(path: Path) -> TextIO:
     return os.fdopen(descriptor, "w", encoding="utf-8")
 
 
+def open_private_append_output(path: Path) -> TextIO:
+    descriptor = open_resume_descriptor(path, writable=True)
+    if sys.platform != "win32":
+        os.fchmod(descriptor, 0o600)
+    os.lseek(descriptor, 0, os.SEEK_END)
+    return os.fdopen(descriptor, "a", encoding="utf-8")
+
+
 def open_resume_descriptor(path: Path, *, writable: bool) -> int:
     no_follow_flag = getattr(os, "O_NOFOLLOW", 0)
     binary_flag = os.O_BINARY if sys.platform == "win32" else 0

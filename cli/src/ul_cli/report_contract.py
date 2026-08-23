@@ -95,6 +95,7 @@ _EVIDENCE_POINTER_ID_PATTERN = r"^ulep_v1_[0-9a-f]{64}$"
 _RUN_RECEIPT_ID_PATTERN = r"^ulrr_v1_[0-9a-f]{64}$"
 _REVIEW_REFERENCE_PATTERN = r"^ulreview_v1_[0-9a-f]{64}$"
 _CAPTURED_JSON_BYTES = 250_000
+_MAXIMUM_FINDING_PACKAGE_BYTES = 16_000_000
 OccurrenceCapability = Literal[
     "cleanup_verification",
     "conversation_replay",
@@ -401,6 +402,17 @@ class CapturedJson(_StrictModel):
         return self
 
 
+class EvidenceArtifact(_StrictModel):
+    artifact_sha256: str = Field(pattern=_SHA256_PATTERN)
+    value: CapturedJson
+
+    @model_validator(mode="after")
+    def validate_digest(self) -> Self:
+        if self.artifact_sha256 != self.value.sha256:
+            raise ValueError("evidence artifact digest must match its retained value")
+        return self
+
+
 class ReceiptEvidenceValue(_StrictModel):
     evidence_pointer_id: str = Field(pattern=_EVIDENCE_POINTER_ID_PATTERN)
     value: CapturedJson
@@ -488,7 +500,7 @@ class RunReceiptContent(_StrictModel):
     provenance: tuple[ProvenanceReceipt, ...] = Field(min_length=1, max_length=100)
     trace_evidence_pointer_ids: tuple[str, ...] = Field(default=(), max_length=1_000)
     usage: UsageReceipt | None = None
-    redaction: RedactionReceipt
+    redaction: RedactionReceipt | None = None
     evidence_pointers: tuple[EvidencePointer, ...] = Field(min_length=1, max_length=1_000)
     limitations: tuple[_FindingReferenceCode, ...] = Field(default=(), max_length=100)
     recorded_at: datetime
@@ -561,6 +573,10 @@ class RunReceiptContent(_StrictModel):
             and "evaluator_provenance_unavailable" not in self.limitations
         ):
             raise ValueError("missing evaluator provenance requires an explicit limitation")
+        if (self.redaction is None) != ("redaction_accounting_unavailable" in self.limitations):
+            raise ValueError(
+                "receipts require producer redaction accounting or an explicit limitation"
+            )
         _validate_pointer_provenance(self.evidence_pointers, self.provenance)
         if self.recorded_at.tzinfo is None or self.recorded_at.utcoffset() is None:
             raise ValueError("receipt timestamp must include a UTC offset")
@@ -588,9 +604,19 @@ class FindingEvidencePackage(_StrictModel):
     disclosure: Literal["private"] = "private"
     occurrence: FindingOccurrence
     receipts: tuple[RunReceipt, ...] = Field(min_length=1, max_length=2_000)
+    artifact_retention: Literal["external", "embedded"] = "external"
+    artifacts: tuple[EvidenceArtifact, ...] = Field(default=(), max_length=4_000)
 
     @model_validator(mode="after")
     def validate_package(self) -> Self:
+        artifact_digests = tuple(artifact.artifact_sha256 for artifact in self.artifacts)
+        if artifact_digests != tuple(sorted(set(artifact_digests))):
+            raise ValueError("retained evidence artifacts must be sorted and unique")
+        if self.artifact_retention == "external":
+            if self.artifacts:
+                raise ValueError("externally retained packages cannot embed artifacts")
+        elif not self.artifacts:
+            raise ValueError("embedded packages require retained evidence artifacts")
         receipt_ids = tuple(receipt.receipt_id for receipt in self.receipts)
         if receipt_ids != tuple(sorted(set(receipt_ids))):
             raise ValueError("package receipts must be sorted and unique")
@@ -616,6 +642,17 @@ class FindingEvidencePackage(_StrictModel):
                 pointers[pointer.pointer_id] = pointer
         if not set(self.occurrence.evidence_pointer_ids).issubset(pointers):
             raise ValueError("package does not contain every public evidence reference")
+        if self.artifact_retention == "embedded":
+            artifacts = {artifact.artifact_sha256: artifact.value for artifact in self.artifacts}
+            for pointer_id in self.occurrence.evidence_pointer_ids:
+                pointer = pointers[pointer_id]
+                artifact = artifacts.get(pointer.artifact_sha256)
+                if artifact is None:
+                    raise ValueError("package does not retain every cited evidence artifact")
+                _resolve_json_pointer(
+                    json.loads(artifact.canonical_json),
+                    pointer.json_pointer,
+                )
         for repetition in self.occurrence.repetitions:
             allowed_pointer_ids: set[str] = set()
             for expected_arm, receipt_id in (
@@ -660,6 +697,11 @@ class FindingEvidencePackage(_StrictModel):
         if not supporting_delta_pointer_ids.issubset(observed_repetition_pointer_ids):
             raise ValueError("aggregate observed deltas must come only from observed repetitions")
         _validate_occurrence_evidence(self.occurrence, pointers)
+        if (
+            len(_canonical_json(self.model_dump(mode="json")).encode("utf-8"))
+            > _MAXIMUM_FINDING_PACKAGE_BYTES
+        ):
+            raise ValueError("finding evidence package exceeds the 16 MB JSON limit")
         return self
 
 
@@ -705,6 +747,27 @@ def _canonical_json(value: object) -> str:
 
 def _reject_json_constant(value: str) -> None:
     raise ValueError(f"non-standard JSON constant: {value}")
+
+
+def _resolve_json_pointer(value: JsonValue, pointer: str) -> JsonValue:
+    current = value
+    if pointer == "":
+        return current
+    for encoded_token in pointer[1:].split("/"):
+        token = encoded_token.replace("~1", "/").replace("~0", "~")
+        if isinstance(current, dict) and token in current:
+            current = current[token]
+        elif (
+            isinstance(current, list)
+            and token.isascii()
+            and token.isdecimal()
+            and (token == "0" or not token.startswith("0"))
+            and int(token) < len(current)
+        ):
+            current = current[int(token)]
+        else:
+            raise ValueError("evidence pointer does not resolve in its retained artifact")
+    return current
 
 
 def _run_receipt_id(content: RunReceiptContent) -> str:
