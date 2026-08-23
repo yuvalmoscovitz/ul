@@ -1122,8 +1122,21 @@ def _build_failure_patterns(
                 review_status=first.review_status,
                 review_severity=first.review_severity,
                 horizontal_facets=PatternHorizontalFacets(
-                    finding_kind=first.kind,
-                    finding_category=first.category,
+                    failure_type=first.category,
+                    affected_subject=(
+                        "rule"
+                        if first.kind == "customer_invariant_violation"
+                        else "outcome"
+                        if first.category == "unstable_behavior"
+                        else "action"
+                    ),
+                    evidence_level=(
+                        "evaluated_rule"
+                        if first.kind == "customer_invariant_violation"
+                        else "observed_outcome"
+                        if first.category == "unstable_behavior"
+                        else "observed_action"
+                    ),
                     mechanism_signature=first_context.mechanism_signature,
                 ),
                 vertical_facets=first_context.vertical_facets,

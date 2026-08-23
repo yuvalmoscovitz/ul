@@ -407,10 +407,10 @@ def test_root_json_report_is_stable_and_omits_private_dataset_fields(tmp_path: P
         "patterns": [
             {
                 "pattern_fingerprint": (
-                    "ulpf_v1_81793d3a66e6dfbe222b998871342f81cfcb6abdb96ec3c3cc313859fc40999d"
+                    "ulpf_v1_5e9767cc825fc5a5e8dd49a13f74e9d10773650a2304f6c98c4c480d34cacaba"
                 ),
                 "pattern_snapshot_id": (
-                    "ulps_v1_306ff85af713fab021682a0962f8d5635660b8cd664c46d3623cacbd21b88b8d"
+                    "ulps_v1_dd8d2782e17ffeaf26ed8a68bc2019042bda1900ebdb966c51a9607f86cc5915"
                 ),
                 "kind": "behavior_difference",
                 "category": "changed_grounded_effect_argument",
@@ -423,8 +423,9 @@ def test_root_json_report_is_stable_and_omits_private_dataset_fields(tmp_path: P
                 "review_status": "needs_review",
                 "review_severity": "unrated",
                 "horizontal_facets": {
-                    "finding_kind": "behavior_difference",
-                    "finding_category": "changed_grounded_effect_argument",
+                    "failure_type": "changed_grounded_effect_argument",
+                    "affected_subject": "action",
+                    "evidence_level": "observed_action",
                     "mechanism_signature": (
                         "ulpm_v1_6f5f3a4bf1b01b071a12aaf35df870dcd1fc1a4077db18efe2ab81453b6ef114"
                     ),
@@ -725,10 +726,7 @@ def test_trusted_vertical_facets_are_optional_fingerprint_dimensions() -> None:
         for finding_id in finding_ids
     )
     trusted_facet = TrustedPatternVerticalFacet(
-        taxonomy=VersionedReference(
-            id="ulref_v1_" + "1" * 64,
-            version="ulref_v1_" + "2" * 64,
-        ),
+        facet="workflow",
         value=VersionedReference(
             id="ulref_v1_" + "3" * 64,
             version="ulref_v1_" + "4" * 64,

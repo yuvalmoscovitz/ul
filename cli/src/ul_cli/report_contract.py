@@ -1046,15 +1046,16 @@ PatternMembershipReason = Literal[
 
 
 class PatternHorizontalFacets(_StrictModel):
-    finding_kind: FindingKind
-    finding_category: FindingCategory
+    failure_type: FindingCategory
+    affected_subject: Literal["action", "outcome", "rule"]
+    evidence_level: Literal["observed_action", "observed_outcome", "evaluated_rule"]
     mechanism_signature: str = Field(pattern=_MECHANISM_SIGNATURE_PATTERN)
 
 
 class TrustedPatternVerticalFacet(_StrictModel):
-    taxonomy: VersionedReference
+    facet: Literal["domain", "workflow", "role", "use_case"]
     value: VersionedReference
-    authority: Literal["customer_declared", "deterministic_evaluator"]
+    authority: Literal["customer_declared"] = "customer_declared"
 
 
 class PatternMember(_StrictModel):
@@ -1124,8 +1125,7 @@ class FailurePattern(_StrictModel):
             raise ValueError("pattern evidence authorities must be sorted and unique")
         vertical_facet_keys = tuple(
             (
-                facet.taxonomy.id,
-                facet.taxonomy.version,
+                facet.facet,
                 facet.value.id,
                 facet.value.version,
                 facet.authority,
@@ -1134,8 +1134,21 @@ class FailurePattern(_StrictModel):
         )
         if vertical_facet_keys != tuple(sorted(set(vertical_facet_keys))):
             raise ValueError("pattern vertical facets must be sorted and unique")
-        if self.horizontal_facets.finding_kind != self.kind or (
-            self.horizontal_facets.finding_category != self.category
+        expected_horizontal_scope = {
+            "duplicate_effect": ("action", "observed_action"),
+            "unexpected_effect": ("action", "observed_action"),
+            "missing_effect": ("action", "observed_action"),
+            "changed_grounded_effect_argument": ("action", "observed_action"),
+            "unstable_behavior": ("outcome", "observed_outcome"),
+            "customer_invariant_violation": ("rule", "evaluated_rule"),
+        }[self.category]
+        if (
+            self.horizontal_facets.failure_type != self.category
+            or (
+                self.horizontal_facets.affected_subject,
+                self.horizontal_facets.evidence_level,
+            )
+            != expected_horizontal_scope
         ):
             raise ValueError("horizontal facets must match the pattern finding type")
         if self.review_status != "confirmed" and self.review_severity != "unrated":
