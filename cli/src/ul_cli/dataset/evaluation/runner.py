@@ -31,7 +31,7 @@ from ul.http_environment import JsonHttpEnvironmentConnection
 from ul.local_target import LocalTargetConnection
 
 from ul_cli.dataset_augmentation_ledger import DatasetAugmentationLedger
-from ul_cli.dataset_campaign import create_dataset_campaign_plan
+from ul_cli.dataset_campaign import DatasetCampaignPlan
 from ul_cli.dataset_review import DatasetEvidenceRunContext
 from ul_cli.dataset_trial_journal import DatasetTrialJournal
 
@@ -72,18 +72,13 @@ async def evaluate_interaction_records(
     evaluator_preflight: EvaluatorModelPreflight,
     trial_journal: DatasetTrialJournal | None = None,
     progress_json: bool = False,
+    progress_plan: DatasetCampaignPlan | None = None,
 ) -> tuple[DatasetEvaluationResult, ...]:
     results: list[DatasetEvaluationResult] = []
     work_upper_bound = len(records) * repetitions * (1 + len(operator_ids))
-    progress_plan = create_dataset_campaign_plan(
-        records=records,
-        selected_operator_ids=operator_ids,
-        repetitions=repetitions,
-        target_calls_per_execution=1,
-        settings=settings,
-        saved_augmentations=saved_augmentations,
-        requires_preflight=False,
-    )
+    semantic_call_budget = progress_plan.calls.total_semantic_model if progress_plan else 0
+    token_budget = progress_plan.tokens.maximum if progress_plan else 0
+    timeout_seconds = settings.timeout_seconds if progress_plan else 1
     progress_renderer = (
         JsonCampaignProgressRenderer(sys.stderr)
         if progress_json
@@ -92,15 +87,15 @@ async def evaluate_interaction_records(
     progress_tracker = CampaignProgressTracker(
         case_count=len(records),
         work_upper_bound=work_upper_bound,
-        target_call_budget=work_upper_bound,
-        semantic_call_budget=progress_plan.calls.total_semantic_model,
+        target_call_budget=planned_target_calls,
+        semantic_call_budget=semantic_call_budget,
         environment_call_budget=max_environment_api_calls,
-        token_budget=progress_plan.tokens.maximum,
+        token_budget=token_budget,
         maximum_wall_time_seconds=max(
             1,
-            work_upper_bound + progress_plan.calls.total_semantic_model,
+            planned_target_calls + semantic_call_budget,
         )
-        * settings.timeout_seconds,
+        * timeout_seconds,
         publish=SafeCampaignProgressPublisher(progress_renderer).publish,
     )
     campaign_control = CampaignControl()

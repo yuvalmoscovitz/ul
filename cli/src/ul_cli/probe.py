@@ -1267,6 +1267,7 @@ def _run_campaign(
                         repetitions=repetitions,
                         max_environment_api_calls=plan.calls.total_environment_api,
                         planned_target_calls=plan.calls.total_environment_api,
+                        progress_plan=plan,
                         run_context=run_context,
                         evaluator_preflight=evaluator_preflight,
                     )

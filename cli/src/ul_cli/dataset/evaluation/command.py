@@ -1130,16 +1130,20 @@ def evaluate_dataset(
     try:
         with output_stream, finding_output_stream:
             evaluation_parameters = inspect.signature(evaluate_interaction_records).parameters
-            accepts_trial_journal = "trial_journal" in evaluation_parameters or any(
+            accepts_extra_arguments = any(
                 parameter.kind is inspect.Parameter.VAR_KEYWORD
                 for parameter in evaluation_parameters.values()
             )
-            durable_arguments = (
-                {"trial_journal": trial_journal}
-                if trial_journal is not None and accepts_trial_journal
-                else {}
-            )
-            if progress_json:
+            durable_arguments: dict[str, object] = {}
+            if "progress_plan" in evaluation_parameters or accepts_extra_arguments:
+                durable_arguments["progress_plan"] = campaign_plan
+            if trial_journal is not None and (
+                "trial_journal" in evaluation_parameters or accepts_extra_arguments
+            ):
+                durable_arguments["trial_journal"] = trial_journal
+            if progress_json and (
+                "progress_json" in evaluation_parameters or accepts_extra_arguments
+            ):
                 durable_arguments["progress_json"] = True
             evaluation_runner = cast(Any, evaluate_interaction_records)
             if invariant_suite is not None:

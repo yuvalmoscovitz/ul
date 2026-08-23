@@ -367,6 +367,7 @@ def test_resume_skips_already_processed_interaction_ids(
         saved_augmentations: object,
         redaction_engine: object,
         evaluator_preflight: object,
+        progress_plan: object,
     ) -> tuple[object, ...]:
         del (
             operator_ids,
@@ -375,6 +376,7 @@ def test_resume_skips_already_processed_interaction_ids(
             max_environment_api_calls,
             planned_target_calls,
             augmentation_ledger,
+            progress_plan,
         )
         assert (
             cast(dict[str, DatasetAugmentationResult], saved_augmentations)["interaction-2"]

@@ -266,6 +266,7 @@ def test_execution_creates_private_explicit_output(
         redaction_engine: object,
         evaluator_preflight: object,
         trial_journal: object,
+        progress_plan: Any,
     ) -> tuple[object, ...]:
         del settings, target, run_context, augmentation_ledger, saved_augmentations
         assert evaluator_preflight == _evaluator_preflight()
@@ -275,6 +276,7 @@ def test_execution_creates_private_explicit_output(
         assert repetitions == 3
         assert max_environment_api_calls == 100
         assert planned_target_calls == 30
+        assert progress_plan.calls.total_environment_api == 30
         output_stream.write('{"saved":true}\n')
         output_stream.flush()
         return ()
@@ -518,6 +520,7 @@ def test_execution_wires_redaction_into_records_pipeline_and_run_context(
         redaction_engine: object,
         evaluator_preflight: object,
         trial_journal: object,
+        progress_plan: object,
     ) -> tuple[object, ...]:
         del (
             repetitions,
@@ -525,6 +528,7 @@ def test_execution_wires_redaction_into_records_pipeline_and_run_context(
             planned_target_calls,
             augmentation_ledger,
             saved_augmentations,
+            progress_plan,
         )
         assert redaction_engine is not None
         assert evaluator_preflight == _evaluator_preflight()
@@ -673,6 +677,7 @@ def test_target_config_runs_nested_request_and_response_against_loopback(
             redaction_engine: object,
             evaluator_preflight: object,
             trial_journal: object,
+            progress_plan: object,
         ) -> tuple[object, ...]:
             del (
                 operator_ids,
@@ -683,6 +688,7 @@ def test_target_config_runs_nested_request_and_response_against_loopback(
                 run_context,
                 augmentation_ledger,
                 saved_augmentations,
+                progress_plan,
             )
             assert redaction_engine is None
             assert evaluator_preflight == _evaluator_preflight()
