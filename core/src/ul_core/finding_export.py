@@ -32,6 +32,7 @@ _ARTIFACT_REFERENCE_ID_PATTERN = r"^ular_v1_[0-9a-f]{64}$"
 _ANNOTATION_ID_PATTERN = r"^ulann_v1_[0-9a-f]{64}$"
 _BUNDLE_ID_PATTERN = r"^ulfb_v1_[0-9a-f]{64}$"
 _SAFE_BUNDLE_ID_PATTERN = r"^ulfs_v1_[0-9a-f]{64}$"
+_SAFE_OPERATIONAL_ID_PATTERN = r"^ulop_v1_[0-9a-f]{64}$"
 _CATEGORY_PATTERN = r"^[a-z][a-z0-9._-]{0,99}$"
 _MEDIA_TYPE_PATTERN = r"^[a-z0-9][a-z0-9.+-]{0,99}/[a-z0-9][a-z0-9.+-]{0,99}$"
 _TRACE_ID = re.compile(r"^[0-9a-f]{32}$")
@@ -181,7 +182,7 @@ class FindingRecord(_StrictModel):
     review_status: FindingReviewStatus
     severity: FindingExportSeverity = "unrated"
     evidence_level: FindingEvidenceLevel
-    target_trace: W3CTraceReference
+    target_trace: W3CTraceReference | None = None
     evidence_references: tuple[FindingEvidenceReference, ...] = Field(min_length=1)
     artifact_references: tuple[FindingArtifactReference, ...] = ()
     recorded_at: datetime
@@ -298,20 +299,20 @@ class SafeFindingRecord(_StrictModel):
     severity: FindingExportSeverity
     evidence_facts: tuple[EvidenceFact, ...] = Field(min_length=1)
     evidence_authorities: tuple[EvidenceAuthority, ...] = Field(min_length=1)
-    target_trace: W3CTraceReference
+    target_trace: W3CTraceReference | None = None
     evidence_reference_ids: tuple[str, ...] = Field(min_length=1)
     artifact_reference_ids: tuple[str, ...] = ()
     recorded_at: datetime
-    campaign_id: str = Field(min_length=1, max_length=500)
-    case_id: str = Field(min_length=1, max_length=500)
-    probe_id: str | None = Field(default=None, min_length=1, max_length=500)
-    attempt_id: str | None = Field(default=None, min_length=1, max_length=500)
-    session_id: str | None = Field(default=None, min_length=1, max_length=500)
+    campaign_id: str = Field(pattern=_SAFE_OPERATIONAL_ID_PATTERN)
+    case_id: str = Field(pattern=_SAFE_OPERATIONAL_ID_PATTERN)
+    probe_id: str | None = Field(default=None, pattern=_SAFE_OPERATIONAL_ID_PATTERN)
+    attempt_id: str | None = Field(default=None, pattern=_SAFE_OPERATIONAL_ID_PATTERN)
+    session_id: str | None = Field(default=None, pattern=_SAFE_OPERATIONAL_ID_PATTERN)
     turn_ids: tuple[str, ...] = ()
-    variation_id: str | None = Field(default=None, min_length=1, max_length=500)
+    variation_id: str | None = Field(default=None, pattern=_SAFE_OPERATIONAL_ID_PATTERN)
     repetition: int | None = Field(default=None, ge=1)
-    fixture_id: str | None = Field(default=None, min_length=1, max_length=500)
-    fixture_version: str | None = Field(default=None, min_length=1, max_length=500)
+    fixture_id: str | None = Field(default=None, pattern=_SAFE_OPERATIONAL_ID_PATTERN)
+    fixture_version: str | None = Field(default=None, pattern=_SAFE_OPERATIONAL_ID_PATTERN)
 
     @model_validator(mode="after")
     def validate_safe_record(self) -> Self:
@@ -326,8 +327,10 @@ class SafeFindingRecord(_StrictModel):
             raise ValueError("safe finding artifact reference IDs must be sorted and unique")
         if self.turn_ids != tuple(dict.fromkeys(self.turn_ids)):
             raise ValueError("safe finding turn IDs must be unique and ordered")
-        if any(not 1 <= len(turn_id) <= 500 for turn_id in self.turn_ids):
-            raise ValueError("safe finding turn IDs must contain 1 to 500 characters")
+        if any(
+            re.fullmatch(_SAFE_OPERATIONAL_ID_PATTERN, turn_id) is None for turn_id in self.turn_ids
+        ):
+            raise ValueError("safe finding turn IDs must be opaque operational identifiers")
         if (self.fixture_id is None) != (self.fixture_version is None):
             raise ValueError("safe finding fixture ID and version must be provided together")
         return self
@@ -402,7 +405,7 @@ class FindingOtlpEvent(_StrictModel):
     schema_version: Literal["1.0.0"] = "1.0.0"
     finding_id: str = Field(pattern=_FINDING_ID_PATTERN)
     carrier_trace: W3CTraceReference
-    target_trace: W3CTraceReference
+    target_trace: W3CTraceReference | None = None
     time_unix_nano: int = Field(ge=0)
     conclusion: FindingConclusion
     category: str = Field(pattern=_CATEGORY_PATTERN)
@@ -412,18 +415,28 @@ class FindingOtlpEvent(_StrictModel):
     evidence_authorities: tuple[EvidenceAuthority, ...] = Field(min_length=1)
     evidence_reference_ids: tuple[str, ...] = Field(min_length=1)
     artifact_reference_ids: tuple[str, ...] = ()
-    campaign_id: str
-    case_id: str
-    probe_id: str | None = None
-    attempt_id: str | None = None
-    session_id: str | None = None
+    campaign_id: str = Field(pattern=_SAFE_OPERATIONAL_ID_PATTERN)
+    case_id: str = Field(pattern=_SAFE_OPERATIONAL_ID_PATTERN)
+    probe_id: str | None = Field(default=None, pattern=_SAFE_OPERATIONAL_ID_PATTERN)
+    attempt_id: str | None = Field(default=None, pattern=_SAFE_OPERATIONAL_ID_PATTERN)
+    session_id: str | None = Field(default=None, pattern=_SAFE_OPERATIONAL_ID_PATTERN)
     turn_ids: tuple[str, ...] = ()
-    variation_id: str | None = None
+    variation_id: str | None = Field(default=None, pattern=_SAFE_OPERATIONAL_ID_PATTERN)
     repetition: int | None = None
-    fixture_id: str | None = None
-    fixture_version: str | None = None
+    fixture_id: str | None = Field(default=None, pattern=_SAFE_OPERATIONAL_ID_PATTERN)
+    fixture_version: str | None = Field(default=None, pattern=_SAFE_OPERATIONAL_ID_PATTERN)
     effective_annotation_id: str | None = None
     annotator_kind: FindingAnnotatorKind
+
+    @model_validator(mode="after")
+    def validate_operational_ids(self) -> Self:
+        if any(
+            re.fullmatch(_SAFE_OPERATIONAL_ID_PATTERN, turn_id) is None for turn_id in self.turn_ids
+        ):
+            raise ValueError("OTLP finding turn IDs must be opaque operational identifiers")
+        if (self.fixture_id is None) != (self.fixture_version is None):
+            raise ValueError("OTLP finding fixture ID and version must be provided together")
+        return self
 
 
 def finding_evidence_reference_id(

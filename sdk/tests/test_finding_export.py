@@ -34,6 +34,7 @@ from ul_core.finding_export import (
     FindingAnnotation,
     FindingAnnotationInput,
     FindingEvidenceLevel,
+    FindingOtlpEvent,
     FindingProvenance,
     FindingRecord,
     W3CTraceReference,
@@ -44,9 +45,21 @@ from ul_core.finding_export import (
 pytestmark = pytest.mark.asyncio
 _CANARY = "private-customer-content-secret-9f3b"
 _RECORDED_AT = datetime(2026, 8, 23, 7, 0, tzinfo=UTC)
+_TRACE = W3CTraceReference(trace_id="1" * 32, span_id="2" * 16)
+_PRIVATE_OPERATIONAL_IDS = (
+    "customer@example.com",
+    "ticket-42-private-content",
+    "probe-prompt-content",
+    "attempt-customer-name",
+    "session-secret-token",
+    "turn-user-input-content",
+    "variation-ticket-subject",
+    "fixture-customer-account",
+    "fixture-version-email@example.com",
+)
 
 
-def _bundle():
+def _bundle(*, target_trace: W3CTraceReference | None = _TRACE):
     evidence_reference = create_finding_evidence_reference(
         kind="trajectory",
         source_id=f"observer-{_CANARY}",
@@ -65,17 +78,17 @@ def _bundle():
         producer_version="0.1.0",
         config_sha256="c" * 64,
         source_finding_id=f"source-{_CANARY}",
-        campaign_id="campaign-1",
-        case_id="case-1",
+        campaign_id=_PRIVATE_OPERATIONAL_IDS[0],
+        case_id=_PRIVATE_OPERATIONAL_IDS[1],
         source_interaction_id=f"interaction-{_CANARY}",
-        probe_id="probe-1",
-        attempt_id="attempt-1",
-        session_id="session-1",
-        turn_ids=("turn-1",),
-        variation_id="input.surface.rephrase",
+        probe_id=_PRIVATE_OPERATIONAL_IDS[2],
+        attempt_id=_PRIVATE_OPERATIONAL_IDS[3],
+        session_id=_PRIVATE_OPERATIONAL_IDS[4],
+        turn_ids=(_PRIVATE_OPERATIONAL_IDS[5],),
+        variation_id=_PRIVATE_OPERATIONAL_IDS[6],
         repetition=1,
-        fixture_id="accounts",
-        fixture_version="2",
+        fixture_id=_PRIVATE_OPERATIONAL_IDS[7],
+        fixture_version=_PRIVATE_OPERATIONAL_IDS[8],
         metadata={"authorization": f"Bearer {_CANARY}", "prompt": _CANARY},
     )
     evidence_level = FindingEvidenceLevel(
@@ -96,7 +109,7 @@ def _bundle():
         review_status="needs_review",
         severity="unrated",
         evidence_level=evidence_level,
-        target_trace=W3CTraceReference(trace_id="1" * 32, span_id="2" * 16),
+        target_trace=target_trace,
         evidence_references=(evidence_reference,),
         artifact_references=(artifact_reference,),
         recorded_at=_RECORDED_AT,
@@ -122,21 +135,29 @@ async def test_safe_and_private_json_and_jsonl_round_trip() -> None:
 
     assert _CANARY not in safe_json
     assert _CANARY not in safe_jsonl
+    assert all(value not in safe_json for value in _PRIVATE_OPERATIONAL_IDS)
+    assert all(value not in safe_jsonl for value in _PRIVATE_OPERATIONAL_IDS)
     assert _CANARY in private_json
     assert _CANARY in private_jsonl
     parsed_safe = parse_safe_finding_bundle_json(safe_json)
     assert parsed_safe == safe_finding_bundle(bundle)
     assert parse_safe_finding_bundle_jsonl(safe_jsonl) == safe_finding_bundle(bundle)
-    assert parsed_safe.findings[0].campaign_id == "campaign-1"
-    assert parsed_safe.findings[0].case_id == "case-1"
-    assert parsed_safe.findings[0].probe_id == "probe-1"
-    assert parsed_safe.findings[0].attempt_id == "attempt-1"
-    assert parsed_safe.findings[0].session_id == "session-1"
-    assert parsed_safe.findings[0].turn_ids == ("turn-1",)
-    assert parsed_safe.findings[0].variation_id == "input.surface.rephrase"
+    assert parsed_safe.findings[0].campaign_id.startswith("ulop_v1_")
+    assert parsed_safe.findings[0].case_id.startswith("ulop_v1_")
+    assert parsed_safe.findings[0].probe_id is not None
+    assert parsed_safe.findings[0].probe_id.startswith("ulop_v1_")
+    assert parsed_safe.findings[0].attempt_id is not None
+    assert parsed_safe.findings[0].attempt_id.startswith("ulop_v1_")
+    assert parsed_safe.findings[0].session_id is not None
+    assert parsed_safe.findings[0].session_id.startswith("ulop_v1_")
+    assert parsed_safe.findings[0].turn_ids[0].startswith("ulop_v1_")
+    assert parsed_safe.findings[0].variation_id is not None
+    assert parsed_safe.findings[0].variation_id.startswith("ulop_v1_")
     assert parsed_safe.findings[0].repetition == 1
-    assert parsed_safe.findings[0].fixture_id == "accounts"
-    assert parsed_safe.findings[0].fixture_version == "2"
+    assert parsed_safe.findings[0].fixture_id is not None
+    assert parsed_safe.findings[0].fixture_id.startswith("ulop_v1_")
+    assert parsed_safe.findings[0].fixture_version is not None
+    assert parsed_safe.findings[0].fixture_version.startswith("ulop_v1_")
     assert parse_private_finding_bundle_json(private_json) == bundle
     assert parse_private_finding_bundle_jsonl(private_jsonl) == bundle
     with pytest.raises(FindingExportInputError, match="explicit confirmation"):
@@ -268,6 +289,7 @@ async def test_neutral_annotation_appends_review_without_rewriting_evidence() ->
 
 async def test_otlp_carrier_uses_generic_link_and_safe_evaluation_conventions() -> None:
     bundle = _bundle()
+    safe_record = safe_finding_bundle(bundle).findings[0]
 
     first = finding_otlp_json(bundle)
     second = finding_otlp_json(bundle)
@@ -290,21 +312,28 @@ async def test_otlp_carrier_uses_generic_link_and_safe_evaluation_conventions() 
         {"stringValue": "response_observed"},
         {"stringValue": "trajectory_observed"},
     ]
-    assert attributes["underlayer.finding.campaign.id"] == {"stringValue": "campaign-1"}
-    assert attributes["underlayer.finding.case.id"] == {"stringValue": "case-1"}
-    assert attributes["underlayer.finding.probe.id"] == {"stringValue": "probe-1"}
-    assert attributes["underlayer.finding.attempt.id"] == {"stringValue": "attempt-1"}
-    assert attributes["underlayer.finding.session.id"] == {"stringValue": "session-1"}
+    assert attributes["underlayer.finding.campaign.id"] == {"stringValue": safe_record.campaign_id}
+    assert attributes["underlayer.finding.case.id"] == {"stringValue": safe_record.case_id}
+    assert attributes["underlayer.finding.probe.id"] == {"stringValue": safe_record.probe_id}
+    assert attributes["underlayer.finding.attempt.id"] == {"stringValue": safe_record.attempt_id}
+    assert attributes["underlayer.finding.session.id"] == {"stringValue": safe_record.session_id}
     assert attributes["underlayer.finding.turn.ids"]["arrayValue"]["values"] == [
-        {"stringValue": "turn-1"}
+        {"stringValue": safe_record.turn_ids[0]}
     ]
     assert attributes["underlayer.finding.variation.id"] == {
-        "stringValue": "input.surface.rephrase"
+        "stringValue": safe_record.variation_id
     }
     assert attributes["underlayer.finding.repetition"] == {"intValue": "1"}
-    assert attributes["underlayer.finding.fixture.id"] == {"stringValue": "accounts"}
-    assert attributes["underlayer.finding.fixture.version"] == {"stringValue": "2"}
+    assert attributes["underlayer.finding.fixture.id"] == {"stringValue": safe_record.fixture_id}
+    assert attributes["underlayer.finding.fixture.version"] == {
+        "stringValue": safe_record.fixture_version
+    }
     assert _CANARY not in encoded
+    assert all(value not in encoded for value in _PRIVATE_OPERATIONAL_IDS)
+    unsafe_event = events[0].model_dump(mode="python")
+    unsafe_event["campaign_id"] = _PRIVATE_OPERATIONAL_IDS[0]
+    with pytest.raises(ValidationError, match="string_pattern_mismatch"):
+        FindingOtlpEvent.model_validate(unsafe_event)
     for forbidden in ("content", "secret", "raw_trace", "state", "prompt", "authorization"):
         assert forbidden not in encoded.casefold()
 
@@ -344,6 +373,31 @@ async def test_annotation_emits_new_carrier_identity_time_and_human_kind() -> No
     assert reviewed_attributes["underlayer.finding.annotation.id"] == {
         "stringValue": reviewed.annotations[0].annotation_id
     }
+
+
+async def test_response_only_finding_round_trips_and_emits_no_span_link() -> None:
+    bundle = _bundle(target_trace=None)
+
+    private_json = private_finding_bundle_json(bundle, private_export_confirmed=True)
+    private_jsonl = private_finding_bundle_jsonl(bundle, private_export_confirmed=True)
+    safe_json = safe_finding_bundle_json(bundle)
+    safe_jsonl = safe_finding_bundle_jsonl(bundle)
+    payload = finding_otlp_json(bundle)
+    event = finding_otlp_events(bundle)[0]
+    span = payload["resourceSpans"][0]["scopeSpans"][0]["spans"][0]
+    attributes = {
+        item["key"]: item["value"] for item in span["attributes"] if isinstance(item, dict)
+    }
+
+    assert parse_private_finding_bundle_json(private_json) == bundle
+    assert parse_private_finding_bundle_jsonl(private_jsonl) == bundle
+    assert parse_safe_finding_bundle_json(safe_json) == safe_finding_bundle(bundle)
+    assert parse_safe_finding_bundle_jsonl(safe_jsonl) == safe_finding_bundle(bundle)
+    assert bundle.findings[0].target_trace is None
+    assert event.target_trace is None
+    assert "links" not in span
+    assert attributes["underlayer.finding.campaign.id"]["stringValue"].startswith("ulop_v1_")
+    assert all(value not in json.dumps(payload) for value in _PRIVATE_OPERATIONAL_IDS)
 
 
 async def test_otlp_payload_reaches_bounded_ul_receiver() -> None:

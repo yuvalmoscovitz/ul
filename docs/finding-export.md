@@ -3,11 +3,14 @@
 UL findings have two neutral, versioned export forms:
 
 - `finding_otlp_json(bundle)` and `safe_finding_bundle_json/jsonl(bundle)` are safe by
-  default. They contain the allowlisted campaign, case, probe, attempt, session, turn,
-  variation, repetition, and fixture identifiers; category; review state; severity; exact
-  evidence facts and authorities; hashes; and W3C trace/span linkage. They omit finding
+  default. They contain field-scoped SHA-256 pseudonyms for the allowlisted campaign, case,
+  probe, attempt, session, turn, variation, and fixture identifiers; the numeric repetition;
+  category; review state; severity; exact evidence facts and authorities; hashes; and optional W3C
+  trace/span linkage. They omit finding
   content, prompts, secrets, raw traces, state, private metadata, source IDs, locators, and
-  review explanations. Operational ID fields must contain IDs, never private content.
+  review explanations. Original operational values remain private even when an upstream system put
+  an email address, ticket title, or input text in an ID field. Pseudonyms use the opaque
+  `ulop_v1_<sha256>` form and are stable only within their field namespace.
 - `private_finding_bundle_json/jsonl(bundle, private_export_confirmed=True)` preserves the
   complete validated record. Treat this output as sensitive evidence and store it only in an
   access-controlled location. The explicit confirmation prevents selecting it accidentally.
@@ -26,7 +29,9 @@ Each safe finding becomes an OTLP/HTTP JSON evaluator carrier span:
 - The carrier has a deterministic W3C trace ID and span ID. An appended review emits a new
   carrier identity at the review time; it never changes the identity or timestamp of an
   already-exported carrier.
-- Its single span link points to the agent span identified by `target_trace`.
+- When `target_trace` is available, its single span link points to that agent span. Response-only
+  findings may set `target_trace=None`; their carrier has no span link and retains pseudonymous
+  campaign/case/probe/session correlation attributes.
 - `openinference.span.kind=EVALUATOR` and flattened
   `evaluations.0.evaluation.*` attributes make the post-hoc evaluation discoverable by
   OpenInference-compatible tooling. The annotator kind is `HUMAN`, `LLM`, or `CODE` from the

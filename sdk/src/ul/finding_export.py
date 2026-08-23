@@ -97,7 +97,7 @@ def create_finding_record(
     review_status: FindingReviewStatus,
     severity: FindingExportSeverity,
     evidence_level: FindingEvidenceLevel,
-    target_trace: W3CTraceReference,
+    target_trace: W3CTraceReference | None,
     evidence_references: tuple[FindingEvidenceReference, ...],
     recorded_at: datetime,
     provenance: FindingProvenance,
@@ -388,17 +388,30 @@ def _safe_finding(
         evidence_reference_ids=tuple(item.reference_id for item in finding.evidence_references),
         artifact_reference_ids=tuple(item.reference_id for item in finding.artifact_references),
         recorded_at=finding.recorded_at,
-        campaign_id=finding.provenance.campaign_id,
-        case_id=finding.provenance.case_id,
-        probe_id=finding.provenance.probe_id,
-        attempt_id=finding.provenance.attempt_id,
-        session_id=finding.provenance.session_id,
-        turn_ids=finding.provenance.turn_ids,
-        variation_id=finding.provenance.variation_id,
+        campaign_id=_safe_operational_id("campaign", finding.provenance.campaign_id),
+        case_id=_safe_operational_id("case", finding.provenance.case_id),
+        probe_id=_optional_safe_operational_id("probe", finding.provenance.probe_id),
+        attempt_id=_optional_safe_operational_id("attempt", finding.provenance.attempt_id),
+        session_id=_optional_safe_operational_id("session", finding.provenance.session_id),
+        turn_ids=tuple(
+            _safe_operational_id("turn", turn_id) for turn_id in finding.provenance.turn_ids
+        ),
+        variation_id=_optional_safe_operational_id("variation", finding.provenance.variation_id),
         repetition=finding.provenance.repetition,
-        fixture_id=finding.provenance.fixture_id,
-        fixture_version=finding.provenance.fixture_version,
+        fixture_id=_optional_safe_operational_id("fixture", finding.provenance.fixture_id),
+        fixture_version=_optional_safe_operational_id(
+            "fixture-version", finding.provenance.fixture_version
+        ),
     )
+
+
+def _safe_operational_id(field: str, value: str) -> str:
+    digest = hashlib.sha256(f"underlayer-safe-operational-id:{field}:{value}".encode()).hexdigest()
+    return f"ulop_v1_{digest}"
+
+
+def _optional_safe_operational_id(field: str, value: str | None) -> str | None:
+    return _safe_operational_id(field, value) if value is not None else None
 
 
 def _finding_otlp_event(
@@ -487,7 +500,7 @@ def _otlp_span(event: FindingOtlpEvent) -> dict[str, JsonValue]:
         _otlp_attribute("underlayer.finding.review.status", event.review_status),
         _otlp_attribute("underlayer.finding.evidence.facts", event.evidence_facts),
     ]
-    return cast(
+    span = cast(
         dict[str, JsonValue],
         {
             "traceId": event.carrier_trace.trace_id,
@@ -504,15 +517,17 @@ def _otlp_span(event: FindingOtlpEvent) -> dict[str, JsonValue]:
                     "attributes": generic_event_attributes,
                 }
             ],
-            "links": [
-                {
-                    "traceId": event.target_trace.trace_id,
-                    "spanId": event.target_trace.span_id,
-                }
-            ],
             "status": {"code": 1},
         },
     )
+    if event.target_trace is not None:
+        span["links"] = [
+            {
+                "traceId": event.target_trace.trace_id,
+                "spanId": event.target_trace.span_id,
+            }
+        ]
+    return span
 
 
 def _otlp_attribute(key: str, value: object) -> dict[str, JsonValue]:
