@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
+from typing import cast
 
 from pydantic import JsonValue
 from ul_core.contracts import EnvironmentExecutor
@@ -13,6 +14,7 @@ from ul_core.evaluation import (
 )
 from ul_core.models import ConversationRole, ConversationTurn
 
+from ul.outcome_projection import OutcomeProjection, OutcomeProjectionError
 from ul.state_hooks import diff_json_states
 
 
@@ -53,6 +55,10 @@ def validate_execution_evidence(
         raise ValueError("environment evidence identity does not match the connection")
     if evidence.environment_config_sha256 != environment.config_sha256:
         raise ValueError("environment evidence config does not match the connection")
+    configured_projection = cast(
+        OutcomeProjection | None, getattr(environment, "outcome_projection", None)
+    )
+    validate_outcome_projection_evidence(evidence, configured_projection)
     requested_event = case.timeout_after_commit_event
     event_evidence = evidence.timeout_after_commit_event
     if (requested_event is None) != (event_evidence is None):
@@ -121,6 +127,37 @@ def validate_execution_evidence(
             raise ValueError("environment state evidence authority does not match its capabilities")
 
 
+def validate_outcome_projection_evidence(
+    evidence: ExecutionEvidence,
+    configured_projection: OutcomeProjection | None,
+) -> None:
+    if evidence.lifecycle.terminal_status != "succeeded":
+        if evidence.outcome_projection is not None:
+            raise ValueError("failed execution evidence cannot contain an outcome projection")
+        return
+    if configured_projection is None:
+        if evidence.outcome_projection is not None:
+            raise ValueError("execution evidence contains an unconfigured outcome projection")
+        return
+    definition = configured_projection.model_dump(mode="json")
+    if evidence.outcome_projection != definition:
+        raise ValueError("execution outcome projection does not match the configured target")
+    if evidence.outcome_projection_sha256 != configured_projection.digest:
+        raise ValueError("execution outcome projection digest does not match its definition")
+    try:
+        for turn in evidence.turns:
+            normalized = configured_projection.project(turn.response)
+            public = configured_projection.public_result(normalized)
+            if turn.normalized_response != normalized:
+                raise ValueError("normalized response does not match the raw target response")
+            if turn.public_normalized_response != public:
+                raise ValueError("public normalized response does not match its projection")
+            if turn.outcome_projection_sha256 != configured_projection.digest:
+                raise ValueError("turn outcome projection digest does not match its definition")
+    except OutcomeProjectionError:
+        raise ValueError("execution outcome projection cannot be reproduced") from None
+
+
 def observed_outputs_from_evidence(
     evidence: ExecutionEvidence,
 ) -> tuple[ObservedAgentOutput, ...]:
@@ -130,8 +167,17 @@ def observed_outputs_from_evidence(
     for turn in evidence.turns:
         outputs.append(
             ObservedAgentOutput(
-                raw_output=turn.response,
+                raw_output=(
+                    turn.public_normalized_response
+                    if turn.public_normalized_response is not None
+                    else turn.response
+                ),
                 metadata={
+                    **(
+                        {"outcome_projection_sha256": turn.outcome_projection_sha256}
+                        if turn.outcome_projection_sha256 is not None
+                        else {}
+                    ),
                     **(
                         {"committed_state_snapshot": turn.state_snapshot}
                         if turn.state_snapshot is not None

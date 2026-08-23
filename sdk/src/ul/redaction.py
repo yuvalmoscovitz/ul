@@ -31,6 +31,7 @@ from ul_core.dataset import (
 )
 from ul_core.evaluation import (
     EnvironmentCapabilities,
+    EnvironmentTurnEvidence,
     EvaluationCase,
     ExecutionEvidence,
     ProbeExecutionEvent,
@@ -39,6 +40,7 @@ from ul_core.evaluation import (
 from ul_core.models import ULModel
 
 from ul.deconstruction import SemanticCallMetrics
+from ul.outcome_projection import OutcomeProjection, OutcomeProjectionError
 
 if sys.platform == "win32":
     import msvcrt
@@ -587,6 +589,13 @@ class RehydratingEnvironmentConnection:
     def config_sha256(self) -> str:
         return self._environment.config_sha256
 
+    @property
+    def outcome_projection(self) -> OutcomeProjection | None:
+        return cast(
+            OutcomeProjection | None,
+            getattr(self._environment, "outcome_projection", None),
+        )
+
     def api_calls_for_case(self, case: EvaluationCase) -> int:
         return self._environment.api_calls_for_case(case)
 
@@ -605,19 +614,36 @@ class RehydratingEnvironmentConnection:
         except RedactionBoundaryError:
             raise
         evidence = await self._environment.execute(rehydrated_case)
-        protected_turns = tuple(
-            turn.model_copy(
-                update={
-                    "response": self._engine.transform(turn.response, location="output").value,
-                    "state_snapshot": (
-                        self._engine.transform(turn.state_snapshot, location="output").value
-                        if turn.state_snapshot is not None
-                        else None
-                    ),
-                }
+        protected_turns: list[EnvironmentTurnEvidence] = []
+        for turn in evidence.turns:
+            protected_response = self._engine.transform(turn.response, location="output").value
+            projection = self.outcome_projection
+            try:
+                normalized_response = (
+                    projection.project(protected_response) if projection is not None else None
+                )
+                public_normalized_response = (
+                    projection.public_result(normalized_response)
+                    if projection is not None and normalized_response is not None
+                    else None
+                )
+            except OutcomeProjectionError:
+                raise RedactionBoundaryError() from None
+            protected_turns.append(
+                turn.model_copy(
+                    update={
+                        "response": protected_response,
+                        "normalized_response": normalized_response,
+                        "public_normalized_response": public_normalized_response,
+                        "state_snapshot": (
+                            self._engine.transform(turn.state_snapshot, location="output").value
+                            if turn.state_snapshot is not None
+                            else None
+                        ),
+                    }
+                )
             )
-            for turn in evidence.turns
-        )
+        protected_turns_tuple = tuple(protected_turns)
         protected_observations = tuple(
             ProbeObservation.model_validate(
                 {
@@ -707,15 +733,25 @@ class RehydratingEnvironmentConnection:
                     if evidence.initial_state is not None
                     else None
                 ),
-                "turns": protected_turns,
+                "turns": protected_turns_tuple,
                 "observations": protected_observations,
                 "execution_events": protected_execution_events,
-                "final_response": protected_turns[-1].response if protected_turns else None,
+                "final_response": (
+                    protected_turns_tuple[-1].response if protected_turns_tuple else None
+                ),
+                "normalized_result": (
+                    protected_turns_tuple[-1].normalized_response if protected_turns_tuple else None
+                ),
+                "public_normalized_result": (
+                    protected_turns_tuple[-1].public_normalized_response
+                    if protected_turns_tuple
+                    else None
+                ),
                 "final_state": (
                     evidence.final_state.model_copy(
-                        update={"value": protected_turns[-1].state_snapshot}
+                        update={"value": protected_turns_tuple[-1].state_snapshot}
                     )
-                    if evidence.final_state is not None and protected_turns
+                    if evidence.final_state is not None and protected_turns_tuple
                     else None
                 ),
             }

@@ -12,9 +12,13 @@ import pytest
 from typer.testing import CliRunner
 from ul import (
     DatasetAugmentationResult,
+    EnvironmentLifecycleEvidence,
+    EnvironmentTurnEvidence,
     EvaluatorModelPreflight,
+    ExecutionEvidence,
     JsonHttpEnvironmentConfig,
     ObservedAgentOutput,
+    OutcomeProjection,
 )
 from ul.dataset_invariants import (
     DatasetInvariantSuite,
@@ -605,6 +609,84 @@ def test_resume_snapshot_detects_same_summary_content_change() -> None:
     assert first_snapshot.has_review_findings == changed_snapshot.has_review_findings
     assert first_snapshot.raw_evidence_sha256 != changed_snapshot.raw_evidence_sha256
     assert first_snapshot != changed_snapshot
+
+
+def test_resume_rejects_projected_evidence_not_derived_from_raw_response() -> None:
+    evaluation_result = _evaluation_result("interaction-1")
+    projection = OutcomeProjection(action="/result/action")
+    base_context = cast(Any, _run_context((evaluation_result.source,)))
+    projected_config = base_context.target.config.model_copy(update={"outcome": projection})
+    run_context = cast(
+        Any,
+        _run_context((evaluation_result.source,), target_config=projected_config),
+    )
+    forged_normalized = {"action": "approve"}
+    execution_evidence = ExecutionEvidence(
+        evidence_scope="response_only",
+        case_id="interaction-1:current_baseline:round-1",
+        environment_id="test-environment",
+        environment_config_sha256="a" * 64,
+        turns=(
+            EnvironmentTurnEvidence(
+                turn_id="turn-1",
+                response={"result": {"action": "refund"}},
+                normalized_response=forged_normalized,
+                public_normalized_response=forged_normalized,
+                outcome_projection_sha256=projection.digest,
+            ),
+        ),
+        final_response={"result": {"action": "refund"}},
+        normalized_result=forged_normalized,
+        public_normalized_result=forged_normalized,
+        outcome_projection=projection.model_dump(mode="json"),
+        outcome_projection_sha256=projection.digest,
+        lifecycle=EnvironmentLifecycleEvidence(
+            terminal_status="succeeded",
+            completed_phases=("execute_turn",),
+            delivery="certain",
+            cleanup="not_attempted",
+            environment_state_uncertain=False,
+        ),
+    )
+    baseline_trial = evaluation_result.baseline.trial_set.trials[0].model_copy(
+        update={"execution_evidence": execution_evidence}
+    )
+    forged_result = evaluation_result.model_copy(
+        update={
+            "baseline": evaluation_result.baseline.model_copy(
+                update={
+                    "trial_set": evaluation_result.baseline.trial_set.model_copy(
+                        update={"trials": (baseline_trial,)}
+                    )
+                }
+            )
+        }
+    )
+
+    with pytest.raises(ValueError, match="normalized response does not match"):
+        dataset_review._validate_resumed_outcome_projections(
+            forged_result,
+            run_context.target,
+        )
+
+
+def test_resume_accepts_canonical_probe_projection_receipt() -> None:
+    evaluation_result = _evaluation_result("interaction-1")
+    projection = OutcomeProjection(
+        complete_result="/result",
+        private_json_pointers=("/secret",),
+    )
+    receipt = {
+        "outcome_projection": projection.model_dump(mode="json"),
+        "outcome_projection_sha256": projection.digest,
+    }
+    target = dataset_review.DatasetEvidenceTarget(
+        kind="probe_target",
+        receipt=receipt,
+        sha256=dataset_review._canonical_json_sha256(receipt),
+    )
+
+    dataset_review._validate_resumed_outcome_projections(evaluation_result, target)
 
 
 def test_resume_accepts_rich_evidence_schema_1_9() -> None:

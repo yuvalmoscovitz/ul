@@ -244,7 +244,140 @@ def test_private_smoke_output_requires_explicit_flag(
     )
 
     assert result.exit_code == 0, result.output
-    assert "Private normalized response:" in result.output
+    assert "Private raw target response:" in result.output
+
+
+def _write_projected_callable_config(
+    path: Path, outcome: dict[str, object], *, target: str = "customer_agent:run"
+) -> Path:
+    config = path / "projected-target.json"
+    config.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "kind": "python_callable",
+                "target_id": "projected-agent",
+                "working_directory": str(path),
+                "interpreter": str(Path(sys.executable).resolve()),
+                "target": target,
+                "outcome": outcome,
+            }
+        ),
+        encoding="utf-8",
+    )
+    return config
+
+
+def test_smoke_previews_projection_before_any_semantic_call(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _write_callable(tmp_path)
+    dataset = _write_dataset(tmp_path)
+    config = _write_projected_callable_config(
+        tmp_path,
+        {
+            "schema_version": "1.0.0",
+            "complete_result": "",
+            "private_json_pointers": ["/source"],
+        },
+    )
+    monkeypatch.chdir(tmp_path)
+
+    async def unexpected_preflight(*args: object, **kwargs: object) -> None:
+        raise AssertionError("semantic preflight must not run before paid confirmation")
+
+    monkeypatch.setattr(probe_module, "preflight_evaluator", unexpected_preflight)
+    result = runner.invoke(app, ["probe", str(dataset), "--target", str(config)], input="y\nn\n")
+
+    assert result.exit_code == 0, result.output
+    assert "Target-reported normalized result preview:" in result.output
+    assert "State summary: unverified (no state observation configured)" in result.output
+    assert '"source":"[PRIVATE]"' in result.output
+    assert "live-call" not in result.output
+    saved = json.loads((tmp_path / ".ul" / "probe.json").read_text())
+    assert len(saved["outcome_projection_sha256"]) == 64
+
+
+def test_invalid_smoke_projection_names_selector_and_makes_zero_semantic_calls(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _write_callable(tmp_path)
+    dataset = _write_dataset(tmp_path)
+    config = _write_projected_callable_config(
+        tmp_path,
+        {"schema_version": "1.0.0", "action": "/missing/action"},
+    )
+    monkeypatch.chdir(tmp_path)
+    semantic_calls = 0
+
+    async def unexpected_preflight(*args: object, **kwargs: object) -> None:
+        nonlocal semantic_calls
+        semantic_calls += 1
+
+    monkeypatch.setattr(probe_module, "preflight_evaluator", unexpected_preflight)
+    result = runner.invoke(app, ["probe", str(dataset), "--target", str(config)], input="y\n")
+
+    assert result.exit_code == 2
+    assert "Reason: PROBE_OUTCOME_PROJECTION_INVALID" in result.output
+    assert "'action' at selector '/missing/action' does not resolve" in result.output
+    assert "Restore a known-safe fixture before retrying" in result.output
+    assert "Target safe to reuse: no" in result.output
+    assert semantic_calls == 0
+    assert not (tmp_path / ".ul").exists()
+
+
+def test_saved_probe_binding_rejects_altered_projection_digest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _write_callable(tmp_path)
+    dataset = _write_dataset(tmp_path)
+    config = _write_projected_callable_config(
+        tmp_path,
+        {"schema_version": "1.0.0", "complete_result": ""},
+    )
+    monkeypatch.chdir(tmp_path)
+    first = runner.invoke(app, ["probe", str(dataset), "--target", str(config)], input="y\nn\n")
+    assert first.exit_code == 0, first.output
+    saved_path = tmp_path / ".ul" / "probe.json"
+    saved = json.loads(saved_path.read_text())
+    saved["outcome_projection_sha256"] = "0" * 64
+    saved_path.write_text(json.dumps(saved), encoding="utf-8")
+    saved_path.chmod(0o600)
+
+    second = runner.invoke(app, ["probe", str(dataset), "--target", str(config)])
+
+    assert second.exit_code == 2
+    assert "Reason: PROBE_CONFIG_EXISTS" in second.output
+    assert len((tmp_path / "target-invocations.jsonl").read_text().splitlines()) == 1
+
+
+def test_run_target_receipt_records_projection_definition_and_digest(tmp_path: Path) -> None:
+    _write_callable(tmp_path)
+    config = _write_projected_callable_config(
+        tmp_path,
+        {
+            "schema_version": "1.0.0",
+            "action": "/result/action",
+            "status": "/result/status",
+        },
+    )
+    resolved = probe_module._resolve_target(str(config), allow_insecure_http=False)
+    assert resolved.config.outcome is not None
+
+    receipt = probe_module._target_evidence_receipt(resolved)
+
+    assert receipt["outcome_projection"] == {
+        "schema_version": "1.0.0",
+        "action": "/result/action",
+        "status": "/result/status",
+        "resource_id": None,
+        "decision": None,
+        "amount": None,
+        "effects": None,
+        "complete_result": None,
+        "private_json_pointers": [],
+    }
+    assert receipt["outcome_projection_sha256"] == resolved.config.outcome.digest
 
 
 def test_changed_target_artifact_is_rejected_immediately_before_launch(
@@ -718,7 +851,9 @@ def test_public_documentation_flow_runs_real_callable_campaign_and_report(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     (tmp_path / "agent.py").write_text(
-        "def run(value):\n    return {'action': 'lookup', 'ticket': 42}\n",
+        "def run(value):\n"
+        "    return {'result': {'action': 'lookup', 'ticket': 42, "
+        "'customer': {'email': 'private@example.test'}}}\n",
         encoding="utf-8",
     )
     dataset = tmp_path / "interactions.jsonl"
@@ -726,6 +861,15 @@ def test_public_documentation_flow_runs_real_callable_campaign_and_report(
         '{"id":"case-1","input":"Return the status for ticket 42.",'
         '"output":{"action":"lookup","ticket":42}}\n',
         encoding="utf-8",
+    )
+    config = _write_projected_callable_config(
+        tmp_path,
+        {
+            "schema_version": "1.0.0",
+            "complete_result": "/result",
+            "private_json_pointers": ["/customer/email"],
+        },
+        target="agent:run",
     )
     output = tmp_path / ".ul" / "runs" / "probe-evidence.jsonl"
     semantic_model = _CleanRoomSemanticModel()
@@ -753,7 +897,7 @@ def test_public_documentation_flow_runs_real_callable_campaign_and_report(
             "probe",
             str(dataset),
             "--target",
-            "agent:run",
+            str(config),
             "--output",
             str(output),
         ],
@@ -773,9 +917,81 @@ def test_public_documentation_flow_runs_real_callable_campaign_and_report(
     assert evidence["run_context"]["semantic_settings"]["model"]
     assert evidence["run_context"]["target"]["kind"] == "probe_target"
     assert evidence["run_context"]["target"]["receipt"]["confirmation_sha256"]
-    assert evidence["technical_details"]["baseline"]["trial_set"]["trials"][0][
-        "execution_evidence"
-    ]["environment_id"].startswith("probe-")
+    assert (
+        evidence["run_context"]["target"]["receipt"]["outcome_projection"]["complete_result"]
+        == "/result"
+    )
+    assert (
+        evidence["technical_details"]["baseline"]["trial_set"]["trials"][0]["execution_evidence"][
+            "public_normalized_result"
+        ]["customer"]["email"]
+        == "[PRIVATE]"
+    )
+
+
+def test_campaign_projection_failure_retains_exact_reason_and_partial_work(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (tmp_path / "agent.py").write_text(
+        "from pathlib import Path\n\n"
+        "def run(value):\n"
+        "    count_path = Path('projection-call-count')\n"
+        "    count = int(count_path.read_text()) + 1 if count_path.exists() else 1\n"
+        "    count_path.write_text(str(count))\n"
+        "    return {'result': {'action': 'lookup'}} if count == 1 else {'result': {}}\n",
+        encoding="utf-8",
+    )
+    dataset = tmp_path / "interactions.jsonl"
+    dataset.write_text(
+        '{"id":"case-1","input":"Return the status for ticket 42.",'
+        '"output":{"action":"lookup","ticket":42}}\n',
+        encoding="utf-8",
+    )
+    config = _write_projected_callable_config(
+        tmp_path,
+        {"schema_version": "1.0.0", "action": "/result/action"},
+        target="agent:run",
+    )
+    output = tmp_path / ".ul" / "runs" / "projection-failure.jsonl"
+    semantic_model = _CleanRoomSemanticModel()
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("UL_LIVE", "true")
+    monkeypatch.setenv("OPEN_ROUTER_API_KEY", "test-key")
+
+    async def clean_room_preflight(settings: object) -> object:
+        del settings
+        return object()
+
+    def clean_room_model(settings: object) -> _CleanRoomSemanticModel:
+        del settings
+        return semantic_model
+
+    monkeypatch.setattr(probe_module, "preflight_evaluator", clean_room_preflight)
+    monkeypatch.setattr(
+        campaign_runner_module,
+        "create_semantic_model_deconstructor",
+        clean_room_model,
+    )
+
+    result = runner.invoke(
+        app,
+        ["probe", str(dataset), "--target", str(config), "--output", str(output)],
+        input="y\ny\n",
+    )
+
+    assert result.exit_code == 2, result.output
+    assert "outcome field 'action' at selector '/result/action' does not resolve" in result.output
+    assert "target execution completed" in result.output
+    assert "Paid preparation and target work already occurred" in result.output
+    assert f"partial evidence remains in {output}" in result.output
+    assert "Target safe to reuse: no" in result.output
+    assert "PROBE_EVALUATION_FAILED" not in result.output
+    evidence = json.loads(output.read_text().splitlines()[0])
+    failure = evidence["technical_details"]["baseline"]["trial_set"]["trials"][0]
+    assert failure["lifecycle_failure"]["failed_phase"] == "outcome_projection"
+    assert failure["lifecycle_failure"]["environment_state_may_remain"] is True
+    assert "result evaluation was not run" in failure["inconclusive_reasons"][0]
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX executable-script test")

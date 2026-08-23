@@ -47,6 +47,8 @@ from ul.local_target import (
     create_local_target_dry_run_plan,
     load_local_target_config,
 )
+from ul.outcome_projection import OutcomeProjection, OutcomeProjectionError
+from ul.probe_execution import OutcomeProjectionExecutionError
 from ul_core.models import ConversationRole, ConversationTurn
 
 from ul_cli.dataset.evaluation.command import preflight_evaluator
@@ -103,6 +105,7 @@ class ProbeProjectConfig(_StrictModel):
     target_kind: Literal["python_callable", "command", "http"]
     target_config_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     target_confirmation_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    outcome_projection_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
     operator: Literal["input.surface.typing_noise"] = _PILOT_OPERATOR
     limit: Literal[10] = _PILOT_LIMIT
     repetitions: Literal[1] = _PILOT_REPETITIONS
@@ -221,6 +224,7 @@ def _semantic_settings_snapshot(
 
 def _target_evidence_receipt(resolved_target: _ResolvedTarget) -> dict[str, JsonValue]:
     confirmation = resolved_target.confirmation
+    outcome_projection = _outcome_projection(resolved_target)
     return {
         "kind": confirmation.kind,
         "config_sha256": confirmation.config_sha256,
@@ -232,7 +236,17 @@ def _target_evidence_receipt(resolved_target: _ResolvedTarget) -> dict[str, Json
         "artifact_sha256": [artifact.sha256 for artifact in confirmation.artifacts],
         "environment": [item.model_dump(mode="json") for item in confirmation.environment],
         "callable": confirmation.callable,
+        "outcome_projection": (
+            outcome_projection.model_dump(mode="json") if outcome_projection is not None else None
+        ),
+        "outcome_projection_sha256": (
+            outcome_projection.digest if outcome_projection is not None else None
+        ),
     }
+
+
+def _outcome_projection(resolved_target: _ResolvedTarget) -> OutcomeProjection | None:
+    return resolved_target.config.outcome
 
 
 def _artifact_identity(path: Path) -> _ArtifactIdentity:
@@ -509,6 +523,9 @@ def probe(
             remaining_target_seconds=remaining_target_seconds,
             run_context=run_context,
         )
+        projection_failure = _campaign_projection_failure(results, output)
+        if projection_failure is not None:
+            raise projection_failure
         try:
             print_dataset_results(results, output, show_report_guidance=False)
         except Exception:
@@ -738,7 +755,14 @@ async def _run_smoke(
         async with connection:
             evidence = await connection.execute(case)
         elapsed_seconds = time.monotonic() - started_at
-        validate_execution_evidence(case, connection, evidence)
+    except OutcomeProjectionExecutionError as error:
+        raise ProbeFailure(
+            "smoke invocation",
+            "PROBE_OUTCOME_PROJECTION_INVALID",
+            str(error),
+            _projection_failure_remediation(error, error.target_safe_to_reuse),
+            target_safe_to_reuse=error.target_safe_to_reuse,
+        ) from None
     except (OSError, RuntimeError, TimeoutError, ValueError, httpx.HTTPError) as error:
         raise ProbeFailure(
             "smoke invocation",
@@ -747,6 +771,21 @@ async def _run_smoke(
             "Run the target's advanced environment/local dry-run check, then retry.",
             target_safe_to_reuse=False,
         ) from error
+    try:
+        validate_execution_evidence(case, connection, evidence)
+    except OutcomeProjectionError as error:
+        target_safe_to_reuse = (
+            evidence.evidence_scope == "response_and_state"
+            and not evidence.lifecycle.environment_state_uncertain
+            and evidence.lifecycle.cleanup == "succeeded"
+        )
+        raise ProbeFailure(
+            "smoke invocation",
+            "PROBE_OUTCOME_PROJECTION_INVALID",
+            str(error),
+            _projection_failure_remediation(error, target_safe_to_reuse),
+            target_safe_to_reuse=target_safe_to_reuse,
+        ) from None
     if evidence.lifecycle.terminal_status != "succeeded":
         raise ProbeFailure(
             "smoke invocation",
@@ -792,8 +831,30 @@ def _print_smoke(
         f"{len(encoded_response)} bytes"
     )
     console.print(f"  Response sha256: {hashlib.sha256(encoded_response).hexdigest()}")
+    projection = _outcome_projection(resolved_target)
+    if projection is not None:
+        if evidence.normalized_result is None:
+            raise AssertionError("successful projected smoke evidence requires a normalized result")
+        public_result = evidence.public_normalized_result
+        if public_result is None:
+            raise AssertionError("projected smoke evidence requires a public normalized result")
+        console.print(f"  Outcome projection sha256: {projection.digest}")
+        console.print(
+            "  Target-reported normalized result preview: "
+            + json.dumps(public_result, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+        )
     if show_response:
-        console.print("  Private normalized response: " + encoded_response.decode())
+        console.print("  Private raw target response: " + encoded_response.decode())
+        if evidence.normalized_result is not None:
+            console.print(
+                "  Private normalized result: "
+                + json.dumps(
+                    evidence.normalized_result,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                    sort_keys=True,
+                )
+            )
     observation_count = sum(
         observation.status != "missing" for observation in evidence.observations
     )
@@ -803,9 +864,53 @@ def _print_smoke(
         + (
             "before/after available"
             if resolved_target.supports_state_observation
-            else "not available"
+            else "unverified (no state observation configured)"
         )
     )
+
+
+def _projection_failure_remediation(
+    error: OutcomeProjectionError, target_safe_to_reuse: bool
+) -> str:
+    selector_fix = f"Correct outcome selector {error.selector!r} for field {error.field!r}."
+    if target_safe_to_reuse:
+        return f"{selector_fix} Verified cleanup succeeded; then retry."
+    return f"{selector_fix} Restore a known-safe fixture before retrying."
+
+
+def _campaign_projection_failure(
+    results: tuple[DatasetEvaluationResult, ...], output: Path
+) -> ProbeFailure | None:
+    trials = (
+        trial
+        for result in results
+        for trial_set in (
+            result.baseline.trial_set,
+            *(case.trial_set for case in result.cases if case.trial_set is not None),
+        )
+        for trial in trial_set.trials
+    )
+    for trial in trials:
+        lifecycle_failure = trial.lifecycle_failure
+        if lifecycle_failure is None or lifecycle_failure.failed_phase != "outcome_projection":
+            continue
+        exact_reason = trial.inconclusive_reasons[0]
+        target_safe_to_reuse = not lifecycle_failure.environment_state_may_remain
+        remediation = (
+            "Correct the named projection selector and retry with a new output."
+            if target_safe_to_reuse
+            else "Correct the named projection selector, restore a known-safe fixture, and retry "
+            "with a new output."
+        )
+        return ProbeFailure(
+            "evaluation",
+            "PROBE_OUTCOME_PROJECTION_INVALID",
+            f"{exact_reason} Paid preparation and target work already occurred; partial evidence "
+            f"remains in {output}.",
+            remediation,
+            target_safe_to_reuse=target_safe_to_reuse,
+        )
+    return None
 
 
 def _save_probe_config(
@@ -823,6 +928,11 @@ def _save_probe_config(
             target_kind=resolved_target.kind,
             target_config_sha256=resolved_target.config_sha256,
             target_confirmation_sha256=resolved_target.confirmation_sha256,
+            outcome_projection_sha256=(
+                projection.digest
+                if (projection := _outcome_projection(resolved_target)) is not None
+                else None
+            ),
         )
         if existing_config is not None:
             ensure_project_pattern_identity_key(project_directory)
@@ -873,6 +983,11 @@ def _check_probe_config_binding(
         target_kind=resolved_target.kind,
         target_config_sha256=resolved_target.config_sha256,
         target_confirmation_sha256=resolved_target.confirmation_sha256,
+        outcome_projection_sha256=(
+            projection.digest
+            if (projection := _outcome_projection(resolved_target)) is not None
+            else None
+        ),
     )
     try:
         existing = _load_existing_probe_config(path)

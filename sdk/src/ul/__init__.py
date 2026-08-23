@@ -314,6 +314,7 @@ from ul.otlp_observation import (
     OtlpObservationConfig,
     OtlpObservationSource,
 )
+from ul.outcome_projection import OutcomeProjection, OutcomeProjectionError
 from ul.probe_execution import ComposedEnvironmentExecutor
 from ul.redaction import (
     LocalPseudonymStore,
@@ -532,6 +533,8 @@ __all__ = [
     "OtlpJsonHttpReceiver",
     "OtlpObservationConfig",
     "OtlpObservationSource",
+    "OutcomeProjection",
+    "OutcomeProjectionError",
     "PairwiseEvaluator",
     "ProbeCapabilities",
     "ProbeExecutionEvent",
