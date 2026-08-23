@@ -63,7 +63,10 @@ def test_running_trial_fails_closed_as_quarantined_on_resume(tmp_path: Path) -> 
     resumed = open_dataset_trial_journal(path, manifest)
 
     assert resumed.snapshot.quarantined_unit_ids == {unit.id}
-    assert resumed.snapshot.recovered_trials == {}
+    recovered = resumed.snapshot.recovered_trials[unit.id]
+    assert recovered.lifecycle_failure is not None
+    assert recovered.lifecycle_failure.environment_state_may_remain is True
+    assert "was not retried" in recovered.inconclusive_reasons[0]
     resumed.close()
 
 
@@ -132,6 +135,68 @@ def test_truncated_journal_is_preserved_and_rejected(tmp_path: Path) -> None:
         open_dataset_trial_journal(path, manifest)
 
     assert path.read_bytes() == corrupted
+
+
+def test_complete_tail_record_truncation_is_rejected_by_durable_anchor(tmp_path: Path) -> None:
+    path = tmp_path / "trials.jsonl"
+    manifest = _manifest()
+    journal = create_dataset_trial_journal(path, manifest)
+    journal.start(manifest.work_plan[0])
+    journal.finish(
+        manifest.work_plan[0],
+        _evaluation_result("interaction-1").baseline.trial_set.trials[0],
+    )
+    journal.close()
+    lines = path.read_bytes().splitlines(keepends=True)
+    path.write_bytes(b"".join(lines[:-1]))
+
+    with pytest.raises(ValueError, match="durable anchor"):
+        open_dataset_trial_journal(path, manifest)
+
+
+def test_second_resume_cannot_claim_locked_journal(tmp_path: Path) -> None:
+    path = tmp_path / "trials.jsonl"
+    manifest = _manifest()
+    first = create_dataset_trial_journal(path, manifest)
+
+    with pytest.raises(ValueError, match=r"temporarily unavailable|locked|Resource busy"):
+        open_dataset_trial_journal(path, manifest)
+
+    first.close()
+
+
+def test_journal_rejects_hard_links_and_symlinks(tmp_path: Path) -> None:
+    path = tmp_path / "trials.jsonl"
+    manifest = _manifest()
+    create_dataset_trial_journal(path, manifest).close()
+    hard_link = tmp_path / "trials-hard-link.jsonl"
+    hard_link.hardlink_to(path)
+
+    with pytest.raises(ValueError, match="hard link"):
+        open_dataset_trial_journal(path, manifest)
+
+    manifest_path = tmp_path / "manifest.json"
+    persist_dataset_run_manifest(manifest_path, manifest)
+    symlink = tmp_path / "manifest-symlink.json"
+    symlink.symlink_to(manifest_path)
+    with pytest.raises(ValueError, match=r"regular file|symbolic link|changed while opening"):
+        read_dataset_run_manifest(symlink)
+
+
+def test_manifest_rejects_unbounded_repetitions_before_plan_materialization() -> None:
+    manifest = _manifest()
+    with pytest.raises(ValueError, match="repetitions cannot exceed 100"):
+        create_dataset_run_manifest(
+            run_context=manifest.run_context.model_copy(update={"repetitions": 101}),
+            selected_records=manifest.selected_records,
+            selected_operator_ids=manifest.selected_operator_ids,
+            repetitions=101,
+            max_environment_api_calls=10,
+            allow_environment_network=True,
+            confirm_test_environment=True,
+            allow_insecure_http=False,
+            save_augmentations=True,
+        )
 
 
 def test_repeated_recovery_of_ten_by_eleven_by_three_plan_never_duplicates_mutations(

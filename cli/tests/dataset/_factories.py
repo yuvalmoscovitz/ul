@@ -207,6 +207,8 @@ def _settings(**overrides: object) -> SimpleNamespace:
         "max_response_bytes": 1_000_000,
         "timeout_seconds": 60.0,
         "semantic_provider_id": "openrouter",
+        "semantic_provider_type": "openrouter",
+        "semantic_base_url": "https://openrouter.ai/api/v1",
         "semantic_endpoint_sha256": (
             "76ef4ad6f0c8a4ae66efb13875c107cee40c78997a212353d379acfbb2f45591"
         ),

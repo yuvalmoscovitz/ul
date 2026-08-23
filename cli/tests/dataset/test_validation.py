@@ -392,9 +392,7 @@ def test_repetition_budget_is_explicit_and_checked_before_external_setup(
 
     assert huge_plan.exit_code != 0
     normalized_output = " ".join(_ANSI_ESCAPE_PATTERN.sub("", huge_plan.output).split())
-    assert "would make up to" in normalized_output
-    assert "--max-environment-api-calls" in normalized_output
-    assert "call budget" in normalized_output
+    assert "repetitions cannot exceed 100" in normalized_output
 
     monkeypatch.setattr(
         command_module,

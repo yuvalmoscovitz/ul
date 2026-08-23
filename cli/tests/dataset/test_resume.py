@@ -51,12 +51,33 @@ runner = CliRunner()
 _ANSI_ESCAPE_PATTERN = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 
 
+def test_resume_rejects_incomplete_durable_sidecars_before_legacy_fallback(
+    tmp_path: Path,
+) -> None:
+    evidence = tmp_path / "evidence.jsonl"
+    evidence.write_bytes(b"")
+    dataset_trial_journal.journal_path(evidence).write_bytes(b"")
+
+    result = runner.invoke(
+        root_app,
+        ["dataset", "evaluate", "--resume", str(evidence), "--dry-run"],
+    )
+
+    assert result.exit_code == 2
+    assert "durable resume sidecars are incomplete" in result.output
+
+
 def test_resume_reuses_manifest_without_original_data_config_or_overrides(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     evidence = tmp_path / "evidence.jsonl"
+    invariant_path = tmp_path / "custom-invariants.json"
+    custom_augmentations = tmp_path / "private" / "custom-augmentations.jsonl"
+    custom_augmentations.parent.mkdir()
+    _write_invariant_suite(invariant_path)
+    invariant_suite = command_module.load_dataset_invariant_suite(invariant_path)
     source = _evaluation_result("interaction-1").source
-    run_context = _run_context((source,))
+    run_context = _run_context((source,), invariant_suite=invariant_suite)
     manifest = dataset_trial_journal.create_dataset_run_manifest(
         run_context=run_context,
         selected_records=(source,),
@@ -67,6 +88,9 @@ def test_resume_reuses_manifest_without_original_data_config_or_overrides(
         confirm_test_environment=True,
         allow_insecure_http=False,
         save_augmentations=True,
+        invariant_suite_snapshot=invariant_suite,
+        invariant_suite_source=str(invariant_path.resolve()),
+        augmentations_output_path=str(custom_augmentations.resolve()),
     )
     evidence.write_bytes(b"")
     dataset_trial_journal.persist_dataset_run_manifest(
@@ -76,7 +100,29 @@ def test_resume_reuses_manifest_without_original_data_config_or_overrides(
         dataset_trial_journal.journal_path(evidence), manifest
     ).close()
     persistence_module.persist_evaluator_preflight(evidence, _evaluator_preflight())
-    monkeypatch.setattr(command_module, "load_dataset_semantic_settings", _settings)
+    invariant_path.unlink()
+    for variable in (
+        "UL_DATASET_LIVE_CALLS",
+        "UL_DATASET_ALLOW_EXTERNAL_DATA_PROCESSING",
+        "UL_DATASET_MODEL",
+        "UL_DATASET_RENDER_MODEL",
+        "UL_DATASET_EQUIVALENCE_MODEL",
+        "UL_DATASET_MAX_INPUT_CHARS",
+        "UL_DATASET_MAX_OUTPUT_TOKENS",
+        "UL_DATASET_MAX_RENDER_TOKENS",
+        "UL_DATASET_MAX_RESPONSE_BYTES",
+        "UL_DATASET_TIMEOUT_SECONDS",
+        "UL_DATASET_OPENAI_PROVIDER_ID",
+        "UL_DATASET_OPENAI_BASE_URL",
+    ):
+        monkeypatch.delenv(variable, raising=False)
+
+    def unexpected_settings_load() -> object:
+        raise AssertionError("durable resume must restore safe evaluator settings")
+
+    monkeypatch.setattr(
+        command_module, "load_dataset_semantic_settings", unexpected_settings_load
+    )
 
     result = runner.invoke(
         root_app,
@@ -86,6 +132,7 @@ def test_resume_reuses_manifest_without_original_data_config_or_overrides(
     assert result.exit_code == 0, result.output
     assert "Selected interactions: 1" in result.output
     assert "input.surface.rephrase" in result.output
+    assert str(custom_augmentations) in result.output
 
 
 def test_resume_fails_closed_when_completed_trials_have_no_durable_augmentation(
@@ -125,6 +172,66 @@ def test_resume_fails_closed_when_completed_trials_have_no_durable_augmentation(
 
     assert result.exit_code == 2
     assert "resume_incompatible:augmentation_not_durable" in result.output
+
+
+def test_quarantined_trial_requires_bound_operator_cleanup_attestation(
+    tmp_path: Path,
+) -> None:
+    evidence = tmp_path / "evidence.jsonl"
+    source = _evaluation_result("interaction-1").source
+    manifest = dataset_trial_journal.create_dataset_run_manifest(
+        run_context=_run_context((source,)),
+        selected_records=(source,),
+        selected_operator_ids=("input.surface.rephrase",),
+        repetitions=1,
+        max_environment_api_calls=10,
+        allow_environment_network=True,
+        confirm_test_environment=True,
+        allow_insecure_http=False,
+        save_augmentations=True,
+    )
+    evidence.write_bytes(b"")
+    dataset_trial_journal.persist_dataset_run_manifest(
+        dataset_trial_journal.manifest_path(evidence), manifest
+    )
+    journal = dataset_trial_journal.create_dataset_trial_journal(
+        dataset_trial_journal.journal_path(evidence), manifest
+    )
+    journal.start(manifest.work_plan[0])
+    journal.close()
+    persistence_module.persist_evaluator_preflight(evidence, _evaluator_preflight())
+
+    refused = runner.invoke(
+        root_app,
+        ["dataset", "evaluate", "--resume", str(evidence), "--dry-run"],
+    )
+    attested = runner.invoke(
+        root_app,
+        [
+            "dataset",
+            "evaluate",
+            "--resume",
+            str(evidence),
+            "--resolve-quarantine-after",
+            "environment-reset",
+            "--dry-run",
+        ],
+    )
+    subsequent = runner.invoke(
+        root_app,
+        ["dataset", "evaluate", "--resume", str(evidence), "--dry-run"],
+    )
+
+    assert refused.exit_code == 2
+    assert "cannot independently verify this cleanup" in refused.output
+    assert attested.exit_code == 0, attested.output
+    assert subsequent.exit_code == 0, subsequent.output
+    resolution = dataset_trial_journal.read_quarantine_resolution(
+        dataset_trial_journal.quarantine_resolution_path(evidence)
+    )
+    assert resolution.independently_verified is False
+    assert resolution.target_sha256 == manifest.run_context.target.sha256
+    assert resolution.quarantined_unit_ids == (manifest.work_plan[0].id,)
 
 
 def test_resume_skips_already_processed_interaction_ids(

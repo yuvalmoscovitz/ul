@@ -21,6 +21,7 @@ from ul.environment import evaluation_case_from_inputs
 from ul_cli.dataset.evaluation import command as command_module
 from ul_cli.dataset.evaluation import runner as runner_module
 from ul_cli.dataset.evidence import persistence as persistence_module
+from ul_cli.dataset_trial_journal import manifest_path, read_dataset_run_manifest
 from ul_cli.main import app as root_app
 
 from ._factories import (
@@ -560,6 +561,11 @@ def test_execution_wires_redaction_into_records_pipeline_and_run_context(
     assert key not in output.read_text()
     assert secret not in state_path.read_text()
     assert stat.S_IMODE(state_path.stat().st_mode) == 0o600
+    manifest = read_dataset_run_manifest(manifest_path(output))
+    assert manifest.effective_command.redaction_policy_snapshot is not None
+    assert manifest.effective_command.redaction_policy_source == str(policy_path.resolve())
+    assert manifest.effective_command.redaction_state_path == str(state_path.resolve())
+    assert manifest.effective_command.redaction_state_sha256 is not None
 
 
 def test_target_config_runs_nested_request_and_response_against_loopback(
