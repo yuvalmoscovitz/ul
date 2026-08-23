@@ -352,7 +352,8 @@ def test_invalid_smoke_projection_names_selector_and_makes_zero_semantic_calls(
     assert "Restore a known-safe fixture before retrying" in result.output
     assert "Target safe to reuse: no" in result.output
     assert semantic_calls == 0
-    assert not (tmp_path / ".ul").exists()
+    safety_state = next((tmp_path / ".ul").glob("probe-quarantine-*.json"))
+    assert json.loads(safety_state.read_text())["status"] == "quarantined"
 
 
 def test_saved_probe_binding_rejects_altered_projection_digest(
@@ -1404,9 +1405,12 @@ def test_public_documentation_flow_runs_real_callable_campaign_and_report(
         ]["customer"]["email"]
         == "[PRIVATE]"
     )
-    assert evidence["technical_details"]["baseline"]["trial_set"]["trials"][0][
-        "execution_evidence"
-    ]["environment_id"].startswith("probe-")
+    assert (
+        evidence["technical_details"]["baseline"]["trial_set"]["trials"][0]["execution_evidence"][
+            "environment_id"
+        ]
+        == "projected-agent"
+    )
     assert output.with_name(f"{output.name}.manifest.json").is_file()
     assert output.with_name(f"{output.name}.trials.jsonl").is_file()
     assert output.with_name(f"{output.name}.trials.jsonl.anchor.json").is_file()
@@ -1445,7 +1449,7 @@ def test_campaign_projection_failure_retains_exact_reason_and_partial_work(
 
     async def clean_room_preflight(settings: object) -> object:
         del settings
-        return object()
+        return _evaluator_preflight()
 
     def clean_room_model(settings: object) -> _CleanRoomSemanticModel:
         del settings
