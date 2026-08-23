@@ -19,6 +19,7 @@ from ul_core.contracts import (
     ProductionSource,
     SemanticEquivalenceVerifier,
     StateEnvironment,
+    WorkerTraceFlusher,
 )
 from ul_core.coverage import (
     CoverageArchive,
@@ -52,6 +53,7 @@ from ul_core.evaluation import (
     ObservationSourceCapabilities,
     ProbeCapabilities,
     ProbeExecutionEvent,
+    ProbeExecutionIdentity,
     ProbeInvokerCapabilities,
     ProbeObservation,
     ProbeRequest,
@@ -151,6 +153,7 @@ __all__ = [
     "PairwiseEvaluator",
     "ProbeCapabilities",
     "ProbeExecutionEvent",
+    "ProbeExecutionIdentity",
     "ProbeInvoker",
     "ProbeInvokerCapabilities",
     "ProbeObservation",
@@ -180,6 +183,7 @@ __all__ = [
     "TimeoutAfterCommitTriggerStatus",
     "ToolCallEvaluator",
     "VisibleContextTurn",
+    "WorkerTraceFlusher",
     "builtin_augmentation_catalog",
     "builtin_augmentation_registry",
     "evidence_profile_from_capabilities",

@@ -118,6 +118,11 @@ class ObservationSource(Protocol):
 
 
 @runtime_checkable
+class WorkerTraceFlusher(Protocol):
+    def flush(self, request: ProbeRequest) -> Awaitable[None] | None: ...
+
+
+@runtime_checkable
 class StateEnvironment(Protocol):
     @property
     def capabilities(self) -> StateEnvironmentCapabilities: ...

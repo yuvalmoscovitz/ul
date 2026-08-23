@@ -714,3 +714,5 @@ def test_probe_contracts_are_public_core_api() -> None:
     assert ul_core.ProbeRequest is not None
     assert ul_core.ProbeResult is not None
     assert ul_core.EvidenceProfile is not None
+    assert ul_core.ProbeExecutionIdentity is not None
+    assert ul_core.WorkerTraceFlusher is not None

@@ -149,7 +149,7 @@ async def test_invoker_only_produces_response_evidence_with_provenance() -> None
     evidence = await executor.execute(_case("hello", "again"))
 
     assert [request.turn.input for request in invoker.requests] == ["hello", "again"]
-    assert evidence.schema_version == "1.3.0"
+    assert evidence.schema_version == "1.4.0"
     assert evidence.evidence_scope == "response_only"
     assert evidence.final_response == {"echo": "again"}
     assert evidence.turns[0].response_source_id == "test-invoker"
@@ -159,7 +159,7 @@ async def test_invoker_only_produces_response_evidence_with_provenance() -> None
 
 
 @pytest.mark.asyncio
-async def test_executor_forwards_structured_case_context_unchanged() -> None:
+async def test_executor_preserves_structured_case_context_with_correlation_keys() -> None:
     invoker = _Invoker()
     executor = ComposedEnvironmentExecutor(invoker, config_sha256=_CONFIG_SHA256)
     probe_context = {
@@ -184,7 +184,12 @@ async def test_executor_forwards_structured_case_context_unchanged() -> None:
         _case("Please cancel it.").model_copy(update={"probe_context": probe_context})
     )
 
-    assert invoker.requests[0].context == probe_context
+    request_context = invoker.requests[0].context
+    assert {key: request_context[key] for key in probe_context} == probe_context
+    assert request_context["ul.case.id"] == "case-1"
+    assert request_context["ul.turn.id"] == "case-1:turn-1"
+    assert request_context["ul.correlation.id"] == invoker.requests[0].correlation_id
+    assert request_context["traceparent"].startswith("00-")
 
 
 @pytest.mark.asyncio
