@@ -444,6 +444,7 @@ class _LocalTargetInvoker:
         self._stderr_overflow = False
         self._active_session_id = None
         environment = {name: os.environ[name] for name in self._config.environment_allowlist}
+        environment["PYTHONDONTWRITEBYTECODE"] = "1"
         try:
             process = await self._spawn_process(environment)
         except _ExecutableIdentityError:
