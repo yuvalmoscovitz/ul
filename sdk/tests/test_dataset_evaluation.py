@@ -21,6 +21,8 @@ from ul.dataset_evaluation import (
 )
 from ul.dataset_evaluation import DatasetEvaluationRunner as _DatasetEvaluationRunner
 from ul.deconstruction import OpenRouterDatasetSettings, create_semantic_model_deconstructor
+from ul.outcome_projection import OutcomeProjectionError
+from ul.probe_execution import OutcomeProjectionExecutionError
 from ul.redaction import (
     LocalPseudonymStore,
     RedactedSemanticPipeline,
@@ -497,6 +499,17 @@ class LifecycleFailingEnvironment(DeterministicEnvironment):
                 cleanup_failure_reason="environment API reset did not report clean state",
                 environment_state_uncertain=True,
             ),
+        )
+
+
+class ProjectionFailingEnvironment(DeterministicEnvironment):
+    async def execute(self, case: EvaluationCase) -> ExecutionEvidence:
+        self.raw_inputs.append(case.turns[0].content)
+        raise OutcomeProjectionExecutionError(
+            OutcomeProjectionError("action", "/result/action", "does not resolve"),
+            completed_phases=("execute_turn",),
+            cleanup_reset_failed=False,
+            target_safe_to_reuse=False,
         )
 
 
@@ -2196,3 +2209,30 @@ async def test_runner_surfaces_cleanup_failure_and_stops_further_execution() -> 
     assert first_trial.lifecycle_failure.cleanup_reset_failed is True
     assert "environment state may remain" in first_trial.inconclusive_reasons[0]
     assert "not executed" in second_trial.inconclusive_reasons[0]
+
+
+async def test_runner_preserves_projection_failure_and_quarantines_unknown_target_state() -> None:
+    semantic_pipeline = DeterministicSemanticPipeline((_source_outcomes()[0],))
+    target = ProjectionFailingEnvironment()
+    runner = DatasetEvaluationRunner(
+        DatasetAugmentationEngine(semantic_pipeline, semantic_pipeline),
+        semantic_pipeline,
+        target,
+    )
+
+    result = await runner.run(_source(), repetitions=2)
+
+    first_trial, second_trial = result.baseline.trial_set.trials
+    assert first_trial.lifecycle_failure is not None
+    assert first_trial.lifecycle_failure.failed_phase == "outcome_projection"
+    assert first_trial.lifecycle_failure.environment_state_may_remain is True
+    assert first_trial.inconclusive_reasons == (
+        "current baseline target execution completed, but outcome field 'action' at selector "
+        "'/result/action' does not resolve; result evaluation was not run; target reuse is "
+        "unverified; restore a known-safe fixture before continuing",
+    )
+    assert second_trial.inconclusive_reasons == (
+        "current baseline not executed because target state is uncertain; environment state may "
+        "remain",
+    )
+    assert target.raw_inputs == ["Transfer 100 to Alice."]

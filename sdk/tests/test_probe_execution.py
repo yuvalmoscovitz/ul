@@ -15,7 +15,11 @@ from ul.environment import (
     validate_execution_evidence,
 )
 from ul.outcome_projection import OutcomeProjection
-from ul.probe_execution import CapabilityExecutionError, ComposedEnvironmentExecutor
+from ul.probe_execution import (
+    CapabilityExecutionError,
+    ComposedEnvironmentExecutor,
+    OutcomeProjectionExecutionError,
+)
 from ul_core.evaluation import (
     ObservationRequest,
     ObservationSourceCapabilities,
@@ -320,6 +324,27 @@ async def test_projection_preserves_raw_normalized_trace_and_state_channels() ->
         "secret": "[PRIVATE]",
     }
     assert evidence.outcome_projection_sha256 == executor._outcome_projection.digest  # pyright: ignore[reportPrivateUsage,reportOptionalMemberAccess]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("with_state", [False, True])
+async def test_projection_failure_reports_verified_reuse_status(with_state: bool) -> None:
+    executor = ComposedEnvironmentExecutor(
+        _Invoker(),
+        config_sha256=_CONFIG_SHA256,
+        state_environment=_StateEnvironment() if with_state else None,
+        fixture_id="fixture-1" if with_state else None,
+        outcome_projection=OutcomeProjection(action="/missing/action"),
+    )
+
+    with pytest.raises(OutcomeProjectionExecutionError) as caught:
+        await executor.execute(_case("hello"))
+
+    assert caught.value.field == "action"
+    assert caught.value.selector == "/missing/action"
+    assert caught.value.target_safe_to_reuse is with_state
+    assert caught.value.cleanup_reset_failed is False
+    assert "execute_turn" in caught.value.completed_phases
 
 
 @pytest.mark.asyncio

@@ -32,6 +32,8 @@ from ul.environment import (
     observed_outputs_from_evidence,
     validate_execution_evidence,
 )
+from ul.outcome_projection import OutcomeProjectionError
+from ul.probe_execution import OutcomeProjectionExecutionError
 
 FindingCategory = Literal[
     "duplicate_effect",
@@ -548,6 +550,15 @@ class DatasetEvaluationRunner:
                     update={"max_environment_api_calls": environment_api_calls}
                 )
                 execution_evidence = await self._environment.execute(evaluation_case)
+        except OutcomeProjectionExecutionError as error:
+            return self._outcome_projection_failure_trial(
+                repetition=repetition,
+                subject=subject,
+                error=error,
+                completed_phases=error.completed_phases,
+                cleanup_reset_failed=error.cleanup_reset_failed,
+                target_safe_to_reuse=error.target_safe_to_reuse,
+            )
         except TimeoutError:
             if environment_timeout_requires_quarantine(self._environment.capabilities):
                 self._target_state_uncertain = True
@@ -560,7 +571,21 @@ class DatasetEvaluationRunner:
                 repetition=repetition,
                 inconclusive_reasons=(f"{subject} execution failed",),
             )
-        validate_execution_evidence(evaluation_case, self._environment, execution_evidence)
+        try:
+            validate_execution_evidence(evaluation_case, self._environment, execution_evidence)
+        except OutcomeProjectionError as error:
+            target_safe_to_reuse = (
+                execution_evidence.evidence_scope == "response_and_state"
+                and not execution_evidence_requires_quarantine(execution_evidence)
+            )
+            return self._outcome_projection_failure_trial(
+                repetition=repetition,
+                subject=subject,
+                error=error,
+                completed_phases=execution_evidence.lifecycle.completed_phases,
+                cleanup_reset_failed=execution_evidence.lifecycle.cleanup == "failed",
+                target_safe_to_reuse=target_safe_to_reuse,
+            )
         lifecycle = execution_evidence.lifecycle
         if lifecycle.terminal_status != "succeeded":
             environment_state_may_remain = execution_evidence_requires_quarantine(
@@ -624,6 +649,39 @@ class DatasetEvaluationRunner:
             execution_evidence=execution_evidence,
             target_output=target_output,
             observed_frame=observed_frame,
+        )
+
+    def _outcome_projection_failure_trial(
+        self,
+        *,
+        repetition: int,
+        subject: str,
+        error: OutcomeProjectionError,
+        completed_phases: tuple[str, ...],
+        cleanup_reset_failed: bool,
+        target_safe_to_reuse: bool,
+    ) -> DatasetEvaluationTrial:
+        environment_state_may_remain = not target_safe_to_reuse
+        if environment_state_may_remain:
+            self._target_state_uncertain = True
+        reuse_status = (
+            "verified cleanup left the target reusable"
+            if target_safe_to_reuse
+            else "target reuse is unverified; restore a known-safe fixture before continuing"
+        )
+        return DatasetEvaluationTrial(
+            repetition=repetition,
+            inconclusive_reasons=(
+                f"{subject} target execution completed, but outcome field {error.field!r} at "
+                f"selector {error.selector!r} {error.reason}; result evaluation was not run; "
+                f"{reuse_status}",
+            ),
+            lifecycle_failure=DatasetTargetLifecycleFailure(
+                failed_phase="outcome_projection",
+                completed_phases=completed_phases,
+                cleanup_reset_failed=cleanup_reset_failed,
+                environment_state_may_remain=environment_state_may_remain,
+            ),
         )
 
     @staticmethod

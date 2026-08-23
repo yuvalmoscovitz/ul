@@ -39,7 +39,7 @@ from ul_core.evaluation import (
     evidence_profile_from_capabilities,
 )
 
-from ul.outcome_projection import OutcomeProjection
+from ul.outcome_projection import OutcomeProjection, OutcomeProjectionError
 from ul.state_hooks import bounded_json_size
 
 _ENVIRONMENT_LIFECYCLE_FAILURE_CODES = frozenset(get_args(EnvironmentLifecycleFailureCode))
@@ -75,6 +75,21 @@ class CapabilityExecutionError(RuntimeError):
         self.not_delivered = not_delivered
         self.state_operation_result = state_operation_result
         self.safe_reason = reason if _reason_is_safe else None
+
+
+class OutcomeProjectionExecutionError(OutcomeProjectionError):
+    def __init__(
+        self,
+        error: OutcomeProjectionError,
+        *,
+        completed_phases: tuple[str, ...],
+        cleanup_reset_failed: bool,
+        target_safe_to_reuse: bool,
+    ) -> None:
+        super().__init__(error.field, error.selector, error.reason)
+        self.completed_phases = completed_phases
+        self.cleanup_reset_failed = cleanup_reset_failed
+        self.target_safe_to_reuse = target_safe_to_reuse
 
 
 async def _resolve[T](value: T | Awaitable[T]) -> T:
@@ -836,7 +851,16 @@ class ComposedEnvironmentExecutor:
         *,
         error: CapabilityExecutionError | None,
     ) -> ExecutionEvidence:
-        turns = self._project_turns(turns) if error is None else turns
+        if error is None:
+            try:
+                turns = self._project_turns(turns)
+            except OutcomeProjectionError as projection_error:
+                raise OutcomeProjectionExecutionError(
+                    projection_error,
+                    completed_phases=tuple("execute_turn" for _ in turns),
+                    cleanup_reset_failed=False,
+                    target_safe_to_reuse=False,
+                ) from None
         return ExecutionEvidence(
             evidence_scope="response_only",
             case_id=case.id,
@@ -894,7 +918,16 @@ class ComposedEnvironmentExecutor:
         cleanup: Literal["succeeded", "failed", "not_attempted"],
         cleanup_error: CapabilityExecutionError | None,
     ) -> ExecutionEvidence:
-        turns = self._project_turns(turns) if error is None else turns
+        if error is None:
+            try:
+                turns = self._project_turns(turns)
+            except OutcomeProjectionError as projection_error:
+                raise OutcomeProjectionExecutionError(
+                    projection_error,
+                    completed_phases=completed_phases,
+                    cleanup_reset_failed=cleanup == "failed",
+                    target_safe_to_reuse=(cleanup == "succeeded" and not self._state_uncertain),
+                ) from None
         final_turn = turns[-1] if turns else None
         return ExecutionEvidence(
             evidence_scope="response_and_state",

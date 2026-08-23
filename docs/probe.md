@@ -58,6 +58,66 @@ When the target already returns a structured business result, add a versioned `o
 to its local or HTTP target configuration. Each selector is a required RFC 6901 JSON Pointer into
 the target response:
 
+For a runnable callable example, make `agent.py` return a structured result:
+
+```python
+def run(value):
+    return {
+        "result": {
+            "action": "lookup_ticket",
+            "status": "completed",
+            "ticket_id": "42",
+            "customer": {"email": "private@example.test"},
+        }
+    }
+```
+
+Then save and validate a portable, absolute-path configuration with `configure_target.py`:
+
+```python
+import json
+import sys
+from pathlib import Path
+
+from ul import create_local_target_dry_run_plan, load_local_target_config
+
+root = Path.cwd().resolve()
+configuration = {
+    "version": 1,
+    "kind": "python_callable",
+    "target_id": "ticket-agent-local",
+    "working_directory": str(root),
+    "interpreter": str(Path(sys.executable).resolve()),
+    "target": "agent:run",
+    "outcome": {
+        "schema_version": "1.0.0",
+        "complete_result": "/result",
+        "private_json_pointers": ["/customer/email"],
+    },
+}
+path = root / "projected-target.json"
+path.write_text(json.dumps(configuration, indent=2) + "\n", encoding="utf-8")
+validated = load_local_target_config(path)
+print(create_local_target_dry_run_plan(validated).model_dump_json(indent=2))
+```
+
+Run `uv run python configure_target.py`, inspect the validation plan, then use the discovered
+configuration directly:
+
+```bash
+uv run ul probe interactions.jsonl --target projected-target.json
+```
+
+UL asks for target confirmation before importing or invoking the callable. This configuration path
+works the same way on Windows, macOS, and Linux because Python resolves the platform-specific
+interpreter and working-directory paths.
+
+For named roles, selectors such as `action: "/result/action"` address the raw target response. The
+normalized object is then `{"action": "lookup_ticket", ...}`, so private pointers address that
+normalized object (for example `/resource_id`, not `/result/resource_id`). With
+`complete_result: "/result"`, the selected `result` object becomes the normalized root, so
+`/customer/email` addresses `result.customer.email`.
+
 ```json
 {
   "outcome": {
@@ -94,10 +154,13 @@ do not run code or expressions.
 
 The first result includes a bounded structural summary and digest of the live raw target response,
 response-only or response-and-state evidence level, available trajectory observations, and
-state-summary availability. When configured, UL validates the outcome projection here and prints
-its independently filtered normalized preview before loading semantic-provider settings. A missing
+state-summary availability. Without a state observer, UL labels committed state unverified. When
+configured, UL validates the outcome projection here and prints its independently filtered,
+target-reported normalized preview before loading semantic-provider settings. A missing
 or type-invalid selector fails with `PROBE_OUTCOME_PROJECTION_INVALID`, the exact field and pointer,
-and zero semantic-model calls. Use `--show-smoke-response` only when private raw and normalized
+and zero semantic-model calls. A successful smoke proves only that the selector matched that one
+live response; UL applies it again to every later response and does not assume future response
+shapes. Use `--show-smoke-response` only when private raw and normalized
 response content is safe to print. Case, turn, and canonical request identities are printed without
 request content.
 Only after a
