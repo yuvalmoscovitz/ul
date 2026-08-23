@@ -18,6 +18,7 @@ from ul.dataset_evaluation import (
     DatasetEvaluationResult,
     DatasetEvaluationTrial,
     DatasetEvaluationTrialSet,
+    DatasetTrialUnit,
 )
 from ul.dataset_evaluation import DatasetEvaluationRunner as _DatasetEvaluationRunner
 from ul.deconstruction import OpenRouterDatasetSettings, create_semantic_model_deconstructor
@@ -83,6 +84,11 @@ class DatasetEvaluationRunner(_DatasetEvaluationRunner):
         repetitions: int = 1,
         precomputed_augmentation: DatasetAugmentationResult | None = None,
         augmentation_checkpoint_callback: Callable[[DatasetAugmentationResult], None] | None = None,
+        prior_trials: dict[str, DatasetEvaluationTrial] | None = None,
+        trial_started_callback: Callable[[DatasetTrialUnit], None] | None = None,
+        trial_terminal_callback: (
+            Callable[[DatasetTrialUnit, DatasetEvaluationTrial], None] | None
+        ) = None,
     ) -> DatasetEvaluationResult:
         return await super().run(
             source,
@@ -90,6 +96,9 @@ class DatasetEvaluationRunner(_DatasetEvaluationRunner):
             repetitions=repetitions,
             precomputed_augmentation=precomputed_augmentation,
             augmentation_checkpoint_callback=augmentation_checkpoint_callback,
+            prior_trials=prior_trials,
+            trial_started_callback=trial_started_callback,
+            trial_terminal_callback=trial_terminal_callback,
         )
 
 
@@ -391,6 +400,34 @@ async def test_runner_propagates_dataset_variation_and_repetition_to_probe_cases
         {"ul.variation.id": "current_baseline", "ul.repetition": 2},
         {"ul.variation.id": "input.surface.rephrase", "ul.repetition": 2},
     ]
+
+
+async def test_runner_reuses_terminal_trials_without_duplicate_target_mutations() -> None:
+    first_runner, _, first_target = _runner((_source_outcomes()[0],))
+    recovered_trials: dict[str, DatasetEvaluationTrial] = {}
+    started_units: list[str] = []
+
+    result = await first_runner.run(
+        _source(),
+        repetitions=2,
+        trial_started_callback=lambda unit: started_units.append(unit.id),
+        trial_terminal_callback=lambda unit, trial: recovered_trials.__setitem__(unit.id, trial),
+    )
+
+    resumed_runner, _, resumed_target = _runner((_source_outcomes()[0],))
+    resumed_result = await resumed_runner.run(
+        _source(),
+        repetitions=2,
+        precomputed_augmentation=result.augmentation,
+        prior_trials=recovered_trials,
+        trial_started_callback=lambda unit: pytest.fail(f"retried {unit.id}"),
+    )
+
+    assert len(started_units) == 4
+    assert len(first_target.cases) == 4
+    assert resumed_target.cases == []
+    assert resumed_result.baseline == result.baseline
+    assert resumed_result.cases == result.cases
 
 
 class SecretBearingEnvironment(DeterministicEnvironment):

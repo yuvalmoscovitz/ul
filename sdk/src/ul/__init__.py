@@ -190,6 +190,7 @@ from ul.dataset_evaluation import (
     DatasetEvaluationTrial,
     DatasetEvaluationTrialSet,
     DatasetTargetLifecycleFailure,
+    DatasetTrialUnit,
 )
 from ul.dataset_invariants import (
     DatasetInvariantArmEvaluation,
@@ -444,6 +445,7 @@ __all__ = [
     "DatasetRegressionVariation",
     "DatasetSemanticSettings",
     "DatasetTargetLifecycleFailure",
+    "DatasetTrialUnit",
     "EnvironmentCapabilities",
     "EnvironmentLifecycleEvidence",
     "EnvironmentResetEvidence",

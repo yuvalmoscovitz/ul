@@ -12,6 +12,7 @@ from ul import (
 )
 from ul_cli.dataset.evaluation import command as command_module
 from ul_cli.dataset.evaluation import runner as runner_module
+from ul_cli.dataset.evidence.persistence import durable_evidence_marker_manifest_sha256
 from ul_cli.main import app as root_app
 
 from ._factories import (
@@ -175,7 +176,11 @@ def test_evaluator_preflight_failure_surfaces_capability_and_safe_action(
     assert "required seed capability" in result.output
     assert "choose another configured evaluator model" in result.output
     assert "before campaign execution" in result.output
-    assert not output.exists()
+    assert output.exists()
+    assert durable_evidence_marker_manifest_sha256(output) is not None
+    assert len(output.read_bytes().splitlines()) == 1
+    assert (tmp_path / "results.jsonl.manifest.json").exists()
+    assert (tmp_path / "results.jsonl.trials.jsonl").exists()
     assert not (tmp_path / "results.augmentations.jsonl").exists()
     assert not (tmp_path / "results.jsonl.preflight.json").exists()
 

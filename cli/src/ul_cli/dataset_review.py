@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import stat
 import sys
 import unicodedata
@@ -505,6 +506,8 @@ def validate_dataset_resume_evidence(
     elif invariant_suite.sha256 != expected_context.invariant_suite_sha256:
         raise ValueError("resume invariant suite does not match the current evaluation plan")
     raw_lines = raw_evidence.splitlines()
+    if raw_lines and dataset_durable_run_marker_manifest_sha256(raw_lines[0]) is not None:
+        raw_lines = raw_lines[1:]
     if not raw_lines:
         return DatasetResumeEvidence(
             processed_ids=frozenset(),
@@ -1541,6 +1544,8 @@ def _load_evidence(path: Path) -> list[_LoadedEvidenceRecord]:
             f"cannot safely read evidence ({error.__class__.__name__})"
         ) from None
     raw_lines = raw.splitlines()
+    if raw_lines and dataset_durable_run_marker_manifest_sha256(raw_lines[0]) is not None:
+        raw_lines = raw_lines[1:]
     if not raw_lines or len(raw_lines) > _MAXIMUM_EVIDENCE_RECORDS:
         raise _ReviewInputError("evidence must contain 1 to 100 JSONL records")
     if any(not raw_line.strip() for raw_line in raw_lines):
@@ -1557,6 +1562,31 @@ def _load_evidence(path: Path) -> list[_LoadedEvidenceRecord]:
     except (ValidationError, ValueError):
         raise _ReviewInputError("evidence is not valid UL schema through 1.9.0 JSONL") from None
     return records
+
+
+def dataset_durable_run_marker_manifest_sha256(raw_line: bytes) -> str | None:
+    try:
+        decoded: object = json.loads(raw_line)
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    if not isinstance(decoded, dict):
+        return None
+    value = cast(dict[str, object], decoded)
+    if set(value) != {
+        "schema_version",
+        "record_type",
+        "manifest_sha256",
+    }:
+        return None
+    manifest_sha256 = value.get("manifest_sha256")
+    if (
+        value.get("schema_version") != "1.0.0"
+        or value.get("record_type") != "dataset_durable_run"
+        or not isinstance(manifest_sha256, str)
+        or re.fullmatch(_SHA256_PATTERN, manifest_sha256) is None
+    ):
+        return None
+    return manifest_sha256
 
 
 def is_reportable_dataset_evidence(path: Path) -> bool:

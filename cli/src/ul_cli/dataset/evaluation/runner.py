@@ -10,6 +10,7 @@ from ul import (
     DatasetEvaluationResult,
     DatasetEvaluationRunner,
     DatasetSemanticSettings,
+    DatasetTrialUnit,
     EvaluatorModelPreflight,
     InteractionRecord,
     RedactedSemanticPipeline,
@@ -26,6 +27,7 @@ from ul.local_target import LocalTargetConnection
 
 from ul_cli.dataset_augmentation_ledger import DatasetAugmentationLedger
 from ul_cli.dataset_review import DatasetEvidenceRunContext
+from ul_cli.dataset_trial_journal import DatasetTrialJournal
 
 from ..evidence.customer import build_customer_evidence_record
 
@@ -53,6 +55,7 @@ async def evaluate_interaction_records(
     redaction_engine: RedactionEngine | None = None,
     allow_network_egress: bool = True,
     evaluator_preflight: EvaluatorModelPreflight,
+    trial_journal: DatasetTrialJournal | None = None,
 ) -> tuple[DatasetEvaluationResult, ...]:
     results: list[DatasetEvaluationResult] = []
     deconstructor = create_semantic_model_deconstructor(settings)
@@ -88,13 +91,48 @@ async def evaluate_interaction_records(
                 saved_augmentations.get(record.id) if saved_augmentations is not None else None
             )
 
+            def checkpoint_plan_outcomes(
+                augmentation: DatasetAugmentationResult,
+                source: InteractionRecord = record,
+            ) -> None:
+                if trial_journal is None:
+                    return
+                candidates = {
+                    candidate.operator_id: candidate for candidate in augmentation.candidates
+                }
+                for operator_reference in operator_ids:
+                    operator_id = operator_reference.partition("@")[0]
+                    candidate = candidates.get(operator_id)
+                    if candidate is not None and candidate.passed:
+                        continue
+                    state = "inapplicable" if candidate is None else "rejected"
+                    reason_code = (
+                        "operator_not_materialized"
+                        if candidate is None
+                        else "augmentation_rejected"
+                    )
+                    for repetition in range(1, repetitions + 1):
+                        unit = DatasetTrialUnit(
+                            interaction_id=source.id,
+                            operator_id=operator_id,
+                            arm="probe",
+                            repetition=repetition,
+                        )
+                        if not trial_journal.is_terminal(unit):
+                            trial_journal.terminal(unit, state, reason_code)
+
             def checkpoint_augmentation(
                 augmentation: DatasetAugmentationResult,
                 source: InteractionRecord = record,
             ) -> None:
                 if augmentation_ledger is None:
-                    return
-                augmentation_ledger.append(source=source, augmentation=augmentation)
+                    pass
+                else:
+                    augmentation_ledger.append(source=source, augmentation=augmentation)
+                checkpoint_plan_outcomes(augmentation)
+
+            if precomputed_augmentation is not None:
+                checkpoint_plan_outcomes(precomputed_augmentation)
 
             result = await runner.run(
                 record,
@@ -102,7 +140,16 @@ async def evaluate_interaction_records(
                 repetitions=repetitions,
                 precomputed_augmentation=precomputed_augmentation,
                 augmentation_checkpoint_callback=(
-                    checkpoint_augmentation if augmentation_ledger is not None else None
+                    checkpoint_augmentation
+                    if augmentation_ledger is not None or trial_journal is not None
+                    else None
+                ),
+                prior_trials=(
+                    trial_journal.snapshot.recovered_trials if trial_journal is not None else None
+                ),
+                trial_started_callback=(trial_journal.start if trial_journal is not None else None),
+                trial_terminal_callback=(
+                    trial_journal.finish if trial_journal is not None else None
                 ),
             )
             invariant_evaluation = (

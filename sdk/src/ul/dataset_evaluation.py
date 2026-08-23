@@ -51,6 +51,7 @@ CaseVerdict = Literal[
 BaselineVerdict = Literal["inconclusive", "no_divergence"]
 TrialSetStability = Literal["stable", "unstable", "inconclusive"]
 DatasetEvaluationMode = Literal["variance", "correctness", "preference"]
+TrialArm = Literal["original", "probe"]
 
 
 class _StrictULModel(ULModel):
@@ -92,6 +93,26 @@ class DatasetEvaluationTrial(_StrictULModel):
         if self.observed_frame is None and not self.inconclusive_reasons:
             raise ValueError("a trial without an observed frame requires an inconclusive reason")
         return self
+
+
+class DatasetTrialUnit(_StrictULModel):
+    interaction_id: str = Field(min_length=1)
+    operator_id: str = Field(min_length=1)
+    arm: TrialArm
+    repetition: int = Field(ge=1)
+    attempt: int = Field(default=1, ge=1)
+
+    @property
+    def id(self) -> str:
+        return ":".join(
+            (
+                self.interaction_id,
+                self.operator_id,
+                self.arm,
+                str(self.repetition),
+                str(self.attempt),
+            )
+        )
 
 
 class DatasetEvaluationOutcomeGroup(_StrictULModel):
@@ -322,6 +343,11 @@ class DatasetEvaluationRunner:
         repetitions: int = 3,
         precomputed_augmentation: DatasetAugmentationResult | None = None,
         augmentation_checkpoint_callback: Callable[[DatasetAugmentationResult], None] | None = None,
+        prior_trials: dict[str, DatasetEvaluationTrial] | None = None,
+        trial_started_callback: Callable[[DatasetTrialUnit], None] | None = None,
+        trial_terminal_callback: (
+            Callable[[DatasetTrialUnit, DatasetEvaluationTrial], None] | None
+        ) = None,
     ) -> DatasetEvaluationResult:
         if type(repetitions) is not int or repetitions < 1:
             raise ValueError("repetitions must be a positive integer")
@@ -354,43 +380,69 @@ class DatasetEvaluationRunner:
         candidate_trials: dict[str, list[DatasetEvaluationTrial]] = {
             candidate.operator_id: [] for candidate in accepted_candidates
         }
+        recovered_trials = prior_trials or {}
         for repetition in range(1, repetitions + 1):
-            baseline_trial = await self._execute_trial(
+            baseline_unit = DatasetTrialUnit(
+                interaction_id=source.id,
+                operator_id="current_baseline",
+                arm="original",
                 repetition=repetition,
-                interaction_id=f"{source.id}:current_baseline:round-{repetition}",
-                raw_input=source.raw_input,
-                reference_frame=source_frame,
-                source=source,
-                subject="current baseline",
-                variation_id="current_baseline",
             )
+            baseline_trial = recovered_trials.get(baseline_unit.id)
+            if baseline_trial is None:
+                if trial_started_callback is not None:
+                    trial_started_callback(baseline_unit)
+                baseline_trial = await self._execute_trial(
+                    repetition=repetition,
+                    interaction_id=f"{source.id}:current_baseline:round-{repetition}",
+                    raw_input=source.raw_input,
+                    reference_frame=source_frame,
+                    source=source,
+                    subject="current baseline",
+                    variation_id="current_baseline",
+                )
+                if trial_terminal_callback is not None:
+                    trial_terminal_callback(baseline_unit, baseline_trial)
             baseline_trials.append(baseline_trial)
             for candidate in accepted_candidates:
+                candidate_unit = DatasetTrialUnit(
+                    interaction_id=source.id,
+                    operator_id=candidate.operator_id,
+                    arm="probe",
+                    repetition=repetition,
+                )
+                recovered_candidate_trial = recovered_trials.get(candidate_unit.id)
+                if recovered_candidate_trial is not None:
+                    candidate_trials[candidate.operator_id].append(recovered_candidate_trial)
+                    continue
                 if baseline_trial.inconclusive_reasons:
-                    candidate_trials[candidate.operator_id].append(
-                        DatasetEvaluationTrial(
-                            repetition=repetition,
-                            inconclusive_reasons=(
-                                "paired original repetition was inconclusive; "
-                                "variation not executed",
-                            ),
-                        )
+                    skipped_trial = DatasetEvaluationTrial(
+                        repetition=repetition,
+                        inconclusive_reasons=(
+                            "paired original repetition was inconclusive; variation not executed",
+                        ),
                     )
+                    candidate_trials[candidate.operator_id].append(skipped_trial)
+                    if trial_terminal_callback is not None:
+                        trial_terminal_callback(candidate_unit, skipped_trial)
                     continue
                 reference_frame = baseline_trial.observed_frame
                 if reference_frame is None:
                     raise AssertionError("conclusive baseline trial requires an observed frame")
-                candidate_trials[candidate.operator_id].append(
-                    await self._execute_trial(
-                        repetition=repetition,
-                        interaction_id=(f"{source.id}:{candidate.operator_id}:round-{repetition}"),
-                        raw_input=candidate.augmented_input,
-                        reference_frame=reference_frame,
-                        source=source,
-                        subject="variation",
-                        variation_id=candidate.operator_id,
-                    )
+                if trial_started_callback is not None:
+                    trial_started_callback(candidate_unit)
+                candidate_trial = await self._execute_trial(
+                    repetition=repetition,
+                    interaction_id=(f"{source.id}:{candidate.operator_id}:round-{repetition}"),
+                    raw_input=candidate.augmented_input,
+                    reference_frame=reference_frame,
+                    source=source,
+                    subject="variation",
+                    variation_id=candidate.operator_id,
                 )
+                candidate_trials[candidate.operator_id].append(candidate_trial)
+                if trial_terminal_callback is not None:
+                    trial_terminal_callback(candidate_unit, candidate_trial)
 
         baseline_trial_set = _group_evaluation_trials(
             tuple(baseline_trials), source.raw_input, source_frame

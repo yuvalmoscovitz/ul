@@ -4,7 +4,13 @@ import os
 from pathlib import Path
 
 from pydantic import JsonValue, SecretStr
-from ul import InteractionRecord, LocalPseudonymStore, RedactionEngine, load_redaction_policy
+from ul import (
+    InteractionRecord,
+    LocalPseudonymStore,
+    RedactionEngine,
+    RedactionPolicy,
+    load_redaction_policy,
+)
 
 from ul_cli.dataset_review import DatasetEvidenceRedactionCoverage
 
@@ -16,12 +22,17 @@ def load_redaction_engine(
     state_path: Path | None,
     *,
     state_required: bool,
+    policy_snapshot: RedactionPolicy | None = None,
 ) -> RedactionEngine | None:
-    if policy_path is None:
+    if policy_path is None and policy_snapshot is None:
         if state_path is not None:
             raise ValueError("--redaction-state requires --redaction-policy")
         return None
-    policy = load_redaction_policy(policy_path)
+    if policy_snapshot is None:
+        assert policy_path is not None
+        policy = load_redaction_policy(policy_path)
+    else:
+        policy = policy_snapshot
     if not state_required:
         return RedactionEngine(
             policy,
