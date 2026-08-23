@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import stat
@@ -205,6 +206,8 @@ def test_callable_smoke_proves_target_call_and_decline_makes_zero_semantic_calls
     assert "Smoke target invocation succeeded" in result.output
     assert "Response structure: dict;" in result.output
     assert "Response sha256:" in result.output
+    assert "Request sha256:" in result.output
+    assert "Case: case-1:smoke" in result.output
     assert "Echo grounded example 1." not in result.output
     assert "Evidence level: response only" in result.output
     assert "Source interactions: 10 (maximum 10)" in result.output
@@ -264,6 +267,35 @@ def test_changed_target_artifact_is_rejected_immediately_before_launch(
     assert result.exit_code == 2
     assert "Reason: PROBE_TARGET_IDENTITY_CHANGED" in result.output
     assert not (tmp_path / "target-invocations.jsonl").exists()
+
+
+def test_python_declared_helpers_and_allowlisted_environment_are_bound(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _write_callable(tmp_path)
+    helper = tmp_path / "customer_helper.py"
+    helper.write_text("VALUE = 1\n", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("CUSTOMER_MODE", "test-a")
+    config = probe_module.PythonCallableTargetConfig(
+        target_id="bound-agent",
+        working_directory=tmp_path,
+        interpreter=Path(sys.executable).resolve(),
+        target="customer_agent:run",
+        environment_allowlist=("CUSTOMER_MODE",),
+    )
+    plan = probe_module.create_local_target_dry_run_plan(config)
+    resolved = probe_module._local_target(
+        "customer_agent:run", config, plan.config_sha256, (helper,)
+    )
+
+    assert str(helper.resolve()) in {item.path for item in resolved.confirmation.artifacts}
+    assert resolved.confirmation.environment[0].name == "CUSTOMER_MODE"
+    first_digest = resolved.confirmation.environment[0].value_sha256
+    monkeypatch.setenv("CUSTOMER_MODE", "test-b")
+    with pytest.raises(probe_module.ProbeFailure, match="artifact changed"):
+        resolved.revalidate_identity()
+    assert first_digest != hashlib.sha256(b"test-b").hexdigest()
 
 
 def test_existing_binding_is_checked_before_target_invocation(
@@ -405,8 +437,65 @@ def test_stale_campaign_digest_cannot_authorize_changed_environment(
     assert result.exit_code == 2
     assert "Semantic provider:" in result.output
     assert "Semantic endpoint sha256:" in result.output
+    assert "Semantic settings sha256:" in result.output
     assert "Data policy:" in result.output
+    assert "UNKNOWN AND UNBOUNDED" in result.output
     assert "Reason: PROBE_CAMPAIGN_CONFIRMATION_CHANGED" in result.output
+
+
+def test_campaign_receipt_binds_models_bounds_and_command_wide_smoke_wall(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _write_callable(tmp_path)
+    records = probe_module._load_pilot_records(_write_dataset(tmp_path))
+    monkeypatch.chdir(tmp_path)
+    resolved = probe_module._resolve_target("customer_agent:run", allow_insecure_http=False)
+    settings = probe_module.load_dataset_semantic_settings()
+    operator_ids = probe_module.validate_operator_ids(["input.surface.typing_noise"])
+    plan = probe_module.create_dataset_campaign_plan(
+        records=records,
+        selected_operator_ids=operator_ids,
+        repetitions=1,
+        target_calls_per_execution=1,
+        settings=settings,
+    )
+    original = probe_module._campaign_confirmation(plan, settings, resolved)
+    changed = probe_module._campaign_confirmation(
+        plan,
+        settings.model_copy(update={"model": "different-model", "max_output_tokens": 1234}),
+        resolved,
+    )
+
+    assert original.semantic_settings_sha256 != changed.semantic_settings_sha256
+    assert probe_module._model_sha256(original) != probe_module._model_sha256(changed)
+    assert original.maximum_wall_seconds >= resolved.maximum_active_target_seconds
+    assert original.monetary_cost_status == "unknown_unbounded"
+
+    http_config = tmp_path / "http-target.json"
+    http_config.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "adapter_tier": "isolated_response",
+                "environment_id": "http-smoke-agent",
+                "request_isolation_attested": True,
+                "safe_test_target_attested": True,
+                "execute": {
+                    "url": "https://agent.example.test/execute",
+                    "request_json_template": {"input": "{{input}}"},
+                    "response_json_pointer": "/response",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    http_target = probe_module._resolve_target(str(http_config), allow_insecure_http=False)
+    http_confirmation = probe_module._campaign_confirmation(plan, settings, http_target)
+    expected_http_wall = (
+        (1 + plan.calls.repetition_executions) * probe_module._TARGET_TIMEOUT_SECONDS
+        + plan.calls.total_semantic_model * settings.timeout_seconds
+    )
+    assert http_confirmation.maximum_wall_seconds == expected_http_wall
 
 
 def test_copy_ready_confirmation_run_reuses_bound_config_and_rebudgets(
@@ -570,6 +659,60 @@ def test_confirmed_flow_composes_campaign_and_normal_report(
     assert "Stronger confirmation:" in result.output
 
 
+@pytest.mark.parametrize(
+    ("failure_point", "expected_stage", "expected_reason"),
+    (
+        ("presentation", "evaluation", "PROBE_RESULT_PRESENTATION_FAILED"),
+        ("report", "analysis", "PROBE_REPORT_FAILED"),
+    ),
+)
+def test_post_campaign_failures_are_staged_without_raw_exceptions(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_point: str,
+    expected_stage: str,
+    expected_reason: str,
+) -> None:
+    _write_callable(tmp_path)
+    dataset = _write_dataset(tmp_path)
+    output = tmp_path / ".ul" / "runs" / "evidence.jsonl"
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("UL_LIVE", "true")
+    monkeypatch.setenv("OPEN_ROUTER_API_KEY", "test-key")
+
+    def fake_campaign(**kwargs: object) -> tuple[DatasetEvaluationResult, ...]:
+        created_output = kwargs["output"]
+        assert isinstance(created_output, Path)
+        created_output.parent.mkdir(parents=True, exist_ok=True)
+        created_output.write_text("evidence\n", encoding="utf-8")
+        return ()
+
+    def presentation(*args: object, **kwargs: object) -> None:
+        del args, kwargs
+        if failure_point == "presentation":
+            raise RuntimeError("private-presentation-detail")
+
+    def report(*args: object, **kwargs: object) -> None:
+        del args, kwargs
+        if failure_point == "report":
+            raise RuntimeError("private-report-detail")
+
+    monkeypatch.setattr(probe_module, "_run_campaign", fake_campaign)
+    monkeypatch.setattr(probe_module, "print_dataset_results", presentation)
+    monkeypatch.setattr(probe_module, "report_evidence", report)
+    result = runner.invoke(
+        app,
+        ["probe", str(dataset), "--target", "customer_agent:run", "--output", str(output)],
+        input="y\ny\n",
+    )
+
+    assert result.exit_code == 2
+    assert f"Stage: {expected_stage}" in result.output
+    assert f"Reason: {expected_reason}" in result.output
+    assert "private-" not in result.output
+    assert "Target safe to reuse: yes" in result.output
+
+
 def test_public_documentation_flow_runs_real_callable_campaign_and_report(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -626,6 +769,10 @@ def test_public_documentation_flow_runs_real_callable_campaign_and_report(
     evidence = json.loads(output.read_text().splitlines()[0])
     assert evidence["execution_plan"]["repetitions"] == 1
     assert evidence["execution_plan"]["dataset_planned_target_calls"] == 2
+    assert evidence["run_context"]["semantic_settings"]["provider"] == "openrouter"
+    assert evidence["run_context"]["semantic_settings"]["model"]
+    assert evidence["run_context"]["target"]["kind"] == "probe_target"
+    assert evidence["run_context"]["target"]["receipt"]["confirmation_sha256"]
     assert evidence["technical_details"]["baseline"]["trial_set"]["trials"][0][
         "execution_evidence"
     ]["environment_id"].startswith("probe-")

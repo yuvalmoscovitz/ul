@@ -19,7 +19,7 @@ from typing import Annotated, Literal, cast
 import httpx
 import typer
 import ul.local_target as local_target_module
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, JsonValue, ValidationError
 from ul import (
     DatasetEvaluationResult,
     DatasetSemanticSettings,
@@ -50,7 +50,7 @@ from ul.local_target import (
 from ul_core.models import ConversationRole, ConversationTurn
 
 from ul_cli.dataset.evaluation.command import preflight_evaluator
-from ul_cli.dataset.evaluation.operators import validate_operator_ids
+from ul_cli.dataset.evaluation.operators import dataset_operator_identity, validate_operator_ids
 from ul_cli.dataset.evaluation.records import (
     DatasetInputError,
     load_interaction_records,
@@ -61,6 +61,11 @@ from ul_cli.dataset.presentation.evaluation import print_dataset_results
 from ul_cli.dataset.presentation.runtime import console, print_dataset_plain
 from ul_cli.dataset.storage.private_files import create_private_output
 from ul_cli.dataset_campaign import DatasetCampaignPlan, create_dataset_campaign_plan
+from ul_cli.dataset_review import (
+    DatasetEvidenceRunContext,
+    DatasetEvidenceSemanticSettings,
+    create_dataset_evidence_run_context,
+)
 from ul_cli.report import report_evidence
 
 _PILOT_LIMIT = 10
@@ -82,6 +87,7 @@ type ProbeStage = Literal[
     "probe execution",
     "evaluation",
     "analysis",
+    "output",
 ]
 
 
@@ -106,6 +112,11 @@ class _ArtifactIdentity(_StrictModel):
     sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
 
 
+class _EnvironmentIdentity(_StrictModel):
+    name: str
+    value_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
 class _TargetConfirmation(_StrictModel):
     schema_version: Literal[1] = 1
     kind: Literal["python_callable", "command", "http"]
@@ -113,6 +124,7 @@ class _TargetConfirmation(_StrictModel):
     config_sha256: str
     executable: _ArtifactIdentity | None = None
     artifacts: tuple[_ArtifactIdentity, ...] = ()
+    environment: tuple[_EnvironmentIdentity, ...] = ()
     callable: str | None = None
 
 
@@ -122,11 +134,14 @@ class _CampaignConfirmation(_StrictModel):
     semantic_provider_id: str
     semantic_provider_type: str
     semantic_endpoint_sha256: str
+    semantic_settings_sha256: str
     data_policy: dict[str, object]
     command_environment_api_requests: int
     semantic_model_calls: int
     maximum_completion_tokens: int
     maximum_wall_seconds: float
+    monetary_cost_status: Literal["bounded", "unknown_unbounded"]
+    maximum_cost_usd: float | None = None
 
 
 @dataclass(frozen=True)
@@ -149,6 +164,9 @@ class _ResolvedTarget:
 class _SmokeResult:
     evidence: ExecutionEvidence
     elapsed_seconds: float
+    case_id: str
+    turn_id: str
+    request_sha256: str
 
 
 class ProbeFailure(RuntimeError):
@@ -174,6 +192,46 @@ def _model_sha256(model: BaseModel) -> str:
         model.model_dump(mode="json"), sort_keys=True, separators=(",", ":")
     ).encode()
     return hashlib.sha256(encoded).hexdigest()
+
+
+def _json_sha256(value: object) -> str:
+    encoded = json.dumps(
+        value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False
+    ).encode()
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _semantic_settings_snapshot(
+    settings: DatasetSemanticSettings,
+) -> DatasetEvidenceSemanticSettings:
+    return DatasetEvidenceSemanticSettings(
+        provider=settings.semantic_provider_id,
+        endpoint_sha256=settings.semantic_endpoint_sha256,
+        model=settings.model,
+        render_model=settings.render_model,
+        equivalence_model=settings.equivalence_model,
+        max_input_chars=settings.max_input_chars,
+        max_output_tokens=settings.max_output_tokens,
+        max_render_tokens=settings.max_render_tokens,
+        max_response_bytes=settings.max_response_bytes,
+        timeout_seconds=settings.timeout_seconds,
+    )
+
+
+def _target_evidence_receipt(resolved_target: _ResolvedTarget) -> dict[str, JsonValue]:
+    confirmation = resolved_target.confirmation
+    return {
+        "kind": confirmation.kind,
+        "config_sha256": confirmation.config_sha256,
+        "confirmation_sha256": resolved_target.confirmation_sha256,
+        "supports_state_observation": resolved_target.supports_state_observation,
+        "executable_sha256": (
+            confirmation.executable.sha256 if confirmation.executable is not None else None
+        ),
+        "artifact_sha256": [artifact.sha256 for artifact in confirmation.artifacts],
+        "environment": [item.model_dump(mode="json") for item in confirmation.environment],
+        "callable": confirmation.callable,
+    }
 
 
 def _artifact_identity(path: Path) -> _ArtifactIdentity:
@@ -208,7 +266,9 @@ def _resolve_executable(value: Path | str, working_directory: Path) -> Path:
     return candidate.resolve(strict=True)
 
 
-def _python_module_artifacts(config: PythonCallableTargetConfig) -> tuple[_ArtifactIdentity, ...]:
+def _python_module_artifacts(
+    config: PythonCallableTargetConfig, explicit_artifacts: tuple[Path, ...]
+) -> tuple[_ArtifactIdentity, ...]:
     module_name = config.target.partition(":")[0]
     current = config.working_directory.resolve(strict=True)
     paths: list[Path] = []
@@ -227,7 +287,14 @@ def _python_module_artifacts(config: PythonCallableTargetConfig) -> tuple[_Artif
         current = package
     worker = Path(local_target_module.__file__).with_name("_local_worker.py")
     paths.append(worker)
-    return tuple(_artifact_identity(path) for path in paths)
+    for path in explicit_artifacts:
+        candidate = path if path.is_absolute() else config.working_directory / path
+        paths.append(candidate)
+    identities: dict[str, _ArtifactIdentity] = {}
+    for path in paths:
+        identity = _artifact_identity(path)
+        identities[identity.path] = identity
+    return tuple(identities.values())
 
 
 def _command_artifacts(
@@ -266,7 +333,7 @@ def _local_target_confirmation(
         executable = _artifact_identity(
             _resolve_executable(config.interpreter, config.working_directory)
         )
-        artifacts = _python_module_artifacts(config)
+        artifacts = _python_module_artifacts(config, explicit_artifacts)
         callable_name = config.target
     else:
         artifacts = _command_artifacts(config, explicit_artifacts)
@@ -278,6 +345,13 @@ def _local_target_confirmation(
         config_sha256=digest,
         executable=executable,
         artifacts=artifacts,
+        environment=tuple(
+            _EnvironmentIdentity(
+                name=name,
+                value_sha256=hashlib.sha256(os.environ[name].encode()).hexdigest(),
+            )
+            for name in sorted(config.environment_allowlist)
+        ),
         callable=callable_name,
     )
 
@@ -370,7 +444,7 @@ def probe(
         _confirm_target(resolved_target, confirmed_digest=confirm_target)
         smoke_result = asyncio.run(_run_smoke(records[0], resolved_target))
         _print_smoke(
-            smoke_result.evidence,
+            smoke_result,
             resolved_target,
             show_response=show_smoke_response,
         )
@@ -395,9 +469,19 @@ def probe(
                 plan, resolved_target, smoke_result.elapsed_seconds
             )
             campaign_confirmation = _campaign_confirmation(plan, settings, resolved_target)
+            run_context = create_dataset_evidence_run_context(
+                selected_records=records,
+                operators=tuple(
+                    dataset_operator_identity(reference) for reference in selected_operator_ids
+                ),
+                repetitions=repetitions,
+                invariant_suite_sha256=None,
+                target_receipt=_target_evidence_receipt(resolved_target),
+                semantic_settings=_semantic_settings_snapshot(settings),
+            )
         except ProbeFailure:
             raise
-        except (OSError, RuntimeError, ValidationError, ValueError):
+        except Exception:
             raise ProbeFailure(
                 "augmentation preparation",
                 "PROBE_AUGMENTATION_PREPARATION_FAILED",
@@ -405,7 +489,7 @@ def probe(
                 "Review semantic settings and target limits, then rerun.",
                 target_safe_to_reuse=True,
             ) from None
-        _print_pilot_budget(plan, settings, campaign_confirmation)
+        _print_pilot_budget(plan, campaign_confirmation)
         if not _confirm_paid_execution(
             confirmation=campaign_confirmation,
             confirmed_digest=confirm_paid_execution,
@@ -422,17 +506,36 @@ def probe(
             output=output,
             repetitions=repetitions,
             remaining_target_seconds=remaining_target_seconds,
+            run_context=run_context,
         )
-        print_dataset_results(results, output, show_report_guidance=False)
-        _print_stronger_run(
-            data,
-            target,
-            output,
-            allow_insecure_http=allow_insecure_http,
-            target_artifacts=tuple(target_artifact or ()),
-        )
-        console.print("")
-        report_evidence(output)
+        try:
+            print_dataset_results(results, output, show_report_guidance=False)
+        except Exception:
+            raise ProbeFailure(
+                "evaluation",
+                "PROBE_RESULT_PRESENTATION_FAILED",
+                "The campaign evidence was written, but its result summary could not be shown.",
+                "Use the saved evidence file with `ul report` after fixing terminal output.",
+                target_safe_to_reuse=True,
+            ) from None
+        try:
+            _print_stronger_run(
+                data,
+                target,
+                output,
+                allow_insecure_http=allow_insecure_http,
+                target_artifacts=tuple(target_artifact or ()),
+            )
+            console.print("")
+            report_evidence(output)
+        except Exception:
+            raise ProbeFailure(
+                "analysis",
+                "PROBE_REPORT_FAILED",
+                "The campaign evidence was written, but the report could not be produced.",
+                "Run `ul report` against the saved private evidence file.",
+                target_safe_to_reuse=True,
+            ) from None
     except ProbeFailure as failure:
         _print_failure(failure, diagnostic_artifact=diagnostic_artifact)
         raise typer.Exit(code=2) from None
@@ -581,6 +684,8 @@ def _confirm_target(resolved_target: _ResolvedTarget, *, confirmed_digest: str |
         console.print(f"  Executable: {executable.path} ({executable.sha256})")
     for artifact in resolved_target.confirmation.artifacts:
         console.print(f"  Artifact: {artifact.path} ({artifact.sha256})")
+    for environment in resolved_target.confirmation.environment:
+        console.print(f"  Environment: {environment.name} value sha256 {environment.value_sha256}")
     if resolved_target.kind == "http":
         http_config = cast(JsonHttpTargetConfig, resolved_target.config)
         console.print(f"  Endpoint: {json_http_environment_config_urls(http_config)[0]}")
@@ -649,18 +754,34 @@ async def _run_smoke(
             "Inspect the target lifecycle and retry only after restoring a known-safe state.",
             target_safe_to_reuse=not evidence.lifecycle.environment_state_uncertain,
         )
-    return _SmokeResult(evidence=evidence, elapsed_seconds=elapsed_seconds)
+    return _SmokeResult(
+        evidence=evidence,
+        elapsed_seconds=elapsed_seconds,
+        case_id=case.id,
+        turn_id=case.turns[0].id,
+        request_sha256=_json_sha256(
+            {
+                "case_id": case.id,
+                "turn": case.turns[0].model_dump(mode="json"),
+                "probe_context": case.probe_context,
+            }
+        ),
+    )
 
 
 def _print_smoke(
-    evidence: ExecutionEvidence,
+    smoke_result: _SmokeResult,
     resolved_target: _ResolvedTarget,
     *,
     show_response: bool,
 ) -> None:
+    evidence = smoke_result.evidence
     console.print("")
     console.print("Smoke target invocation succeeded")
     console.print(f"  Target: {evidence.environment_id}")
+    console.print(f"  Case: {smoke_result.case_id}")
+    console.print(f"  Turn: {smoke_result.turn_id}")
+    console.print(f"  Request sha256: {smoke_result.request_sha256}")
     console.print(f"  Evidence level: {evidence.evidence_scope.replace('_', ' ')}")
     encoded_response = json.dumps(
         evidence.final_response, ensure_ascii=False, separators=(",", ":"), sort_keys=True
@@ -842,7 +963,6 @@ def _validate_campaign_target_budget(
 
 def _print_pilot_budget(
     plan: DatasetCampaignPlan,
-    settings: DatasetSemanticSettings,
     confirmation: _CampaignConfirmation,
 ) -> None:
     console.print("")
@@ -858,9 +978,14 @@ def _print_pilot_budget(
     )
     console.print(f"  Semantic-model calls: up to {plan.calls.total_semantic_model}")
     console.print(f"  Completion tokens: 0..{plan.tokens.maximum}")
-    console.print("  Monetary cost: unavailable (no trusted pricing configured)")
+    if confirmation.monetary_cost_status == "bounded":
+        assert confirmation.maximum_cost_usd is not None
+        console.print(f"  Maximum monetary cost: ${confirmation.maximum_cost_usd:.6f} USD")
+    else:
+        console.print("  Monetary cost: UNKNOWN AND UNBOUNDED (no trusted pricing configured)")
     console.print(f"  Semantic provider: {confirmation.semantic_provider_id}")
     console.print(f"  Semantic endpoint sha256: {confirmation.semantic_endpoint_sha256}")
+    console.print(f"  Semantic settings sha256: {confirmation.semantic_settings_sha256}")
     console.print("  Data policy: " + json.dumps(confirmation.data_policy, sort_keys=True))
     console.print(f"  Maximum active wall time: {confirmation.maximum_wall_seconds:.1f} seconds")
     console.print(f"  Campaign confirmation sha256: {_model_sha256(confirmation)}")
@@ -871,7 +996,9 @@ def _campaign_confirmation(
     settings: DatasetSemanticSettings,
     resolved_target: _ResolvedTarget,
 ) -> _CampaignConfirmation:
-    planned_target_seconds = plan.calls.repetition_executions * _TARGET_TIMEOUT_SECONDS
+    planned_target_seconds = (
+        resolved_target.calls_per_execution + plan.calls.repetition_executions
+    ) * _TARGET_TIMEOUT_SECONDS
     bounded_target_seconds = (
         resolved_target.maximum_active_target_seconds
         if resolved_target.maximum_active_target_seconds is not None
@@ -902,6 +1029,7 @@ def _campaign_confirmation(
         semantic_provider_id=settings.semantic_provider_id,
         semantic_provider_type=settings.semantic_provider_type,
         semantic_endpoint_sha256=settings.semantic_endpoint_sha256,
+        semantic_settings_sha256=_model_sha256(_semantic_settings_snapshot(settings)),
         data_policy=data_policy,
         command_environment_api_requests=(
             resolved_target.calls_per_execution + plan.calls.total_environment_api
@@ -911,6 +1039,8 @@ def _campaign_confirmation(
         maximum_wall_seconds=(
             bounded_target_seconds + plan.calls.total_semantic_model * settings.timeout_seconds
         ),
+        monetary_cost_status=("bounded" if plan.money is not None else "unknown_unbounded"),
+        maximum_cost_usd=plan.money.maximum if plan.money is not None else None,
     )
 
 
@@ -962,11 +1092,12 @@ def _run_campaign(
     output: Path,
     repetitions: int,
     remaining_target_seconds: float | None,
+    run_context: DatasetEvidenceRunContext,
 ) -> tuple[DatasetEvaluationResult, ...]:
     resolved_target.revalidate_identity()
     if output.exists():
         raise ProbeFailure(
-            "analysis",
+            "output",
             "PROBE_EVIDENCE_EXISTS",
             "The evidence output already exists; UL will not overwrite it.",
             "Choose a new --output path.",
@@ -974,8 +1105,17 @@ def _run_campaign(
         )
     try:
         output.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    except OSError:
+        raise ProbeFailure(
+            "output",
+            "PROBE_OUTPUT_PREPARATION_FAILED",
+            "The private evidence directory could not be prepared.",
+            "Check the output path and permissions, then rerun.",
+            target_safe_to_reuse=True,
+        ) from None
+    try:
         evaluator_preflight = asyncio.run(preflight_evaluator(settings))
-    except (OSError, RuntimeError, ValueError):
+    except Exception:
         raise ProbeFailure(
             "augmentation preparation",
             "PROBE_AUGMENTATION_PREPARATION_FAILED",
@@ -983,33 +1123,56 @@ def _run_campaign(
             "Verify provider settings and model compatibility, then rerun.",
             target_safe_to_reuse=True,
         ) from None
-    connection = resolved_target.create_connection(
-        plan.calls.total_environment_api,
-        remaining_target_seconds,
-    )
     try:
-        with create_private_output(output) as output_stream:
-            results = asyncio.run(
-                evaluate_interaction_records(
-                    records,
-                    selected_operator_ids,
-                    settings,
-                    connection,
-                    output_stream,
-                    repetitions=repetitions,
-                    max_environment_api_calls=plan.calls.total_environment_api,
-                    planned_target_calls=plan.calls.total_environment_api,
-                    evaluator_preflight=evaluator_preflight,
-                )
-            )
-    except (OSError, RuntimeError, TimeoutError, ValueError, httpx.HTTPError) as error:
+        connection = resolved_target.create_connection(
+            plan.calls.total_environment_api,
+            remaining_target_seconds,
+        )
+    except Exception:
         raise ProbeFailure(
             "probe execution",
-            "PROBE_CAMPAIGN_FAILED",
-            "The bounded campaign stopped; complete evidence written before failure remains local.",
-            "Inspect the evidence and restore the test target before retrying with a new output.",
+            "PROBE_TARGET_CONNECTION_FAILED",
+            "The confirmed target connection could not be prepared.",
+            "Revalidate the target receipt and advanced target configuration.",
+            target_safe_to_reuse=True,
+        ) from None
+    try:
+        with create_private_output(output) as output_stream:
+            try:
+                results = asyncio.run(
+                    evaluate_interaction_records(
+                        records,
+                        selected_operator_ids,
+                        settings,
+                        connection,
+                        output_stream,
+                        repetitions=repetitions,
+                        max_environment_api_calls=plan.calls.total_environment_api,
+                        planned_target_calls=plan.calls.total_environment_api,
+                        run_context=run_context,
+                        evaluator_preflight=evaluator_preflight,
+                    )
+                )
+            except Exception:
+                raise ProbeFailure(
+                    "evaluation",
+                    "PROBE_EVALUATION_FAILED",
+                    "Evaluation stopped after campaign execution began; completed evidence "
+                    "remains local.",
+                    "Inspect the saved evidence and provider diagnostics before using a new "
+                    "output.",
+                    target_safe_to_reuse=False,
+                ) from None
+    except ProbeFailure:
+        raise
+    except Exception:
+        raise ProbeFailure(
+            "output",
+            "PROBE_EVIDENCE_WRITE_FAILED",
+            "The private evidence output could not be completed.",
+            "Check disk space and permissions; inspect any retained evidence before retrying.",
             target_safe_to_reuse=False,
-        ) from error
+        ) from None
     return results
 
 

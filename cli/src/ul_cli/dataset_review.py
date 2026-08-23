@@ -202,13 +202,21 @@ class DatasetEvidenceRedactionCoverage(_StrictModel):
 
 
 class DatasetEvidenceTarget(_StrictModel):
-    kind: Literal["environment_http"]
-    config: JsonHttpTargetConfig
+    kind: Literal["environment_http", "probe_target"]
+    config: JsonHttpTargetConfig | None = cast(Any, Field)(default=None, exclude_if=_is_none)
+    receipt: dict[str, JsonValue] | None = cast(Any, Field)(default=None, exclude_if=_is_none)
     sha256: str = Field(pattern=_SHA256_PATTERN)
 
     @model_validator(mode="after")
     def validate_target(self) -> Self:
-        expected_sha256 = dataset_regression_target_config_sha256(self.config)
+        if self.kind == "environment_http":
+            if self.config is None or self.receipt is not None:
+                raise ValueError("HTTP run context target requires only its config snapshot")
+            expected_sha256 = dataset_regression_target_config_sha256(self.config)
+        else:
+            if self.receipt is None or self.config is not None:
+                raise ValueError("probe run context target requires only its receipt snapshot")
+            expected_sha256 = _canonical_json_sha256(self.receipt)
         if self.sha256 != expected_sha256:
             raise ValueError("run context target digest must match its snapshot")
         return self
@@ -384,6 +392,7 @@ def create_dataset_evidence_run_context(
     repetitions: int,
     invariant_suite_sha256: str | None,
     target_config: JsonHttpTargetConfig | None = None,
+    target_receipt: dict[str, JsonValue] | None = None,
     semantic_settings: DatasetEvidenceSemanticSettings,
     redaction_policy_sha256: str | None = None,
     redaction_coverage: tuple[DatasetEvidenceRedactionCoverage, ...] = (),
@@ -395,14 +404,26 @@ def create_dataset_evidence_run_context(
         DatasetEvidenceOperator(id=operator_id, version=version)
         for operator_id, version in operators
     )
-    if target_config is None:
-        raise ValueError("run context requires a environment API connection")
-    target = DatasetEvidenceTarget(
-        kind="environment_http",
-        config=target_config,
-        sha256=dataset_regression_target_config_sha256(target_config),
+    if (target_config is None) == (target_receipt is None):
+        raise ValueError("run context requires exactly one target snapshot or receipt")
+    target = (
+        DatasetEvidenceTarget(
+            kind="environment_http",
+            config=target_config,
+            sha256=dataset_regression_target_config_sha256(target_config),
+        )
+        if target_config is not None
+        else DatasetEvidenceTarget(
+            kind="probe_target",
+            receipt=target_receipt,
+            sha256=_canonical_json_sha256(target_receipt),
+        )
     )
-    fixture = _dataset_evidence_fixture(target_config)
+    fixture = (
+        _dataset_evidence_fixture(target_config)
+        if target_config is not None
+        else DatasetEvidenceFixture(status="not_required")
+    )
     content = {
         "schema_version": "1.3.0",
         "pipeline_version": _DATASET_EVALUATION_PIPELINE_VERSION,
@@ -884,18 +905,23 @@ def _summarize_dataset_evidence(
         Literal[0, 1, 2],
         {"resolved": 0, "action_required": 1, "inconclusive": 2}[report_review_status],
     )
-    target_configs = tuple(
-        loaded_record.evidence.run_context.target.config
+    targets = tuple(
+        loaded_record.evidence.run_context.target
         for loaded_record in evidence_records
         if loaded_record.evidence.run_context is not None
     )
-    if any(
-        isinstance(config, JsonHttpIsolatedResponseConfig) for config in target_configs
-    ) and not all(isinstance(config, JsonHttpIsolatedResponseConfig) for config in target_configs):
-        raise _ReviewInputError("evidence combines incompatible target capability tiers")
-    response_only = bool(target_configs) and all(
-        isinstance(config, JsonHttpIsolatedResponseConfig) for config in target_configs
+    response_only_targets = tuple(
+        (
+            target.kind == "probe_target"
+            and target.receipt is not None
+            and target.receipt.get("supports_state_observation") is False
+        )
+        or isinstance(target.config, JsonHttpIsolatedResponseConfig)
+        for target in targets
     )
+    if any(response_only_targets) and not all(response_only_targets):
+        raise _ReviewInputError("evidence combines incompatible target capability tiers")
+    response_only = bool(targets) and all(response_only_targets)
     return UnifiedReport(
         evidence_type="dataset_evaluation",
         evidence_schema_versions=tuple(

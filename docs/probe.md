@@ -44,8 +44,11 @@ ul probe interactions.jsonl --target local-target.json
 ul probe interactions.jsonl --target http-target.json
 ```
 
-UL automatically binds command arguments that resolve to files. When a generic interpreter hides
-its worker artifact, repeat `--target-artifact PATH` for every script or bundle that will execute.
+UL binds the resolved executable, the direct Python module and UL worker, allowlisted environment
+value digests, and command arguments that resolve to files. Repeat `--target-artifact PATH` for
+every transitive Python helper, command script, bundle, or other executable dependency that is not
+resolved directly from the target declaration. UL validates every declared artifact immediately
+before launch; it does not claim undeclared transitive dependencies are bound.
 
 Plain local HTTP also requires `--allow-insecure-http`. HTTP is never the implicit default.
 
@@ -54,7 +57,8 @@ Plain local HTTP also requires `--allow-insecure-http`. HTTP is never the implic
 The first result includes a bounded structural summary and digest of the live normalized target
 response, response-only or response-and-state evidence level, available trajectory observations,
 and state-summary availability. Use `--show-smoke-response` only when private response content is
-safe to print. Only after a
+safe to print. Case, turn, and canonical request identities are printed without request content.
+Only after a
 successful smoke does UL save private target/dataset bindings in `.ul/probe.json`.
 
 UL then selects at most ten examples, recommends the low-risk
@@ -62,6 +66,14 @@ UL then selects at most ten examples, recommends the low-risk
 requests, maximum semantic calls, completion-token bound, monetary-estimate availability, one
 repetition, and maximum active wall time. Declining the second confirmation stops with zero semantic
 calls.
+
+The campaign receipt binds the semantic provider and endpoint, model, render model, equivalence
+model, input/output/token/response/time bounds, data policy, target receipt, and command-wide call,
+wall-time, and cost status. Normal evidence records the same semantic settings plus dataset,
+operator, and target-receipt provenance in `run_context`.
+
+When no trusted provider pricing is configured, the confirmation says monetary cost is unknown and
+unbounded. Confirming that receipt accepts this uncertainty; it is not a cost guarantee.
 
 ## 4. Run the bounded pilot
 
