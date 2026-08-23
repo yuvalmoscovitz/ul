@@ -1,10 +1,10 @@
-from ul.dataset_augmentation import builtin_dataset_augmentation_operators
-from ul.event_stress import (
+from ul.augmentations.conversation import (
     CorrectionAfterFirstResponseCase,
     RetryAfterSuccessfulCommitCase,
 )
-from ul.timeout_after_commit import TimeoutAfterCommitCase
-from ul_core.augmentation import builtin_augmentation_registry
+from ul.augmentations.dataset import builtin_dataset_augmentation_operators
+from ul.augmentations.environment_fault import TimeoutAfterCommitCase
+from ul_core.augmentations.registry import builtin_augmentation_registry
 
 
 def test_every_runtime_augmentation_uses_one_canonical_namespace() -> None:

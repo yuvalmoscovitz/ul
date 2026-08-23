@@ -10,12 +10,12 @@ from typing import Literal, Never, cast
 
 import typer
 from pydantic import ValidationError
-from ul.dataset_invariants import DatasetInvariantRuleResult
-from ul.event_stress import (
+from ul.augmentations.conversation import (
     CorrectionStressResult,
     RetryAfterSuccessfulCommitStressResult,
 )
-from ul.timeout_after_commit import TimeoutAfterCommitStressResult
+from ul.augmentations.environment_fault import TimeoutAfterCommitStressResult
+from ul.dataset_invariants import DatasetInvariantRuleResult
 
 from ul_cli.dataset_review import (
     is_reportable_dataset_evidence,

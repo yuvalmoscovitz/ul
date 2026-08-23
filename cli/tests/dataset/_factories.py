@@ -28,7 +28,7 @@ from ul import (
     SemanticFrame,
     project_rich_interaction_case,
 )
-from ul.dataset_augmentation import DatasetAugmentationCandidate
+from ul.augmentations.dataset import DatasetAugmentationCandidate
 from ul.dataset_invariants import (
     DatasetInvariantArmEvaluation,
     DatasetInvariantEvaluation,

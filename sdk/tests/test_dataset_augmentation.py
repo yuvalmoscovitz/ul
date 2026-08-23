@@ -4,7 +4,7 @@ from collections.abc import Iterator
 from typing import Literal
 
 import pytest
-from ul.dataset_augmentation import (
+from ul.augmentations.dataset import (
     DatasetAugmentationEngine,
     DatasetAugmentationOperator,
     builtin_dataset_augmentation_operators,

@@ -1,4 +1,4 @@
-from ul_core.augmentation import builtin_augmentation_registry
+from ul_core.augmentations.registry import builtin_augmentation_registry
 from ul_core.coverage import (
     CoverageArchive,
     DeterministicAugmentationSelector,

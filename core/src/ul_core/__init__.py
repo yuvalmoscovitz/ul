@@ -1,10 +1,6 @@
 """Core primitives for UL."""
 
-from ul_core.augmentation import (
-    AugmentationRegistry,
-    builtin_augmentation_registry,
-)
-from ul_core.augmentation_catalog import (
+from ul_core.augmentations.definitions import (
     AugmentationBinding,
     AugmentationExecutionOwner,
     AugmentationRef,
@@ -12,6 +8,10 @@ from ul_core.augmentation_catalog import (
     BuiltinAugmentationCatalog,
     BuiltinAugmentationSpec,
     builtin_augmentation_catalog,
+)
+from ul_core.augmentations.registry import (
+    AugmentationRegistry,
+    builtin_augmentation_registry,
 )
 from ul_core.contracts import (
     ObservationSource,

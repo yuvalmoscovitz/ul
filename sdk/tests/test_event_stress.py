@@ -5,8 +5,7 @@ from pathlib import Path
 
 import pytest
 import typer
-from ul.dataset_invariants import JsonValuesEqualInvariant
-from ul.event_stress import (
+from ul.augmentations.conversation import (
     CorrectionAfterFirstResponseCase,
     create_multi_turn_regression_case,
     load_multi_turn_regression_case,
@@ -14,6 +13,7 @@ from ul.event_stress import (
     replay_multi_turn_regression,
     run_correction_stress_test,
 )
+from ul.dataset_invariants import JsonValuesEqualInvariant
 from ul.http_environment import JsonHttpEnvironmentConfig
 from ul_cli.event_stress import _print_result
 from ul_core.dataset import ObservedAgentOutput

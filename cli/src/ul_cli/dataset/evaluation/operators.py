@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from ul import DatasetAugmentationOperator, resolve_dataset_augmentation_operator
-from ul_core.augmentation_catalog import builtin_augmentation_catalog
+from ul_core.augmentations.definitions import builtin_augmentation_catalog
 
 from ..presentation.runtime import console
 from .records import DatasetInputError

@@ -1,10 +1,16 @@
+"""Runtime protocol and registry for scenario augmentations."""
+
 from __future__ import annotations
 
 from collections.abc import Iterable
-from typing import Protocol, runtime_checkable
+from typing import Protocol, cast, runtime_checkable
 
 from pydantic import Field
 
+from ul_core.augmentations.definitions import (
+    BuiltinAugmentationSpec,
+    builtin_augmentation_catalog,
+)
 from ul_core.models import OracleRelation, Scenario, ShrinkMetadata, ULModel
 
 
@@ -57,10 +63,13 @@ class AugmentationRegistry:
             self.register(augmentation)
 
     def register(self, augmentation: Augmentation) -> None:
-        key = (augmentation.metadata.id, augmentation.metadata.version)
+        candidate = cast(object, augmentation)
+        if not isinstance(candidate, Augmentation):
+            raise TypeError("registered object must implement the augmentation runtime protocol")
+        key = (candidate.metadata.id, candidate.metadata.version)
         if key in self._augmentations:
             raise ValueError(f"augmentation already registered: {key[0]}@{key[1]}")
-        self._augmentations[key] = augmentation
+        self._augmentations[key] = candidate
 
     def get(self, augmentation_id: str, version: str | None = None) -> Augmentation:
         matching = [
@@ -96,6 +105,30 @@ class AugmentationRegistry:
             if augmentation.applicability(scenario).applicable
         )
 
+    def definition(
+        self, augmentation_id: str, version: str | None = None
+    ) -> BuiltinAugmentationSpec:
+        """Resolve the authoritative product definition for an installed runtime binding."""
+
+        runtime = self.get(augmentation_id, version)
+        definition = builtin_augmentation_catalog().get(
+            runtime.metadata.id, runtime.metadata.version
+        )
+        binding = next(
+            (
+                binding
+                for binding in definition.bindings
+                if binding.mode == "scenario_materialization"
+            ),
+            None,
+        )
+        if binding is None:
+            raise ValueError("runtime augmentation has no scenario-materialization binding")
+        runtime_path = f"{type(runtime).__module__}:{type(runtime).__qualname__}"
+        if binding.runtime != runtime_path:
+            raise ValueError("registered runtime does not match the authoritative binding")
+        return definition
+
 
 def _version_tuple(version: str) -> tuple[int, int, int]:
     major, minor, patch = version.split(".")
@@ -103,6 +136,6 @@ def _version_tuple(version: str) -> tuple[int, int, int]:
 
 
 def builtin_augmentation_registry() -> AugmentationRegistry:
-    from ul_core.operators import BUILTIN_AUGMENTATIONS
+    from ul_core.augmentations.scenario import BUILTIN_AUGMENTATIONS
 
     return AugmentationRegistry(BUILTIN_AUGMENTATIONS)

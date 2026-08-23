@@ -5,7 +5,7 @@ import json
 from collections import Counter
 from collections.abc import Iterable
 
-from ul_core.augmentation import Augmentation, AugmentationRegistry
+from ul_core.augmentations.registry import Augmentation, AugmentationRegistry
 from ul_core.models import (
     EnvironmentEvent,
     ExecutionResult,

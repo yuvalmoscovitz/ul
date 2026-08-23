@@ -12,13 +12,7 @@ from typing import Annotated, TextIO
 
 import typer
 from pydantic import ValidationError
-from ul.dataset_invariants import (
-    DatasetInvariantRule,
-    ObservationAuthority,
-    load_dataset_invariant_suite,
-)
-from ul.dataset_regression import dataset_regression_target_config_sha256
-from ul.event_stress import (
+from ul.augmentations.conversation import (
     CorrectionAfterFirstResponseCase,
     CorrectionStressResult,
     MultiTurnRegressionCase,
@@ -34,18 +28,24 @@ from ul.event_stress import (
     run_correction_stress_test,
     run_retry_after_successful_commit_stress_test,
 )
-from ul.http_environment import (
-    JsonHttpEnvironmentConnection,
-    load_json_http_environment_config,
-    require_stateful_json_http_environment,
-    validate_json_http_environment_configuration,
-)
-from ul.timeout_after_commit import (
+from ul.augmentations.environment_fault import (
     TimeoutAfterCommitCase,
     TimeoutAfterCommitStressResult,
     load_timeout_after_commit_case,
     plan_timeout_after_commit_stress_test,
     run_timeout_after_commit_stress_test,
+)
+from ul.dataset_invariants import (
+    DatasetInvariantRule,
+    ObservationAuthority,
+    load_dataset_invariant_suite,
+)
+from ul.dataset_regression import dataset_regression_target_config_sha256
+from ul.http_environment import (
+    JsonHttpEnvironmentConnection,
+    load_json_http_environment_config,
+    require_stateful_json_http_environment,
+    validate_json_http_environment_configuration,
 )
 from ul.trace_replay import (
     TraceReplayBundle,

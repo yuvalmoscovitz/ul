@@ -1,3 +1,5 @@
+"""Timeout-after-commit augmentation runtime."""
+
 from __future__ import annotations
 
 import asyncio

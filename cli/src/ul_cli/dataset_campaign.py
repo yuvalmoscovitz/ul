@@ -10,7 +10,10 @@ from ul import (
     InteractionRecord,
     plan_evaluator_preflight_profiles,
 )
-from ul_core.augmentation_catalog import BuiltinAugmentationSpec, builtin_augmentation_catalog
+from ul_core.augmentations.definitions import (
+    BuiltinAugmentationSpec,
+    builtin_augmentation_catalog,
+)
 
 
 class _StrictModel(BaseModel):
