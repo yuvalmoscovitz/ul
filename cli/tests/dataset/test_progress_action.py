@@ -220,3 +220,35 @@ def test_action_kind_rejects_cross_boundary_command_substitution() -> None:
             "dataset_report",
             ("ul", "probe", "PRIVATE_DATA", "--target", "PRIVATE_TARGET"),
         )
+
+
+def test_quarantine_attestation_is_limited_to_probe_resume_actions(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        progress_action_module,
+        "_action_receipt_directory",
+        lambda: tmp_path / "action-state",
+    )
+    public_argv = progress_action_module.create_progress_action(
+        "dataset_report",
+        ("ul", "dataset", "report", str(tmp_path / "evidence.jsonl")),
+    )
+    monkeypatch.setattr(
+        progress_action_module.subprocess,
+        "run",
+        lambda *args, **kwargs: pytest.fail("non-probe attestation must not execute"),
+    )
+
+    result = CliRunner().invoke(
+        root_app,
+        [
+            *public_argv[1:],
+            "--resolve-quarantine-after",
+            "environment-reset",
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert "Unable to resolve the progress action safely." in result.output

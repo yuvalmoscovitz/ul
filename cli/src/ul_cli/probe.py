@@ -69,6 +69,7 @@ from ul_cli.dataset.evaluation.runner import evaluate_interaction_records
 from ul_cli.dataset.evidence.persistence import (
     create_durable_evidence_output,
     default_augmentations_output,
+    durable_evidence_marker_manifest_sha256,
     load_evaluator_preflight,
     open_resume_output,
     persist_evaluator_preflight,
@@ -1160,6 +1161,7 @@ def probe(
             evaluator_preflight=evaluator_preflight,
             resume_campaign=resume_checkpoint is not None,
             allow_insecure_http=allow_insecure_http,
+            resolve_quarantine_after=resolve_quarantine_after,
         )
         projection_failure = _campaign_projection_failure(results, output)
         if projection_failure is not None:
@@ -1908,6 +1910,7 @@ def _run_campaign(
     evaluator_preflight: EvaluatorModelPreflight | None,
     resume_campaign: bool,
     allow_insecure_http: bool,
+    resolve_quarantine_after: Literal["environment-reset", "environment-replacement"] | None,
 ) -> tuple[DatasetEvaluationResult, ...]:
     resolved_target.revalidate_identity()
     if output.exists() and not resume_campaign:
@@ -1972,6 +1975,37 @@ def _run_campaign(
             if recorded_manifest != expected_manifest:
                 raise ValueError("probe campaign manifest does not match the resumed campaign")
             trial_journal = open_dataset_trial_journal(journal_path(output), recorded_manifest)
+            if trial_journal.snapshot.quarantined_unit_ids:
+                if resolve_quarantine_after is None:
+                    try:
+                        _persist_probe_quarantine(
+                            resolved_target,
+                            "target_delivery_or_cleanup_uncertain",
+                        )
+                    except (OSError, ValueError):
+                        raise ProbeFailure(
+                            "output",
+                            "PROBE_QUARANTINE_PERSIST_FAILED",
+                            "UL could not persist target quarantine after interrupted delivery.",
+                            "Do not call this target; fix the private .ul directory first.",
+                            target_safe_to_reuse=False,
+                        ) from None
+                    raise ProbeFailure(
+                        "target load",
+                        "PROBE_TARGET_QUARANTINED",
+                        "An interrupted probe trial has uncertain target delivery.",
+                        "After an operator resets or replaces the test environment, rerun with "
+                        "--resolve-quarantine-after environment-reset (or "
+                        "environment-replacement).",
+                        target_safe_to_reuse=False,
+                    )
+                _persist_probe_safety_state(
+                    resolved_target,
+                    status="reusable",
+                    reason_code=(f"operator_attested_{resolve_quarantine_after.replace('-', '_')}"),
+                )
+            if durable_evidence_marker_manifest_sha256(output) != recorded_manifest.manifest_sha256:
+                raise ValueError("probe evidence marker does not match the resumed campaign")
             augmentation_ledger = open_augmentation_ledger_for_resume(
                 augmentations_output,
                 expected_context=augmentation_generation_context,
@@ -1986,6 +2020,10 @@ def _run_campaign(
                 generation_context=augmentation_generation_context,
                 selected_records=records,
             )
+    except ProbeFailure:
+        if trial_journal is not None:
+            trial_journal.close()
+        raise
     except (OSError, ValueError):
         if augmentation_ledger is not None:
             augmentation_ledger.close()
@@ -1997,7 +2035,7 @@ def _run_campaign(
             "The durable campaign manifest, journal, or evidence output could not be "
             "opened safely.",
             "Keep the target stopped and inspect the private campaign artifacts.",
-            target_safe_to_reuse=True,
+            target_safe_to_reuse=not resume_campaign,
         ) from None
 
     terminal_states = trial_journal.snapshot.terminal_states

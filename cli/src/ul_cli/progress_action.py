@@ -280,17 +280,32 @@ def execute_progress_action(
         str,
         typer.Argument(help="Opaque action ID emitted by campaign progress."),
     ],
+    resolve_quarantine_after: Annotated[
+        Literal["environment-reset", "environment-replacement"] | None,
+        typer.Option(
+            help="Attest cleanup before resuming a quarantined probe target.",
+        ),
+    ] = None,
 ) -> None:
     try:
         receipt = _read_progress_action(action_id)
+        if resolve_quarantine_after is not None and receipt.action_kind != "probe_resume":
+            raise ValueError("quarantine attestation is only valid for probe resume actions")
         if receipt.action_kind == "probe_diagnose":
             typer.echo(
                 "Probe target calls are stopped. Inspect the private probe diagnostic and "
                 "safety state; restart only after an explicit environment reset or replacement."
             )
             return
+        private_argv = receipt.argv
+        if resolve_quarantine_after is not None:
+            private_argv = (
+                *private_argv,
+                "--resolve-quarantine-after",
+                resolve_quarantine_after,
+            )
         completed = subprocess.run(
-            (sys.executable, "-I", "-m", "ul_cli.main", *receipt.argv[1:]),
+            (sys.executable, "-I", "-m", "ul_cli.main", *private_argv[1:]),
             check=False,
             cwd=receipt.working_directory,
         )

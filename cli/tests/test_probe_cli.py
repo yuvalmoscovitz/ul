@@ -840,7 +840,10 @@ def test_probe_quarantine_fsyncs_private_state_and_directory(
     assert json.loads(safety_state.read_text())["status"] == "quarantined"
 
 
-@pytest.mark.parametrize("checkpoint_tamper", (None, "elapsed", "evidence"))
+@pytest.mark.parametrize(
+    "checkpoint_tamper",
+    (None, "elapsed", "evidence", "marker", "running", "running_marker"),
+)
 def test_paused_probe_action_blocks_before_repeating_completed_smoke(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -899,18 +902,17 @@ def test_paused_probe_action_blocks_before_repeating_completed_smoke(
         "create_semantic_model_deconstructor",
         lambda _settings: semantic_model,
     )
-    result = runner.invoke(
-        app,
-        [
-            "probe",
-            str(dataset),
-            "--target",
-            "agent:run",
-            "--output",
-            str(output),
-        ],
-        input="y\ny\n",
-    )
+    probe_arguments = [
+        "probe",
+        str(dataset),
+        "--target",
+        "agent:run",
+        "--output",
+        str(output),
+    ]
+    if checkpoint_tamper == "running":
+        probe_arguments.append("--confirmation-run")
+    result = runner.invoke(app, probe_arguments, input="y\ny\n")
 
     assert result.exit_code == 130, result.output
     assert "Reason: PROBE_PAUSED_AFTER_PREFLIGHT" in result.output
@@ -923,7 +925,7 @@ def test_paused_probe_action_blocks_before_repeating_completed_smoke(
     assert action_match is not None
     invocations = tmp_path / "target-invocations.jsonl"
     assert len(invocations.read_text().splitlines()) == 1
-    if checkpoint_tamper is not None:
+    if checkpoint_tamper in {"elapsed", "evidence"}:
         checkpoint_path = tmp_path / "evidence.jsonl.probe-checkpoint.json"
         checkpoint = json.loads(checkpoint_path.read_text(encoding="utf-8"))
         if checkpoint_tamper == "elapsed":
@@ -933,6 +935,24 @@ def test_paused_probe_action_blocks_before_repeating_completed_smoke(
                 "structurally_valid": "PRIVATE_FORGED_EVIDENCE"
             }
         checkpoint_path.write_text(json.dumps(checkpoint) + "\n", encoding="utf-8")
+    elif checkpoint_tamper == "marker":
+        marker = json.loads(output.read_text(encoding="utf-8"))
+        marker["manifest_sha256"] = "0" * 64
+        output.write_text(json.dumps(marker) + "\n", encoding="utf-8")
+    elif checkpoint_tamper in {"running", "running_marker"}:
+        manifest = probe_module.read_dataset_run_manifest(
+            output.with_name(f"{output.name}.manifest.json")
+        )
+        journal = probe_module.open_dataset_trial_journal(
+            output.with_name(f"{output.name}.trials.jsonl"),
+            manifest,
+        )
+        journal.start(manifest.work_plan[-1])
+        journal.close()
+        if checkpoint_tamper == "running_marker":
+            marker = json.loads(output.read_text(encoding="utf-8"))
+            marker["manifest_sha256"] = "0" * 64
+            output.write_text(json.dumps(marker) + "\n", encoding="utf-8")
     nested_results = []
 
     def invoke_trusted_cli(
@@ -958,11 +978,42 @@ def test_paused_probe_action_blocks_before_repeating_completed_smoke(
             "Reusing durable smoke and evaluator preflight checkpoints" in nested_results[0].output
         )
         assert len(invocations.read_text().splitlines()) == 3
-    else:
+    elif checkpoint_tamper in {"elapsed", "evidence"}:
         assert action_result.exit_code == 2
         assert "Reason: PROBE_CHECKPOINT_INVALID" in nested_results[0].output
         assert "PRIVATE_FORGED_EVIDENCE" not in nested_results[0].output
         assert len(invocations.read_text().splitlines()) == 1
+    elif checkpoint_tamper == "marker":
+        assert action_result.exit_code == 2
+        assert "Reason: PROBE_DURABLE_STATE_INVALID" in nested_results[0].output
+        assert len(invocations.read_text().splitlines()) == 1
+    elif checkpoint_tamper == "running_marker":
+        assert action_result.exit_code == 2
+        assert "Reason: PROBE_TARGET_QUARANTINED" in nested_results[0].output
+        assert "environment=quarantined" in nested_results[0].output
+        assert len(invocations.read_text().splitlines()) == 1
+        safety_state = next((tmp_path / ".ul").glob("probe-quarantine-*.json"))
+        assert json.loads(safety_state.read_text())["status"] == "quarantined"
+    else:
+        assert action_result.exit_code == 2
+        assert "Reason: PROBE_TARGET_QUARANTINED" in nested_results[0].output
+        assert "environment=quarantined" in nested_results[0].output
+        assert len(invocations.read_text().splitlines()) == 1
+        resumed_action = runner.invoke(
+            app,
+            [
+                "action",
+                action_match.group(1),
+                "--resolve-quarantine-after",
+                "environment-reset",
+            ],
+        )
+        assert resumed_action.exit_code == 2
+        assert "Reason: PROBE_REPORT_FAILED" in nested_results[1].output
+        assert (
+            "Reusing durable smoke and evaluator preflight checkpoints" in nested_results[1].output
+        )
+        assert len(invocations.read_text().splitlines()) == 6
 
 
 def test_paused_probe_action_resumes_after_terminal_trial_without_replay(
