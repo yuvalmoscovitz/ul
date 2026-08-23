@@ -29,6 +29,7 @@ from ul.dataset_augmentation import (
 from ul.environment import (
     environment_timeout_requires_quarantine,
     execution_evidence_requires_quarantine,
+    observed_outputs_from_evidence,
     validate_execution_evidence,
 )
 
@@ -587,22 +588,7 @@ class DatasetEvaluationRunner:
             )
         if len(execution_evidence.turns) != 1:
             raise RuntimeError("environment returned invalid single-turn evidence")
-        turn_evidence = execution_evidence.turns[0]
-        target_output = ObservedAgentOutput(
-            raw_output=turn_evidence.response,
-            metadata={
-                **(
-                    {"committed_state_snapshot": turn_evidence.state_snapshot}
-                    if turn_evidence.state_snapshot is not None
-                    else {}
-                ),
-                **(
-                    {"state_observation_authority": turn_evidence.state_observation_authority}
-                    if turn_evidence.state_observation_authority is not None
-                    else {}
-                ),
-            },
-        )
+        target_output = observed_outputs_from_evidence(execution_evidence)[0]
         record = InteractionRecord(
             id=interaction_id,
             raw_input=raw_input,

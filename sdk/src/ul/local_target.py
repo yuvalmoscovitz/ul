@@ -19,6 +19,7 @@ from types import TracebackType
 from typing import Annotated, Literal, Self, cast
 
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, TypeAdapter, ValidationError
+from ul_core.contracts import StateEnvironment
 from ul_core.evaluation import (
     EnvironmentCapabilities,
     EnvironmentLifecycleFailureCode,
@@ -31,6 +32,7 @@ from ul_core.evaluation import (
 )
 
 from ul.probe_execution import CapabilityExecutionError, ComposedEnvironmentExecutor
+from ul.state_hooks import CallbackStateEnvironment, require_state_adapter_identity
 
 _PROTOCOL_VERSION = "1.0.0"
 _MAXIMUM_CONFIG_BYTES = 1_000_000
@@ -245,6 +247,35 @@ def load_local_target_config(path: str | Path) -> LocalTargetConfig:
 def local_target_config_sha256(config: LocalTargetConfig) -> str:
     encoded = json.dumps(
         config.model_dump(mode="json"),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _composed_local_target_config_sha256(
+    config: LocalTargetConfig,
+    *,
+    state_environment: StateEnvironment | None,
+) -> str:
+    if state_environment is None:
+        return local_target_config_sha256(config)
+    state_identity = require_state_adapter_identity(state_environment)
+    encoded = json.dumps(
+        {
+            "local_target_sha256": local_target_config_sha256(config),
+            "state_capabilities": state_environment.capabilities.model_dump(
+                mode="json", exclude_none=True
+            ),
+            "state_identity": state_identity.model_dump(mode="json"),
+            **(
+                {"state_config_sha256": state_environment.config_sha256}
+                if isinstance(state_environment, CallbackStateEnvironment)
+                else {}
+            ),
+        },
         ensure_ascii=False,
         sort_keys=True,
         separators=(",", ":"),
@@ -717,6 +748,7 @@ class LocalTargetConnection:
         config: LocalTargetConfig,
         *,
         customer_code_execution_confirmed: bool,
+        state_environment: StateEnvironment | None = None,
     ) -> None:
         if customer_code_execution_confirmed is not True:
             raise ValueError(
@@ -725,9 +757,19 @@ class LocalTargetConnection:
         validate_local_target_config(config)
         self._config = config
         self._invoker = _LocalTargetInvoker(config)
+        state_identity = (
+            require_state_adapter_identity(state_environment)
+            if state_environment is not None
+            else None
+        )
         self._executor = ComposedEnvironmentExecutor(
             self._invoker,
-            config_sha256=local_target_config_sha256(config),
+            config_sha256=_composed_local_target_config_sha256(
+                config,
+                state_environment=state_environment,
+            ),
+            state_environment=state_environment,
+            fixture_id=state_identity.fixture_id if state_identity is not None else None,
         )
         self.capabilities: EnvironmentCapabilities = self._executor.capabilities
 
@@ -737,10 +779,12 @@ class LocalTargetConnection:
         config: LocalTargetConfig,
         *,
         customer_code_execution_confirmed: bool,
+        state_environment: StateEnvironment | None = None,
     ) -> Self:
         return cls(
             config,
             customer_code_execution_confirmed=customer_code_execution_confirmed,
+            state_environment=state_environment,
         )
 
     @property

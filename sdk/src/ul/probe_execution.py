@@ -39,6 +39,8 @@ from ul_core.evaluation import (
     evidence_profile_from_capabilities,
 )
 
+from ul.state_hooks import bounded_json_size
+
 _ENVIRONMENT_LIFECYCLE_FAILURE_CODES = frozenset(get_args(EnvironmentLifecycleFailureCode))
 
 
@@ -789,18 +791,16 @@ class ComposedEnvironmentExecutor:
                 "state snapshot did not match its request",
                 delivery_uncertain=True,
             )
-        snapshot_size_bytes = len(
-            json.dumps(
+        try:
+            bounded_json_size(
                 snapshot.value,
-                ensure_ascii=False,
-                separators=(",", ":"),
-            ).encode("utf-8")
-        )
-        if snapshot_size_bytes > capabilities.snapshot_size_limit_bytes:
+                max_bytes=capabilities.snapshot_size_limit_bytes,
+            )
+        except ValueError:
             raise CapabilityExecutionError(
                 "response_too_large",
                 "state snapshot exceeds the size limit",
-            )
+            ) from None
 
     def _state_request(
         self,
@@ -816,6 +816,7 @@ class ComposedEnvironmentExecutor:
             session_id=session_id,
             correlation_id=correlation_id,
             turn_id=turn_id,
+            configuration=case.probe_context,
         )
 
     def _response_only_evidence(

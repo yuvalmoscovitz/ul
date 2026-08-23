@@ -784,6 +784,16 @@ async def test_runner_executes_only_accepted_candidates_and_keeps_rejected_candi
     assert accepted.verdict == "no_divergence"
     assert accepted.target_output is not None
     assert accepted.target_output.metadata == {
+        "committed_state_before_turn": {"execution_count": 0},
+        "committed_state_diff": [
+            {
+                "schema_version": "1.0.0",
+                "path": "/execution_count",
+                "kind": "changed",
+                "before": 0,
+                "after": 1,
+            }
+        ],
         "committed_state_snapshot": {"execution_count": 1},
         "state_observation_authority": "environment_self_reported",
     }

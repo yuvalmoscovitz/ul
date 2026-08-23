@@ -729,13 +729,10 @@ async def test_sync_runner_is_reusable_before_result_callback_runs(
     original_call_soon_threadsafe = loop.call_soon_threadsafe
     first_result_scheduled = threading.Event()
     release_first_worker = threading.Event()
-    scheduled_calls = 0
 
     def block_first_worker_after_scheduling(callback: object, *args: object) -> object:
-        nonlocal scheduled_calls
-        scheduled_calls += 1
         handle = original_call_soon_threadsafe(callback, *args)
-        if scheduled_calls == 1:
+        if threading.current_thread().name == "test-sync-order":
             first_result_scheduled.set()
             release_first_worker.wait(timeout=1)
         return handle
