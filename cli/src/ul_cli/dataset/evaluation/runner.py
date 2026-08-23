@@ -31,6 +31,7 @@ from ul.http_environment import JsonHttpEnvironmentConnection
 from ul.local_target import LocalTargetConnection
 
 from ul_cli.dataset_augmentation_ledger import DatasetAugmentationLedger
+from ul_cli.dataset_campaign import create_dataset_campaign_plan
 from ul_cli.dataset_review import DatasetEvidenceRunContext
 from ul_cli.dataset_trial_journal import DatasetTrialJournal
 
@@ -74,6 +75,15 @@ async def evaluate_interaction_records(
 ) -> tuple[DatasetEvaluationResult, ...]:
     results: list[DatasetEvaluationResult] = []
     work_upper_bound = len(records) * repetitions * (1 + len(operator_ids))
+    progress_plan = create_dataset_campaign_plan(
+        records=records,
+        selected_operator_ids=operator_ids,
+        repetitions=repetitions,
+        target_calls_per_execution=1,
+        settings=settings,
+        saved_augmentations=saved_augmentations,
+        requires_preflight=False,
+    )
     progress_renderer = (
         JsonCampaignProgressRenderer(sys.stderr)
         if progress_json
@@ -83,11 +93,14 @@ async def evaluate_interaction_records(
         case_count=len(records),
         work_upper_bound=work_upper_bound,
         target_call_budget=work_upper_bound,
-        semantic_call_budget=work_upper_bound * 4,
+        semantic_call_budget=progress_plan.calls.total_semantic_model,
         environment_call_budget=max_environment_api_calls,
-        token_budget=work_upper_bound * getattr(settings, "max_output_tokens", 0) * 4,
-        maximum_wall_time_seconds=max(1, work_upper_bound)
-        * getattr(settings, "timeout_seconds", 1),
+        token_budget=progress_plan.tokens.maximum,
+        maximum_wall_time_seconds=max(
+            1,
+            work_upper_bound + progress_plan.calls.total_semantic_model,
+        )
+        * settings.timeout_seconds,
         publish=SafeCampaignProgressPublisher(progress_renderer).publish,
     )
     campaign_control = CampaignControl()
@@ -193,11 +206,12 @@ async def evaluate_interaction_records(
                     unit: DatasetTrialUnit,
                     case_position: int = case_number,
                 ) -> None:
-                    nonlocal active_trial
+                    nonlocal active_trial, actual_target_calls
                     stop_at_requested_boundary()
                     if trial_journal is not None:
                         trial_journal.start(unit)
                     progress_tracker.trial_started(case_number=case_position, unit=unit)
+                    actual_target_calls += 1
                     active_trial = (case_position, unit)
                     task = asyncio.current_task()
                     if task is not None:
@@ -208,13 +222,11 @@ async def evaluate_interaction_records(
                     trial: DatasetEvaluationTrial,
                     case_position: int = case_number,
                 ) -> None:
-                    nonlocal active_trial, actual_target_calls
+                    nonlocal active_trial
                     signal_control.target_call_finished()
                     active_trial = None
                     if trial_journal is not None:
                         trial_journal.finish(unit, trial)
-                    if trial.execution_evidence is not None:
-                        actual_target_calls += 1
                     progress_tracker.trial_terminal(
                         case_number=case_position,
                         unit=unit,
