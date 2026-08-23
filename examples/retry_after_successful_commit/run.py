@@ -13,7 +13,7 @@ from typing import Annotated, TextIO, cast
 
 import typer
 from pydantic import ValidationError
-from ul.event_stress import RetryAfterSuccessfulCommitStressResult
+from ul.augmentations.conversation import RetryAfterSuccessfulCommitStressResult
 
 from examples.retry_after_successful_commit.defective_agent import create_server
 

@@ -4,7 +4,7 @@ import re
 from typing import Protocol
 
 import pytest
-from ul.dataset_augmentation import DatasetAugmentationEngine
+from ul.augmentations.dataset import DatasetAugmentationEngine
 from ul.dataset_evaluation import DatasetEvaluationRunner
 from ul.deconstruction import OpenRouterDatasetSettings, create_semantic_model_deconstructor
 from ul_core.dataset import (

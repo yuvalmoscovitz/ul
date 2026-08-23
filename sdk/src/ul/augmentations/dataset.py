@@ -1,3 +1,5 @@
+"""Dataset augmentation bindings and generation runtime."""
+
 from __future__ import annotations
 
 import hashlib
@@ -9,6 +11,7 @@ from itertools import islice, pairwise
 from typing import Any, Literal, Self, cast
 
 from pydantic import Field, JsonValue, model_validator
+from ul_core.augmentations.definitions import builtin_augmentation_catalog
 from ul_core.contracts import (
     SemanticDeconstructor,
     SemanticEquivalenceVerifier,
@@ -75,7 +78,7 @@ class DatasetAugmentationOperator(ULModel):
     instruction: str = Field(min_length=1)
     applicability_profile: OperatorApplicabilityProfile = "broad"
     applicability_rule: str = Field(
-        default="Applies to any nonempty user input with qualified source semantics.",
+        default="Applies to any nonempty user input with recorded source semantics.",
         min_length=1,
     )
     allowed_change: AllowedChange
@@ -96,90 +99,85 @@ class DatasetAugmentationOperator(ULModel):
         return self
 
 
+def _builtin_operator(
+    operator_id: OperatorId,
+    *,
+    allowed_change: AllowedChange,
+    target_communication_kind: str | None = None,
+    target_marker_required: bool = False,
+) -> DatasetAugmentationOperator:
+    definition = builtin_augmentation_catalog().get(operator_id)
+    binding = next(item for item in definition.bindings if item.mode == "dataset_variation")
+    return DatasetAugmentationOperator(
+        id=operator_id,
+        version=definition.ref.version,
+        instruction=_PROMPTS.get_prompt(_OPERATOR_PROMPT_NAMES[operator_id]),
+        applicability_profile=definition.applicability_profile,
+        applicability_rule=definition.applicability_rule,
+        allowed_change=allowed_change,
+        target_communication_kind=target_communication_kind,
+        target_marker_required=target_marker_required,
+        human_review_required=binding.requirements.human_review,
+    )
+
+
 _BUILTIN_OPERATORS = (
-    DatasetAugmentationOperator(
-        id="input.surface.rephrase",
-        instruction=_PROMPTS.get_prompt("augmentation.input.surface.rephrase"),
+    _builtin_operator(
+        operator_id="input.surface.rephrase",
         allowed_change="surface_form_only",
     ),
-    DatasetAugmentationOperator(
-        id="input.surface.typing_noise",
-        instruction=_PROMPTS.get_prompt("augmentation.input.surface.typing_noise"),
+    _builtin_operator(
+        operator_id="input.surface.typing_noise",
         allowed_change="declared_communication_form",
         target_communication_kind="typing_noise",
     ),
-    DatasetAugmentationOperator(
-        id="input.surface.case_variation",
-        instruction=_PROMPTS.get_prompt("augmentation.input.surface.case_variation"),
-        applicability_profile="conditional",
-        applicability_rule=(
-            "Applies only when the input contains an unprotected Unicode letter with a "
-            "single-code-point uppercase or lowercase mapping."
-        ),
+    _builtin_operator(
+        operator_id="input.surface.case_variation",
         allowed_change="declared_communication_form",
         target_communication_kind="typing_noise",
     ),
-    DatasetAugmentationOperator(
-        id="input.surface.punctuation_noise",
-        instruction=_PROMPTS.get_prompt("augmentation.input.surface.punctuation_noise"),
-        applicability_profile="conditional",
-        applicability_rule=(
-            "Applies only when punctuation can be inserted outside a protected semantic value."
-        ),
+    _builtin_operator(
+        operator_id="input.surface.punctuation_noise",
         allowed_change="declared_communication_form",
         target_communication_kind="typing_noise",
     ),
-    DatasetAugmentationOperator(
-        id="input.surface.grammar_error",
-        instruction=_PROMPTS.get_prompt("augmentation.input.surface.grammar_error"),
+    _builtin_operator(
+        operator_id="input.surface.grammar_error",
         allowed_change="declared_communication_form",
         target_communication_kind="fragmented_syntax",
     ),
-    DatasetAugmentationOperator(
-        id="input.surface.fragmented_syntax",
-        instruction=_PROMPTS.get_prompt("augmentation.input.surface.fragmented_syntax"),
+    _builtin_operator(
+        operator_id="input.surface.fragmented_syntax",
         allowed_change="declared_communication_form",
         target_communication_kind="fragmented_syntax",
         target_marker_required=True,
     ),
-    DatasetAugmentationOperator(
-        id="input.surface.disfluency_repeat",
-        instruction=_PROMPTS.get_prompt("augmentation.input.surface.disfluency_repeat"),
+    _builtin_operator(
+        operator_id="input.surface.disfluency_repeat",
         allowed_change="declared_communication_form",
         target_communication_kind="repetition",
     ),
-    DatasetAugmentationOperator(
-        id="input.style.terse",
-        instruction=_PROMPTS.get_prompt("augmentation.input.style.terse"),
+    _builtin_operator(
+        operator_id="input.style.terse",
         allowed_change="declared_communication_form",
         target_communication_kind="terse",
     ),
-    DatasetAugmentationOperator(
-        id="input.style.verbose",
-        instruction=_PROMPTS.get_prompt("augmentation.input.style.verbose"),
+    _builtin_operator(
+        operator_id="input.style.verbose",
         allowed_change="declared_communication_form",
         target_communication_kind="verbose",
     ),
-    DatasetAugmentationOperator(
-        id="input.tone.frustrated",
-        instruction=_PROMPTS.get_prompt("augmentation.input.tone.frustrated"),
+    _builtin_operator(
+        operator_id="input.tone.frustrated",
         allowed_change="declared_communication_form",
         target_communication_kind="frustrated",
         target_marker_required=True,
-        human_review_required=True,
     ),
-    DatasetAugmentationOperator(
-        id="input.intent.self_correction",
-        instruction=_PROMPTS.get_prompt("augmentation.input.intent.self_correction"),
+    _builtin_operator(
+        operator_id="input.intent.self_correction",
         allowed_change="structured_self_correction",
         target_communication_kind="self_correction",
         target_marker_required=True,
-        human_review_required=True,
-        applicability_profile="conditional",
-        applicability_rule=(
-            "Applies only when one explicit numeric, monetary, date, or duration value can be "
-            "temporarily misstated and immediately corrected without ambiguity."
-        ),
     ),
 )
 _BUILTIN_OPERATORS_BY_REFERENCE = {

@@ -8,7 +8,12 @@ from typing import NoReturn
 
 import pytest
 from pydantic import ValidationError
-from ul.augmentation_qualification import (
+from ul.augmentations.dataset import (
+    DatasetAugmentationEngine,
+    DatasetAugmentationOperator,
+    builtin_dataset_augmentation_operators,
+)
+from ul.augmentations.qualification import (
     AugmentationQualificationAttempt,
     AugmentationQualificationCorpus,
     AugmentationQualificationHumanReview,
@@ -18,11 +23,6 @@ from ul.augmentation_qualification import (
     load_augmentation_qualification_report,
     replay_augmentation_qualification,
     write_augmentation_qualification_report,
-)
-from ul.dataset_augmentation import (
-    DatasetAugmentationEngine,
-    DatasetAugmentationOperator,
-    builtin_dataset_augmentation_operators,
 )
 from ul_core.dataset import (
     CommunicationAct,

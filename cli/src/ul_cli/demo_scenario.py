@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import ClassVar
 
 from pydantic import JsonValue
-from ul.dataset_augmentation import (
+from ul.augmentations.dataset import (
     DatasetAugmentationCandidate,
     DatasetAugmentationEngine,
     DatasetAugmentationOperatorReference,

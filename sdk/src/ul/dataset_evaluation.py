@@ -20,7 +20,7 @@ from ul_core.dataset import InteractionRecord, ObservedAgentOutput, ObservedOutc
 from ul_core.evaluation import EvaluationCase, ExecutionEvidence
 from ul_core.models import ConversationRole, ConversationTurn, ULModel
 
-from ul.dataset_augmentation import (
+from ul.augmentations.dataset import (
     DatasetAugmentationCandidate,
     DatasetAugmentationEngine,
     DatasetAugmentationResult,

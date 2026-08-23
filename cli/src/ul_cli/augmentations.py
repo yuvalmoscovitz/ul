@@ -16,11 +16,12 @@ from ul.http_environment import (
     load_json_http_environment_config,
     validate_json_http_environment_configuration,
 )
-from ul_core.augmentation_catalog import (
+from ul_core.augmentations.definitions import (
     AugmentationBinding,
     AugmentationMode,
     AugmentationRef,
     AugmentationScope,
+    AugmentationSurface,
     BuiltinAugmentationSpec,
     builtin_augmentation_catalog,
 )
@@ -38,6 +39,14 @@ from ul_cli.project import (
 app = typer.Typer(help="Inspect UL's built-in augmentation library.")
 
 _SCOPES: tuple[AugmentationScope, ...] = ("input", "conversation", "environment")
+_SURFACES: tuple[AugmentationSurface, ...] = (
+    "human_behavior",
+    "task_semantics",
+    "conversation_workflow",
+    "world_business_state",
+    "tool_execution",
+    "trust_policy_authorization",
+)
 _MODES: tuple[AugmentationMode, ...] = (
     "dataset_variation",
     "scenario_materialization",
@@ -50,6 +59,23 @@ _REFERENCE_PATTERN = re.compile(
 
 _ReadinessStatus = Literal["ready", "blocked", "manual"]
 _ProjectStatus = Literal["ready", "missing", "invalid"]
+
+
+@app.command("guide")
+def augmentation_guide() -> None:
+    """Show every augmentation grouped by the business area it tests."""
+    catalog = builtin_augmentation_catalog()
+    for surface in _SURFACES:
+        typer.echo(_surface_label(surface))
+        for definition in catalog.list(surface=surface):
+            typer.echo(
+                f"  {definition.ref.id}@{definition.ref.version} "
+                f"[{definition.implementation_status}; {definition.qualification_status}]"
+            )
+            typer.echo(f"    {definition.summary}")
+            typer.echo(f"    Expected: {definition.expected_relation}")
+        typer.echo()
+    typer.echo("Use 'ul augmentations show ID' for applicability and runtime details.")
 
 
 @dataclass(frozen=True)
@@ -99,6 +125,10 @@ class _PlannedAugmentation:
 @app.command("list")
 def list_augmentations(
     scope: Annotated[str | None, typer.Option(help="Only show one augmentation scope.")] = None,
+    surface: Annotated[
+        str | None,
+        typer.Option(help="Only show one business-risk surface."),
+    ] = None,
     mode: Annotated[str | None, typer.Option(help="Only show one execution mode.")] = None,
     cli_only: Annotated[
         bool, typer.Option("--cli-only", help="Only show augmentations with a CLI command.")
@@ -112,9 +142,11 @@ def list_augmentations(
 ) -> None:
     """List every built-in augmentation through one catalog."""
     selected_scope = _parse_scope(scope)
+    selected_surface = _parse_surface(surface)
     selected_mode = _parse_mode(mode)
     augmentations = builtin_augmentation_catalog().list(
         scope=selected_scope,
+        surface=selected_surface,
         mode=selected_mode,
         cli_only=cli_only,
         latest_only=not all_versions,
@@ -139,10 +171,17 @@ def list_augmentations(
         modes = ",".join(binding.mode for binding in augmentation.bindings)
         cli_available = "yes" if augmentation.cli_available else "no"
         typer.echo(f"{augmentation.ref.id}@{augmentation.ref.version}")
-        typer.echo(f"  scope={augmentation.scope} modes={modes} cli_available={cli_available}")
+        typer.echo(
+            f"  surface={augmentation.surface} scope={augmentation.scope} "
+            f"modes={modes} cli_available={cli_available}"
+        )
         typer.echo(f"  applicability={augmentation.applicability_profile}")
+        typer.echo(
+            f"  implementation={augmentation.implementation_status} "
+            f"qualification={augmentation.qualification_status}"
+        )
         typer.echo(f"  {augmentation.summary}")
-    typer.echo("Use 'ul augmentations show ID[@VERSION]' for requirements and safety details.")
+    typer.echo("Use 'ul augmentations show ID[@VERSION]' for requirements and runtime details.")
 
 
 @app.command("plan")
@@ -246,14 +285,19 @@ def show_augmentation(
         return
     typer.echo(f"{augmentation.ref.id}@{augmentation.ref.version}")
     typer.echo(f"Summary: {augmentation.summary}")
+    typer.echo(f"Surface: {augmentation.surface}")
     typer.echo(f"Scope: {augmentation.scope}")
     typer.echo(f"Applicability: {augmentation.applicability_profile}")
     typer.echo(f"Applicability rule: {augmentation.applicability_rule}")
     typer.echo(f"CLI execution available: {'yes' if augmentation.cli_available else 'no'}")
+    typer.echo(f"Expected relation: {augmentation.expected_relation}")
+    typer.echo(f"Implementation: {augmentation.implementation_status}")
+    typer.echo(f"Qualification: {augmentation.qualification_status}")
     for binding in augmentation.bindings:
         typer.echo(f"Mode: {binding.mode}")
         typer.echo(f"  Stages: {', '.join(binding.stages)}")
         typer.echo(f"  Execution owner: {_execution_owner_label(binding.execution_owner)}")
+        typer.echo(f"  Runtime: {binding.runtime}")
         typer.echo(f"  CLI command: {binding.command or 'unavailable'}")
         requirements = binding.requirements
         typer.echo(
@@ -270,7 +314,7 @@ def show_augmentation(
             )
         )
     typer.echo("Catalog inspection: 0 model calls, 0 environment calls, 0 network requests.")
-    typer.echo("Execution safety and call cost are enforced by the selected command's planner.")
+    typer.echo("This command inspects metadata. It does not execute the augmentation.")
 
 
 @app.command("enabled")
@@ -854,9 +898,13 @@ def _catalog_item(augmentation: BuiltinAugmentationSpec) -> dict[str, object]:
     return {
         "ref": augmentation.ref.model_dump(mode="json"),
         "scope": augmentation.scope,
+        "surface": augmentation.surface,
         "summary": augmentation.summary,
+        "expected_relation": augmentation.expected_relation,
         "applicability_profile": augmentation.applicability_profile,
         "applicability_rule": augmentation.applicability_rule,
+        "implementation_status": augmentation.implementation_status,
+        "qualification_status": augmentation.qualification_status,
         "bindings": [
             {
                 **binding.model_dump(mode="json"),
@@ -884,6 +932,29 @@ def _parse_scope(value: str | None) -> AugmentationScope | None:
             f"unknown scope; choose one of: {', '.join(_SCOPES)}", param_hint="--scope"
         )
     return value
+
+
+def _parse_surface(value: str | None) -> AugmentationSurface | None:
+    if value is None:
+        return None
+    normalized = value.replace("-", "_")
+    if normalized not in _SURFACES:
+        raise typer.BadParameter(
+            f"unknown surface; choose one of: {', '.join(_SURFACES)}",
+            param_hint="--surface",
+        )
+    return normalized
+
+
+def _surface_label(surface: AugmentationSurface) -> str:
+    return {
+        "human_behavior": "Human behavior",
+        "task_semantics": "Task semantics",
+        "conversation_workflow": "Conversation and workflow",
+        "world_business_state": "World and business state",
+        "tool_execution": "Tool and execution",
+        "trust_policy_authorization": "Trust, policy, and authorization",
+    }[surface]
 
 
 def _parse_mode(value: str | None) -> AugmentationMode | None:

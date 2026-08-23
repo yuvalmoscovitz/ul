@@ -9,7 +9,7 @@ from typing import Literal, cast
 import httpx
 import pytest
 from pydantic import JsonValue, SecretStr, ValidationError
-from ul.dataset_augmentation import DatasetAugmentationEngine, DatasetAugmentationResult
+from ul.augmentations.dataset import DatasetAugmentationEngine, DatasetAugmentationResult
 from ul.dataset_evaluation import (
     DatasetEvaluationBaseline,
     DatasetEvaluationCase,

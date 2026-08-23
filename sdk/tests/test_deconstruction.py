@@ -8,7 +8,7 @@ from typing import Any, cast, overload
 import httpx
 import pytest
 from pydantic import SecretStr, ValidationError
-from ul.dataset_augmentation import (
+from ul.augmentations.dataset import (
     DatasetAugmentationEngine,
     builtin_dataset_augmentation_operators,
 )
