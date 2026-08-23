@@ -321,6 +321,60 @@ def test_invalid_smoke_projection_names_selector_and_makes_zero_semantic_calls(
     assert not (tmp_path / ".ul").exists()
 
 
+def test_saved_probe_binding_rejects_altered_projection_digest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _write_callable(tmp_path)
+    dataset = _write_dataset(tmp_path)
+    config = _write_projected_callable_config(
+        tmp_path,
+        {"schema_version": "1.0.0", "complete_result": ""},
+    )
+    monkeypatch.chdir(tmp_path)
+    first = runner.invoke(app, ["probe", str(dataset), "--target", str(config)], input="y\nn\n")
+    assert first.exit_code == 0, first.output
+    saved_path = tmp_path / ".ul" / "probe.json"
+    saved = json.loads(saved_path.read_text())
+    saved["outcome_projection_sha256"] = "0" * 64
+    saved_path.write_text(json.dumps(saved), encoding="utf-8")
+    saved_path.chmod(0o600)
+
+    second = runner.invoke(app, ["probe", str(dataset), "--target", str(config)])
+
+    assert second.exit_code == 2
+    assert "Reason: PROBE_CONFIG_EXISTS" in second.output
+    assert len((tmp_path / "target-invocations.jsonl").read_text().splitlines()) == 1
+
+
+def test_run_target_receipt_records_projection_definition_and_digest(tmp_path: Path) -> None:
+    _write_callable(tmp_path)
+    config = _write_projected_callable_config(
+        tmp_path,
+        {
+            "schema_version": "1.0.0",
+            "action": "/result/action",
+            "status": "/result/status",
+        },
+    )
+    resolved = probe_module._resolve_target(str(config), allow_insecure_http=False)
+    assert resolved.config.outcome is not None
+
+    receipt = probe_module._target_evidence_receipt(resolved)
+
+    assert receipt["outcome_projection"] == {
+        "schema_version": "1.0.0",
+        "action": "/result/action",
+        "status": "/result/status",
+        "resource_id": None,
+        "decision": None,
+        "amount": None,
+        "effects": None,
+        "complete_result": None,
+        "private_json_pointers": [],
+    }
+    assert receipt["outcome_projection_sha256"] == resolved.config.outcome.digest
+
+
 def test_changed_target_artifact_is_rejected_immediately_before_launch(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
