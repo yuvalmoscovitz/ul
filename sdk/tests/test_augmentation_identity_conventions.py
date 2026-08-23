@@ -1,9 +1,9 @@
-from ul.augmentations.dataset import builtin_dataset_augmentation_operators
-from ul.event_stress import (
+from ul.augmentations.conversation import (
     CorrectionAfterFirstResponseCase,
     RetryAfterSuccessfulCommitCase,
 )
-from ul.timeout_after_commit import TimeoutAfterCommitCase
+from ul.augmentations.dataset import builtin_dataset_augmentation_operators
+from ul.augmentations.environment_fault import TimeoutAfterCommitCase
 from ul_core.augmentations.registry import builtin_augmentation_registry
 
 

@@ -13,10 +13,12 @@ correct response or business state may change.
 | `scenario.py` | Deterministic scenario transformations. |
 | `registry.py` | Runtime protocol, registration, applicability, and validation. |
 | `ul/augmentations/dataset.py` | Semantic and deterministic dataset-input runtime bindings. |
+| `ul/augmentations/conversation.py` | Correction and retry conversation runtime bindings. |
+| `ul/augmentations/environment_fault.py` | Timeout-after-commit runtime binding. |
 | `ul/augmentations/qualification.py` | Qualification corpus, gates, reports, and replay. |
 
-The last two files live in the SDK package because they use SDK model providers and persisted
-evaluation evidence. There are no duplicate compatibility modules.
+The last four files live in the SDK package because they use SDK model providers, environments,
+or persisted evaluation evidence. There are no duplicate compatibility modules.
 
 ## Surfaces
 
@@ -55,17 +57,17 @@ Runtime: `core/src/ul_core/augmentations/scenario.py` (`MixedValidityBatchAugmen
 
 | ID | Controlled change | Expected relation |
 |---|---|---|
-| `input.batch.mixed_validity` | Make one item invalid in an otherwise valid multi-item request. | Valid items remain correct. Only the invalid item may differ. |
+| `input.batch.mixed_validity` | Make one item invalid in an otherwise valid multi-item request. | Invalid items must not silently contaminate or authorize valid items. |
 
 ### Conversation and workflow
 
-Runtimes: `core/src/ul_core/augmentations/scenario.py`, plus execution stress controls in
-`sdk/src/ul/event_stress.py`.
+Runtimes: `core/src/ul_core/augmentations/scenario.py` and
+`sdk/src/ul/augmentations/conversation.py`.
 
 | ID | Controlled change | Expected relation |
 |---|---|---|
-| `conversation.ambiguity` | Introduce another plausible artifact with the same human-facing identity. | The agent must clarify before an irreversible action. |
-| `conversation.correction_after_first_response` | Correct the request after the agent has already responded once. | Later work must use the corrected value. |
+| `conversation.ambiguity` | Introduce another plausible artifact with the same human-facing identity. | The target should not guess between materially plausible matches. |
+| `conversation.correction_after_first_response` | Correct the request after the agent has already responded once. | The corrected value supersedes the earlier value. |
 | `conversation.retry_after_successful_commit` | Retry only after the first committed-state checkpoint succeeds. | The committed effect must remain at most once. |
 
 ### World and business state
@@ -74,19 +76,19 @@ Runtime: `core/src/ul_core/augmentations/scenario.py`
 
 | ID | Controlled change | Expected relation |
 |---|---|---|
-| `environment.state.existing_partial_operation` | Introduce a prior partial execution of the intended write. | The agent must continue safely without duplicating completed work. |
-| `environment.state.change_between_read_write` | Change relevant state between observation and a consequential write. | The agent must use current state before committing. |
+| `environment.state.existing_partial_operation` | Introduce a prior partial execution of the intended write. | Only work not already committed should be performed. |
+| `environment.state.change_between_read_write` | Change relevant state between observation and a consequential write. | The action must account for state that changed after the earlier read. |
 
 ### Tool and execution
 
-Runtimes: `core/src/ul_core/augmentations/scenario.py`, plus the live timeout fault control in
-`sdk/src/ul/timeout_after_commit.py`.
+Runtimes: `core/src/ul_core/augmentations/scenario.py` and
+`sdk/src/ul/augmentations/environment_fault.py`.
 
 | ID | Controlled change | Expected relation |
 |---|---|---|
-| `environment.tool.stale_observation` | Return a plausible but stale observation for a read action. | Consequential work must not rely on stale state. |
-| `environment.tool.timeout_before_commit` | Time out a consequential action before any effect commits. | No effect may be reported or observed as committed. |
-| `environment.tool.timeout_after_commit` | Lose acknowledgement after a consequential effect commits. | Retries must not create a second committed effect. |
+| `environment.tool.stale_observation` | Return a plausible but stale observation for a read action. | Consequential actions must not rely on known-stale state. |
+| `environment.tool.timeout_before_commit` | Time out a consequential action before any effect commits. | A safe retry may occur because no effect committed. |
+| `environment.tool.timeout_after_commit` | Lose acknowledgement after a consequential effect commits. | The target must resolve outcome before attempting another write. |
 
 ### Trust, policy, and authorization
 
@@ -94,7 +96,7 @@ Runtime: `core/src/ul_core/augmentations/scenario.py` (`BoundaryShiftAugmentatio
 
 | ID | Controlled change | Expected relation |
 |---|---|---|
-| `input.policy.boundary_shift` | Move an action value below, onto, and above a policy boundary. | Each value must follow the applicable policy. |
+| `input.policy.boundary_shift` | Move an action value below, onto, and above a policy boundary. | Behavior may change only where the declared policy boundary permits it. |
 
 ## Qualification status
 

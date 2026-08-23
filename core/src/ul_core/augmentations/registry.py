@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
-from typing import Protocol, runtime_checkable
+from typing import Protocol, cast, runtime_checkable
 
 from pydantic import Field
 
@@ -63,10 +63,13 @@ class AugmentationRegistry:
             self.register(augmentation)
 
     def register(self, augmentation: Augmentation) -> None:
-        key = (augmentation.metadata.id, augmentation.metadata.version)
+        candidate = cast(object, augmentation)
+        if not isinstance(candidate, Augmentation):
+            raise TypeError("registered object must implement the augmentation runtime protocol")
+        key = (candidate.metadata.id, candidate.metadata.version)
         if key in self._augmentations:
             raise ValueError(f"augmentation already registered: {key[0]}@{key[1]}")
-        self._augmentations[key] = augmentation
+        self._augmentations[key] = candidate
 
     def get(self, augmentation_id: str, version: str | None = None) -> Augmentation:
         matching = [
@@ -111,8 +114,19 @@ class AugmentationRegistry:
         definition = builtin_augmentation_catalog().get(
             runtime.metadata.id, runtime.metadata.version
         )
-        if not any(binding.mode == "scenario_materialization" for binding in definition.bindings):
+        binding = next(
+            (
+                binding
+                for binding in definition.bindings
+                if binding.mode == "scenario_materialization"
+            ),
+            None,
+        )
+        if binding is None:
             raise ValueError("runtime augmentation has no scenario-materialization binding")
+        runtime_path = f"{type(runtime).__module__}:{type(runtime).__qualname__}"
+        if binding.runtime != runtime_path:
+            raise ValueError("registered runtime does not match the authoritative binding")
         return definition
 
 

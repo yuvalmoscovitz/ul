@@ -1,4 +1,4 @@
-"""Dataset augmentation generation and qualification.
+"""Dataset, conversation, environment-fault, and qualification runtimes.
 
 Product definitions and scenario runtimes are in ``ul_core.augmentations``.
 """

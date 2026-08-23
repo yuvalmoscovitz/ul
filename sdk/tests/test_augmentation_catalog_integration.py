@@ -1,12 +1,12 @@
 from importlib import import_module
 from pathlib import Path
 
-from ul.augmentations.dataset import builtin_dataset_augmentation_operators
-from ul.event_stress import (
+from ul.augmentations.conversation import (
     CorrectionAfterFirstResponseCase,
     RetryAfterSuccessfulCommitCase,
 )
-from ul.timeout_after_commit import TimeoutAfterCommitCase
+from ul.augmentations.dataset import builtin_dataset_augmentation_operators
+from ul.augmentations.environment_fault import TimeoutAfterCommitCase
 from ul_core.augmentations.definitions import builtin_augmentation_catalog
 from ul_core.augmentations.registry import builtin_augmentation_registry
 
@@ -68,11 +68,15 @@ def test_dataset_catalog_and_runtime_share_applicability_contracts() -> None:
 
 def test_every_catalog_binding_points_to_an_importable_runtime() -> None:
     stress_case_by_runtime = {
-        "ul.event_stress:run_correction_stress_test": CorrectionAfterFirstResponseCase,
-        "ul.event_stress:run_retry_after_successful_commit_stress_test": (
+        "ul.augmentations.conversation:run_correction_stress_test": (
+            CorrectionAfterFirstResponseCase
+        ),
+        "ul.augmentations.conversation:run_retry_after_successful_commit_stress_test": (
             RetryAfterSuccessfulCommitCase
         ),
-        "ul.timeout_after_commit:run_timeout_after_commit_stress_test": TimeoutAfterCommitCase,
+        "ul.augmentations.environment_fault:run_timeout_after_commit_stress_test": (
+            TimeoutAfterCommitCase
+        ),
     }
     scenario_registry = builtin_augmentation_registry()
     for specification in builtin_augmentation_catalog().list(latest_only=False):
