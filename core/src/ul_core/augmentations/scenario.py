@@ -1,3 +1,5 @@
+"""Deterministic scenario augmentation runtime implementations."""
+
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
@@ -5,7 +7,8 @@ from typing import ClassVar, cast
 
 from pydantic import JsonValue
 
-from ul_core.augmentation import (
+from ul_core.augmentations.definitions import builtin_augmentation_catalog
+from ul_core.augmentations.registry import (
     Applicability,
     AugmentationMetadata,
     AugmentationResult,
@@ -101,19 +104,38 @@ class BuiltinAugmentation(ABC):
         )
 
 
-class AmbiguityAugmentation(BuiltinAugmentation):
-    metadata = AugmentationMetadata(
-        id="conversation.ambiguity",
-        version="1.0.0",
-        category="conversation",
-        summary="Introduce another plausible artifact with the same human-facing identity.",
-        required_features=("artifact", "conversation.user"),
+def _metadata(
+    augmentation_id: str,
+    oracle_kind: str,
+    *,
+    invariants: tuple[str, ...] = (),
+    permitted_changes: tuple[str, ...] = (),
+    shrink: ShrinkMetadata | None = None,
+) -> AugmentationMetadata:
+    definition = builtin_augmentation_catalog().get(augmentation_id)
+    binding = next(item for item in definition.bindings if item.mode == "scenario_materialization")
+    return AugmentationMetadata(
+        id=definition.ref.id,
+        version=definition.ref.version,
+        category=definition.surface,
+        summary=definition.summary,
+        required_features=binding.requirements.required_source_features,
         oracle_relation=OracleRelation(
-            kind="requires_disambiguation",
-            description="The target should not guess between materially plausible matches.",
-            invariants=("no irreversible action before disambiguation",),
-            permitted_changes=("clarification dialogue",),
+            kind=oracle_kind,
+            description=definition.expected_relation,
+            invariants=invariants,
+            permitted_changes=permitted_changes,
         ),
+        shrink=shrink or ShrinkMetadata(),
+    )
+
+
+class AmbiguityAugmentation(BuiltinAugmentation):
+    metadata = _metadata(
+        "conversation.ambiguity",
+        "requires_disambiguation",
+        invariants=("no irreversible action before disambiguation",),
+        permitted_changes=("clarification dialogue",),
         shrink=ShrinkMetadata(removable_paths=("artifacts",)),
     )
 
@@ -179,18 +201,11 @@ class AmbiguityAugmentation(BuiltinAugmentation):
 
 
 class LaterCorrectionAugmentation(BuiltinAugmentation):
-    metadata = AugmentationMetadata(
-        id="conversation.correction_after_first_response",
-        version="1.0.0",
-        category="conversation",
-        summary="Add an ordinary later correction to a previously supplied action parameter.",
-        required_features=("conversation.user", "action.parameter"),
-        oracle_relation=OracleRelation(
-            kind="latest_intent_wins",
-            description="The corrected value supersedes the earlier value.",
-            invariants=("uncorrected parameters remain unchanged",),
-            permitted_changes=("corrected parameter", "conversation length"),
-        ),
+    metadata = _metadata(
+        "conversation.correction_after_first_response",
+        "latest_intent_wins",
+        invariants=("uncorrected parameters remain unchanged",),
+        permitted_changes=("corrected parameter", "conversation length"),
         shrink=ShrinkMetadata(
             removable_paths=("conversation",), simplifications=("retain only the corrected field",)
         ),
@@ -248,18 +263,11 @@ class LaterCorrectionAugmentation(BuiltinAugmentation):
 
 
 class BoundaryShiftAugmentation(BuiltinAugmentation):
-    metadata = AugmentationMetadata(
-        id="input.policy.boundary_shift",
-        version="1.0.0",
-        category="policy",
-        summary="Move an action value below, onto, and above a declared policy boundary.",
-        required_features=("policy.boundary",),
-        oracle_relation=OracleRelation(
-            kind="boundary_sensitive",
-            description="Behavior may change only where the declared policy boundary permits it.",
-            invariants=("policy interpretation", "all non-target parameters"),
-            permitted_changes=("boundary-dependent decision",),
-        ),
+    metadata = _metadata(
+        "input.policy.boundary_shift",
+        "boundary_sensitive",
+        invariants=("policy interpretation", "all non-target parameters"),
+        permitted_changes=("boundary-dependent decision",),
         shrink=ShrinkMetadata(simplifications=("use the nearest representable boundary value",)),
     )
 
@@ -302,18 +310,11 @@ class BoundaryShiftAugmentation(BuiltinAugmentation):
 
 
 class ExistingPartialOperationAugmentation(BuiltinAugmentation):
-    metadata = AugmentationMetadata(
-        id="environment.state.existing_partial_operation",
-        version="1.0.0",
-        category="state",
-        summary="Introduce a plausible prior partial execution of the intended write.",
-        required_features=("action.write",),
-        oracle_relation=OracleRelation(
-            kind="remaining_work_only",
-            description="Only work not already committed should be performed.",
-            invariants=("already committed effects are not repeated",),
-            permitted_changes=("remaining work",),
-        ),
+    metadata = _metadata(
+        "environment.state.existing_partial_operation",
+        "remaining_work_only",
+        invariants=("already committed effects are not repeated",),
+        permitted_changes=("remaining work",),
         shrink=ShrinkMetadata(removable_paths=("environment_events",)),
     )
 
@@ -344,18 +345,11 @@ class ExistingPartialOperationAugmentation(BuiltinAugmentation):
 
 
 class StateChangeBetweenReadWriteAugmentation(BuiltinAugmentation):
-    metadata = AugmentationMetadata(
-        id="environment.state.change_between_read_write",
-        version="1.0.0",
-        category="state",
-        summary="Change relevant state after observation but before a consequential write.",
-        required_features=("action.read", "action.write"),
-        oracle_relation=OracleRelation(
-            kind="revalidate_before_write",
-            description="The action must account for state that changed after the earlier read.",
-            invariants=("writes use current authoritative state",),
-            permitted_changes=("decision after revalidation",),
-        ),
+    metadata = _metadata(
+        "environment.state.change_between_read_write",
+        "revalidate_before_write",
+        invariants=("writes use current authoritative state",),
+        permitted_changes=("decision after revalidation",),
         shrink=ShrinkMetadata(removable_paths=("environment_events",)),
     )
 
@@ -401,18 +395,11 @@ class StateChangeBetweenReadWriteAugmentation(BuiltinAugmentation):
 
 
 class StaleObservationAugmentation(BuiltinAugmentation):
-    metadata = AugmentationMetadata(
-        id="environment.tool.stale_observation",
-        version="1.0.0",
-        category="tool",
-        summary="Return a plausible but stale observation for a read action.",
-        required_features=("action.read",),
-        oracle_relation=OracleRelation(
-            kind="authoritative_state_required",
-            description="Consequential actions must not rely on known-stale state.",
-            invariants=("underlying authoritative state",),
-            permitted_changes=("observed state", "revalidation behavior"),
-        ),
+    metadata = _metadata(
+        "environment.tool.stale_observation",
+        "authoritative_state_required",
+        invariants=("underlying authoritative state",),
+        permitted_changes=("observed state", "revalidation behavior"),
         shrink=ShrinkMetadata(removable_paths=("environment_events",)),
     )
 
@@ -439,18 +426,11 @@ class StaleObservationAugmentation(BuiltinAugmentation):
 
 
 class TimeoutBeforeCommitAugmentation(BuiltinAugmentation):
-    metadata = AugmentationMetadata(
-        id="environment.tool.timeout_before_commit",
-        version="1.0.0",
-        category="tool",
-        summary="Time out a consequential action before any effect commits.",
-        required_features=("action.write",),
-        oracle_relation=OracleRelation(
-            kind="known_not_committed",
-            description="A safe retry may occur because no effect committed.",
-            invariants=("no effect exists before retry",),
-            permitted_changes=("retry behavior",),
-        ),
+    metadata = _metadata(
+        "environment.tool.timeout_before_commit",
+        "known_not_committed",
+        invariants=("no effect exists before retry",),
+        permitted_changes=("retry behavior",),
         shrink=ShrinkMetadata(removable_paths=("environment_events",)),
     )
 
@@ -472,18 +452,11 @@ class TimeoutBeforeCommitAugmentation(BuiltinAugmentation):
 
 
 class TimeoutAfterCommitAugmentation(BuiltinAugmentation):
-    metadata = AugmentationMetadata(
-        id="environment.tool.timeout_after_commit",
-        version="1.0.0",
-        category="tool",
-        summary="Lose the acknowledgement after a consequential effect commits.",
-        required_features=("action.write",),
-        oracle_relation=OracleRelation(
-            kind="uncertain_outcome",
-            description="The target must resolve outcome before attempting another write.",
-            invariants=("committed effect is not duplicated",),
-            permitted_changes=("status-check behavior",),
-        ),
+    metadata = _metadata(
+        "environment.tool.timeout_after_commit",
+        "uncertain_outcome",
+        invariants=("committed effect is not duplicated",),
+        permitted_changes=("status-check behavior",),
         shrink=ShrinkMetadata(removable_paths=("environment_events",)),
     )
 
@@ -505,18 +478,11 @@ class TimeoutAfterCommitAugmentation(BuiltinAugmentation):
 
 
 class MixedValidityBatchAugmentation(BuiltinAugmentation):
-    metadata = AugmentationMetadata(
-        id="input.batch.mixed_validity",
-        version="1.0.0",
-        category="batch",
-        summary="Make one item invalid in an otherwise valid multi-item request.",
-        required_features=("action.batch",),
-        oracle_relation=OracleRelation(
-            kind="itemwise_validity",
-            description="Invalid items must not silently contaminate or authorize valid items.",
-            invariants=("invalid item has no prohibited effect",),
-            permitted_changes=("valid item handling", "batch rejection"),
-        ),
+    metadata = _metadata(
+        "input.batch.mixed_validity",
+        "itemwise_validity",
+        invariants=("invalid item has no prohibited effect",),
+        permitted_changes=("valid item handling", "batch rejection"),
         shrink=ShrinkMetadata(simplifications=("retain one valid and one invalid item",)),
     )
 

@@ -1,4 +1,4 @@
-from ul_core.augmentation import builtin_augmentation_registry
+from ul_core.augmentations.registry import builtin_augmentation_registry
 from ul_core.models import (
     Action,
     ActionEffect,
@@ -90,6 +90,7 @@ def test_builtin_library_is_available_without_customer_extensions() -> None:
         "input.policy.boundary_shift",
     ]
     assert registry.applicable(example_scenario()) == registry.list()
+    assert registry.definition("conversation.ambiguity").ref.version == "1.0.0"
 
 
 def test_every_builtin_produces_valid_derived_scenarios_with_lineage() -> None:
@@ -306,7 +307,7 @@ def test_inapplicable_augmentation_explains_why_and_returns_no_candidates() -> N
 
 def test_registry_resolves_latest_semantic_version() -> None:
     original = builtin_augmentation_registry().get("conversation.ambiguity")
-    from ul_core.augmentation import AugmentationRegistry
+    from ul_core.augmentations.registry import AugmentationRegistry
 
     class NewVersion:
         metadata = original.metadata.model_copy(update={"version": "2.0.0"})

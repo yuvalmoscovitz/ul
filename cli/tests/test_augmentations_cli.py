@@ -168,6 +168,41 @@ def test_list_json_is_stable_sorted_and_complete() -> None:
     references = [(item["ref"]["id"], item["ref"]["version"]) for item in payload["augmentations"]]
     assert references == sorted(references)
     assert all(isinstance(item["cli_available"], bool) for item in payload["augmentations"])
+    assert {item["surface"] for item in payload["augmentations"]} == {
+        "human_behavior",
+        "task_semantics",
+        "conversation_workflow",
+        "world_business_state",
+        "tool_execution",
+        "trust_policy_authorization",
+    }
+    assert all(item["implementation_status"] == "implemented" for item in payload["augmentations"])
+    assert all(item["qualification_status"] == "not_qualified" for item in payload["augmentations"])
+
+
+def test_guide_and_surface_filter_make_the_library_navigable() -> None:
+    guide = runner.invoke(app, ["augmentations", "guide"])
+
+    assert guide.exit_code == 0, guide.output
+    assert "Human behavior" in guide.output
+    assert "Task semantics" in guide.output
+    assert "Conversation and workflow" in guide.output
+    assert "World and business state" in guide.output
+    assert "Tool and execution" in guide.output
+    assert "Trust, policy, and authorization" in guide.output
+    assert guide.output.count("@1.0.0 [implemented; not_qualified]") == 21
+
+    filtered = runner.invoke(
+        app,
+        ["augmentations", "list", "--surface", "tool-execution", "--json"],
+    )
+    assert filtered.exit_code == 0, filtered.output
+    payload = json.loads(filtered.output)
+    assert {item["ref"]["id"] for item in payload["augmentations"]} == {
+        "environment.tool.stale_observation",
+        "environment.tool.timeout_before_commit",
+        "environment.tool.timeout_after_commit",
+    }
 
 
 def test_list_filters_by_scope_mode_and_runnability() -> None:

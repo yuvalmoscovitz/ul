@@ -1,3 +1,5 @@
+"""Runtime protocol and registry for scenario augmentations."""
+
 from __future__ import annotations
 
 from collections.abc import Iterable
@@ -5,6 +7,10 @@ from typing import Protocol, runtime_checkable
 
 from pydantic import Field
 
+from ul_core.augmentations.definitions import (
+    BuiltinAugmentationSpec,
+    builtin_augmentation_catalog,
+)
 from ul_core.models import OracleRelation, Scenario, ShrinkMetadata, ULModel
 
 
@@ -96,6 +102,19 @@ class AugmentationRegistry:
             if augmentation.applicability(scenario).applicable
         )
 
+    def definition(
+        self, augmentation_id: str, version: str | None = None
+    ) -> BuiltinAugmentationSpec:
+        """Resolve the authoritative product definition for an installed runtime binding."""
+
+        runtime = self.get(augmentation_id, version)
+        definition = builtin_augmentation_catalog().get(
+            runtime.metadata.id, runtime.metadata.version
+        )
+        if not any(binding.mode == "scenario_materialization" for binding in definition.bindings):
+            raise ValueError("runtime augmentation has no scenario-materialization binding")
+        return definition
+
 
 def _version_tuple(version: str) -> tuple[int, int, int]:
     major, minor, patch = version.split(".")
@@ -103,6 +122,6 @@ def _version_tuple(version: str) -> tuple[int, int, int]:
 
 
 def builtin_augmentation_registry() -> AugmentationRegistry:
-    from ul_core.operators import BUILTIN_AUGMENTATIONS
+    from ul_core.augmentations.scenario import BUILTIN_AUGMENTATIONS
 
     return AugmentationRegistry(BUILTIN_AUGMENTATIONS)

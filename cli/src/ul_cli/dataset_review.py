@@ -44,7 +44,7 @@ from ul.dataset_invariants import (
 )
 from ul.dataset_regression import dataset_regression_target_config_sha256
 from ul.http_environment import JsonHttpIsolatedResponseConfig, JsonHttpTargetConfig
-from ul_core.augmentation_catalog import builtin_augmentation_catalog
+from ul_core.augmentations.definitions import builtin_augmentation_catalog
 
 from ul_cli.report_contract import (
     FailurePattern,

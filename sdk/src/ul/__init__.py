@@ -1,7 +1,6 @@
 """Public Python SDK for UL."""
 
-from ul_core.augmentation import builtin_augmentation_registry
-from ul_core.augmentation_catalog import (
+from ul_core.augmentations.definitions import (
     AugmentationApplicabilityProfile,
     AugmentationBinding,
     AugmentationExecutionOwner,
@@ -11,6 +10,7 @@ from ul_core.augmentation_catalog import (
     BuiltinAugmentationSpec,
     builtin_augmentation_catalog,
 )
+from ul_core.augmentations.registry import builtin_augmentation_registry
 from ul_core.contracts import (
     ObservationSource,
     ProbeInvoker,
@@ -120,7 +120,15 @@ from ul_core.models import (
 )
 from ul_core.prompts import PromptManager, PromptTemplateInfo
 
-from ul.augmentation_qualification import (
+from ul.augmentations.dataset import (
+    DatasetAugmentationEngine,
+    DatasetAugmentationOperator,
+    DatasetAugmentationResult,
+    DatasetAugmentationSkip,
+    builtin_dataset_augmentation_operators,
+    resolve_dataset_augmentation_operator,
+)
+from ul.augmentations.qualification import (
     AugmentationQualificationAttempt,
     AugmentationQualificationCorpus,
     AugmentationQualificationCorpusCase,
@@ -140,14 +148,6 @@ from ul.augmentation_qualification import (
     load_augmentation_qualification_report,
     replay_augmentation_qualification,
     write_augmentation_qualification_report,
-)
-from ul.dataset_augmentation import (
-    DatasetAugmentationEngine,
-    DatasetAugmentationOperator,
-    DatasetAugmentationResult,
-    DatasetAugmentationSkip,
-    builtin_dataset_augmentation_operators,
-    resolve_dataset_augmentation_operator,
 )
 from ul.dataset_evaluation import (
     DatasetEvaluationBaseline,

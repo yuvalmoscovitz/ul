@@ -1,3 +1,5 @@
+"""Authoritative definitions for every built-in augmentation."""
+
 from __future__ import annotations
 
 from typing import Literal, Self
@@ -7,6 +9,14 @@ from pydantic import ConfigDict, Field, field_validator, model_validator
 from ul_core.models import ULModel
 
 AugmentationScope = Literal["input", "conversation", "environment"]
+AugmentationSurface = Literal[
+    "human_behavior",
+    "task_semantics",
+    "conversation_workflow",
+    "world_business_state",
+    "tool_execution",
+    "trust_policy_authorization",
+]
 AugmentationMode = Literal[
     "dataset_variation",
     "scenario_materialization",
@@ -16,6 +26,8 @@ AugmentationMode = Literal[
 AugmentationStage = Literal["materialization", "execution", "evaluation"]
 AugmentationExecutionOwner = Literal["dataset_cli", "augmentation_registry", "stress_cli"]
 AugmentationApplicabilityProfile = Literal["broad", "conditional"]
+AugmentationImplementationStatus = Literal["implemented"]
+AugmentationQualificationStatus = Literal["not_qualified"]
 
 _AUGMENTATION_ID_PATTERN = r"^[a-z][a-z0-9_]*(?:\.[a-z][a-z0-9_]*)+$"
 _VERSION_PATTERN = r"^(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)$"
@@ -43,9 +55,9 @@ class AugmentationRequirements(_CatalogModel):
     @model_validator(mode="after")
     def validate_requirements(self) -> Self:
         if self.environment_capabilities and not self.environment:
-            raise ValueError("environment capabilities require a environment")
+            raise ValueError("environment capabilities require an environment")
         if (self.conversations or self.state_observation) and not self.environment:
-            raise ValueError("environment execution requirements require a environment")
+            raise ValueError("environment execution requirements require an environment")
         if len(self.required_source_features) != len(set(self.required_source_features)):
             raise ValueError("required source features must be unique")
         if len(self.environment_capabilities) != len(set(self.environment_capabilities)):
@@ -57,6 +69,7 @@ class AugmentationBinding(_CatalogModel):
     mode: AugmentationMode
     stages: tuple[AugmentationStage, ...] = Field(min_length=1)
     execution_owner: AugmentationExecutionOwner
+    runtime: str = Field(min_length=3, max_length=500)
     command: str | None = Field(default=None, min_length=1, max_length=200)
     requirements: AugmentationRequirements = AugmentationRequirements()
 
@@ -79,7 +92,7 @@ class AugmentationBinding(_CatalogModel):
         if self.mode == "environment_fault" and (
             not self.requirements.environment or not self.requirements.environment_capabilities
         ):
-            raise ValueError("environment fault bindings require a environment capability")
+            raise ValueError("environment fault bindings require an environment capability")
         return self
 
     @property
@@ -89,11 +102,15 @@ class AugmentationBinding(_CatalogModel):
 
 class BuiltinAugmentationSpec(_CatalogModel):
     ref: AugmentationRef
+    surface: AugmentationSurface
     scope: AugmentationScope
     summary: str = Field(min_length=1, max_length=500)
+    expected_relation: str = Field(min_length=1, max_length=1_000)
     applicability_profile: AugmentationApplicabilityProfile
     applicability_rule: str = Field(min_length=1, max_length=500)
     bindings: tuple[AugmentationBinding, ...] = Field(min_length=1)
+    implementation_status: AugmentationImplementationStatus = "implemented"
+    qualification_status: AugmentationQualificationStatus = "not_qualified"
 
     @model_validator(mode="after")
     def validate_bindings(self) -> Self:
@@ -130,6 +147,7 @@ class BuiltinAugmentationCatalog(_CatalogModel):
         self,
         *,
         scope: AugmentationScope | None = None,
+        surface: AugmentationSurface | None = None,
         mode: AugmentationMode | None = None,
         cli_only: bool = False,
         latest_only: bool = True,
@@ -148,6 +166,7 @@ class BuiltinAugmentationCatalog(_CatalogModel):
             item
             for item in candidates
             if (scope is None or item.scope == scope)
+            and (surface is None or item.surface == surface)
             and any(
                 (mode is None or binding.mode == mode) and (not cli_only or binding.cli_available)
                 for binding in item.bindings
@@ -173,6 +192,7 @@ def builtin_augmentation_catalog() -> BuiltinAugmentationCatalog:
 def _binding(
     mode: AugmentationMode,
     stages: tuple[AugmentationStage, ...],
+    runtime: str,
     *,
     execution_owner: AugmentationExecutionOwner = "augmentation_registry",
     command: str | None = None,
@@ -182,6 +202,7 @@ def _binding(
         mode=mode,
         stages=stages,
         execution_owner=execution_owner,
+        runtime=runtime,
         command=command,
         requirements=requirements or AugmentationRequirements(),
     )
@@ -191,21 +212,28 @@ def _dataset_spec(
     augmentation_id: str,
     summary: str,
     *,
+    expected_relation: str = (
+        "The wording may change. Task meaning, authorization, consequential actions, and "
+        "business state must stay the same."
+    ),
     human_review: bool = False,
     applicability_profile: AugmentationApplicabilityProfile = "broad",
-    applicability_rule: str = "Applies to any nonempty user input with qualified source semantics.",
+    applicability_rule: str = "Applies to any nonempty user input with recorded source semantics.",
 ) -> BuiltinAugmentationSpec:
     version = "1.0.0"
     return BuiltinAugmentationSpec(
         ref=AugmentationRef(id=augmentation_id, version=version),
+        surface="human_behavior",
         scope="input",
         summary=summary,
+        expected_relation=expected_relation,
         applicability_profile=applicability_profile,
         applicability_rule=applicability_rule,
         bindings=(
             _binding(
                 "dataset_variation",
                 ("materialization", "execution", "evaluation"),
+                "ul.augmentations.dataset:resolve_dataset_augmentation_operator",
                 execution_owner="dataset_cli",
                 command=f"ul dataset evaluate --operator {augmentation_id}@{version}",
                 requirements=AugmentationRequirements(
@@ -222,14 +250,19 @@ def _dataset_spec(
 
 def _scenario_spec(
     augmentation_id: str,
+    surface: AugmentationSurface,
     scope: AugmentationScope,
     summary: str,
+    expected_relation: str,
     required_source_features: tuple[str, ...],
+    runtime_class: str,
 ) -> BuiltinAugmentationSpec:
     return BuiltinAugmentationSpec(
         ref=AugmentationRef(id=augmentation_id, version="1.0.0"),
+        surface=surface,
         scope=scope,
         summary=summary,
+        expected_relation=expected_relation,
         applicability_profile="conditional",
         applicability_rule=(
             "Applies only when the source contains: " + ", ".join(required_source_features) + "."
@@ -238,6 +271,7 @@ def _scenario_spec(
             _binding(
                 "scenario_materialization",
                 ("materialization",),
+                f"ul_core.augmentations.scenario:{runtime_class}",
                 requirements=AugmentationRequirements(
                     required_source_features=required_source_features
                 ),
@@ -272,11 +306,18 @@ _BUILTIN_AUGMENTATION_SPECS = (
     _dataset_spec("input.style.terse", "Express the same request tersely."),
     _dataset_spec("input.style.verbose", "Express the same request verbosely."),
     _dataset_spec(
-        "input.tone.frustrated", "Express the same request with frustration.", human_review=True
+        "input.tone.frustrated",
+        "Express the same request with frustration.",
+        expected_relation=(
+            "Tone may change. Service quality, authorization, consequential actions, and business "
+            "state must not degrade."
+        ),
+        human_review=True,
     ),
     _dataset_spec(
         "input.intent.self_correction",
         "Correct one request value within the same input.",
+        expected_relation="The corrected value must control the response and business outcome.",
         human_review=True,
         applicability_profile="conditional",
         applicability_rule=(
@@ -286,20 +327,26 @@ _BUILTIN_AUGMENTATION_SPECS = (
     ),
     _scenario_spec(
         "conversation.ambiguity",
+        "conversation_workflow",
         "conversation",
         "Introduce another plausible artifact with the same human-facing identity.",
+        "The agent must clarify before an irreversible action.",
         ("artifact", "conversation.user"),
+        "AmbiguityAugmentation",
     ),
     BuiltinAugmentationSpec(
         ref=AugmentationRef(id="conversation.correction_after_first_response", version="1.0.0"),
+        surface="conversation_workflow",
         scope="conversation",
         summary="Correct the request after the agent has already responded once.",
+        expected_relation="Later work must use the corrected value.",
         applicability_profile="conditional",
-        applicability_rule="Applies only to an environment that supports two ordered user turns.",
+        applicability_rule="Applies only when two ordered user turns can execute.",
         bindings=(
             _binding(
                 "scenario_materialization",
                 ("materialization",),
+                "ul_core.augmentations.scenario:LaterCorrectionAugmentation",
                 requirements=AugmentationRequirements(
                     required_source_features=("conversation.user", "action.parameter")
                 ),
@@ -307,6 +354,7 @@ _BUILTIN_AUGMENTATION_SPECS = (
             _binding(
                 "conversation_stress",
                 ("execution", "evaluation"),
+                "ul.event_stress:run_correction_stress_test",
                 execution_owner="stress_cli",
                 command="ul stress correction",
                 requirements=AugmentationRequirements(
@@ -321,52 +369,70 @@ _BUILTIN_AUGMENTATION_SPECS = (
     ),
     _scenario_spec(
         "input.policy.boundary_shift",
+        "trust_policy_authorization",
         "input",
         "Move an action value below, onto, and above a policy boundary.",
+        "Each value must follow the applicable policy.",
         ("policy.boundary",),
+        "BoundaryShiftAugmentation",
     ),
     _scenario_spec(
         "environment.state.existing_partial_operation",
+        "world_business_state",
         "environment",
         "Introduce a prior partial execution of the intended write.",
+        "The agent must continue safely without duplicating completed work.",
         ("action.write",),
+        "ExistingPartialOperationAugmentation",
     ),
     _scenario_spec(
         "environment.state.change_between_read_write",
+        "world_business_state",
         "environment",
         "Change relevant state between observation and a consequential write.",
+        "The agent must use current state before committing.",
         ("action.read", "action.write"),
+        "StateChangeBetweenReadWriteAugmentation",
     ),
     _scenario_spec(
         "environment.tool.stale_observation",
+        "tool_execution",
         "environment",
         "Return a plausible but stale observation for a read action.",
+        "Consequential work must not rely on stale state.",
         ("action.read",),
+        "StaleObservationAugmentation",
     ),
     _scenario_spec(
         "environment.tool.timeout_before_commit",
+        "tool_execution",
         "environment",
         "Time out a consequential action before any effect commits.",
+        "No effect may be reported or observed as committed.",
         ("action.write",),
+        "TimeoutBeforeCommitAugmentation",
     ),
     BuiltinAugmentationSpec(
         ref=AugmentationRef(id="environment.tool.timeout_after_commit", version="1.0.0"),
+        surface="tool_execution",
         scope="environment",
         summary="Lose acknowledgement after a consequential effect commits.",
+        expected_relation="Retries must not create a second committed effect.",
         applicability_profile="conditional",
         applicability_rule=(
-            "Applies only to consequential write actions in an environment that can inject a "
-            "timeout after commit."
+            "Applies only to consequential writes where the environment can time out after commit."
         ),
         bindings=(
             _binding(
                 "scenario_materialization",
                 ("materialization",),
+                "ul_core.augmentations.scenario:TimeoutAfterCommitAugmentation",
                 requirements=AugmentationRequirements(required_source_features=("action.write",)),
             ),
             _binding(
                 "environment_fault",
                 ("execution", "evaluation"),
+                "ul.timeout_after_commit:run_timeout_after_commit_stress_test",
                 execution_owner="stress_cli",
                 command="ul stress timeout-after-commit",
                 requirements=AugmentationRequirements(
@@ -381,22 +447,28 @@ _BUILTIN_AUGMENTATION_SPECS = (
     ),
     _scenario_spec(
         "input.batch.mixed_validity",
+        "task_semantics",
         "input",
         "Make one item invalid in an otherwise valid multi-item request.",
+        "Valid items remain correct. Only the invalid item may differ.",
         ("action.batch",),
+        "MixedValidityBatchAugmentation",
     ),
     BuiltinAugmentationSpec(
         ref=AugmentationRef(id="conversation.retry_after_successful_commit", version="1.0.0"),
+        surface="conversation_workflow",
         scope="conversation",
         summary="Retry only after the first committed-state checkpoint succeeds.",
+        expected_relation="The committed effect must remain at most once.",
         applicability_profile="conditional",
         applicability_rule=(
-            "Applies only when a committed effect can be observed before a second user turn."
+            "Applies only when committed state is observable before a second user turn."
         ),
         bindings=(
             _binding(
                 "conversation_stress",
                 ("execution", "evaluation"),
+                "ul.event_stress:run_retry_after_successful_commit_stress_test",
                 execution_owner="stress_cli",
                 command="ul stress retry-after-successful-commit",
                 requirements=AugmentationRequirements(

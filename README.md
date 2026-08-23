@@ -1,5 +1,8 @@
 # UL
 
+See the [augmentation library index](core/src/ul_core/augmentations/README.md) for every built-in
+augmentation, its surface, controlled change, expected relation, and code location.
+
 [![CI](https://github.com/yuvalmoscovitz/ul/actions/workflows/ci.yml/badge.svg)](https://github.com/yuvalmoscovitz/ul/actions/workflows/ci.yml)
 
 UL finds consequential failures in high-risk AI agents. It takes recorded interactions, creates
