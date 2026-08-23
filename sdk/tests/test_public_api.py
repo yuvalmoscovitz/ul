@@ -18,6 +18,8 @@ from ul import (
     EvaluationCaseResult,
     ExecutionResult,
     ExecutionStatus,
+    FindingBundle,
+    FindingOtlpEvent,
     InteractionRecord,
     JsonHttpEnvironmentConfig,
     JsonHttpEnvironmentConnection,
@@ -46,6 +48,7 @@ from ul import (
     SemanticModelDeconstructor,
     UserInputRecord,
     WorkerTraceFlusher,
+    append_finding_annotations,
     builtin_augmentation_registry,
     builtin_dataset_augmentation_operators,
     create_dataset_regression_case,
@@ -59,6 +62,7 @@ from ul import (
     load_json_http_environment_config,
     load_redaction_policy,
     replay_dataset_regression,
+    safe_finding_bundle_json,
 )
 
 
@@ -72,6 +76,13 @@ def test_sdk_exposes_scenario_and_builtin_library() -> None:
 
     assert scenario.id == "sdk-case"
     assert len(builtin_augmentation_registry().list()) == 9
+
+
+def test_sdk_exposes_neutral_finding_export_api() -> None:
+    assert FindingBundle.__name__ == "FindingBundle"
+    assert FindingOtlpEvent.__name__ == "FindingOtlpEvent"
+    assert append_finding_annotations.__name__ == "append_finding_annotations"
+    assert safe_finding_bundle_json.__name__ == "safe_finding_bundle_json"
 
 
 def test_sdk_execution_result_preserves_json_safe_provider_evidence() -> None:
