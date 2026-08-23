@@ -265,21 +265,44 @@ async def test_request_mode_preserves_turn_and_generic_context_envelope(tmp_path
         input_mode="request",
     )
 
+    case = _case("case-context", "hello")
+    rich_context: dict[str, JsonValue] = {
+        "schema_version": "1.0.0",
+        "source_interaction_id": "interaction-1",
+        "inputs": {"message": "hello", "customer": {"id": "cus-7"}},
+        "context": [{"id": "prior-1", "role": "user", "content": "prior"}],
+        "fixture": {"id": "accounts", "version": "2"},
+    }
+    case = case.model_copy(
+        update={
+            "turns": (case.turns[0].model_copy(update={"metadata": {"target": "message"}}),),
+            "probe_context": rich_context,
+        }
+    )
+
     async with LocalTargetConnection(config, customer_code_execution_confirmed=True) as connection:
-        evidence = await connection.execute(_case("case-context", "hello"))
+        evidence = await connection.execute(case)
 
     response = _runtime_payload(evidence.final_response)
     assert response["schema_version"] == "1.0.0"
     assert response["case_id"] == "case-context"
-    assert _string_payload(response, "session_id").startswith("ul-probe-")
+    assert _string_payload(response, "session_id").startswith("ul-session-")
     assert _string_payload(response, "probe_id").startswith("ul-probe-")
     assert response["turn"] == {
         "schema_version": "1.0.0",
         "id": "case-context:turn-1",
         "input": "hello",
-        "metadata": {},
+        "metadata": {"target": "message"},
     }
-    assert response["context"] == {}
+    request_context = _runtime_payload(response["context"])
+    assert {key: request_context[key] for key in rich_context} == rich_context
+    assert request_context["ul.case.id"] == "case-context"
+    assert request_context["ul.turn.id"] == "case-context:turn-1"
+    assert request_context["ul.correlation.id"] == response["probe_id"]
+    assert _string_payload(request_context, "traceparent").startswith("00-")
+    assert "ul.campaign.id=" in _string_payload(request_context, "baggage")
+    assert evidence.probe_identity is not None
+    assert evidence.probe_identity.session_id == response["session_id"]
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX executable-script test")
