@@ -3,11 +3,15 @@ from __future__ import annotations
 import asyncio
 import json
 import math
+import os
+import shlex
 import signal
+import subprocess
 import threading
 import time
 from collections.abc import Callable, Generator
 from contextlib import contextmanager
+from pathlib import Path
 from types import FrameType
 from typing import Literal, Protocol
 
@@ -52,16 +56,22 @@ class CampaignUsage(_ProgressModel):
     semantic_calls: int | None = Field(default=None, ge=0)
     environment_calls: int | None = Field(default=None, ge=0)
     tokens: int | None = Field(default=None, ge=0)
-    remaining_target_call_budget: int = Field(ge=0)
-    remaining_semantic_call_budget: int = Field(ge=0)
-    remaining_environment_call_budget: int = Field(ge=0)
-    remaining_token_budget: int = Field(ge=0)
+    remaining_target_call_budget: int | None = Field(default=None, ge=0)
+    remaining_semantic_call_budget: int | None = Field(default=None, ge=0)
+    remaining_environment_call_budget: int | None = Field(default=None, ge=0)
+    remaining_token_budget: int | None = Field(default=None, ge=0)
 
 
 class CampaignTiming(_ProgressModel):
     elapsed_seconds: float = Field(ge=0)
     eta_seconds: float | None = Field(default=None, ge=0)
     maximum_wall_time_seconds: float = Field(gt=0)
+
+
+class CampaignNextCommands(_ProgressModel):
+    inspect_findings: str = Field(min_length=1)
+    resume: str = Field(min_length=1)
+    diagnose: str = Field(min_length=1)
 
 
 class CampaignPosition(_ProgressModel):
@@ -84,7 +94,7 @@ class CampaignProgressEvent(_ProgressModel):
     timing: CampaignTiming
     environment: Literal["reusable", "quarantined", "awaiting_cleanup"]
     delivery_uncertain: bool = False
-    next_command: Literal["ul report", "ul dataset evaluate --resume", "ul diagnose"] | None = None
+    next_command: str | None = Field(default=None, min_length=1)
 
     @model_validator(mode="after")
     def validate_terminal_command(self) -> CampaignProgressEvent:
@@ -134,7 +144,8 @@ class TerminalCampaignProgressRenderer:
             for name in ("target_calls", "semantic_calls", "environment_calls", "tokens")
         )
         remaining_budget = ",".join(
-            f"{name.removeprefix('remaining_')}={usage[name]}"
+            f"{name.removeprefix('remaining_')}="
+            f"{usage[name] if usage[name] is not None else 'unknown'}"
             for name in (
                 "remaining_target_call_budget",
                 "remaining_semantic_call_budget",
@@ -185,6 +196,10 @@ class CampaignControl:
         with self._lock:
             self._request = "cancel"
 
+    def request_pause_or_cancel(self) -> None:
+        with self._lock:
+            self._request = "cancel" if self._request == "pause" else "pause"
+
     def requested_action(self) -> Literal["pause", "cancel"] | None:
         with self._lock:
             return self._request
@@ -210,7 +225,7 @@ class CampaignSignalControl:
     def interrupt(self) -> None:
         target_task = self._target_task
         if target_task is None or target_task.done():
-            self._control.request_pause()
+            self._control.request_pause_or_cancel()
             return
         target_task.get_loop().call_soon_threadsafe(target_task.cancel)
 
@@ -243,6 +258,7 @@ class CampaignProgressTracker:
         environment_call_budget: int,
         token_budget: int,
         maximum_wall_time_seconds: float,
+        next_commands: CampaignNextCommands,
         publish: Callable[[CampaignProgressEvent], None],
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
@@ -269,6 +285,7 @@ class CampaignProgressTracker:
             token_budget,
         )
         self._maximum_wall_time_seconds = maximum_wall_time_seconds
+        self._next_commands = next_commands
         self._publish = publish
         self._clock = clock
         self._started_at = clock()
@@ -375,11 +392,11 @@ class CampaignProgressTracker:
         target_budget, semantic_budget, environment_budget, token_budget = self._budgets
         next_command = None
         if status == "completed":
-            next_command = "ul report"
+            next_command = self._next_commands.inspect_findings
         elif status in {"paused", "cancelled"}:
-            next_command = "ul dataset evaluate --resume"
+            next_command = self._next_commands.resume
         elif status == "failed":
-            next_command = "ul diagnose"
+            next_command = self._next_commands.diagnose
         event = CampaignProgressEvent(
             sequence=self._sequence,
             status=status,
@@ -405,12 +422,20 @@ class CampaignProgressTracker:
                 semantic_calls=actual_semantic,
                 environment_calls=actual_environment,
                 tokens=actual_tokens,
-                remaining_target_call_budget=max(0, target_budget - (actual_target or 0)),
-                remaining_semantic_call_budget=max(0, semantic_budget - (actual_semantic or 0)),
-                remaining_environment_call_budget=max(
-                    0, environment_budget - (actual_environment or 0)
+                remaining_target_call_budget=(
+                    None if actual_target is None else max(0, target_budget - actual_target)
                 ),
-                remaining_token_budget=max(0, token_budget - (actual_tokens or 0)),
+                remaining_semantic_call_budget=(
+                    None if actual_semantic is None else max(0, semantic_budget - actual_semantic)
+                ),
+                remaining_environment_call_budget=(
+                    None
+                    if actual_environment is None
+                    else max(0, environment_budget - actual_environment)
+                ),
+                remaining_token_budget=(
+                    None if actual_tokens is None else max(0, token_budget - actual_tokens)
+                ),
             ),
             timing=CampaignTiming(
                 elapsed_seconds=elapsed,
@@ -438,3 +463,22 @@ class CampaignProgressTracker:
             stage="terminal",
         )
         return False
+
+
+def create_campaign_next_commands(evidence_path: Path) -> CampaignNextCommands:
+    def command(*arguments: str) -> str:
+        return subprocess.list2cmdline(arguments) if os.name == "nt" else shlex.join(arguments)
+
+    evidence = str(evidence_path)
+    return CampaignNextCommands(
+        inspect_findings=command("ul", "report", evidence),
+        resume=command("ul", "dataset", "evaluate", "--resume", evidence),
+        diagnose=command(
+            "ul",
+            "dataset",
+            "evaluate",
+            "--resume",
+            evidence,
+            "--dry-run",
+        ),
+    )

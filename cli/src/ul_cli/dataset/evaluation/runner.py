@@ -4,6 +4,7 @@ import asyncio
 import json
 import os
 import sys
+from pathlib import Path
 from typing import TextIO
 
 from rich.console import Console
@@ -39,11 +40,13 @@ from ..evidence.customer import build_customer_evidence_record
 from ..progress import (
     CampaignControl,
     CampaignControlRequested,
+    CampaignNextCommands,
     CampaignProgressTracker,
     CampaignSignalControl,
     JsonCampaignProgressRenderer,
     SafeCampaignProgressPublisher,
     TerminalCampaignProgressRenderer,
+    create_campaign_next_commands,
 )
 
 
@@ -73,12 +76,17 @@ async def evaluate_interaction_records(
     trial_journal: DatasetTrialJournal | None = None,
     progress_json: bool = False,
     progress_plan: DatasetCampaignPlan | None = None,
+    progress_next_commands: CampaignNextCommands | None = None,
 ) -> tuple[DatasetEvaluationResult, ...]:
     results: list[DatasetEvaluationResult] = []
     work_upper_bound = len(records) * repetitions * (1 + len(operator_ids))
     semantic_call_budget = progress_plan.calls.total_semantic_model if progress_plan else 0
     token_budget = progress_plan.tokens.maximum if progress_plan else 0
     timeout_seconds = settings.timeout_seconds if progress_plan else 1
+    if progress_next_commands is None:
+        progress_next_commands = create_campaign_next_commands(
+            Path(str(getattr(output_stream, "name", "evidence.jsonl")))
+        )
     progress_renderer = (
         JsonCampaignProgressRenderer(sys.stderr)
         if progress_json
@@ -96,6 +104,7 @@ async def evaluate_interaction_records(
             planned_target_calls + semantic_call_budget,
         )
         * timeout_seconds,
+        next_commands=progress_next_commands,
         publish=SafeCampaignProgressPublisher(progress_renderer).publish,
     )
     campaign_control = CampaignControl()

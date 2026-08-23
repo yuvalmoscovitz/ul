@@ -9,6 +9,7 @@ from rich.console import Console
 from ul import DatasetTrialProgress
 from ul_cli.dataset.progress import (
     CampaignControl,
+    CampaignNextCommands,
     CampaignProgressTracker,
     CampaignSignalControl,
     JsonCampaignProgressRenderer,
@@ -26,6 +27,11 @@ def _tracker(publish: object, clock: object) -> CampaignProgressTracker:
         environment_call_budget=200,
         token_budget=50_000,
         maximum_wall_time_seconds=600,
+        next_commands=CampaignNextCommands(
+            inspect_findings="ul report evidence.jsonl",
+            resume="ul dataset evaluate --resume evidence.jsonl",
+            diagnose="ul dataset evaluate --resume evidence.jsonl --dry-run",
+        ),
         publish=publish,
         clock=clock,
     )
@@ -136,7 +142,7 @@ def test_control_flushes_before_single_terminal_resume_command() -> None:
     assert order == ["flushed", "reported"]
     assert len(actions) == 1
     assert actions[0].status == "paused"
-    assert actions[0].next_command == "ul dataset evaluate --resume"
+    assert actions[0].next_command == "ul dataset evaluate --resume evidence.jsonl"
 
 
 def test_renderer_failure_cannot_affect_campaign_execution() -> None:
@@ -159,6 +165,30 @@ def test_signal_requests_pause_at_safe_boundary() -> None:
     signal_control.interrupt()
 
     assert control.requested_action() == "pause"
+
+
+def test_second_signal_requests_cancel_at_safe_boundary() -> None:
+    control = CampaignControl()
+    signal_control = CampaignSignalControl(control)
+
+    signal_control.interrupt()
+    signal_control.interrupt()
+
+    assert control.requested_action() == "cancel"
+
+
+def test_remaining_budgets_are_unknown_until_actual_usage_is_available() -> None:
+    clock_values = iter((1.0, 2.0))
+    events = []
+    tracker = _tracker(events.append, lambda: next(clock_values))
+
+    tracker.emit(status="running", stage="preflight")
+
+    usage = events[0].usage
+    assert usage.remaining_target_call_budget is None
+    assert usage.remaining_semantic_call_budget is None
+    assert usage.remaining_environment_call_budget is None
+    assert usage.remaining_token_budget is None
 
 
 async def _wait_for_cancellation() -> None:
@@ -201,5 +231,5 @@ def test_uncertain_delivery_is_terminal_and_quarantined() -> None:
     assert event.work.failed == 1
     assert event.environment == "quarantined"
     assert event.delivery_uncertain is True
-    assert event.next_command == "ul diagnose"
+    assert event.next_command == "ul dataset evaluate --resume evidence.jsonl --dry-run"
     assert "PRIVATE_CASE_ID" not in event.model_dump_json()
