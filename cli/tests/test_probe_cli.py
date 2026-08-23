@@ -965,6 +965,132 @@ def test_paused_probe_action_blocks_before_repeating_completed_smoke(
         assert len(invocations.read_text().splitlines()) == 1
 
 
+def test_paused_probe_action_resumes_after_terminal_trial_without_replay(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (tmp_path / "agent.py").write_text(
+        "import json\n"
+        "from pathlib import Path\n\n"
+        "def run(value):\n"
+        "    with Path('target-invocations.jsonl').open('a') as stream:\n"
+        "        stream.write(json.dumps(value) + '\\n')\n"
+        "    return {'action': 'lookup', 'ticket': 42}\n",
+        encoding="utf-8",
+    )
+    dataset = tmp_path / "examples.jsonl"
+    dataset.write_text(
+        '{"id":"case-1","input":"Return ticket 42.","output":{"action":"lookup","ticket":42}}\n',
+        encoding="utf-8",
+    )
+    output = tmp_path / "evidence.jsonl"
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("UL_LIVE", "true")
+    monkeypatch.setenv("OPEN_ROUTER_API_KEY", "test-key")
+
+    preflight_calls = 0
+
+    async def clean_room_preflight(_settings: object) -> object:
+        nonlocal preflight_calls
+        preflight_calls += 1
+        return _evaluator_preflight()
+
+    async def load_clean_room_preflight(_output: Path, _settings: object) -> tuple[object, Path]:
+        return _evaluator_preflight(), _output.with_name(f"{_output.name}.preflight.json")
+
+    create_runtime = probe_module.create_campaign_progress_runtime
+    runtime_calls = 0
+
+    def create_trial_paused_runtime(**arguments: object) -> object:
+        nonlocal runtime_calls
+        runtime_calls += 1
+        runtime = create_runtime(**arguments)
+        if runtime_calls == 1:
+            original_trial_terminal = runtime.tracker.trial_terminal
+
+            def pause_after_original_trial(**terminal_arguments: object) -> None:
+                original_trial_terminal(**terminal_arguments)
+                unit = terminal_arguments["unit"]
+                if unit.arm == "original":
+                    runtime.control.request_pause()
+
+            monkeypatch.setattr(runtime.tracker, "trial_terminal", pause_after_original_trial)
+        return runtime
+
+    monkeypatch.setattr(probe_module, "preflight_evaluator", clean_room_preflight)
+    monkeypatch.setattr(probe_module, "load_evaluator_preflight", load_clean_room_preflight)
+    monkeypatch.setattr(
+        probe_module,
+        "create_campaign_progress_runtime",
+        create_trial_paused_runtime,
+    )
+    monkeypatch.setattr(
+        campaign_runner_module,
+        "create_semantic_model_deconstructor",
+        lambda _settings: _CleanRoomSemanticModel(),
+    )
+    result = runner.invoke(
+        app,
+        [
+            "probe",
+            str(dataset),
+            "--target",
+            "agent:run",
+            "--output",
+            str(output),
+        ],
+        input="y\ny\n",
+    )
+
+    assert result.exit_code == 130, result.output
+    assert "Reason: PROBE_PAUSED_DURING_CAMPAIGN" in result.output
+    assert "environment=reusable" in result.output
+    assert "next_action=resume" in result.output
+    action_match = re.search(
+        r'next_argv=\["ul","action","([0-9a-f]{64})"\]',
+        result.output,
+    )
+    assert action_match is not None
+    invocations = tmp_path / "target-invocations.jsonl"
+    assert len(invocations.read_text().splitlines()) == 2
+    nested_results = []
+
+    def invoke_trusted_cli(
+        argv: tuple[str, ...],
+        *,
+        check: bool,
+        cwd: str,
+    ) -> SimpleNamespace:
+        assert check is False
+        assert Path(cwd) == tmp_path
+        nested = runner.invoke(app, list(argv[4:]))
+        nested_results.append(nested)
+        return SimpleNamespace(returncode=nested.exit_code)
+
+    monkeypatch.setattr(progress_action_module.subprocess, "run", invoke_trusted_cli)
+    action_result = runner.invoke(app, ["action", action_match.group(1)])
+
+    assert action_result.exit_code == 0, nested_results[0].output
+    assert nested_results[0].exit_code == 0, nested_results[0].output
+    assert "Reusing durable smoke and evaluator preflight checkpoints" in nested_results[0].output
+    assert "UL run report" in nested_results[0].output
+    assert "stage=terminal" in nested_results[0].output
+    assert preflight_calls == 1
+    assert len(invocations.read_text().splitlines()) == 3
+    evidence_lines = [json.loads(line) for line in output.read_text().splitlines()]
+    assert len(evidence_lines) == 2
+    assert evidence_lines[0]["record_type"] == "dataset_durable_run"
+    assert evidence_lines[1]["execution_plan"]["repetitions"] == 1
+    journal_records = [
+        json.loads(line)
+        for line in output.with_name(f"{output.name}.trials.jsonl").read_text().splitlines()
+    ]
+    completed_units = {
+        record["unit"]["arm"] for record in journal_records if record["state"] == "completed"
+    }
+    assert completed_units == {"original", "probe"}
+
+
 @pytest.mark.skipif(sys.platform == "win32", reason="symlink creation requires privileges")
 def test_successful_smoke_refuses_symlinked_project_directory(
     tmp_path: Path,
@@ -1208,7 +1334,9 @@ def test_public_documentation_flow_runs_real_callable_campaign_and_report(
     assert "environment_calls=3" in result.output
     assert "semantic_calls=unknown" in result.output
     assert "tokens=unknown" in result.output
-    evidence = json.loads(output.read_text().splitlines()[0])
+    evidence_lines = [json.loads(line) for line in output.read_text().splitlines()]
+    assert evidence_lines[0]["record_type"] == "dataset_durable_run"
+    evidence = evidence_lines[1]
     assert evidence["execution_plan"]["repetitions"] == 1
     assert evidence["execution_plan"]["dataset_planned_target_calls"] == 2
     assert evidence["run_context"]["semantic_settings"]["provider"] == "openrouter"
@@ -1225,6 +1353,13 @@ def test_public_documentation_flow_runs_real_callable_campaign_and_report(
         ]["customer"]["email"]
         == "[PRIVATE]"
     )
+    assert evidence["technical_details"]["baseline"]["trial_set"]["trials"][0][
+        "execution_evidence"
+    ]["environment_id"].startswith("probe-")
+    assert output.with_name(f"{output.name}.manifest.json").is_file()
+    assert output.with_name(f"{output.name}.trials.jsonl").is_file()
+    assert output.with_name(f"{output.name}.trials.jsonl.anchor.json").is_file()
+    assert output.with_name(f"{output.stem}.augmentations.jsonl").is_file()
 
 
 def test_campaign_projection_failure_retains_exact_reason_and_partial_work(
@@ -1285,7 +1420,7 @@ def test_campaign_projection_failure_retains_exact_reason_and_partial_work(
     assert f"partial evidence remains in {output}" in result.output
     assert "Target safe to reuse: no" in result.output
     assert "PROBE_EVALUATION_FAILED" not in result.output
-    evidence = json.loads(output.read_text().splitlines()[0])
+    evidence = json.loads(output.read_text().splitlines()[1])
     failure = evidence["technical_details"]["baseline"]["trial_set"]["trials"][0]
     assert failure["lifecycle_failure"]["failed_phase"] == "outcome_projection"
     assert failure["lifecycle_failure"]["environment_state_may_remain"] is True

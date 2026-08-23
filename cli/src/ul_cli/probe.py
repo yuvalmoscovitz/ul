@@ -67,7 +67,10 @@ from ul_cli.dataset.evaluation.records import (
 )
 from ul_cli.dataset.evaluation.runner import evaluate_interaction_records
 from ul_cli.dataset.evidence.persistence import (
+    create_durable_evidence_output,
+    default_augmentations_output,
     load_evaluator_preflight,
+    open_resume_output,
     persist_evaluator_preflight,
 )
 from ul_cli.dataset.presentation.evaluation import print_dataset_results
@@ -80,11 +83,28 @@ from ul_cli.dataset.progress import (
     create_probe_next_commands,
 )
 from ul_cli.dataset.storage.private_files import create_private_output, open_resume_descriptor
+from ul_cli.dataset_augmentation_ledger import (
+    DatasetAugmentationLedger,
+    DatasetAugmentationLedgerSemanticSettings,
+    create_dataset_augmentation_generation_context,
+    create_private_augmentation_ledger,
+    open_augmentation_ledger_for_resume,
+)
 from ul_cli.dataset_campaign import DatasetCampaignPlan, create_dataset_campaign_plan
 from ul_cli.dataset_review import (
     DatasetEvidenceRunContext,
     DatasetEvidenceSemanticSettings,
     create_dataset_evidence_run_context,
+)
+from ul_cli.dataset_trial_journal import (
+    DatasetTrialJournal,
+    create_dataset_run_manifest,
+    create_dataset_trial_journal,
+    journal_path,
+    manifest_path,
+    open_dataset_trial_journal,
+    persist_dataset_run_manifest,
+    read_dataset_run_manifest,
 )
 from ul_cli.pattern_identity import ensure_project_pattern_identity_key
 from ul_cli.report import report_evidence
@@ -1138,6 +1158,8 @@ def probe(
             run_context=run_context,
             progress_runtime=progress_runtime,
             evaluator_preflight=evaluator_preflight,
+            resume_campaign=resume_checkpoint is not None,
+            allow_insecure_http=allow_insecure_http,
         )
         projection_failure = _campaign_projection_failure(results, output)
         if projection_failure is not None:
@@ -1191,7 +1213,12 @@ def probe(
                 environment="reusable" if failure.target_safe_to_reuse else "quarantined",
             )
         _print_failure(failure, diagnostic_artifact=diagnostic_artifact)
-        exit_code = 130 if failure.reason_code == "PROBE_PAUSED_AFTER_PREFLIGHT" else 2
+        exit_code = (
+            130
+            if failure.reason_code
+            in {"PROBE_PAUSED_AFTER_PREFLIGHT", "PROBE_PAUSED_DURING_CAMPAIGN"}
+            else 2
+        )
         raise typer.Exit(code=exit_code) from None
     finally:
         if target_lock_descriptor is not None:
@@ -1879,9 +1906,11 @@ def _run_campaign(
     run_context: DatasetEvidenceRunContext,
     progress_runtime: CampaignProgressRuntime,
     evaluator_preflight: EvaluatorModelPreflight | None,
+    resume_campaign: bool,
+    allow_insecure_http: bool,
 ) -> tuple[DatasetEvaluationResult, ...]:
     resolved_target.revalidate_identity()
-    if output.exists():
+    if output.exists() and not resume_campaign:
         raise ProbeFailure(
             "output",
             "PROBE_EVIDENCE_EXISTS",
@@ -1899,6 +1928,96 @@ def _run_campaign(
             "Check the output path and permissions, then rerun.",
             target_safe_to_reuse=True,
         ) from None
+    augmentations_output = default_augmentations_output(output)
+    augmentation_generation_context = create_dataset_augmentation_generation_context(
+        selected_records=records,
+        operators=tuple(
+            dataset_operator_identity(operator_reference)
+            for operator_reference in selected_operator_ids
+        ),
+        semantic_settings=DatasetAugmentationLedgerSemanticSettings(
+            provider=settings.semantic_provider_id,
+            endpoint_sha256=settings.semantic_endpoint_sha256,
+            model=settings.model,
+            render_model=settings.render_model,
+            equivalence_model=settings.equivalence_model,
+            max_input_chars=settings.max_input_chars,
+            max_output_tokens=settings.max_output_tokens,
+            max_render_tokens=settings.max_render_tokens,
+            max_response_bytes=settings.max_response_bytes,
+            timeout_seconds=settings.timeout_seconds,
+        ),
+    )
+    expected_manifest = create_dataset_run_manifest(
+        run_context=run_context,
+        selected_records=records,
+        selected_operator_ids=selected_operator_ids,
+        repetitions=repetitions,
+        max_environment_api_calls=plan.calls.total_environment_api,
+        allow_environment_network=True,
+        confirm_test_environment=True,
+        allow_insecure_http=allow_insecure_http,
+        save_augmentations=True,
+        semantic_provider_type=settings.semantic_provider_type,
+        semantic_base_url=settings.semantic_base_url,
+        semantic_live_calls=settings.live_calls,
+        semantic_allow_external_data_processing=settings.allow_external_data_processing,
+        augmentations_output_path=str(augmentations_output.resolve()),
+    )
+    trial_journal: DatasetTrialJournal | None = None
+    augmentation_ledger: DatasetAugmentationLedger | None = None
+    try:
+        if resume_campaign:
+            recorded_manifest = read_dataset_run_manifest(manifest_path(output))
+            if recorded_manifest != expected_manifest:
+                raise ValueError("probe campaign manifest does not match the resumed campaign")
+            trial_journal = open_dataset_trial_journal(journal_path(output), recorded_manifest)
+            augmentation_ledger = open_augmentation_ledger_for_resume(
+                augmentations_output,
+                expected_context=augmentation_generation_context,
+                selected_records=records,
+            )
+        else:
+            persist_dataset_run_manifest(manifest_path(output), expected_manifest)
+            trial_journal = create_dataset_trial_journal(journal_path(output), expected_manifest)
+            create_durable_evidence_output(output, expected_manifest.manifest_sha256)
+            augmentation_ledger = create_private_augmentation_ledger(
+                augmentations_output,
+                generation_context=augmentation_generation_context,
+                selected_records=records,
+            )
+    except (OSError, ValueError):
+        if augmentation_ledger is not None:
+            augmentation_ledger.close()
+        if trial_journal is not None:
+            trial_journal.close()
+        raise ProbeFailure(
+            "output",
+            "PROBE_DURABLE_STATE_INVALID",
+            "The durable campaign manifest, journal, or evidence output could not be "
+            "opened safely.",
+            "Keep the target stopped and inspect the private campaign artifacts.",
+            target_safe_to_reuse=True,
+        ) from None
+
+    terminal_states = trial_journal.snapshot.terminal_states
+    if terminal_states:
+        progress_runtime.tracker.hydrate_terminal_states(terminal_states)
+        attempted_target_calls = sum(
+            state in {"completed", "errored", "inconclusive", "quarantined"}
+            for state in terminal_states.values()
+        )
+        progress_runtime.tracker.record_usage(
+            target_calls=1 + attempted_target_calls,
+            semantic_calls=None,
+            environment_calls=(resolved_target.calls_per_execution * (1 + attempted_target_calls)),
+            tokens=None,
+        )
+
+    def flush_progress_boundary() -> None:
+        assert trial_journal is not None
+        trial_journal.flush()
+
     progress_runtime.tracker.emit(status="running", stage="preflight")
     try:
         if evaluator_preflight is None:
@@ -1907,12 +2026,14 @@ def _run_campaign(
             persist_evaluator_preflight(output, evaluator_preflight)
         if not progress_runtime.tracker.safe_boundary(
             progress_runtime.control,
-            lambda: None,
+            flush_progress_boundary,
         ):
             action = progress_runtime.control.requested_action()
             assert action is not None
             raise CampaignControlRequested(action)
     except CampaignControlRequested:
+        augmentation_ledger.close()
+        trial_journal.close()
         raise ProbeFailure(
             "augmentation preparation",
             "PROBE_PAUSED_AFTER_PREFLIGHT",
@@ -1921,6 +2042,8 @@ def _run_campaign(
             target_safe_to_reuse=True,
         ) from None
     except Exception:
+        augmentation_ledger.close()
+        trial_journal.close()
         raise ProbeFailure(
             "augmentation preparation",
             "PROBE_AUGMENTATION_PREPARATION_FAILED",
@@ -1934,6 +2057,8 @@ def _run_campaign(
             remaining_target_seconds,
         )
     except Exception:
+        augmentation_ledger.close()
+        trial_journal.close()
         raise ProbeFailure(
             "probe execution",
             "PROBE_TARGET_CONNECTION_FAILED",
@@ -1942,11 +2067,32 @@ def _run_campaign(
             target_safe_to_reuse=True,
         ) from None
     try:
-        with create_private_output(output) as output_stream:
+        try:
+            output_stream, resume_evidence = open_resume_output(
+                output,
+                expected_context=run_context,
+                selected_records=records,
+                invariant_suite=None,
+            )
+        except (OSError, ValueError):
+            raise ProbeFailure(
+                "output",
+                "PROBE_EVIDENCE_WRITE_FAILED",
+                "The durable evidence output could not be opened safely.",
+                "Keep the target stopped and inspect the private campaign artifacts.",
+                target_safe_to_reuse=True,
+            ) from None
+        campaign_records = tuple(
+            record for record in records if record.id not in resume_evidence.processed_ids
+        )
+        saved_augmentations = {
+            record.source.id: record.augmentation for record in augmentation_ledger.snapshot.records
+        }
+        with output_stream:
             try:
                 results = asyncio.run(
                     evaluate_interaction_records(
-                        records,
+                        campaign_records,
                         selected_operator_ids,
                         settings,
                         connection,
@@ -1960,8 +2106,19 @@ def _run_campaign(
                         environment_calls_per_target_call=(resolved_target.calls_per_execution),
                         run_context=run_context,
                         evaluator_preflight=evaluator_preflight,
+                        trial_journal=trial_journal,
+                        augmentation_ledger=augmentation_ledger,
+                        saved_augmentations=saved_augmentations,
                     )
                 )
+            except CampaignControlRequested:
+                raise ProbeFailure(
+                    "evaluation",
+                    "PROBE_PAUSED_DURING_CAMPAIGN",
+                    "The campaign paused at a durable trial boundary.",
+                    "Run the opaque resume action to continue only unfinished trials.",
+                    target_safe_to_reuse=True,
+                ) from None
             except Exception:
                 raise ProbeFailure(
                     "evaluation",
@@ -1982,6 +2139,9 @@ def _run_campaign(
             "Check disk space and permissions; inspect any retained evidence before retrying.",
             target_safe_to_reuse=False,
         ) from None
+    finally:
+        augmentation_ledger.close()
+        trial_journal.close()
     return results
 
 
