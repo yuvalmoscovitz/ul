@@ -18,6 +18,7 @@ from ul.dataset_evaluation import (
     DatasetEvaluationResult,
     DatasetEvaluationTrial,
     DatasetEvaluationTrialSet,
+    DatasetTargetDeliveryUncertain,
     DatasetTrialUnit,
 )
 from ul.dataset_evaluation import DatasetEvaluationRunner as _DatasetEvaluationRunner
@@ -2246,6 +2247,8 @@ async def test_runner_surfaces_cleanup_failure_and_stops_further_execution() -> 
     assert first_trial.lifecycle_failure.cleanup_reset_failed is True
     assert "environment state may remain" in first_trial.inconclusive_reasons[0]
     assert "not executed" in second_trial.inconclusive_reasons[0]
+
+
 async def test_runner_preserves_projection_failure_and_quarantines_unknown_target_state() -> None:
     semantic_pipeline = DeterministicSemanticPipeline((_source_outcomes()[0],))
     target = ProjectionFailingEnvironment()

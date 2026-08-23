@@ -6,7 +6,7 @@ import json
 
 import pytest
 from rich.console import Console
-from ul import DatasetTrialProgress
+from ul import DatasetEvaluationTrial, DatasetTrialUnit
 from ul_cli.dataset.progress import (
     CampaignControl,
     CampaignNextCommands,
@@ -47,15 +47,14 @@ def test_json_and_terminal_renderers_expose_equivalent_progress_facts() -> None:
         environment_calls=12,
         tokens=900,
     )
-    callback = tracker.trial_callback(case_number=2)
-    callback(
-        DatasetTrialProgress(
-            status="running",
-            kind="probe",
+    tracker.trial_started(
+        case_number=2,
+        unit=DatasetTrialUnit(
+            interaction_id="PRIVATE_CASE_ID",
             operator_id="input.surface.rephrase",
+            arm="probe",
             repetition=3,
-            environment="awaiting_cleanup",
-        )
+        ),
     )
     event = events[-1]
     json_stream = io.StringIO()
@@ -107,13 +106,18 @@ def test_progress_contract_never_accepts_or_emits_private_content() -> None:
     clock_values = iter((1.0, 2.0))
     events = []
     tracker = _tracker(events.append, lambda: next(clock_values))
-    tracker.trial_callback(case_number=1)(
-        DatasetTrialProgress(
-            status="completed",
-            kind="original",
+    tracker.trial_terminal(
+        case_number=1,
+        unit=DatasetTrialUnit(
+            interaction_id="PRIVATE_CASE_ID",
+            operator_id="current_baseline",
+            arm="original",
             repetition=1,
-            environment="reusable",
-        )
+        ),
+        trial=DatasetEvaluationTrial(
+            repetition=1,
+            inconclusive_reasons=("sanitized failure",),
+        ),
     )
     serialized = events[0].model_dump_json()
     assert all(canary not in serialized for canary in canaries)

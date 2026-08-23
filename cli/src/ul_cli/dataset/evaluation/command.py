@@ -36,6 +36,11 @@ from ul.http_environment import (
     validate_json_http_environment_configuration,
 )
 
+from ul_cli.dataset.progress import (
+    CampaignControlRequested,
+    create_campaign_next_commands,
+    create_campaign_progress_runtime,
+)
 from ul_cli.dataset_augmentation_ledger import (
     DatasetAugmentationLedger,
     DatasetAugmentationLedgerSemanticSettings,
@@ -1012,17 +1017,52 @@ def evaluate_dataset(
             param_hint="--environment-config",
         ) from None
 
+    progress_runtime = create_campaign_progress_runtime(
+        case_count=len(selected_records),
+        work_upper_bound=(len(selected_records) * repetitions * (1 + len(selected_operators))),
+        target_call_budget=campaign_plan.calls.total_environment_api,
+        semantic_call_budget=campaign_plan.calls.total_semantic_model,
+        environment_call_budget=max_environment_api_calls,
+        token_budget=campaign_plan.tokens.maximum,
+        maximum_wall_time_seconds=(
+            max(
+                1,
+                campaign_plan.calls.total_environment_api
+                + campaign_plan.calls.total_semantic_model,
+            )
+            * settings.timeout_seconds
+        ),
+        next_commands=create_campaign_next_commands(output),
+        json_output=progress_json,
+    )
+
+    def flush_progress_boundary() -> None:
+        if trial_journal is not None:
+            trial_journal.flush()
+
+    progress_runtime.tracker.emit(status="running", stage="preflight")
     if evaluator_preflight is None:
         try:
-            evaluator_preflight = asyncio.run(preflight_evaluator(settings))
+            with progress_runtime.signal_control.installed():
+                evaluator_preflight = asyncio.run(preflight_evaluator(settings))
             evaluator_preflight_receipt = persist_evaluator_preflight(output, evaluator_preflight)
+            if not progress_runtime.tracker.safe_boundary(
+                progress_runtime.control,
+                flush_progress_boundary,
+            ):
+                asyncio.run(target.aclose())
+                if trial_journal is not None:
+                    trial_journal.close()
+                raise typer.Exit(code=130)
         except EvaluatorModelCompatibilityError as error:
+            progress_runtime.tracker.emit(status="failed", stage="terminal")
             if trial_journal is not None:
                 trial_journal.close()
             asyncio.run(target.aclose())
             print_dataset_plain(f"Evaluation stopped before campaign execution: {error}")
             raise typer.Exit(code=2) from None
         except (OSError, ValueError) as error:
+            progress_runtime.tracker.emit(status="failed", stage="terminal")
             if trial_journal is not None:
                 trial_journal.close()
             asyncio.run(target.aclose())
@@ -1074,12 +1114,7 @@ def evaluate_dataset(
                         )
         failure_parameter = "--resume" if resume is not None else "--output"
         if resume is None:
-            assert expected_manifest is not None
-            assert run_manifest_path is not None
-            assert run_journal_path is not None
-            persist_dataset_run_manifest(run_manifest_path, expected_manifest)
-            trial_journal = create_dataset_trial_journal(run_journal_path, expected_manifest)
-            create_private_output(output).close()
+            assert trial_journal is not None
             output_stream, initial_evidence = open_resume_output(
                 output,
                 expected_context=run_context,
@@ -1137,6 +1172,8 @@ def evaluate_dataset(
             durable_arguments: dict[str, object] = {}
             if "progress_plan" in evaluation_parameters or accepts_extra_arguments:
                 durable_arguments["progress_plan"] = campaign_plan
+            if "progress_runtime" in evaluation_parameters or accepts_extra_arguments:
+                durable_arguments["progress_runtime"] = progress_runtime
             if trial_journal is not None and (
                 "trial_journal" in evaluation_parameters or accepts_extra_arguments
             ):
@@ -1220,7 +1257,11 @@ def evaluate_dataset(
                 has_review_findings |= result_needs_review(result)
             finding_output_stream.flush()
             os.fsync(finding_output_stream.fileno())
+    except CampaignControlRequested:
+        raise typer.Exit(code=130) from None
     except (TimeoutError, RuntimeError, ValueError, httpx.HTTPError) as error:
+        if not progress_runtime.tracker.terminal_emitted:
+            progress_runtime.tracker.emit(status="failed", stage="terminal")
         if isinstance(error, ProviderDiagnosticError):
             console.print(str(error))
             try:

@@ -3,11 +3,9 @@ from __future__ import annotations
 import asyncio
 import json
 import os
-import sys
 from pathlib import Path
 from typing import TextIO
 
-from rich.console import Console
 from ul import (
     DatasetAugmentationEngine,
     DatasetAugmentationResult,
@@ -38,15 +36,11 @@ from ul_cli.dataset_trial_journal import DatasetTrialJournal
 
 from ..evidence.customer import build_customer_evidence_record
 from ..progress import (
-    CampaignControl,
     CampaignControlRequested,
     CampaignNextCommands,
-    CampaignProgressTracker,
-    CampaignSignalControl,
-    JsonCampaignProgressRenderer,
-    SafeCampaignProgressPublisher,
-    TerminalCampaignProgressRenderer,
+    CampaignProgressRuntime,
     create_campaign_next_commands,
+    create_campaign_progress_runtime,
 )
 
 
@@ -77,6 +71,8 @@ async def evaluate_interaction_records(
     progress_json: bool = False,
     progress_plan: DatasetCampaignPlan | None = None,
     progress_next_commands: CampaignNextCommands | None = None,
+    progress_runtime: CampaignProgressRuntime | None = None,
+    complete_progress: bool = True,
 ) -> tuple[DatasetEvaluationResult, ...]:
     results: list[DatasetEvaluationResult] = []
     work_upper_bound = len(records) * repetitions * (1 + len(operator_ids))
@@ -87,28 +83,23 @@ async def evaluate_interaction_records(
         progress_next_commands = create_campaign_next_commands(
             Path(str(getattr(output_stream, "name", "evidence.jsonl")))
         )
-    progress_renderer = (
-        JsonCampaignProgressRenderer(sys.stderr)
-        if progress_json
-        else TerminalCampaignProgressRenderer(Console(stderr=True))
-    )
-    progress_tracker = CampaignProgressTracker(
-        case_count=len(records),
-        work_upper_bound=work_upper_bound,
-        target_call_budget=planned_target_calls,
-        semantic_call_budget=semantic_call_budget,
-        environment_call_budget=max_environment_api_calls,
-        token_budget=token_budget,
-        maximum_wall_time_seconds=max(
-            1,
-            planned_target_calls + semantic_call_budget,
+    if progress_runtime is None:
+        progress_runtime = create_campaign_progress_runtime(
+            case_count=len(records),
+            work_upper_bound=work_upper_bound,
+            target_call_budget=planned_target_calls,
+            semantic_call_budget=semantic_call_budget,
+            environment_call_budget=max_environment_api_calls,
+            token_budget=token_budget,
+            maximum_wall_time_seconds=(
+                max(1, planned_target_calls + semantic_call_budget) * timeout_seconds
+            ),
+            next_commands=progress_next_commands,
+            json_output=progress_json,
         )
-        * timeout_seconds,
-        next_commands=progress_next_commands,
-        publish=SafeCampaignProgressPublisher(progress_renderer).publish,
-    )
-    campaign_control = CampaignControl()
-    signal_control = CampaignSignalControl(campaign_control)
+    progress_tracker = progress_runtime.tracker
+    campaign_control = progress_runtime.control
+    signal_control = progress_runtime.signal_control
     actual_target_calls = 0
     active_trial: tuple[int, DatasetTrialUnit] | None = None
 
@@ -271,6 +262,20 @@ async def evaluate_interaction_records(
                 )
                 if invariant_evaluation is not None and invariant_evaluations is not None:
                     invariant_evaluations.append(invariant_evaluation)
+                progress_tracker.record_usage(
+                    target_calls=actual_target_calls,
+                    semantic_calls=sum(
+                        getattr(getattr(item, "semantic_calls", None), "actual_calls", 0)
+                        for item in (*results, result)
+                    ),
+                    environment_calls=None,
+                    tokens=None,
+                )
+                progress_tracker.emit(
+                    status="running",
+                    stage="evidence",
+                    case_number=case_number,
+                )
                 output_stream.write(
                     json.dumps(
                         build_customer_evidence_record(
@@ -286,15 +291,7 @@ async def evaluate_interaction_records(
                     + "\n"
                 )
                 durable_flush()
-                progress_tracker.record_usage(
-                    target_calls=actual_target_calls,
-                    semantic_calls=sum(
-                        getattr(getattr(item, "semantic_calls", None), "actual_calls", 0)
-                        for item in (*results, result)
-                    ),
-                    environment_calls=None,
-                    tokens=None,
-                )
                 results.append(result)
-    progress_tracker.emit(status="completed", stage="terminal")
+    if complete_progress:
+        progress_tracker.emit(status="completed", stage="terminal")
     return tuple(results)

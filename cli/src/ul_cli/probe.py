@@ -61,6 +61,12 @@ from ul_cli.dataset.evaluation.records import (
 from ul_cli.dataset.evaluation.runner import evaluate_interaction_records
 from ul_cli.dataset.presentation.evaluation import print_dataset_results
 from ul_cli.dataset.presentation.runtime import console, print_dataset_plain
+from ul_cli.dataset.progress import (
+    CampaignProgressRuntime,
+    CampaignSignalControl,
+    create_campaign_next_commands,
+    create_campaign_progress_runtime,
+)
 from ul_cli.dataset.storage.private_files import create_private_output
 from ul_cli.dataset_campaign import DatasetCampaignPlan, create_dataset_campaign_plan
 from ul_cli.dataset_review import (
@@ -446,8 +452,16 @@ def probe(
         bool,
         typer.Option(help="Print private smoke response content instead of only its digest."),
     ] = False,
+    progress_json: Annotated[
+        bool,
+        typer.Option(
+            "--progress-json",
+            help="Write stable privacy-safe progress JSON Lines to stderr.",
+        ),
+    ] = False,
 ) -> None:
     """Smoke a real target, then optionally run one bounded active-probe pilot."""
+    progress_runtime: CampaignProgressRuntime | None = None
     try:
         records = _load_pilot_records(data)
         resolved_target = _resolve_target(
@@ -457,17 +471,6 @@ def probe(
         )
         existing_config = _check_probe_config_binding(data, resolved_target)
         _confirm_target(resolved_target, confirmed_digest=confirm_target)
-        smoke_result = asyncio.run(_run_smoke(records[0], resolved_target))
-        _print_smoke(
-            smoke_result,
-            resolved_target,
-            show_response=show_smoke_response,
-        )
-        _save_probe_config(
-            data=data,
-            resolved_target=resolved_target,
-            existing_config=existing_config,
-        )
         try:
             settings = load_dataset_semantic_settings()
             validate_model_input_bounds(records, settings.max_input_chars)
@@ -480,9 +483,6 @@ def probe(
                 target_calls_per_execution=resolved_target.calls_per_execution,
                 settings=settings,
             )
-            remaining_target_seconds = _validate_campaign_target_budget(
-                plan, resolved_target, smoke_result.elapsed_seconds
-            )
             campaign_confirmation = _campaign_confirmation(plan, settings, resolved_target)
             run_context = create_dataset_evidence_run_context(
                 selected_records=records,
@@ -494,6 +494,21 @@ def probe(
                 target_receipt=_target_evidence_receipt(resolved_target),
                 semantic_settings=_semantic_settings_snapshot(settings),
             )
+            progress_runtime = create_campaign_progress_runtime(
+                case_count=len(records),
+                work_upper_bound=(len(records) * repetitions * (1 + len(selected_operator_ids))),
+                target_call_budget=(
+                    resolved_target.calls_per_execution + plan.calls.total_environment_api
+                ),
+                semantic_call_budget=plan.calls.total_semantic_model,
+                environment_call_budget=(
+                    resolved_target.calls_per_execution + plan.calls.total_environment_api
+                ),
+                token_budget=plan.tokens.maximum,
+                maximum_wall_time_seconds=campaign_confirmation.maximum_wall_seconds,
+                next_commands=create_campaign_next_commands(output),
+                json_output=progress_json,
+            )
         except ProbeFailure:
             raise
         except Exception:
@@ -504,6 +519,34 @@ def probe(
                 "Review semantic settings and target limits, then rerun.",
                 target_safe_to_reuse=True,
             ) from None
+        progress_runtime.tracker.emit(status="running", stage="smoke")
+        with progress_runtime.signal_control.installed():
+            smoke_result = asyncio.run(
+                _run_smoke(
+                    records[0],
+                    resolved_target,
+                    signal_control=progress_runtime.signal_control,
+                )
+            )
+        progress_runtime.tracker.record_usage(
+            target_calls=resolved_target.calls_per_execution,
+            semantic_calls=0,
+            environment_calls=resolved_target.calls_per_execution,
+            tokens=0,
+        )
+        _print_smoke(
+            smoke_result,
+            resolved_target,
+            show_response=show_smoke_response,
+        )
+        _save_probe_config(
+            data=data,
+            resolved_target=resolved_target,
+            existing_config=existing_config,
+        )
+        remaining_target_seconds = _validate_campaign_target_budget(
+            plan, resolved_target, smoke_result.elapsed_seconds
+        )
         _print_pilot_budget(plan, campaign_confirmation)
         if not _confirm_paid_execution(
             confirmation=campaign_confirmation,
@@ -522,11 +565,13 @@ def probe(
             repetitions=repetitions,
             remaining_target_seconds=remaining_target_seconds,
             run_context=run_context,
+            progress_runtime=progress_runtime,
         )
         projection_failure = _campaign_projection_failure(results, output)
         if projection_failure is not None:
             raise projection_failure
         try:
+            progress_runtime.tracker.emit(status="running", stage="report")
             print_dataset_results(results, output, show_report_guidance=False)
         except Exception:
             raise ProbeFailure(
@@ -546,6 +591,7 @@ def probe(
             )
             console.print("")
             report_evidence(output)
+            progress_runtime.tracker.emit(status="completed", stage="terminal")
         except Exception:
             raise ProbeFailure(
                 "analysis",
@@ -555,6 +601,12 @@ def probe(
                 target_safe_to_reuse=True,
             ) from None
     except ProbeFailure as failure:
+        if progress_runtime is not None and not progress_runtime.tracker.terminal_emitted:
+            progress_runtime.tracker.emit(
+                status="failed",
+                stage="terminal",
+                environment="reusable" if failure.target_safe_to_reuse else "quarantined",
+            )
         _print_failure(failure, diagnostic_artifact=diagnostic_artifact)
         raise typer.Exit(code=2) from None
 
@@ -731,6 +783,8 @@ def _confirm_target(resolved_target: _ResolvedTarget, *, confirmed_digest: str |
 async def _run_smoke(
     record: InteractionRecord,
     resolved_target: _ResolvedTarget,
+    *,
+    signal_control: CampaignSignalControl | None = None,
 ) -> _SmokeResult:
     resolved_target.revalidate_identity()
     connection = resolved_target.create_connection(
@@ -753,7 +807,12 @@ async def _run_smoke(
     try:
         started_at = time.monotonic()
         async with connection:
+            task = asyncio.current_task()
+            if signal_control is not None and task is not None:
+                signal_control.target_call_started(task)
             evidence = await connection.execute(case)
+            if signal_control is not None:
+                signal_control.target_call_finished()
         elapsed_seconds = time.monotonic() - started_at
     except OutcomeProjectionExecutionError as error:
         raise ProbeFailure(
@@ -762,6 +821,16 @@ async def _run_smoke(
             str(error),
             _projection_failure_remediation(error, error.target_safe_to_reuse),
             target_safe_to_reuse=error.target_safe_to_reuse,
+        ) from None
+    except asyncio.CancelledError:
+        if signal_control is not None:
+            signal_control.target_call_finished()
+        raise ProbeFailure(
+            "smoke invocation",
+            "PROBE_SMOKE_DELIVERY_UNCERTAIN",
+            "Smoke delivery may have begun before interruption; UL did not retry it.",
+            "Quarantine the target until an operator resets or replaces the test environment.",
+            target_safe_to_reuse=False,
         ) from None
     except (OSError, RuntimeError, TimeoutError, ValueError, httpx.HTTPError) as error:
         raise ProbeFailure(
@@ -1211,6 +1280,7 @@ def _run_campaign(
     repetitions: int,
     remaining_target_seconds: float | None,
     run_context: DatasetEvidenceRunContext,
+    progress_runtime: CampaignProgressRuntime,
 ) -> tuple[DatasetEvaluationResult, ...]:
     resolved_target.revalidate_identity()
     if output.exists():
@@ -1231,8 +1301,10 @@ def _run_campaign(
             "Check the output path and permissions, then rerun.",
             target_safe_to_reuse=True,
         ) from None
+    progress_runtime.tracker.emit(status="running", stage="preflight")
     try:
-        evaluator_preflight = asyncio.run(preflight_evaluator(settings))
+        with progress_runtime.signal_control.installed():
+            evaluator_preflight = asyncio.run(preflight_evaluator(settings))
     except Exception:
         raise ProbeFailure(
             "augmentation preparation",
@@ -1268,6 +1340,8 @@ def _run_campaign(
                         max_environment_api_calls=plan.calls.total_environment_api,
                         planned_target_calls=plan.calls.total_environment_api,
                         progress_plan=plan,
+                        progress_runtime=progress_runtime,
+                        complete_progress=False,
                         run_context=run_context,
                         evaluator_preflight=evaluator_preflight,
                     )

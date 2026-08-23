@@ -21,7 +21,12 @@ from ul.environment import evaluation_case_from_inputs
 from ul_cli.dataset.evaluation import command as command_module
 from ul_cli.dataset.evaluation import runner as runner_module
 from ul_cli.dataset.evidence import persistence as persistence_module
-from ul_cli.dataset_trial_journal import manifest_path, read_dataset_run_manifest
+from ul_cli.dataset_trial_journal import (
+    journal_path,
+    manifest_path,
+    open_dataset_trial_journal,
+    read_dataset_run_manifest,
+)
 from ul_cli.main import app as root_app
 
 from ._factories import (
@@ -36,6 +41,71 @@ from ._files import (
 
 runner = CliRunner()
 _ANSI_ESCAPE_PATTERN = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+
+
+def test_safe_boundary_pause_flushes_a_resumable_campaign(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    dataset = tmp_path / "interactions.jsonl"
+    output = tmp_path / "results.jsonl"
+    target_config = tmp_path / "target.json"
+    _write_dataset(dataset, [_record()])
+    _write_target_config(target_config)
+
+    class FakeTarget:
+        @classmethod
+        def from_config(cls, *_args: object, **_kwargs: object) -> FakeTarget:
+            return cls()
+
+        async def aclose(self) -> None:
+            pass
+
+    async def successful_preflight(_settings: object) -> object:
+        return _evaluator_preflight()
+
+    create_runtime = command_module.create_campaign_progress_runtime
+
+    def create_paused_runtime(**arguments: object) -> object:
+        runtime = create_runtime(**arguments)
+        runtime.control.request_pause()
+        return runtime
+
+    monkeypatch.setattr(command_module, "load_dataset_semantic_settings", _settings)
+    monkeypatch.setattr(command_module, "JsonHttpEnvironmentConnection", FakeTarget)
+    monkeypatch.setattr(command_module, "preflight_evaluator", successful_preflight)
+    monkeypatch.setattr(
+        command_module,
+        "create_campaign_progress_runtime",
+        create_paused_runtime,
+    )
+
+    result = runner.invoke(
+        root_app,
+        [
+            "dataset",
+            "evaluate",
+            str(dataset),
+            "--environment-config",
+            str(target_config),
+            "--allow-environment-network",
+            "--confirm-test-environment",
+            "--output",
+            str(output),
+        ],
+    )
+
+    assert result.exit_code == 130, result.output
+    assert result.output.count(" next=") == 1
+    assert f"next=ul dataset evaluate --resume {output}" in result.output
+    manifest = read_dataset_run_manifest(manifest_path(output))
+    journal = open_dataset_trial_journal(journal_path(output), manifest)
+    journal.close()
+    resume_check = runner.invoke(
+        root_app,
+        ["dataset", "evaluate", "--resume", str(output), "--dry-run"],
+    )
+    assert resume_check.exit_code == 0, resume_check.output
 
 
 def test_execution_requires_config_network_confirmation_environment_and_output(

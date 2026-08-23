@@ -910,6 +910,19 @@ def test_public_documentation_flow_runs_real_callable_campaign_and_report(
     assert "UL run report" in result.output
     assert "Evidence type: dataset evaluation" in result.output
     assert "Stronger confirmation:" in result.output
+    for stage in (
+        "smoke",
+        "preflight",
+        "augmentation",
+        "original",
+        "probe",
+        "evidence",
+        "report",
+        "terminal",
+    ):
+        assert f"stage={stage}" in result.output
+    assert result.output.count(" next=") == 1
+    assert f"next=ul report {output}" in result.output
     evidence = json.loads(output.read_text().splitlines()[0])
     assert evidence["execution_plan"]["repetitions"] == 1
     assert evidence["execution_plan"]["dataset_planned_target_calls"] == 2

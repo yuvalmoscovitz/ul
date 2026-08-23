@@ -7,17 +7,19 @@ import os
 import shlex
 import signal
 import subprocess
+import sys
 import threading
 import time
 from collections.abc import Callable, Generator
 from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
 from types import FrameType
 from typing import Literal, Protocol
 
 from pydantic import ConfigDict, Field, model_validator
 from rich.console import Console
-from ul import DatasetTrialProgress
+from ul import DatasetEvaluationTrial, DatasetTrialUnit
 from ul_core.models import ULModel
 
 CampaignStage = Literal[
@@ -247,6 +249,13 @@ class CampaignSignalControl:
             signal.signal(signal.SIGINT, previous_handler)
 
 
+@dataclass(frozen=True)
+class CampaignProgressRuntime:
+    tracker: CampaignProgressTracker
+    control: CampaignControl
+    signal_control: CampaignSignalControl
+
+
 class CampaignProgressTracker:
     def __init__(
         self,
@@ -294,6 +303,8 @@ class CampaignProgressTracker:
         self._running = 0
         self._skipped = 0
         self._failed = 0
+        self._terminal_emitted = False
+        self._environment: Literal["reusable", "quarantined", "awaiting_cleanup"] = "reusable"
         self._actual_usage: tuple[int | None, int | None, int | None, int | None] = (
             None,
             None,
@@ -301,31 +312,50 @@ class CampaignProgressTracker:
             None,
         )
 
-    def trial_callback(self, *, case_number: int) -> Callable[[DatasetTrialProgress], None]:
-        def report(progress: DatasetTrialProgress) -> None:
-            if progress.status == "running":
-                self._running = 1
-            else:
-                self._running = 0
-                if progress.status == "completed":
-                    self._completed += 1
-                elif progress.status == "skipped":
-                    self._skipped += 1
-                else:
-                    self._failed += 1
-            self.emit(
-                status="running",
-                stage=progress.kind,
-                case_number=case_number,
-                operator_id=progress.operator_id,
-                trial_kind=progress.kind,
-                repetition=progress.repetition,
-                attempt=progress.attempt,
-                environment=progress.environment,
-                delivery_uncertain=progress.delivery_uncertain,
-            )
+    def trial_started(self, *, case_number: int, unit: DatasetTrialUnit) -> None:
+        self._running = 1
+        self.emit(
+            status="running",
+            stage=unit.arm,
+            case_number=case_number,
+            operator_id=None if unit.arm == "original" else unit.operator_id,
+            trial_kind=unit.arm,
+            repetition=unit.repetition,
+            attempt=unit.attempt,
+            environment="awaiting_cleanup",
+        )
 
-        return report
+    def trial_terminal(
+        self,
+        *,
+        case_number: int,
+        unit: DatasetTrialUnit,
+        trial: DatasetEvaluationTrial,
+    ) -> None:
+        self._running = 0
+        skipped = trial.execution_evidence is None and any(
+            "not executed" in reason for reason in trial.inconclusive_reasons
+        )
+        if skipped:
+            self._skipped += 1
+        elif trial.inconclusive_reasons:
+            self._failed += 1
+        else:
+            self._completed += 1
+        quarantined = (
+            trial.lifecycle_failure is not None
+            and trial.lifecycle_failure.environment_state_may_remain
+        )
+        self.emit(
+            status="running",
+            stage=unit.arm,
+            case_number=case_number,
+            operator_id=None if unit.arm == "original" else unit.operator_id,
+            trial_kind=unit.arm,
+            repetition=unit.repetition,
+            attempt=unit.attempt,
+            environment="quarantined" if quarantined else "reusable",
+        )
 
     def trial_skipped(self, *, case_number: int, unit: DatasetTrialUnit) -> None:
         self._skipped += 1
@@ -378,9 +408,13 @@ class CampaignProgressTracker:
         trial_kind: Literal["original", "probe"] | None = None,
         repetition: int | None = None,
         attempt: int | None = None,
-        environment: Literal["reusable", "quarantined", "awaiting_cleanup"] = "reusable",
+        environment: Literal["reusable", "quarantined", "awaiting_cleanup"] | None = None,
         delivery_uncertain: bool = False,
     ) -> CampaignProgressEvent:
+        if status != "running":
+            self._terminal_emitted = True
+        if environment is not None:
+            self._environment = environment
         self._sequence += 1
         elapsed = max(0.0, self._clock() - self._started_at)
         terminal_count = self._completed + self._skipped + self._failed
@@ -442,12 +476,16 @@ class CampaignProgressTracker:
                 eta_seconds=eta,
                 maximum_wall_time_seconds=self._maximum_wall_time_seconds,
             ),
-            environment=environment,
+            environment=self._environment,
             delivery_uncertain=delivery_uncertain,
             next_command=next_command,
         )
         self._publish(event)
         return event
+
+    @property
+    def terminal_emitted(self) -> bool:
+        return self._terminal_emitted
 
     def safe_boundary(
         self,
@@ -481,4 +519,40 @@ def create_campaign_next_commands(evidence_path: Path) -> CampaignNextCommands:
             evidence,
             "--dry-run",
         ),
+    )
+
+
+def create_campaign_progress_runtime(
+    *,
+    case_count: int,
+    work_upper_bound: int,
+    target_call_budget: int,
+    semantic_call_budget: int,
+    environment_call_budget: int,
+    token_budget: int,
+    maximum_wall_time_seconds: float,
+    next_commands: CampaignNextCommands,
+    json_output: bool,
+) -> CampaignProgressRuntime:
+    renderer = (
+        JsonCampaignProgressRenderer(sys.stderr)
+        if json_output
+        else TerminalCampaignProgressRenderer(Console(stderr=True))
+    )
+    tracker = CampaignProgressTracker(
+        case_count=case_count,
+        work_upper_bound=work_upper_bound,
+        target_call_budget=target_call_budget,
+        semantic_call_budget=semantic_call_budget,
+        environment_call_budget=environment_call_budget,
+        token_budget=token_budget,
+        maximum_wall_time_seconds=maximum_wall_time_seconds,
+        next_commands=next_commands,
+        publish=SafeCampaignProgressPublisher(renderer).publish,
+    )
+    control = CampaignControl()
+    return CampaignProgressRuntime(
+        tracker=tracker,
+        control=control,
+        signal_control=CampaignSignalControl(control),
     )
