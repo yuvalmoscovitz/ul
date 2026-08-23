@@ -34,6 +34,7 @@ from ul_cli import report as report_module
 from ul_cli.dataset.evaluation import command as dataset_command
 from ul_cli.dataset.evaluation import runner as dataset_runner
 from ul_cli.main import app
+from ul_cli.pattern_identity import pattern_mechanism_pseudonym
 from ul_cli.report_contract import (
     FindingSummary,
     UnifiedReport,
@@ -41,6 +42,7 @@ from ul_cli.report_contract import (
 
 runner = CliRunner()
 FINDING_ID = f"ulf_v1_{'a' * 64}"
+_PATTERN_IDENTITY_KEY = bytes(range(32))
 _ANSI_ESCAPE_PATTERN = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 
 
@@ -271,6 +273,13 @@ def _technical_details() -> dict[str, Any]:
 
 
 def _write_evidence(path: Path, records: list[dict[str, Any]] | None = None) -> bytes:
+    project_directory = path.parent / ".ul"
+    project_directory.mkdir(mode=0o700, exist_ok=True)
+    project_directory.chmod(0o700)
+    identity_key_path = project_directory / "pattern-identity.key"
+    if not identity_key_path.exists():
+        identity_key_path.write_bytes(_PATTERN_IDENTITY_KEY)
+        identity_key_path.chmod(0o600)
     raw = b"".join(
         json.dumps(record, ensure_ascii=False, separators=(",", ":")).encode() + b"\n"
         for record in (records or [_evidence_record()])
@@ -405,10 +414,10 @@ def test_root_json_report_is_stable_and_omits_private_dataset_fields(tmp_path: P
         "patterns": [
             {
                 "pattern_fingerprint": (
-                    "ulpf_v1_8e07d18f89508d32fc9c4e884e6d811d1685e617bcf3c75014f8556906f43599"
+                    "ulpf_v1_b5dd705fb4db534431680decfe8b221fbebfd049d7b7aba99c2b59af966a2ca3"
                 ),
                 "pattern_snapshot_id": (
-                    "ulps_v1_fe450fcf62ea692b04490458f87197c173df27ac7d4ba90ac56fc84117a195d7"
+                    "ulps_v1_c6b003667fc2f8b325a8c753cb6caf0332fbe0e63f27134d7fb4787b87c9f093"
                 ),
                 "kind": "behavior_difference",
                 "category": "changed_grounded_effect_argument",
@@ -417,11 +426,15 @@ def test_root_json_report_is_stable_and_omits_private_dataset_fields(tmp_path: P
                 "summary": "The changed input altered an important action detail.",
                 "severity": "unrated",
                 "stability": "stable",
-                "evidence_authorities": ["deterministic_evaluator"],
+                "evidence_authorities": ["model_derived_unverified"],
+                "evidence_limitations": ["semantic_model_output_not_independently_verified"],
                 "horizontal_facets": {
                     "failure_type": "changed_grounded_effect_argument",
                     "affected_subject": "action",
-                    "evidence_level": "observed_action",
+                    "evidence_level": "model_derived_action",
+                    "mechanism_pseudonym": (
+                        "ulpm_v1_43c0893b3d2af633ffb223be1f918c9c2d16af24ab8c6535193025f706b866e6"
+                    ),
                 },
                 "finding_count": 1,
                 "source_case_count": 1,
@@ -440,6 +453,7 @@ def test_root_json_report_is_stable_and_omits_private_dataset_fields(tmp_path: P
                         "membership_reasons": [
                             "same_action_shape",
                             "same_evidence_authority",
+                            "same_evidence_limitation",
                             "same_finding_category",
                             "same_finding_kind",
                             "same_outcome_stability",
@@ -466,7 +480,8 @@ def test_root_json_report_is_stable_and_omits_private_dataset_fields(tmp_path: P
                 "conclusive_repetitions": 3,
                 "inconclusive_repetitions": 0,
                 "stability": "stable",
-                "evidence_authorities": ["deterministic_evaluator"],
+                "evidence_authorities": ["model_derived_unverified"],
+                "evidence_limitations": ["semantic_model_output_not_independently_verified"],
                 "violated_repetitions": None,
                 "next_action": "review_dataset_finding",
                 "summary": "The changed input altered an important action detail.",
@@ -481,7 +496,8 @@ def test_root_json_report_is_stable_and_omits_private_dataset_fields(tmp_path: P
     assert "Pay pay AC-100" not in report.output
     assert "AC-101" not in report.output
     assert "technical_details" not in report.output
-    assert "ulpm_v1_" not in report.output
+    assert "ulpm_v1_" in report.output
+    assert _PATTERN_IDENTITY_KEY.hex() not in report.output
     assert "6f5f3a4bf1b01b071a12aaf35df870dcd1fc1a4077db18efe2ab81453b6ef114" not in (report.output)
     for private_label in ("payment_committed", "invoice_reference", "completed"):
         assert hashlib.sha256(private_label.encode()).hexdigest() not in report.output
@@ -498,6 +514,8 @@ def test_root_human_report_explains_patterns_and_augmentation_names(tmp_path: Pa
     assert "Patterns group similar evidence; they do not claim a root cause." in report.output
     assert "Pattern 1: The changed input altered an important action detail." in report.output
     assert "Priority: unrated" in report.output
+    assert "Evidence authority: model derived unverified" in report.output
+    assert "Evidence limitation: semantic model output not independently verified" in report.output
     assert "Why grouped: same finding category and private action shape." in report.output
     assert "Affected: 1 finding(s) across 1 test question(s)" in report.output
     assert "Repeat a word as a natural disfluency." in report.output
@@ -591,7 +609,9 @@ def test_failure_patterns_group_same_mechanism_across_questions_and_augmentation
         ),
     }
 
-    patterns = dataset_review._build_failure_patterns(findings, contexts)
+    patterns = dataset_review._build_failure_patterns(
+        findings, contexts, pattern_identity_key=_PATTERN_IDENTITY_KEY
+    )
 
     changed_argument_pattern = next(
         pattern for pattern in patterns if pattern.category == "changed_grounded_effect_argument"
@@ -640,9 +660,13 @@ def test_pattern_fingerprint_survives_compatible_membership_changes() -> None:
     }
 
     first_snapshot = dataset_review._build_failure_patterns(
-        findings[:1], {finding_ids[0]: contexts[finding_ids[0]]}
+        findings[:1],
+        {finding_ids[0]: contexts[finding_ids[0]]},
+        pattern_identity_key=_PATTERN_IDENTITY_KEY,
     )[0]
-    second_snapshot = dataset_review._build_failure_patterns(findings, contexts)[0]
+    second_snapshot = dataset_review._build_failure_patterns(
+        findings, contexts, pattern_identity_key=_PATTERN_IDENTITY_KEY
+    )[0]
 
     assert first_snapshot.pattern_fingerprint == second_snapshot.pattern_fingerprint
     assert first_snapshot.pattern_snapshot_id != second_snapshot.pattern_snapshot_id
@@ -651,6 +675,7 @@ def test_pattern_fingerprint_survives_compatible_membership_changes() -> None:
         == (
             "same_action_shape",
             "same_evidence_authority",
+            "same_evidence_limitation",
             "same_finding_category",
             "same_finding_kind",
             "same_outcome_stability",
@@ -691,15 +716,35 @@ def test_private_action_shapes_split_snapshots_without_leaking_public_hashes() -
         for index, finding_id in enumerate(finding_ids)
     }
 
-    patterns = dataset_review._build_failure_patterns(findings, contexts)
+    patterns = dataset_review._build_failure_patterns(
+        findings, contexts, pattern_identity_key=_PATTERN_IDENTITY_KEY
+    )
     serialized_patterns = json.dumps(
         [pattern.model_dump(mode="json") for pattern in patterns], sort_keys=True
     )
 
     assert len(patterns) == 2
-    assert patterns[0].pattern_fingerprint == patterns[1].pattern_fingerprint
+    assert patterns[0].pattern_fingerprint != patterns[1].pattern_fingerprint
     assert patterns[0].pattern_snapshot_id != patterns[1].pattern_snapshot_id
     assert all(private_key not in serialized_patterns for private_key in private_keys)
+
+
+def test_mechanism_pseudonym_resists_dictionary_checks_and_key_rotation_starts_new_identity() -> (
+    None
+):
+    private_mechanism_digest = hashlib.sha256(b"payment_committed").hexdigest()
+    pseudonym = pattern_mechanism_pseudonym(
+        _PATTERN_IDENTITY_KEY,
+        private_mechanism_digest,
+    )
+    rotated_key_pseudonym = pattern_mechanism_pseudonym(
+        bytes(reversed(_PATTERN_IDENTITY_KEY)),
+        private_mechanism_digest,
+    )
+
+    assert pseudonym != f"ulpm_v1_{private_mechanism_digest}"
+    assert pseudonym != rotated_key_pseudonym
+    assert private_mechanism_digest not in pseudonym
 
 
 def test_pattern_grouping_splits_outcomes_and_authorities_but_keeps_review_cohorts() -> None:
@@ -739,7 +784,9 @@ def test_pattern_grouping_splits_outcomes_and_authorities_but_keeps_review_cohor
         if finding.finding_id is not None
     }
 
-    patterns = dataset_review._build_failure_patterns(findings, contexts)
+    patterns = dataset_review._build_failure_patterns(
+        findings, contexts, pattern_identity_key=_PATTERN_IDENTITY_KEY
+    )
 
     assert len(patterns) == 3
     assert len({pattern.pattern_fingerprint for pattern in patterns}) == 3
@@ -775,18 +822,30 @@ def test_pattern_fingerprint_survives_a_member_review_transition() -> None:
         "input.surface.typing_noise",
         ("deterministic_evaluator",),
     )
-    before_review = dataset_review._build_failure_patterns((finding,), {FINDING_ID: context})[0]
+    before_review = dataset_review._build_failure_patterns(
+        (finding,),
+        {FINDING_ID: context},
+        pattern_identity_key=_PATTERN_IDENTITY_KEY,
+    )[0]
     reviewed_finding = finding.model_copy(
         update={"review_status": "confirmed", "review_severity": "high"}
     )
     after_review = dataset_review._build_failure_patterns(
-        (reviewed_finding,), {FINDING_ID: context}
+        (reviewed_finding,),
+        {FINDING_ID: context},
+        pattern_identity_key=_PATTERN_IDENTITY_KEY,
+    )[0]
+    after_key_rotation = dataset_review._build_failure_patterns(
+        (reviewed_finding,),
+        {FINDING_ID: context},
+        pattern_identity_key=bytes(reversed(_PATTERN_IDENTITY_KEY)),
     )[0]
 
     assert before_review.pattern_fingerprint == after_review.pattern_fingerprint
     assert before_review.pattern_snapshot_id != after_review.pattern_snapshot_id
     assert before_review.members[0].review_status == "needs_review"
     assert after_review.members[0].review_status == "confirmed"
+    assert after_review.pattern_fingerprint != after_key_rotation.pattern_fingerprint
 
 
 def test_pattern_grouping_splits_conflicting_customer_rules() -> None:
@@ -824,7 +883,9 @@ def test_pattern_grouping_splits_conflicting_customer_rules() -> None:
         for index, finding_id in enumerate(finding_ids)
     }
 
-    patterns = dataset_review._build_failure_patterns(findings, contexts)
+    patterns = dataset_review._build_failure_patterns(
+        findings, contexts, pattern_identity_key=_PATTERN_IDENTITY_KEY
+    )
 
     assert len(patterns) == 2
     assert {pattern.rule_id for pattern in patterns} == {"rule-0", "rule-1"}

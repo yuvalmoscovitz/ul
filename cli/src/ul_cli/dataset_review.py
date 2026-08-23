@@ -46,6 +46,7 @@ from ul.dataset_regression import dataset_regression_target_config_sha256
 from ul.http_environment import JsonHttpIsolatedResponseConfig, JsonHttpTargetConfig
 from ul_core.augmentation_catalog import builtin_augmentation_catalog
 
+from ul_cli.pattern_identity import pattern_mechanism_pseudonym
 from ul_cli.report_contract import (
     FailurePattern,
     FindingCategory,
@@ -706,9 +707,15 @@ _BEHAVIOR_FINDING_SUMMARIES: dict[str, FindingSummaryText] = {
 def summarize_dataset_evidence(
     evidence: Path,
     reviews: Path | None = None,
+    *,
+    pattern_identity_key: bytes,
 ) -> UnifiedReport:
     try:
-        return _summarize_dataset_evidence(evidence, reviews)
+        return _summarize_dataset_evidence(
+            evidence,
+            reviews,
+            pattern_identity_key=pattern_identity_key,
+        )
     except _ReviewInputError as error:
         raise ReportInputError(str(error)) from None
     except (ValidationError, ValueError):
@@ -718,6 +725,8 @@ def summarize_dataset_evidence(
 def _summarize_dataset_evidence(
     evidence: Path,
     reviews: Path | None,
+    *,
+    pattern_identity_key: bytes,
 ) -> UnifiedReport:
     evidence_records = _load_evidence(evidence)
     evaluation_mode = _dataset_evaluation_mode(evidence_records)
@@ -763,7 +772,8 @@ def _summarize_dataset_evidence(
                     conclusive_repetitions=observations.observed_repetitions,
                     inconclusive_repetitions=observations.inconclusive_repetitions,
                     stability=observations.stability,
-                    evidence_authorities=("deterministic_evaluator",),
+                    evidence_authorities=("model_derived_unverified",),
+                    evidence_limitations=("semantic_model_output_not_independently_verified",),
                     next_action=next_action,
                     summary=summary,
                 )
@@ -776,7 +786,7 @@ def _summarize_dataset_evidence(
                         private_mechanism_key=pattern_signature,
                         source_case_id=indexed_finding.evidence_record.evidence.interaction_id,
                         operator_id=indexed_finding.case.operator_id,
-                        evidence_authorities=("deterministic_evaluator",),
+                        evidence_authorities=("model_derived_unverified",),
                     )
             continue
 
@@ -915,7 +925,11 @@ def _summarize_dataset_evidence(
                 )
 
     findings = tuple(finding_summaries)
-    patterns = _build_failure_patterns(findings, pattern_contexts)
+    patterns = _build_failure_patterns(
+        findings,
+        pattern_contexts,
+        pattern_identity_key=pattern_identity_key,
+    )
     summary = build_report_summary(findings)
     if summary.actionable_finding_count:
         report_review_status: ReportReviewStatus = "action_required"
@@ -1040,6 +1054,8 @@ def _bounded_effect_mechanisms(effects: list[_Effect]) -> list[dict[str, object]
 def _build_failure_patterns(
     findings: tuple[FindingSummary, ...],
     contexts: dict[str, _PatternContext],
+    *,
+    pattern_identity_key: bytes,
 ) -> tuple[FailurePattern, ...]:
     findings_by_id = {
         finding.finding_id: finding for finding in findings if finding.finding_id is not None
@@ -1056,6 +1072,7 @@ def _build_failure_patterns(
                 "rule_version": finding.rule_version,
                 "stability": finding.stability,
                 "evidence_authorities": context.evidence_authorities,
+                "evidence_limitations": finding.evidence_limitations,
             }
         )
         grouped.setdefault(grouping_key, []).append((finding, context))
@@ -1115,6 +1132,7 @@ def _build_failure_patterns(
                     ),
                     "same_outcome_stability",
                     "same_evidence_authority",
+                    "same_evidence_limitation",
                 )
             )
         )
@@ -1128,6 +1146,7 @@ def _build_failure_patterns(
                 severity=pattern_severity,
                 stability=first.stability,
                 evidence_authorities=first_context.evidence_authorities,
+                evidence_limitations=first.evidence_limitations,
                 horizontal_facets=PatternHorizontalFacets(
                     failure_type=first.category,
                     affected_subject=(
@@ -1140,9 +1159,18 @@ def _build_failure_patterns(
                     evidence_level=(
                         "evaluated_rule"
                         if first.kind == "customer_invariant_violation"
+                        else "model_derived_outcome"
+                        if first.category == "unstable_behavior"
+                        and "model_derived_unverified" in first.evidence_authorities
+                        else "model_derived_action"
+                        if "model_derived_unverified" in first.evidence_authorities
                         else "observed_outcome"
                         if first.category == "unstable_behavior"
                         else "observed_action"
+                    ),
+                    mechanism_pseudonym=pattern_mechanism_pseudonym(
+                        pattern_identity_key,
+                        first_context.private_mechanism_key,
                     ),
                 ),
                 finding_count=len(members),

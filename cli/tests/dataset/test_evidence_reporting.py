@@ -22,6 +22,7 @@ from ul_cli import dataset_review
 from ul_cli.dataset.evidence import customer as customer_module
 from ul_cli.dataset.presentation import evaluation as presentation_module
 from ul_cli.main import app as root_app
+from ul_cli.pattern_identity import ensure_project_pattern_identity_key
 
 from ._factories import (
     _evaluation_result,
@@ -36,6 +37,12 @@ runner = CliRunner()
 _ANSI_ESCAPE_PATTERN = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 
 
+def _create_pattern_identity_key(tmp_path: Path) -> None:
+    project_directory = tmp_path / ".ul"
+    project_directory.mkdir(mode=0o700)
+    ensure_project_pattern_identity_key(project_directory)
+
+
 def test_rich_evidence_builds_parses_and_reports_end_to_end(tmp_path: Path) -> None:
     result = _rich_evaluation_result()
     run_context = _run_context((result.source,))
@@ -48,6 +55,7 @@ def test_rich_evidence_builds_parses_and_reports_end_to_end(tmp_path: Path) -> N
     )
     evidence_path = tmp_path / "rich-evidence.jsonl"
     evidence_path.write_text(json.dumps(record) + "\n", encoding="utf-8")
+    _create_pattern_identity_key(tmp_path)
 
     assert record["schema_version"] == "1.9.0"
     assert dataset_review.is_reportable_dataset_evidence(evidence_path) is True
@@ -130,6 +138,7 @@ def test_unified_report_surfaces_response_only_scope_and_limitations(tmp_path: P
     )
     evidence = tmp_path / "evidence.jsonl"
     evidence.write_text(json.dumps(record) + "\n", encoding="utf-8")
+    _create_pattern_identity_key(tmp_path)
 
     json_report = runner.invoke(root_app, ["report", str(evidence), "--json"])
     human_report = runner.invoke(root_app, ["report", str(evidence)])

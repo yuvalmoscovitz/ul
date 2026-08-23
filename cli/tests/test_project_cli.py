@@ -126,9 +126,12 @@ def test_init_creates_private_project_and_generated_environment(
     assert environment_config["fixture_id"] == "standard-account"
     assert environment_config["fixture_version"] == "v3"
     assert (tmp_path / ".ul" / ".gitignore").read_text(encoding="utf-8") == "*\n"
+    identity_key_path = tmp_path / ".ul" / "pattern-identity.key"
+    assert len(identity_key_path.read_bytes()) == 32
     if hasattr(stat, "S_IMODE"):
         assert stat.S_IMODE(config_path.stat().st_mode) == 0o600
         assert stat.S_IMODE(environment_path.stat().st_mode) == 0o600
+        assert stat.S_IMODE(identity_key_path.stat().st_mode) == 0o600
         assert stat.S_IMODE((tmp_path / ".ul").stat().st_mode) == 0o700
         assert stat.S_IMODE((tmp_path / ".ul" / "runs").stat().st_mode) == 0o700
 

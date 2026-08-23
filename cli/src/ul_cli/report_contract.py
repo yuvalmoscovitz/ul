@@ -56,13 +56,16 @@ PatternEvidenceAuthority = Literal[
     "customer_declared",
     "deterministic_evaluator",
     "independent_observer",
+    "model_derived_unverified",
 ]
+PatternEvidenceLimitation = Literal["semantic_model_output_not_independently_verified"]
 
 _IDENTIFIER_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$"
 _VERSION_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9._+-]{0,49}$"
 _FINDING_ID_PATTERN = r"^ulf_v1_[0-9a-f]{64}$"
 _PATTERN_FINGERPRINT_PATTERN = r"^ulpf_v1_[0-9a-f]{64}$"
 _PATTERN_SNAPSHOT_ID_PATTERN = r"^ulps_v1_[0-9a-f]{64}$"
+_PATTERN_MECHANISM_PSEUDONYM_PATTERN = r"^ulpm_v1_[0-9a-f]{64}$"
 _SHA256_PATTERN = r"^[0-9a-f]{64}$"
 _JSON_POINTER_PATTERN = re.compile(r"(?:/(?:[^~/]|~[01])*)*")
 _MAXIMUM_RUN_RECEIPT_BYTES = 1_000_000
@@ -755,6 +758,7 @@ def _pattern_fingerprint(pattern: FailurePattern) -> str:
             "rule_version",
             "stability",
             "evidence_authorities",
+            "evidence_limitations",
             "horizontal_facets",
         },
     )
@@ -988,6 +992,7 @@ class FindingSummary(_StrictModel):
     inconclusive_repetitions: int = Field(ge=0)
     stability: Literal["stable", "unstable", "inconclusive"] | None = None
     evidence_authorities: tuple[PatternEvidenceAuthority, ...] = ()
+    evidence_limitations: tuple[PatternEvidenceLimitation, ...] = ()
     violated_repetitions: int | None = Field(default=None, ge=0)
     next_action: FindingNextAction
     summary: FindingSummaryText
@@ -996,6 +1001,13 @@ class FindingSummary(_StrictModel):
     def validate_finding(self) -> Self:
         if self.evidence_authorities != tuple(sorted(set(self.evidence_authorities))):
             raise ValueError("finding evidence authorities must be sorted and unique")
+        if self.evidence_limitations != tuple(sorted(set(self.evidence_limitations))):
+            raise ValueError("finding evidence limitations must be sorted and unique")
+        model_derived = "model_derived_unverified" in self.evidence_authorities
+        if model_derived != (
+            self.evidence_limitations == ("semantic_model_output_not_independently_verified",)
+        ):
+            raise ValueError("model-derived evidence requires its explicit limitation")
         if (self.operator_id is None) != (self.operator_version is None):
             raise ValueError("operator ID and version must be present together")
         if (self.rule_id is None) != (self.rule_version is None):
@@ -1043,6 +1055,7 @@ PatternMembershipReason = Literal[
     "same_action_shape",
     "same_customer_rule",
     "same_evidence_authority",
+    "same_evidence_limitation",
     "same_finding_category",
     "same_finding_kind",
     "same_outcome_stability",
@@ -1052,7 +1065,14 @@ PatternMembershipReason = Literal[
 class PatternHorizontalFacets(_StrictModel):
     failure_type: FindingCategory
     affected_subject: Literal["action", "outcome", "rule"]
-    evidence_level: Literal["observed_action", "observed_outcome", "evaluated_rule"]
+    evidence_level: Literal[
+        "observed_action",
+        "observed_outcome",
+        "model_derived_action",
+        "model_derived_outcome",
+        "evaluated_rule",
+    ]
+    mechanism_pseudonym: str = Field(pattern=_PATTERN_MECHANISM_PSEUDONYM_PATTERN)
 
 
 class PatternMember(_StrictModel):
@@ -1089,6 +1109,7 @@ class FailurePattern(_StrictModel):
     severity: FindingSeverity
     stability: Literal["stable", "unstable", "inconclusive"]
     evidence_authorities: tuple[PatternEvidenceAuthority, ...] = Field(min_length=1)
+    evidence_limitations: tuple[PatternEvidenceLimitation, ...] = ()
     horizontal_facets: PatternHorizontalFacets
     finding_count: int = Field(ge=1)
     source_case_count: int = Field(ge=1)
@@ -1127,12 +1148,21 @@ class FailurePattern(_StrictModel):
             raise ValueError("pattern operators must be sorted and unique")
         if self.evidence_authorities != tuple(sorted(set(self.evidence_authorities))):
             raise ValueError("pattern evidence authorities must be sorted and unique")
+        if self.evidence_limitations != tuple(sorted(set(self.evidence_limitations))):
+            raise ValueError("pattern evidence limitations must be sorted and unique")
+        model_derived = "model_derived_unverified" in self.evidence_authorities
+        if model_derived != (
+            self.evidence_limitations == ("semantic_model_output_not_independently_verified",)
+        ):
+            raise ValueError("model-derived patterns require their explicit limitation")
+        action_evidence_level = "model_derived_action" if model_derived else "observed_action"
+        outcome_evidence_level = "model_derived_outcome" if model_derived else "observed_outcome"
         expected_horizontal_scope = {
-            "duplicate_effect": ("action", "observed_action"),
-            "unexpected_effect": ("action", "observed_action"),
-            "missing_effect": ("action", "observed_action"),
-            "changed_grounded_effect_argument": ("action", "observed_action"),
-            "unstable_behavior": ("outcome", "observed_outcome"),
+            "duplicate_effect": ("action", action_evidence_level),
+            "unexpected_effect": ("action", action_evidence_level),
+            "missing_effect": ("action", action_evidence_level),
+            "changed_grounded_effect_argument": ("action", action_evidence_level),
+            "unstable_behavior": ("outcome", outcome_evidence_level),
             "customer_invariant_violation": ("rule", "evaluated_rule"),
         }[self.category]
         if (
@@ -1156,6 +1186,7 @@ class FailurePattern(_StrictModel):
                     ),
                     "same_outcome_stability",
                     "same_evidence_authority",
+                    "same_evidence_limitation",
                 )
             )
         )
@@ -1271,6 +1302,7 @@ class UnifiedReport(_StrictModel):
                     or finding.summary != pattern.summary
                     or finding.stability != pattern.stability
                     or finding.evidence_authorities != pattern.evidence_authorities
+                    or finding.evidence_limitations != pattern.evidence_limitations
                     or finding.review_status != member.review_status
                     or finding.review_severity != member.review_severity
                 ):
