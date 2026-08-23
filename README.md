@@ -65,6 +65,8 @@ To probe a Python callable or an explicit local command without hosting an HTTP 
 [Local process targets](docs/local-targets.md).
 To add reset and authoritative committed-state inspection with ordinary Python callbacks, including
 beside an existing response-only HTTP agent, see [Composable state hooks](docs/state-hooks.md).
+For the shortest smoke-first journey from grounded examples to a bounded active probe, see
+[Guided active-probe quickstart](docs/probe.md).
 
 To connect an existing response-only JSON endpoint that starts every request from isolated state:
 

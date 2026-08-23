@@ -22,6 +22,7 @@ from ul.dataset_invariants import (
     evaluate_dataset_invariants,
 )
 from ul.http_environment import JsonHttpEnvironmentConnection
+from ul.local_target import LocalTargetConnection
 
 from ul_cli.dataset_augmentation_ledger import DatasetAugmentationLedger
 from ul_cli.dataset_review import DatasetEvidenceRunContext
@@ -38,7 +39,7 @@ async def evaluate_interaction_records(
     records: tuple[InteractionRecord, ...],
     operator_ids: tuple[str, ...],
     settings: DatasetSemanticSettings,
-    target: JsonHttpEnvironmentConnection,
+    target: JsonHttpEnvironmentConnection | LocalTargetConnection,
     output_stream: TextIO,
     *,
     repetitions: int,
