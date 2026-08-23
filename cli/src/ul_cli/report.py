@@ -246,7 +246,8 @@ def _print_human_report(report: UnifiedReport, evidence: Path) -> None:
         for index, pattern in enumerate(report.patterns, start=1):
             typer.echo("")
             typer.echo(f"Pattern {index}: {pattern.summary}")
-            typer.echo(f"  Pattern ID: {pattern.pattern_id}")
+            typer.echo(f"  Pattern fingerprint: {pattern.pattern_fingerprint}")
+            typer.echo(f"  Snapshot ID: {pattern.pattern_snapshot_id}")
             typer.echo(f"  Priority: {pattern.severity}")
             if pattern.rule_id is not None:
                 typer.echo(
@@ -269,7 +270,9 @@ def _print_human_report(report: UnifiedReport, evidence: Path) -> None:
                 f"{pattern.needs_review_count} needs review; "
                 f"{pattern.confirmed_count} confirmed"
             )
-            typer.echo(f"  Finding IDs: {', '.join(pattern.finding_ids)}")
+            typer.echo(
+                f"  Finding IDs: {', '.join(member.finding_id for member in pattern.members)}"
+            )
             typer.echo("  Next: use the per-finding review commands below.")
     grouped_finding_count = sum(pattern.finding_count for pattern in report.patterns)
     ungrouped_actionable_count = report.summary.actionable_finding_count - grouped_finding_count

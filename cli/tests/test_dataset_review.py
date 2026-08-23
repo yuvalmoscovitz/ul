@@ -34,7 +34,12 @@ from ul_cli import report as report_module
 from ul_cli.dataset.evaluation import command as dataset_command
 from ul_cli.dataset.evaluation import runner as dataset_runner
 from ul_cli.main import app
-from ul_cli.report_contract import FindingSummary, UnifiedReport
+from ul_cli.report_contract import (
+    FindingSummary,
+    TrustedPatternVerticalFacet,
+    UnifiedReport,
+    VersionedReference,
+)
 
 runner = CliRunner()
 FINDING_ID = f"ulf_v1_{'a' * 64}"
@@ -380,7 +385,7 @@ def test_root_json_report_is_stable_and_omits_private_dataset_fields(tmp_path: P
 
     assert report.exit_code == 1, report.output
     expected = {
-        "schema_version": "1.5.0",
+        "schema_version": "1.6.0",
         "evidence_type": "dataset_evaluation",
         "evidence_schema_versions": ["1.3.0"],
         "evidence_scope": "response_and_state",
@@ -401,8 +406,11 @@ def test_root_json_report_is_stable_and_omits_private_dataset_fields(tmp_path: P
         },
         "patterns": [
             {
-                "pattern_id": (
-                    "ulp_v1_7b5a7ed8ae70cb94775e84e7896140c6fba2bf35c33187d09c015c645ae5bcd9"
+                "pattern_fingerprint": (
+                    "ulpf_v1_81793d3a66e6dfbe222b998871342f81cfcb6abdb96ec3c3cc313859fc40999d"
+                ),
+                "pattern_snapshot_id": (
+                    "ulps_v1_306ff85af713fab021682a0962f8d5635660b8cd664c46d3623cacbd21b88b8d"
                 ),
                 "kind": "behavior_difference",
                 "category": "changed_grounded_effect_argument",
@@ -410,6 +418,18 @@ def test_root_json_report_is_stable_and_omits_private_dataset_fields(tmp_path: P
                 "rule_version": None,
                 "summary": "The changed input altered an important action detail.",
                 "severity": "unrated",
+                "stability": "stable",
+                "evidence_authorities": ["deterministic_evaluator"],
+                "review_status": "needs_review",
+                "review_severity": "unrated",
+                "horizontal_facets": {
+                    "finding_kind": "behavior_difference",
+                    "finding_category": "changed_grounded_effect_argument",
+                    "mechanism_signature": (
+                        "ulpm_v1_6f5f3a4bf1b01b071a12aaf35df870dcd1fc1a4077db18efe2ab81453b6ef114"
+                    ),
+                },
+                "vertical_facets": [],
                 "finding_count": 1,
                 "source_case_count": 1,
                 "operators": [
@@ -421,7 +441,19 @@ def test_root_json_report_is_stable_and_omits_private_dataset_fields(tmp_path: P
                 ],
                 "needs_review_count": 1,
                 "confirmed_count": 0,
-                "finding_ids": [FINDING_ID],
+                "members": [
+                    {
+                        "finding_id": FINDING_ID,
+                        "membership_reasons": [
+                            "same_action_shape",
+                            "same_evidence_authority",
+                            "same_finding_category",
+                            "same_finding_kind",
+                            "same_outcome_stability",
+                            "same_review_decision",
+                        ],
+                    }
+                ],
             }
         ],
         "findings": [
@@ -440,6 +472,7 @@ def test_root_json_report_is_stable_and_omits_private_dataset_fields(tmp_path: P
                 "conclusive_repetitions": 3,
                 "inconclusive_repetitions": 0,
                 "stability": "stable",
+                "evidence_authorities": ["deterministic_evaluator"],
                 "violated_repetitions": None,
                 "next_action": "review_dataset_finding",
                 "summary": "The changed input altered an important action detail.",
@@ -486,7 +519,7 @@ def test_report_contract_rejects_pattern_review_counts_that_disagree_with_findin
     payload["patterns"][0]["needs_review_count"] = 0
     payload["patterns"][0]["confirmed_count"] = 1
 
-    with pytest.raises(ValueError, match="review counts must match member findings"):
+    with pytest.raises(ValueError, match="pattern snapshot ID must match its exact snapshot"):
         UnifiedReport.model_validate_json(json.dumps(payload))
 
 
@@ -523,6 +556,7 @@ def test_failure_patterns_group_same_mechanism_across_questions_and_augmentation
             conclusive_repetitions=3,
             inconclusive_repetitions=0,
             stability="stable",
+            evidence_authorities=("deterministic_evaluator",),
             next_action="review_dataset_finding",
             summary=summary,
         )
@@ -531,10 +565,30 @@ def test_failure_patterns_group_same_mechanism_across_questions_and_augmentation
         )
     )
     contexts = {
-        finding_ids[0]: ("1" * 64, "source-a", operators[0]),
-        finding_ids[1]: ("1" * 64, "source-a", operators[1]),
-        finding_ids[2]: ("1" * 64, "source-b", operators[2]),
-        finding_ids[3]: ("2" * 64, "source-b", operators[3]),
+        finding_ids[0]: dataset_review._PatternContext(
+            "ulpm_v1_" + "1" * 64,
+            "source-a",
+            operators[0],
+            ("deterministic_evaluator",),
+        ),
+        finding_ids[1]: dataset_review._PatternContext(
+            "ulpm_v1_" + "1" * 64,
+            "source-a",
+            operators[1],
+            ("deterministic_evaluator",),
+        ),
+        finding_ids[2]: dataset_review._PatternContext(
+            "ulpm_v1_" + "1" * 64,
+            "source-b",
+            operators[2],
+            ("deterministic_evaluator",),
+        ),
+        finding_ids[3]: dataset_review._PatternContext(
+            "ulpm_v1_" + "2" * 64,
+            "source-b",
+            operators[3],
+            ("deterministic_evaluator",),
+        ),
     }
 
     patterns = dataset_review._build_failure_patterns(findings, contexts)
@@ -548,8 +602,200 @@ def test_failure_patterns_group_same_mechanism_across_questions_and_augmentation
         "input.style.terse",
         "input.surface.typing_noise",
     ]
-    assert changed_argument_pattern.finding_ids == finding_ids[:3]
+    assert (
+        tuple(member.finding_id for member in changed_argument_pattern.members) == finding_ids[:3]
+    )
     assert len(patterns) == 2
+
+
+def test_pattern_fingerprint_survives_compatible_membership_changes() -> None:
+    finding_ids = tuple(f"ulf_v1_{character * 64}" for character in "ab")
+    findings = tuple(
+        FindingSummary(
+            finding_id=finding_id,
+            kind="behavior_difference",
+            category="duplicate_effect",
+            operator_id="input.surface.typing_noise",
+            operator_version="1.0.0",
+            review_status="needs_review",
+            review_severity="unrated",
+            requested_repetitions=3,
+            conclusive_repetitions=3,
+            inconclusive_repetitions=0,
+            stability="stable",
+            evidence_authorities=("deterministic_evaluator",),
+            next_action="review_dataset_finding",
+            summary="The changed input made the agent repeat an action.",
+        )
+        for finding_id in finding_ids
+    )
+    contexts = {
+        finding_id: dataset_review._PatternContext(
+            "ulpm_v1_" + "1" * 64,
+            f"source-{index}",
+            "input.surface.typing_noise",
+            ("deterministic_evaluator",),
+        )
+        for index, finding_id in enumerate(finding_ids)
+    }
+
+    first_snapshot = dataset_review._build_failure_patterns(
+        findings[:1], {finding_ids[0]: contexts[finding_ids[0]]}
+    )[0]
+    second_snapshot = dataset_review._build_failure_patterns(findings, contexts)[0]
+
+    assert first_snapshot.pattern_fingerprint == second_snapshot.pattern_fingerprint
+    assert first_snapshot.pattern_snapshot_id != second_snapshot.pattern_snapshot_id
+    assert all(
+        member.membership_reasons
+        == (
+            "same_action_shape",
+            "same_evidence_authority",
+            "same_finding_category",
+            "same_finding_kind",
+            "same_outcome_stability",
+            "same_review_decision",
+        )
+        for member in second_snapshot.members
+    )
+
+
+def test_pattern_grouping_splits_conflicting_outcomes_authorities_and_reviews() -> None:
+    variants = (
+        ("a", "stable", ("deterministic_evaluator",), "needs_review"),
+        ("b", "unstable", ("deterministic_evaluator",), "needs_review"),
+        ("c", "stable", ("independent_observer",), "needs_review"),
+        ("d", "stable", ("deterministic_evaluator",), "confirmed"),
+    )
+    findings = tuple(
+        FindingSummary(
+            finding_id=f"ulf_v1_{character * 64}",
+            kind="behavior_difference",
+            category="duplicate_effect",
+            operator_id="input.surface.typing_noise",
+            operator_version="1.0.0",
+            review_status=review_status,
+            review_severity="unrated",
+            requested_repetitions=3,
+            conclusive_repetitions=3,
+            inconclusive_repetitions=0,
+            stability=stability,
+            evidence_authorities=authorities,
+            next_action="review_dataset_finding",
+            summary="The changed input made the agent repeat an action.",
+        )
+        for character, stability, authorities, review_status in variants
+    )
+    contexts = {
+        finding.finding_id: dataset_review._PatternContext(
+            "ulpm_v1_" + "1" * 64,
+            f"source-{index}",
+            "input.surface.typing_noise",
+            finding.evidence_authorities,
+        )
+        for index, finding in enumerate(findings)
+        if finding.finding_id is not None
+    }
+
+    patterns = dataset_review._build_failure_patterns(findings, contexts)
+
+    assert len(patterns) == 4
+    assert len({pattern.pattern_fingerprint for pattern in patterns}) == 4
+
+
+def test_trusted_vertical_facets_are_optional_fingerprint_dimensions() -> None:
+    finding_ids = tuple(f"ulf_v1_{character * 64}" for character in "ab")
+    findings = tuple(
+        FindingSummary(
+            finding_id=finding_id,
+            kind="behavior_difference",
+            category="duplicate_effect",
+            operator_id="input.surface.typing_noise",
+            operator_version="1.0.0",
+            review_status="needs_review",
+            review_severity="unrated",
+            requested_repetitions=1,
+            conclusive_repetitions=1,
+            inconclusive_repetitions=0,
+            stability="stable",
+            evidence_authorities=("deterministic_evaluator",),
+            next_action="review_dataset_finding",
+            summary="The changed input made the agent repeat an action.",
+        )
+        for finding_id in finding_ids
+    )
+    trusted_facet = TrustedPatternVerticalFacet(
+        taxonomy=VersionedReference(
+            id="ulref_v1_" + "1" * 64,
+            version="ulref_v1_" + "2" * 64,
+        ),
+        value=VersionedReference(
+            id="ulref_v1_" + "3" * 64,
+            version="ulref_v1_" + "4" * 64,
+        ),
+        authority="customer_declared",
+    )
+    contexts = {
+        finding_ids[0]: dataset_review._PatternContext(
+            "ulpm_v1_" + "5" * 64,
+            "source-a",
+            "input.surface.typing_noise",
+            ("deterministic_evaluator",),
+        ),
+        finding_ids[1]: dataset_review._PatternContext(
+            "ulpm_v1_" + "5" * 64,
+            "source-b",
+            "input.surface.typing_noise",
+            ("deterministic_evaluator",),
+            (trusted_facet,),
+        ),
+    }
+
+    patterns = dataset_review._build_failure_patterns(findings, contexts)
+
+    assert len(patterns) == 2
+    assert {pattern.vertical_facets for pattern in patterns} == {(), (trusted_facet,)}
+
+
+def test_pattern_grouping_splits_conflicting_customer_rules() -> None:
+    finding_ids = tuple(f"ulf_v1_{character * 64}" for character in "ab")
+    findings = tuple(
+        FindingSummary(
+            finding_id=finding_id,
+            kind="customer_invariant_violation",
+            category="customer_invariant_violation",
+            operator_id="input.surface.typing_noise",
+            operator_version="1.0.0",
+            rule_id=f"rule-{index}",
+            rule_version="1.0.0",
+            declared_severity="high",
+            review_status="needs_review",
+            review_severity="unrated",
+            requested_repetitions=1,
+            conclusive_repetitions=1,
+            inconclusive_repetitions=0,
+            stability="stable",
+            evidence_authorities=("customer_declared", "deterministic_evaluator"),
+            violated_repetitions=1,
+            next_action="review_dataset_finding",
+            summary="The agent violated a customer-defined rule.",
+        )
+        for index, finding_id in enumerate(finding_ids)
+    )
+    contexts = {
+        finding_id: dataset_review._PatternContext(
+            "ulpm_v1_" + "5" * 64,
+            f"source-{index}",
+            "input.surface.typing_noise",
+            ("customer_declared", "deterministic_evaluator"),
+        )
+        for index, finding_id in enumerate(finding_ids)
+    }
+
+    patterns = dataset_review._build_failure_patterns(findings, contexts)
+
+    assert len(patterns) == 2
+    assert {pattern.rule_id for pattern in patterns} == {"rule-0", "rule-1"}
 
 
 def test_effect_statuses_produce_distinct_pattern_signatures() -> None:
