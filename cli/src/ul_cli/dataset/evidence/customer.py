@@ -16,6 +16,7 @@ from ul.dataset_invariants import DatasetInvariantEvaluation
 from ul_core.dataset import ObservedOutcome
 
 from ul_cli.dataset_review import DatasetEvidenceRunContext
+from ul_cli.report_contract import PatternVerticalFacets
 
 _CUSTOMER_STATUSES = {
     "augmentation_rejected": "VARIATION DISCARDED",
@@ -42,6 +43,7 @@ def build_customer_evidence_record(
 ) -> dict[str, JsonValue]:
     evaluation_mode = cast(Literal["variance"], getattr(result, "evaluation_mode", "variance"))
     augmentation_target = getattr(result.source, "augmentation_target", None)
+    pattern_facets = _customer_pattern_facets(getattr(result.source, "metadata", {}))
     cases: list[JsonValue] = []
     for case in result.cases:
         cases.append(
@@ -81,9 +83,18 @@ def build_customer_evidence_record(
     if uses_extended_invariants and run_context is None:
         raise ValueError("extended invariant evidence requires a resumable run context")
     evidence: dict[str, JsonValue] = {
-        "schema_version": "1.9.0" if augmentation_target is not None else "1.8.0",
+        "schema_version": "1.11.0" if augmentation_target is not None else "1.10.0",
         "evaluation_mode": evaluation_mode,
         "interaction_id": result.source.id,
+        **(
+            {
+                "pattern_facets": cast(
+                    JsonValue, pattern_facets.model_dump(mode="json", exclude_none=True)
+                )
+            }
+            if pattern_facets is not None
+            else {}
+        ),
         **(
             {
                 "source_record_id": result.source.source_interaction_id,
@@ -116,6 +127,13 @@ def build_customer_evidence_record(
     if run_context is not None:
         evidence["run_context"] = cast(JsonValue, run_context.model_dump(mode="json"))
     return evidence
+
+
+def _customer_pattern_facets(metadata: dict[str, JsonValue]) -> PatternVerticalFacets | None:
+    raw_facets = metadata.get("ul_pattern_facets")
+    if raw_facets is None:
+        return None
+    return PatternVerticalFacets.model_validate(raw_facets)
 
 
 def create_customer_evidence_record(

@@ -85,6 +85,21 @@ def pattern_mechanism_pseudonym(key: bytes, private_mechanism_digest: str) -> st
     return f"ulpm_v1_{digest}"
 
 
+def pattern_evidence_reference(key: bytes, evidence_record_sha256: str) -> str:
+    if len(key) != _PATTERN_IDENTITY_KEY_BYTES:
+        raise PatternIdentityKeyError("project pattern identity key must contain 32 bytes")
+    if len(evidence_record_sha256) != 64 or any(
+        character not in "0123456789abcdef" for character in evidence_record_sha256
+    ):
+        raise ValueError("evidence record digest must be a lowercase SHA-256 digest")
+    digest = hmac.new(
+        key,
+        b"ul.pattern-evidence.v1\0" + bytes.fromhex(evidence_record_sha256),
+        hashlib.sha256,
+    ).hexdigest()
+    return f"ulpe_v1_{digest}"
+
+
 def _read_private_key(project_directory: Path, path: Path) -> bytes:
     _validate_private_project_directory(project_directory)
 

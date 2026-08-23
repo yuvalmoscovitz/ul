@@ -22,6 +22,24 @@ projects one evaluation record per target and records the source case and target
 The complete encoded case is limited to 1 MB, with at most 100 context turns, 100 targets, and 100
 evidence references.
 
+Customer-authored metadata can add optional vertical finding facets through the reserved
+`ul_pattern_facets` object. UL accepts only `domain`, `workflow`, `role`, and `use_case`, with
+non-empty string values. These values partition otherwise matching patterns and become part of the
+stable pattern fingerprint; arbitrary or model-derived metadata is not promoted into facets.
+
+```json
+{
+  "metadata": {
+    "ul_pattern_facets": {
+      "domain": "payments",
+      "workflow": "invoice-payment",
+      "role": "approver",
+      "use_case": "pay-approved-invoice"
+    }
+  }
+}
+```
+
 HTTP request templates can copy typed values into a target request with a complete leaf placeholder:
 
 ```json

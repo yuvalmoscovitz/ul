@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import os
@@ -34,7 +35,7 @@ from ul_cli import report as report_module
 from ul_cli.dataset.evaluation import command as dataset_command
 from ul_cli.dataset.evaluation import runner as dataset_runner
 from ul_cli.main import app
-from ul_cli.pattern_identity import pattern_mechanism_pseudonym
+from ul_cli.pattern_identity import pattern_evidence_reference, pattern_mechanism_pseudonym
 from ul_cli.report_contract import (
     FindingSummary,
     UnifiedReport,
@@ -288,6 +289,22 @@ def _write_evidence(path: Path, records: list[dict[str, Any]] | None = None) -> 
     return raw
 
 
+def _matching_evidence_record(
+    *,
+    finding_id: str,
+    interaction_id: str,
+    pattern_facets: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    record = copy.deepcopy(_evidence_record(finding_id=finding_id))
+    record["interaction_id"] = interaction_id
+    if pattern_facets is not None:
+        record["schema_version"] = "1.10.0"
+        record["evaluation_mode"] = "variance"
+        record["technical_details"]["evaluation_mode"] = "variance"
+        record["pattern_facets"] = pattern_facets
+    return record
+
+
 def _review_arguments(
     evidence: Path,
     *,
@@ -392,7 +409,7 @@ def test_root_json_report_is_stable_and_omits_private_dataset_fields(tmp_path: P
 
     assert report.exit_code == 1, report.output
     expected = {
-        "schema_version": "1.6.0",
+        "schema_version": "1.7.0",
         "evidence_type": "dataset_evaluation",
         "evidence_schema_versions": ["1.3.0"],
         "evidence_scope": "response_and_state",
@@ -411,13 +428,14 @@ def test_root_json_report_is_stable_and_omits_private_dataset_fields(tmp_path: P
                 "inconclusive": 0,
             },
         },
+        "stable_pattern_count": 1,
         "patterns": [
             {
                 "pattern_fingerprint": (
                     "ulpf_v1_b5dd705fb4db534431680decfe8b221fbebfd049d7b7aba99c2b59af966a2ca3"
                 ),
                 "pattern_snapshot_id": (
-                    "ulps_v1_c6b003667fc2f8b325a8c753cb6caf0332fbe0e63f27134d7fb4787b87c9f093"
+                    "ulps_v1_fe1a8c4612be33a7a5c3c7a773abd2031143d610f630ecc37912ab83b63779a6"
                 ),
                 "kind": "behavior_difference",
                 "category": "changed_grounded_effect_argument",
@@ -436,6 +454,7 @@ def test_root_json_report_is_stable_and_omits_private_dataset_fields(tmp_path: P
                         "ulpm_v1_43c0893b3d2af633ffb223be1f918c9c2d16af24ab8c6535193025f706b866e6"
                     ),
                 },
+                "vertical_facets": None,
                 "finding_count": 1,
                 "source_case_count": 1,
                 "operators": [
@@ -447,9 +466,16 @@ def test_root_json_report_is_stable_and_omits_private_dataset_fields(tmp_path: P
                 ],
                 "needs_review_count": 1,
                 "confirmed_count": 0,
+                "expected_count": 0,
+                "unsupported_count": 0,
+                "inconclusive_count": 0,
                 "members": [
                     {
                         "finding_id": FINDING_ID,
+                        "evidence_record_ref": pattern_evidence_reference(
+                            _PATTERN_IDENTITY_KEY,
+                            "659e1d52c9acf4f038c8f49b92eff256e38e1c266ffe544219de9a00b88ea25e",
+                        ),
                         "membership_reasons": [
                             "same_action_shape",
                             "same_evidence_authority",
@@ -464,6 +490,7 @@ def test_root_json_report_is_stable_and_omits_private_dataset_fields(tmp_path: P
                 ],
             }
         ],
+        "pattern_reviews": [],
         "findings": [
             {
                 "finding_id": FINDING_ID,
@@ -497,6 +524,7 @@ def test_root_json_report_is_stable_and_omits_private_dataset_fields(tmp_path: P
     assert "AC-101" not in report.output
     assert "technical_details" not in report.output
     assert "ulpm_v1_" in report.output
+    assert "659e1d52c9acf4f038c8f49b92eff256e38e1c266ffe544219de9a00b88ea25e" not in (report.output)
     assert _PATTERN_IDENTITY_KEY.hex() not in report.output
     assert "6f5f3a4bf1b01b071a12aaf35df870dcd1fc1a4077db18efe2ab81453b6ef114" not in (report.output)
     for private_label in ("payment_committed", "invoice_reference", "completed"):
@@ -510,7 +538,7 @@ def test_root_human_report_explains_patterns_and_augmentation_names(tmp_path: Pa
     report = runner.invoke(app, ["report", str(evidence)])
 
     assert report.exit_code == 1, report.output
-    assert "Reviewable finding patterns: 1" in report.output
+    assert "Finding patterns: 1 stable pattern(s); 1 review cohort(s)" in report.output
     assert "Patterns group similar evidence; they do not claim a root cause." in report.output
     assert "Pattern 1: The changed input altered an important action detail." in report.output
     assert "Priority: unrated" in report.output
@@ -522,9 +550,270 @@ def test_root_human_report_explains_patterns_and_augmentation_names(tmp_path: Pa
     assert "1 needs review; 0 confirmed" in report.output
     assert f"{FINDING_ID}: same action shape, same evidence authority" in report.output
     assert "review=needs_review/unrated" in report.output
-    assert "Next: use the per-finding review commands below." in report.output
+    assert "Next: ul dataset review-pattern" in report.output
     assert "Pay AC-100" not in report.output
     assert "AC-101" not in report.output
+
+
+def test_pattern_review_binds_exact_snapshot_preserves_exceptions_and_not_future_members(
+    tmp_path: Path,
+) -> None:
+    evidence = tmp_path / "evidence.jsonl"
+    second_finding_id = f"ulf_v1_{'b' * 64}"
+    third_finding_id = f"ulf_v1_{'c' * 64}"
+    first_record = _matching_evidence_record(
+        finding_id=FINDING_ID,
+        interaction_id="first-payment",
+    )
+    second_record = _matching_evidence_record(
+        finding_id=second_finding_id,
+        interaction_id="second-payment",
+    )
+    _write_evidence(evidence, [first_record, second_record])
+
+    initial = runner.invoke(app, ["report", str(evidence), "--json"])
+    assert initial.exit_code == 1, initial.output
+    initial_pattern = json.loads(initial.output)["patterns"][0]
+
+    exception_review_arguments = _review_arguments(
+        evidence,
+        status_value="expected",
+        severity=None,
+    )
+    exception = runner.invoke(app, exception_review_arguments)
+    assert exception.exit_code == 0, exception.output
+
+    before_pattern_review = runner.invoke(app, ["report", str(evidence), "--json"])
+    assert before_pattern_review.exit_code == 1, before_pattern_review.output
+    reviewable_pattern = next(
+        pattern
+        for pattern in json.loads(before_pattern_review.output)["patterns"]
+        if pattern["needs_review_count"] == 1
+    )
+    assert reviewable_pattern["pattern_fingerprint"] == initial_pattern["pattern_fingerprint"]
+    assert reviewable_pattern["pattern_snapshot_id"] != initial_pattern["pattern_snapshot_id"]
+    assert reviewable_pattern["expected_count"] == 0
+    assert reviewable_pattern["needs_review_count"] == 1
+
+    preview = runner.invoke(
+        app,
+        [
+            "dataset",
+            "review-pattern",
+            str(evidence),
+            reviewable_pattern["pattern_snapshot_id"],
+        ],
+    )
+    assert preview.exit_code == 0, preview.output
+    assert "Pattern review preview" in preview.output
+    assert "Decision candidates (1):" in preview.output
+    assert second_finding_id in preview.output.replace("\n", "")
+    assert "Exceptions unchanged (1):" in preview.output
+    assert FINDING_ID in preview.output.replace("\n", "")
+    assert "expected/unrated" in preview.output
+    assert "No review was written." in preview.output
+    reviews_path = tmp_path / "evidence.reviews.jsonl"
+    assert len(_read_reviews(reviews_path)) == 1
+
+    decision = runner.invoke(
+        app,
+        [
+            "dataset",
+            "review-pattern",
+            str(evidence),
+            reviewable_pattern["pattern_snapshot_id"],
+            "--status",
+            "confirmed",
+            "--severity",
+            "high",
+            "--reviewer",
+            "payments-risk",
+            "--reason",
+            "The remaining occurrence shows the same consequential payment failure.",
+        ],
+    )
+    assert decision.exit_code == 0, decision.output
+    assert "Future matching occurrences remain needs_review" in decision.output
+    review_history = _read_reviews(reviews_path)
+    assert len(review_history) == 2
+    pattern_review = review_history[1]
+    derived_review = pattern_review["occurrence_decisions"][0]
+    assert pattern_review["record_type"] == "pattern_review"
+    assert (
+        pattern_review["pattern_snapshot"]["pattern_snapshot_id"]
+        == reviewable_pattern["pattern_snapshot_id"]
+    )
+    assert pattern_review["reviewed_finding_ids"] == [second_finding_id]
+    assert pattern_review["exception_finding_ids"] == [FINDING_ID]
+    assert derived_review["finding_id"] == second_finding_id
+    fabricated_reviews = tmp_path / "fabricated.reviews.jsonl"
+    fabricated_history = copy.deepcopy(review_history)
+    fabricated_history[1]["grouping_evidence_sha256"] = "0" * 64
+    fabricated_reviews.write_text(
+        "\n".join(json.dumps(record) for record in fabricated_history) + "\n",
+        encoding="utf-8",
+    )
+    fabricated = runner.invoke(
+        app,
+        ["dataset", "report", str(evidence), "--reviews", str(fabricated_reviews)],
+    )
+    assert fabricated.exit_code == 2
+    assert "exact unreviewed cohort" in fabricated.output
+    assert (
+        dataset_review.load_confirmed_dataset_finding(
+            evidence,
+            reviews_path,
+            second_finding_id,
+        ).review.review_id
+        == derived_review["review_id"]
+    )
+    identity_key_path = tmp_path / ".ul" / "pattern-identity.key"
+    identity_key_path.write_bytes(bytes(reversed(range(32))))
+    identity_key_path.chmod(0o600)
+    rotated_report = runner.invoke(app, ["report", str(evidence), "--json"])
+    assert rotated_report.exit_code == 1, rotated_report.output
+    assert (
+        dataset_review.load_confirmed_dataset_finding(
+            evidence,
+            reviews_path,
+            second_finding_id,
+        ).review.review_id
+        == derived_review["review_id"]
+    )
+    identity_key_path.write_bytes(_PATTERN_IDENTITY_KEY)
+    identity_key_path.chmod(0o600)
+    with pytest.raises(ValueError, match="active confirmed review"):
+        dataset_review.load_confirmed_dataset_finding(evidence, reviews_path, FINDING_ID)
+    stale = runner.invoke(
+        app,
+        [
+            "dataset",
+            "review-pattern",
+            str(evidence),
+            reviewable_pattern["pattern_snapshot_id"],
+            "--status",
+            "confirmed",
+            "--severity",
+            "high",
+            "--reviewer",
+            "payments-risk",
+            "--reason",
+            "This stale decision must not be appended.",
+        ],
+    )
+    assert stale.exit_code == 2
+    assert "pattern snapshot was not found" in stale.output
+    assert _read_reviews(reviews_path) == review_history
+
+    reviewed = runner.invoke(app, ["report", str(evidence), "--json"])
+    assert reviewed.exit_code == 1, reviewed.output
+    reviewed_payload = json.loads(reviewed.output)
+    reviewed_pattern = next(
+        pattern for pattern in reviewed_payload["patterns"] if pattern["confirmed_count"] == 1
+    )
+    assert reviewed_pattern["needs_review_count"] == 0
+    assert reviewed_pattern["confirmed_count"] == 1
+    assert reviewed_pattern["expected_count"] == 0
+    assert len(reviewed_payload["patterns"]) == 2
+    assert len(reviewed_payload["pattern_reviews"]) == 1
+    assert "same consequential payment failure" not in reviewed.output
+    assert "payments-risk" not in reviewed.output
+
+    third_record = _matching_evidence_record(
+        finding_id=third_finding_id,
+        interaction_id="third-payment",
+    )
+    _write_evidence(evidence, [first_record, second_record, third_record])
+    future = runner.invoke(app, ["report", str(evidence), "--json"])
+    assert future.exit_code == 1, future.output
+    future_payload = json.loads(future.output)
+    future_pattern = next(
+        pattern for pattern in future_payload["patterns"] if pattern["needs_review_count"] == 1
+    )
+    assert future_pattern["pattern_fingerprint"] == initial_pattern["pattern_fingerprint"]
+    assert future_pattern["pattern_snapshot_id"] != reviewed_pattern["pattern_snapshot_id"]
+    assert future_pattern["needs_review_count"] == 1
+    future_member = next(
+        member for member in future_pattern["members"] if member["finding_id"] == third_finding_id
+    )
+    assert future_member["review_status"] == "needs_review"
+    assert len(future_payload["pattern_reviews"]) == 1
+
+
+def test_atomic_review_replacement_preserves_history_when_commit_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    evidence = tmp_path / "evidence.jsonl"
+    _write_evidence(evidence)
+    first = runner.invoke(app, _review_arguments(evidence))
+    assert first.exit_code == 0, first.output
+    reviews_path = tmp_path / "evidence.reviews.jsonl"
+    original_history = reviews_path.read_bytes()
+    active_review_id = _read_reviews(reviews_path)[0]["review_id"]
+
+    def fail_replace(source: Path, destination: Path) -> None:
+        raise OSError("simulated atomic commit failure")
+
+    monkeypatch.setattr(dataset_review.os, "replace", fail_replace)
+    replacement = runner.invoke(
+        app,
+        _review_arguments(
+            evidence,
+            status_value="expected",
+            severity=None,
+            supersedes=active_review_id,
+        ),
+    )
+
+    assert replacement.exit_code == 2
+    assert "cannot safely update review file" in replacement.output
+    assert reviews_path.read_bytes() == original_history
+
+
+def test_trusted_vertical_facets_partition_patterns_and_are_reported(tmp_path: Path) -> None:
+    evidence = tmp_path / "evidence.jsonl"
+    records = [
+        _matching_evidence_record(
+            finding_id=f"ulf_v1_{character * 64}",
+            interaction_id=f"case-{character}",
+            pattern_facets={
+                "domain": domain,
+                "workflow": "invoice-payment",
+                "role": "approver",
+                "use_case": "pay-approved-invoice",
+            },
+        )
+        for character, domain in (("a", "payments"), ("b", "payments"), ("c", "support"))
+    ]
+    _write_evidence(evidence, records)
+
+    report = runner.invoke(app, ["report", str(evidence), "--json"])
+    assert report.exit_code == 1, report.output
+    patterns = json.loads(report.output)["patterns"]
+    assert len(patterns) == 2
+    assert {pattern["vertical_facets"]["domain"] for pattern in patterns} == {
+        "payments",
+        "support",
+    }
+    payments = next(
+        pattern for pattern in patterns if pattern["vertical_facets"]["domain"] == "payments"
+    )
+    assert payments["finding_count"] == 2
+    assert len({member["evidence_record_ref"] for member in payments["members"]}) == 2
+    assert len({pattern["pattern_fingerprint"] for pattern in patterns}) == 2
+
+
+def test_vertical_facets_require_the_versioned_evidence_contract(tmp_path: Path) -> None:
+    evidence = tmp_path / "evidence.jsonl"
+    record = _evidence_record()
+    record["pattern_facets"] = {"domain": "payments"}
+    _write_evidence(evidence, [record])
+
+    report = runner.invoke(app, ["report", str(evidence), "--json"])
+
+    assert report.exit_code == 2
+    assert "unsupported evidence" in report.output
 
 
 def test_report_contract_rejects_pattern_review_counts_that_disagree_with_findings(
@@ -588,24 +877,28 @@ def test_failure_patterns_group_same_mechanism_across_questions_and_augmentation
             "source-a",
             operators[0],
             ("deterministic_evaluator",),
+            "e" * 64,
         ),
         finding_ids[1]: dataset_review._PatternContext(
             "1" * 64,
             "source-a",
             operators[1],
             ("deterministic_evaluator",),
+            "e" * 64,
         ),
         finding_ids[2]: dataset_review._PatternContext(
             "1" * 64,
             "source-b",
             operators[2],
             ("deterministic_evaluator",),
+            "e" * 64,
         ),
         finding_ids[3]: dataset_review._PatternContext(
             "2" * 64,
             "source-b",
             operators[3],
             ("deterministic_evaluator",),
+            "e" * 64,
         ),
     }
 
@@ -655,6 +948,7 @@ def test_pattern_fingerprint_survives_compatible_membership_changes() -> None:
             f"source-{index}",
             "input.surface.typing_noise",
             ("deterministic_evaluator",),
+            "e" * 64,
         )
         for index, finding_id in enumerate(finding_ids)
     }
@@ -667,9 +961,23 @@ def test_pattern_fingerprint_survives_compatible_membership_changes() -> None:
     second_snapshot = dataset_review._build_failure_patterns(
         findings, contexts, pattern_identity_key=_PATTERN_IDENTITY_KEY
     )[0]
+    rebound_context = dataset_review._PatternContext(
+        "1" * 64,
+        "source-0",
+        "input.surface.typing_noise",
+        ("deterministic_evaluator",),
+        "f" * 64,
+    )
+    rebound_snapshot = dataset_review._build_failure_patterns(
+        findings[:1],
+        {finding_ids[0]: rebound_context},
+        pattern_identity_key=_PATTERN_IDENTITY_KEY,
+    )[0]
 
     assert first_snapshot.pattern_fingerprint == second_snapshot.pattern_fingerprint
     assert first_snapshot.pattern_snapshot_id != second_snapshot.pattern_snapshot_id
+    assert rebound_snapshot.pattern_fingerprint == first_snapshot.pattern_fingerprint
+    assert rebound_snapshot.pattern_snapshot_id != first_snapshot.pattern_snapshot_id
     assert all(
         member.membership_reasons
         == (
@@ -712,6 +1020,7 @@ def test_private_action_shapes_split_snapshots_without_leaking_public_hashes() -
             f"source-{index}",
             "input.surface.typing_noise",
             ("deterministic_evaluator",),
+            "e" * 64,
         )
         for index, finding_id in enumerate(finding_ids)
     }
@@ -779,6 +1088,7 @@ def test_pattern_grouping_splits_outcomes_and_authorities_but_keeps_review_cohor
             f"source-{index}",
             "input.surface.typing_noise",
             finding.evidence_authorities,
+            "e" * 64,
         )
         for index, finding in enumerate(findings)
         if finding.finding_id is not None
@@ -788,12 +1098,20 @@ def test_pattern_grouping_splits_outcomes_and_authorities_but_keeps_review_cohor
         findings, contexts, pattern_identity_key=_PATTERN_IDENTITY_KEY
     )
 
-    assert len(patterns) == 3
+    assert len(patterns) == 4
     assert len({pattern.pattern_fingerprint for pattern in patterns}) == 3
-    mixed_review_pattern = next(pattern for pattern in patterns if pattern.finding_count == 2)
-    assert mixed_review_pattern.needs_review_count == 1
-    assert mixed_review_pattern.confirmed_count == 1
-    assert {member.review_status for member in mixed_review_pattern.members} == {
+    stable_deterministic_cohorts = [
+        pattern
+        for pattern in patterns
+        if pattern.pattern_fingerprint
+        == next(
+            candidate.pattern_fingerprint
+            for candidate in patterns
+            if candidate.members[0].finding_id == f"ulf_v1_{'a' * 64}"
+        )
+    ]
+    assert len(stable_deterministic_cohorts) == 2
+    assert {cohort.members[0].review_status for cohort in stable_deterministic_cohorts} == {
         "needs_review",
         "confirmed",
     }
@@ -821,6 +1139,7 @@ def test_pattern_fingerprint_survives_a_member_review_transition() -> None:
         "source-a",
         "input.surface.typing_noise",
         ("deterministic_evaluator",),
+        "e" * 64,
     )
     before_review = dataset_review._build_failure_patterns(
         (finding,),
@@ -879,6 +1198,7 @@ def test_pattern_grouping_splits_conflicting_customer_rules() -> None:
             f"source-{index}",
             "input.surface.typing_noise",
             ("customer_declared", "deterministic_evaluator"),
+            "e" * 64,
         )
         for index, finding_id in enumerate(finding_ids)
     }
@@ -1639,7 +1959,7 @@ def test_invalid_evidence_diagnostic_lists_current_schema(tmp_path: Path) -> Non
     result = runner.invoke(app, ["dataset", "report", str(evidence)])
 
     assert result.exit_code != 0
-    assert "1.9.0" in result.output
+    assert "1.11.0" in result.output
 
 
 def test_malformed_extra_field_and_digest_mismatch_reviews_are_rejected(tmp_path: Path) -> None:
@@ -1651,6 +1971,20 @@ def test_malformed_extra_field_and_digest_mismatch_reviews_are_rejected(tmp_path
     malformed = runner.invoke(app, ["dataset", "report", str(evidence), "--reviews", str(reviews)])
     assert malformed.exit_code != 0
     assert "review file is not valid review JSONL" in malformed.output
+
+    duplicate_key_record = json.dumps(
+        _manual_review(
+            finding_id=FINDING_ID,
+            evidence_sha256=hashlib.sha256(evidence_bytes).hexdigest(),
+        ),
+        separators=(",", ":"),
+    ).replace('"status":"confirmed"', '"status":"confirmed","status":"expected"')
+    reviews.write_text(duplicate_key_record + "\n", encoding="utf-8")
+    duplicate_key = runner.invoke(
+        app, ["dataset", "report", str(evidence), "--reviews", str(reviews)]
+    )
+    assert duplicate_key.exit_code != 0
+    assert "review file is not valid review JSONL" in duplicate_key.output
 
     extra_field = _manual_review(
         finding_id=FINDING_ID,

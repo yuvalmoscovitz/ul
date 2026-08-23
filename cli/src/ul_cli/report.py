@@ -249,9 +249,17 @@ def _print_human_report(report: UnifiedReport, evidence: Path) -> None:
             f"expected={review_counts.expected}, unsupported={review_counts.unsupported}, "
             f"inconclusive={review_counts.inconclusive}"
         )
+    safe_evidence = "".join(
+        character if character.isprintable() else f"\\u{ord(character):04x}"
+        for character in str(evidence)
+    )
+    quoted_evidence = None if _WINDOWS else shlex.quote(safe_evidence)
     if report.patterns:
         typer.echo("")
-        typer.echo(f"Reviewable finding patterns: {len(report.patterns)}")
+        typer.echo(
+            f"Finding patterns: {report.stable_pattern_count} stable pattern(s); "
+            f"{len(report.patterns)} review cohort(s)"
+        )
         typer.echo("Patterns group similar evidence; they do not claim a root cause.")
         for index, pattern in enumerate(report.patterns, start=1):
             typer.echo("")
@@ -267,6 +275,12 @@ def _print_human_report(report: UnifiedReport, evidence: Path) -> None:
             )
             for limitation in pattern.evidence_limitations:
                 typer.echo(f"  Evidence limitation: {limitation.replace('_', ' ')}")
+            if pattern.vertical_facets is not None:
+                facets = pattern.vertical_facets.model_dump(exclude_none=True)
+                typer.echo(
+                    "  Customer facets: "
+                    + ", ".join(f"{name}={value}" for name, value in facets.items())
+                )
             if pattern.rule_id is not None:
                 typer.echo(
                     f"  Customer rule: {pattern.rule_id}@{pattern.rule_version} "
@@ -286,10 +300,14 @@ def _print_human_report(report: UnifiedReport, evidence: Path) -> None:
             typer.echo(
                 "  Review queue: "
                 f"{pattern.needs_review_count} needs review; "
-                f"{pattern.confirmed_count} confirmed"
+                f"{pattern.confirmed_count} confirmed; {pattern.expected_count} expected; "
+                f"{pattern.unsupported_count} unsupported; "
+                f"{pattern.inconclusive_count} inconclusive"
             )
-            typer.echo("  Members:")
+            typer.echo("  Decision candidates:")
             for member in pattern.members:
+                if member.review_status != "needs_review":
+                    continue
                 reasons = ", ".join(
                     reason.replace("_", " ") for reason in member.membership_reasons
                 )
@@ -297,8 +315,41 @@ def _print_human_report(report: UnifiedReport, evidence: Path) -> None:
                     f"    - {member.finding_id}: {reasons}; "
                     f"review={member.review_status}/{member.review_severity}"
                 )
-            typer.echo("  Next: use the per-finding review commands below.")
-    grouped_finding_count = sum(pattern.finding_count for pattern in report.patterns)
+            exception_members = [
+                member
+                for sibling in report.patterns
+                if sibling.pattern_fingerprint == pattern.pattern_fingerprint
+                and sibling.pattern_snapshot_id != pattern.pattern_snapshot_id
+                for member in sibling.members
+            ]
+            typer.echo("  Exceptions unchanged:")
+            for member in exception_members:
+                typer.echo(
+                    f"    - {member.finding_id}: "
+                    f"review={member.review_status}/{member.review_severity}"
+                )
+            prior_reviews = [
+                review
+                for review in report.pattern_reviews
+                if review.pattern_fingerprint == pattern.pattern_fingerprint
+            ]
+            typer.echo(f"  Prior decision context: {len(prior_reviews)} decision(s)")
+            for review in prior_reviews:
+                typer.echo(
+                    f"    - {review.pattern_review_id}: {review.status}/{review.severity}; "
+                    f"reviewed_at={review.reviewed_at.isoformat()}; "
+                    f"snapshot={review.pattern_snapshot_id}"
+                )
+            if pattern.needs_review_count:
+                typer.echo(
+                    "  Next: ul dataset review-pattern "
+                    f"{quoted_evidence or 'EVIDENCE'} {pattern.pattern_snapshot_id}"
+                )
+            else:
+                typer.echo("  Next: inspect prior decisions or occurrence evidence below.")
+    grouped_finding_count = sum(
+        pattern.needs_review_count + pattern.confirmed_count for pattern in report.patterns
+    )
     ungrouped_actionable_count = report.summary.actionable_finding_count - grouped_finding_count
     if ungrouped_actionable_count:
         typer.echo("")
@@ -306,11 +357,6 @@ def _print_human_report(report: UnifiedReport, evidence: Path) -> None:
             f"Additional actionable findings not in the reviewable pattern queue: "
             f"{ungrouped_actionable_count}. Inspect them below."
         )
-    safe_evidence = "".join(
-        character if character.isprintable() else f"\\u{ord(character):04x}"
-        for character in str(evidence)
-    )
-    quoted_evidence = None if _WINDOWS else shlex.quote(safe_evidence)
     for index, finding in enumerate(report.findings, start=1):
         typer.echo("")
         typer.echo(f"Finding {finding.finding_id or index}")
