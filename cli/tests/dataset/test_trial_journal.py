@@ -90,6 +90,35 @@ def test_terminal_trial_is_recovered_and_cannot_be_recorded_twice(tmp_path: Path
     resumed.close()
 
 
+def test_skipped_trial_is_recovered_without_duplicate_terminal_transition(tmp_path: Path) -> None:
+    path = tmp_path / "trials.jsonl"
+    manifest = _manifest()
+    unit = manifest.work_plan[1]
+    skipped_trial = (
+        _evaluation_result("interaction-1")
+        .baseline.trial_set.trials[0]
+        .model_copy(
+            update={
+                "execution_evidence": None,
+                "target_output": None,
+                "observed_frame": None,
+                "inconclusive_reasons": (
+                    "paired original repetition was inconclusive; variation not executed",
+                ),
+            }
+        )
+    )
+    journal = create_dataset_trial_journal(path, manifest)
+    journal.finish(unit, skipped_trial)
+    journal.close()
+
+    resumed = open_dataset_trial_journal(path, manifest)
+
+    assert resumed.snapshot.terminal_states[unit.id] == "skipped"
+    assert resumed.snapshot.recovered_trials[unit.id] == skipped_trial
+    resumed.close()
+
+
 def test_truncated_journal_is_preserved_and_rejected(tmp_path: Path) -> None:
     path = tmp_path / "trials.jsonl"
     manifest = _manifest()

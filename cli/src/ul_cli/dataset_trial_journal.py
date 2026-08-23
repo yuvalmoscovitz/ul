@@ -195,6 +195,7 @@ def persist_dataset_run_manifest(path: Path, manifest: DatasetRunManifest) -> No
         os.close(descriptor)
     try:
         os.link(temporary_path, path)
+        fsync_run_directory(path)
     finally:
         temporary_path.unlink(missing_ok=True)
 
@@ -225,7 +226,7 @@ class DatasetTrialJournal:
         recovered_trials = {
             record.unit.id: record.trial
             for record in self._records
-            if record.state in {"completed", "inconclusive"} and record.trial is not None
+            if record.state in _TERMINAL_STATES and record.trial is not None
         }
         terminal_states: dict[str, TrialState] = {
             record.unit.id: record.state
@@ -347,7 +348,22 @@ class DatasetTrialJournal:
 
 def create_dataset_trial_journal(path: Path, manifest: DatasetRunManifest) -> DatasetTrialJournal:
     descriptor = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        fsync_run_directory(path)
+    except BaseException:
+        os.close(descriptor)
+        raise
     return DatasetTrialJournal(descriptor, manifest)
+
+
+def fsync_run_directory(path: Path) -> None:
+    if sys.platform == "win32":
+        return
+    descriptor = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
 
 
 def open_dataset_trial_journal(path: Path, manifest: DatasetRunManifest) -> DatasetTrialJournal:

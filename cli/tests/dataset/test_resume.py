@@ -88,6 +88,45 @@ def test_resume_reuses_manifest_without_original_data_config_or_overrides(
     assert "input.surface.rephrase" in result.output
 
 
+def test_resume_fails_closed_when_completed_trials_have_no_durable_augmentation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    evidence = tmp_path / "evidence.jsonl"
+    evaluation = _evaluation_result("interaction-1")
+    run_context = _run_context((evaluation.source,))
+    manifest = dataset_trial_journal.create_dataset_run_manifest(
+        run_context=run_context,
+        selected_records=(evaluation.source,),
+        selected_operator_ids=("input.surface.rephrase",),
+        repetitions=1,
+        max_environment_api_calls=10,
+        allow_environment_network=True,
+        confirm_test_environment=True,
+        allow_insecure_http=False,
+        save_augmentations=False,
+    )
+    evidence.write_bytes(b"")
+    dataset_trial_journal.persist_dataset_run_manifest(
+        dataset_trial_journal.manifest_path(evidence), manifest
+    )
+    journal = dataset_trial_journal.create_dataset_trial_journal(
+        dataset_trial_journal.journal_path(evidence), manifest
+    )
+    journal.start(manifest.work_plan[0])
+    journal.finish(manifest.work_plan[0], evaluation.baseline.trial_set.trials[0])
+    journal.close()
+    persistence_module.persist_evaluator_preflight(evidence, _evaluator_preflight())
+    monkeypatch.setattr(command_module, "load_dataset_semantic_settings", _settings)
+
+    result = runner.invoke(
+        root_app,
+        ["dataset", "evaluate", "--resume", str(evidence), "--dry-run"],
+    )
+
+    assert result.exit_code == 2
+    assert "resume_incompatible:augmentation_not_durable" in result.output
+
+
 def test_resume_skips_already_processed_interaction_ids(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

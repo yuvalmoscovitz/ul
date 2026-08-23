@@ -46,6 +46,7 @@ from ul_cli.dataset_trial_journal import (
     DatasetTrialJournal,
     create_dataset_run_manifest,
     create_dataset_trial_journal,
+    fsync_run_directory,
     journal_path,
     manifest_path,
     open_dataset_trial_journal,
@@ -549,7 +550,7 @@ def evaluate_dataset(
         skipped_count = len(resume_evidence.processed_ids)
 
     trial_journal: DatasetTrialJournal | None = None
-    if not dry_run:
+    if not dry_run or (resume is not None and recorded_manifest_for_resume is not None):
         assert output is not None
         assert run_context is not None
         if augmentations_output is not None and not augmentations_output.parent.is_dir():
@@ -575,6 +576,7 @@ def evaluate_dataset(
                 persist_dataset_run_manifest(run_manifest_path, expected_manifest)
                 trial_journal = create_dataset_trial_journal(run_journal_path, expected_manifest)
                 create_private_output(output).close()
+                fsync_run_directory(output)
             elif run_manifest_path.exists():
                 recorded_manifest = read_dataset_run_manifest(run_manifest_path)
                 incompatibility = _manifest_incompatibility_reason(
@@ -587,6 +589,11 @@ def evaluate_dataset(
                 trial_journal = open_dataset_trial_journal(run_journal_path, recorded_manifest)
                 if trial_journal.snapshot.quarantined_unit_ids:
                     raise ValueError("resume_quarantined:target_delivery_or_cleanup_uncertain")
+                if (
+                    not recorded_manifest.effective_command.save_augmentations
+                    and trial_journal.snapshot.terminal_states
+                ):
+                    raise ValueError("resume_incompatible:augmentation_not_durable")
         except (OSError, ValueError) as error:
             if trial_journal is not None:
                 trial_journal.close()
@@ -697,6 +704,8 @@ def evaluate_dataset(
             campaign_plan=campaign_plan,
             json_output=json_output,
         )
+        if trial_journal is not None:
+            trial_journal.close()
         return
 
     if not selected_records and skipped_count > 0:
