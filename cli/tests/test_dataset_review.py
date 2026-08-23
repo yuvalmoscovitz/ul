@@ -36,9 +36,7 @@ from ul_cli.dataset.evaluation import runner as dataset_runner
 from ul_cli.main import app
 from ul_cli.report_contract import (
     FindingSummary,
-    TrustedPatternVerticalFacet,
     UnifiedReport,
-    VersionedReference,
 )
 
 runner = CliRunner()
@@ -407,10 +405,10 @@ def test_root_json_report_is_stable_and_omits_private_dataset_fields(tmp_path: P
         "patterns": [
             {
                 "pattern_fingerprint": (
-                    "ulpf_v1_5e9767cc825fc5a5e8dd49a13f74e9d10773650a2304f6c98c4c480d34cacaba"
+                    "ulpf_v1_8e07d18f89508d32fc9c4e884e6d811d1685e617bcf3c75014f8556906f43599"
                 ),
                 "pattern_snapshot_id": (
-                    "ulps_v1_dd8d2782e17ffeaf26ed8a68bc2019042bda1900ebdb966c51a9607f86cc5915"
+                    "ulps_v1_fe450fcf62ea692b04490458f87197c173df27ac7d4ba90ac56fc84117a195d7"
                 ),
                 "kind": "behavior_difference",
                 "category": "changed_grounded_effect_argument",
@@ -420,17 +418,11 @@ def test_root_json_report_is_stable_and_omits_private_dataset_fields(tmp_path: P
                 "severity": "unrated",
                 "stability": "stable",
                 "evidence_authorities": ["deterministic_evaluator"],
-                "review_status": "needs_review",
-                "review_severity": "unrated",
                 "horizontal_facets": {
                     "failure_type": "changed_grounded_effect_argument",
                     "affected_subject": "action",
                     "evidence_level": "observed_action",
-                    "mechanism_signature": (
-                        "ulpm_v1_6f5f3a4bf1b01b071a12aaf35df870dcd1fc1a4077db18efe2ab81453b6ef114"
-                    ),
                 },
-                "vertical_facets": [],
                 "finding_count": 1,
                 "source_case_count": 1,
                 "operators": [
@@ -451,8 +443,9 @@ def test_root_json_report_is_stable_and_omits_private_dataset_fields(tmp_path: P
                             "same_finding_category",
                             "same_finding_kind",
                             "same_outcome_stability",
-                            "same_review_decision",
                         ],
+                        "review_status": "needs_review",
+                        "review_severity": "unrated",
                     }
                 ],
             }
@@ -488,6 +481,10 @@ def test_root_json_report_is_stable_and_omits_private_dataset_fields(tmp_path: P
     assert "Pay pay AC-100" not in report.output
     assert "AC-101" not in report.output
     assert "technical_details" not in report.output
+    assert "ulpm_v1_" not in report.output
+    assert "6f5f3a4bf1b01b071a12aaf35df870dcd1fc1a4077db18efe2ab81453b6ef114" not in (report.output)
+    for private_label in ("payment_committed", "invoice_reference", "completed"):
+        assert hashlib.sha256(private_label.encode()).hexdigest() not in report.output
 
 
 def test_root_human_report_explains_patterns_and_augmentation_names(tmp_path: Path) -> None:
@@ -505,6 +502,8 @@ def test_root_human_report_explains_patterns_and_augmentation_names(tmp_path: Pa
     assert "Affected: 1 finding(s) across 1 test question(s)" in report.output
     assert "Repeat a word as a natural disfluency." in report.output
     assert "1 needs review; 0 confirmed" in report.output
+    assert f"{FINDING_ID}: same action shape, same evidence authority" in report.output
+    assert "review=needs_review/unrated" in report.output
     assert "Next: use the per-finding review commands below." in report.output
     assert "Pay AC-100" not in report.output
     assert "AC-101" not in report.output
@@ -520,7 +519,7 @@ def test_report_contract_rejects_pattern_review_counts_that_disagree_with_findin
     payload["patterns"][0]["needs_review_count"] = 0
     payload["patterns"][0]["confirmed_count"] = 1
 
-    with pytest.raises(ValueError, match="pattern snapshot ID must match its exact snapshot"):
+    with pytest.raises(ValueError, match="review counts must match member snapshots"):
         UnifiedReport.model_validate_json(json.dumps(payload))
 
 
@@ -567,25 +566,25 @@ def test_failure_patterns_group_same_mechanism_across_questions_and_augmentation
     )
     contexts = {
         finding_ids[0]: dataset_review._PatternContext(
-            "ulpm_v1_" + "1" * 64,
+            "1" * 64,
             "source-a",
             operators[0],
             ("deterministic_evaluator",),
         ),
         finding_ids[1]: dataset_review._PatternContext(
-            "ulpm_v1_" + "1" * 64,
+            "1" * 64,
             "source-a",
             operators[1],
             ("deterministic_evaluator",),
         ),
         finding_ids[2]: dataset_review._PatternContext(
-            "ulpm_v1_" + "1" * 64,
+            "1" * 64,
             "source-b",
             operators[2],
             ("deterministic_evaluator",),
         ),
         finding_ids[3]: dataset_review._PatternContext(
-            "ulpm_v1_" + "2" * 64,
+            "2" * 64,
             "source-b",
             operators[3],
             ("deterministic_evaluator",),
@@ -632,7 +631,7 @@ def test_pattern_fingerprint_survives_compatible_membership_changes() -> None:
     )
     contexts = {
         finding_id: dataset_review._PatternContext(
-            "ulpm_v1_" + "1" * 64,
+            "1" * 64,
             f"source-{index}",
             "input.surface.typing_noise",
             ("deterministic_evaluator",),
@@ -655,13 +654,55 @@ def test_pattern_fingerprint_survives_compatible_membership_changes() -> None:
             "same_finding_category",
             "same_finding_kind",
             "same_outcome_stability",
-            "same_review_decision",
         )
         for member in second_snapshot.members
     )
 
 
-def test_pattern_grouping_splits_conflicting_outcomes_authorities_and_reviews() -> None:
+def test_private_action_shapes_split_snapshots_without_leaking_public_hashes() -> None:
+    finding_ids = tuple(f"ulf_v1_{character * 64}" for character in "ab")
+    findings = tuple(
+        FindingSummary(
+            finding_id=finding_id,
+            kind="behavior_difference",
+            category="duplicate_effect",
+            operator_id="input.surface.typing_noise",
+            operator_version="1.0.0",
+            review_status="needs_review",
+            review_severity="unrated",
+            requested_repetitions=1,
+            conclusive_repetitions=1,
+            inconclusive_repetitions=0,
+            stability="stable",
+            evidence_authorities=("deterministic_evaluator",),
+            next_action="review_dataset_finding",
+            summary="The changed input made the agent repeat an action.",
+        )
+        for finding_id in finding_ids
+    )
+    private_keys = ("1" * 64, "2" * 64)
+    contexts = {
+        finding_id: dataset_review._PatternContext(
+            private_keys[index],
+            f"source-{index}",
+            "input.surface.typing_noise",
+            ("deterministic_evaluator",),
+        )
+        for index, finding_id in enumerate(finding_ids)
+    }
+
+    patterns = dataset_review._build_failure_patterns(findings, contexts)
+    serialized_patterns = json.dumps(
+        [pattern.model_dump(mode="json") for pattern in patterns], sort_keys=True
+    )
+
+    assert len(patterns) == 2
+    assert patterns[0].pattern_fingerprint == patterns[1].pattern_fingerprint
+    assert patterns[0].pattern_snapshot_id != patterns[1].pattern_snapshot_id
+    assert all(private_key not in serialized_patterns for private_key in private_keys)
+
+
+def test_pattern_grouping_splits_outcomes_and_authorities_but_keeps_review_cohorts() -> None:
     variants = (
         ("a", "stable", ("deterministic_evaluator",), "needs_review"),
         ("b", "unstable", ("deterministic_evaluator",), "needs_review"),
@@ -689,7 +730,7 @@ def test_pattern_grouping_splits_conflicting_outcomes_authorities_and_reviews() 
     )
     contexts = {
         finding.finding_id: dataset_review._PatternContext(
-            "ulpm_v1_" + "1" * 64,
+            "1" * 64,
             f"source-{index}",
             "input.surface.typing_noise",
             finding.evidence_authorities,
@@ -700,59 +741,52 @@ def test_pattern_grouping_splits_conflicting_outcomes_authorities_and_reviews() 
 
     patterns = dataset_review._build_failure_patterns(findings, contexts)
 
-    assert len(patterns) == 4
-    assert len({pattern.pattern_fingerprint for pattern in patterns}) == 4
-
-
-def test_trusted_vertical_facets_are_optional_fingerprint_dimensions() -> None:
-    finding_ids = tuple(f"ulf_v1_{character * 64}" for character in "ab")
-    findings = tuple(
-        FindingSummary(
-            finding_id=finding_id,
-            kind="behavior_difference",
-            category="duplicate_effect",
-            operator_id="input.surface.typing_noise",
-            operator_version="1.0.0",
-            review_status="needs_review",
-            review_severity="unrated",
-            requested_repetitions=1,
-            conclusive_repetitions=1,
-            inconclusive_repetitions=0,
-            stability="stable",
-            evidence_authorities=("deterministic_evaluator",),
-            next_action="review_dataset_finding",
-            summary="The changed input made the agent repeat an action.",
-        )
-        for finding_id in finding_ids
-    )
-    trusted_facet = TrustedPatternVerticalFacet(
-        facet="workflow",
-        value=VersionedReference(
-            id="ulref_v1_" + "3" * 64,
-            version="ulref_v1_" + "4" * 64,
-        ),
-        authority="customer_declared",
-    )
-    contexts = {
-        finding_ids[0]: dataset_review._PatternContext(
-            "ulpm_v1_" + "5" * 64,
-            "source-a",
-            "input.surface.typing_noise",
-            ("deterministic_evaluator",),
-        ),
-        finding_ids[1]: dataset_review._PatternContext(
-            "ulpm_v1_" + "5" * 64,
-            "source-b",
-            "input.surface.typing_noise",
-            ("deterministic_evaluator",),
-            (trusted_facet,),
-        ),
+    assert len(patterns) == 3
+    assert len({pattern.pattern_fingerprint for pattern in patterns}) == 3
+    mixed_review_pattern = next(pattern for pattern in patterns if pattern.finding_count == 2)
+    assert mixed_review_pattern.needs_review_count == 1
+    assert mixed_review_pattern.confirmed_count == 1
+    assert {member.review_status for member in mixed_review_pattern.members} == {
+        "needs_review",
+        "confirmed",
     }
 
-    patterns = dataset_review._build_failure_patterns(findings, contexts)
 
-    assert len(patterns) == 2
-    assert {pattern.vertical_facets for pattern in patterns} == {(), (trusted_facet,)}
+def test_pattern_fingerprint_survives_a_member_review_transition() -> None:
+    finding = FindingSummary(
+        finding_id=FINDING_ID,
+        kind="behavior_difference",
+        category="duplicate_effect",
+        operator_id="input.surface.typing_noise",
+        operator_version="1.0.0",
+        review_status="needs_review",
+        review_severity="unrated",
+        requested_repetitions=1,
+        conclusive_repetitions=1,
+        inconclusive_repetitions=0,
+        stability="stable",
+        evidence_authorities=("deterministic_evaluator",),
+        next_action="review_dataset_finding",
+        summary="The changed input made the agent repeat an action.",
+    )
+    context = dataset_review._PatternContext(
+        "1" * 64,
+        "source-a",
+        "input.surface.typing_noise",
+        ("deterministic_evaluator",),
+    )
+    before_review = dataset_review._build_failure_patterns((finding,), {FINDING_ID: context})[0]
+    reviewed_finding = finding.model_copy(
+        update={"review_status": "confirmed", "review_severity": "high"}
+    )
+    after_review = dataset_review._build_failure_patterns(
+        (reviewed_finding,), {FINDING_ID: context}
+    )[0]
+
+    assert before_review.pattern_fingerprint == after_review.pattern_fingerprint
+    assert before_review.pattern_snapshot_id != after_review.pattern_snapshot_id
+    assert before_review.members[0].review_status == "needs_review"
+    assert after_review.members[0].review_status == "confirmed"
 
 
 def test_pattern_grouping_splits_conflicting_customer_rules() -> None:
@@ -782,7 +816,7 @@ def test_pattern_grouping_splits_conflicting_customer_rules() -> None:
     )
     contexts = {
         finding_id: dataset_review._PatternContext(
-            "ulpm_v1_" + "5" * 64,
+            "5" * 64,
             f"source-{index}",
             "input.surface.typing_noise",
             ("customer_declared", "deterministic_evaluator"),
@@ -819,6 +853,48 @@ def test_behavior_pattern_signature_abstains_from_unbounded_effect_metadata() ->
     )
 
     assert dataset_review._behavior_pattern_signature(finding) is None
+
+
+def test_private_pattern_identity_is_nfc_normalized_and_total_size_bounded() -> None:
+    decomposed_payload = _effect("cafe\u0301")
+    decomposed_payload["predicate"] = "paie\u0301ment"
+    composed_payload = _effect("café")
+    composed_payload["predicate"] = "paiément"
+    decomposed_effect = dataset_review._Effect.model_validate(decomposed_payload)
+    composed_effect = dataset_review._Effect.model_validate(composed_payload)
+
+    def finding(effect: dataset_review._Effect, grounded_field: str) -> dataset_review._Finding:
+        return dataset_review._Finding(
+            finding_id=FINDING_ID,
+            category="changed_grounded_effect_argument",
+            grounded_field_names=[grounded_field],
+            severity="unrated",
+            review_status="needs_review",
+            summary="Needs review.",
+            reference_effects=[effect],
+            observed_effects=[effect],
+        )
+
+    assert dataset_review._behavior_pattern_signature(
+        finding(composed_effect, "référence")
+    ) == dataset_review._behavior_pattern_signature(
+        finding(decomposed_effect, "re\u0301fe\u0301rence")
+    )
+
+    oversized_label = composed_effect.model_copy(update={"status": "x" * 501})
+    assert dataset_review._behavior_pattern_signature(finding(oversized_label, "reference")) is None
+
+    large_effect = composed_effect.model_copy(
+        update={
+            "kind": "k" * 500,
+            "predicate": "p" * 500,
+            "status": "s" * 500,
+        }
+    )
+    large_identity = finding(large_effect, "reference").model_copy(
+        update={"reference_effects": [large_effect] * 100, "observed_effects": [large_effect] * 100}
+    )
+    assert dataset_review._behavior_pattern_signature(large_identity) is None
 
 
 def test_root_report_uses_a_placeholder_in_windows_commands(

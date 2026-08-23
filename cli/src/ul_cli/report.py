@@ -270,9 +270,15 @@ def _print_human_report(report: UnifiedReport, evidence: Path) -> None:
                 f"{pattern.needs_review_count} needs review; "
                 f"{pattern.confirmed_count} confirmed"
             )
-            typer.echo(
-                f"  Finding IDs: {', '.join(member.finding_id for member in pattern.members)}"
-            )
+            typer.echo("  Members:")
+            for member in pattern.members:
+                reasons = ", ".join(
+                    reason.replace("_", " ") for reason in member.membership_reasons
+                )
+                typer.echo(
+                    f"    - {member.finding_id}: {reasons}; "
+                    f"review={member.review_status}/{member.review_severity}"
+                )
             typer.echo("  Next: use the per-finding review commands below.")
     grouped_finding_count = sum(pattern.finding_count for pattern in report.patterns)
     ungrouped_actionable_count = report.summary.actionable_finding_count - grouped_finding_count

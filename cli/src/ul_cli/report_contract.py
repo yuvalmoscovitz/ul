@@ -63,10 +63,11 @@ _VERSION_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9._+-]{0,49}$"
 _FINDING_ID_PATTERN = r"^ulf_v1_[0-9a-f]{64}$"
 _PATTERN_FINGERPRINT_PATTERN = r"^ulpf_v1_[0-9a-f]{64}$"
 _PATTERN_SNAPSHOT_ID_PATTERN = r"^ulps_v1_[0-9a-f]{64}$"
-_MECHANISM_SIGNATURE_PATTERN = r"^ulpm_v1_[0-9a-f]{64}$"
 _SHA256_PATTERN = r"^[0-9a-f]{64}$"
 _JSON_POINTER_PATTERN = re.compile(r"(?:/(?:[^~/]|~[01])*)*")
 _MAXIMUM_RUN_RECEIPT_BYTES = 1_000_000
+_MAXIMUM_PATTERN_FINGERPRINT_BYTES = 16_000
+_MAXIMUM_PATTERN_SNAPSHOT_BYTES = 1_000_000
 _FindingReferenceCode = Annotated[str, Field(pattern=_IDENTIFIER_PATTERN)]
 _SEVERITY_RANK: dict[FindingSeverity, int] = {
     "unrated": 0,
@@ -754,19 +755,23 @@ def _pattern_fingerprint(pattern: FailurePattern) -> str:
             "rule_version",
             "stability",
             "evidence_authorities",
-            "review_status",
-            "review_severity",
             "horizontal_facets",
-            "vertical_facets",
         },
     )
-    digest = hashlib.sha256(_canonical_json(grouping_facets).encode("utf-8"))
+    canonical_grouping_facets = _canonical_json(grouping_facets).encode("utf-8")
+    if len(canonical_grouping_facets) > _MAXIMUM_PATTERN_FINGERPRINT_BYTES:
+        raise ValueError("pattern fingerprint input exceeds the size limit")
+    digest = hashlib.sha256(canonical_grouping_facets)
     return f"ulpf_v1_{digest.hexdigest()}"
 
 
 def _pattern_snapshot_id(pattern: FailurePattern) -> str:
-    snapshot = pattern.model_dump(mode="json", exclude={"pattern_snapshot_id"})
-    digest = hashlib.sha256(_canonical_json(snapshot).encode("utf-8"))
+    snapshot = _canonical_json(
+        pattern.model_dump(mode="json", exclude={"pattern_snapshot_id"})
+    ).encode("utf-8")
+    if len(snapshot) > _MAXIMUM_PATTERN_SNAPSHOT_BYTES:
+        raise ValueError("pattern snapshot input exceeds the size limit")
+    digest = hashlib.sha256(snapshot)
     return f"ulps_v1_{digest.hexdigest()}"
 
 
@@ -1041,7 +1046,6 @@ PatternMembershipReason = Literal[
     "same_finding_category",
     "same_finding_kind",
     "same_outcome_stability",
-    "same_review_decision",
 ]
 
 
@@ -1049,23 +1053,20 @@ class PatternHorizontalFacets(_StrictModel):
     failure_type: FindingCategory
     affected_subject: Literal["action", "outcome", "rule"]
     evidence_level: Literal["observed_action", "observed_outcome", "evaluated_rule"]
-    mechanism_signature: str = Field(pattern=_MECHANISM_SIGNATURE_PATTERN)
-
-
-class TrustedPatternVerticalFacet(_StrictModel):
-    facet: Literal["domain", "workflow", "role", "use_case"]
-    value: VersionedReference
-    authority: Literal["customer_declared"] = "customer_declared"
 
 
 class PatternMember(_StrictModel):
     finding_id: str = Field(pattern=_FINDING_ID_PATTERN)
     membership_reasons: tuple[PatternMembershipReason, ...] = Field(min_length=1)
+    review_status: Literal["needs_review", "confirmed"]
+    review_severity: FindingSeverity
 
     @model_validator(mode="after")
     def validate_member(self) -> Self:
         if self.membership_reasons != tuple(sorted(set(self.membership_reasons))):
             raise ValueError("pattern membership reasons must be sorted and unique")
+        if self.review_status != "confirmed" and self.review_severity != "unrated":
+            raise ValueError("only confirmed members can have a rated review severity")
         return self
 
 
@@ -1088,16 +1089,13 @@ class FailurePattern(_StrictModel):
     severity: FindingSeverity
     stability: Literal["stable", "unstable", "inconclusive"]
     evidence_authorities: tuple[PatternEvidenceAuthority, ...] = Field(min_length=1)
-    review_status: Literal["needs_review", "confirmed"]
-    review_severity: FindingSeverity
     horizontal_facets: PatternHorizontalFacets
-    vertical_facets: tuple[TrustedPatternVerticalFacet, ...] = ()
     finding_count: int = Field(ge=1)
     source_case_count: int = Field(ge=1)
-    operators: tuple[PatternOperator, ...] = Field(min_length=1)
+    operators: tuple[PatternOperator, ...] = Field(min_length=1, max_length=100)
     needs_review_count: int = Field(ge=0)
     confirmed_count: int = Field(ge=0)
-    members: tuple[PatternMember, ...] = Field(min_length=1)
+    members: tuple[PatternMember, ...] = Field(min_length=1, max_length=10_000)
 
     @model_validator(mode="after")
     def validate_pattern(self, info: ValidationInfo) -> Self:
@@ -1116,6 +1114,12 @@ class FailurePattern(_StrictModel):
             raise ValueError("pattern members must be sorted and unique")
         if self.needs_review_count + self.confirmed_count != self.finding_count:
             raise ValueError("pattern review counts must match finding count")
+        if self.needs_review_count != sum(
+            member.review_status == "needs_review" for member in self.members
+        ) or self.confirmed_count != sum(
+            member.review_status == "confirmed" for member in self.members
+        ):
+            raise ValueError("pattern review counts must match member snapshots")
         operator_keys = tuple(
             (operator.operator_id, operator.operator_version) for operator in self.operators
         )
@@ -1123,17 +1127,6 @@ class FailurePattern(_StrictModel):
             raise ValueError("pattern operators must be sorted and unique")
         if self.evidence_authorities != tuple(sorted(set(self.evidence_authorities))):
             raise ValueError("pattern evidence authorities must be sorted and unique")
-        vertical_facet_keys = tuple(
-            (
-                facet.facet,
-                facet.value.id,
-                facet.value.version,
-                facet.authority,
-            )
-            for facet in self.vertical_facets
-        )
-        if vertical_facet_keys != tuple(sorted(set(vertical_facet_keys))):
-            raise ValueError("pattern vertical facets must be sorted and unique")
         expected_horizontal_scope = {
             "duplicate_effect": ("action", "observed_action"),
             "unexpected_effect": ("action", "observed_action"),
@@ -1151,8 +1144,6 @@ class FailurePattern(_StrictModel):
             != expected_horizontal_scope
         ):
             raise ValueError("horizontal facets must match the pattern finding type")
-        if self.review_status != "confirmed" and self.review_severity != "unrated":
-            raise ValueError("only confirmed patterns can have a rated review severity")
         expected_reasons: tuple[PatternMembershipReason, ...] = tuple(
             sorted(
                 (
@@ -1165,7 +1156,6 @@ class FailurePattern(_StrictModel):
                     ),
                     "same_outcome_stability",
                     "same_evidence_authority",
-                    "same_review_decision",
                 )
             )
         )
@@ -1281,8 +1271,8 @@ class UnifiedReport(_StrictModel):
                     or finding.summary != pattern.summary
                     or finding.stability != pattern.stability
                     or finding.evidence_authorities != pattern.evidence_authorities
-                    or finding.review_status != pattern.review_status
-                    or finding.review_severity != pattern.review_severity
+                    or finding.review_status != member.review_status
+                    or finding.review_severity != member.review_severity
                 ):
                     raise ValueError("pattern fields must match its actionable findings")
                 patterned_findings.add(finding_id)
