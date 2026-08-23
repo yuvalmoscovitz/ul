@@ -18,6 +18,7 @@ from ul import (
     ProviderDiagnosticError,
 )
 from ul.environment import evaluation_case_from_inputs
+from ul_cli import progress_action as progress_action_module
 from ul_cli.dataset.evaluation import command as command_module
 from ul_cli.dataset.evaluation import runner as runner_module
 from ul_cli.dataset.evidence import persistence as persistence_module
@@ -41,6 +42,18 @@ from ._files import (
 
 runner = CliRunner()
 _ANSI_ESCAPE_PATTERN = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+
+
+@pytest.fixture(autouse=True)
+def isolate_progress_action_receipts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        progress_action_module,
+        "_action_receipt_directory",
+        lambda: tmp_path / "action-state",
+    )
 
 
 def test_safe_boundary_pause_flushes_a_resumable_campaign(
@@ -98,7 +111,10 @@ def test_safe_boundary_pause_flushes_a_resumable_campaign(
     assert result.exit_code == 130, result.output
     assert result.output.count(" next_action=") == 1
     assert "next_action=resume" in result.output
-    assert 'next_argv=["ul","dataset","evaluate","--resume","EVIDENCE"]' in result.output
+    assert re.search(
+        r'next_argv=\["ul","action","[A-Za-z0-9_-]{32}"\]',
+        result.output,
+    )
     assert str(output) not in result.output.split("next_action=", 1)[1]
     manifest = read_dataset_run_manifest(manifest_path(output))
     journal = open_dataset_trial_journal(journal_path(output), manifest)

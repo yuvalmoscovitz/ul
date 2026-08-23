@@ -16,6 +16,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Annotated, Literal, cast
 
+if sys.platform == "win32":
+    import msvcrt
+else:
+    import fcntl
+
 import httpx
 import typer
 import ul.local_target as local_target_module
@@ -156,11 +161,11 @@ class _CampaignConfirmation(_StrictModel):
     maximum_cost_usd: float | None = None
 
 
-class _ProbeQuarantineReceipt(_StrictModel):
+class _ProbeSafetyState(_StrictModel):
     schema_version: Literal[1] = 1
     target_confirmation_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    status: Literal["reusable", "quarantined"]
     reason_code: str = Field(min_length=1, max_length=100)
-    independently_verified: Literal[False] = False
 
 
 @dataclass(frozen=True)
@@ -228,46 +233,200 @@ def _probe_quarantine_path(resolved_target: _ResolvedTarget) -> Path:
     )
 
 
+def _probe_target_lock_path(resolved_target: _ResolvedTarget) -> Path:
+    return _probe_quarantine_path(resolved_target).with_suffix(".lock")
+
+
+def _open_probe_target_lock(resolved_target: _ResolvedTarget) -> tuple[int, bool]:
+    project_directory = Path.cwd() / _PROJECT_DIRECTORY
+    _ensure_private_project_directory(project_directory)
+    path = _probe_target_lock_path(resolved_target)
+    no_follow = getattr(os, "O_NOFOLLOW", 0)
+    created = False
+    while True:
+        try:
+            path_status = os.lstat(path)
+        except FileNotFoundError:
+            try:
+                descriptor = os.open(path, os.O_RDWR | os.O_CREAT | os.O_EXCL | no_follow, 0o600)
+                created = True
+                path_status = os.lstat(path)
+                _fsync_probe_project_directory(project_directory)
+                break
+            except FileExistsError:
+                continue
+        if not stat.S_ISREG(path_status.st_mode):
+            raise OSError("probe target lock must be a regular private file")
+        descriptor = os.open(path, os.O_RDWR | no_follow)
+        break
+    try:
+        descriptor_status = os.fstat(descriptor)
+        if (
+            not os.path.samestat(path_status, descriptor_status)
+            or not stat.S_ISREG(descriptor_status.st_mode)
+            or descriptor_status.st_nlink != 1
+            or (sys.platform != "win32" and stat.S_IMODE(descriptor_status.st_mode) & 0o077)
+            or (hasattr(os, "getuid") and descriptor_status.st_uid != os.getuid())
+        ):
+            raise OSError("probe target lock must be a regular private owner-only file")
+        if sys.platform == "win32" and descriptor_status.st_size == 0:
+            os.write(descriptor, b"0")
+            os.fsync(descriptor)
+        if sys.platform == "win32":
+            os.lseek(descriptor, 0, os.SEEK_SET)
+            msvcrt.locking(descriptor, msvcrt.LK_LOCK, 1)
+        else:
+            fcntl.flock(descriptor, fcntl.LOCK_EX)
+        return descriptor, created
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _close_probe_target_lock(descriptor: int) -> None:
+    try:
+        if sys.platform == "win32":
+            os.lseek(descriptor, 0, os.SEEK_SET)
+            msvcrt.locking(descriptor, msvcrt.LK_UNLCK, 1)
+        else:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+    finally:
+        os.close(descriptor)
+
+
+def _fsync_probe_project_directory(project_directory: Path) -> None:
+    if sys.platform == "win32":
+        return
+    descriptor = os.open(
+        project_directory,
+        os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
+    )
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _load_probe_safety_state(path: Path) -> _ProbeSafetyState:
+    path_status = os.lstat(path)
+    if (
+        not stat.S_ISREG(path_status.st_mode)
+        or path_status.st_size > 10_000
+        or path_status.st_nlink != 1
+        or (sys.platform != "win32" and stat.S_IMODE(path_status.st_mode) & 0o077)
+        or (hasattr(os, "getuid") and path_status.st_uid != os.getuid())
+    ):
+        raise ValueError("probe safety state must be a regular private owner-only file")
+    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    try:
+        descriptor_status = os.fstat(descriptor)
+        if (
+            not os.path.samestat(path_status, descriptor_status)
+            or not stat.S_ISREG(descriptor_status.st_mode)
+            or descriptor_status.st_nlink != 1
+        ):
+            raise ValueError("probe safety state changed while opening")
+        raw = os.read(descriptor, 10_001)
+    finally:
+        os.close(descriptor)
+    if len(raw) > 10_000:
+        raise ValueError("probe safety state exceeds its size limit")
+    return _ProbeSafetyState.model_validate_json(raw)
+
+
+def _persist_probe_safety_state(
+    resolved_target: _ResolvedTarget,
+    *,
+    status: Literal["reusable", "quarantined"],
+    reason_code: str,
+) -> None:
+    project_directory = Path.cwd() / _PROJECT_DIRECTORY
+    _ensure_private_project_directory(project_directory)
+    path = _probe_quarantine_path(resolved_target)
+    temporary_path = path.with_name(path.name + f".tmp-{os.getpid()}-{time.time_ns()}")
+    state = _ProbeSafetyState(
+        target_confirmation_sha256=resolved_target.confirmation_sha256,
+        status=status,
+        reason_code=reason_code,
+    )
+    descriptor = os.open(
+        temporary_path,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+        0o600,
+    )
+    try:
+        encoded = (state.model_dump_json() + "\n").encode()
+        os.write(descriptor, encoded)
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+    try:
+        os.replace(temporary_path, path)
+        _fsync_probe_project_directory(project_directory)
+    except BaseException:
+        with suppress(OSError):
+            temporary_path.unlink()
+        raise
+
+
 def _enforce_probe_quarantine(
     resolved_target: _ResolvedTarget,
     resolution: Literal["environment-reset", "environment-replacement"] | None,
+    *,
+    lock_created: bool,
 ) -> None:
     path = _probe_quarantine_path(resolved_target)
-    if not path.exists():
-        return
     try:
-        path_status = os.lstat(path)
-        if (
-            not stat.S_ISREG(path_status.st_mode)
-            or path_status.st_size > 10_000
-            or (sys.platform != "win32" and stat.S_IMODE(path_status.st_mode) & 0o077)
-        ):
-            raise ValueError("quarantine receipt exceeds its size limit")
-        descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
-        try:
-            descriptor_status = os.fstat(descriptor)
-            if not os.path.samestat(path_status, descriptor_status):
-                raise ValueError("quarantine receipt changed while opening")
-            raw = os.read(descriptor, 10_001)
-        finally:
-            os.close(descriptor)
-        receipt = _ProbeQuarantineReceipt.model_validate_json(raw)
+        state = _load_probe_safety_state(path)
+    except FileNotFoundError:
+        if lock_created:
+            _persist_probe_safety_state(
+                resolved_target,
+                status="reusable",
+                reason_code="target_safety_initialized",
+            )
+            return
+        if resolution is not None:
+            _persist_probe_safety_state(
+                resolved_target,
+                status="reusable",
+                reason_code=f"operator_attested_{resolution.replace('-', '_')}",
+            )
+            return
+        raise ProbeFailure(
+            "target load",
+            "PROBE_QUARANTINE_RECEIPT_MISSING",
+            "The durable target safety state is missing after a prior probe attempt.",
+            "After an operator resets or replaces the test environment, rerun with the matching "
+            "--resolve-quarantine-after attestation.",
+            target_safe_to_reuse=False,
+        ) from None
     except (OSError, ValidationError, ValueError):
+        if resolution is not None:
+            _persist_probe_safety_state(
+                resolved_target,
+                status="reusable",
+                reason_code=f"operator_attested_{resolution.replace('-', '_')}",
+            )
+            return
         raise ProbeFailure(
             "target load",
             "PROBE_QUARANTINE_RECEIPT_INVALID",
-            "The bound target quarantine receipt is invalid or unreadable.",
-            "Restore the private receipt before making any further call to this target.",
+            "The bound target safety state is invalid or unreadable.",
+            "After an operator resets or replaces the test environment, restore safety with the "
+            "matching --resolve-quarantine-after attestation.",
             target_safe_to_reuse=False,
         ) from None
-    if receipt.target_confirmation_sha256 != resolved_target.confirmation_sha256:
+    if state.target_confirmation_sha256 != resolved_target.confirmation_sha256:
         raise ProbeFailure(
             "target load",
             "PROBE_QUARANTINE_RECEIPT_MISMATCH",
-            "The quarantine receipt does not match the resolved target identity.",
-            "Restore the matching target and receipt; do not call the uncertain target.",
+            "The target safety state does not match the resolved target identity.",
+            "Do not call the target; restore its matching private safety state.",
             target_safe_to_reuse=False,
         )
+    if state.status == "reusable":
+        return
     if resolution is None:
         raise ProbeFailure(
             "target load",
@@ -277,18 +436,14 @@ def _enforce_probe_quarantine(
             "--resolve-quarantine-after environment-reset (or environment-replacement).",
             target_safe_to_reuse=False,
         )
-    try:
-        path.unlink()
-    except OSError:
-        raise ProbeFailure(
-            "target load",
-            "PROBE_QUARANTINE_RESOLUTION_FAILED",
-            "The operator cleanup attestation could not clear the private quarantine receipt.",
-            "Fix the .ul directory permissions and retry without calling the target.",
-            target_safe_to_reuse=False,
-        ) from None
+    _persist_probe_safety_state(
+        resolved_target,
+        status="reusable",
+        reason_code=f"operator_attested_{resolution.replace('-', '_')}",
+    )
     console.print(
-        "Recorded target quarantine cleared after operator attestation; the receipt was removed."
+        "Recorded target quarantine cleared after operator attestation; durable safety state "
+        "was updated."
     )
 
 
@@ -296,16 +451,11 @@ def _persist_probe_quarantine(
     resolved_target: _ResolvedTarget,
     reason_code: str,
 ) -> None:
-    path = _probe_quarantine_path(resolved_target)
-    if path.exists():
-        return
-    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    receipt = _ProbeQuarantineReceipt(
-        target_confirmation_sha256=resolved_target.confirmation_sha256,
+    _persist_probe_safety_state(
+        resolved_target,
+        status="quarantined",
         reason_code=reason_code,
     )
-    with create_private_output(path) as stream:
-        stream.write(receipt.model_dump_json() + "\n")
 
 
 def _semantic_settings_snapshot(
@@ -567,6 +717,7 @@ def probe(
     """Smoke a real target, then optionally run one bounded active-probe pilot."""
     progress_runtime: CampaignProgressRuntime | None = None
     resolved_target: _ResolvedTarget | None = None
+    target_lock_descriptor: int | None = None
     try:
         records = _load_pilot_records(data)
         resolved_target = _resolve_target(
@@ -574,9 +725,45 @@ def probe(
             allow_insecure_http=allow_insecure_http,
             explicit_artifacts=tuple(target_artifact or ()),
         )
-        _enforce_probe_quarantine(resolved_target, resolve_quarantine_after)
         existing_config = _check_probe_config_binding(data, resolved_target)
+        try:
+            os.lstat(_probe_target_lock_path(resolved_target))
+            target_lock_preexists = True
+        except FileNotFoundError:
+            target_lock_preexists = False
+        if target_lock_preexists:
+            try:
+                target_lock_descriptor, lock_created = _open_probe_target_lock(resolved_target)
+            except OSError:
+                raise ProbeFailure(
+                    "target load",
+                    "PROBE_TARGET_LOCK_UNAVAILABLE",
+                    "The private target safety lock could not be acquired.",
+                    "Fix the private .ul directory before making any target call.",
+                    target_safe_to_reuse=True,
+                ) from None
+            _enforce_probe_quarantine(
+                resolved_target,
+                resolve_quarantine_after,
+                lock_created=lock_created,
+            )
         _confirm_target(resolved_target, confirmed_digest=confirm_target)
+        if target_lock_descriptor is None:
+            try:
+                target_lock_descriptor, lock_created = _open_probe_target_lock(resolved_target)
+            except OSError:
+                raise ProbeFailure(
+                    "target load",
+                    "PROBE_TARGET_LOCK_UNAVAILABLE",
+                    "The private target safety lock could not be acquired.",
+                    "Fix the private .ul directory before making any target call.",
+                    target_safe_to_reuse=True,
+                ) from None
+            _enforce_probe_quarantine(
+                resolved_target,
+                resolve_quarantine_after,
+                lock_created=lock_created,
+            )
         try:
             settings = load_dataset_semantic_settings()
             validate_model_input_bounds(records, settings.max_input_chars)
@@ -590,6 +777,39 @@ def probe(
                 settings=settings,
             )
             campaign_confirmation = _campaign_confirmation(plan, settings, resolved_target)
+            target_path = Path(target)
+            action_target = str(target_path.resolve()) if target_path.is_file() else target
+            rerun_arguments = [
+                "ul",
+                "probe",
+                str(data.resolve()),
+                "--target",
+                action_target,
+                "--output",
+                str(output.resolve()),
+                "--confirm-target",
+                resolved_target.confirmation_sha256,
+            ]
+            for artifact in target_artifact or ():
+                rerun_arguments.extend(("--target-artifact", str(artifact.resolve())))
+            if confirmation_run:
+                rerun_arguments.append("--confirmation-run")
+            if allow_insecure_http:
+                rerun_arguments.append("--allow-insecure-http")
+            if diagnostic_artifact is not None:
+                rerun_arguments.extend(
+                    ("--diagnostic-artifact", str(diagnostic_artifact.resolve()))
+                )
+            if show_smoke_response:
+                rerun_arguments.append("--show-smoke-response")
+            if progress_json:
+                rerun_arguments.append("--progress-json")
+            diagnose_argv = tuple(rerun_arguments)
+            resume_argv = (
+                *diagnose_argv,
+                "--confirm-paid-execution",
+                _model_sha256(campaign_confirmation),
+            )
             run_context = create_dataset_evidence_run_context(
                 selected_records=records,
                 operators=tuple(
@@ -612,7 +832,11 @@ def probe(
                 ),
                 token_budget=plan.tokens.maximum,
                 maximum_wall_time_seconds=campaign_confirmation.maximum_wall_seconds,
-                next_commands=create_probe_next_commands(),
+                next_commands=create_probe_next_commands(
+                    evidence_path=output,
+                    resume_argv=resume_argv,
+                    diagnose_argv=diagnose_argv,
+                ),
                 json_output=progress_json,
             )
         except ProbeFailure:
@@ -727,6 +951,9 @@ def probe(
             )
         _print_failure(failure, diagnostic_artifact=diagnostic_artifact)
         raise typer.Exit(code=2) from None
+    finally:
+        if target_lock_descriptor is not None:
+            _close_probe_target_lock(target_lock_descriptor)
 
 
 def _load_pilot_records(data: Path) -> tuple[InteractionRecord, ...]:
@@ -1194,8 +1421,9 @@ def _check_probe_config_binding(
 def _ensure_private_project_directory(path: Path) -> None:
     with suppress(FileExistsError):
         os.mkdir(path, 0o700)
+    path_status = os.lstat(path)
     if os.name == "nt":
-        if not stat.S_ISDIR(os.lstat(path).st_mode):
+        if not stat.S_ISDIR(path_status.st_mode):
             raise OSError("project path is not a directory")
         return
     descriptor = os.open(
@@ -1203,10 +1431,12 @@ def _ensure_private_project_directory(path: Path) -> None:
         os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
     )
     try:
-        path_status = os.fstat(descriptor)
-        if not stat.S_ISDIR(path_status.st_mode):
+        descriptor_status = os.fstat(descriptor)
+        if not stat.S_ISDIR(descriptor_status.st_mode) or not os.path.samestat(
+            path_status, descriptor_status
+        ):
             raise OSError("project path is not a directory")
-        if hasattr(os, "getuid") and path_status.st_uid != os.getuid():
+        if hasattr(os, "getuid") and descriptor_status.st_uid != os.getuid():
             raise OSError("project directory is not owned by the current user")
         if os.name != "nt":
             os.fchmod(descriptor, 0o700)

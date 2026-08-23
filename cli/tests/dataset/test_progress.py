@@ -16,6 +16,7 @@ from ul import (
     DatasetTrialUnit,
     InteractionRecord,
 )
+from ul_cli import progress_action as progress_action_module
 from ul_cli.dataset.evaluation import runner as runner_module
 from ul_cli.dataset.progress import (
     CampaignControl,
@@ -37,9 +38,21 @@ def _tracker(publish: object, clock: object) -> CampaignProgressTracker:
         environment_call_budget=200,
         token_budget=50_000,
         maximum_wall_time_seconds=600,
-        next_commands=create_campaign_next_commands(),
+        next_commands=create_campaign_next_commands(Path.cwd() / "tmp" / "test-evidence.jsonl"),
         publish=publish,
         clock=clock,
+    )
+
+
+@pytest.fixture(autouse=True)
+def _private_progress_action_directory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        progress_action_module,
+        "_action_receipt_directory",
+        lambda: tmp_path / "action-state",
     )
 
 
@@ -154,13 +167,8 @@ def test_control_flushes_before_single_terminal_resume_command() -> None:
     assert actions[0].status == "paused"
     assert actions[0].next_command is not None
     assert actions[0].next_command.action == "resume"
-    assert actions[0].next_command.argv == (
-        "ul",
-        "dataset",
-        "evaluate",
-        "--resume",
-        "EVIDENCE",
-    )
+    assert actions[0].next_command.argv[:2] == ("ul", "action")
+    assert len(actions[0].next_command.argv[2]) == 32
 
 
 def test_renderer_failure_cannot_affect_campaign_execution() -> None:
@@ -334,6 +342,22 @@ def test_cancellation_after_delivery_before_semantic_completion_is_quarantined(
 ) -> None:
     post_delivery_semantic_started = asyncio.Event()
     run_calls = 0
+    journal_transitions: list[tuple[str, str]] = []
+
+    class FakeJournal:
+        snapshot = SimpleNamespace(recovered_trials={})
+
+        def start(self, unit: DatasetTrialUnit) -> None:
+            journal_transitions.append((unit.id, "running"))
+
+        def is_terminal(self, _unit: DatasetTrialUnit) -> bool:
+            return False
+
+        def terminal(self, unit: DatasetTrialUnit, state: str, _reason: str) -> None:
+            journal_transitions.append((unit.id, state))
+
+        def flush(self) -> None:
+            pass
 
     class AsyncContext:
         async def __aenter__(self) -> object:
@@ -393,6 +417,7 @@ def test_cancellation_after_delivery_before_semantic_completion_is_quarantined(
                     max_environment_api_calls=1,
                     planned_target_calls=1,
                     evaluator_preflight=cast(Any, object()),
+                    trial_journal=cast(Any, FakeJournal()),
                 )
             )
             await post_delivery_semantic_started.wait()
@@ -409,3 +434,4 @@ def test_cancellation_after_delivery_before_semantic_completion_is_quarantined(
     assert "PRIVATE_CASE_ID" not in progress_output
     assert "PRIVATE_SOURCE_CANARY" not in progress_output
     assert "PRIVATE_TARGET_CANARY" not in progress_output
+    assert [state for _, state in journal_transitions] == ["running", "quarantined"]

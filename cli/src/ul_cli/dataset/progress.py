@@ -10,6 +10,7 @@ import time
 from collections.abc import Callable, Generator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
+from pathlib import Path
 from types import FrameType
 from typing import Literal, Protocol
 
@@ -17,6 +18,8 @@ from pydantic import ConfigDict, Field, model_validator
 from rich.console import Console
 from ul import DatasetEvaluationTrial, DatasetTrialUnit
 from ul_core.models import ULModel
+
+from ul_cli.progress_action import create_progress_action
 
 CampaignStage = Literal[
     "smoke",
@@ -460,9 +463,9 @@ class CampaignProgressTracker:
         next_command = None
         if status == "completed":
             next_command = self._next_commands.inspect_findings
-        elif status in {"paused", "cancelled"}:
+        elif status == "paused":
             next_command = self._next_commands.resume
-        elif status == "failed":
+        elif status in {"cancelled", "failed"}:
             next_command = self._next_commands.diagnose
         event = CampaignProgressEvent(
             sequence=self._sequence,
@@ -536,51 +539,53 @@ class CampaignProgressTracker:
         return False
 
 
-def create_campaign_next_commands() -> CampaignNextCommands:
+def create_campaign_next_commands(evidence_path: Path) -> CampaignNextCommands:
+    resolved_evidence_path = evidence_path.resolve()
     return CampaignNextCommands(
         inspect_findings=CampaignNextCommand(
             action="inspect_findings",
-            argv=("ul", "report", "EVIDENCE"),
+            argv=create_progress_action(("ul", "dataset", "report", str(resolved_evidence_path))),
         ),
         resume=CampaignNextCommand(
             action="resume",
-            argv=("ul", "dataset", "evaluate", "--resume", "EVIDENCE"),
+            argv=create_progress_action(
+                ("ul", "dataset", "evaluate", "--resume", str(resolved_evidence_path))
+            ),
         ),
         diagnose=CampaignNextCommand(
             action="diagnose",
-            argv=(
-                "ul",
-                "dataset",
-                "evaluate",
-                "--resume",
-                "EVIDENCE",
-                "--dry-run",
+            argv=create_progress_action(
+                (
+                    "ul",
+                    "dataset",
+                    "evaluate",
+                    "--resume",
+                    str(resolved_evidence_path),
+                    "--dry-run",
+                )
             ),
         ),
     )
 
 
-def create_probe_next_commands() -> CampaignNextCommands:
+def create_probe_next_commands(
+    *,
+    evidence_path: Path,
+    resume_argv: tuple[str, ...],
+    diagnose_argv: tuple[str, ...],
+) -> CampaignNextCommands:
     return CampaignNextCommands(
         inspect_findings=CampaignNextCommand(
             action="inspect_findings",
-            argv=("ul", "report", "EVIDENCE"),
+            argv=create_progress_action(("ul", "report", str(evidence_path.resolve()))),
         ),
         resume=CampaignNextCommand(
             action="resume",
-            argv=("ul", "probe", "DATA", "--target", "TARGET", "--output", "EVIDENCE"),
+            argv=create_progress_action(resume_argv),
         ),
         diagnose=CampaignNextCommand(
             action="diagnose",
-            argv=(
-                "ul",
-                "probe",
-                "DATA",
-                "--target",
-                "TARGET",
-                "--resolve-quarantine-after",
-                "ACTION",
-            ),
+            argv=create_progress_action(diagnose_argv),
         ),
     )
 

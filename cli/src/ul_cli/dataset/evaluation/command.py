@@ -1037,7 +1037,7 @@ def evaluate_dataset(
             )
             * settings.timeout_seconds
         ),
-        next_commands=create_campaign_next_commands(),
+        next_commands=create_campaign_next_commands(output),
         json_output=progress_json,
     )
     if trial_journal is not None:

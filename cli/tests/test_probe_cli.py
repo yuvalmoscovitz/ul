@@ -5,8 +5,10 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import stat
 import sys
+import threading
 from pathlib import Path
 
 import pytest
@@ -17,6 +19,7 @@ from ul import (
     InteractionRecord,
 )
 from ul_cli import probe as probe_module
+from ul_cli import progress_action as progress_action_module
 from ul_cli.dataset.evaluation import runner as campaign_runner_module
 from ul_cli.main import app
 from ul_core.dataset import (
@@ -30,6 +33,30 @@ from ul_core.dataset import (
 )
 
 runner = CliRunner()
+
+
+@pytest.fixture(autouse=True)
+def _private_progress_action_directory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        progress_action_module,
+        "_action_receipt_directory",
+        lambda: tmp_path / "action-state",
+    )
+
+
+@pytest.fixture(autouse=True)
+def isolate_progress_action_receipts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        progress_action_module,
+        "_action_receipt_directory",
+        lambda: tmp_path / "action-state",
+    )
 
 
 def _write_dataset(path: Path, count: int = 1) -> Path:
@@ -718,6 +745,98 @@ def test_failed_smoke_has_staged_safe_diagnostic_and_does_not_save_config(
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="symlink creation requires privileges")
+def test_probe_safety_state_deletion_and_dangling_symlink_fail_closed_before_target_call(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _write_callable(tmp_path)
+    dataset = _write_dataset(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    arguments = ["probe", str(dataset), "--target", "customer_agent:run"]
+
+    first = runner.invoke(app, arguments, input="y\nn\n")
+
+    assert first.exit_code == 0, first.output
+    invocations = tmp_path / "target-invocations.jsonl"
+    assert len(invocations.read_text().splitlines()) == 1
+    safety_state = next((tmp_path / ".ul").glob("probe-quarantine-*.json"))
+    safety_state.unlink()
+
+    missing = runner.invoke(app, arguments)
+
+    assert missing.exit_code == 2
+    assert "Reason: PROBE_QUARANTINE_RECEIPT_MISSING" in missing.output
+    assert len(invocations.read_text().splitlines()) == 1
+    safety_state.unlink()
+    safety_state.symlink_to(tmp_path / "missing-safety-state.json")
+
+    dangling = runner.invoke(app, arguments)
+
+    assert dangling.exit_code == 2
+    assert "Reason: PROBE_QUARANTINE_RECEIPT_INVALID" in dangling.output
+    assert len(invocations.read_text().splitlines()) == 1
+
+
+def test_target_lock_serializes_probe_safety_check_through_target_lifecycle(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _write_callable(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.syspath_prepend(str(tmp_path))
+    resolved_target = probe_module._resolve_target(
+        "customer_agent:run",
+        allow_insecure_http=False,
+    )
+    first_descriptor, _ = probe_module._open_probe_target_lock(resolved_target)
+    second_acquired = threading.Event()
+    second_descriptor: list[int] = []
+
+    def acquire_same_target() -> None:
+        descriptor, _ = probe_module._open_probe_target_lock(resolved_target)
+        second_descriptor.append(descriptor)
+        second_acquired.set()
+
+    thread = threading.Thread(target=acquire_same_target)
+    thread.start()
+    try:
+        assert not second_acquired.wait(0.1)
+    finally:
+        probe_module._close_probe_target_lock(first_descriptor)
+    assert second_acquired.wait(2)
+    probe_module._close_probe_target_lock(second_descriptor.pop())
+    thread.join(timeout=2)
+    assert not thread.is_alive()
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="directory fsync is POSIX-specific")
+def test_probe_quarantine_fsyncs_private_state_and_directory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _write_callable(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.syspath_prepend(str(tmp_path))
+    resolved_target = probe_module._resolve_target(
+        "customer_agent:run",
+        allow_insecure_http=False,
+    )
+    synced_file_types: list[int] = []
+
+    def record_fsync(descriptor: int) -> None:
+        synced_file_types.append(stat.S_IFMT(os.fstat(descriptor).st_mode))
+
+    monkeypatch.setattr(probe_module.os, "fsync", record_fsync)
+
+    probe_module._persist_probe_quarantine(resolved_target, "delivery_uncertain")
+
+    assert stat.S_IFREG in synced_file_types
+    assert stat.S_IFDIR in synced_file_types
+    safety_state = next((tmp_path / ".ul").glob("probe-quarantine-*.json"))
+    assert json.loads(safety_state.read_text())["status"] == "quarantined"
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="symlink creation requires privileges")
 def test_successful_smoke_refuses_symlinked_project_directory(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -950,7 +1069,12 @@ def test_public_documentation_flow_runs_real_callable_campaign_and_report(
         assert f"stage={stage}" in result.output
     assert result.output.count(" next_action=") == 1
     assert "next_action=inspect_findings" in result.output
-    assert 'next_argv=["ul","report","EVIDENCE"]' in result.output
+    action_match = re.search(
+        r'next_argv=\["ul","action","([A-Za-z0-9_-]{32})"\]',
+        result.output,
+    )
+    assert action_match is not None
+    assert str(output) not in result.output.split("next_action=", 1)[1]
     assert "target_calls=3" in result.output
     assert "environment_calls=3" in result.output
     assert "semantic_calls=unknown" in result.output
@@ -1097,6 +1221,6 @@ done
     assert "Response structure: dict;" in result.output
     assert "transport" not in result.output
     assert result.output.count("next_action=") == 1
-    assert "next_action=resume" in result.output
+    assert "next_action=diagnose" in result.output
     saved = json.loads((tmp_path / ".ul" / "probe.json").read_text())
     assert saved["target_kind"] == "command"

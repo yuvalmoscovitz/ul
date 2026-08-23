@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+from pathlib import Path
 from typing import TextIO
 
 from ul import (
@@ -82,7 +83,8 @@ async def evaluate_interaction_records(
     token_budget = progress_plan.tokens.maximum if progress_plan else 0
     timeout_seconds = settings.timeout_seconds if progress_plan else 1
     if progress_next_commands is None:
-        progress_next_commands = create_campaign_next_commands()
+        output_name = str(getattr(output_stream, "name", "dataset-evidence.jsonl"))
+        progress_next_commands = create_campaign_next_commands(Path(output_name))
     if progress_runtime is None:
         progress_runtime = create_campaign_progress_runtime(
             case_count=len(records),
@@ -247,9 +249,15 @@ async def evaluate_interaction_records(
                     )
                 except (DatasetTargetDeliveryUncertain, asyncio.CancelledError):
                     signal_control.target_call_finished()
-                    durable_flush()
                     assert active_trial is not None
                     active_case_number, active_unit = active_trial
+                    if trial_journal is not None and not trial_journal.is_terminal(active_unit):
+                        trial_journal.terminal(
+                            active_unit,
+                            "quarantined",
+                            "target_delivery_or_cleanup_uncertain",
+                        )
+                    durable_flush()
                     progress_tracker.trial_delivery_uncertain(
                         case_number=active_case_number,
                         unit=active_unit,
