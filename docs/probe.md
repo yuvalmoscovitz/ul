@@ -52,12 +52,54 @@ before launch; it does not claim undeclared transitive dependencies are bound.
 
 Plain local HTTP also requires `--allow-insecure-http`. HTTP is never the implicit default.
 
+### Optional deterministic outcome projection
+
+When the target already returns a structured business result, add a versioned `outcome` contract
+to its local or HTTP target configuration. Each selector is a required RFC 6901 JSON Pointer into
+the target response:
+
+```json
+{
+  "outcome": {
+    "schema_version": "1.0.0",
+    "action": "/result/action",
+    "status": "/result/status",
+    "resource_id": "/result/order_id",
+    "decision": "/result/decision",
+    "amount": "/result/amount"
+  }
+}
+```
+
+The common roles are `action`, `status`, `resource_id`, `decision`, `amount`, and `effects`.
+String roles must select non-empty strings, `amount` must select a finite number, and `effects`
+must select an object or array. For a domain-specific object, use one named selector instead:
+
+```json
+{
+  "outcome": {
+    "schema_version": "1.0.0",
+    "complete_result": "/result",
+    "private_json_pointers": ["/customer/email", "/internal_note"]
+  }
+}
+```
+
+`complete_result` must select an object and cannot be combined with role selectors. Private
+pointers address the normalized object and are replaced with `[PRIVATE]` in the public smoke
+preview. The full normalized result remains private evidence. Projections are bounded to 64 KB and
+do not run code or expressions.
+
 ## 3. Inspect the smoke proof
 
-The first result includes a bounded structural summary and digest of the live normalized target
-response, response-only or response-and-state evidence level, available trajectory observations,
-and state-summary availability. Use `--show-smoke-response` only when private response content is
-safe to print. Case, turn, and canonical request identities are printed without request content.
+The first result includes a bounded structural summary and digest of the live raw target response,
+response-only or response-and-state evidence level, available trajectory observations, and
+state-summary availability. When configured, UL validates the outcome projection here and prints
+its independently filtered normalized preview before loading semantic-provider settings. A missing
+or type-invalid selector fails with `PROBE_OUTCOME_PROJECTION_INVALID`, the exact field and pointer,
+and zero semantic-model calls. Use `--show-smoke-response` only when private raw and normalized
+response content is safe to print. Case, turn, and canonical request identities are printed without
+request content.
 Only after a
 successful smoke does UL save private target/dataset bindings in `.ul/probe.json`.
 
@@ -67,10 +109,17 @@ requests, maximum semantic calls, completion-token bound, monetary-estimate avai
 repetition, and maximum active wall time. Declining the second confirmation stops with zero semantic
 calls.
 
+Raw target response, normalized result, trajectory/tool observations, and independently observed
+state remain four separate evidence channels. A target-declared outcome is authoritative only as a
+reported business result; it is never committed-state proof. Semantic deconstruction uses the
+normalized result when present and retains its existing fallback for targets without a projection.
+
 The campaign receipt binds the semantic provider and endpoint, model, render model, equivalence
 model, input/output/token/response/time bounds, data policy, target receipt, and command-wide call,
 wall-time, and cost status. Normal evidence records the same semantic settings plus dataset,
-operator, and target-receipt provenance in `run_context`.
+operator, and target-receipt provenance in `run_context`. The target receipt includes the canonical
+projection definition and SHA-256 digest; `.ul/probe.json` also binds that digest, so changing the
+projection is incompatible with the saved run configuration.
 
 When no trusted provider pricing is configured, the confirmation says monetary cost is unknown and
 unbounded. Confirming that receipt accepts this uncertainty; it is not a cost guarantee.

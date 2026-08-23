@@ -9,7 +9,8 @@ from dataclasses import dataclass, field
 
 import pytest
 from pydantic import JsonValue
-from ul.environment import evaluation_case_from_inputs
+from ul.environment import evaluation_case_from_inputs, observed_outputs_from_evidence
+from ul.outcome_projection import OutcomeProjection
 from ul.probe_execution import CapabilityExecutionError, ComposedEnvironmentExecutor
 from ul_core.evaluation import (
     ObservationRequest,
@@ -268,6 +269,30 @@ async def test_all_capabilities_preserve_response_trace_and_state_provenance() -
             "deterministic_replay_verified",
         }
     )
+
+
+@pytest.mark.asyncio
+async def test_projection_preserves_raw_normalized_trace_and_state_channels() -> None:
+    executor = ComposedEnvironmentExecutor(
+        _Invoker(),
+        config_sha256=_CONFIG_SHA256,
+        observation_source=_Observer(),
+        state_environment=_StateEnvironment(),
+        fixture_id="fixture-1",
+        outcome_projection=OutcomeProjection(complete_result=""),
+    )
+
+    evidence = await executor.execute(_case("hello"))
+
+    assert evidence.final_response == {"echo": "hello"}
+    assert evidence.normalized_result == {"echo": "hello"}
+    assert evidence.turns[0].response == {"echo": "hello"}
+    assert evidence.turns[0].normalized_response == {"echo": "hello"}
+    assert evidence.observations[0].traces == ({"span": "agent"},)
+    assert evidence.final_state is not None
+    assert evidence.final_state.value == {"turn_id": "case-1:turn-1"}
+    assert observed_outputs_from_evidence(evidence)[0].raw_output == {"echo": "hello"}
+    assert evidence.outcome_projection_sha256 == executor._outcome_projection.digest  # pyright: ignore[reportPrivateUsage,reportOptionalMemberAccess]
 
 
 def test_composition_rejects_partial_state_lifecycle() -> None:

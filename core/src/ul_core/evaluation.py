@@ -500,6 +500,8 @@ class EnvironmentCapabilities(_StrictModel):
 class EnvironmentTurnEvidence(_StrictModel):
     turn_id: str = Field(min_length=1)
     response: JsonValue
+    normalized_response: dict[str, JsonValue] | None = None
+    outcome_projection_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
     response_source_id: str | None = Field(default=None, min_length=1, max_length=500)
     correlation_id: str | None = Field(default=None, min_length=1, max_length=500)
     state_snapshot: JsonValue | None = None
@@ -508,6 +510,8 @@ class EnvironmentTurnEvidence(_StrictModel):
 
     @model_validator(mode="after")
     def validate_state_evidence(self) -> Self:
+        if (self.normalized_response is None) != (self.outcome_projection_sha256 is None):
+            raise ValueError("normalized response and outcome projection digest must be paired")
         if (self.response_source_id is None) != (self.correlation_id is None):
             raise ValueError(
                 "response source and correlation identifiers must be provided together"
@@ -624,6 +628,8 @@ class ExecutionEvidence(_StrictModel):
     initial_state: EnvironmentStateEvidence | None = None
     turns: tuple[EnvironmentTurnEvidence, ...] = ()
     final_response: JsonValue | None = None
+    normalized_result: dict[str, JsonValue] | None = None
+    outcome_projection_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
     final_state: EnvironmentStateEvidence | None = None
     timeout_after_commit_event: TimeoutAfterCommitEventEvidence | None = None
     observations: tuple[ProbeObservation, ...] = ()
@@ -633,6 +639,8 @@ class ExecutionEvidence(_StrictModel):
 
     @model_validator(mode="after")
     def validate_successful_evidence(self) -> Self:
+        if (self.normalized_result is None) != (self.outcome_projection_sha256 is None):
+            raise ValueError("normalized result and outcome projection digest must be paired")
         if self.probe_identity is not None:
             if self.probe_identity.case_id != self.case_id:
                 raise ValueError("probe identity must match the evidence case")
@@ -672,6 +680,10 @@ class ExecutionEvidence(_StrictModel):
             final_turn = self.turns[-1]
             if self.final_response != final_turn.response:
                 raise ValueError("final response must match the last turn")
+            if self.normalized_result != final_turn.normalized_response:
+                raise ValueError("normalized result must match the last turn")
+            if self.outcome_projection_sha256 != final_turn.outcome_projection_sha256:
+                raise ValueError("outcome projection digest must match the last turn")
             if self.evidence_scope == "response_and_state":
                 if self.initial_state is None or self.final_state is None:
                     raise ValueError("response-and-state evidence requires explicit pre/post state")

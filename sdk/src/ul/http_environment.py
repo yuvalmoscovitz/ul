@@ -50,6 +50,7 @@ from ul_core.evaluation import (
     TimeoutAfterCommitTriggerStatus,
 )
 
+from ul.outcome_projection import OutcomeProjection
 from ul.probe_execution import CapabilityExecutionError, ComposedEnvironmentExecutor
 from ul.state_hooks import CallbackStateEnvironment, require_state_adapter_identity
 
@@ -354,6 +355,7 @@ class JsonHttpEnvironmentConfig(BaseModel):
     execute_turn: JsonHttpLifecycleExecuteTurnConfig
     snapshot: JsonHttpLifecycleObservationConfig
     timeout_after_commit: JsonHttpTimeoutAfterCommitConfig | None = None
+    outcome: OutcomeProjection | None = None
 
     @field_validator("version", mode="before")
     @classmethod
@@ -387,6 +389,7 @@ class JsonHttpIsolatedResponseConfig(BaseModel):
     safe_test_target_attested: Literal[True]
     headers_from_env: dict[str, str] = Field(default_factory=dict)
     execute: JsonHttpIsolatedExecuteConfig
+    outcome: OutcomeProjection | None = None
 
     @field_validator("version", mode="before")
     @classmethod
@@ -625,6 +628,7 @@ class JsonHttpEnvironmentConnection:
             ),
             observation_timeout_seconds=observation_timeout_seconds,
             campaign_id=campaign_id,
+            outcome_projection=config.outcome,
         )
         self.capabilities = (
             json_http_environment_capabilities(config)

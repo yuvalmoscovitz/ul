@@ -31,6 +31,7 @@ from ul_core.evaluation import (
     ProbeResult,
 )
 
+from ul.outcome_projection import OutcomeProjection
 from ul.probe_execution import CapabilityExecutionError, ComposedEnvironmentExecutor
 from ul.state_hooks import CallbackStateEnvironment, require_state_adapter_identity
 
@@ -81,6 +82,7 @@ class _LocalTargetBase(_StrictModel):
         default=(), max_length=_MAXIMUM_ENVIRONMENT_VARIABLES
     )
     limits: LocalTargetLimits = Field(default_factory=LocalTargetLimits)
+    outcome: OutcomeProjection | None = None
 
     def model_post_init(self, context: object, /) -> None:
         del context
@@ -771,6 +773,7 @@ class LocalTargetConnection:
             ),
             state_environment=state_environment,
             fixture_id=state_identity.fixture_id if state_identity is not None else None,
+            outcome_projection=config.outcome,
         )
         self.capabilities: EnvironmentCapabilities = self._executor.capabilities
 

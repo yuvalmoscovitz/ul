@@ -39,6 +39,7 @@ from ul_core.evaluation import (
     evidence_profile_from_capabilities,
 )
 
+from ul.outcome_projection import OutcomeProjection
 from ul.state_hooks import bounded_json_size
 
 _ENVIRONMENT_LIFECYCLE_FAILURE_CODES = frozenset(get_args(EnvironmentLifecycleFailureCode))
@@ -162,6 +163,7 @@ class ComposedEnvironmentExecutor:
         campaign_id: str | None = None,
         variation_id: str | None = None,
         repetition: int | None = None,
+        outcome_projection: OutcomeProjection | None = None,
     ) -> None:
         if len(config_sha256) != 64 or any(
             character not in "0123456789abcdef" for character in config_sha256
@@ -205,6 +207,7 @@ class ComposedEnvironmentExecutor:
         self._campaign_id = campaign_id or f"ul-campaign-{secrets.token_hex(16)}"
         self._variation_id = variation_id
         self._repetition = repetition
+        self._outcome_projection = outcome_projection
         self._lock = asyncio.Lock()
         self._state_uncertain = False
         self._invoker_sync_runner = _SyncAdapterRunner("ul-probe-invoker")
@@ -829,6 +832,7 @@ class ComposedEnvironmentExecutor:
         *,
         error: CapabilityExecutionError | None,
     ) -> ExecutionEvidence:
+        turns = self._project_turns(turns) if error is None else turns
         return ExecutionEvidence(
             evidence_scope="response_only",
             case_id=case.id,
@@ -836,6 +840,10 @@ class ComposedEnvironmentExecutor:
             environment_config_sha256=self.config_sha256,
             turns=turns,
             final_response=turns[-1].response if turns and error is None else None,
+            normalized_result=(turns[-1].normalized_response if turns and error is None else None),
+            outcome_projection_sha256=(
+                turns[-1].outcome_projection_sha256 if turns and error is None else None
+            ),
             observations=observations,
             execution_events=execution_events,
             probe_identity=_probe_identity(execution_context, case),
@@ -874,6 +882,7 @@ class ComposedEnvironmentExecutor:
         cleanup: Literal["succeeded", "failed", "not_attempted"],
         cleanup_error: CapabilityExecutionError | None,
     ) -> ExecutionEvidence:
+        turns = self._project_turns(turns) if error is None else turns
         final_turn = turns[-1] if turns else None
         return ExecutionEvidence(
             evidence_scope="response_and_state",
@@ -891,6 +900,14 @@ class ComposedEnvironmentExecutor:
             ),
             turns=turns,
             final_response=final_turn.response if final_turn is not None else None,
+            normalized_result=(
+                final_turn.normalized_response if final_turn is not None and error is None else None
+            ),
+            outcome_projection_sha256=(
+                final_turn.outcome_projection_sha256
+                if final_turn is not None and error is None
+                else None
+            ),
             final_state=(
                 EnvironmentStateEvidence(
                     value=final_turn.state_snapshot,
@@ -935,6 +952,22 @@ class ComposedEnvironmentExecutor:
                     _reset_evidence(cleanup_reset) if cleanup != "not_attempted" else None
                 ),
             ),
+        )
+
+    def _project_turns(
+        self, turns: tuple[EnvironmentTurnEvidence, ...]
+    ) -> tuple[EnvironmentTurnEvidence, ...]:
+        projection = self._outcome_projection
+        if projection is None:
+            return turns
+        return tuple(
+            turn.model_copy(
+                update={
+                    "normalized_response": projection.project(turn.response),
+                    "outcome_projection_sha256": projection.digest,
+                }
+            )
+            for turn in turns
         )
 
 

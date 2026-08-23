@@ -130,8 +130,17 @@ def observed_outputs_from_evidence(
     for turn in evidence.turns:
         outputs.append(
             ObservedAgentOutput(
-                raw_output=turn.response,
+                raw_output=(
+                    turn.normalized_response
+                    if turn.normalized_response is not None
+                    else turn.response
+                ),
                 metadata={
+                    **(
+                        {"outcome_projection_sha256": turn.outcome_projection_sha256}
+                        if turn.outcome_projection_sha256 is not None
+                        else {}
+                    ),
                     **(
                         {"committed_state_snapshot": turn.state_snapshot}
                         if turn.state_snapshot is not None

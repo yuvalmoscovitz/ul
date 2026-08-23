@@ -247,6 +247,80 @@ def test_private_smoke_output_requires_explicit_flag(
     assert "Private normalized response:" in result.output
 
 
+def _write_projected_callable_config(path: Path, outcome: dict[str, object]) -> Path:
+    config = path / "projected-target.json"
+    config.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "kind": "python_callable",
+                "target_id": "projected-agent",
+                "working_directory": str(path),
+                "interpreter": str(Path(sys.executable).resolve()),
+                "target": "customer_agent:run",
+                "outcome": outcome,
+            }
+        ),
+        encoding="utf-8",
+    )
+    return config
+
+
+def test_smoke_previews_projection_before_any_semantic_call(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _write_callable(tmp_path)
+    dataset = _write_dataset(tmp_path)
+    config = _write_projected_callable_config(
+        tmp_path,
+        {
+            "schema_version": "1.0.0",
+            "complete_result": "",
+            "private_json_pointers": ["/source"],
+        },
+    )
+    monkeypatch.chdir(tmp_path)
+
+    async def unexpected_preflight(*args: object, **kwargs: object) -> None:
+        raise AssertionError("semantic preflight must not run before paid confirmation")
+
+    monkeypatch.setattr(probe_module, "preflight_evaluator", unexpected_preflight)
+    result = runner.invoke(app, ["probe", str(dataset), "--target", str(config)], input="y\nn\n")
+
+    assert result.exit_code == 0, result.output
+    assert "Normalized result preview:" in result.output
+    assert '"source":"[PRIVATE]"' in result.output
+    assert "live-call" not in result.output
+    saved = json.loads((tmp_path / ".ul" / "probe.json").read_text())
+    assert len(saved["outcome_projection_sha256"]) == 64
+
+
+def test_invalid_smoke_projection_names_selector_and_makes_zero_semantic_calls(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _write_callable(tmp_path)
+    dataset = _write_dataset(tmp_path)
+    config = _write_projected_callable_config(
+        tmp_path,
+        {"schema_version": "1.0.0", "action": "/missing/action"},
+    )
+    monkeypatch.chdir(tmp_path)
+    semantic_calls = 0
+
+    async def unexpected_preflight(*args: object, **kwargs: object) -> None:
+        nonlocal semantic_calls
+        semantic_calls += 1
+
+    monkeypatch.setattr(probe_module, "preflight_evaluator", unexpected_preflight)
+    result = runner.invoke(app, ["probe", str(dataset), "--target", str(config)], input="y\n")
+
+    assert result.exit_code == 2
+    assert "Reason: PROBE_OUTCOME_PROJECTION_INVALID" in result.output
+    assert "'action' at selector '/missing/action' does not resolve" in result.output
+    assert semantic_calls == 0
+    assert not (tmp_path / ".ul").exists()
+
+
 def test_changed_target_artifact_is_rejected_immediately_before_launch(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
