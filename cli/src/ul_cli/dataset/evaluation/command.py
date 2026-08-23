@@ -6,7 +6,7 @@ import os
 import secrets
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Annotated, TextIO
+from typing import Annotated, Any, TextIO, cast
 
 import httpx
 import typer
@@ -40,7 +40,17 @@ from ul_cli.dataset_augmentation_ledger import (
     read_augmentation_ledger,
 )
 from ul_cli.dataset_campaign import create_dataset_campaign_plan
-from ul_cli.dataset_review import DatasetResumeEvidence
+from ul_cli.dataset_review import DatasetEvidenceRunContext, DatasetResumeEvidence
+from ul_cli.dataset_trial_journal import (
+    DatasetTrialJournal,
+    create_dataset_run_manifest,
+    create_dataset_trial_journal,
+    journal_path,
+    manifest_path,
+    open_dataset_trial_journal,
+    persist_dataset_run_manifest,
+    read_dataset_run_manifest,
+)
 from ul_cli.environment import TEST_ENVIRONMENT_CONFIRMATION_MESSAGE
 from ul_cli.finding_adapters import FindingAdapterContext, adapt_dataset_finding_packages
 
@@ -78,7 +88,7 @@ _DEFAULT_MAXIMUM_ENVIRONMENT_API_CALLS = 100
 
 def evaluate_dataset(
     data: Annotated[
-        Path,
+        Path | None,
         typer.Argument(
             exists=True,
             dir_okay=False,
@@ -88,7 +98,7 @@ def evaluate_dataset(
                 "records or structured multi-turn cases."
             ),
         ),
-    ],
+    ] = None,
     environment_config: Annotated[
         Path | None,
         typer.Option(
@@ -150,24 +160,24 @@ def evaluate_dataset(
         ),
     ] = None,
     limit: Annotated[
-        int,
+        int | None,
         typer.Option(min=1, max=_MAXIMUM_DATASET_RECORDS, help="Interactions to evaluate."),
-    ] = 10,
+    ] = None,
     repetitions: Annotated[
-        int,
+        int | None,
         typer.Option(
             min=1,
             help="Fresh-state environment executions per original input and accepted variation.",
         ),
-    ] = 3,
+    ] = None,
     max_environment_api_calls: Annotated[
-        int,
+        int | None,
         typer.Option(
             "--max-environment-api-calls",
             min=1,
             help="Maximum customer environment API requests authorized for this evaluation.",
         ),
-    ] = _DEFAULT_MAXIMUM_ENVIRONMENT_API_CALLS,
+    ] = None,
     allow_environment_network: Annotated[
         bool,
         typer.Option(
@@ -255,6 +265,41 @@ def evaluate_dataset(
     Discover operators: ul augmentations list --mode dataset_variation
     Augmentation retention: --augmentations-output PATH or --no-save-augmentations
     """
+    recorded_manifest_for_resume = None
+    if resume is not None and manifest_path(resume).exists():
+        try:
+            recorded_manifest_for_resume = read_dataset_run_manifest(manifest_path(resume))
+        except (OSError, ValueError) as error:
+            message = str(error) if isinstance(error, ValueError) else error.__class__.__name__
+            raise typer.BadParameter(
+                f"cannot safely read recorded run manifest ({message})",
+                param_hint="--resume",
+            ) from None
+        recorded_command = recorded_manifest_for_resume.effective_command
+        repetitions = repetitions or recorded_command.repetitions
+        max_environment_api_calls = (
+            max_environment_api_calls or recorded_command.max_environment_api_calls
+        )
+        allow_environment_network = (
+            allow_environment_network or recorded_command.allow_environment_network
+        )
+        confirm_test_environment = (
+            confirm_test_environment or recorded_command.confirm_test_environment
+        )
+        allow_insecure_http = allow_insecure_http or recorded_command.allow_insecure_http
+        if operator is None:
+            operator = list(recorded_manifest_for_resume.selected_operator_ids)
+        if data is None:
+            limit = len(recorded_manifest_for_resume.selected_records)
+        no_save_augmentations = not recorded_command.save_augmentations
+    repetitions = repetitions or 3
+    max_environment_api_calls = max_environment_api_calls or _DEFAULT_MAXIMUM_ENVIRONMENT_API_CALLS
+    limit = limit or 10
+    if data is None and recorded_manifest_for_resume is None:
+        raise typer.BadParameter(
+            "DATA is required unless --resume has a durable run manifest",
+            param_hint="DATA",
+        )
     if (json_output or show_sensitive_values) and not dry_run:
         option = "--show-sensitive-values" if show_sensitive_values else "--json"
         raise typer.BadParameter(f"{option} requires --dry-run", param_hint=option)
@@ -289,7 +334,11 @@ def evaluate_dataset(
             param_hint="--augmentations-output",
         )
     try:
-        records = load_interaction_records(data)
+        if data is None:
+            assert recorded_manifest_for_resume is not None
+            records = recorded_manifest_for_resume.selected_records
+        else:
+            records = load_interaction_records(data)
         selected_operators = validate_operator_ids(operator)
         invariant_suite = (
             load_dataset_invariant_suite(invariants) if invariants is not None else None
@@ -308,8 +357,16 @@ def evaluate_dataset(
                 "redaction policy changed since 'ul init'; reinitialize the project before "
                 "sending data to the semantic provider"
             )
-        redaction_coverage = calculate_redaction_coverage(selected_records, redaction_engine)
-        if redaction_engine is not None and (not dry_run or resume is not None):
+        redaction_coverage = (
+            recorded_manifest_for_resume.run_context.redaction_coverage
+            if data is None and recorded_manifest_for_resume is not None
+            else calculate_redaction_coverage(selected_records, redaction_engine)
+        )
+        if (
+            data is not None
+            and redaction_engine is not None
+            and (not dry_run or resume is not None)
+        ):
             selected_records = protect_interaction_records(selected_records, redaction_engine)
         all_selected_records = selected_records
         if not dry_run and resume is None:
@@ -331,7 +388,12 @@ def evaluate_dataset(
         loaded_target_config = (
             load_json_http_environment_config(environment_config)
             if environment_config is not None
-            else None
+            else (
+                recorded_manifest_for_resume.run_context.target.config
+                if recorded_manifest_for_resume is not None
+                and recorded_manifest_for_resume.run_context.target.kind == "environment_http"
+                else None
+            )
         )
         if expected_environment_origin is not None:
             if loaded_target_config is None:
@@ -371,7 +433,7 @@ def evaluate_dataset(
                 )
         normalized_target_config = loaded_target_config
         if resume is not None and normalized_target_config is None:
-            raise ValueError("--resume requires --environment-config")
+            raise ValueError("--resume requires a recorded or explicit environment configuration")
         target_calls_per_execution = (
             json_http_environment_calls_per_execution(normalized_target_config)
             if normalized_target_config is not None
@@ -484,6 +546,49 @@ def evaluate_dataset(
             record for record in selected_records if record.id not in resume_evidence.processed_ids
         )
         skipped_count = len(resume_evidence.processed_ids)
+
+    trial_journal: DatasetTrialJournal | None = None
+    if not dry_run:
+        assert output is not None
+        assert run_context is not None
+        expected_manifest = create_dataset_run_manifest(
+            run_context=run_context,
+            selected_records=all_selected_records,
+            selected_operator_ids=selected_operators,
+            repetitions=repetitions,
+            max_environment_api_calls=max_environment_api_calls,
+            allow_environment_network=allow_environment_network,
+            confirm_test_environment=confirm_test_environment,
+            allow_insecure_http=allow_insecure_http,
+            save_augmentations=not no_save_augmentations,
+        )
+        run_manifest_path = manifest_path(output)
+        run_journal_path = journal_path(output)
+        try:
+            if resume is None:
+                persist_dataset_run_manifest(run_manifest_path, expected_manifest)
+                trial_journal = create_dataset_trial_journal(run_journal_path, expected_manifest)
+                create_private_output(output).close()
+            elif run_manifest_path.exists():
+                recorded_manifest = read_dataset_run_manifest(run_manifest_path)
+                incompatibility = _manifest_incompatibility_reason(
+                    recorded_manifest.run_context, expected_manifest.run_context
+                )
+                if incompatibility is not None:
+                    raise ValueError(f"resume_incompatible:{incompatibility}")
+                if recorded_manifest != expected_manifest:
+                    raise ValueError("resume_incompatible:effective_command")
+                trial_journal = open_dataset_trial_journal(run_journal_path, recorded_manifest)
+                if trial_journal.snapshot.quarantined_unit_ids:
+                    raise ValueError("resume_quarantined:target_delivery_or_cleanup_uncertain")
+        except (OSError, ValueError) as error:
+            if trial_journal is not None:
+                trial_journal.close()
+            message = str(error) if isinstance(error, ValueError) else error.__class__.__name__
+            raise typer.BadParameter(
+                f"cannot safely open durable run state ({message})",
+                param_hint="--resume" if resume is not None else "--output",
+            ) from None
 
     evaluator_preflight: EvaluatorModelPreflight | None = None
     evaluator_preflight_receipt: Path | None = None
@@ -623,6 +728,8 @@ def evaluate_dataset(
             f"Resume compatible: all {skipped_count} selected interaction(s) are complete in "
             f"{output}. Nothing to do."
         )
+        if trial_journal is not None:
+            trial_journal.close()
         previous_invariant_exit_code = dataset_invariant_exit_code(
             resume_evidence.invariant_evaluations
         )
@@ -632,9 +739,9 @@ def evaluate_dataset(
             raise typer.Exit(code=1)
         raise typer.Exit(code=0)
 
-    if environment_config is None:
+    if loaded_target_config is None:
         raise typer.BadParameter(
-            "execution requires --environment-config",
+            "execution requires a recorded or explicit environment configuration",
             param_hint="--environment-config",
         )
     if not confirm_test_environment:
@@ -694,10 +801,14 @@ def evaluate_dataset(
             evaluator_preflight = asyncio.run(preflight_evaluator(settings))
             evaluator_preflight_receipt = persist_evaluator_preflight(output, evaluator_preflight)
         except EvaluatorModelCompatibilityError as error:
+            if trial_journal is not None:
+                trial_journal.close()
             asyncio.run(target.aclose())
             print_dataset_plain(f"Evaluation stopped before campaign execution: {error}")
             raise typer.Exit(code=2) from None
         except (OSError, ValueError) as error:
+            if trial_journal is not None:
+                trial_journal.close()
             asyncio.run(target.aclose())
             message = str(error) if isinstance(error, ValueError) else error.__class__.__name__
             raise typer.BadParameter(
@@ -747,7 +858,15 @@ def evaluate_dataset(
                         )
         failure_parameter = "--resume" if resume is not None else "--output"
         if resume is None:
-            output_stream = create_private_output(output)
+            output_stream, initial_evidence = open_resume_output(
+                output,
+                expected_context=run_context,
+                selected_records=all_selected_records,
+                invariant_suite=invariant_suite,
+            )
+            if initial_evidence.processed_ids:
+                output_stream.close()
+                raise ValueError("new evidence output is not empty")
             finding_output_stream = create_private_output(finding_output)
         else:
             assert resume_evidence is not None
@@ -788,8 +907,12 @@ def evaluate_dataset(
     invariant_evaluations: list[DatasetInvariantEvaluation] = []
     try:
         with output_stream, finding_output_stream:
+            durable_arguments = (
+                {"trial_journal": trial_journal} if trial_journal is not None else {}
+            )
+            evaluation_runner = cast(Any, evaluate_interaction_records)
             if invariant_suite is not None:
-                evaluation_coroutine = evaluate_interaction_records(
+                evaluation_coroutine = evaluation_runner(
                     selected_records,
                     selected_operators,
                     settings,
@@ -810,9 +933,10 @@ def evaluate_dataset(
                     invariant_evaluations=invariant_evaluations,
                     redaction_engine=redaction_engine,
                     evaluator_preflight=evaluator_preflight,
+                    **durable_arguments,
                 )
             else:
-                evaluation_coroutine = evaluate_interaction_records(
+                evaluation_coroutine = evaluation_runner(
                     selected_records,
                     selected_operators,
                     settings,
@@ -831,6 +955,7 @@ def evaluate_dataset(
                     saved_augmentations=saved_augmentations,
                     redaction_engine=redaction_engine,
                     evaluator_preflight=evaluator_preflight,
+                    **durable_arguments,
                 )
             results = asyncio.run(evaluation_coroutine)
             invariant_evaluation_by_interaction = {
@@ -884,6 +1009,8 @@ def evaluate_dataset(
     finally:
         if augmentation_ledger is not None:
             augmentation_ledger.close()
+        if trial_journal is not None:
+            trial_journal.close()
 
     if skipped_count > 0:
         console.print(
@@ -909,3 +1036,19 @@ def evaluate_dataset(
         raise typer.Exit(code=2)
     if has_review_findings or (resume_evidence is not None and resume_evidence.has_review_findings):
         raise typer.Exit(code=1)
+
+
+def _manifest_incompatibility_reason(
+    recorded: DatasetEvidenceRunContext,
+    requested: DatasetEvidenceRunContext,
+) -> str | None:
+    checks = (
+        ("fixture", recorded.fixture, requested.fixture),
+        ("target", recorded.target, requested.target),
+        ("projection", recorded.invariant_suite_sha256, requested.invariant_suite_sha256),
+        ("operators", recorded.operators, requested.operators),
+        ("evaluator", recorded.semantic_settings, requested.semantic_settings),
+        ("dataset", recorded.selected_dataset_sha256, requested.selected_dataset_sha256),
+        ("redaction", recorded.redaction_policy_sha256, requested.redaction_policy_sha256),
+    )
+    return next((reason for reason, left, right in checks if left != right), None)
