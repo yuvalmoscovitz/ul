@@ -1134,6 +1134,21 @@ def _compare_action_outcomes(
     return tuple(findings)
 
 
+def compare_action_outcomes(
+    expected_frame: SemanticFrame,
+    observed_frame: SemanticFrame,
+    source_input: str,
+    *,
+    grounding_frame: SemanticFrame | None = None,
+) -> tuple[DatasetEvaluationFinding, ...]:
+    return _compare_action_outcomes(
+        expected_frame,
+        observed_frame,
+        source_input,
+        grounding_frame=grounding_frame,
+    )
+
+
 def _action_outcomes_by_key(
     frame: SemanticFrame,
 ) -> dict[tuple[str, str], tuple[ObservedOutcome, ...]]:
