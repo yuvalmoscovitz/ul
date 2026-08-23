@@ -69,7 +69,9 @@ from ul_cli.finding_adapters import FindingAdapterContext, adapt_dataset_finding
 
 from ..evidence.context import build_dataset_evidence_run_context
 from ..evidence.persistence import (
+    create_durable_evidence_output,
     default_augmentations_output,
+    durable_evidence_marker_manifest_sha256,
     load_evaluator_preflight,
     open_resume_output,
     persist_evaluator_preflight,
@@ -293,6 +295,7 @@ def evaluate_dataset(
     redaction_state_was_explicit = redaction_state is not None
     recorded_manifest_for_resume = None
     durable_path_presence = (False, False, False)
+    durable_evidence_manifest_sha256 = None
     if resume is not None:
         durable_paths = (
             manifest_path(resume),
@@ -300,6 +303,20 @@ def evaluate_dataset(
             journal_anchor_path(resume),
         )
         durable_path_presence = tuple(os.path.lexists(path) for path in durable_paths)
+        try:
+            durable_evidence_manifest_sha256 = durable_evidence_marker_manifest_sha256(resume)
+        except (OSError, ValueError) as error:
+            message = str(error) if isinstance(error, ValueError) else error.__class__.__name__
+            raise typer.BadParameter(
+                f"cannot safely inspect resume evidence ({message})",
+                param_hint="--resume",
+            ) from None
+        if durable_evidence_manifest_sha256 is not None and not all(durable_path_presence):
+            raise typer.BadParameter(
+                "durable evidence requires its manifest, journal, and anchor sidecars; restore "
+                "all three together because legacy replay is unsafe",
+                param_hint="--resume",
+            )
         if any(durable_path_presence) and not all(durable_path_presence):
             raise typer.BadParameter(
                 "durable resume sidecars are incomplete; restore the manifest, journal, and "
@@ -315,6 +332,14 @@ def evaluate_dataset(
                 f"cannot safely read recorded run manifest ({message})",
                 param_hint="--resume",
             ) from None
+        if (
+            durable_evidence_manifest_sha256 is not None
+            and durable_evidence_manifest_sha256 != recorded_manifest_for_resume.manifest_sha256
+        ):
+            raise typer.BadParameter(
+                "primary evidence marker does not match its durable manifest",
+                param_hint="--resume",
+            )
         recorded_command = recorded_manifest_for_resume.effective_command
         repetitions = repetitions or recorded_command.repetitions
         max_environment_api_calls = (
@@ -707,7 +732,7 @@ def evaluate_dataset(
             if resume is None:
                 persist_dataset_run_manifest(run_manifest_path, expected_manifest)
                 trial_journal = create_dataset_trial_journal(run_journal_path, expected_manifest)
-                create_private_output(output).close()
+                create_durable_evidence_output(output, expected_manifest.manifest_sha256)
                 fsync_run_directory(output)
             elif run_manifest_path.exists():
                 recorded_manifest = read_dataset_run_manifest(run_manifest_path)

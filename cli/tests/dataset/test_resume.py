@@ -67,6 +67,64 @@ def test_resume_rejects_incomplete_durable_sidecars_before_legacy_fallback(
     assert "durable resume sidecars are incomplete" in result.output
 
 
+def test_resume_rejects_deleted_durable_sidecars_instead_of_replaying_as_legacy(
+    tmp_path: Path,
+) -> None:
+    dataset = tmp_path / "interactions.jsonl"
+    evidence = tmp_path / "evidence.jsonl"
+    target_config = tmp_path / "target.json"
+    _write_dataset(dataset, [_record("interaction-1")])
+    _write_target_config(target_config)
+    source = _evaluation_result("interaction-1").source
+    manifest = dataset_trial_journal.create_dataset_run_manifest(
+        run_context=_run_context((source,)),
+        selected_records=(source,),
+        selected_operator_ids=("input.surface.rephrase",),
+        repetitions=1,
+        max_environment_api_calls=10,
+        allow_environment_network=True,
+        confirm_test_environment=True,
+        allow_insecure_http=False,
+        save_augmentations=True,
+    )
+    dataset_trial_journal.persist_dataset_run_manifest(
+        dataset_trial_journal.manifest_path(evidence), manifest
+    )
+    journal = dataset_trial_journal.create_dataset_trial_journal(
+        dataset_trial_journal.journal_path(evidence), manifest
+    )
+    journal.start(manifest.work_plan[0])
+    journal.close()
+    persistence_module.create_durable_evidence_output(evidence, manifest.manifest_sha256)
+    dataset_trial_journal.manifest_path(evidence).unlink()
+    dataset_trial_journal.journal_path(evidence).unlink()
+    dataset_trial_journal.journal_anchor_path(evidence).unlink()
+
+    result = runner.invoke(
+        root_app,
+        [
+            "dataset",
+            "evaluate",
+            str(dataset),
+            "--environment-config",
+            str(target_config),
+            "--operator",
+            "input.surface.rephrase",
+            "--repetitions",
+            "1",
+            "--resume",
+            str(evidence),
+            "--dry-run",
+        ],
+    )
+
+    assert result.exit_code == 2
+    normalized_output = " ".join(_ANSI_ESCAPE_PATTERN.sub("", result.output).split())
+    assert "durable evidence requires" in normalized_output
+    assert "legacy replay is" in normalized_output
+    assert "unsafe" in normalized_output
+
+
 def test_resume_reuses_manifest_without_original_data_config_or_overrides(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -120,9 +178,7 @@ def test_resume_reuses_manifest_without_original_data_config_or_overrides(
     def unexpected_settings_load() -> object:
         raise AssertionError("durable resume must restore safe evaluator settings")
 
-    monkeypatch.setattr(
-        command_module, "load_dataset_semantic_settings", unexpected_settings_load
-    )
+    monkeypatch.setattr(command_module, "load_dataset_semantic_settings", unexpected_settings_load)
 
     result = runner.invoke(
         root_app,

@@ -20,6 +20,7 @@ from ul.dataset_invariants import DatasetInvariantSuite
 from ul_cli.dataset_review import (
     DatasetEvidenceRunContext,
     DatasetResumeEvidence,
+    dataset_durable_run_marker_manifest_sha256,
     validate_dataset_resume_evidence,
 )
 
@@ -29,6 +30,34 @@ from .customer import build_customer_evidence_record
 _MAXIMUM_EVIDENCE_BYTES = 128_000_000
 _MAXIMUM_PREFLIGHT_RECEIPT_BYTES = 100_000
 _PROVIDER_DIAGNOSTIC_SCHEMA_VERSION = "1.0.0"
+
+
+def create_durable_evidence_output(path: Path, manifest_sha256: str) -> None:
+    marker = {
+        "schema_version": "1.0.0",
+        "record_type": "dataset_durable_run",
+        "manifest_sha256": manifest_sha256,
+    }
+    with create_private_output(path) as output_stream:
+        json.dump(marker, output_stream, ensure_ascii=False, sort_keys=True)
+        output_stream.write("\n")
+        output_stream.flush()
+        os.fsync(output_stream.fileno())
+
+
+def durable_evidence_marker_manifest_sha256(path: Path) -> str | None:
+    descriptor = open_resume_descriptor(path, writable=False)
+    try:
+        size = os.fstat(descriptor).st_size
+        if size > _MAXIMUM_EVIDENCE_BYTES:
+            raise ValueError("resume evidence exceeds the 128 MB limit")
+        prefix = os.read(descriptor, min(size, 1_024))
+        if size > 1_024 and b"\n" not in prefix:
+            return None
+        first_line = prefix.split(b"\n", 1)[0]
+        return dataset_durable_run_marker_manifest_sha256(first_line)
+    finally:
+        os.close(descriptor)
 
 
 def default_augmentations_output(evidence_output: Path) -> Path:

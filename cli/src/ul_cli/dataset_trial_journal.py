@@ -177,9 +177,7 @@ class DatasetQuarantineResolution(_StrictModel):
     def validate_resolution(self) -> DatasetQuarantineResolution:
         if tuple(sorted(set(self.quarantined_unit_ids))) != self.quarantined_unit_ids:
             raise ValueError("quarantine resolution unit ids must be unique and sorted")
-        expected = _canonical_sha256(
-            self.model_dump(mode="json", exclude={"resolution_sha256"})
-        )
+        expected = _canonical_sha256(self.model_dump(mode="json", exclude={"resolution_sha256"}))
         if self.resolution_sha256 != expected:
             raise ValueError("quarantine resolution digest does not match")
         return self

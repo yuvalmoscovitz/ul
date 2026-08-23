@@ -305,7 +305,9 @@ def test_execution_creates_private_explicit_output(
 
     assert result.exit_code == 0, result.output
     assert captured_records == ["interaction-1"]
-    assert output.read_text(encoding="utf-8") == '{"saved":true}\n'
+    output_lines = output.read_text(encoding="utf-8").splitlines()
+    assert json.loads(output_lines[0])["record_type"] == "dataset_durable_run"
+    assert output_lines[1] == '{"saved":true}'
     assert stat.S_IMODE(output.stat().st_mode) == 0o600
     assert "Complete evidence" in result.output
     assert "Next: ul dataset report" in result.output
@@ -733,4 +735,6 @@ def test_target_config_runs_nested_request_and_response_against_loopback(
     assert observed_outputs == [
         {"actions": [{"action": "transfer", "amount": 100, "recipient": "Alice"}]}
     ]
-    assert output.read_text(encoding="utf-8") == '{"saved":true}\n'
+    output_lines = output.read_text(encoding="utf-8").splitlines()
+    assert json.loads(output_lines[0])["record_type"] == "dataset_durable_run"
+    assert output_lines[1] == '{"saved":true}'
