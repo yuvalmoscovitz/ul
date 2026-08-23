@@ -63,6 +63,10 @@ For objective assertions, model-judged rubrics, pairwise preference, and human r
 workflows, see [Customer-defined evaluators](docs/evaluators.md).
 To probe a Python callable or an explicit local command without hosting an HTTP server, see
 [Local process targets](docs/local-targets.md).
+To add reset and authoritative committed-state inspection with ordinary Python callbacks, including
+beside an existing response-only HTTP agent, see [Composable state hooks](docs/state-hooks.md).
+For the shortest smoke-first journey from grounded examples to a bounded active probe, see
+[Guided active-probe quickstart](docs/probe.md).
 
 To connect an existing response-only JSON endpoint that starts every request from isolated state:
 
@@ -87,9 +91,10 @@ and `/response`). For another JSON shape, use `--request-json-template` and
 `--response-json-pointer`. Header values come only from the named `UL_ENVIRONMENT_*` variables and
 are never written to the config. The separate confirmations attest that this is a test target,
 every request starts fresh and is isolated from every other request, and requests cannot cause
-real-world effects. UL records response evidence only at this tier. It rejects committed-state
-invariants, conversations, timeout-after-commit checks, and other state-dependent stress tests. Move
-to `stateful-lifecycle` when UL must inspect side effects or behavior across turns.
+real-world effects. Without a separately composed state observer, UL records response evidence only
+at this tier and rejects committed-state invariants, conversations, timeout-after-commit checks, and
+other state-dependent stress tests. Use [composable state hooks](docs/state-hooks.md) to inspect a
+local test fixture, or move to `stateful-lifecycle` when the HTTP environment owns state control.
 
 The endpoint URL cannot contain credentials, a query string, or a fragment. Put credentials in
 `--header-from-env`; use a custom adapter when the endpoint requires query parameters.

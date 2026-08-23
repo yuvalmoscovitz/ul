@@ -26,6 +26,7 @@ from ul.local_target import (
     create_local_target_dry_run_plan,
     load_local_target_config,
 )
+from ul.state_hooks import CallbackStateEnvironment, StateAdapterIdentity, StateCallbackContext
 from ul_core.evaluation import ProbeRequest, ProbeTurn
 
 
@@ -157,6 +158,52 @@ async def test_python_worker_runs_sync_async_and_reuses_process(tmp_path: Path) 
         evidence = await connection.execute(_case("case-async", "hello"))
 
     assert evidence.final_response == {"async": "hello"}
+
+
+@pytest.mark.asyncio
+async def test_local_process_target_composes_with_callback_state_without_http(
+    tmp_path: Path,
+) -> None:
+    _write_python_target(tmp_path)
+    state: dict[str, JsonValue] = {}
+
+    def reset(context: StateCallbackContext) -> None:
+        state.clear()
+        state["fixture_id"] = context.fixture_id
+        state["status"] = "clean"
+
+    state_environment = CallbackStateEnvironment(
+        environment_id="local-state-observer",
+        identity=StateAdapterIdentity(
+            adapter_id="local-state-adapter",
+            adapter_version="1.0.0",
+            fixture_id="fixture-local",
+            fixture_version="1",
+        ),
+        reset=reset,
+        snapshot=lambda context: dict(state),
+        authority="independent_observer",
+    )
+    case = _case("case-state", "hello").model_copy(
+        update={
+            "required_state_observation_authority": "independent_observer",
+            "required_state_observer_id": "local-state-observer",
+        }
+    )
+
+    async with LocalTargetConnection(
+        _python_config(tmp_path, "customer_agent:sync_agent"),
+        customer_code_execution_confirmed=True,
+        state_environment=state_environment,
+    ) as connection:
+        evidence = await connection.execute(case)
+
+    assert evidence.final_response == {"value": "hello", "invocations": 1}
+    assert evidence.evidence_scope == "response_and_state"
+    assert evidence.initial_state is not None
+    assert evidence.initial_state.value == {"fixture_id": "fixture-local", "status": "clean"}
+    assert evidence.final_state is not None
+    assert evidence.final_state.authority == "independent_observer"
 
 
 @pytest.mark.asyncio

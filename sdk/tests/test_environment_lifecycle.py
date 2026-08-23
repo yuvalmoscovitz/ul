@@ -156,10 +156,42 @@ def test_observed_outputs_preserve_each_turns_before_and_after_state() -> None:
 
     assert first_output.metadata["committed_state_before_turn"] == {"clean": True}
     assert first_output.metadata["committed_state_snapshot"] == {"payments": []}
+    assert first_output.metadata["committed_state_diff"] == [
+        {
+            "schema_version": "1.0.0",
+            "path": "/clean",
+            "kind": "removed",
+            "before": True,
+            "after": None,
+        },
+        {
+            "schema_version": "1.0.0",
+            "path": "/payments",
+            "kind": "added",
+            "before": None,
+            "after": [],
+        },
+    ]
     assert second_output.metadata["committed_state_before_turn"] == {"payments": []}
     assert second_output.metadata["committed_state_snapshot"] == {
         "payments": ["payment-1", "payment-2"]
     }
+    assert second_output.metadata["committed_state_diff"] == [
+        {
+            "schema_version": "1.0.0",
+            "path": "/payments/0",
+            "kind": "added",
+            "before": None,
+            "after": "payment-1",
+        },
+        {
+            "schema_version": "1.0.0",
+            "path": "/payments/1",
+            "kind": "added",
+            "before": None,
+            "after": "payment-2",
+        },
+    ]
 
 
 def test_incomplete_timeout_event_is_rejected_and_quarantined() -> None:
