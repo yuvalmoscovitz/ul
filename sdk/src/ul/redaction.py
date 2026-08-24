@@ -191,6 +191,28 @@ class LocalPseudonymStore:
                 )
         return _PLACEHOLDER_PATTERN.sub(lambda match: decoded[match.group()], value)
 
+    def rehydrate_value(self, value: JsonValue) -> JsonValue:
+        if isinstance(value, str):
+            placeholders = _PLACEHOLDER_PATTERN.findall(value)
+            if len(placeholders) == 1 and placeholders[0] == value:
+                with self._locked_state() as state:
+                    mappings = cast(dict[str, str], state["mappings"])
+                    encoded_value = mappings.get(value)
+                    if encoded_value is None:
+                        raise RedactionBoundaryError()
+                    try:
+                        return cast(
+                            JsonValue, json.loads(base64.b64decode(encoded_value, validate=True))
+                        )
+                    except (ValueError, json.JSONDecodeError):
+                        raise RedactionBoundaryError() from None
+            return self.rehydrate_text(value)
+        if isinstance(value, list):
+            return [self.rehydrate_value(item) for item in value]
+        if isinstance(value, dict):
+            return {key: self.rehydrate_value(item) for key, item in value.items()}
+        return value
+
     def validate_placeholders(self, value: JsonValue) -> None:
         placeholders = tuple(dict.fromkeys(_find_placeholders(value)))
         if not placeholders:
@@ -484,22 +506,27 @@ class RedactedSemanticPipeline:
     def protect_record(
         self, record: InteractionRecord | UserInputRecord
     ) -> InteractionRecord | UserInputRecord:
-        protected_input = self.engine.transform(record.raw_input, location="input").value
-        if not isinstance(protected_input, str):
-            raise RedactionBoundaryError()
         if isinstance(record, InteractionRecord):
+            try:
+                protected_record = record.with_input_value(
+                    self.engine.transform(record.input_value, location="input").value
+                )
+            except ValueError:
+                raise RedactionBoundaryError() from None
             protected_output = self.engine.transform(
                 record.raw_observed_output, location="output"
             ).value
-            return record.model_copy(
-                update={"raw_input": protected_input, "raw_observed_output": protected_output}
-            )
+            return protected_record.model_copy(update={"raw_observed_output": protected_output})
+        protected_input = self.engine.transform(record.raw_input, location="input").value
+        if not isinstance(protected_input, str):
+            raise RedactionBoundaryError()
         return record.model_copy(update={"raw_input": protected_input})
 
     def dry_run(self, record: InteractionRecord | UserInputRecord) -> tuple[RedactionCoverage, ...]:
-        coverage = [
-            self.engine.transform(record.raw_input, location="input", dry_run=True).coverage
-        ]
+        input_value = (
+            record.input_value if isinstance(record, InteractionRecord) else record.raw_input
+        )
+        coverage = [self.engine.transform(input_value, location="input", dry_run=True).coverage]
         if isinstance(record, InteractionRecord):
             coverage.append(
                 self.engine.transform(
@@ -608,7 +635,19 @@ class RehydratingEnvironmentConnection:
                             update={"content": self._engine.store.rehydrate_text(turn.content)}
                         )
                         for turn in case.turns
-                    )
+                    ),
+                    "probe_context": {
+                        **case.probe_context,
+                        **(
+                            {
+                                "ul.target.input": self._engine.store.rehydrate_value(
+                                    case.probe_context["ul.target.input"]
+                                )
+                            }
+                            if "ul.target.input" in case.probe_context
+                            else {}
+                        ),
+                    },
                 }
             )
         except RedactionBoundaryError:

@@ -117,6 +117,38 @@ def test_structured_shorthand_requires_one_text_augmentation_target(tmp_path: Pa
         load_interaction_records(dataset)
 
 
+@pytest.mark.parametrize(
+    ("structured_input", "target", "expected"),
+    (
+        ({"message": "Hello", "tenant": "test"}, "/message", {"message": "Hi", "tenant": "test"}),
+        (["Hello", {"tenant": "test"}], "/0", ["Hi", {"tenant": "test"}]),
+    ),
+)
+def test_structured_shorthand_replaces_top_level_augmentation_target(
+    tmp_path: Path,
+    structured_input: object,
+    target: str,
+    expected: object,
+) -> None:
+    dataset = tmp_path / "interactions.jsonl"
+    dataset.write_text(
+        json.dumps(
+            {
+                "id": "structured",
+                "input": structured_input,
+                "augmentation_target": target,
+                "output": "Hi",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    record = load_interaction_records(dataset)[0]
+
+    assert record.target_input("Hi") == expected
+
+
 def test_shorthand_metadata_is_bounded(tmp_path: Path) -> None:
     dataset = tmp_path / "interactions.jsonl"
     dataset.write_text(

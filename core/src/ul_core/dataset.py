@@ -145,7 +145,8 @@ def resolve_json_pointer(value: JsonValue, pointer: str) -> JsonValue:
 def _replace_json_pointer(value: JsonValue, pointer: str, replacement: str) -> JsonValue:
     copied_value = copy.deepcopy(value)
     tokens = tuple(token.replace("~1", "/").replace("~0", "~") for token in pointer[1:].split("/"))
-    parent = resolve_json_pointer(copied_value, "/" + "/".join(pointer.split("/")[1:-1]))
+    parent_pointer = "/".join(pointer.split("/")[:-1])
+    parent = resolve_json_pointer(copied_value, parent_pointer)
     final_token = tokens[-1]
     if isinstance(parent, dict):
         parent[final_token] = replacement
@@ -203,6 +204,20 @@ class InteractionRecord(UserInputRecord):
         return _replace_json_pointer(
             self.structured_input, self.structured_input_target, selected_value
         )
+
+    @property
+    def input_value(self) -> JsonValue:
+        return self.structured_input if self.structured_input is not None else self.raw_input
+
+    def with_input_value(self, value: JsonValue) -> InteractionRecord:
+        if self.structured_input_target is None:
+            if not isinstance(value, str):
+                raise ValueError("executable input must remain text")
+            return self.model_copy(update={"raw_input": value})
+        selected_input = resolve_json_pointer(value, self.structured_input_target)
+        if not isinstance(selected_input, str) or not selected_input:
+            raise ValueError("structured input target must remain non-empty text")
+        return self.model_copy(update={"raw_input": selected_input, "structured_input": value})
 
     def probe_context(self, selected_text: str | None = None) -> dict[str, JsonValue]:
         if self.structured_input is not None:

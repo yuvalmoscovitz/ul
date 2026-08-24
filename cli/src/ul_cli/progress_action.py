@@ -156,6 +156,9 @@ def _validate_action_argv(
             "--operator",
             "--limit",
             "--repetitions",
+            "--target-working-directory",
+            "--target-interpreter",
+            "--target-environment-variable",
         }
         flag_options = {
             "--allow-insecure-http",

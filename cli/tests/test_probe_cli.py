@@ -12,7 +12,7 @@ import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from types import SimpleNamespace
-from typing import cast
+from typing import Any, cast
 
 import pytest
 import typer
@@ -339,6 +339,15 @@ def test_probe_generates_valid_secret_free_local_target_config(
     config_path = tmp_path / "target.json"
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("CUSTOMER_AGENT_TOKEN", secret_canary)
+    created_runtimes: list[object] = []
+    create_runtime = probe_module.create_campaign_progress_runtime
+
+    def capture_runtime(**arguments: object) -> object:
+        runtime = create_runtime(**arguments)
+        created_runtimes.append(runtime)
+        return runtime
+
+    monkeypatch.setattr(probe_module, "create_campaign_progress_runtime", capture_runtime)
 
     result = runner.invoke(
         app,
@@ -356,10 +365,10 @@ def test_probe_generates_valid_secret_free_local_target_config(
             "--save-target-config",
             str(config_path),
         ],
-        input="n\n",
+        input="y\nn\n",
     )
 
-    assert result.exit_code == 2
+    assert result.exit_code == 0, result.output
     config = load_local_target_config(config_path)
     assert config.environment_allowlist == ("CUSTOMER_AGENT_TOKEN",)
     assert config.working_directory == tmp_path
@@ -367,6 +376,70 @@ def test_probe_generates_valid_secret_free_local_target_config(
     assert secret_canary not in result.output
     if os.name != "nt":
         assert stat.S_IMODE(config_path.stat().st_mode) == 0o600
+    runtime = cast(Any, created_runtimes[0])
+    public_resume_argv = runtime.tracker._next_commands.resume.argv
+    resume_argv = progress_action_module._read_progress_action(public_resume_argv[-1]).argv
+    assert resume_argv[resume_argv.index("--target") + 1] == str(config_path.resolve())
+    assert "--target-working-directory" not in resume_argv
+    assert "--target-interpreter" not in resume_argv
+    assert "--target-environment-variable" not in resume_argv
+
+    reuse_result = runner.invoke(
+        app,
+        ["probe", str(dataset), "--target", str(config_path)],
+        input="y\nn\n",
+    )
+
+    assert reuse_result.exit_code == 0, reuse_result.output
+    assert "Using saved project config" in reuse_result.output
+    assert len((tmp_path / "target-invocations.jsonl").read_text().splitlines()) == 2
+
+
+def test_probe_resume_action_preserves_direct_local_target_options(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _write_callable(tmp_path)
+    dataset = _write_dataset(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("CUSTOMER_AGENT_TOKEN", "private-agent-key")
+    created_runtimes: list[object] = []
+    create_runtime = probe_module.create_campaign_progress_runtime
+
+    def capture_runtime(**arguments: object) -> object:
+        runtime = create_runtime(**arguments)
+        created_runtimes.append(runtime)
+        return runtime
+
+    monkeypatch.setattr(probe_module, "create_campaign_progress_runtime", capture_runtime)
+
+    result = runner.invoke(
+        app,
+        [
+            "probe",
+            str(dataset),
+            "--target",
+            "customer_agent:run",
+            "--target-working-directory",
+            str(tmp_path),
+            "--target-interpreter",
+            sys.executable,
+            "--target-environment-variable",
+            "CUSTOMER_AGENT_TOKEN",
+        ],
+        input="y\nn\n",
+    )
+
+    assert result.exit_code == 0, result.output
+    runtime = cast(Any, created_runtimes[0])
+    public_resume_argv = runtime.tracker._next_commands.resume.argv
+    resume_argv = progress_action_module._read_progress_action(public_resume_argv[-1]).argv
+    assert resume_argv[resume_argv.index("--target") + 1] == "customer_agent:run"
+    assert resume_argv[resume_argv.index("--target-working-directory") + 1] == str(tmp_path)
+    assert resume_argv[resume_argv.index("--target-interpreter") + 1] == str(
+        Path(sys.executable).resolve()
+    )
+    assert "CUSTOMER_AGENT_TOKEN" in resume_argv
 
 
 def test_probe_generates_valid_secret_free_http_target_config(

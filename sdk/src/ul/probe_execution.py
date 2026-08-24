@@ -611,7 +611,7 @@ class ComposedEnvironmentExecutor:
         execution_context: _ProbeExecutionContext,
     ) -> ProbeResult:
         request_context = _request_context(execution_context, turn_id, correlation_id)
-        target_input = request_context.pop("ul.target.input", content)
+        target_input = execution_context.probe_context.get("ul.target.input", content)
         request = ProbeRequest(
             case_id=case.id,
             session_id=execution_context.session_id,
@@ -839,7 +839,11 @@ class ComposedEnvironmentExecutor:
             session_id=session_id,
             correlation_id=correlation_id,
             turn_id=turn_id,
-            configuration=case.probe_context,
+            configuration={
+                key: value
+                for key, value in case.probe_context.items()
+                if key != "ul.target.input"
+            },
         )
 
     def _response_only_evidence(
@@ -1058,7 +1062,11 @@ def _request_context(
         attributes["ul.repetition"] = execution_context.repetition
     baggage = ",".join(f"{key}={quote(str(value), safe='')}" for key, value in attributes.items())
     return {
-        **execution_context.probe_context,
+        **{
+            key: value
+            for key, value in execution_context.probe_context.items()
+            if key != "ul.target.input"
+        },
         **attributes,
         "trace_id": trace_id,
         "span_id": span_id,

@@ -858,6 +858,11 @@ def probe(
         )
         if save_target_config is not None:
             _save_generated_target_config(save_target_config, resolved_target.config)
+            resolved_target = _resolve_configured_target(
+                save_target_config.resolve(),
+                allow_insecure_http=allow_insecure_http,
+                explicit_artifacts=tuple(target_artifact or ()),
+            )
         existing_config = _check_probe_config_binding(data, resolved_target)
         try:
             os.lstat(_probe_target_lock_path(resolved_target))
@@ -911,14 +916,12 @@ def probe(
                 plan, settings, resolved_target, case_limit=limit
             )
             checkpoint_path = _probe_checkpoint_path(output)
-            target_path = Path(target)
-            action_target = str(target_path.resolve()) if target_path.is_file() else target
             resume_argv = [
                 "ul",
                 "probe",
                 str(data.resolve()),
                 "--target",
-                action_target,
+                resolved_target.reference,
                 "--output",
                 str(output.resolve()),
                 "--confirm-target",
@@ -933,18 +936,28 @@ def probe(
             for operator_reference in selected_operator_ids:
                 resume_argv.extend(("--operator", operator_reference))
             resume_argv.extend(("--limit", str(limit), "--repetitions", str(repetitions)))
+            if save_target_config is None:
+                if target_working_directory is not None:
+                    resume_argv.extend(
+                        ("--target-working-directory", str(target_working_directory.resolve()))
+                    )
+                if target_interpreter is not None:
+                    resume_argv.extend(("--target-interpreter", str(target_interpreter.resolve())))
+                for name in target_environment_variable or ():
+                    resume_argv.extend(("--target-environment-variable", name))
             if allow_insecure_http:
                 resume_argv.append("--allow-insecure-http")
-            if http_preset is not None:
-                resume_argv.extend(("--http-preset", http_preset))
-            if request_json_template is not None:
-                resume_argv.extend(("--request-json-template", request_json_template))
-            if response_json_pointer is not None:
-                resume_argv.extend(("--response-json-pointer", response_json_pointer))
-            if agent_model is not None:
-                resume_argv.extend(("--agent-model", agent_model))
-            for mapping in header_from_env or ():
-                resume_argv.extend(("--header-from-env", mapping))
+            if save_target_config is None:
+                if http_preset is not None:
+                    resume_argv.extend(("--http-preset", http_preset))
+                if request_json_template is not None:
+                    resume_argv.extend(("--request-json-template", request_json_template))
+                if response_json_pointer is not None:
+                    resume_argv.extend(("--response-json-pointer", response_json_pointer))
+                if agent_model is not None:
+                    resume_argv.extend(("--agent-model", agent_model))
+                for mapping in header_from_env or ():
+                    resume_argv.extend(("--header-from-env", mapping))
             if diagnostic_artifact is not None:
                 resume_argv.extend(("--diagnostic-artifact", str(diagnostic_artifact.resolve())))
             if show_smoke_response:
@@ -1322,16 +1335,21 @@ def _resolve_configured_target(
     allow_insecure_http: bool,
     explicit_artifacts: tuple[Path, ...],
 ) -> _ResolvedTarget:
+    canonical_path = path.resolve()
     try:
-        local_target = resolve_local_target(str(path), explicit_artifacts=explicit_artifacts)
+        local_target = resolve_local_target(
+            str(canonical_path), explicit_artifacts=explicit_artifacts
+        )
     except ValueError:
-        http_config = load_json_http_environment_config(path)
+        http_config = load_json_http_environment_config(canonical_path)
         validate_json_http_environment_configuration(
             http_config,
             test_environment_confirmed=True,
             allow_insecure_http=allow_insecure_http,
         )
-        return _http_target(str(path), http_config, allow_insecure_http=allow_insecure_http)
+        return _http_target(
+            str(canonical_path), http_config, allow_insecure_http=allow_insecure_http
+        )
     if allow_insecure_http:
         raise ValueError("--allow-insecure-http requires an HTTP URL or config target")
     return _local_target(local_target)
