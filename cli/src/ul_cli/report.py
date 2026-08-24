@@ -618,6 +618,38 @@ def _print_human_report(report: UnifiedReport, evidence: Path) -> None:
         )
         if finding.stability is not None:
             typer.echo(f"  Stability: {finding.stability}")
+        if finding.cross_examination is not None:
+            cross_examination = finding.cross_examination
+            typer.echo("  Cross-examination:")
+            typer.echo("    Historical output: reference evidence only; not a correctness oracle")
+            typer.echo(
+                "    Baseline drift: "
+                f"{cross_examination.baseline_drift.replace('_', ' ')} "
+                "(descriptive divergence; not an agent failure)"
+            )
+            typer.echo(
+                "    Augmentation sensitivity: "
+                f"{cross_examination.augmentation_sensitivity.replace('_', ' ')}"
+            )
+            typer.echo(
+                "    Intrinsic instability: "
+                f"{cross_examination.intrinsic_instability.replace('_', ' ')}"
+            )
+            typer.echo(
+                "    Evidence level: "
+                f"{cross_examination.evidence_level.replace('_', ' ')}; "
+                f"material deltas={cross_examination.material_delta_count}"
+            )
+            typer.echo(
+                "    Fresh baseline repetitions: "
+                f"{cross_examination.current_baseline.observed_repetitions}/"
+                f"{cross_examination.current_baseline.requested_repetitions} observed"
+            )
+            typer.echo(
+                "    Variation repetitions: "
+                f"{cross_examination.variation.observed_repetitions}/"
+                f"{cross_examination.variation.requested_repetitions} observed"
+            )
         if finding.violated_repetitions is not None:
             typer.echo(f"  Violated repetitions: {finding.violated_repetitions}")
         if finding.next_action == "review_dataset_finding":

@@ -32,9 +32,11 @@ from ul_core.evaluation import EnvironmentStateEvidence, ExecutionEvidence
 from ul_cli.finding_reference import finding_public_reference
 from ul_cli.report_contract import (
     CapturedJson,
+    CrossExaminationArm,
     EvidenceArtifact,
     EvidencePointer,
     FindingCategory,
+    FindingCrossExamination,
     FindingEvidencePackage,
     FindingPrivateReferences,
     FindingRepetition,
@@ -98,6 +100,8 @@ class FindingAdapterContext:
 class _ReceiptBuild:
     receipt: RunReceipt
     input_pointer_id: str
+    response_pointer_id: str | None
+    historical_reference_pointer_id: str | None
     category_pointer_ids: tuple[str, ...]
     rule_definition_pointer_id: str | None = None
     artifacts: tuple[EvidenceArtifact, ...] = ()
@@ -146,6 +150,7 @@ def adapt_dataset_behavior_finding(
                 category=finding.category if evidence.source_value is not None else None,
                 category_value=evidence.source_value,
                 context=context,
+                historical_reference_value=result.source.raw_observed_output,
             )
         )
         probe_receipts.append(
@@ -170,6 +175,9 @@ def adapt_dataset_behavior_finding(
         source_receipts=source_receipts,
         probe_receipts=probe_receipts,
         repetition_evidence=repetition_evidence,
+        baseline_stability=result.baseline.trial_set.stability,
+        variation_stability=trial_set.stability,
+        baseline_drift=_baseline_drift_signal(result),
         context=context,
     )
 
@@ -473,6 +481,7 @@ def _dataset_receipt(
     category_json_pointer: str = "",
     context: FindingAdapterContext,
     rule_definition: DatasetInvariantRule | None = None,
+    historical_reference_value: JsonValue | None = None,
 ) -> _ReceiptBuild:
     if execution_evidence is not None:
         return _execution_receipt(
@@ -485,6 +494,7 @@ def _dataset_receipt(
             category_value=category_value,
             category_json_pointer=category_json_pointer,
             rule_definition=rule_definition,
+            historical_reference_value=historical_reference_value,
         )
     if target_output is None:
         return _unavailable_receipt(
@@ -515,13 +525,13 @@ def _dataset_receipt(
         state_after_authority="invoker_self_reported",
         environment_source_id=context.invoker_source_id,
         artifact=target_output,
-        response_json_pointer="/raw_output",
         lifecycle_json_pointer=None,
         context=context,
         category=category,
         category_value=category_value,
         category_json_pointer=category_json_pointer,
         rule_definition=rule_definition,
+        historical_reference_value=historical_reference_value,
         limitations=("model_provenance_unavailable",),
     )
 
@@ -580,6 +590,7 @@ def _execution_receipt(
     category_value: JsonValue | None = None,
     category_json_pointer: str = "",
     rule_definition: DatasetInvariantRule | None = None,
+    historical_reference_value: JsonValue | None = None,
 ) -> _ReceiptBuild:
     state_before = (
         execution_evidence.initial_state.value
@@ -644,12 +655,12 @@ def _execution_receipt(
         category_json_pointer=category_json_pointer,
         rule_definition=rule_definition,
         target_config_sha256=execution_evidence.environment_config_sha256,
-        response_json_pointer="/final_response",
         state_before_json_pointer="/initial_state/value",
         state_after_json_pointer="/final_state/value",
         lifecycle_json_pointer="/lifecycle",
         limitations=tuple(receipt_limitations),
         execution_available=execution_available,
+        historical_reference_value=historical_reference_value,
     )
 
 
@@ -700,12 +711,12 @@ def _receipt_from_values(
     category_json_pointer: str,
     rule_definition: DatasetInvariantRule | None,
     target_config_sha256: str | None = None,
-    response_json_pointer: str = "/response",
     state_before_json_pointer: str = "/state_before",
     state_after_json_pointer: str = "/state_after",
     lifecycle_json_pointer: str | None = "/lifecycle",
     limitations: tuple[str, ...] = (),
     execution_available: bool = True,
+    historical_reference_value: JsonValue | None = None,
 ) -> _ReceiptBuild:
     pointers: list[EvidencePointer] = []
     retained_artifacts: dict[str, EvidenceArtifact] = {}
@@ -765,10 +776,23 @@ def _receipt_from_values(
     if response_value is not None:
         response_pointer_id = add_pointer(
             kind="response",
-            json_pointer=response_json_pointer,
+            json_pointer="",
             pointer_arm=arm,
             authority=response_authority,
             source_id=response_source_id,
+            pointer_artifact=response_value,
+            retain_artifact=True,
+        )
+    historical_reference_pointer_id = None
+    if historical_reference_value is not None:
+        historical_reference_pointer_id = add_pointer(
+            kind="response",
+            json_pointer="",
+            pointer_arm="shared",
+            authority="customer_declared",
+            source_id=context.customer_source_id,
+            pointer_artifact=historical_reference_value,
+            retain_artifact=True,
         )
     lifecycle_pointer_ids: tuple[str, ...] = ()
     if lifecycle_json_pointer is not None:
@@ -878,6 +902,15 @@ def _receipt_from_values(
             evidence_pointer_id=input_pointer_id,
             value=_bounded_capture_json(input_value),
         ),
+        historical_reference_response=(
+            ReceiptEvidenceValue(
+                evidence_pointer_id=historical_reference_pointer_id,
+                value=_bounded_capture_json(historical_reference_value),
+            )
+            if historical_reference_pointer_id is not None
+            and historical_reference_value is not None
+            else None
+        ),
         response=(
             ReceiptEvidenceValue(
                 evidence_pointer_id=response_pointer_id,
@@ -923,6 +956,8 @@ def _receipt_from_values(
     return _ReceiptBuild(
         receipt=build_run_receipt(content),
         input_pointer_id=input_pointer_id,
+        response_pointer_id=response_pointer_id,
+        historical_reference_pointer_id=historical_reference_pointer_id,
         category_pointer_ids=category_pointer_ids,
         rule_definition_pointer_id=rule_definition_pointer_id,
         artifacts=tuple(sorted(retained_artifacts.values(), key=lambda item: item.artifact_sha256)),
@@ -941,6 +976,9 @@ def _build_behavior_package(
     source_receipts: list[_ReceiptBuild],
     probe_receipts: list[_ReceiptBuild],
     repetition_evidence: list[_BehaviorRepetitionEvidence],
+    baseline_stability: Literal["stable", "unstable", "inconclusive"],
+    variation_stability: Literal["stable", "unstable", "inconclusive"],
+    baseline_drift: Literal["observed", "not_observed", "inconclusive"],
     context: FindingAdapterContext,
 ) -> FindingEvidencePackage:
     repetitions: list[FindingRepetition] = []
@@ -1004,6 +1042,140 @@ def _build_behavior_package(
         rule_definition_pointer_ids=(),
         private_rule_id=None,
         private_rule_version=None,
+        cross_examination=_dataset_cross_examination(
+            operator_id=operator_id,
+            operator_version=operator_version,
+            source_receipts=source_receipts,
+            probe_receipts=probe_receipts,
+            material_delta_pointer_ids=observed_delta.evidence_pointer_ids,
+            baseline_stability=baseline_stability,
+            variation_stability=variation_stability,
+            baseline_drift=baseline_drift,
+            context=context,
+        ),
+    )
+
+
+def _baseline_drift_signal(
+    result: DatasetEvaluationResult,
+) -> Literal["observed", "not_observed", "inconclusive"]:
+    if result.baseline.trial_set.stability != "stable":
+        return "inconclusive"
+    current_baseline_frame = result.baseline.trial_set.representative_frame
+    if current_baseline_frame is None:
+        return "inconclusive"
+    historical_frame = result.augmentation.source_frames[0]
+    try:
+        drift_deltas = compare_action_outcomes(
+            historical_frame,
+            current_baseline_frame,
+            result.source.raw_input,
+            grounding_frame=historical_frame,
+        )
+    except ValueError:
+        return "inconclusive"
+    return "observed" if drift_deltas else "not_observed"
+
+
+def _dataset_cross_examination(
+    *,
+    operator_id: str,
+    operator_version: str,
+    source_receipts: list[_ReceiptBuild],
+    probe_receipts: list[_ReceiptBuild],
+    material_delta_pointer_ids: tuple[str, ...],
+    baseline_stability: Literal["stable", "unstable", "inconclusive"],
+    variation_stability: Literal["stable", "unstable", "inconclusive"],
+    baseline_drift: Literal["observed", "not_observed", "inconclusive"],
+    context: FindingAdapterContext,
+) -> FindingCrossExamination:
+    historical_pointer_ids = tuple(
+        sorted(
+            {
+                pointer_id
+                for receipt in source_receipts
+                if receipt.historical_reference_pointer_id is not None
+                for pointer_id in (receipt.historical_reference_pointer_id,)
+            }
+        )
+    )
+    current_pointer_ids = tuple(
+        sorted(
+            {
+                pointer_id
+                for receipt in source_receipts
+                if receipt.response_pointer_id is not None
+                for pointer_id in (receipt.response_pointer_id,)
+            }
+        )
+    )
+    variation_pointer_ids = tuple(
+        sorted(
+            {
+                pointer_id
+                for receipt in probe_receipts
+                if receipt.response_pointer_id is not None
+                for pointer_id in (receipt.response_pointer_id,)
+            }
+        )
+    )
+    if not historical_pointer_ids or not current_pointer_ids or not variation_pointer_ids:
+        raise ValueError("response-level cross-examination requires all three evidence arms")
+    baseline_observed = sum(receipt.execution_available for receipt in source_receipts)
+    variation_observed = sum(receipt.execution_available for receipt in probe_receipts)
+    requested = len(source_receipts)
+    incomplete = "inconclusive" in {baseline_stability, variation_stability}
+    unstable = "unstable" in {baseline_stability, variation_stability}
+    return FindingCrossExamination(
+        historical_reference=CrossExaminationArm(
+            role="historical_reference",
+            response_evidence_pointer_ids=historical_pointer_ids,
+            requested_repetitions=0,
+            observed_repetitions=0,
+            inconclusive_repetitions=0,
+            stability="not_applicable",
+        ),
+        current_baseline=CrossExaminationArm(
+            role="current_baseline",
+            response_evidence_pointer_ids=current_pointer_ids,
+            requested_repetitions=requested,
+            observed_repetitions=baseline_observed,
+            inconclusive_repetitions=requested - baseline_observed,
+            stability=baseline_stability,
+        ),
+        variation=CrossExaminationArm(
+            role="variation",
+            response_evidence_pointer_ids=variation_pointer_ids,
+            requested_repetitions=len(probe_receipts),
+            observed_repetitions=variation_observed,
+            inconclusive_repetitions=len(probe_receipts) - variation_observed,
+            stability=variation_stability,
+        ),
+        augmentation_relation=_versioned_ref(
+            context,
+            "operator",
+            operator_id,
+            operator_version,
+        ),
+        baseline_drift=("inconclusive" if baseline_stability == "inconclusive" else baseline_drift),
+        augmentation_sensitivity=("inconclusive" if incomplete or unstable else "observed"),
+        intrinsic_instability=(
+            "inconclusive" if incomplete else "observed" if unstable else "not_observed"
+        ),
+        material_delta_evidence_pointer_ids=material_delta_pointer_ids,
+        evidence_level=(
+            "committed_state_verified"
+            if all(
+                receipt.receipt.content.evidence_scope == "response_and_state"
+                for receipt in (*source_receipts, *probe_receipts)
+            )
+            else "response_observed"
+        ),
+        limitations=(
+            "causality_not_established",
+            "correctness_not_verified",
+            "historical_reference_not_an_oracle",
+        ),
     )
 
 
@@ -1143,6 +1315,7 @@ def _package(
     private_rule_version: str | None,
     fixture_id: str | None = None,
     fixture_version: str | None = None,
+    cross_examination: FindingCrossExamination | None = None,
 ) -> FindingEvidencePackage:
     requested = len(repetitions)
     observed = sum(item.outcome == "finding_observed" for item in repetitions)
@@ -1171,6 +1344,19 @@ def _package(
                 *change_probe_pointer_ids,
                 *rule_definition_pointer_ids,
                 *observed_delta.evidence_pointer_ids,
+                *(
+                    (
+                        pointer_id
+                        for arm in (
+                            cross_examination.historical_reference,
+                            cross_examination.current_baseline,
+                            cross_examination.variation,
+                        )
+                        for pointer_id in arm.response_evidence_pointer_ids
+                    )
+                    if cross_examination is not None
+                    else ()
+                ),
                 *(
                     pointer_id
                     for repetition in repetitions
@@ -1215,6 +1401,7 @@ def _package(
             source_evidence_pointer_ids=change_source_pointer_ids,
             probe_evidence_pointer_ids=change_probe_pointer_ids,
         ),
+        cross_examination=cross_examination,
         observed_deltas=(observed_delta,),
         violated_rule=violated_rule,
         rule_definition_evidence_pointer_ids=rule_definition_pointer_ids,

@@ -63,6 +63,7 @@ from ul_cli.pattern_identity import (
 from ul_cli.report_contract import (
     FailurePattern,
     FindingCategory,
+    FindingCrossExaminationSummary,
     FindingReviewStatus,
     FindingSeverity,
     FindingSummary,
@@ -349,6 +350,7 @@ class _Case(_StrictModel):
     variation_rejection_reasons: list[str]
     observations: _Observations | None
     findings: list[_Finding]
+    cross_examination: FindingCrossExaminationSummary | None = None
     inconclusive_reasons: list[str]
 
 
@@ -363,6 +365,7 @@ class _EvidenceRecord(_StrictModel):
         "1.9.0",
         "1.10.0",
         "1.11.0",
+        "1.12.0",
     ]
     evaluation_mode: Literal["variance"] | None = None
     interaction_id: str
@@ -382,11 +385,16 @@ class _EvidenceRecord(_StrictModel):
 
     @model_validator(mode="after")
     def validate_invariant_evaluation(self) -> Self:
-        current_schemas = {"1.8.0", "1.9.0", "1.10.0", "1.11.0"}
-        if self.schema_version not in {"1.10.0", "1.11.0"} and "pattern_facets" in (
+        current_schemas = {"1.8.0", "1.9.0", "1.10.0", "1.11.0", "1.12.0"}
+        if self.schema_version not in {"1.10.0", "1.11.0", "1.12.0"} and "pattern_facets" in (
             self.model_fields_set
         ):
             raise ValueError("vertical pattern facets require evidence schema 1.10.0")
+        if self.schema_version == "1.12.0":
+            if any(case.cross_examination is None for case in self.cases):
+                raise ValueError("evidence schema 1.12.0 requires case cross-examination")
+        elif any("cross_examination" in case.model_fields_set for case in self.cases):
+            raise ValueError("legacy evidence cannot contain cross-examination")
         if self.schema_version in current_schemas and self.evaluation_mode is None:
             raise ValueError(f"evidence schema {self.schema_version} requires an evaluation mode")
         if self.schema_version in current_schemas and (
@@ -413,6 +421,7 @@ class _EvidenceRecord(_StrictModel):
                 "1.9.0",
                 "1.10.0",
                 "1.11.0",
+                "1.12.0",
             }
             and "run_context" in self.model_fields_set
         ):
@@ -432,6 +441,7 @@ class _EvidenceRecord(_StrictModel):
             "1.9.0",
             "1.10.0",
             "1.11.0",
+            "1.12.0",
         }:
             raise ValueError("extended invariant results require evidence schema 1.6.0")
         if (
@@ -590,6 +600,7 @@ def validate_dataset_resume_evidence(
                 "1.9.0",
                 "1.10.0",
                 "1.11.0",
+                "1.12.0",
             }
             or evidence.run_context is None
         ):
@@ -998,6 +1009,7 @@ def _summarize_dataset_evidence(
                     evidence_limitations=("semantic_model_output_not_independently_verified",),
                     next_action=next_action,
                     summary=summary,
+                    cross_examination=indexed_finding.case.cross_examination,
                 )
             )
             semantic_finding = indexed_finding.semantic_finding
@@ -1088,6 +1100,7 @@ def _summarize_dataset_evidence(
                         summary=(
                             "The changed input produced inconsistent behavior across repetitions."
                         ),
+                        cross_examination=case.cross_examination,
                     )
                 )
 
@@ -2094,7 +2107,7 @@ def _load_evidence(path: Path) -> list[_LoadedEvidenceRecord]:
                 )
             )
     except (ValidationError, ValueError):
-        raise _ReviewInputError("evidence is not valid UL schema through 1.11.0 JSONL") from None
+        raise _ReviewInputError("evidence is not valid UL schema through 1.12.0 JSONL") from None
     return records
 
 

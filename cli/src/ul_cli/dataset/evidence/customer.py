@@ -12,6 +12,7 @@ from ul import (
     DatasetEvaluationTrialSet,
     DatasetTargetLifecycleFailure,
 )
+from ul.dataset_evaluation import compare_action_outcomes
 from ul.dataset_invariants import DatasetInvariantEvaluation
 from ul_core.dataset import ObservedOutcome
 
@@ -72,6 +73,7 @@ def build_customer_evidence_record(
                     operator_version=case.candidate.operator_version,
                     augmented_input=case.candidate.augmented_input,
                 ),
+                "cross_examination": _customer_cross_examination(result, case),
                 "inconclusive_reasons": list(case.inconclusive_reasons),
             }
         )
@@ -83,7 +85,7 @@ def build_customer_evidence_record(
     if uses_extended_invariants and run_context is None:
         raise ValueError("extended invariant evidence requires a resumable run context")
     evidence: dict[str, JsonValue] = {
-        "schema_version": "1.11.0" if augmentation_target is not None else "1.10.0",
+        "schema_version": "1.12.0",
         "evaluation_mode": evaluation_mode,
         "interaction_id": result.source.id,
         **(
@@ -134,6 +136,106 @@ def _customer_pattern_facets(metadata: dict[str, JsonValue]) -> PatternVerticalF
     if raw_facets is None:
         return None
     return PatternVerticalFacets.model_validate(raw_facets)
+
+
+def _customer_cross_examination(
+    result: DatasetEvaluationResult,
+    case: DatasetEvaluationCase,
+) -> JsonValue:
+    baseline_trial_set = result.baseline.trial_set
+    variation_trial_set = case.trial_set
+    baseline_incomplete = baseline_trial_set.stability == "inconclusive"
+    comparison_incomplete = baseline_incomplete or (
+        variation_trial_set is None or variation_trial_set.stability == "inconclusive"
+    )
+    unstable = baseline_trial_set.stability == "unstable" or (
+        variation_trial_set is not None and variation_trial_set.stability == "unstable"
+    )
+    current_baseline_frame = getattr(baseline_trial_set, "representative_frame", None)
+    augmentation = getattr(result, "augmentation", None)
+    source_frames = getattr(augmentation, "source_frames", ())
+    if baseline_incomplete or current_baseline_frame is None or not source_frames:
+        baseline_drift = "inconclusive"
+    else:
+        historical_frame = source_frames[0]
+        try:
+            baseline_deltas = compare_action_outcomes(
+                historical_frame,
+                current_baseline_frame,
+                result.source.raw_input,
+                grounding_frame=historical_frame,
+            )
+        except ValueError:
+            baseline_drift = "inconclusive"
+        else:
+            baseline_drift = "observed" if baseline_deltas else "not_observed"
+    augmentation_sensitivity = (
+        "inconclusive"
+        if comparison_incomplete or unstable
+        else "observed"
+        if case.findings
+        else "not_observed"
+    )
+    intrinsic_instability = (
+        "inconclusive" if comparison_incomplete else "observed" if unstable else "not_observed"
+    )
+    executed_trial_sets = tuple(
+        trial_set
+        for trial_set in (baseline_trial_set, variation_trial_set)
+        if trial_set is not None
+    )
+    evidence_level = (
+        "committed_state_verified"
+        if executed_trial_sets
+        and all(
+            (execution_evidence := getattr(trial, "execution_evidence", None)) is not None
+            and execution_evidence.evidence_scope == "response_and_state"
+            for trial_set in executed_trial_sets
+            for trial in trial_set.trials
+        )
+        else "response_observed"
+    )
+    return cast(
+        JsonValue,
+        {
+            "historical_reference_available": True,
+            "current_baseline": _cross_examination_run_summary(baseline_trial_set),
+            "variation": _cross_examination_run_summary(variation_trial_set),
+            "baseline_drift": baseline_drift,
+            "augmentation_sensitivity": augmentation_sensitivity,
+            "intrinsic_instability": intrinsic_instability,
+            "material_delta_count": len(case.findings),
+            "evidence_level": evidence_level,
+            "limitations": [
+                "causality_not_established",
+                "correctness_not_verified",
+                "historical_reference_not_an_oracle",
+            ],
+        },
+    )
+
+
+def _cross_examination_run_summary(trial_set: DatasetEvaluationTrialSet | None) -> JsonValue:
+    if trial_set is None:
+        return cast(
+            JsonValue,
+            {
+                "requested_repetitions": 0,
+                "observed_repetitions": 0,
+                "inconclusive_repetitions": 0,
+                "stability": "inconclusive",
+            },
+        )
+    inconclusive = sum(bool(trial.inconclusive_reasons) for trial in trial_set.trials)
+    return cast(
+        JsonValue,
+        {
+            "requested_repetitions": trial_set.requested_repetitions,
+            "observed_repetitions": trial_set.requested_repetitions - inconclusive,
+            "inconclusive_repetitions": inconclusive,
+            "stability": trial_set.stability,
+        },
+    )
 
 
 def create_customer_evidence_record(

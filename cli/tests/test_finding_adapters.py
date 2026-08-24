@@ -558,6 +558,65 @@ def test_public_occurrences_do_not_disclose_private_workflow_values() -> None:
         assert _PRIVATE_SECRET in package.model_dump_json()
 
 
+def test_dataset_occurrence_cross_examines_all_three_response_arms() -> None:
+    package = adapt_dataset_behavior_finding(
+        _dataset_result(),
+        case_index=0,
+        finding_index=0,
+        context=_context(),
+    )
+
+    cross_examination = package.occurrence.cross_examination
+    assert cross_examination is not None
+    assert cross_examination.baseline_drift == "not_observed"
+    assert cross_examination.augmentation_sensitivity == "observed"
+    assert cross_examination.intrinsic_instability == "not_observed"
+    assert cross_examination.evidence_level == "response_observed"
+    assert cross_examination.current_baseline.requested_repetitions == 2
+    assert cross_examination.variation.requested_repetitions == 2
+    assert cross_examination.material_delta_evidence_pointer_ids
+    assert cross_examination.limitations == (
+        "causality_not_established",
+        "correctness_not_verified",
+        "historical_reference_not_an_oracle",
+    )
+
+
+def test_baseline_drift_is_descriptive_and_can_coexist_with_sensitivity() -> None:
+    result = _dataset_result()
+    historical_action = ObservedOutcome(
+        id="historical-payment",
+        confidence=1,
+        status="observed",
+        position=0,
+        kind="action",
+        predicate="historical_payment",
+    )
+    historical_frame = result.augmentation.source_frames[0].model_copy(
+        update={"outcomes": (historical_action,)}
+    )
+    result = result.model_copy(
+        update={
+            "augmentation": result.augmentation.model_copy(
+                update={"source_frames": (historical_frame,)}
+            )
+        }
+    )
+
+    package = adapt_dataset_behavior_finding(
+        result,
+        case_index=0,
+        finding_index=0,
+        context=_context(),
+    )
+
+    cross_examination = package.occurrence.cross_examination
+    assert cross_examination is not None
+    assert cross_examination.baseline_drift == "observed"
+    assert cross_examination.augmentation_sensitivity == "observed"
+    assert "correctness_not_verified" in cross_examination.limitations
+
+
 @pytest.mark.parametrize(
     "category",
     (
