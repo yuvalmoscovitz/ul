@@ -153,9 +153,11 @@ def _validate_action_argv(
             "--response-json-pointer",
             "--agent-model",
             "--header-from-env",
+            "--operator",
+            "--limit",
+            "--repetitions",
         }
         flag_options = {
-            "--confirmation-run",
             "--allow-insecure-http",
             "--show-smoke-response",
             "--progress-json",
@@ -168,16 +170,20 @@ def _validate_action_argv(
             "--resume-checkpoint",
             "--resume-checkpoint-sha256",
         }
+        single_value_options = required | {"--limit", "--repetitions"}
         seen_required: set[str] = set()
+        seen_single_value_options: set[str] = set()
         index = 3
         while index < len(argv):
             option = argv[index]
             if option in value_options:
                 if index + 1 >= len(argv) or argv[index + 1].startswith("--"):
                     raise ValueError("probe resume option is missing its value")
+                if option in single_value_options:
+                    if option in seen_single_value_options:
+                        raise ValueError("probe resume repeats a single-value option")
+                    seen_single_value_options.add(option)
                 if option in required:
-                    if option in seen_required:
-                        raise ValueError("probe resume repeats a required option")
                     seen_required.add(option)
                 index += 2
                 continue

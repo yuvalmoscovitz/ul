@@ -109,10 +109,11 @@ from ul_cli.pattern_identity import (
 )
 from ul_cli.report import report_evidence
 
-_PILOT_LIMIT = 10
-_PILOT_REPETITIONS = 1
-_CONFIRMATION_REPETITIONS = 3
-_PILOT_OPERATOR = "input.surface.typing_noise"
+_DEFAULT_LIMIT = 10
+_DEFAULT_REPETITIONS = 1
+_DEFAULT_OPERATOR = "input.surface.typing_noise"
+_MAXIMUM_DATASET_RECORDS = 100
+_MAXIMUM_REPETITIONS = 100
 _TARGET_TIMEOUT_SECONDS = 30.0
 _PROJECT_DIRECTORY = ".ul"
 _PROBE_CONFIG = "probe.json"
@@ -138,16 +139,13 @@ class _StrictModel(BaseModel):
 
 
 class ProbeProjectConfig(_StrictModel):
-    schema_version: Literal[2] = 2
+    schema_version: Literal[3] = 3
     dataset: str = Field(min_length=1)
     target: str = Field(min_length=1)
     target_kind: Literal["python_callable", "command", "http"]
     target_config_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     target_confirmation_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     outcome_projection_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
-    operator: Literal["input.surface.typing_noise"] = _PILOT_OPERATOR
-    limit: Literal[10] = _PILOT_LIMIT
-    repetitions: Literal[1] = _PILOT_REPETITIONS
 
 
 class _ArtifactIdentity(_StrictModel):
@@ -178,6 +176,8 @@ class _CampaignConfirmation(_StrictModel):
     semantic_provider_type: str
     semantic_endpoint_sha256: str
     semantic_settings_sha256: str
+    campaign_plan_sha256: str
+    case_limit: int = Field(ge=1, le=_MAXIMUM_DATASET_RECORDS)
     data_policy: dict[str, object]
     command_environment_api_requests: int
     semantic_model_calls: int
@@ -697,6 +697,28 @@ def probe(
         Path,
         typer.Option(help="New normal UL evidence JSONL file."),
     ] = Path(_DEFAULT_EVIDENCE),
+    operator: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--operator",
+            help=(
+                "Available dataset augmentation ID; repeat as needed. Run "
+                "'ul augmentations list --mode dataset_variation' for values."
+            ),
+        ),
+    ] = None,
+    limit: Annotated[
+        int,
+        typer.Option(min=1, max=_MAXIMUM_DATASET_RECORDS, help="Interactions to evaluate."),
+    ] = _DEFAULT_LIMIT,
+    repetitions: Annotated[
+        int,
+        typer.Option(
+            min=1,
+            max=_MAXIMUM_REPETITIONS,
+            help="Target executions per original input and accepted variation.",
+        ),
+    ] = _DEFAULT_REPETITIONS,
     target_artifact: Annotated[
         list[Path] | None,
         typer.Option(help="Additional command worker artifact to hash and bind; repeat as needed."),
@@ -738,13 +760,6 @@ def probe(
             help="Non-interactively authorize this exact displayed campaign digest.",
         ),
     ] = None,
-    confirmation_run: Annotated[
-        bool,
-        typer.Option(
-            "--confirmation-run",
-            help="After a pilot, repeat every original/probe arm three times.",
-        ),
-    ] = False,
     allow_insecure_http: Annotated[
         bool,
         typer.Option(help="Allow a local plain-HTTP test target."),
@@ -788,12 +803,16 @@ def probe(
         typer.Option("--resume-checkpoint-sha256", hidden=True),
     ] = None,
 ) -> None:
-    """Smoke a real target, then optionally run one bounded active-probe pilot."""
+    """Smoke a real target, then optionally run one bounded active-probe campaign."""
     progress_runtime: CampaignProgressRuntime | None = None
     resolved_target: _ResolvedTarget | None = None
     target_lock_descriptor: int | None = None
     try:
-        records = _load_pilot_records(data)
+        records = _load_campaign_records(data, limit=limit)
+        try:
+            selected_operator_ids = validate_operator_ids(operator or [_DEFAULT_OPERATOR])
+        except DatasetInputError as error:
+            raise typer.BadParameter(str(error), param_hint="--operator") from None
         resolved_target = _resolve_target(
             target,
             allow_insecure_http=allow_insecure_http,
@@ -846,8 +865,6 @@ def probe(
         try:
             settings = load_dataset_semantic_settings()
             validate_model_input_bounds(records, settings.max_input_chars)
-            selected_operator_ids = validate_operator_ids([_PILOT_OPERATOR])
-            repetitions = _CONFIRMATION_REPETITIONS if confirmation_run else _PILOT_REPETITIONS
             plan = create_dataset_campaign_plan(
                 records=records,
                 selected_operator_ids=selected_operator_ids,
@@ -855,7 +872,9 @@ def probe(
                 target_calls_per_execution=resolved_target.calls_per_execution,
                 settings=settings,
             )
-            campaign_confirmation = _campaign_confirmation(plan, settings, resolved_target)
+            campaign_confirmation = _campaign_confirmation(
+                plan, settings, resolved_target, case_limit=limit
+            )
             checkpoint_path = _probe_checkpoint_path(output)
             target_path = Path(target)
             action_target = str(target_path.resolve()) if target_path.is_file() else target
@@ -876,8 +895,9 @@ def probe(
             ]
             for artifact in target_artifact or ():
                 resume_argv.extend(("--target-artifact", str(artifact.resolve())))
-            if confirmation_run:
-                resume_argv.append("--confirmation-run")
+            for operator_reference in selected_operator_ids:
+                resume_argv.extend(("--operator", operator_reference))
+            resume_argv.extend(("--limit", str(limit), "--repetitions", str(repetitions)))
             if allow_insecure_http:
                 resume_argv.append("--allow-insecure-http")
             if http_preset is not None:
@@ -1031,7 +1051,12 @@ def probe(
         remaining_target_seconds = _validate_campaign_target_budget(
             plan, resolved_target, smoke_result.elapsed_seconds
         )
-        _print_pilot_budget(plan, campaign_confirmation)
+        _print_campaign_budget(
+            plan,
+            campaign_confirmation,
+            selected_operator_ids=selected_operator_ids,
+            limit=limit,
+        )
         if not _confirm_paid_execution(
             confirmation=campaign_confirmation,
             confirmed_digest=confirm_paid_execution,
@@ -1083,6 +1108,9 @@ def probe(
                 response_json_pointer=response_json_pointer,
                 agent_model=agent_model,
                 header_from_env=tuple(header_from_env or ()),
+                selected_operator_ids=selected_operator_ids,
+                limit=limit,
+                repetitions=repetitions,
             )
             console.print("")
             report_evidence(output)
@@ -1126,9 +1154,11 @@ def probe(
             _close_probe_target_lock(target_lock_descriptor)
 
 
-def _load_pilot_records(data: Path) -> tuple[InteractionRecord, ...]:
+def _load_campaign_records(
+    data: Path, *, limit: int = _DEFAULT_LIMIT
+) -> tuple[InteractionRecord, ...]:
     try:
-        return load_interaction_records(data)[:_PILOT_LIMIT]
+        return load_interaction_records(data)[:limit]
     except (DatasetInputError, ValidationError, ValueError) as error:
         raise ProbeFailure(
             "observation import",
@@ -1728,14 +1758,17 @@ def _validate_campaign_target_budget(
     return remaining
 
 
-def _print_pilot_budget(
+def _print_campaign_budget(
     plan: DatasetCampaignPlan,
     confirmation: _CampaignConfirmation,
+    *,
+    selected_operator_ids: tuple[str, ...],
+    limit: int,
 ) -> None:
     console.print("")
-    console.print("Bounded active-probe pilot")
-    console.print(f"  Source interactions: {len(plan.examples)} (maximum {_PILOT_LIMIT})")
-    console.print(f"  Operator: {_PILOT_OPERATOR}")
+    console.print("Bounded active-probe campaign")
+    console.print(f"  Source interactions: {len(plan.examples)} (limit {limit})")
+    console.print(f"  Operators: {', '.join(selected_operator_ids)}")
     console.print(f"  Repetitions: {plan.calls.repetitions}")
     console.print(f"  Original agent invocations: {plan.calls.baseline}")
     console.print(f"  Probe agent invocations: {plan.calls.variation}")
@@ -1753,6 +1786,7 @@ def _print_pilot_budget(
     console.print(f"  Semantic provider: {confirmation.semantic_provider_id}")
     console.print(f"  Semantic endpoint sha256: {confirmation.semantic_endpoint_sha256}")
     console.print(f"  Semantic settings sha256: {confirmation.semantic_settings_sha256}")
+    console.print(f"  Campaign plan sha256: {confirmation.campaign_plan_sha256}")
     console.print("  Data policy: " + json.dumps(confirmation.data_policy, sort_keys=True))
     console.print(f"  Maximum active wall time: {confirmation.maximum_wall_seconds:.1f} seconds")
     console.print(f"  Campaign confirmation sha256: {_model_sha256(confirmation)}")
@@ -1762,6 +1796,8 @@ def _campaign_confirmation(
     plan: DatasetCampaignPlan,
     settings: DatasetSemanticSettings,
     resolved_target: _ResolvedTarget,
+    *,
+    case_limit: int,
 ) -> _CampaignConfirmation:
     planned_target_seconds = (
         resolved_target.calls_per_execution + plan.calls.repetition_executions
@@ -1797,6 +1833,8 @@ def _campaign_confirmation(
         semantic_provider_type=settings.semantic_provider_type,
         semantic_endpoint_sha256=settings.semantic_endpoint_sha256,
         semantic_settings_sha256=_model_sha256(_semantic_settings_snapshot(settings)),
+        campaign_plan_sha256=_model_sha256(plan),
+        case_limit=case_limit,
         data_policy=data_policy,
         command_environment_api_requests=(
             resolved_target.calls_per_execution + plan.calls.total_environment_api
@@ -2149,6 +2187,9 @@ def _print_stronger_run(
     response_json_pointer: str | None,
     agent_model: str | None,
     header_from_env: tuple[str, ...],
+    selected_operator_ids: tuple[str, ...],
+    limit: int,
+    repetitions: int,
 ) -> None:
     arguments = [
         "ul",
@@ -2158,8 +2199,13 @@ def _print_stronger_run(
         target,
         "--output",
         str(output.with_name(output.stem + "-confirmation.jsonl")),
-        "--confirmation-run",
+        "--limit",
+        str(limit),
+        "--repetitions",
+        str(max(3, repetitions)),
     ]
+    for operator_reference in selected_operator_ids:
+        arguments.extend(("--operator", operator_reference))
     if allow_insecure_http:
         arguments.append("--allow-insecure-http")
     if http_preset is not None:
