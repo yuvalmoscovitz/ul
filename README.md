@@ -233,6 +233,9 @@ an earlier pattern decision is context only. Patterns are
 evidence-navigation aids, not correctness, causation, or root-cause claims. Inspect-only findings,
 such as unstable behavior without a reviewable semantic difference, remain listed separately.
 Use `ul dataset report EVIDENCE.jsonl` when you need the detailed private dataset review surface.
+The private `.ul/review-history.key` authenticates pattern decisions independently of the rotatable
+pattern identity key. Back it up with the project: pattern review history cannot be verified without
+it.
 Trace replay bundles are not supported by `ul report`.
 
 Reviews are appended to a separate audit file. Evidence is never rewritten. The human report and

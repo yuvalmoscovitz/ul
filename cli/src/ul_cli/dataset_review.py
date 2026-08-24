@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
 import os
 import re
@@ -52,9 +53,12 @@ from ul_core.augmentations.definitions import builtin_augmentation_catalog
 
 from ul_cli.pattern_identity import (
     PatternIdentityKeyError,
+    ReviewHistoryKeyError,
     load_pattern_identity_key,
+    load_review_history_key,
     pattern_evidence_reference,
     pattern_mechanism_pseudonym,
+    pattern_review_record_hmac,
 )
 from ul_cli.report_contract import (
     FailurePattern,
@@ -745,8 +749,9 @@ class PatternEvidenceBinding(_StrictModel):
 
 class PatternReviewRecord(_StrictModel):
     record_type: Literal["pattern_review"] = "pattern_review"
-    schema_version: Literal["1.0.0"] = "1.0.0"
+    schema_version: Literal["1.1.0"] = "1.1.0"
     pattern_review_id: str = Field(pattern=_PATTERN_REVIEW_ID_PATTERN)
+    record_hmac_sha256: str = Field(pattern=_SHA256_PATTERN)
     grouping_evidence_sha256: str = Field(pattern=_SHA256_PATTERN)
     pattern_snapshot: FailurePattern
     status: ReviewStatus
@@ -814,6 +819,9 @@ class PatternReviewRecord(_StrictModel):
             )
             for decision in self.occurrence_decisions
         )
+
+    def hmac_payload(self) -> dict[str, Any]:
+        return self.model_dump(mode="json", exclude={"record_hmac_sha256"})
 
     def summary(self) -> PatternReviewSummary:
         return PatternReviewSummary(
@@ -884,7 +892,12 @@ def load_confirmed_dataset_finding(
     if selected is None:
         raise ValueError("finding ID was not found in the evidence")
     review_records = _load_reviews(reviews_path)
-    _validate_review_history(review_records, findings, evidence_records)
+    _validate_review_history(
+        review_records,
+        findings,
+        evidence_records,
+        review_history_key=_review_history_key_for_records(evidence_path, review_records),
+    )
     active_review = _active_reviews(review_records).get(finding_id)
     if active_review is None or active_review.status != "confirmed":
         raise ValueError("finding must have an active confirmed review")
@@ -920,7 +933,7 @@ def summarize_dataset_evidence(
             reviews,
             pattern_identity_key=pattern_identity_key,
         )
-    except _ReviewInputError as error:
+    except (PatternIdentityKeyError, ReviewHistoryKeyError, _ReviewInputError) as error:
         raise ReportInputError(str(error)) from None
     except (ValidationError, ValueError):
         raise ReportInputError("dataset evidence cannot be summarized safely") from None
@@ -936,7 +949,12 @@ def _summarize_dataset_evidence(
     evaluation_mode = _dataset_evaluation_mode(evidence_records)
     review_records = _load_reviews(reviews or _default_reviews_path(evidence))
     indexed_findings = _index_findings(evidence_records)
-    _validate_review_history(review_records, indexed_findings, evidence_records)
+    _validate_review_history(
+        review_records,
+        indexed_findings,
+        evidence_records,
+        review_history_key=_review_history_key_for_records(evidence, review_records),
+    )
     active_reviews = _active_reviews(review_records)
 
     finding_summaries: list[FindingSummary] = []
@@ -1559,7 +1577,12 @@ def report_dataset_evidence(
         evidence_records = _load_evidence(evidence)
         review_records = _load_reviews(reviews_path)
         findings = _index_findings(evidence_records)
-        _validate_review_history(review_records, findings, evidence_records)
+        _validate_review_history(
+            review_records,
+            findings,
+            evidence_records,
+            review_history_key=_review_history_key_for_records(evidence, review_records),
+        )
         sensitive_lines: tuple[str, ...] = ()
         if show_sensitive_values:
             if sensitive_finding_id is None:
@@ -1577,7 +1600,7 @@ def report_dataset_evidence(
             )
         elif sensitive_finding_id is not None:
             raise _ReviewInputError("--finding is valid only with --show-sensitive-values")
-    except _ReviewInputError as error:
+    except (PatternIdentityKeyError, ReviewHistoryKeyError, _ReviewInputError) as error:
         raise typer.BadParameter(str(error)) from None
 
     active_reviews = _active_reviews(review_records)
@@ -1763,7 +1786,12 @@ def review_dataset_finding(
         )
         with _locked_reviews_file(reviews_path) as locked_reviews:
             review_records = _read_reviews_descriptor(locked_reviews.descriptor)
-            _validate_review_history(review_records, findings, evidence_records)
+            _validate_review_history(
+                review_records,
+                findings,
+                evidence_records,
+                review_history_key=_review_history_key_for_records(evidence, review_records),
+            )
             active_review = _active_reviews(review_records).get(finding_id)
             if active_review is None and supersedes is not None:
                 raise _ReviewInputError(
@@ -1786,7 +1814,12 @@ def review_dataset_finding(
             ):
                 raise _ReviewInputError("review file exceeds the 10 MB limit")
             _append_review_atomically(locked_reviews, encoded_review)
-    except (ValidationError, _ReviewInputError) as error:
+    except (
+        ValidationError,
+        PatternIdentityKeyError,
+        ReviewHistoryKeyError,
+        _ReviewInputError,
+    ) as error:
         message = "review fields are invalid" if isinstance(error, ValidationError) else str(error)
         raise typer.BadParameter(message) from None
     except _ReviewCommitUncertainError:
@@ -1842,7 +1875,12 @@ def review_dataset_pattern(
         findings = _index_findings(evidence_records)
         review_records = _load_reviews(reviews_path)
         pattern_identity_key = load_pattern_identity_key(evidence)
-        _validate_review_history(review_records, findings, evidence_records)
+        _validate_review_history(
+            review_records,
+            findings,
+            evidence_records,
+            review_history_key=_review_history_key_for_records(evidence, review_records),
+        )
         report = _summarize_dataset_evidence(
             evidence,
             reviews_path,
@@ -1895,6 +1933,7 @@ def review_dataset_pattern(
             return
         if reviewer is None or reason is None:
             raise _ReviewInputError("--status requires --reviewer and --reason")
+        review_history_key = load_review_history_key(evidence)
         reviewed_at = datetime.now(UTC)
         occurrence_decisions: list[PatternOccurrenceDecision] = []
         for finding_id in reviewed_finding_ids:
@@ -1910,6 +1949,7 @@ def review_dataset_pattern(
             )
         pattern_review = PatternReviewRecord(
             pattern_review_id=f"ulpr_{uuid4()}",
+            record_hmac_sha256="0" * 64,
             grouping_evidence_sha256=_indexed_pattern_grouping_sha256(
                 findings[reviewed_finding_ids[0]]
             ),
@@ -1931,6 +1971,14 @@ def review_dataset_pattern(
             reason=reason,
             reviewed_at=reviewed_at,
         )
+        pattern_review = pattern_review.model_copy(
+            update={
+                "record_hmac_sha256": pattern_review_record_hmac(
+                    review_history_key,
+                    pattern_review.hmac_payload(),
+                )
+            }
+        )
         encoded_record = (
             json.dumps(
                 pattern_review.model_dump(mode="json"),
@@ -1943,7 +1991,12 @@ def review_dataset_pattern(
             current_records = _read_reviews_descriptor(locked_reviews.descriptor)
             if current_records != review_records:
                 raise _ReviewInputError("review history changed; rerun the pattern preview")
-            _validate_review_history([*current_records, pattern_review], findings, evidence_records)
+            _validate_review_history(
+                [*current_records, pattern_review],
+                findings,
+                evidence_records,
+                review_history_key=review_history_key,
+            )
             if len(current_records) + 1 > _MAXIMUM_REVIEW_RECORDS:
                 raise _ReviewInputError("review file exceeds the 10,000 record limit")
             if (
@@ -1952,7 +2005,12 @@ def review_dataset_pattern(
             ):
                 raise _ReviewInputError("review file exceeds the 10 MB limit")
             _append_review_atomically(locked_reviews, encoded_record)
-    except (ValidationError, PatternIdentityKeyError, _ReviewInputError) as error:
+    except (
+        ValidationError,
+        PatternIdentityKeyError,
+        ReviewHistoryKeyError,
+        _ReviewInputError,
+    ) as error:
         message = "review fields are invalid" if isinstance(error, ValidationError) else str(error)
         raise typer.BadParameter(message) from None
     except _ReviewCommitUncertainError:
@@ -2074,32 +2132,12 @@ def is_reportable_dataset_evidence(path: Path) -> bool:
 
 
 def _load_reviews(path: Path) -> list[ReviewHistoryRecord]:
-    lock_path = _reviews_lock_path(path)
-    if (
-        not path.exists()
-        and not path.is_symlink()
-        and not lock_path.exists()
-        and not lock_path.is_symlink()
-    ):
-        return []
     try:
-        lock_descriptor = _open_regular_file(lock_path, os.O_RDWR | os.O_CREAT)
+        descriptor = _open_regular_file(path, os.O_RDONLY)
         try:
-            _set_private_file_permissions(lock_descriptor)
-            _lock_file(lock_descriptor, exclusive=False)
-            try:
-                try:
-                    descriptor = _open_regular_file(path, os.O_RDONLY)
-                except FileNotFoundError:
-                    return []
-                try:
-                    return _read_reviews_descriptor(descriptor)
-                finally:
-                    os.close(descriptor)
-            finally:
-                _unlock_file(lock_descriptor)
+            return _read_reviews_descriptor(descriptor)
         finally:
-            os.close(lock_descriptor)
+            os.close(descriptor)
     except FileNotFoundError:
         return []
     except OSError as error:
@@ -2702,6 +2740,8 @@ def _validate_review_history(
     reviews: list[ReviewHistoryRecord],
     findings: dict[str, _IndexedFinding],
     evidence_records: list[_LoadedEvidenceRecord],
+    *,
+    review_history_key: bytes | None,
 ) -> None:
     reviews_by_id: dict[str, ReviewRecord] = {}
     pattern_reviews_by_id: dict[str, PatternReviewRecord] = {}
@@ -2711,6 +2751,16 @@ def _validate_review_history(
     historical_active_by_finding: dict[str, ReviewRecord] = {}
     for review in reviews:
         if isinstance(review, PatternReviewRecord):
+            if review_history_key is None:
+                raise _ReviewInputError(
+                    "pattern review history requires the project review history key"
+                )
+            expected_hmac = pattern_review_record_hmac(
+                review_history_key,
+                review.hmac_payload(),
+            )
+            if not hmac.compare_digest(review.record_hmac_sha256, expected_hmac):
+                raise _ReviewInputError("pattern review authentication does not match its record")
             if review.pattern_review_id in pattern_reviews_by_id:
                 raise _ReviewInputError("review file contains a duplicate pattern review ID")
             snapshot_id = review.pattern_snapshot.pattern_snapshot_id
@@ -2774,6 +2824,15 @@ def _validate_review_history(
             superseded_ids.add(previous.review_id)
         reviews_by_id[review.review_id] = review
         active_by_finding[review.finding_id] = review
+
+
+def _review_history_key_for_records(
+    evidence: Path,
+    reviews: list[ReviewHistoryRecord],
+) -> bytes | None:
+    if any(isinstance(review, PatternReviewRecord) for review in reviews):
+        return load_review_history_key(evidence)
+    return None
 
 
 def _active_reviews(reviews: list[ReviewHistoryRecord]) -> dict[str, ReviewRecord]:

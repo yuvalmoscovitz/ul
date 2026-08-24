@@ -24,6 +24,7 @@ from ul_cli.dataset_review import (
 )
 from ul_cli.pattern_identity import PatternIdentityKeyError, load_pattern_identity_key
 from ul_cli.report_contract import (
+    FailurePattern,
     FindingSummary,
     ReportEvidenceType,
     ReportInputError,
@@ -261,12 +262,14 @@ def _print_human_report(report: UnifiedReport, evidence: Path) -> None:
             f"{len(report.patterns)} review cohort(s)"
         )
         typer.echo("Patterns group similar evidence; they do not claim a root cause.")
-        for index, pattern in enumerate(report.patterns, start=1):
+        patterns_by_fingerprint: dict[str, list[FailurePattern]] = {}
+        for pattern in report.patterns:
+            patterns_by_fingerprint.setdefault(pattern.pattern_fingerprint, []).append(pattern)
+        for index, cohorts in enumerate(patterns_by_fingerprint.values(), start=1):
+            pattern = cohorts[0]
             typer.echo("")
             typer.echo(f"Pattern {index}: {pattern.summary}")
             typer.echo(f"  Pattern fingerprint: {pattern.pattern_fingerprint}")
-            typer.echo(f"  Snapshot ID: {pattern.pattern_snapshot_id}")
-            typer.echo(f"  Priority: {pattern.severity}")
             typer.echo(
                 "  Evidence authority: "
                 + ", ".join(
@@ -289,45 +292,6 @@ def _print_human_report(report: UnifiedReport, evidence: Path) -> None:
                 typer.echo("  Why grouped: same customer-defined rule.")
             else:
                 typer.echo("  Why grouped: same finding category and private action shape.")
-            typer.echo(
-                f"  Affected: {pattern.finding_count} finding(s) across "
-                f"{pattern.source_case_count} test question(s)"
-            )
-            typer.echo("  Observed under:")
-            for operator in pattern.operators:
-                label = operator.summary or operator.operator_id
-                typer.echo(f"    - {label} ({operator.operator_id}@{operator.operator_version})")
-            typer.echo(
-                "  Review queue: "
-                f"{pattern.needs_review_count} needs review; "
-                f"{pattern.confirmed_count} confirmed; {pattern.expected_count} expected; "
-                f"{pattern.unsupported_count} unsupported; "
-                f"{pattern.inconclusive_count} inconclusive"
-            )
-            typer.echo("  Decision candidates:")
-            for member in pattern.members:
-                if member.review_status != "needs_review":
-                    continue
-                reasons = ", ".join(
-                    reason.replace("_", " ") for reason in member.membership_reasons
-                )
-                typer.echo(
-                    f"    - {member.finding_id}: {reasons}; "
-                    f"review={member.review_status}/{member.review_severity}"
-                )
-            exception_members = [
-                member
-                for sibling in report.patterns
-                if sibling.pattern_fingerprint == pattern.pattern_fingerprint
-                and sibling.pattern_snapshot_id != pattern.pattern_snapshot_id
-                for member in sibling.members
-            ]
-            typer.echo("  Exceptions unchanged:")
-            for member in exception_members:
-                typer.echo(
-                    f"    - {member.finding_id}: "
-                    f"review={member.review_status}/{member.review_severity}"
-                )
             prior_reviews = [
                 review
                 for review in report.pattern_reviews
@@ -340,13 +304,56 @@ def _print_human_report(report: UnifiedReport, evidence: Path) -> None:
                     f"reviewed_at={review.reviewed_at.isoformat()}; "
                     f"snapshot={review.pattern_snapshot_id}"
                 )
-            if pattern.needs_review_count:
+            typer.echo(f"  Review cohorts: {len(cohorts)}")
+            for cohort_index, cohort in enumerate(cohorts, start=1):
+                review_status = cohort.members[0].review_status
+                review_severity = cohort.members[0].review_severity
+                typer.echo(f"    Cohort {cohort_index}: review={review_status}/{review_severity}")
+                typer.echo(f"      Snapshot ID: {cohort.pattern_snapshot_id}")
+                typer.echo(f"      Priority: {cohort.severity}")
                 typer.echo(
-                    "  Next: ul dataset review-pattern "
-                    f"{quoted_evidence or 'EVIDENCE'} {pattern.pattern_snapshot_id}"
+                    f"      Affected: {cohort.finding_count} finding(s) across "
+                    f"{cohort.source_case_count} test question(s)"
                 )
-            else:
-                typer.echo("  Next: inspect prior decisions or occurrence evidence below.")
+                typer.echo(
+                    f"      Review queue: {cohort.needs_review_count} needs review; "
+                    f"{cohort.confirmed_count} confirmed"
+                )
+                typer.echo("      Observed under:")
+                for operator in cohort.operators:
+                    label = operator.summary or operator.operator_id
+                    typer.echo(
+                        f"        - {label} ({operator.operator_id}@{operator.operator_version})"
+                    )
+                if not cohort.needs_review_count:
+                    typer.echo("      Next: inspect occurrence evidence below.")
+                    continue
+                typer.echo("      Decision candidates:")
+                for member in cohort.members:
+                    reasons = ", ".join(
+                        reason.replace("_", " ") for reason in member.membership_reasons
+                    )
+                    typer.echo(
+                        f"        - {member.finding_id}: {reasons}; "
+                        f"review={member.review_status}/{member.review_severity}"
+                    )
+                exception_members = [
+                    member
+                    for sibling in cohorts
+                    if sibling.pattern_snapshot_id != cohort.pattern_snapshot_id
+                    for member in sibling.members
+                    if member.review_status != "needs_review"
+                ]
+                typer.echo("      Exceptions unchanged:")
+                for member in exception_members:
+                    typer.echo(
+                        f"        - {member.finding_id}: "
+                        f"review={member.review_status}/{member.review_severity}"
+                    )
+                typer.echo(
+                    "      Next: ul dataset review-pattern "
+                    f"{quoted_evidence or 'EVIDENCE'} {cohort.pattern_snapshot_id}"
+                )
     grouped_finding_count = sum(
         pattern.needs_review_count + pattern.confirmed_count for pattern in report.patterns
     )

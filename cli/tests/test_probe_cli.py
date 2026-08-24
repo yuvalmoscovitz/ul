@@ -247,6 +247,7 @@ def test_callable_smoke_proves_target_call_and_decline_makes_zero_semantic_calls
     assert len((tmp_path / "target-invocations.jsonl").read_text().splitlines()) == 1
     assert not (tmp_path / "__pycache__").exists()
     saved = json.loads((tmp_path / ".ul" / "probe.json").read_text())
+    assert len((tmp_path / ".ul" / "review-history.key").read_bytes()) == 32
     assert saved["target_kind"] == "python_callable"
     assert len(saved["target_confirmation_sha256"]) == 64
     assert saved["limit"] == 10
@@ -676,6 +677,7 @@ def test_copy_ready_confirmation_run_reuses_bound_config_and_rebudgets(
     ]
 
     pilot = runner.invoke(app, base_arguments, input="y\nn\n")
+    (tmp_path / ".ul" / "review-history.key").unlink()
     confirmation = runner.invoke(app, [*base_arguments, "--confirmation-run"], input="y\nn\n")
 
     assert pilot.exit_code == 0, pilot.output
@@ -685,6 +687,7 @@ def test_copy_ready_confirmation_run_reuses_bound_config_and_rebudgets(
     assert "Original agent invocations: 3" in confirmation.output
     assert "Probe agent invocations: 3" in confirmation.output
     assert "No semantic-model calls were made" in confirmation.output
+    assert len((tmp_path / ".ul" / "review-history.key").read_bytes()) == 32
 
 
 def test_failed_smoke_has_staged_safe_diagnostic_and_does_not_save_config(

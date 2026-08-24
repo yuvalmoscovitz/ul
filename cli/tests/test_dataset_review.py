@@ -44,6 +44,7 @@ from ul_cli.report_contract import (
 runner = CliRunner()
 FINDING_ID = f"ulf_v1_{'a' * 64}"
 _PATTERN_IDENTITY_KEY = bytes(range(32))
+_REVIEW_HISTORY_KEY = bytes(255 - value for value in range(32))
 _ANSI_ESCAPE_PATTERN = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 
 
@@ -281,6 +282,10 @@ def _write_evidence(path: Path, records: list[dict[str, Any]] | None = None) -> 
     if not identity_key_path.exists():
         identity_key_path.write_bytes(_PATTERN_IDENTITY_KEY)
         identity_key_path.chmod(0o600)
+    review_history_key_path = project_directory / "review-history.key"
+    if not review_history_key_path.exists():
+        review_history_key_path.write_bytes(_REVIEW_HISTORY_KEY)
+        review_history_key_path.chmod(0o600)
     raw = b"".join(
         json.dumps(record, ensure_ascii=False, separators=(",", ":")).encode() + b"\n"
         for record in (records or [_evidence_record()])
@@ -541,6 +546,8 @@ def test_root_human_report_explains_patterns_and_augmentation_names(tmp_path: Pa
     assert "Finding patterns: 1 stable pattern(s); 1 review cohort(s)" in report.output
     assert "Patterns group similar evidence; they do not claim a root cause." in report.output
     assert "Pattern 1: The changed input altered an important action detail." in report.output
+    assert "Review cohorts: 1" in report.output
+    assert "Cohort 1: review=needs_review/unrated" in report.output
     assert "Priority: unrated" in report.output
     assert "Evidence authority: model derived unverified" in report.output
     assert "Evidence limitation: semantic model output not independently verified" in report.output
@@ -569,7 +576,7 @@ def test_pattern_review_binds_exact_snapshot_preserves_exceptions_and_not_future
         finding_id=second_finding_id,
         interaction_id="second-payment",
     )
-    _write_evidence(evidence, [first_record, second_record])
+    _write_evidence(evidence, [second_record, first_record])
 
     initial = runner.invoke(app, ["report", str(evidence), "--json"])
     assert initial.exit_code == 1, initial.output
@@ -594,6 +601,15 @@ def test_pattern_review_binds_exact_snapshot_preserves_exceptions_and_not_future
     assert reviewable_pattern["pattern_snapshot_id"] != initial_pattern["pattern_snapshot_id"]
     assert reviewable_pattern["expected_count"] == 0
     assert reviewable_pattern["needs_review_count"] == 1
+
+    human_cohorts = runner.invoke(app, ["report", str(evidence)])
+    assert human_cohorts.exit_code == 1, human_cohorts.output
+    assert human_cohorts.output.count("Pattern 1:") == 1
+    assert "Pattern 2:" not in human_cohorts.output
+    assert "Review cohorts: 2" in human_cohorts.output
+    assert human_cohorts.output.count("Decision candidates") == 1
+    assert human_cohorts.output.count("Exceptions unchanged") == 1
+    assert human_cohorts.output.count("ul dataset review-pattern") == 1
 
     preview = runner.invoke(
         app,
@@ -639,6 +655,8 @@ def test_pattern_review_binds_exact_snapshot_preserves_exceptions_and_not_future
     pattern_review = review_history[1]
     derived_review = pattern_review["occurrence_decisions"][0]
     assert pattern_review["record_type"] == "pattern_review"
+    assert pattern_review["schema_version"] == "1.1.0"
+    assert re.fullmatch(r"[0-9a-f]{64}", pattern_review["record_hmac_sha256"])
     assert (
         pattern_review["pattern_snapshot"]["pattern_snapshot_id"]
         == reviewable_pattern["pattern_snapshot_id"]
@@ -648,7 +666,17 @@ def test_pattern_review_binds_exact_snapshot_preserves_exceptions_and_not_future
     assert derived_review["finding_id"] == second_finding_id
     fabricated_reviews = tmp_path / "fabricated.reviews.jsonl"
     fabricated_history = copy.deepcopy(review_history)
-    fabricated_history[1]["grouping_evidence_sha256"] = "0" * 64
+    fabricated_history[1]["evidence_record_sha256s"] = fabricated_history[1][
+        "evidence_record_sha256s"
+    ][:1]
+    retained_digests = set(fabricated_history[1]["evidence_record_sha256s"])
+    fabricated_history[1]["evidence_bindings"] = [
+        binding
+        for binding in fabricated_history[1]["evidence_bindings"]
+        if binding["evidence_record_sha256"] in retained_digests
+    ]
+    fabricated_history[1]["exception_finding_ids"] = []
+    dataset_review.PatternReviewRecord.model_validate_json(json.dumps(fabricated_history[1]))
     fabricated_reviews.write_text(
         "\n".join(json.dumps(record) for record in fabricated_history) + "\n",
         encoding="utf-8",
@@ -658,7 +686,7 @@ def test_pattern_review_binds_exact_snapshot_preserves_exceptions_and_not_future
         ["dataset", "report", str(evidence), "--reviews", str(fabricated_reviews)],
     )
     assert fabricated.exit_code == 2
-    assert "exact unreviewed cohort" in fabricated.output
+    assert "authentication does not match" in fabricated.output
     assert (
         dataset_review.load_confirmed_dataset_finding(
             evidence,
@@ -667,6 +695,12 @@ def test_pattern_review_binds_exact_snapshot_preserves_exceptions_and_not_future
         ).review.review_id
         == derived_review["review_id"]
     )
+    review_history_key_path = tmp_path / ".ul" / "review-history.key"
+    review_history_key_path.rename(tmp_path / ".ul" / "review-history.key.backup")
+    missing_key = runner.invoke(app, ["report", str(evidence), "--json"])
+    assert missing_key.exit_code == 2
+    assert "review history key not found" in missing_key.output
+    (tmp_path / ".ul" / "review-history.key.backup").rename(review_history_key_path)
     identity_key_path = tmp_path / ".ul" / "pattern-identity.key"
     identity_key_path.write_bytes(bytes(reversed(range(32))))
     identity_key_path.chmod(0o600)
@@ -718,12 +752,18 @@ def test_pattern_review_binds_exact_snapshot_preserves_exceptions_and_not_future
     assert len(reviewed_payload["pattern_reviews"]) == 1
     assert "same consequential payment failure" not in reviewed.output
     assert "payments-risk" not in reviewed.output
+    reviewed_human = runner.invoke(app, ["report", str(evidence)])
+    assert reviewed_human.exit_code == 1, reviewed_human.output
+    assert reviewed_human.output.count("Pattern 1:") == 1
+    assert "Decision candidates" not in reviewed_human.output
+    assert "Exceptions unchanged" not in reviewed_human.output
+    assert "ul dataset review-pattern" not in reviewed_human.output
 
     third_record = _matching_evidence_record(
         finding_id=third_finding_id,
         interaction_id="third-payment",
     )
-    _write_evidence(evidence, [first_record, second_record, third_record])
+    _write_evidence(evidence, [second_record, first_record, third_record])
     future = runner.invoke(app, ["report", str(evidence), "--json"])
     assert future.exit_code == 1, future.output
     future_payload = json.loads(future.output)
@@ -2047,6 +2087,30 @@ def test_symlink_and_nonregular_paths_are_refused(tmp_path: Path) -> None:
     assert linked_reviews.exit_code != 0
     assert "cannot safely update review file" in linked_reviews.output
     assert protected_target.read_text(encoding="utf-8") == "do not change"
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX read-only permissions")
+def test_existing_reviews_report_from_read_only_directory_without_lock_artifact(
+    tmp_path: Path,
+) -> None:
+    evidence = tmp_path / "evidence.jsonl"
+    _write_evidence(evidence)
+    reviewed = runner.invoke(app, _review_arguments(evidence))
+    assert reviewed.exit_code == 0, reviewed.output
+    reviews = tmp_path / "evidence.reviews.jsonl"
+    lock_path = dataset_review._reviews_lock_path(reviews)
+    lock_path.unlink()
+    reviews.chmod(0o400)
+    tmp_path.chmod(0o500)
+    try:
+        report = runner.invoke(app, ["dataset", "report", str(evidence)])
+        assert report.exit_code == 0, report.output
+        assert "confirmed=1" in report.output
+        assert not lock_path.exists()
+        assert not tuple(tmp_path.glob(".*.tmp"))
+    finally:
+        tmp_path.chmod(0o700)
+        reviews.chmod(0o600)
 
 
 def test_report_and_review_make_no_model_or_network_calls(

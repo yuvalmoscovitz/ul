@@ -107,7 +107,10 @@ from ul_cli.dataset_trial_journal import (
     persist_dataset_run_manifest,
     read_dataset_run_manifest,
 )
-from ul_cli.pattern_identity import ensure_project_pattern_identity_key
+from ul_cli.pattern_identity import (
+    ensure_project_pattern_identity_key,
+    ensure_project_review_history_key,
+)
 from ul_cli.report import report_evidence
 
 _PILOT_LIMIT = 10
@@ -1628,10 +1631,12 @@ def _save_probe_config(
         )
         if existing_config is not None:
             ensure_project_pattern_identity_key(project_directory)
+            ensure_project_review_history_key(project_directory)
             console.print(f"  Using saved project config: {config_path}")
             return
         _ensure_private_project_directory(project_directory)
         ensure_project_pattern_identity_key(project_directory)
+        ensure_project_review_history_key(project_directory)
         with create_private_output(config_path) as stream:
             json.dump(config.model_dump(mode="json"), stream, ensure_ascii=False, indent=2)
             stream.write("\n")

@@ -35,7 +35,9 @@ from ul_cli.dataset_review import is_reportable_dataset_evidence
 from ul_cli.environment import TEST_ENVIRONMENT_CONFIRMATION_MESSAGE
 from ul_cli.pattern_identity import (
     PATTERN_IDENTITY_KEY_FILENAME,
+    REVIEW_HISTORY_KEY_FILENAME,
     create_project_pattern_identity_key,
+    create_project_review_history_key,
 )
 from ul_cli.report import report_evidence
 
@@ -341,6 +343,7 @@ def initialize_project(
     runs_directory_created = not runs_directory.exists()
     ignore_file_created = False
     pattern_identity_key_created = False
+    review_history_key_created = False
     generated_environment_path: Path | None = None
     project_directory_status: os.stat_result | None = None
     project_directory_descriptor: int | None = None
@@ -353,6 +356,8 @@ def initialize_project(
         ignore_file_created = True
         create_project_pattern_identity_key(project_directory)
         pattern_identity_key_created = True
+        create_project_review_history_key(project_directory)
+        review_history_key_created = True
 
         selected_environment_config = environment_config
         if environment_url is not None:
@@ -423,6 +428,7 @@ def initialize_project(
             runs_directory_created=runs_directory_created,
             ignore_file_created=ignore_file_created,
             pattern_identity_key_created=pattern_identity_key_created,
+            review_history_key_created=review_history_key_created,
             project_directory_status=project_directory_status,
             project_directory_descriptor=project_directory_descriptor,
         )
@@ -437,6 +443,7 @@ def initialize_project(
             runs_directory_created=runs_directory_created,
             ignore_file_created=ignore_file_created,
             pattern_identity_key_created=pattern_identity_key_created,
+            review_history_key_created=review_history_key_created,
             project_directory_status=project_directory_status,
             project_directory_descriptor=project_directory_descriptor,
         )
@@ -453,6 +460,7 @@ def initialize_project(
             runs_directory_created=runs_directory_created,
             ignore_file_created=ignore_file_created,
             pattern_identity_key_created=pattern_identity_key_created,
+            review_history_key_created=review_history_key_created,
             project_directory_status=project_directory_status,
             project_directory_descriptor=project_directory_descriptor,
         )
@@ -467,6 +475,7 @@ def initialize_project(
             runs_directory_created=runs_directory_created,
             ignore_file_created=ignore_file_created,
             pattern_identity_key_created=pattern_identity_key_created,
+            review_history_key_created=review_history_key_created,
             project_directory_status=project_directory_status,
             project_directory_descriptor=project_directory_descriptor,
         )
@@ -1018,6 +1027,7 @@ def _discard_incomplete_project(
     runs_directory_created: bool,
     ignore_file_created: bool,
     pattern_identity_key_created: bool,
+    review_history_key_created: bool,
     project_directory_status: os.stat_result | None,
     project_directory_descriptor: int | None,
 ) -> None:
@@ -1037,6 +1047,9 @@ def _discard_incomplete_project(
         if pattern_identity_key_created:
             with suppress(FileNotFoundError):
                 (project_directory / PATTERN_IDENTITY_KEY_FILENAME).unlink()
+        if review_history_key_created:
+            with suppress(FileNotFoundError):
+                (project_directory / REVIEW_HISTORY_KEY_FILENAME).unlink()
         if runs_directory_created:
             with suppress(OSError):
                 runs_directory.rmdir()
@@ -1053,6 +1066,9 @@ def _discard_incomplete_project(
     if pattern_identity_key_created:
         with suppress(FileNotFoundError):
             os.unlink(PATTERN_IDENTITY_KEY_FILENAME, dir_fd=project_directory_descriptor)
+    if review_history_key_created:
+        with suppress(FileNotFoundError):
+            os.unlink(REVIEW_HISTORY_KEY_FILENAME, dir_fd=project_directory_descriptor)
     if runs_directory_created:
         with suppress(OSError):
             os.rmdir(runs_directory.name, dir_fd=project_directory_descriptor)
