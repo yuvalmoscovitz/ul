@@ -1286,9 +1286,7 @@ def test_http_target_contract_runs_authenticated_loopback_and_resumes(
                 return
             content_length = int(self.headers["Content-Length"])
             received_requests.append(json.loads(self.rfile.read(content_length)))
-            response = json.dumps(
-                {"result": {"action": "lookup", "ticket": 42}}
-            ).encode()
+            response = json.dumps({"result": {"action": "lookup", "ticket": 42}}).encode()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(response)))
@@ -1316,9 +1314,7 @@ def test_http_target_contract_runs_authenticated_loopback_and_resumes(
             "allow_insecure_http": True,
             "request_json_template": '{"message":"{{input}}"}',
             "response_json_pointer": "/result",
-            "header_from_env": [
-                "Authorization=UL_ENVIRONMENT_CUSTOMER_TOKEN"
-            ],
+            "header_from_env": ["Authorization=UL_ENVIRONMENT_CUSTOMER_TOKEN"],
         }
         if target_mode == "saved":
             config = create_isolated_response_target_config(
@@ -1333,9 +1329,7 @@ def test_http_target_contract_runs_authenticated_loopback_and_resumes(
             )
             target_reference = str(target_config)
             target_arguments = ["--target", target_reference]
-            resolved_target = resolve_http_target(
-                target_reference, allow_insecure_http=True
-            )
+            resolved_target = resolve_http_target(target_reference, allow_insecure_http=True)
         else:
             target_reference = url
             target_arguments = [
@@ -1413,11 +1407,9 @@ def test_http_target_contract_runs_authenticated_loopback_and_resumes(
             )
             assert action_id_match is not None
             receipt = json.loads(
-                (
-                    tmp_path
-                    / "action-state"
-                    / f"{action_id_match.group(1)}.json"
-                ).read_text(encoding="utf-8")
+                (tmp_path / "action-state" / f"{action_id_match.group(1)}.json").read_text(
+                    encoding="utf-8"
+                )
             )
             assert receipt["argv"] == [
                 "ul",
@@ -1478,8 +1470,6 @@ def test_http_target_contract_runs_authenticated_loopback_and_resumes(
         "Authorization": "UL_ENVIRONMENT_CUSTOMER_TOKEN"
     }
     persisted_text = "\n".join(
-        path.read_text(encoding="utf-8")
-        for path in tmp_path.iterdir()
-        if path.is_file()
+        path.read_text(encoding="utf-8") for path in tmp_path.iterdir() if path.is_file()
     )
     assert secret_canary not in persisted_text

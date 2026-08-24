@@ -245,9 +245,7 @@ def evaluate_dataset(
         str | None,
         typer.Option(
             "--target",
-            help=(
-                "HTTP(S) URL, Python module:callable, or local/HTTP target configuration JSON."
-            ),
+            help=("HTTP(S) URL, Python module:callable, or local/HTTP target configuration JSON."),
         ),
     ] = None,
     target_artifact: Annotated[
