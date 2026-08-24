@@ -234,22 +234,29 @@ map to that review status:
 Review status is workflow state, not an agent correctness verdict.
 
 Save selected confirmed findings as regressions one occurrence at a time. A pattern decision never
-promotes every member automatically:
+promotes every member automatically. For a response-only callable or authenticated HTTP probe,
+no environment bridge is required. Confirm the finding, provide a customer invariant that is
+satisfied by the fresh original-input probe response and violated by the accepted variation, save
+it, then replay the same target:
 
 ```bash
 ul regression save EVIDENCE.jsonl FINDING_ID \
+  --invariants invariants.json \
   --rule RULE_ID \
-  --environment-config .ul/environment.json \
   --output regressions/finding.json \
   --confirm-versioned-input
 
-ul regression run regressions \
-  --environment-config .ul/environment.json \
-  --allow-environment-network \
-  --confirm-test-environment \
-  --max-environment-api-calls 100 \
-  --output regression-results.jsonl
+ul regression replay regressions/finding.json \
+  --target agent:run \
+  --confirm-target TARGET_DIGEST \
+  --max-target-calls 3 \
+  --output replay.json
 ```
+
+Use the same HTTP mapping and environment-backed authentication options at replay that were used by
+`ul probe`; the saved secret-safe target receipt must match. Historical and semantic outputs remain
+reference evidence, never a correctness oracle. `ul regression run` is the legacy multi-case path
+for stateful environment regressions; response-only probe regressions use `ul regression replay`.
 
 ## Configuration
 

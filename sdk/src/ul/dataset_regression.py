@@ -77,16 +77,52 @@ class DatasetRegressionVariation(_StrictModel):
     operator_version: str = Field(min_length=1, max_length=100)
     original_input: str = Field(min_length=1, max_length=1_000_000)
     variation_input: str = Field(min_length=1, max_length=1_000_000)
+    historical_reference_output: JsonValue = None
+    augmentation_target: JsonValue = None
+
+
+class DatasetRegressionReviewSnapshot(_StrictModel):
+    review_id: str = Field(pattern=_REVIEW_ID_PATTERN)
+    status: Literal["confirmed"]
+    severity: Literal["unrated", "low", "medium", "high", "critical"]
+    reviewer: str = Field(min_length=1, max_length=200)
+    reason: str = Field(min_length=1, max_length=4_000)
+    reviewed_at: str = Field(min_length=1, max_length=100)
+
+    @model_validator(mode="after")
+    def validate_reviewed_at(self) -> Self:
+        try:
+            reviewed_at = datetime.fromisoformat(self.reviewed_at)
+        except ValueError:
+            raise ValueError("regression review snapshot must use an ISO-8601 timestamp") from None
+        if reviewed_at.tzinfo is None or reviewed_at.utcoffset() != UTC.utcoffset(None):
+            raise ValueError("regression review snapshot must use UTC")
+        return self
 
 
 class DatasetRegressionTargetSnapshot(_StrictModel):
-    provenance: Literal["declared_at_case_creation"]
-    config: JsonHttpTargetConfig
+    provenance: Literal["declared_at_case_creation", "observed_at_discovery"]
+    kind: Literal["environment_http", "probe_target"] = "environment_http"
+    config: JsonHttpTargetConfig | None = None
+    receipt: dict[str, JsonValue] | None = None
     config_sha256: str = Field(pattern=_SHA256_PATTERN)
 
     @model_validator(mode="after")
     def validate_config_digest(self) -> Self:
-        if self.config_sha256 != dataset_regression_target_config_sha256(self.config):
+        if self.kind == "environment_http":
+            if self.config is None or self.receipt is not None:
+                raise ValueError("environment regression targets require only a config snapshot")
+            expected_sha256 = dataset_regression_target_config_sha256(self.config)
+        else:
+            if self.receipt is None or self.config is not None:
+                raise ValueError("probe regression targets require only a discovery receipt")
+            receipt_config_sha256 = self.receipt.get("config_sha256")
+            if not isinstance(receipt_config_sha256, str):
+                raise ValueError("probe regression target receipt requires a config digest")
+            expected_sha256 = receipt_config_sha256
+            if self.receipt.get("supports_state_observation") is not False:
+                raise ValueError("probe regressions currently require a response-only target")
+        if self.config_sha256 != expected_sha256:
             raise ValueError("target config digest must match its canonical snapshot")
         return self
 
@@ -125,11 +161,13 @@ class DatasetRegressionInvariantSuite(_StrictModel):
 
 
 class DatasetRegressionCase(_StrictModel):
-    schema_version: Literal["1.0.0", "1.1.0", "1.2.0", "1.3.0"]
+    schema_version: Literal["1.0.0", "1.1.0", "1.2.0", "1.3.0", "1.4.0"]
     case_id: str = Field(pattern=_CASE_ID_PATTERN)
     lineage: DatasetRegressionLineage
     variation: DatasetRegressionVariation
     target: DatasetRegressionTargetSnapshot
+    review_snapshot: DatasetRegressionReviewSnapshot | None = None
+    discovery_cross_examination: dict[str, JsonValue] | None = None
     invariant_suite: DatasetRegressionInvariantSuite
     discovery_repetitions: int = Field(ge=1)
 
@@ -139,10 +177,17 @@ class DatasetRegressionCase(_StrictModel):
             not isinstance(rule, JsonValuesEqualInvariant) for rule in self.invariant_suite.rules
         ):
             raise ValueError("regression schema 1.0.0 supports only json_values_equal rules")
-        if self.schema_version not in {"1.2.0", "1.3.0"} and any(
+        if self.schema_version not in {"1.2.0", "1.3.0", "1.4.0"} and any(
             rule.type in _TRANSITION_RULE_TYPES for rule in self.invariant_suite.rules
         ):
             raise ValueError("state-transition regression rules require schema 1.2.0")
+        if self.schema_version == "1.4.0":
+            if self.target.kind != "probe_target" or self.review_snapshot is None:
+                raise ValueError("probe regression schema requires target and review snapshots")
+            if self.review_snapshot.review_id != self.lineage.review_id:
+                raise ValueError("probe regression review snapshot must match its lineage")
+        elif self.review_snapshot is not None or self.discovery_cross_examination is not None:
+            raise ValueError("legacy regression schemas do not include probe snapshots")
         if self.case_id != _case_id(self.model_dump(mode="json", exclude={"case_id"})):
             raise ValueError("regression case ID must match its canonical content")
         if len(self.model_dump_json().encode("utf-8")) > _MAXIMUM_CASE_BYTES:
@@ -172,7 +217,7 @@ class DatasetRegressionExecution(_StrictModel):
 
 
 class DatasetRegressionResult(_StrictModel):
-    schema_version: Literal["1.0.0", "1.1.0", "1.2.0", "1.3.0"] = "1.3.0"
+    schema_version: Literal["1.0.0", "1.1.0", "1.2.0", "1.3.0", "1.4.0"] = "1.3.0"
     case_id: str = Field(pattern=_CASE_ID_PATTERN)
     target_config_sha256: str = Field(pattern=_SHA256_PATTERN)
     source_suite_sha256: str = Field(pattern=_SHA256_PATTERN)
@@ -230,7 +275,7 @@ class DatasetRegressionRunCaseResult(_StrictModel):
 
 
 class DatasetRegressionRunResult(_StrictModel):
-    schema_version: Literal["1.0.0", "1.1.0", "1.2.0", "1.3.0"] = "1.3.0"
+    schema_version: Literal["1.0.0", "1.1.0", "1.2.0", "1.3.0", "1.4.0"] = "1.3.0"
     started_at: datetime
     completed_at: datetime
     target_config_sha256: str = Field(pattern=_SHA256_PATTERN)
@@ -309,19 +354,37 @@ def create_dataset_regression_case(
     operator_version: str,
     original_input: str,
     variation_input: str,
-    target_config: JsonHttpTargetConfig,
+    target_config: JsonHttpTargetConfig | None,
     source_suite_sha256: str,
     observation_authority: ObservationAuthority,
     state_observation_authority: StateObservationAuthority | None,
     state_observer_id: str | None = None,
     selected_rules: tuple[DatasetInvariantRule, ...],
     discovery_repetitions: int,
+    historical_reference_output: JsonValue = None,
+    augmentation_target: JsonValue = None,
+    target_receipt: dict[str, JsonValue] | None = None,
+    review_snapshot: DatasetRegressionReviewSnapshot | None = None,
+    discovery_cross_examination: dict[str, JsonValue] | None = None,
 ) -> DatasetRegressionCase:
-    target = DatasetRegressionTargetSnapshot(
-        provenance="declared_at_case_creation",
-        config=target_config,
-        config_sha256=dataset_regression_target_config_sha256(target_config),
-    )
+    if (target_config is None) == (target_receipt is None):
+        raise ValueError("regression case requires exactly one target config or receipt")
+    if target_config is not None:
+        target = DatasetRegressionTargetSnapshot(
+            provenance="declared_at_case_creation",
+            kind="environment_http",
+            config=target_config,
+            config_sha256=dataset_regression_target_config_sha256(target_config),
+        )
+    else:
+        if target_receipt is None:
+            raise AssertionError("validated probe regression requires a target receipt")
+        target = DatasetRegressionTargetSnapshot(
+            provenance="observed_at_discovery",
+            kind="probe_target",
+            receipt=target_receipt,
+            config_sha256=cast(str, target_receipt["config_sha256"]),
+        )
     lineage = DatasetRegressionLineage(
         finding_id=finding_id,
         evidence_sha256=evidence_sha256,
@@ -333,6 +396,8 @@ def create_dataset_regression_case(
         operator_version=operator_version,
         original_input=original_input,
         variation_input=variation_input,
+        historical_reference_output=historical_reference_output,
+        augmentation_target=augmentation_target,
     )
     invariant_suite = DatasetRegressionInvariantSuite(
         source_suite_sha256=source_suite_sha256,
@@ -342,7 +407,7 @@ def create_dataset_regression_case(
         state_observer_id=state_observer_id,
         rules=selected_rules,
     )
-    schema_version: Literal["1.0.0", "1.1.0", "1.2.0", "1.3.0"] = "1.3.0"
+    schema_version: Literal["1.3.0", "1.4.0"] = "1.4.0" if target_receipt is not None else "1.3.0"
     serialized_content = cast(
         dict[str, JsonValue],
         {
@@ -350,6 +415,10 @@ def create_dataset_regression_case(
             "lineage": lineage.model_dump(mode="json"),
             "variation": variation.model_dump(mode="json"),
             "target": target.model_dump(mode="json"),
+            "review_snapshot": (
+                review_snapshot.model_dump(mode="json") if review_snapshot is not None else None
+            ),
+            "discovery_cross_examination": discovery_cross_examination,
             "invariant_suite": invariant_suite.model_dump(mode="json"),
             "discovery_repetitions": discovery_repetitions,
         },
@@ -360,6 +429,8 @@ def create_dataset_regression_case(
         lineage=lineage,
         variation=variation,
         target=target,
+        review_snapshot=review_snapshot,
+        discovery_cross_examination=discovery_cross_examination,
         invariant_suite=invariant_suite,
         discovery_repetitions=discovery_repetitions,
     )
@@ -406,6 +477,7 @@ async def replay_dataset_regression(
     target_timeout_seconds: float = 30,
     allow_network_egress: bool = False,
     max_target_calls: int = 100,
+    target_receipt: dict[str, JsonValue] | None = None,
 ) -> DatasetRegressionResult:
     if not allow_network_egress:
         raise ValueError("regression environment API access requires explicit network opt-in")
@@ -413,6 +485,11 @@ async def replay_dataset_regression(
         raise ValueError("max_target_calls must be a positive integer")
     if not math.isfinite(target_timeout_seconds) or target_timeout_seconds <= 0:
         raise ValueError("target_timeout_seconds must be positive and finite")
+    if case.target.kind == "probe_target":
+        if target_receipt != case.target.receipt:
+            raise ValueError("replay target receipt does not match the regression case")
+    elif target_receipt is not None:
+        raise ValueError("environment regressions do not accept a probe target receipt")
     evaluation_case = _regression_evaluation_case(
         case,
         repetition=1,
@@ -529,10 +606,18 @@ def _build_dataset_regression_result(
         status = "inconclusive"
     else:
         status = "passed"
+    execution_config_sha256 = next(
+        (
+            execution.execution_evidence.environment_config_sha256
+            for execution in executions
+            if execution.execution_evidence is not None
+        ),
+        case.target.config_sha256,
+    )
     return DatasetRegressionResult(
         schema_version=case.schema_version,
         case_id=case.case_id,
-        target_config_sha256=case.target.config_sha256,
+        target_config_sha256=execution_config_sha256,
         source_suite_sha256=case.invariant_suite.source_suite_sha256,
         requested_repetitions=case.discovery_repetitions,
         target_calls_per_execution=target_calls_per_execution,
@@ -555,6 +640,8 @@ async def run_dataset_regressions(
         raise ValueError("regression environment API access requires explicit network opt-in")
     if not cases:
         raise ValueError("regression run requires at least one case")
+    if any(case.target.kind == "probe_target" for case in cases):
+        raise ValueError("probe target regressions require individually bound replay receipts")
     if len(cases) > 100:
         raise ValueError("regression run supports at most 100 cases")
     case_ids = tuple(case.case_id for case in cases)
@@ -641,7 +728,9 @@ async def run_dataset_regressions(
         status = "passed"
     return DatasetRegressionRunResult(
         schema_version=(
-            "1.3.0"
+            "1.4.0"
+            if any(result.schema_version == "1.4.0" for result in results)
+            else "1.3.0"
             if any(result.schema_version == "1.3.0" for result in results)
             else "1.2.0"
             if any(result.schema_version == "1.2.0" for result in results)

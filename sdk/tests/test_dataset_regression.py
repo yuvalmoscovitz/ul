@@ -19,6 +19,7 @@ from ul.dataset_invariants import (
 from ul.dataset_regression import (
     DatasetRegressionCase,
     DatasetRegressionResult,
+    DatasetRegressionReviewSnapshot,
     DatasetRegressionRunResult,
     create_dataset_regression_case,
     load_dataset_regression_case,
@@ -388,6 +389,38 @@ def test_case_rejects_tampered_case_and_target_digests() -> None:
     serialized["target"]["config_sha256"] = "0" * 64  # type: ignore[index]
     with pytest.raises(ValidationError, match="target config digest must match"):
         DatasetRegressionCase.model_validate(serialized)
+
+
+def test_probe_case_binds_review_snapshot_to_lineage() -> None:
+    with pytest.raises(ValidationError, match="review snapshot must match its lineage"):
+        create_dataset_regression_case(
+            finding_id=FINDING_ID,
+            evidence_sha256="3" * 64,
+            review_id=REVIEW_ID,
+            interaction_id="invoice-correction",
+            operator_id="input.surface.rephrase",
+            operator_version="1.0.0",
+            original_input="Pay invoice AC-100.",
+            variation_input="Please pay invoice AC-100.",
+            target_config=None,
+            target_receipt={
+                "config_sha256": "4" * 64,
+                "supports_state_observation": False,
+            },
+            review_snapshot=DatasetRegressionReviewSnapshot(
+                review_id="ulr_11111111-1111-4111-8111-111111111111",
+                status="confirmed",
+                severity="high",
+                reviewer="payments-risk",
+                reason="The accepted variation pays a different invoice.",
+                reviewed_at="2026-08-24T00:00:00+00:00",
+            ),
+            source_suite_sha256=SUITE_SHA256,
+            observation_authority="agent_response",
+            state_observation_authority=None,
+            selected_rules=(_rule(),),
+            discovery_repetitions=1,
+        )
 
 
 @pytest.mark.parametrize(

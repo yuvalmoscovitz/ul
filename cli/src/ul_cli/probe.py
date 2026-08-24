@@ -1166,7 +1166,9 @@ def probe(
             )
             console.print("")
             report_evidence(output)
+        except typer.Exit:
             progress_runtime.tracker.emit(status="completed", stage="terminal")
+            raise
         except Exception:
             raise ProbeFailure(
                 "analysis",
@@ -1175,6 +1177,8 @@ def probe(
                 "Run `ul report` against the saved private evidence file.",
                 target_safe_to_reuse=True,
             ) from None
+        else:
+            progress_runtime.tracker.emit(status="completed", stage="terminal")
     except ProbeFailure as failure:
         if not failure.target_safe_to_reuse and resolved_target is not None:
             try:
@@ -2379,3 +2383,8 @@ def _print_failure(failure: ProbeFailure, *, diagnostic_artifact: Path | None) -
             print_dataset_plain(f"Private diagnostic: {diagnostic_artifact}")
         except OSError:
             print_dataset_plain("Private diagnostic could not be written.")
+
+
+resolve_probe_target = _resolve_target
+confirm_probe_target = _confirm_target
+probe_target_evidence_receipt = _target_evidence_receipt
