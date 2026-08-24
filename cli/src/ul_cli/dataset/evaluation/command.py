@@ -14,7 +14,7 @@ from typing import Annotated, Any, Literal, TextIO, cast
 
 import httpx
 import typer
-from pydantic import ValidationError
+from pydantic import JsonValue, ValidationError
 from ul import (
     DatasetAugmentationResult,
     DatasetEvaluationMode,
@@ -34,6 +34,7 @@ from ul.dataset_invariants import (
 )
 from ul.http_environment import (
     JsonHttpEnvironmentConnection,
+    JsonHttpTargetConfig,
     json_http_environment_calls_per_execution,
     json_http_environment_capabilities,
     json_http_environment_config_sha256,
@@ -82,6 +83,13 @@ from ul_cli.finding_reference import (
     FindingReferenceContext,
     finding_reference_key_path,
     resolve_finding_reference_context,
+)
+from ul_cli.http_target_resolution import (
+    HttpTargetConfirmation,
+    ResolvedHttpTarget,
+    http_target_evidence_receipt,
+    resolve_http_target,
+    resolve_http_target_config,
 )
 from ul_cli.local_target_resolution import (
     ResolvedLocalTarget,
@@ -244,7 +252,10 @@ def evaluate_dataset(
         str | None,
         typer.Option(
             "--target",
-            help="Python module:callable or local callable/command target configuration JSON.",
+            help=(
+                "Isolated-response HTTP(S) URL, Python module:callable, or local/HTTP target "
+                "configuration JSON."
+            ),
         ),
     ] = None,
     target_artifact: Annotated[
@@ -254,11 +265,34 @@ def evaluate_dataset(
             help="Additional command worker artifact to hash and bind; repeat as needed.",
         ),
     ] = None,
+    http_preset: Annotated[
+        Literal["generic-json", "openai-chat"] | None,
+        typer.Option(help="Request/response shape for an HTTP URL; defaults to generic-json."),
+    ] = None,
+    request_json_template: Annotated[
+        str | None,
+        typer.Option(help="JSON containing one {{input}} value; overrides the direct HTTP preset."),
+    ] = None,
+    response_json_pointer: Annotated[
+        str | None,
+        typer.Option(help="RFC 6901 pointer to the direct HTTP response value."),
+    ] = None,
+    agent_model: Annotated[
+        str | None,
+        typer.Option(help="Model sent by the direct HTTP openai-chat preset."),
+    ] = None,
+    header_from_env: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--header-from-env",
+            help="HTTP_HEADER=UL_ENVIRONMENT_VARIABLE; repeat for credentials or routing.",
+        ),
+    ] = None,
     confirm_target: Annotated[
         str | None,
         typer.Option(
             "--confirm-target",
-            help="Confirm the exact local executable, artifacts, environment, and callable digest.",
+            help="Confirm the exact local or HTTP target digest.",
         ),
     ] = None,
     output: Annotated[
@@ -307,7 +341,7 @@ def evaluate_dataset(
             "--operator",
             help=(
                 "Augmentation ID. Run 'ul augmentations list --mode dataset_variation' "
-                "for values; repeat as needed."
+                "for values; repeat as needed. Defaults to input.surface.typing_noise."
             ),
         ),
     ] = None,
@@ -340,6 +374,16 @@ def evaluate_dataset(
     confirm_test_environment: Annotated[
         bool,
         typer.Option(help=("Confirm the environment is intended for testing and can be reset.")),
+    ] = False,
+    confirm_request_isolation: Annotated[
+        bool,
+        typer.Option(
+            help="Attest every direct HTTP request starts fresh and cannot affect another."
+        ),
+    ] = False,
+    confirm_safe_test_target: Annotated[
+        bool,
+        typer.Option(help="Attest the direct HTTP target cannot cause real-world effects."),
     ] = False,
     allow_insecure_http: Annotated[
         bool,
@@ -428,12 +472,18 @@ def evaluate_dataset(
     reset/setup/execute/snapshot lifecycle. Production observations are passive source data and
     cannot select the execution destination.
 
+    Pass --target URL for an existing response-only JSON agent without writing a UL config. Direct
+    HTTP targets use the generic-json mapping by default, must isolate every request, and cannot
+    provide committed-state evidence without a separate state observer.
+
+    ul probe and this command both default to input.surface.typing_noise when --operator is omitted.
+
     Example: ul dataset evaluate interactions.jsonl --environment-config environment.json
     --allow-environment-network --confirm-test-environment
     --output results.jsonl
 
-    Local: ul dataset evaluate interactions.jsonl --target agent:invoke
-    --confirm-test-environment --confirm-target DIGEST --output results.jsonl
+    Direct HTTP: ul dataset evaluate interactions.jsonl --target https://agent.test/invoke
+    --confirm-request-isolation --confirm-safe-test-target --dry-run
 
     Discover operators: ul augmentations list --mode dataset_variation
     Augmentation retention: --augmentations-output PATH or --no-save-augmentations
@@ -509,6 +559,13 @@ def evaluate_dataset(
         if redaction_state is None and recorded_command.redaction_state_path is not None:
             redaction_state = Path(recorded_command.redaction_state_path)
     repetitions = repetitions or 3
+    direct_http_options_used = (
+        http_preset is not None
+        or request_json_template is not None
+        or response_json_pointer is not None
+        or agent_model is not None
+        or bool(header_from_env)
+    )
     if environment_config is not None and target is not None:
         raise typer.BadParameter(
             "--target cannot be combined with --environment-config",
@@ -517,6 +574,11 @@ def evaluate_dataset(
     if target_artifact and target is None:
         raise typer.BadParameter(
             "--target-artifact requires --target", param_hint="--target-artifact"
+        )
+    if direct_http_options_used and target is None:
+        raise typer.BadParameter(
+            "direct HTTP mapping options require --target with an HTTP URL",
+            param_hint="--target",
         )
     if confirm_target is not None and target is None:
         raise typer.BadParameter(
@@ -630,28 +692,78 @@ def evaluate_dataset(
                     TEST_ENVIRONMENT_CONFIRMATION_MESSAGE,
                     param_hint="--confirm-test-environment",
                 )
-        loaded_local_target: ResolvedLocalTarget | None = (
-            resolve_local_target(
-                target,
-                explicit_artifacts=tuple(target_artifact or ()),
+        loaded_local_target: ResolvedLocalTarget | None = None
+        resolved_http_target: ResolvedHttpTarget | None = None
+        if target is not None:
+            direct_http_target = target.casefold().startswith(("https://", "http://"))
+            if direct_http_target and not confirm_request_isolation:
+                raise typer.BadParameter(
+                    "direct HTTP targets require --confirm-request-isolation",
+                    param_hint="--confirm-request-isolation",
+                )
+            if direct_http_target and not confirm_safe_test_target:
+                raise typer.BadParameter(
+                    "direct HTTP targets require --confirm-safe-test-target",
+                    param_hint="--confirm-safe-test-target",
+                )
+            try:
+                resolved_http_target = resolve_http_target(
+                    target,
+                    allow_insecure_http=allow_insecure_http,
+                    http_preset=http_preset,
+                    request_json_template=request_json_template,
+                    response_json_pointer=response_json_pointer,
+                    agent_model=agent_model,
+                    header_from_env=header_from_env,
+                    request_isolation_attested=confirm_request_isolation,
+                    safe_test_target_attested=confirm_safe_test_target,
+                )
+            except (OSError, ValidationError, ValueError):
+                if (
+                    target.casefold().startswith(("https://", "http://"))
+                    or direct_http_options_used
+                ):
+                    raise
+                loaded_local_target = resolve_local_target(
+                    target,
+                    explicit_artifacts=tuple(target_artifact or ()),
+                )
+            if resolved_http_target is not None and target_artifact:
+                raise ValueError("--target-artifact applies only to local targets")
+        loaded_target_config = (
+            resolved_http_target.config
+            if resolved_http_target is not None
+            else (
+                load_json_http_environment_config(environment_config)
+                if environment_config is not None
+                else _recorded_http_target_config(recorded_manifest_for_resume)
             )
-            if target is not None
+        )
+        recorded_http_confirmation = (
+            recorded_manifest_for_resume.effective_command.http_target_confirmation
+            if recorded_manifest_for_resume is not None
             else None
         )
-        loaded_target_config = (
-            load_json_http_environment_config(environment_config)
-            if environment_config is not None
-            else (
-                recorded_manifest_for_resume.run_context.target.config
-                if recorded_manifest_for_resume is not None
-                and recorded_manifest_for_resume.run_context.target.kind == "environment_http"
-                else None
-            )
-        )
+        if (
+            recorded_http_confirmation is not None
+            and resolved_http_target is None
+            and loaded_target_config is not None
+        ):
+            current_http_confirmation = resolve_http_target_config(
+                recorded_http_confirmation.reference,
+                loaded_target_config,
+                allow_insecure_http=allow_insecure_http,
+            ).confirmation
+            if current_http_confirmation != recorded_http_confirmation:
+                raise ValueError(
+                    "HTTP target credential identity changed since this run was confirmed; "
+                    "start a new evaluation and confirm the new target digest"
+                )
         if (
             resume is not None
             and recorded_manifest_for_resume is not None
             and recorded_manifest_for_resume.run_context.target.kind == "probe_target"
+            and recorded_manifest_for_resume.effective_command.http_target_config is None
             and loaded_local_target is None
         ):
             raise ValueError("local target resume requires the same explicit --target")
@@ -691,6 +803,22 @@ def evaluate_dataset(
                     "committed-state invariants require the stateful-lifecycle adapter tier; "
                     "isolated-response targets provide response evidence only"
                 )
+        if (
+            resolved_http_target is not None
+            and not dry_run
+            and resume is None
+            and not allow_environment_network
+        ):
+            raise ValueError("HTTP target execution requires --allow-environment-network")
+        if (
+            resolved_http_target is not None
+            and not dry_run
+            and resume is None
+            and confirm_target != resolved_http_target.confirmation_sha256
+        ):
+            raise ValueError(
+                "HTTP execution requires --confirm-target with the exact displayed digest"
+            )
         if (
             loaded_local_target is not None
             and invariant_suite is not None
@@ -739,6 +867,9 @@ def evaluate_dataset(
             else load_dataset_semantic_settings()
         )
         validate_model_input_bounds(selected_records, settings.max_input_chars)
+        direct_http_target_receipt = _direct_http_target_receipt(
+            resolved_http_target, recorded_manifest_for_resume
+        )
         run_context = (
             build_dataset_evidence_run_context(
                 selected_records=selected_records,
@@ -746,11 +877,13 @@ def evaluate_dataset(
                 evaluation_mode=evaluation_mode,
                 repetitions=repetitions,
                 invariant_suite=invariant_suite,
-                target_config=normalized_target_config,
+                target_config=(
+                    None if direct_http_target_receipt is not None else normalized_target_config
+                ),
                 target_receipt=(
                     local_target_evidence_receipt(loaded_local_target)
                     if loaded_local_target is not None
-                    else None
+                    else direct_http_target_receipt
                 ),
                 settings=settings,
                 redaction_policy_sha256=(
@@ -915,6 +1048,12 @@ def evaluate_dataset(
                     else None
                 )
             ),
+            http_target_confirmation=_recorded_or_resolved_http_confirmation(
+                resolved_http_target, recorded_manifest_for_resume
+            ),
+            http_target_config=_resolved_or_recorded_http_target_config(
+                resolved_http_target, recorded_manifest_for_resume
+            ),
         )
         run_manifest_path = manifest_path(output)
         run_journal_path = journal_path(output)
@@ -1046,6 +1185,8 @@ def evaluate_dataset(
     if dry_run:
         if loaded_local_target is not None:
             _print_local_target_identity(loaded_local_target)
+        if resolved_http_target is not None:
+            _print_http_target_identity(resolved_http_target)
         print_dataset_plan(
             record_count=len(records),
             selected_count=len(selected_records),
@@ -1213,6 +1354,13 @@ def evaluate_dataset(
             )
         else:
             assert loaded_target_config is not None
+            if (
+                resolved_http_target is not None
+                and confirm_target != resolved_http_target.confirmation_sha256
+            ):
+                raise ValueError(
+                    "HTTP execution requires --confirm-target with the exact displayed digest"
+                )
             if not allow_environment_network:
                 raise ValueError("environment execution requires --allow-environment-network")
             execution_target = JsonHttpEnvironmentConnection.from_config(
@@ -1224,7 +1372,11 @@ def evaluate_dataset(
     except ValueError as error:
         raise typer.BadParameter(
             str(error),
-            param_hint="--target" if loaded_local_target is not None else "--environment-config",
+            param_hint=(
+                "--target"
+                if loaded_local_target is not None or resolved_http_target is not None
+                else "--environment-config"
+            ),
         ) from None
 
     resume_argv: tuple[str, ...] | None = None
@@ -1559,6 +1711,55 @@ def evaluate_dataset(
         raise typer.Exit(code=1)
 
 
+def _recorded_http_target_config(
+    recorded_manifest: DatasetRunManifest | None,
+) -> JsonHttpTargetConfig | None:
+    if recorded_manifest is None:
+        return None
+    direct_http_config = recorded_manifest.effective_command.http_target_config
+    if direct_http_config is not None:
+        return direct_http_config
+    if recorded_manifest.run_context.target.kind == "environment_http":
+        return recorded_manifest.run_context.target.config
+    return None
+
+
+def _direct_http_target_receipt(
+    resolved_target: ResolvedHttpTarget | None,
+    recorded_manifest: DatasetRunManifest | None,
+) -> dict[str, JsonValue] | None:
+    if resolved_target is not None:
+        return http_target_evidence_receipt(resolved_target)
+    if (
+        recorded_manifest is not None
+        and recorded_manifest.effective_command.http_target_config is not None
+    ):
+        return recorded_manifest.run_context.target.receipt
+    return None
+
+
+def _recorded_or_resolved_http_confirmation(
+    resolved_target: ResolvedHttpTarget | None,
+    recorded_manifest: DatasetRunManifest | None,
+) -> HttpTargetConfirmation | None:
+    if resolved_target is not None:
+        return resolved_target.confirmation
+    if recorded_manifest is not None:
+        return recorded_manifest.effective_command.http_target_confirmation
+    return None
+
+
+def _resolved_or_recorded_http_target_config(
+    resolved_target: ResolvedHttpTarget | None,
+    recorded_manifest: DatasetRunManifest | None,
+) -> JsonHttpTargetConfig | None:
+    if resolved_target is not None:
+        return resolved_target.config
+    if recorded_manifest is not None:
+        return recorded_manifest.effective_command.http_target_config
+    return None
+
+
 def _print_local_target_identity(target: ResolvedLocalTarget) -> None:
     confirmation = target.confirmation
     print_dataset_plain("UL active-probe target")
@@ -1576,6 +1777,14 @@ def _print_local_target_identity(target: ResolvedLocalTarget) -> None:
         )
     if confirmation.callable is not None:
         print_dataset_plain(f"  Callable: {confirmation.callable}")
+    print_dataset_plain("Use only a dedicated test target that cannot cause real-world effects.")
+
+
+def _print_http_target_identity(target: ResolvedHttpTarget) -> None:
+    print_dataset_plain("UL active-probe target")
+    print_dataset_plain("  Kind: http")
+    print_dataset_plain(f"  Config sha256: {target.config_sha256}")
+    print_dataset_plain(f"  Confirmation sha256: {target.confirmation_sha256}")
     print_dataset_plain("Use only a dedicated test target that cannot cause real-world effects.")
 
 

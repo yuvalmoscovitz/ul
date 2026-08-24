@@ -4,86 +4,20 @@ import json
 import os
 import stat
 from pathlib import Path
-from typing import Annotated, Literal, cast
-from urllib.parse import urlsplit
+from typing import Annotated, Literal
 
 import typer
-from pydantic import JsonValue, ValidationError
+from pydantic import ValidationError
 from ul.http_environment import (
     ENVIRONMENT_ID_PLACEHOLDER,
     JsonHttpEnvironmentConfig,
-    JsonHttpIsolatedResponseConfig,
     JsonHttpTargetConfig,
 )
 
-from ..evaluation.records import (
-    reject_duplicate_json_keys,
-    reject_nonstandard_json_constant,
-)
+from ul_cli.http_target_resolution import create_isolated_response_target_config
+
 from ..presentation.runtime import console
 from ..storage.private_files import create_private_output
-
-_ISOLATED_ADAPTER_PRESETS: dict[str, tuple[JsonValue, str]] = {
-    "generic-json": ({"input": "{{input}}"}, "/response"),
-    "openai-chat": (
-        {"messages": [{"role": "user", "content": "{{input}}"}]},
-        "/choices/0/message/content",
-    ),
-}
-
-
-def create_isolated_response_target_config(
-    url: str,
-    *,
-    isolated_preset: Literal["generic-json", "openai-chat"] = "generic-json",
-    environment_id: str | None = None,
-    request_json_template: str | None = None,
-    response_json_pointer: str | None = None,
-    agent_model: str | None = None,
-    header_from_env: list[str] | None = None,
-) -> JsonHttpIsolatedResponseConfig:
-    if (
-        isolated_preset == "openai-chat"
-        and request_json_template is None
-        and (agent_model is None or not agent_model.strip())
-    ):
-        raise ValueError(
-            "openai-chat preset requires --agent-model unless --request-json-template is set"
-        )
-    if agent_model is not None and (
-        isolated_preset != "openai-chat" or request_json_template is not None
-    ):
-        raise ValueError(
-            "--agent-model is available only with the openai-chat preset request template"
-        )
-    preset_template, preset_pointer = _ISOLATED_ADAPTER_PRESETS[isolated_preset]
-    selected_template = (
-        _parse_request_json_template(request_json_template)
-        if request_json_template is not None
-        else (
-            {"model": agent_model, **cast(dict[str, JsonValue], preset_template)}
-            if isolated_preset == "openai-chat"
-            else preset_template
-        )
-    )
-    endpoint_host = urlsplit(url).hostname or "target"
-    return JsonHttpIsolatedResponseConfig.model_validate(
-        {
-            "version": 1,
-            "adapter_tier": "isolated_response",
-            "environment_id": environment_id or f"isolated-response:{endpoint_host}",
-            "request_isolation_attested": True,
-            "safe_test_target_attested": True,
-            "headers_from_env": _parse_header_environment_mappings(header_from_env or []),
-            "execute": {
-                "url": url,
-                "request_json_template": selected_template,
-                "response_json_pointer": (
-                    response_json_pointer if response_json_pointer is not None else preset_pointer
-                ),
-            },
-        }
-    )
 
 
 def initialize_dataset_environment(
@@ -225,6 +159,8 @@ def initialize_dataset_environment(
                 response_json_pointer=response_json_pointer,
                 agent_model=agent_model,
                 header_from_env=header_from_env,
+                request_isolation_attested=confirm_request_isolation,
+                safe_test_target_attested=confirm_safe_test_target,
             )
         else:
             config = JsonHttpEnvironmentConfig.model_validate(
@@ -347,18 +283,6 @@ def initialize_dataset_environment(
     )
 
 
-def _parse_request_json_template(encoded_template: str) -> JsonValue:
-    try:
-        value: object = json.loads(
-            encoded_template,
-            object_pairs_hook=reject_duplicate_json_keys,
-            parse_constant=reject_nonstandard_json_constant,
-        )
-    except (json.JSONDecodeError, RecursionError, ValueError):
-        raise ValueError("request JSON template must be valid standard JSON") from None
-    return cast(JsonValue, value)
-
-
 def _summarize_validation_error(error: ValidationError) -> str:
     reasons: list[str] = []
     for issue in error.errors(include_url=False, include_context=False, include_input=False):
@@ -366,23 +290,3 @@ def _summarize_validation_error(error: ValidationError) -> str:
         message = str(issue["msg"]).removeprefix("Value error, ")
         reasons.append(f"{field_path}: {message}" if field_path else message)
     return f"environment config is invalid: {'; '.join(reasons)}"
-
-
-def _parse_header_environment_mappings(mappings: list[str]) -> dict[str, str]:
-    parsed: dict[str, str] = {}
-    normalized_names: set[str] = set()
-    for mapping in mappings:
-        header_name, separator, environment_variable = mapping.partition("=")
-        normalized_name = header_name.casefold()
-        if (
-            not separator
-            or not header_name
-            or not environment_variable
-            or normalized_name in normalized_names
-        ):
-            raise ValueError(
-                "header mappings must be unique HTTP_HEADER=UL_ENVIRONMENT_VARIABLE values"
-            )
-        normalized_names.add(normalized_name)
-        parsed[header_name] = environment_variable
-    return parsed

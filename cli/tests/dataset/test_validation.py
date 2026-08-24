@@ -13,6 +13,7 @@ from ul import (
 from ul_cli.dataset.evaluation import command as command_module
 from ul_cli.dataset.evaluation import runner as runner_module
 from ul_cli.dataset.evaluation.records import load_interaction_records
+from ul_cli.http_target_resolution import resolve_http_target
 from ul_cli.main import app as root_app
 
 from ._factories import (
@@ -543,4 +544,157 @@ def test_default_limit_and_repetitions_fit_the_default_call_budget(tmp_path: Pat
 
     assert result.exit_code == 0, result.output
     assert "Selected interactions: 10" in result.output
+    assert "Operators: input.surface.typing_noise" in result.output
     assert "Potential environment API calls: up to 60" in result.output
+
+
+def test_direct_http_target_requires_tls_or_explicit_loopback_exception(tmp_path: Path) -> None:
+    dataset = tmp_path / "interactions.jsonl"
+    _write_dataset(dataset, [_record()])
+
+    result = runner.invoke(
+        root_app,
+        [
+            "dataset",
+            "evaluate",
+            str(dataset),
+            "--target",
+            "http://127.0.0.1:8765/invoke",
+            "--confirm-request-isolation",
+            "--confirm-safe-test-target",
+            "--dry-run",
+        ],
+    )
+
+    assert result.exit_code != 0
+    normalized_output = " ".join(
+        _ANSI_ESCAPE_PATTERN.sub("", result.output).replace("│", "").split()
+    )
+    assert "insecure transport opt-in" in normalized_output
+
+
+def test_direct_http_mapping_options_reject_non_http_targets(tmp_path: Path) -> None:
+    dataset = tmp_path / "interactions.jsonl"
+    _write_dataset(dataset, [_record()])
+
+    result = runner.invoke(
+        root_app,
+        [
+            "dataset",
+            "evaluate",
+            str(dataset),
+            "--target",
+            "customer_agent:run",
+            "--response-json-pointer",
+            "/response",
+            "--dry-run",
+        ],
+    )
+
+    assert result.exit_code != 0
+    assert "direct HTTP mapping options require an HTTP URL target" in " ".join(
+        result.output.split()
+    )
+
+
+def test_direct_http_execution_requires_exact_target_confirmation_before_output(
+    tmp_path: Path,
+) -> None:
+    dataset = tmp_path / "interactions.jsonl"
+    output = tmp_path / "results.jsonl"
+    _write_dataset(dataset, [_record()])
+
+    result = runner.invoke(
+        root_app,
+        [
+            "dataset",
+            "evaluate",
+            str(dataset),
+            "--target",
+            "https://agent.example.test/invoke",
+            "--allow-environment-network",
+            "--confirm-test-environment",
+            "--confirm-request-isolation",
+            "--confirm-safe-test-target",
+            "--confirm-target",
+            "0" * 64,
+            "--output",
+            str(output),
+        ],
+    )
+
+    assert result.exit_code != 0
+    normalized_output = " ".join(
+        _ANSI_ESCAPE_PATTERN.sub("", result.output).replace("│", "").split()
+    )
+    assert (
+        "HTTP execution requires --confirm-target with the exact displayed digest"
+        in normalized_output
+    )
+    assert not output.exists()
+
+
+def test_direct_http_execution_requires_network_opt_in_before_output(tmp_path: Path) -> None:
+    dataset = tmp_path / "interactions.jsonl"
+    output = tmp_path / "results.jsonl"
+    target_reference = "https://agent.example.test/invoke"
+    _write_dataset(dataset, [_record()])
+    target = resolve_http_target(
+        target_reference,
+        allow_insecure_http=False,
+        request_isolation_attested=True,
+        safe_test_target_attested=True,
+    )
+
+    result = runner.invoke(
+        root_app,
+        [
+            "dataset",
+            "evaluate",
+            str(dataset),
+            "--target",
+            target_reference,
+            "--confirm-test-environment",
+            "--confirm-request-isolation",
+            "--confirm-safe-test-target",
+            "--confirm-target",
+            target.confirmation_sha256,
+            "--output",
+            str(output),
+        ],
+    )
+
+    assert result.exit_code != 0
+    assert "HTTP target execution requires --allow-environment-network" in " ".join(
+        _ANSI_ESCAPE_PATTERN.sub("", result.output).replace("│", "").split()
+    )
+    assert not output.exists()
+
+
+def test_direct_http_target_requires_explicit_safety_attestations_before_output(
+    tmp_path: Path,
+) -> None:
+    dataset = tmp_path / "interactions.jsonl"
+    output = tmp_path / "results.jsonl"
+    _write_dataset(dataset, [_record()])
+
+    result = runner.invoke(
+        root_app,
+        [
+            "dataset",
+            "evaluate",
+            str(dataset),
+            "--target",
+            "https://agent.example.test/invoke",
+            "--allow-environment-network",
+            "--confirm-test-environment",
+            "--output",
+            str(output),
+        ],
+    )
+
+    assert result.exit_code != 0
+    assert "direct HTTP targets require --confirm-request-isolation" in " ".join(
+        _ANSI_ESCAPE_PATTERN.sub("", result.output).replace("│", "").split()
+    )
+    assert not output.exists()

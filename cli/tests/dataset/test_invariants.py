@@ -75,7 +75,7 @@ def test_invariant_dry_run_reports_rules_authority_and_no_extra_calls(
     assert "Declared observation authority: committed_state_snapshot" in result.output
     assert "Additional model calls for customer invariants: 0" in result.output
     assert "Additional environment API calls for customer invariants: 0" in result.output
-    assert "Potential semantic model calls: up to 13" in result.output
+    assert "Potential semantic model calls: up to 12" in result.output
     assert "Potential environment API calls: up to 6" in result.output
 
 

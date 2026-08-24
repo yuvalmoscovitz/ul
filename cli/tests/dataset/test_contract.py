@@ -35,8 +35,18 @@ def test_help_explains_dataset_environment_and_operator_contract() -> None:
     assert "requests" in normalized_help
     assert "Discover operators: ul augmentations list --mode dataset_variation" in normalized_help
     assert "--environment-config" in normalized_help
-    assert "configuration" in normalized_help
     help_text = " ".join(normalized_help.replace("│", "").split())
+    assert "Pass --target URL for an existing response-only JSON agent" in help_text
+    assert "Isolated-response HTTP(S) URL" in help_text
+    assert "generic-json mapping by default" in help_text
+    assert "must isolate every request" in help_text
+    assert "both default to input.surface.typing_noise" in help_text
+    assert "--http-preset" in help_text
+    assert "--request-json" in help_text
+    assert "--response-json" in help_text
+    assert "--agent-model" in help_text
+    assert "--header-from" in help_text
+    assert "configuration" in normalized_help
     assert "structured multi-turn cases" in help_text
     assert "customer's agent environment API" in help_text
 
