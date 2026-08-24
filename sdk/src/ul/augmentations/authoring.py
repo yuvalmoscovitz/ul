@@ -1,7 +1,4 @@
-"""Dataset, conversation, environment-fault, and qualification runtimes.
-
-Product definitions and scenario runtimes are in ``ul_core.augmentations``.
-"""
+"""Typed contracts for authoring and registering private UL augmentations."""
 
 from ul_core.augmentations.authoring import (
     AugmentationDefinition,
@@ -25,55 +22,37 @@ from ul_core.augmentations.authoring import (
     ValidatorBinding,
     builtin_augmentation_library,
 )
+from ul_core.augmentations.definitions import AugmentationRef
+from ul_core.augmentations.projections import AugmentationProjection, ProjectionContract
 from ul_core.augmentations.registry import ValidationResult
-
-from ul.augmentations.dataset import (
-    DatasetAugmentationEngine,
-    DatasetAugmentationOperator,
-    DatasetAugmentationResult,
-    DatasetAugmentationSkip,
-    builtin_dataset_augmentation_operators,
-    create_dataset_augmentation_projection,
-    resolve_dataset_augmentation_operator,
-)
-from ul.augmentations.qualification import (
-    AugmentationQualificationReport,
-    create_augmentation_qualification_report,
-    load_augmentation_qualification_report,
-    replay_augmentation_qualification,
-)
+from ul_core.models import ConversationTurn, EnvironmentEvent, Scenario
 
 __all__ = [
     "AugmentationDefinition",
     "AugmentationLibrary",
-    "AugmentationQualificationReport",
+    "AugmentationProjection",
+    "AugmentationRef",
     "AugmentationRuntimeBinding",
     "AugmentationRuntimeKind",
     "AugmentationValidatorRuntime",
     "ConversationModifierBinding",
     "ConversationModifierRuntime",
-    "DatasetAugmentationEngine",
-    "DatasetAugmentationOperator",
-    "DatasetAugmentationResult",
-    "DatasetAugmentationSkip",
+    "ConversationTurn",
     "DeterministicTransformBinding",
     "DeterministicTransformRuntime",
+    "EnvironmentEvent",
     "EnvironmentScheduleBinding",
     "EnvironmentScheduleRuntime",
     "FaultControlBinding",
     "FaultControlRuntime",
     "InstalledRuntimeBinding",
+    "ProjectionContract",
     "RegisteredAugmentation",
     "RegisteredRuntimeBinding",
+    "Scenario",
     "SemanticRendererBinding",
     "SemanticRendererRuntime",
     "ValidationResult",
     "ValidatorBinding",
     "builtin_augmentation_library",
-    "builtin_dataset_augmentation_operators",
-    "create_augmentation_qualification_report",
-    "create_dataset_augmentation_projection",
-    "load_augmentation_qualification_report",
-    "replay_augmentation_qualification",
-    "resolve_dataset_augmentation_operator",
 ]
