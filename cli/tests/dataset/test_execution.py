@@ -355,6 +355,109 @@ def test_full_dataset_evaluation_runs_local_callable_through_worker_boundary(
         )
 
 
+def test_local_target_pause_action_preserves_binding_and_resumes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    dataset = tmp_path / "interactions.jsonl"
+    output = tmp_path / "results.jsonl"
+    artifact = tmp_path / "customer-policy.json"
+    dataset.write_text(
+        '{"id":"case-1","input":"Return status for ticket 42.",'
+        '"output":{"action":"lookup","ticket":42}}\n',
+        encoding="utf-8",
+    )
+    (tmp_path / "customer_agent.py").write_text(
+        "def run(value):\n    return {'action': 'lookup', 'ticket': 42, 'received': value}\n",
+        encoding="utf-8",
+    )
+    artifact.write_text('{"policy":"test-only"}\n', encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("UL_LIVE", "true")
+    monkeypatch.setenv("OPEN_ROUTER_API_KEY", "test-key")
+
+    async def successful_preflight(_settings: object) -> object:
+        return _evaluator_preflight()
+
+    monkeypatch.setattr(command_module, "load_dataset_semantic_settings", _settings)
+    monkeypatch.setattr(command_module, "preflight_evaluator", successful_preflight)
+    monkeypatch.setattr(
+        runner_module,
+        "create_semantic_model_deconstructor",
+        lambda _settings: _LocalEvaluationSemanticModel(),
+    )
+    create_runtime = command_module.create_campaign_progress_runtime
+
+    def create_paused_runtime(**arguments: object) -> object:
+        runtime = create_runtime(**arguments)
+        runtime.control.request_pause()
+        return runtime
+
+    monkeypatch.setattr(
+        command_module,
+        "create_campaign_progress_runtime",
+        create_paused_runtime,
+    )
+    target = resolve_local_target(
+        "customer_agent:run",
+        explicit_artifacts=(artifact,),
+    )
+
+    paused = runner.invoke(
+        root_app,
+        [
+            "dataset",
+            "evaluate",
+            str(dataset),
+            "--target",
+            "customer_agent:run",
+            "--target-artifact",
+            str(artifact),
+            "--confirm-target",
+            target.confirmation_sha256,
+            "--confirm-test-environment",
+            "--repetitions",
+            "1",
+            "--output",
+            str(output),
+        ],
+    )
+
+    assert paused.exit_code == 130, paused.output
+    action_id_match = re.search(r'next_argv=\["ul","action","([0-9a-f]{64})"\]', paused.output)
+    assert action_id_match is not None
+    receipt = json.loads(
+        (tmp_path / "action-state" / f"{action_id_match.group(1)}.json").read_text(encoding="utf-8")
+    )
+    assert receipt["argv"] == [
+        "ul",
+        "dataset",
+        "evaluate",
+        "--resume",
+        str(output.resolve()),
+        "--target",
+        "customer_agent:run",
+        "--confirm-target",
+        target.confirmation_sha256,
+        "--target-artifact",
+        str(artifact.resolve()),
+    ]
+
+    monkeypatch.setattr(
+        command_module,
+        "create_campaign_progress_runtime",
+        create_runtime,
+    )
+    resumed = runner.invoke(root_app, receipt["argv"][1:])
+
+    assert resumed.exit_code == 0, resumed.output
+    saved = json.loads(output.read_text(encoding="utf-8").splitlines()[1])
+    assert (
+        saved["run_context"]["target"]["receipt"]["confirmation_sha256"]
+        == target.confirmation_sha256
+    )
+
+
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX executable-script test")
 def test_full_dataset_evaluation_runs_command_target_through_worker_boundary(
     tmp_path: Path,

@@ -29,14 +29,31 @@ def test_dataset_terminal_actions_are_opaque_private_and_executable(
     )
     private_canary = "PRIVATE_PATH_CANARY\nwith-control-\x1b[31m"
     evidence_path = tmp_path / private_canary
-    next_commands = create_campaign_next_commands(evidence_path)
+    artifact_path = tmp_path / "private-artifact"
+    local_resume_argv = (
+        "ul",
+        "dataset",
+        "evaluate",
+        "--resume",
+        str(evidence_path.resolve()),
+        "--target",
+        "customer_agent:run",
+        "--confirm-target",
+        "a" * 64,
+        "--target-artifact",
+        str(artifact_path.resolve()),
+    )
+    next_commands = create_campaign_next_commands(
+        evidence_path,
+        resume_argv=local_resume_argv,
+    )
     expected_by_status: dict[
         Literal["paused", "cancelled", "completed"],
         tuple[Literal["resume", "diagnose", "inspect_findings"], tuple[str, ...]],
     ] = {
         "paused": (
             "resume",
-            ("ul", "dataset", "evaluate", "--resume", str(evidence_path.resolve())),
+            local_resume_argv,
         ),
         "cancelled": (
             "diagnose",

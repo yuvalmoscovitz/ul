@@ -1227,6 +1227,26 @@ def evaluate_dataset(
             param_hint="--target" if loaded_local_target is not None else "--environment-config",
         ) from None
 
+    resume_argv: tuple[str, ...] | None = None
+    if loaded_local_target is not None:
+        assert target is not None
+        target_path = Path(target)
+        action_target = str(target_path.resolve()) if target_path.is_file() else target
+        local_resume_argv = [
+            "ul",
+            "dataset",
+            "evaluate",
+            "--resume",
+            str(output.resolve()),
+            "--target",
+            action_target,
+            "--confirm-target",
+            loaded_local_target.confirmation_sha256,
+        ]
+        for artifact in target_artifact or ():
+            local_resume_argv.extend(("--target-artifact", str(artifact.resolve())))
+        resume_argv = tuple(local_resume_argv)
+
     progress_runtime = create_campaign_progress_runtime(
         case_count=len(all_selected_records),
         work_upper_bound=(
@@ -1246,7 +1266,7 @@ def evaluate_dataset(
             )
             * settings.timeout_seconds
         ),
-        next_commands=create_campaign_next_commands(output),
+        next_commands=create_campaign_next_commands(output, resume_argv=resume_argv),
         json_output=progress_json,
     )
     if trial_journal is not None:

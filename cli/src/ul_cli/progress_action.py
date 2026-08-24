@@ -32,7 +32,7 @@ class _ProgressActionReceipt(ULModel):
         "probe_resume",
         "probe_diagnose",
     ]
-    argv: tuple[str, ...] = Field(min_length=2, max_length=96)
+    argv: tuple[str, ...] = Field(min_length=2, max_length=512)
     working_directory: str = Field(min_length=1)
     nonce: str = Field(pattern=r"^[0-9a-f]{32}$")
 
@@ -102,11 +102,39 @@ def _validate_action_argv(
     }
     if action_kind in fixed_shapes:
         prefix = fixed_shapes[action_kind]
-        expected_length = len(prefix) + 1 + (action_kind == "dataset_diagnose")
-        if argv[: len(prefix)] != prefix or len(argv) != expected_length:
+        minimum_length = len(prefix) + 1 + (action_kind == "dataset_diagnose")
+        if argv[: len(prefix)] != prefix or len(argv) < minimum_length:
             raise ValueError("progress action arguments do not match their action kind")
+        if argv[len(prefix)].startswith("--"):
+            raise ValueError("progress action path is invalid")
         if action_kind == "dataset_diagnose" and argv[-1] != "--dry-run":
             raise ValueError("dataset diagnosis must be a dry run")
+        if action_kind == "dataset_resume":
+            value_options = {"--target", "--confirm-target", "--target-artifact"}
+            seen_bound_options: set[str] = set()
+            index = len(prefix) + 1
+            while index < len(argv):
+                option = argv[index]
+                if option not in value_options or index + 1 >= len(argv):
+                    raise ValueError("dataset resume contains an unsupported option")
+                if argv[index + 1].startswith("--"):
+                    raise ValueError("dataset resume option is missing its value")
+                if (
+                    option == "--confirm-target"
+                    and re.fullmatch(r"[0-9a-f]{64}", argv[index + 1]) is None
+                ):
+                    raise ValueError("dataset resume target confirmation is invalid")
+                if option == "--target-artifact" and not Path(argv[index + 1]).is_absolute():
+                    raise ValueError("dataset resume target artifact must be absolute")
+                if option != "--target-artifact":
+                    if option in seen_bound_options:
+                        raise ValueError("dataset resume repeats a required bound option")
+                    seen_bound_options.add(option)
+                index += 2
+            if seen_bound_options not in (set(), {"--target", "--confirm-target"}):
+                raise ValueError("dataset resume local target binding is incomplete")
+        elif len(argv) != minimum_length:
+            raise ValueError("progress action arguments do not match their action kind")
         return
     if action_kind == "probe_resume":
         if argv[:2] != ("ul", "probe") or len(argv) < 13 or argv[2].startswith("--"):
