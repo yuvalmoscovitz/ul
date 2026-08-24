@@ -1322,6 +1322,8 @@ def test_http_target_contract_runs_authenticated_loopback_and_resumes(
                 request_json_template=cast(str, direct_options["request_json_template"]),
                 response_json_pointer=cast(str, direct_options["response_json_pointer"]),
                 header_from_env=cast(list[str], direct_options["header_from_env"]),
+                request_isolation_attested=True,
+                safe_test_target_attested=True,
             )
             target_config.write_text(
                 json.dumps(config.model_dump(mode="json", exclude_none=True)),
@@ -1342,7 +1344,12 @@ def test_http_target_contract_runs_authenticated_loopback_and_resumes(
                 "--header-from-env",
                 cast(list[str], direct_options["header_from_env"])[0],
             ]
-            resolved_target = resolve_http_target(target_reference, **direct_options)
+            resolved_target = resolve_http_target(
+                target_reference,
+                request_isolation_attested=True,
+                safe_test_target_attested=True,
+                **direct_options,
+            )
 
         observed_outputs: list[object] = []
 
@@ -1387,6 +1394,7 @@ def test_http_target_contract_runs_authenticated_loopback_and_resumes(
             str(output),
         ]
         if target_mode == "direct":
+            arguments.extend(["--confirm-request-isolation", "--confirm-safe-test-target"])
             create_runtime = command_module.create_campaign_progress_runtime
 
             def create_paused_runtime(**options: object) -> object:
@@ -1424,6 +1432,8 @@ def test_http_target_contract_runs_authenticated_loopback_and_resumes(
                 request_json_template=cast(str, direct_options["request_json_template"]),
                 response_json_pointer="/changed",
                 header_from_env=cast(list[str], direct_options["header_from_env"]),
+                request_isolation_attested=True,
+                safe_test_target_attested=True,
             )
             changed = runner.invoke(
                 root_app,
@@ -1440,6 +1450,8 @@ def test_http_target_contract_runs_authenticated_loopback_and_resumes(
                     "/changed",
                     "--header-from-env",
                     cast(list[str], direct_options["header_from_env"])[0],
+                    "--confirm-request-isolation",
+                    "--confirm-safe-test-target",
                     "--confirm-target",
                     changed_target.confirmation_sha256,
                 ],
@@ -1452,6 +1464,14 @@ def test_http_target_contract_runs_authenticated_loopback_and_resumes(
                 "create_campaign_progress_runtime",
                 create_runtime,
             )
+            monkeypatch.setenv("UL_ENVIRONMENT_CUSTOMER_TOKEN", "changed-secret")
+            changed_credential = runner.invoke(root_app, receipt["argv"][1:])
+            assert changed_credential.exit_code != 0
+            assert "HTTP target credential identity changed" in " ".join(
+                changed_credential.output.replace("│", "").split()
+            )
+            assert received_requests == []
+            monkeypatch.setenv("UL_ENVIRONMENT_CUSTOMER_TOKEN", secret_canary)
             result = runner.invoke(root_app, receipt["argv"][1:])
         else:
             result = runner.invoke(root_app, arguments)

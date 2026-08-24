@@ -560,6 +560,8 @@ def test_direct_http_target_requires_tls_or_explicit_loopback_exception(tmp_path
             str(dataset),
             "--target",
             "http://127.0.0.1:8765/invoke",
+            "--confirm-request-isolation",
+            "--confirm-safe-test-target",
             "--dry-run",
         ],
     )
@@ -610,6 +612,8 @@ def test_direct_http_execution_requires_exact_target_confirmation_before_output(
             "https://agent.example.test/invoke",
             "--allow-environment-network",
             "--confirm-test-environment",
+            "--confirm-request-isolation",
+            "--confirm-safe-test-target",
             "--confirm-target",
             "0" * 64,
             "--output",
@@ -631,7 +635,12 @@ def test_direct_http_execution_requires_network_opt_in_before_output(tmp_path: P
     output = tmp_path / "results.jsonl"
     target_reference = "https://agent.example.test/invoke"
     _write_dataset(dataset, [_record()])
-    target = resolve_http_target(target_reference, allow_insecure_http=False)
+    target = resolve_http_target(
+        target_reference,
+        allow_insecure_http=False,
+        request_isolation_attested=True,
+        safe_test_target_attested=True,
+    )
 
     result = runner.invoke(
         root_app,
@@ -642,6 +651,8 @@ def test_direct_http_execution_requires_network_opt_in_before_output(tmp_path: P
             "--target",
             target_reference,
             "--confirm-test-environment",
+            "--confirm-request-isolation",
+            "--confirm-safe-test-target",
             "--confirm-target",
             target.confirmation_sha256,
             "--output",
@@ -651,6 +662,35 @@ def test_direct_http_execution_requires_network_opt_in_before_output(tmp_path: P
 
     assert result.exit_code != 0
     assert "HTTP target execution requires --allow-environment-network" in " ".join(
+        result.output.replace("│", "").split()
+    )
+    assert not output.exists()
+
+
+def test_direct_http_target_requires_explicit_safety_attestations_before_output(
+    tmp_path: Path,
+) -> None:
+    dataset = tmp_path / "interactions.jsonl"
+    output = tmp_path / "results.jsonl"
+    _write_dataset(dataset, [_record()])
+
+    result = runner.invoke(
+        root_app,
+        [
+            "dataset",
+            "evaluate",
+            str(dataset),
+            "--target",
+            "https://agent.example.test/invoke",
+            "--allow-environment-network",
+            "--confirm-test-environment",
+            "--output",
+            str(output),
+        ],
+    )
+
+    assert result.exit_code != 0
+    assert "direct HTTP targets require --confirm-request-isolation" in " ".join(
         result.output.replace("│", "").split()
     )
     assert not output.exists()

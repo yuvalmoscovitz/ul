@@ -22,6 +22,7 @@ from ul import (
 
 from ul_cli.dataset.storage.private_files import open_resume_descriptor
 from ul_cli.dataset_review import DatasetEvidenceRunContext
+from ul_cli.http_target_resolution import HttpTargetConfirmation
 
 if sys.platform == "win32":
     import msvcrt
@@ -82,6 +83,7 @@ class DatasetRunEffectiveCommand(_StrictModel):
     redaction_state_path: str | None = None
     redaction_state_sha256: str | None = Field(default=None, pattern=_SHA256_PATTERN)
     augmentations_output_path: str | None = None
+    http_target_confirmation: HttpTargetConfirmation | None = None
 
 
 class DatasetRunManifest(_StrictModel):
@@ -229,6 +231,7 @@ def create_dataset_run_manifest(
     redaction_state_path: str | None = None,
     redaction_state_sha256: str | None = None,
     augmentations_output_path: str | None = None,
+    http_target_confirmation: HttpTargetConfirmation | None = None,
 ) -> DatasetRunManifest:
     if repetitions > _MAXIMUM_REPETITIONS:
         raise ValueError(f"repetitions cannot exceed {_MAXIMUM_REPETITIONS}")
@@ -250,6 +253,7 @@ def create_dataset_run_manifest(
         redaction_state_path=redaction_state_path,
         redaction_state_sha256=redaction_state_sha256,
         augmentations_output_path=augmentations_output_path,
+        http_target_confirmation=http_target_confirmation,
     )
     content = {
         "schema_version": "1.0.0",

@@ -88,12 +88,15 @@ work in the configurable runner. Inspect the target digest and complete call bou
 ul dataset evaluate interactions.jsonl \
   --target https://agent.test/invoke \
   --header-from-env Authorization=UL_ENVIRONMENT_AGENT_TOKEN \
+  --confirm-request-isolation \
+  --confirm-safe-test-target \
   --dry-run
 ```
 
 Execution additionally requires `--allow-environment-network`, `--confirm-test-environment`, the
 displayed `--confirm-target` digest, and `--output`. Pause/resume uses the private recorded target
-snapshot, so header secret values never enter a resume command or run artifact.
+snapshot. Header secret values never enter a resume command or run artifact; their hashes are bound
+to the confirmation, and resume stops if a credential value changes.
 
 UL binds the resolved executable, the direct Python module and UL worker, allowlisted environment
 value digests, and command arguments that resolve to files. Repeat `--target-artifact PATH` for

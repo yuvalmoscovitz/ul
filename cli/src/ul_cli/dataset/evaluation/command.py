@@ -83,7 +83,11 @@ from ul_cli.finding_reference import (
     finding_reference_key_path,
     resolve_finding_reference_context,
 )
-from ul_cli.http_target_resolution import ResolvedHttpTarget, resolve_http_target
+from ul_cli.http_target_resolution import (
+    ResolvedHttpTarget,
+    resolve_http_target,
+    resolve_http_target_config,
+)
 from ul_cli.local_target_resolution import (
     ResolvedLocalTarget,
     local_target_evidence_receipt,
@@ -364,6 +368,16 @@ def evaluate_dataset(
     confirm_test_environment: Annotated[
         bool,
         typer.Option(help=("Confirm the environment is intended for testing and can be reset.")),
+    ] = False,
+    confirm_request_isolation: Annotated[
+        bool,
+        typer.Option(
+            help="Attest every direct HTTP request starts fresh and cannot affect another."
+        ),
+    ] = False,
+    confirm_safe_test_target: Annotated[
+        bool,
+        typer.Option(help="Attest the direct HTTP target cannot cause real-world effects."),
     ] = False,
     allow_insecure_http: Annotated[
         bool,
@@ -669,6 +683,17 @@ def evaluate_dataset(
         loaded_local_target: ResolvedLocalTarget | None = None
         resolved_http_target: ResolvedHttpTarget | None = None
         if target is not None:
+            direct_http_target = target.casefold().startswith(("https://", "http://"))
+            if direct_http_target and not confirm_request_isolation:
+                raise typer.BadParameter(
+                    "direct HTTP targets require --confirm-request-isolation",
+                    param_hint="--confirm-request-isolation",
+                )
+            if direct_http_target and not confirm_safe_test_target:
+                raise typer.BadParameter(
+                    "direct HTTP targets require --confirm-safe-test-target",
+                    param_hint="--confirm-safe-test-target",
+                )
             try:
                 resolved_http_target = resolve_http_target(
                     target,
@@ -678,6 +703,8 @@ def evaluate_dataset(
                     response_json_pointer=response_json_pointer,
                     agent_model=agent_model,
                     header_from_env=header_from_env,
+                    request_isolation_attested=confirm_request_isolation,
+                    safe_test_target_attested=confirm_safe_test_target,
                 )
             except (OSError, ValidationError, ValueError):
                 if (
@@ -705,6 +732,26 @@ def evaluate_dataset(
                 )
             )
         )
+        recorded_http_confirmation = (
+            recorded_manifest_for_resume.effective_command.http_target_confirmation
+            if recorded_manifest_for_resume is not None
+            else None
+        )
+        if (
+            recorded_http_confirmation is not None
+            and resolved_http_target is None
+            and loaded_target_config is not None
+        ):
+            current_http_confirmation = resolve_http_target_config(
+                recorded_http_confirmation.reference,
+                loaded_target_config,
+                allow_insecure_http=allow_insecure_http,
+            ).confirmation
+            if current_http_confirmation != recorded_http_confirmation:
+                raise ValueError(
+                    "HTTP target credential identity changed since this run was confirmed; "
+                    "start a new evaluation and confirm the new target digest"
+                )
         if (
             resume is not None
             and recorded_manifest_for_resume is not None
@@ -984,6 +1031,15 @@ def evaluate_dataset(
                 and (recorded_manifest_for_resume is None or augmentations_output_was_explicit)
                 else (
                     recorded_manifest_for_resume.effective_command.augmentations_output_path
+                    if recorded_manifest_for_resume is not None
+                    else None
+                )
+            ),
+            http_target_confirmation=(
+                resolved_http_target.confirmation
+                if resolved_http_target is not None
+                else (
+                    recorded_manifest_for_resume.effective_command.http_target_confirmation
                     if recorded_manifest_for_resume is not None
                     else None
                 )

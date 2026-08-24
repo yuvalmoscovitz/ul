@@ -159,6 +159,8 @@ def initialize_dataset_environment(
                 response_json_pointer=response_json_pointer,
                 agent_model=agent_model,
                 header_from_env=header_from_env,
+                request_isolation_attested=confirm_request_isolation,
+                safe_test_target_attested=confirm_safe_test_target,
             )
         else:
             config = JsonHttpEnvironmentConfig.model_validate(

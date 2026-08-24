@@ -1265,6 +1265,8 @@ def _resolve_target(
                 response_json_pointer=response_json_pointer,
                 agent_model=agent_model,
                 header_from_env=header_from_env,
+                request_isolation_attested=True,
+                safe_test_target_attested=True,
             )
             return _http_target(
                 resolved_http_target.reference,

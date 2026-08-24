@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, cast
@@ -25,6 +26,13 @@ _ISOLATED_ADAPTER_PRESETS: dict[str, tuple[JsonValue, str]] = {
 }
 
 
+class HttpTargetEnvironmentIdentity(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    name: str = Field(min_length=1)
+    value_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
 class HttpTargetConfirmation(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
@@ -34,7 +42,7 @@ class HttpTargetConfirmation(BaseModel):
     config_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     executable: None = None
     artifacts: tuple[()] = ()
-    environment: tuple[()] = ()
+    environment: tuple[HttpTargetEnvironmentIdentity, ...] = ()
     callable: None = None
 
     @property
@@ -66,6 +74,8 @@ def create_isolated_response_target_config(
     response_json_pointer: str | None = None,
     agent_model: str | None = None,
     header_from_env: list[str] | None = None,
+    request_isolation_attested: bool,
+    safe_test_target_attested: bool,
 ) -> JsonHttpIsolatedResponseConfig:
     if (
         isolated_preset == "openai-chat"
@@ -97,8 +107,8 @@ def create_isolated_response_target_config(
             "version": 1,
             "adapter_tier": "isolated_response",
             "environment_id": environment_id or f"isolated-response:{endpoint_host}",
-            "request_isolation_attested": True,
-            "safe_test_target_attested": True,
+            "request_isolation_attested": request_isolation_attested,
+            "safe_test_target_attested": safe_test_target_attested,
             "headers_from_env": _parse_header_environment_mappings(header_from_env or []),
             "execute": {
                 "url": url,
@@ -120,6 +130,8 @@ def resolve_http_target(
     response_json_pointer: str | None = None,
     agent_model: str | None = None,
     header_from_env: list[str] | None = None,
+    request_isolation_attested: bool | None = None,
+    safe_test_target_attested: bool | None = None,
 ) -> ResolvedHttpTarget:
     direct_options_used = (
         http_preset is not None
@@ -129,6 +141,10 @@ def resolve_http_target(
         or bool(header_from_env)
     )
     if reference.casefold().startswith(("https://", "http://")):
+        if request_isolation_attested is not True:
+            raise ValueError("direct HTTP target request isolation must be attested")
+        if safe_test_target_attested is not True:
+            raise ValueError("direct HTTP target safety must be attested")
         config = create_isolated_response_target_config(
             reference,
             isolated_preset=http_preset or "generic-json",
@@ -137,6 +153,8 @@ def resolve_http_target(
             response_json_pointer=response_json_pointer,
             agent_model=agent_model,
             header_from_env=header_from_env,
+            request_isolation_attested=request_isolation_attested,
+            safe_test_target_attested=safe_test_target_attested,
         )
         return resolve_http_target_config(
             reference,
@@ -172,7 +190,19 @@ def resolve_http_target_config(
         reference=reference,
         config=config,
         config_sha256=config_sha256,
-        confirmation=HttpTargetConfirmation(reference=reference, config_sha256=config_sha256),
+        confirmation=HttpTargetConfirmation(
+            reference=reference,
+            config_sha256=config_sha256,
+            environment=tuple(
+                HttpTargetEnvironmentIdentity(
+                    name=environment_variable,
+                    value_sha256=hashlib.sha256(
+                        os.environ[environment_variable].encode("utf-8")
+                    ).hexdigest(),
+                )
+                for environment_variable in sorted(set(config.headers_from_env.values()))
+            ),
+        ),
     )
 
 
