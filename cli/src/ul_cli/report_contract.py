@@ -148,6 +148,12 @@ DecisionClaimKind = Literal[
     "observed_consequence",
     "flag_reason",
 ]
+CrossExaminationSignal = Literal["observed", "not_observed", "inconclusive"]
+CrossExaminationEvidenceLevel = Literal[
+    "response_observed",
+    "trajectory_observed",
+    "committed_state_verified",
+]
 
 
 class VersionedReference(_StrictModel):
@@ -300,6 +306,100 @@ class RepetitionSummary(_StrictModel):
     ]
 
 
+class CrossExaminationArm(_StrictModel):
+    role: Literal["historical_reference", "current_baseline", "variation"]
+    response_evidence_pointer_ids: tuple[str, ...] = Field(min_length=1, max_length=1_000)
+    requested_repetitions: int = Field(ge=0)
+    observed_repetitions: int = Field(ge=0)
+    inconclusive_repetitions: int = Field(ge=0)
+    stability: Literal["stable", "unstable", "inconclusive", "not_applicable"]
+
+    @model_validator(mode="after")
+    def validate_arm(self) -> Self:
+        _validate_sorted_unique(
+            self.response_evidence_pointer_ids,
+            "cross-examination response evidence pointer IDs",
+        )
+        if self.role == "historical_reference":
+            if (
+                self.requested_repetitions,
+                self.observed_repetitions,
+                self.inconclusive_repetitions,
+                self.stability,
+            ) != (0, 0, 0, "not_applicable"):
+                raise ValueError("historical references are observations, not executions")
+        elif (
+            self.observed_repetitions + self.inconclusive_repetitions != self.requested_repetitions
+            or self.stability == "not_applicable"
+        ):
+            raise ValueError("executed cross-examination arms require exact repetition counts")
+        return self
+
+
+class FindingCrossExamination(_StrictModel):
+    historical_reference: CrossExaminationArm
+    current_baseline: CrossExaminationArm
+    variation: CrossExaminationArm
+    augmentation_relation: VersionedReference
+    baseline_drift: CrossExaminationSignal
+    augmentation_sensitivity: CrossExaminationSignal
+    intrinsic_instability: CrossExaminationSignal
+    material_delta_evidence_pointer_ids: tuple[str, ...] = Field(min_length=1, max_length=1_000)
+    evidence_level: CrossExaminationEvidenceLevel
+    limitations: tuple[
+        Literal[
+            "causality_not_established",
+            "correctness_not_verified",
+            "historical_reference_not_an_oracle",
+        ],
+        ...,
+    ]
+
+    @model_validator(mode="after")
+    def validate_cross_examination(self) -> Self:
+        if (
+            self.historical_reference.role != "historical_reference"
+            or self.current_baseline.role != "current_baseline"
+            or self.variation.role != "variation"
+        ):
+            raise ValueError("cross-examination arms must match their declared roles")
+        if len(self.historical_reference.response_evidence_pointer_ids) != 1:
+            raise ValueError("cross-examination requires one historical response reference")
+        _validate_sorted_unique(
+            self.material_delta_evidence_pointer_ids,
+            "cross-examination material delta evidence pointer IDs",
+        )
+        _validate_sorted_unique(self.limitations, "cross-examination limitations")
+        required_limitations = {
+            "causality_not_established",
+            "correctness_not_verified",
+            "historical_reference_not_an_oracle",
+        }
+        if set(self.limitations) != required_limitations:
+            raise ValueError("variance cross-examination requires every interpretation limit")
+        unstable = "unstable" in {
+            self.current_baseline.stability,
+            self.variation.stability,
+        }
+        baseline_incomplete = self.current_baseline.stability == "inconclusive"
+        comparison_incomplete = "inconclusive" in {
+            self.current_baseline.stability,
+            self.variation.stability,
+        }
+        expected_instability: CrossExaminationSignal = (
+            "inconclusive" if comparison_incomplete else "observed" if unstable else "not_observed"
+        )
+        if self.intrinsic_instability != expected_instability:
+            raise ValueError("intrinsic instability must match exact arm stability")
+        if baseline_incomplete and self.baseline_drift != "inconclusive":
+            raise ValueError("incomplete baseline executions make baseline drift inconclusive")
+        if comparison_incomplete and self.augmentation_sensitivity != "inconclusive":
+            raise ValueError("incomplete executions make augmentation sensitivity inconclusive")
+        if unstable and self.augmentation_sensitivity != "inconclusive":
+            raise ValueError("unstable executions cannot support augmentation sensitivity")
+        return self
+
+
 class FindingOccurrence(_StrictModel):
     schema_version: Literal["1.0.0"] = "1.0.0"
     occurrence_id: str = Field(pattern=_FINDING_ID_PATTERN)
@@ -312,6 +412,7 @@ class FindingOccurrence(_StrictModel):
     operator: VersionedReference
     bundle: VersionedReference | None = None
     probe_change: ProbeChange
+    cross_examination: FindingCrossExamination | None = None
     observed_deltas: tuple[ObservedDelta, ...] = Field(min_length=1, max_length=100)
     violated_rule: VersionedReference | None = None
     rule_definition_evidence_pointer_ids: tuple[str, ...] = Field(default=(), max_length=100)
@@ -339,6 +440,13 @@ class FindingOccurrence(_StrictModel):
             or not self.rule_definition_evidence_pointer_ids
         ):
             raise ValueError("invariant occurrences require a customer rule and its definition")
+        if self.kind == "behavior_difference" and self.source_interaction_ref is not None:
+            if self.cross_examination is None:
+                raise ValueError("dataset behavior occurrences require cross-examination evidence")
+            if self.cross_examination.augmentation_relation != self.operator:
+                raise ValueError("cross-examination relation must match the finding operator")
+        elif self.cross_examination is not None:
+            raise ValueError("cross-examination is available only for dataset behavior findings")
         _validate_sorted_unique(self.evidence_pointer_ids, "occurrence evidence pointer IDs")
         _validate_sorted_unique(
             self.rule_definition_evidence_pointer_ids,
@@ -368,6 +476,24 @@ class FindingOccurrence(_StrictModel):
                 for pointer_id in delta.evidence_pointer_ids
             ),
             *(pointer_id for item in self.repetitions for pointer_id in item.evidence_pointer_ids),
+            *(
+                (
+                    pointer_id
+                    for arm in (
+                        self.cross_examination.historical_reference,
+                        self.cross_examination.current_baseline,
+                        self.cross_examination.variation,
+                    )
+                    for pointer_id in arm.response_evidence_pointer_ids
+                )
+                if self.cross_examination is not None
+                else ()
+            ),
+            *(
+                self.cross_examination.material_delta_evidence_pointer_ids
+                if self.cross_examination is not None
+                else ()
+            ),
         }
         if referenced_pointer_ids != set(self.evidence_pointer_ids):
             raise ValueError("occurrence evidence pointers must exactly match its claims")
@@ -521,6 +647,7 @@ class RunReceiptContent(_StrictModel):
     arm: Literal["source", "probe"]
     evidence_scope: ReportEvidenceScope
     input: ReceiptEvidenceValue
+    historical_reference_response: ReceiptEvidenceValue | None = None
     response: ReceiptEvidenceValue | None = None
     tool_exchanges: tuple[ToolExchangeReceipt, ...] = Field(default=(), max_length=1_000)
     state_before: StateReceipt | None = None
@@ -541,6 +668,14 @@ class RunReceiptContent(_StrictModel):
         pointers = {pointer.pointer_id: pointer for pointer in self.evidence_pointers}
         referenced = {self.input.evidence_pointer_id, *self.trace_evidence_pointer_ids}
         _validate_receipt_value_pointer(self.input, pointers, "input", self.arm)
+        if self.historical_reference_response is not None:
+            referenced.add(self.historical_reference_response.evidence_pointer_id)
+            _validate_receipt_value_pointer(
+                self.historical_reference_response,
+                pointers,
+                "response",
+                "shared",
+            )
         if self.response is None:
             if "response_missing" not in self.limitations:
                 raise ValueError("missing responses require an explicit limitation")
@@ -684,6 +819,18 @@ class FindingEvidencePackage(_StrictModel):
         if referenced_receipt_ids != set(receipt_ids):
             raise ValueError("package receipts must exactly match repetition references")
         receipts_by_id = {receipt.receipt_id: receipt for receipt in self.receipts}
+        historical_reference_pointer_ids = tuple(
+            receipt.content.historical_reference_response.evidence_pointer_id
+            for receipt in self.receipts
+            if receipt.content.historical_reference_response is not None
+        )
+        expected_historical_reference_pointer_ids = (
+            self.occurrence.cross_examination.historical_reference.response_evidence_pointer_ids
+            if self.occurrence.cross_examination is not None
+            else ()
+        )
+        if historical_reference_pointer_ids != expected_historical_reference_pointer_ids:
+            raise ValueError("package must retain exactly the cited historical response reference")
         pointers: dict[str, EvidencePointer] = {}
         pointers_by_receipt: dict[str, set[str]] = {}
         for receipt in self.receipts:
@@ -1387,6 +1534,36 @@ def _validate_occurrence_evidence(
         pointer = pointers[pointer_id]
         if pointer.arm != "probe" or pointer.kind not in change_kinds:
             raise ValueError("probe change evidence is incompatible")
+    if occurrence.cross_examination is not None:
+        cross_examination = occurrence.cross_examination
+        for pointer_id in cross_examination.historical_reference.response_evidence_pointer_ids:
+            pointer = pointers[pointer_id]
+            if (
+                pointer.kind != "response"
+                or pointer.arm != "shared"
+                or pointer.authority != "customer_declared"
+            ):
+                raise ValueError(
+                    "historical response references require customer-declared shared evidence"
+                )
+        for arm, expected_pointer_arm in (
+            (cross_examination.current_baseline, "source"),
+            (cross_examination.variation, "probe"),
+        ):
+            if any(
+                pointers[pointer_id].kind != "response"
+                or pointers[pointer_id].arm != expected_pointer_arm
+                for pointer_id in arm.response_evidence_pointer_ids
+            ):
+                raise ValueError("current cross-examination arms require response evidence")
+        if not set(cross_examination.material_delta_evidence_pointer_ids).issubset(
+            {
+                pointer_id
+                for delta in occurrence.observed_deltas
+                for pointer_id in delta.evidence_pointer_ids
+            }
+        ):
+            raise ValueError("material cross-examination deltas must be observed finding deltas")
     delta_kinds = {
         "response": {"response"},
         "action": {"action", "tool_call", "tool_result"},
@@ -1434,6 +1611,82 @@ def _validate_occurrence_evidence(
             raise ValueError("rule violations require evaluator or independent evidence")
 
 
+class CrossExaminationRunSummary(_StrictModel):
+    requested_repetitions: int = Field(ge=0)
+    observed_repetitions: int = Field(ge=0)
+    inconclusive_repetitions: int = Field(ge=0)
+    stability: Literal["stable", "unstable", "inconclusive", "not_applicable"]
+
+    @model_validator(mode="after")
+    def validate_counts(self) -> Self:
+        if self.stability == "not_applicable":
+            if any(
+                (
+                    self.requested_repetitions,
+                    self.observed_repetitions,
+                    self.inconclusive_repetitions,
+                )
+            ):
+                raise ValueError("non-executed arms cannot contain repetition counts")
+        elif (
+            self.observed_repetitions + self.inconclusive_repetitions != self.requested_repetitions
+        ):
+            raise ValueError("cross-examination summary counts must match repetitions")
+        return self
+
+
+class FindingCrossExaminationSummary(_StrictModel):
+    historical_reference_available: bool
+    current_baseline: CrossExaminationRunSummary
+    variation: CrossExaminationRunSummary
+    baseline_drift: CrossExaminationSignal
+    augmentation_sensitivity: CrossExaminationSignal
+    intrinsic_instability: CrossExaminationSignal
+    material_delta_count: int = Field(ge=0)
+    evidence_level: CrossExaminationEvidenceLevel
+    limitations: tuple[
+        Literal[
+            "causality_not_established",
+            "correctness_not_verified",
+            "historical_reference_not_an_oracle",
+        ],
+        ...,
+    ]
+
+    @model_validator(mode="after")
+    def validate_summary(self) -> Self:
+        if not self.historical_reference_available:
+            raise ValueError("cross-examination requires historical reference evidence")
+        _validate_sorted_unique(self.limitations, "cross-examination summary limitations")
+        if set(self.limitations) != {
+            "causality_not_established",
+            "correctness_not_verified",
+            "historical_reference_not_an_oracle",
+        }:
+            raise ValueError("cross-examination summary requires every interpretation limit")
+        baseline_incomplete = self.current_baseline.stability == "inconclusive"
+        comparison_incomplete = "inconclusive" in {
+            self.current_baseline.stability,
+            self.variation.stability,
+        }
+        unstable = "unstable" in {
+            self.current_baseline.stability,
+            self.variation.stability,
+        }
+        expected_instability: CrossExaminationSignal = (
+            "inconclusive" if comparison_incomplete else "observed" if unstable else "not_observed"
+        )
+        if self.intrinsic_instability != expected_instability:
+            raise ValueError("summary instability must match its arm stability")
+        if baseline_incomplete and self.baseline_drift != "inconclusive":
+            raise ValueError("incomplete summary baseline requires inconclusive drift")
+        if comparison_incomplete and self.augmentation_sensitivity != "inconclusive":
+            raise ValueError("incomplete summary arms require inconclusive sensitivity")
+        if unstable and self.augmentation_sensitivity != "inconclusive":
+            raise ValueError("unstable summary arms cannot support sensitivity")
+        return self
+
+
 class FindingSummary(_StrictModel):
     finding_id: str | None = Field(default=None, pattern=_FINDING_ID_PATTERN)
     kind: FindingKind
@@ -1454,6 +1707,9 @@ class FindingSummary(_StrictModel):
     violated_repetitions: int | None = Field(default=None, ge=0)
     next_action: FindingNextAction
     summary: FindingSummaryText
+    cross_examination: FindingCrossExaminationSummary | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
 
     @model_validator(mode="after")
     def validate_finding(self) -> Self:

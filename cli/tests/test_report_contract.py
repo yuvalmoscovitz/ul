@@ -18,9 +18,11 @@ from ul_cli.finding_reference import finding_public_reference, finding_reference
 from ul_cli.main import app
 from ul_cli.report_contract import (
     CapturedJson,
+    CrossExaminationArm,
     DecisionReadyFinding,
     EvidenceArtifact,
     EvidencePointer,
+    FindingCrossExamination,
     FindingDecisionReport,
     FindingEvidencePackage,
     FindingOccurrence,
@@ -204,6 +206,16 @@ def _receipt(
     action_pointer = _pointer(f"{prefix}.action", "action", arm)
     lifecycle_pointer = _pointer(f"{prefix}.lifecycle", "lifecycle", arm)
     pointers = [input_pointer, response_pointer, action_pointer, lifecycle_pointer]
+    historical_reference_pointer = None
+    if arm == "source" and repetition == 1 and not stateful:
+        historical_reference_pointer = _pointer(
+            f"{prefix}.historical-reference",
+            "response",
+            "shared",
+            authority="customer_declared",
+            source_id="customer",
+        )
+        pointers.append(historical_reference_pointer)
     state_before = None
     state_after = None
     if stateful:
@@ -253,9 +265,11 @@ def _receipt(
         ProvenanceReceipt(role="model", id="agent-model", version="1.0.0"),
         ProvenanceReceipt(role="observer", id="observer", version="1.0.0"),
     ]
+    if historical_reference_pointer is not None:
+        provenance.append(ProvenanceReceipt(role="customer", id="customer"))
     if stateful:
         provenance.append(ProvenanceReceipt(role="environment", id="environment", version="1.0.0"))
-    if rule_definition:
+    if rule_definition and historical_reference_pointer is None:
         provenance.append(ProvenanceReceipt(role="customer", id="customer"))
     if rule_violation:
         provenance.append(ProvenanceReceipt(role="evaluator", id="evaluator", version="1.0.0"))
@@ -267,6 +281,11 @@ def _receipt(
         input=_evidence(
             input_pointer,
             {"account": _PRIVATE_CANARY, "arm": arm, "repetition": repetition},
+        ),
+        historical_reference_response=(
+            _evidence(historical_reference_pointer, {"status": "historical-reference"})
+            if historical_reference_pointer is not None
+            else None
         ),
         response=_evidence(response_pointer, {"status": "observed", "arm": arm}),
         state_before=state_before,
@@ -369,6 +388,43 @@ def _dataset_package() -> FindingEvidencePackage:
             source_evidence_pointer_ids=source_inputs,
             probe_evidence_pointer_ids=probe_inputs,
         ),
+        cross_examination=FindingCrossExamination(
+            historical_reference=CrossExaminationArm(
+                role="historical_reference",
+                response_evidence_pointer_ids=ids("response", "shared"),
+                requested_repetitions=0,
+                observed_repetitions=0,
+                inconclusive_repetitions=0,
+                stability="not_applicable",
+            ),
+            current_baseline=CrossExaminationArm(
+                role="current_baseline",
+                response_evidence_pointer_ids=ids("response", "source"),
+                requested_repetitions=2,
+                observed_repetitions=2,
+                inconclusive_repetitions=0,
+                stability="stable",
+            ),
+            variation=CrossExaminationArm(
+                role="variation",
+                response_evidence_pointer_ids=ids("response", "probe"),
+                requested_repetitions=2,
+                observed_repetitions=2,
+                inconclusive_repetitions=0,
+                stability="stable",
+            ),
+            augmentation_relation=_versioned_ref("operator", "private-operator", "1.0.0"),
+            baseline_drift="not_observed",
+            augmentation_sensitivity="observed",
+            intrinsic_instability="not_observed",
+            material_delta_evidence_pointer_ids=action_ids,
+            evidence_level="response_observed",
+            limitations=(
+                "causality_not_established",
+                "correctness_not_verified",
+                "historical_reference_not_an_oracle",
+            ),
+        ),
         observed_deltas=(
             ObservedDelta(
                 kind="action",
@@ -388,7 +444,15 @@ def _dataset_package() -> FindingEvidencePackage:
             ),
         ),
         evidence_pointer_ids=tuple(
-            sorted({*source_inputs, *probe_inputs, *action_ids, *response_ids})
+            sorted(
+                {
+                    *source_inputs,
+                    *probe_inputs,
+                    *action_ids,
+                    *response_ids,
+                    *ids("response", "shared"),
+                }
+            )
         ),
         repetitions=repetitions,
         repetition_summary=RepetitionSummary(

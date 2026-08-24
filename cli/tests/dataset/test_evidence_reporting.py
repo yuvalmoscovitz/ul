@@ -57,13 +57,105 @@ def test_rich_evidence_builds_parses_and_reports_end_to_end(tmp_path: Path) -> N
     evidence_path.write_text(json.dumps(record) + "\n", encoding="utf-8")
     _create_pattern_identity_key(tmp_path)
 
-    assert record["schema_version"] == "1.11.0"
+    assert record["schema_version"] == "1.12.0"
     assert dataset_review.is_reportable_dataset_evidence(evidence_path) is True
     report = runner.invoke(root_app, ["report", str(evidence_path), "--json"])
     assert report.exit_code == 0, report.output
     parsed_report = json.loads(report.output)
-    assert parsed_report["evidence_schema_versions"] == ["1.11.0"]
+    assert parsed_report["evidence_schema_versions"] == ["1.12.0"]
     assert parsed_report["evaluation_mode"] == "variance"
+
+
+def test_cross_examination_json_and_offline_cli_present_the_same_safe_facts(
+    tmp_path: Path,
+) -> None:
+    result = _evaluation_result("private-case-canary", has_review_finding=True)
+    record = customer_module.build_customer_evidence_record(
+        result,
+        repetitions=1,
+        max_environment_api_calls=2,
+        planned_target_calls=2,
+    )
+    evidence_path = tmp_path / "cross-examination.jsonl"
+    evidence_path.write_text(json.dumps(record) + "\n", encoding="utf-8")
+    _create_pattern_identity_key(tmp_path)
+
+    json_report = runner.invoke(root_app, ["report", str(evidence_path), "--json"])
+    human_report = runner.invoke(root_app, ["report", str(evidence_path)])
+
+    assert json_report.exit_code == 1, json_report.output
+    assert human_report.exit_code == 1, human_report.output
+    cross_examination = json.loads(json_report.output)["findings"][0]["cross_examination"]
+    assert cross_examination["historical_reference_available"] is True
+    assert cross_examination["baseline_drift"] == "not_observed"
+    assert cross_examination["augmentation_sensitivity"] == "observed"
+    assert cross_examination["intrinsic_instability"] == "not_observed"
+    assert cross_examination["evidence_level"] == "response_observed"
+    assert "Baseline drift: not observed (descriptive divergence; not an agent failure)" in (
+        human_report.output
+    )
+    assert "Augmentation sensitivity: observed" in human_report.output
+    assert "Historical output: reference evidence only; not a correctness oracle" in (
+        human_report.output
+    )
+    assert "Transfer 100 to Alice" not in human_report.output
+    assert "private-case-canary" not in human_report.output
+
+
+@pytest.mark.parametrize(
+    ("stability", "expected_sensitivity", "expected_instability"),
+    (
+        ("stable", "observed", "not_observed"),
+        ("unstable", "inconclusive", "observed"),
+        ("inconclusive", "inconclusive", "inconclusive"),
+    ),
+)
+def test_cross_examination_classifies_stability_without_correctness_claims(
+    stability: str,
+    expected_sensitivity: str,
+    expected_instability: str,
+) -> None:
+    finding = SimpleNamespace()
+    result = cast(
+        DatasetEvaluationResult,
+        SimpleNamespace(
+            source=SimpleNamespace(raw_input="private-input"),
+            baseline=SimpleNamespace(trial_set=_trial_set(stability=stability)),
+            cases=(),
+        ),
+    )
+    case = cast(
+        Any,
+        SimpleNamespace(
+            trial_set=_trial_set(stability=stability),
+            findings=(finding,),
+        ),
+    )
+
+    cross_examination = customer_module._customer_cross_examination(result, case)
+
+    assert cross_examination["augmentation_sensitivity"] == expected_sensitivity
+    assert cross_examination["intrinsic_instability"] == expected_instability
+    assert cross_examination["limitations"] == [
+        "causality_not_established",
+        "correctness_not_verified",
+        "historical_reference_not_an_oracle",
+    ]
+
+
+def test_missing_variation_does_not_erase_a_conclusive_baseline_comparison() -> None:
+    result = _evaluation_result("rejected-variation")
+
+    record = customer_module.build_customer_evidence_record(
+        result,
+        repetitions=1,
+        max_environment_api_calls=1,
+        planned_target_calls=1,
+    )
+
+    cross_examination = record["cases"][0]["cross_examination"]
+    assert cross_examination["baseline_drift"] == "not_observed"
+    assert cross_examination["augmentation_sensitivity"] == "inconclusive"
 
 
 def test_customer_pattern_facets_are_copied_only_from_the_reserved_metadata_field() -> None:
@@ -149,7 +241,7 @@ def test_rich_customer_evidence_records_source_target_original_and_lineage() -> 
         planned_target_calls=2,
     )
 
-    assert evidence["schema_version"] == "1.11.0"
+    assert evidence["schema_version"] == "1.12.0"
     assert evidence["interaction_id"] == "cancel-order::message"
     assert evidence["source_record_id"] == "cancel-order"
     assert evidence["augmentation_target"] == {
@@ -254,7 +346,7 @@ def test_customer_evidence_keeps_summary_and_nested_technical_details() -> None:
     assert presentation_module.result_needs_review(result) is True
     assert evidence["interaction_id"] == "case-1"
     assert evidence["original_input"] == "transfer 100 to Alice"
-    assert evidence["schema_version"] == "1.10.0"
+    assert evidence["schema_version"] == "1.12.0"
     assert evidence["evaluation_mode"] == "variance"
     assert evidence["invariant_evaluation"] is None
     assert evidence["current_baseline"]["status"] == "ORIGINAL REPLAY STABLE (3/3 OBSERVED)"
@@ -315,7 +407,7 @@ def test_customer_evidence_keeps_invariants_separate_from_behavioral_findings() 
         invariant_evaluation=invariant_evaluation,
     )
 
-    assert evidence["schema_version"] == "1.10.0"
+    assert evidence["schema_version"] == "1.12.0"
     assert evidence["evaluation_mode"] == "variance"
     assert evidence["cases"] == []
     stored_invariants = cast(dict[str, Any], evidence["invariant_evaluation"])

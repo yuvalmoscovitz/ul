@@ -558,6 +558,202 @@ def test_public_occurrences_do_not_disclose_private_workflow_values() -> None:
         assert _PRIVATE_SECRET in package.model_dump_json()
 
 
+def test_dataset_occurrence_cross_examines_all_three_response_arms() -> None:
+    package = adapt_dataset_behavior_finding(
+        _dataset_result(),
+        case_index=0,
+        finding_index=0,
+        context=_context(),
+    )
+
+    cross_examination = package.occurrence.cross_examination
+    assert cross_examination is not None
+    assert cross_examination.baseline_drift == "not_observed"
+    assert cross_examination.augmentation_sensitivity == "observed"
+    assert cross_examination.intrinsic_instability == "not_observed"
+    assert cross_examination.evidence_level == "response_observed"
+    assert cross_examination.current_baseline.requested_repetitions == 2
+    assert cross_examination.variation.requested_repetitions == 2
+    assert len(cross_examination.historical_reference.response_evidence_pointer_ids) == 1
+    assert (
+        sum(
+            receipt.content.historical_reference_response is not None
+            for receipt in package.receipts
+        )
+        == 1
+    )
+    assert cross_examination.material_delta_evidence_pointer_ids
+    assert cross_examination.limitations == (
+        "causality_not_established",
+        "correctness_not_verified",
+        "historical_reference_not_an_oracle",
+    )
+
+
+def test_json_null_is_retained_as_present_historical_evidence() -> None:
+    result = _dataset_result()
+    result = result.model_copy(
+        update={"source": result.source.model_copy(update={"raw_observed_output": None})}
+    )
+
+    package = adapt_dataset_behavior_finding(
+        result,
+        case_index=0,
+        finding_index=0,
+        context=_context(),
+    )
+
+    historical_receipts = tuple(
+        receipt
+        for receipt in package.receipts
+        if receipt.content.historical_reference_response is not None
+    )
+    assert len(historical_receipts) == 1
+    historical_evidence = historical_receipts[0].content.historical_reference_response
+    assert historical_evidence is not None
+    assert historical_evidence.value.canonical_json == "null"
+    cross_examination = package.occurrence.cross_examination
+    assert cross_examination is not None
+    assert cross_examination.historical_reference.response_evidence_pointer_ids == (
+        historical_evidence.evidence_pointer_id,
+    )
+    assert FindingEvidencePackage.model_validate_json(package.model_dump_json()) == package
+
+
+def test_large_historical_response_is_retained_once_across_many_repetitions() -> None:
+    result = _dataset_result()
+    repetition_count = 100
+    historical_response = "h" * 200_000
+
+    def repeated_trial_set(
+        trial_set: DatasetEvaluationTrialSet,
+        *,
+        finding_observed_once: bool = False,
+    ) -> DatasetEvaluationTrialSet:
+        template = trial_set.trials[0]
+        repetitions = tuple(range(1, repetition_count + 1))
+        trials = tuple(
+            template.model_copy(
+                update={
+                    "repetition": repetition,
+                    "observed_frame": (
+                        template.observed_frame.model_copy(update={"outcomes": ()})
+                        if finding_observed_once and repetition > 1
+                        else template.observed_frame
+                    ),
+                }
+            )
+            for repetition in repetitions
+        )
+        outcome_groups = (
+            (
+                DatasetEvaluationOutcomeGroup(
+                    repetitions=(1,),
+                    representative_effects=trial_set.outcome_groups[0].representative_effects,
+                ),
+                DatasetEvaluationOutcomeGroup(
+                    repetitions=repetitions[1:],
+                    representative_effects=(),
+                ),
+            )
+            if finding_observed_once
+            else (
+                DatasetEvaluationOutcomeGroup(
+                    repetitions=repetitions,
+                    representative_effects=trial_set.outcome_groups[0].representative_effects,
+                ),
+            )
+        )
+        return DatasetEvaluationTrialSet.model_validate(
+            {
+                **trial_set.model_dump(mode="python"),
+                "requested_repetitions": repetition_count,
+                "stability": "unstable" if finding_observed_once else "stable",
+                "trials": trials,
+                "outcome_groups": outcome_groups,
+            }
+        )
+
+    probe_trial_set = result.cases[0].trial_set
+    assert probe_trial_set is not None
+    result = result.model_copy(
+        update={
+            "source": result.source.model_copy(update={"raw_observed_output": historical_response}),
+            "baseline": result.baseline.model_copy(
+                update={"trial_set": repeated_trial_set(result.baseline.trial_set)}
+            ),
+            "cases": (
+                result.cases[0].model_copy(
+                    update={
+                        "trial_set": repeated_trial_set(
+                            probe_trial_set,
+                            finding_observed_once=True,
+                        )
+                    }
+                ),
+            ),
+        }
+    )
+
+    package = adapt_dataset_behavior_finding(
+        result,
+        case_index=0,
+        finding_index=0,
+        context=_context(),
+    )
+
+    assert (
+        sum(
+            receipt.content.historical_reference_response is not None
+            for receipt in package.receipts
+        )
+        == 1
+    )
+    cross_examination = package.occurrence.cross_examination
+    assert cross_examination is not None
+    assert len(cross_examination.historical_reference.response_evidence_pointer_ids) == 1
+    duplicated_history_size = repetition_count * len(
+        json.dumps(historical_response, ensure_ascii=False).encode("utf-8")
+    )
+    assert duplicated_history_size > 16_000_000
+    assert len(package.model_dump_json().encode("utf-8")) < 16_000_000
+
+
+def test_baseline_drift_is_descriptive_and_can_coexist_with_sensitivity() -> None:
+    result = _dataset_result()
+    historical_action = ObservedOutcome(
+        id="historical-payment",
+        confidence=1,
+        status="observed",
+        position=0,
+        kind="action",
+        predicate="historical_payment",
+    )
+    historical_frame = result.augmentation.source_frames[0].model_copy(
+        update={"outcomes": (historical_action,)}
+    )
+    result = result.model_copy(
+        update={
+            "augmentation": result.augmentation.model_copy(
+                update={"source_frames": (historical_frame,)}
+            )
+        }
+    )
+
+    package = adapt_dataset_behavior_finding(
+        result,
+        case_index=0,
+        finding_index=0,
+        context=_context(),
+    )
+
+    cross_examination = package.occurrence.cross_examination
+    assert cross_examination is not None
+    assert cross_examination.baseline_drift == "observed"
+    assert cross_examination.augmentation_sensitivity == "observed"
+    assert "correctness_not_verified" in cross_examination.limitations
+
+
 @pytest.mark.parametrize(
     "category",
     (
