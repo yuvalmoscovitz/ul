@@ -13,6 +13,7 @@ from ul import (
 from ul_cli.dataset.evaluation import command as command_module
 from ul_cli.dataset.evaluation import runner as runner_module
 from ul_cli.dataset.evaluation.records import load_interaction_records
+from ul_cli.http_target_resolution import resolve_http_target
 from ul_cli.main import app as root_app
 
 from ._factories import (
@@ -621,5 +622,35 @@ def test_direct_http_execution_requires_exact_target_confirmation_before_output(
     assert (
         "HTTP execution requires --confirm-target with the exact displayed digest"
         in normalized_output
+    )
+    assert not output.exists()
+
+
+def test_direct_http_execution_requires_network_opt_in_before_output(tmp_path: Path) -> None:
+    dataset = tmp_path / "interactions.jsonl"
+    output = tmp_path / "results.jsonl"
+    target_reference = "https://agent.example.test/invoke"
+    _write_dataset(dataset, [_record()])
+    target = resolve_http_target(target_reference, allow_insecure_http=False)
+
+    result = runner.invoke(
+        root_app,
+        [
+            "dataset",
+            "evaluate",
+            str(dataset),
+            "--target",
+            target_reference,
+            "--confirm-test-environment",
+            "--confirm-target",
+            target.confirmation_sha256,
+            "--output",
+            str(output),
+        ],
+    )
+
+    assert result.exit_code != 0
+    assert "HTTP target execution requires --allow-environment-network" in " ".join(
+        result.output.replace("│", "").split()
     )
     assert not output.exists()

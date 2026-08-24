@@ -754,6 +754,13 @@ def evaluate_dataset(
             resolved_http_target is not None
             and not dry_run
             and resume is None
+            and not allow_environment_network
+        ):
+            raise ValueError("HTTP target execution requires --allow-environment-network")
+        if (
+            resolved_http_target is not None
+            and not dry_run
+            and resume is None
             and confirm_target != resolved_http_target.confirmation_sha256
         ):
             raise ValueError(
