@@ -218,6 +218,9 @@ def test_every_builtin_produces_valid_derived_scenarios_with_lineage() -> None:
             )
             assert augmentation.validate(scenario, result.scenario).valid
             assert result.changed_paths
+            assert all(path.startswith("/") for path in result.changed_paths)
+            assert result.scenario.provenance.lineage[-1].changed_paths == result.changed_paths
+            assert result.scenario.provenance.lineage[-1].changed_events == result.changed_events
             assert result.scenario != scenario
             Scenario.model_validate_json(result.scenario.model_dump_json())
 
@@ -233,6 +236,17 @@ def test_policy_boundary_generates_below_equal_and_above_variants() -> None:
         1000,
         1001,
     ]
+
+
+def test_environment_candidate_records_the_exact_changed_event() -> None:
+    result = (
+        builtin_augmentation_registry()
+        .get("environment.tool.timeout_before_commit")
+        .apply(example_scenario())[0]
+    )
+
+    assert result.changed_paths == ("/environment_events/0",)
+    assert result.changed_events == (result.scenario.environment_events[0].id,)
 
 
 def test_later_correction_changes_semantics_and_conversation_together() -> None:

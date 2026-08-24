@@ -5,6 +5,12 @@ This directory is the main entry point for augmentation code.
 An augmentation changes one controlled part of a source case. It also declares how the
 correct response or business state may change.
 
+Every materialized augmentation has an `AugmentationProjection` with typed `reads` and `writes`.
+Targets use RFC 6901 paths and identify one of six locations: `structured_input`, `conversation`,
+`state`, `tool`, `policy`, or `environment`. Projection validation resolves every target before
+execution, rejects overlapping writes, and compares the source with the candidate so untargeted
+data cannot change. The resulting lineage records exact changed paths and environment event IDs.
+
 ## Code map
 
 | File | Purpose |

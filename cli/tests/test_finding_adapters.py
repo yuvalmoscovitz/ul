@@ -23,6 +23,7 @@ from ul import (
     InteractionRecord,
     ObservedAgentOutput,
     SemanticFrame,
+    create_dataset_augmentation_projection,
 )
 from ul.augmentations.conversation import (
     CorrectionAfterFirstResponseCase,
@@ -194,6 +195,8 @@ def _dataset_result() -> DatasetEvaluationResult:
         source_interaction_id=source.id,
         operator_id="input.surface.rephrase",
         operator_version="1.0.0",
+        projection=create_dataset_augmentation_projection(source),
+        changed_paths=(source.augmentation_path,),
         augmented_input=f"Please pay account {_PRIVATE_SECRET}.",
         expected_input_frame=source_frame,
         reparsed_input_frame=source_frame,

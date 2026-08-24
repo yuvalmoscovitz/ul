@@ -26,6 +26,7 @@ from ul import (
     ObservedAgentOutput,
     RichInteractionCase,
     SemanticFrame,
+    create_dataset_augmentation_projection,
     project_rich_interaction_case,
 )
 from ul.augmentations.dataset import DatasetAugmentationCandidate
@@ -113,6 +114,8 @@ def _evaluation_result(
     candidate = DatasetAugmentationCandidate(
         source_interaction_id=identifier,
         operator_id="input.surface.rephrase",
+        projection=create_dataset_augmentation_projection(source),
+        changed_paths=(source.augmentation_path,),
         augmented_input="Please transfer 100 to Alice.",
         expected_input_frame=source_frame,
         reparsed_input_frame=source_frame if has_review_finding else None,
@@ -185,6 +188,8 @@ def _rich_evaluation_result() -> DatasetEvaluationResult:
         update={
             "source_record_id": source.source_interaction_id,
             "augmentation_target_id": source.augmentation_target.id,
+            "projection": create_dataset_augmentation_projection(source),
+            "changed_paths": (source.augmentation_path,),
         }
     )
     return result.model_copy(

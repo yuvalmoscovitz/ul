@@ -210,6 +210,10 @@ def test_rich_case_projects_only_explicit_text_targets() -> None:
         "Cancel order ord-9.",
         "Yes, cancel it.",
     ]
+    assert [record.augmentation_path for record in projected] == [
+        "/inputs/message",
+        "/context/2/content",
+    ]
     changed = projected[1].probe_context("Please cancel it now.")
     assert changed["inputs"] == source.inputs
     assert changed["context"] == [

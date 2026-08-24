@@ -6,6 +6,10 @@ from typing import Literal, Self
 
 from pydantic import ConfigDict, Field, field_validator, model_validator
 
+from ul_core.augmentations.projections import (
+    AugmentationTargetSurface,
+    ProjectionContract,
+)
 from ul_core.models import ULModel
 
 AugmentationScope = Literal["input", "conversation", "environment"]
@@ -72,6 +76,7 @@ class AugmentationBinding(_CatalogModel):
     runtime: str = Field(min_length=3, max_length=500)
     command: str | None = Field(default=None, min_length=1, max_length=200)
     requirements: AugmentationRequirements = AugmentationRequirements()
+    projection: ProjectionContract
 
     @model_validator(mode="after")
     def validate_binding(self) -> Self:
@@ -194,6 +199,7 @@ def _binding(
     stages: tuple[AugmentationStage, ...],
     runtime: str,
     *,
+    projection: ProjectionContract,
     execution_owner: AugmentationExecutionOwner = "augmentation_registry",
     command: str | None = None,
     requirements: AugmentationRequirements | None = None,
@@ -205,6 +211,7 @@ def _binding(
         runtime=runtime,
         command=command,
         requirements=requirements or AugmentationRequirements(),
+        projection=projection,
     )
 
 
@@ -234,6 +241,10 @@ def _dataset_spec(
                 "dataset_variation",
                 ("materialization", "execution", "evaluation"),
                 "ul.augmentations.dataset:resolve_dataset_augmentation_operator",
+                projection=_projection(
+                    reads=("structured_input", "conversation"),
+                    writes=("structured_input", "conversation"),
+                ),
                 execution_owner="dataset_cli",
                 command=f"ul dataset evaluate --operator {augmentation_id}@{version}",
                 requirements=AugmentationRequirements(
@@ -256,6 +267,9 @@ def _scenario_spec(
     expected_relation: str,
     required_source_features: tuple[str, ...],
     runtime_class: str,
+    *,
+    reads: tuple[AugmentationTargetSurface, ...],
+    writes: tuple[AugmentationTargetSurface, ...],
 ) -> BuiltinAugmentationSpec:
     return BuiltinAugmentationSpec(
         ref=AugmentationRef(id=augmentation_id, version="1.0.0"),
@@ -272,12 +286,21 @@ def _scenario_spec(
                 "scenario_materialization",
                 ("materialization",),
                 f"ul_core.augmentations.scenario:{runtime_class}",
+                projection=_projection(reads=reads, writes=writes),
                 requirements=AugmentationRequirements(
                     required_source_features=required_source_features
                 ),
             ),
         ),
     )
+
+
+def _projection(
+    *,
+    reads: tuple[AugmentationTargetSurface, ...],
+    writes: tuple[AugmentationTargetSurface, ...],
+) -> ProjectionContract:
+    return ProjectionContract(reads=reads, writes=writes)
 
 
 _BUILTIN_AUGMENTATION_SPECS = (
@@ -333,6 +356,8 @@ _BUILTIN_AUGMENTATION_SPECS = (
         "The target should not guess between materially plausible matches.",
         ("artifact", "conversation.user"),
         "AmbiguityAugmentation",
+        reads=("state", "conversation", "structured_input"),
+        writes=("state", "conversation", "structured_input"),
     ),
     BuiltinAugmentationSpec(
         ref=AugmentationRef(id="conversation.correction_after_first_response", version="1.0.0"),
@@ -347,6 +372,10 @@ _BUILTIN_AUGMENTATION_SPECS = (
                 "scenario_materialization",
                 ("materialization",),
                 "ul_core.augmentations.scenario:LaterCorrectionAugmentation",
+                projection=_projection(
+                    reads=("structured_input", "conversation"),
+                    writes=("structured_input", "conversation"),
+                ),
                 requirements=AugmentationRequirements(
                     required_source_features=("conversation.user", "action.parameter")
                 ),
@@ -355,6 +384,10 @@ _BUILTIN_AUGMENTATION_SPECS = (
                 "conversation_stress",
                 ("execution", "evaluation"),
                 "ul.augmentations.conversation:run_correction_stress_test",
+                projection=_projection(
+                    reads=("conversation", "state"),
+                    writes=("conversation",),
+                ),
                 execution_owner="stress_cli",
                 command="ul stress correction",
                 requirements=AugmentationRequirements(
@@ -375,6 +408,8 @@ _BUILTIN_AUGMENTATION_SPECS = (
         "Behavior may change only where the declared policy boundary permits it.",
         ("policy.boundary",),
         "BoundaryShiftAugmentation",
+        reads=("policy", "structured_input"),
+        writes=("policy",),
     ),
     _scenario_spec(
         "environment.state.existing_partial_operation",
@@ -384,6 +419,8 @@ _BUILTIN_AUGMENTATION_SPECS = (
         "Only work not already committed should be performed.",
         ("action.write",),
         "ExistingPartialOperationAugmentation",
+        reads=("state",),
+        writes=("environment",),
     ),
     _scenario_spec(
         "environment.state.change_between_read_write",
@@ -393,6 +430,8 @@ _BUILTIN_AUGMENTATION_SPECS = (
         "The action must account for state that changed after the earlier read.",
         ("action.read", "action.write"),
         "StateChangeBetweenReadWriteAugmentation",
+        reads=("state",),
+        writes=("environment",),
     ),
     _scenario_spec(
         "environment.tool.stale_observation",
@@ -402,6 +441,8 @@ _BUILTIN_AUGMENTATION_SPECS = (
         "Consequential actions must not rely on known-stale state.",
         ("action.read",),
         "StaleObservationAugmentation",
+        reads=("tool",),
+        writes=("environment",),
     ),
     _scenario_spec(
         "environment.tool.timeout_before_commit",
@@ -411,6 +452,8 @@ _BUILTIN_AUGMENTATION_SPECS = (
         "A safe retry may occur because no effect committed.",
         ("action.write",),
         "TimeoutBeforeCommitAugmentation",
+        reads=("tool",),
+        writes=("environment",),
     ),
     BuiltinAugmentationSpec(
         ref=AugmentationRef(id="environment.tool.timeout_after_commit", version="1.0.0"),
@@ -427,12 +470,14 @@ _BUILTIN_AUGMENTATION_SPECS = (
                 "scenario_materialization",
                 ("materialization",),
                 "ul_core.augmentations.scenario:TimeoutAfterCommitAugmentation",
+                projection=_projection(reads=("tool",), writes=("environment",)),
                 requirements=AugmentationRequirements(required_source_features=("action.write",)),
             ),
             _binding(
                 "environment_fault",
                 ("execution", "evaluation"),
                 "ul.augmentations.environment_fault:run_timeout_after_commit_stress_test",
+                projection=_projection(reads=("tool", "state"), writes=("environment",)),
                 execution_owner="stress_cli",
                 command="ul stress timeout-after-commit",
                 requirements=AugmentationRequirements(
@@ -453,6 +498,8 @@ _BUILTIN_AUGMENTATION_SPECS = (
         "Invalid items must not silently contaminate or authorize valid items.",
         ("action.batch",),
         "MixedValidityBatchAugmentation",
+        reads=("structured_input",),
+        writes=("structured_input",),
     ),
     BuiltinAugmentationSpec(
         ref=AugmentationRef(id="conversation.retry_after_successful_commit", version="1.0.0"),
@@ -469,6 +516,10 @@ _BUILTIN_AUGMENTATION_SPECS = (
                 "conversation_stress",
                 ("execution", "evaluation"),
                 "ul.augmentations.conversation:run_retry_after_successful_commit_stress_test",
+                projection=_projection(
+                    reads=("conversation", "state"),
+                    writes=("conversation",),
+                ),
                 execution_owner="stress_cli",
                 command="ul stress retry-after-successful-commit",
                 requirements=AugmentationRequirements(

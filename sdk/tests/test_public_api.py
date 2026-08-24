@@ -32,6 +32,9 @@ from ul import (
     OtlpObservationConfig,
     OtlpObservationSource,
     ProbeExecutionIdentity,
+    ProjectionContract,
+    ProjectionTarget,
+    ProjectionTargetOperation,
     PromptManager,
     PromptTemplateInfo,
     RedactedSemanticPipeline,
@@ -51,6 +54,7 @@ from ul import (
     append_finding_annotations,
     builtin_augmentation_registry,
     builtin_dataset_augmentation_operators,
+    create_dataset_augmentation_projection,
     create_dataset_regression_case,
     create_semantic_model_deconstructor,
     dataset_regression_target_config_sha256,
@@ -76,6 +80,12 @@ def test_sdk_exposes_scenario_and_builtin_library() -> None:
 
     assert scenario.id == "sdk-case"
     assert len(builtin_augmentation_registry().list()) == 9
+    assert ProjectionContract.__name__ == "ProjectionContract"
+    assert ProjectionTarget.__name__ == "ProjectionTarget"
+    assert ProjectionTargetOperation == ProjectionTargetOperation
+    assert create_dataset_augmentation_projection.__name__ == (
+        "create_dataset_augmentation_projection"
+    )
 
 
 def test_sdk_exposes_neutral_finding_export_api() -> None:

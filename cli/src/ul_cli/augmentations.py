@@ -25,6 +25,7 @@ from ul_core.augmentations.definitions import (
     BuiltinAugmentationSpec,
     builtin_augmentation_catalog,
 )
+from ul_core.augmentations.projections import ProjectionContract
 from ul_core.evaluation import EnvironmentCapabilities
 
 from ul_cli.dataset import validate_dataset_operator_ids, validate_interaction_dataset
@@ -109,6 +110,7 @@ class _PlannedAugmentation:
     reasons: tuple[_ReadinessReason, ...]
     command: str | None
     enabled: bool
+    projection: ProjectionContract
 
     def as_json(self) -> dict[str, object]:
         return {
@@ -119,6 +121,7 @@ class _PlannedAugmentation:
             "reasons": [reason.as_json() for reason in self.reasons],
             "command": self.command,
             "enabled": self.enabled,
+            "projection": self.projection.model_dump(mode="json"),
         }
 
 
@@ -255,6 +258,12 @@ def plan_augmentations(
                 typer.echo(f"  Reason: {reason.message}")
         if augmentation.command is not None:
             typer.echo(f"  Command: {augmentation.command}")
+        typer.echo(
+            "  Projection: reads="
+            + ",".join(augmentation.projection.reads)
+            + " writes="
+            + ",".join(augmentation.projection.writes)
+        )
     typer.echo("Inspection only: 0 model calls, 0 environment calls, 0 network requests.")
 
 
@@ -299,6 +308,12 @@ def show_augmentation(
         typer.echo(f"  Execution owner: {_execution_owner_label(binding.execution_owner)}")
         typer.echo(f"  Runtime: {binding.runtime}")
         typer.echo(f"  CLI command: {binding.command or 'unavailable'}")
+        typer.echo(
+            "  Projection: reads="
+            + ",".join(binding.projection.reads)
+            + " writes="
+            + ",".join(binding.projection.writes)
+        )
         requirements = binding.requirements
         typer.echo(
             "  Requires: "
@@ -717,6 +732,7 @@ def _plan_augmentation(
             reasons=tuple(reasons),
             command=None,
             enabled=(augmentation.ref.id, augmentation.ref.version) in project.enabled_references,
+            projection=augmentation.bindings[0].projection,
         )
     binding = cli_bindings[0]
     command = _project_command(augmentation, binding)
@@ -730,6 +746,7 @@ def _plan_augmentation(
             reasons=blocking_reasons,
             command=command if binding.execution_owner == "stress_cli" else None,
             enabled=(augmentation.ref.id, augmentation.ref.version) in project.enabled_references,
+            projection=binding.projection,
         )
     manual_reasons = _binding_manual_reasons(binding, project)
     if manual_reasons:
@@ -741,6 +758,7 @@ def _plan_augmentation(
             reasons=manual_reasons,
             command=command,
             enabled=(augmentation.ref.id, augmentation.ref.version) in project.enabled_references,
+            projection=binding.projection,
         )
     return _PlannedAugmentation(
         ref=augmentation.ref,
@@ -755,6 +773,7 @@ def _plan_augmentation(
         ),
         command=command,
         enabled=(augmentation.ref.id, augmentation.ref.version) in project.enabled_references,
+        projection=binding.projection,
     )
 
 

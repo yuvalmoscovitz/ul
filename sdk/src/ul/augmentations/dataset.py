@@ -12,6 +12,7 @@ from typing import Any, Literal, Self, cast
 
 from pydantic import Field, JsonValue, model_validator
 from ul_core.augmentations.definitions import builtin_augmentation_catalog
+from ul_core.augmentations.projections import AugmentationProjection, ProjectionTarget
 from ul_core.contracts import (
     SemanticDeconstructor,
     SemanticEquivalenceVerifier,
@@ -217,6 +218,9 @@ class DatasetAugmentationCandidate(ULModel):
     )
     allowed_change: AllowedChange = "surface_form_only"
     human_review_required: bool = False
+    projection: AugmentationProjection
+    changed_paths: tuple[str, ...] = ()
+    changed_events: tuple[str, ...] = ()
     augmented_input: str = Field(min_length=1)
     renderer_metadata: dict[str, JsonValue] = Field(default_factory=dict)
     expected_input_frame: SemanticFrame
@@ -292,6 +296,37 @@ class DatasetAugmentationResult(ULModel):
             raise ValueError("augmentation result contains duplicate skips")
         if candidate_keys & set(skip_keys):
             raise ValueError("augmentation result cannot both generate and skip an operator")
+        records_by_id = {record.id: record for record in self.source_records}
+        for candidate in self.candidates:
+            record = records_by_id.get(candidate.source_interaction_id)
+            if record is None:
+                raise ValueError("augmentation candidate references an unknown source interaction")
+            binding = next(
+                binding
+                for binding in builtin_augmentation_catalog()
+                .get(candidate.operator_id, candidate.operator_version)
+                .bindings
+                if binding.mode == "dataset_variation"
+            )
+            binding.projection.validate_projection(candidate.projection)
+            try:
+                changes = candidate.projection.validate_candidate(
+                    record.augmentation_document(),
+                    record.augmentation_document(candidate.augmented_input),
+                )
+            except ValueError as error:
+                if str(error) != "augmentation candidate does not change its source":
+                    raise
+                changes = None
+            expected_paths = changes.changed_paths if changes is not None else ()
+            expected_events = changes.changed_events if changes is not None else ()
+            if (
+                candidate.changed_paths != expected_paths
+                or candidate.changed_events != expected_events
+            ):
+                raise ValueError("augmentation candidate change set does not match its projection")
+            if changes is None and candidate.passed:
+                raise ValueError("unchanged augmentation candidates cannot pass")
         return self
 
 
@@ -536,6 +571,24 @@ class DatasetAugmentationEngine:
                         "renderer produced an input already generated for this source"
                     )
                 generated_inputs.add(generated_input_key)
+                projection = create_dataset_augmentation_projection(record)
+                binding = next(
+                    binding
+                    for binding in builtin_augmentation_catalog()
+                    .get(operator.id, operator.version)
+                    .bindings
+                    if binding.mode == "dataset_variation"
+                )
+                binding.projection.validate_projection(projection)
+                try:
+                    changes = projection.validate_candidate(
+                        record.augmentation_document(),
+                        record.augmentation_document(augmented_input),
+                    )
+                except ValueError as error:
+                    if str(error) != "augmentation candidate does not change its source":
+                        raise
+                    changes = None
                 candidates.append(
                     DatasetAugmentationCandidate(
                         source_interaction_id=record.id,
@@ -553,6 +606,9 @@ class DatasetAugmentationEngine:
                         operator_version=operator.version,
                         allowed_change=operator.allowed_change,
                         human_review_required=operator.human_review_required,
+                        projection=projection,
+                        changed_paths=changes.changed_paths if changes is not None else (),
+                        changed_events=changes.changed_events if changes is not None else (),
                         augmented_input=augmented_input,
                         renderer_metadata=renderer_metadata,
                         expected_input_frame=expected_input_frame,
@@ -572,6 +628,33 @@ class DatasetAugmentationEngine:
             candidates=tuple(candidates),
             skips=tuple(skips),
         )
+
+
+def create_dataset_augmentation_projection(
+    record: InteractionRecord,
+) -> AugmentationProjection:
+    surface = (
+        "conversation"
+        if record.augmentation_target is not None
+        and record.augmentation_target.kind == "conversation_turn"
+        else "structured_input"
+    )
+    return AugmentationProjection(
+        reads=(
+            ProjectionTarget(
+                id="source-augmentation-target",
+                surface=surface,
+                path=record.augmentation_path,
+            ),
+        ),
+        writes=(
+            ProjectionTarget(
+                id="candidate-augmentation-target",
+                surface=surface,
+                path=record.augmentation_path,
+            ),
+        ),
+    )
 
 
 def _source_skip_reason(

@@ -8,6 +8,7 @@ from ul.augmentations.dataset import (
     DatasetAugmentationEngine,
     DatasetAugmentationOperatorReference,
     DatasetAugmentationResult,
+    create_dataset_augmentation_projection,
 )
 from ul.dataset_evaluation import DatasetEvaluationResult, DatasetEvaluationRunner
 from ul_core.dataset import (
@@ -192,6 +193,8 @@ def _candidate(
             "operator_version": "1.0.0",
             "allowed_change": "declared_communication_form",
             "human_review_required": operator_id == "input.tone.frustrated",
+            "projection": create_dataset_augmentation_projection(source),
+            "changed_paths": (source.augmentation_path,),
             "augmented_input": augmented_input,
             "renderer_metadata": {"renderer": "ul-demo-deterministic"},
             "expected_input_frame": source_frame,

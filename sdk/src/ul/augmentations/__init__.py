@@ -9,6 +9,7 @@ from ul.augmentations.dataset import (
     DatasetAugmentationResult,
     DatasetAugmentationSkip,
     builtin_dataset_augmentation_operators,
+    create_dataset_augmentation_projection,
     resolve_dataset_augmentation_operator,
 )
 from ul.augmentations.qualification import (
@@ -26,6 +27,7 @@ __all__ = [
     "DatasetAugmentationSkip",
     "builtin_dataset_augmentation_operators",
     "create_augmentation_qualification_report",
+    "create_dataset_augmentation_projection",
     "load_augmentation_qualification_report",
     "replay_augmentation_qualification",
     "resolve_dataset_augmentation_operator",

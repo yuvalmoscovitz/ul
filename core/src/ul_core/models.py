@@ -130,6 +130,7 @@ class AugmentationApplication(ULModel):
     augmentation_id: str = Field(min_length=1)
     version: str = Field(pattern=r"^\d+\.\d+\.\d+$")
     changed_paths: tuple[str, ...]
+    changed_events: tuple[str, ...] = ()
 
 
 class OracleRelation(ULModel):
