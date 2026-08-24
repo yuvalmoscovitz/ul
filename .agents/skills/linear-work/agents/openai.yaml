@@ -1,0 +1,4 @@
+interface:
+  display_name: "Linear Work"
+  short_description: "Keep Linear work focused and auditable"
+  default_prompt: "Use $linear-work to create or update the right Linear issue with minimal overhead."
