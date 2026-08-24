@@ -366,6 +366,7 @@ class _EvidenceRecord(_StrictModel):
         "1.10.0",
         "1.11.0",
         "1.12.0",
+        "1.13.0",
     ]
     evaluation_mode: Literal["variance"] | None = None
     interaction_id: str
@@ -385,14 +386,17 @@ class _EvidenceRecord(_StrictModel):
 
     @model_validator(mode="after")
     def validate_invariant_evaluation(self) -> Self:
-        current_schemas = {"1.8.0", "1.9.0", "1.10.0", "1.11.0", "1.12.0"}
-        if self.schema_version not in {"1.10.0", "1.11.0", "1.12.0"} and "pattern_facets" in (
-            self.model_fields_set
-        ):
+        current_schemas = {"1.8.0", "1.9.0", "1.10.0", "1.11.0", "1.12.0", "1.13.0"}
+        if self.schema_version not in {
+            "1.10.0",
+            "1.11.0",
+            "1.12.0",
+            "1.13.0",
+        } and "pattern_facets" in (self.model_fields_set):
             raise ValueError("vertical pattern facets require evidence schema 1.10.0")
-        if self.schema_version == "1.12.0":
+        if self.schema_version in {"1.12.0", "1.13.0"}:
             if any(case.cross_examination is None for case in self.cases):
-                raise ValueError("evidence schema 1.12.0 requires case cross-examination")
+                raise ValueError("current evidence schemas require case cross-examination")
         elif any("cross_examination" in case.model_fields_set for case in self.cases):
             raise ValueError("legacy evidence cannot contain cross-examination")
         if self.schema_version in current_schemas and self.evaluation_mode is None:
@@ -422,6 +426,7 @@ class _EvidenceRecord(_StrictModel):
                 "1.10.0",
                 "1.11.0",
                 "1.12.0",
+                "1.13.0",
             }
             and "run_context" in self.model_fields_set
         ):
@@ -442,6 +447,7 @@ class _EvidenceRecord(_StrictModel):
             "1.10.0",
             "1.11.0",
             "1.12.0",
+            "1.13.0",
         }:
             raise ValueError("extended invariant results require evidence schema 1.6.0")
         if (
@@ -450,6 +456,29 @@ class _EvidenceRecord(_StrictModel):
             and self.run_context.evaluation_mode != self.evaluation_mode
         ):
             raise ValueError("evidence evaluation mode must match its run context")
+        if self.schema_version == "1.13.0":
+            from ul_cli.dataset.evidence.customer import build_customer_evidence_record
+
+            technical_result = DatasetEvaluationResult.model_validate(
+                self.technical_details,
+                strict=False,
+            )
+            expected_record = build_customer_evidence_record(
+                technical_result,
+                repetitions=self.execution_plan.repetitions,
+                max_environment_api_calls=self.execution_plan.max_target_calls,
+                planned_target_calls=self.execution_plan.dataset_planned_target_calls,
+            )
+            expected_cases = cast(list[dict[str, JsonValue]], expected_record["cases"])
+            if len(expected_cases) != len(self.cases) or any(
+                case.cross_examination is None
+                or case.cross_examination.model_dump(mode="json")
+                != expected_case["cross_examination"]
+                for case, expected_case in zip(self.cases, expected_cases, strict=True)
+            ):
+                raise ValueError(
+                    "cross-examination conclusions must match technical execution evidence"
+                )
         if (
             self.invariant_evaluation is not None
             and self.invariant_evaluation.interaction_id != self.interaction_id
@@ -601,6 +630,7 @@ def validate_dataset_resume_evidence(
                 "1.10.0",
                 "1.11.0",
                 "1.12.0",
+                "1.13.0",
             }
             or evidence.run_context is None
         ):
@@ -1204,7 +1234,7 @@ def _summarize_dataset_evidence(
         evidence_schema_versions=tuple(
             sorted({record.evidence.schema_version for record in evidence_records})
         ),
-        evidence_scope="response_only" if response_only else "response_and_state",
+        response_state_evidence_scope=("response_only" if response_only else "response_and_state"),
         evaluation_mode=evaluation_mode,
         capability_limitations=(
             ("cleanup_verification", "conversation_replay", "state_observation")
@@ -2107,7 +2137,7 @@ def _load_evidence(path: Path) -> list[_LoadedEvidenceRecord]:
                 )
             )
     except (ValidationError, ValueError):
-        raise _ReviewInputError("evidence is not valid UL schema through 1.12.0 JSONL") from None
+        raise _ReviewInputError("evidence is not valid UL schema through 1.13.0 JSONL") from None
     return records
 
 

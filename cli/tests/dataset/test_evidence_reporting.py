@@ -11,7 +11,9 @@ from typer.testing import CliRunner
 from ul import (
     AugmentationTarget,
     CaseFixtureReference,
+    DatasetEvaluationFinding,
     DatasetEvaluationResult,
+    DatasetEvaluationTrialSet,
     RichInteractionCase,
     project_rich_interaction_case,
 )
@@ -23,6 +25,12 @@ from ul_cli.dataset.evidence import customer as customer_module
 from ul_cli.dataset.presentation import evaluation as presentation_module
 from ul_cli.main import app as root_app
 from ul_cli.pattern_identity import ensure_project_pattern_identity_key
+from ul_core.evaluation import (
+    EnvironmentLifecycleEvidence,
+    EnvironmentTurnEvidence,
+    ExecutionEvidence,
+    ProbeExecutionEvent,
+)
 
 from ._factories import (
     _evaluation_result,
@@ -57,12 +65,12 @@ def test_rich_evidence_builds_parses_and_reports_end_to_end(tmp_path: Path) -> N
     evidence_path.write_text(json.dumps(record) + "\n", encoding="utf-8")
     _create_pattern_identity_key(tmp_path)
 
-    assert record["schema_version"] == "1.12.0"
+    assert record["schema_version"] == "1.13.0"
     assert dataset_review.is_reportable_dataset_evidence(evidence_path) is True
     report = runner.invoke(root_app, ["report", str(evidence_path), "--json"])
     assert report.exit_code == 0, report.output
     parsed_report = json.loads(report.output)
-    assert parsed_report["evidence_schema_versions"] == ["1.12.0"]
+    assert parsed_report["evidence_schema_versions"] == ["1.13.0"]
     assert parsed_report["evaluation_mode"] == "variance"
 
 
@@ -90,7 +98,9 @@ def test_cross_examination_json_and_offline_cli_present_the_same_safe_facts(
     assert cross_examination["baseline_drift"] == "not_observed"
     assert cross_examination["augmentation_sensitivity"] == "observed"
     assert cross_examination["intrinsic_instability"] == "not_observed"
-    assert cross_examination["evidence_level"] == "response_observed"
+    assert cross_examination["response_evidence"]["conclusion"] == "observed"
+    assert cross_examination["trajectory_evidence"]["conclusion"] == "unavailable"
+    assert cross_examination["committed_state_evidence"]["conclusion"] == "unavailable"
     assert "Baseline drift: not observed (descriptive divergence; not an agent failure)" in (
         human_report.output
     )
@@ -98,8 +108,168 @@ def test_cross_examination_json_and_offline_cli_present_the_same_safe_facts(
     assert "Historical output: reference evidence only; not a correctness oracle" in (
         human_report.output
     )
+    assert "Response evidence: observed" in human_report.output
+    assert "Trajectory evidence: unavailable" in human_report.output
+    assert "Committed-state verification: unavailable" in human_report.output
     assert "Transfer 100 to Alice" not in human_report.output
     assert "private-case-canary" not in human_report.output
+
+
+def test_response_evidence_remains_observed_when_semantic_evaluation_is_inconclusive() -> None:
+    result = _evaluation_result("semantic-inconclusive", has_review_finding=True)
+
+    def semantic_failure(trial_set: DatasetEvaluationTrialSet) -> DatasetEvaluationTrialSet:
+        return trial_set.model_copy(
+            update={
+                "trials": tuple(
+                    trial.model_copy(update={"inconclusive_reasons": ("semantic_parse_failed",)})
+                    for trial in trial_set.trials
+                )
+            }
+        )
+
+    variation_trial_set = result.cases[0].trial_set
+    assert variation_trial_set is not None
+    result = result.model_copy(
+        update={
+            "baseline": result.baseline.model_copy(
+                update={"trial_set": semantic_failure(result.baseline.trial_set)}
+            ),
+            "cases": (
+                result.cases[0].model_copy(
+                    update={"trial_set": semantic_failure(variation_trial_set)}
+                ),
+            ),
+        }
+    )
+
+    record = customer_module.build_customer_evidence_record(
+        result,
+        repetitions=1,
+        max_environment_api_calls=2,
+        planned_target_calls=2,
+    )
+
+    response_evidence = record["cases"][0]["cross_examination"]["response_evidence"]
+    assert response_evidence["conclusion"] == "observed"
+
+
+def test_failed_lifecycle_response_and_execution_events_reach_human_and_json_reports(
+    tmp_path: Path,
+) -> None:
+    result = _evaluation_result("failed-lifecycle-events", has_review_finding=True)
+
+    def with_failed_event_evidence(
+        trial_set: DatasetEvaluationTrialSet,
+    ) -> DatasetEvaluationTrialSet:
+        return trial_set.model_copy(
+            update={
+                "trials": tuple(
+                    trial.model_copy(
+                        update={
+                            "execution_evidence": ExecutionEvidence(
+                                evidence_scope="response_only",
+                                case_id=f"case-{trial.repetition}",
+                                environment_id="response-agent",
+                                environment_config_sha256="a" * 64,
+                                turns=(
+                                    EnvironmentTurnEvidence(
+                                        turn_id="turn-1",
+                                        response={"status": "captured-before-failure"},
+                                    ),
+                                ),
+                                final_response={"status": "captured-before-failure"},
+                                execution_events=(
+                                    ProbeExecutionEvent(
+                                        id=f"event-{trial.repetition}",
+                                        correlation_id=f"correlation-{trial.repetition}",
+                                        kind="tool_call",
+                                        payload={"tool": "bounded-tool"},
+                                    ),
+                                ),
+                                lifecycle=EnvironmentLifecycleEvidence(
+                                    terminal_status="failed",
+                                    failed_phase="execute_turn",
+                                    failure_code="transport_failed",
+                                    failure_reason="connection closed after response capture",
+                                    delivery="certain",
+                                    cleanup="not_attempted",
+                                    environment_state_uncertain=False,
+                                ),
+                            )
+                        }
+                    )
+                    for trial in trial_set.trials
+                )
+            }
+        )
+
+    variation_trial_set = result.cases[0].trial_set
+    assert variation_trial_set is not None
+    result = result.model_copy(
+        update={
+            "baseline": result.baseline.model_copy(
+                update={"trial_set": with_failed_event_evidence(result.baseline.trial_set)}
+            ),
+            "cases": (
+                result.cases[0].model_copy(
+                    update={"trial_set": with_failed_event_evidence(variation_trial_set)}
+                ),
+            ),
+        }
+    )
+    record = customer_module.build_customer_evidence_record(
+        result,
+        repetitions=1,
+        max_environment_api_calls=2,
+        planned_target_calls=2,
+    )
+    evidence_path = tmp_path / "failed-events.jsonl"
+    evidence_path.write_text(json.dumps(record) + "\n", encoding="utf-8")
+    _create_pattern_identity_key(tmp_path)
+
+    json_report = runner.invoke(root_app, ["report", str(evidence_path), "--json"])
+    human_report = runner.invoke(root_app, ["report", str(evidence_path)])
+
+    assert json_report.exit_code == 1, json_report.output
+    assert human_report.exit_code == 1, human_report.output
+    cross_examination = json.loads(json_report.output)["findings"][0]["cross_examination"]
+    assert cross_examination["response_evidence"]["conclusion"] == "observed"
+    assert cross_examination["trajectory_evidence"]["conclusion"] == "observed"
+    assert "Response evidence: observed" in human_report.output
+    assert "Trajectory evidence: observed" in human_report.output
+    assert "authorities=invoker self reported" in human_report.output
+
+
+def test_customer_evidence_rejects_cross_examination_claims_not_in_technical_details(
+    tmp_path: Path,
+) -> None:
+    result = _evaluation_result("forged-trajectory", has_review_finding=True)
+    record = customer_module.build_customer_evidence_record(
+        result,
+        repetitions=1,
+        max_environment_api_calls=2,
+        planned_target_calls=2,
+    )
+    trajectory = record["cases"][0]["cross_examination"]["trajectory_evidence"]
+    trajectory.update(
+        {
+            "conclusion": "observed",
+            "current_baseline": "observed",
+            "variation": "observed",
+            "current_baseline_covered_repetitions": 1,
+            "variation_covered_repetitions": 1,
+            "current_baseline_authorities": ["independent_observer"],
+            "variation_authorities": ["independent_observer"],
+        }
+    )
+    evidence_path = tmp_path / "forged.jsonl"
+    evidence_path.write_text(json.dumps(record) + "\n", encoding="utf-8")
+
+    report = runner.invoke(root_app, ["report", str(evidence_path), "--json"])
+
+    assert report.exit_code == 2
+    assert "unsupported evidence" in report.output
 
 
 @pytest.mark.parametrize(
@@ -241,7 +411,7 @@ def test_rich_customer_evidence_records_source_target_original_and_lineage() -> 
         planned_target_calls=2,
     )
 
-    assert evidence["schema_version"] == "1.12.0"
+    assert evidence["schema_version"] == "1.13.0"
     assert evidence["interaction_id"] == "cancel-order::message"
     assert evidence["source_record_id"] == "cancel-order"
     assert evidence["augmentation_target"] == {
@@ -273,7 +443,7 @@ def test_unified_report_surfaces_response_only_scope_and_limitations(tmp_path: P
     assert json_report.exit_code == 0, json_report.output
     parsed_report = json.loads(json_report.output)
     assert parsed_report["evaluation_mode"] == "variance"
-    assert parsed_report["evidence_scope"] == "response_only"
+    assert parsed_report["response_state_evidence_scope"] == "response_only"
     assert parsed_report["capability_limitations"] == [
         "cleanup_verification",
         "conversation_replay",
@@ -281,7 +451,7 @@ def test_unified_report_surfaces_response_only_scope_and_limitations(tmp_path: P
     ]
     assert human_report.exit_code == 0, human_report.output
     assert "Evaluation mode: variance" in human_report.output
-    assert "Evidence scope: response only" in human_report.output
+    assert "Response/state evidence scope: response only" in human_report.output
     assert "Not verified: committed state, cleanup, or multi-turn conversations." in (
         human_report.output
     )
@@ -346,7 +516,7 @@ def test_customer_evidence_keeps_summary_and_nested_technical_details() -> None:
     assert presentation_module.result_needs_review(result) is True
     assert evidence["interaction_id"] == "case-1"
     assert evidence["original_input"] == "transfer 100 to Alice"
-    assert evidence["schema_version"] == "1.12.0"
+    assert evidence["schema_version"] == "1.13.0"
     assert evidence["evaluation_mode"] == "variance"
     assert evidence["invariant_evaluation"] is None
     assert evidence["current_baseline"]["status"] == "ORIGINAL REPLAY STABLE (3/3 OBSERVED)"
@@ -407,7 +577,7 @@ def test_customer_evidence_keeps_invariants_separate_from_behavioral_findings() 
         invariant_evaluation=invariant_evaluation,
     )
 
-    assert evidence["schema_version"] == "1.12.0"
+    assert evidence["schema_version"] == "1.13.0"
     assert evidence["evaluation_mode"] == "variance"
     assert evidence["cases"] == []
     stored_invariants = cast(dict[str, Any], evidence["invariant_evaluation"])
@@ -644,35 +814,24 @@ def test_duplicate_semantic_findings_get_stable_unique_reportable_ids(tmp_path: 
     assert finding_ids == reordered_finding_ids
     assert all(re.fullmatch(r"ulf_v1_[0-9a-f]{64}", finding_id) for finding_id in finding_ids)
 
-    candidate = SimpleNamespace(
-        operator_id="input.surface.rephrase",
-        operator_version="1.0.0",
-        augmented_input="Please transfer 100 to Alice.",
-        passed=True,
-        failure_reasons=(),
-    )
-    case = SimpleNamespace(
-        candidate=candidate,
-        verdict="divergence_needs_review",
-        trial_set=_trial_set(representative_effect=first_observed),
-        findings=(first_finding, second_finding),
-        inconclusive_reasons=(),
-    )
-    result = cast(
-        DatasetEvaluationResult,
-        SimpleNamespace(
-            source=SimpleNamespace(id="case-1", raw_input="Transfer 100 to Alice."),
-            baseline=SimpleNamespace(
-                verdict="no_divergence",
-                trial_set=_trial_set(representative_effect=first_reference),
-                inconclusive_reasons=(),
-            ),
-            cases=(case,),
-            model_dump=lambda **kwargs: {
-                "evaluation_mode": "variance",
-                "fixture": "duplicate semantic findings",
+    result = _evaluation_result("case-1", has_review_finding=True)
+    typed_findings = tuple(
+        DatasetEvaluationFinding.model_validate(
+            {
+                "category": finding.category,
+                "message": finding.message,
+                "expected_effects": [effect.model_dump() for effect in finding.expected_effects],
+                "observed_effects": [effect.model_dump() for effect in finding.observed_effects],
+                "grounded_field_names": finding.grounded_field_names,
             },
-        ),
+            strict=False,
+        )
+        for finding in (first_finding, second_finding)
+    )
+    result = result.model_copy(
+        update={
+            "cases": (result.cases[0].model_copy(update={"findings": typed_findings}),),
+        }
     )
     evidence = customer_module.build_customer_evidence_record(
         result,

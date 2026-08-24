@@ -19,6 +19,7 @@ from ul_cli.main import app
 from ul_cli.report_contract import (
     CapturedJson,
     CrossExaminationArm,
+    CrossExaminationEvidenceAvailability,
     DecisionReadyFinding,
     EvidenceArtifact,
     EvidencePointer,
@@ -64,6 +65,37 @@ def test_report_module_imports_in_a_clean_process() -> None:
     )
 
     assert result.returncode == 0, result.stderr
+
+
+@pytest.mark.parametrize(
+    "values",
+    (
+        {
+            "fact": "trajectory",
+            "conclusion": "verified",
+            "current_baseline": "verified",
+            "variation": "verified",
+            "authorities": ("independent_observer",),
+        },
+        {
+            "fact": "committed_state",
+            "conclusion": "verified",
+            "current_baseline": "verified",
+            "variation": "unavailable",
+            "authorities": ("independent_observer",),
+        },
+        {
+            "fact": "response",
+            "conclusion": "observed",
+            "current_baseline": "observed",
+            "variation": "observed",
+            "authorities": (),
+        },
+    ),
+)
+def test_evidence_availability_rejects_overclaims(values: dict[str, object]) -> None:
+    with pytest.raises(ValidationError):
+        CrossExaminationEvidenceAvailability.model_validate(values)
 
 
 def _sha(value: str) -> str:
@@ -132,7 +164,13 @@ def _pointer(
             "kind": kind,
             "artifact_sha256": artifact.sha256,
             "record_id": record_id,
-            "json_pointer": "",
+            "json_pointer": (
+                "/initial_state/value"
+                if kind == "state" and ".state.before" in label
+                else "/final_state/value"
+                if kind == "state"
+                else ""
+            ),
             "arm": arm,
             "authority": authority,
             "source_id": source_id,
@@ -141,20 +179,34 @@ def _pointer(
 
 
 def _pointer_artifact_value(record_id: str, kind: str, arm: str) -> JsonValue:
-    return {
+    value: JsonValue = {
         "private": _PRIVATE_CANARY,
         "record_id": record_id,
         "kind": kind,
         "arm": arm,
     }
+    if kind == "state":
+        state_key = "initial_state" if ".state.before" in record_id else "final_state"
+        return {
+            state_key: {
+                "value": value,
+                "authority": "environment_self_reported",
+                "source_id": "environment",
+            }
+        }
+    return value
 
 
 def _evidence(pointer: EvidencePointer, value: JsonValue) -> ReceiptEvidenceValue:
     del value
     assert pointer.record_id is not None
+    artifact_value = _pointer_artifact_value(pointer.record_id, pointer.kind, pointer.arm)
+    state_key = "initial_state" if ".state.before" in pointer.record_id else "final_state"
     return ReceiptEvidenceValue(
         evidence_pointer_id=pointer.pointer_id,
-        value=capture_json(_pointer_artifact_value(pointer.record_id, pointer.kind, pointer.arm)),
+        value=capture_json(
+            artifact_value[state_key]["value"] if pointer.kind == "state" else artifact_value
+        ),
     )
 
 
@@ -418,7 +470,28 @@ def _dataset_package() -> FindingEvidencePackage:
             augmentation_sensitivity="observed",
             intrinsic_instability="not_observed",
             material_delta_evidence_pointer_ids=action_ids,
-            evidence_level="response_observed",
+            response_evidence=CrossExaminationEvidenceAvailability(
+                fact="response",
+                conclusion="observed",
+                current_baseline="observed",
+                variation="observed",
+                current_baseline_covered_repetitions=2,
+                variation_covered_repetitions=2,
+                current_baseline_authorities=("independent_observer",),
+                variation_authorities=("independent_observer",),
+            ),
+            trajectory_evidence=CrossExaminationEvidenceAvailability(
+                fact="trajectory",
+                conclusion="unavailable",
+                current_baseline="unavailable",
+                variation="unavailable",
+            ),
+            committed_state_evidence=CrossExaminationEvidenceAvailability(
+                fact="committed_state",
+                conclusion="unavailable",
+                current_baseline="unavailable",
+                variation="unavailable",
+            ),
             limitations=(
                 "causality_not_established",
                 "correctness_not_verified",
@@ -606,7 +679,9 @@ def test_dataset_and_stateful_workflows_share_an_auditable_package_contract() ->
     for package in (_dataset_package(), _stateful_package()):
         round_trip = FindingEvidencePackage.model_validate_json(package.model_dump_json())
         assert round_trip == package
-        assert package.schema_version == "1.1.0"
+        assert package.schema_version == "1.2.0"
+        assert package.occurrence.schema_version == "1.1.0"
+        assert all(receipt.schema_version == "1.1.0" for receipt in package.receipts)
         assert len(package.occurrence.repetitions) == 2
         assert all(item.evidence_pointer_ids for item in package.occurrence.repetitions)
 
@@ -650,9 +725,10 @@ def test_dataset_and_stateful_packages_share_decision_ready_explanations(
     }
 
     assert isinstance(finding, DecisionReadyFinding)
+    assert finding.schema_version == "1.1.0"
     assert finding.classification == classification
     assert finding.review_workflow == workflow
-    assert finding.evidence_level == evidence_level
+    assert finding.response_state_evidence_level == evidence_level
     assert finding.campaign_ref == package.occurrence.campaign_ref
     assert finding.case_ref == package.occurrence.case_ref
     assert finding.operator == package.occurrence.operator
@@ -674,6 +750,7 @@ def test_dataset_and_stateful_packages_share_decision_ready_explanations(
     assert "private-record" not in finding.model_dump_json()
 
     report = build_finding_decision_report((package,))
+    assert report.schema_version == "1.1.0"
     assert FindingDecisionReport.model_validate_json(report.model_dump_json()) == report
 
 
@@ -810,7 +887,7 @@ def test_stateful_finding_package_uses_same_safe_offline_report(
 
     assert result.exit_code == 1, result.output
     assert "Classification: customer rule violation" in result.output
-    assert "Evidence scope: response and state" in result.output
+    assert "Response/state evidence scope: response and state" in result.output
     assert "workflow=external review required" in result.output
     assert "Inspect the private normalized receipt" in result.output
     assert "Resolve private references and receipt" in result.output
@@ -838,8 +915,8 @@ def test_stateful_finding_package_uses_same_safe_offline_report(
 def test_decision_report_supports_mixed_evidence_scopes_in_one_campaign() -> None:
     report = build_finding_decision_report((_dataset_package(), _stateful_package()))
 
-    assert report.evidence_scope == "mixed"
-    assert {finding.evidence_scope for finding in report.findings} == {
+    assert report.response_state_evidence_scope == "mixed"
+    assert {finding.response_state_evidence_scope for finding in report.findings} == {
         "response_only",
         "response_and_state",
     }
@@ -923,8 +1000,8 @@ def test_finding_package_report_rejects_duplicate_keys_and_symlinks(tmp_path: Pa
     duplicate = tmp_path / "duplicate.findings.jsonl"
     duplicate.write_text(
         valid.replace(
-            '"schema_version":"1.1.0"',
-            '"schema_version":"1.1.0","schema_version":"1.1.0"',
+            '"schema_version":"1.2.0"',
+            '"schema_version":"1.2.0","schema_version":"1.2.0"',
             1,
         )
         + "\n",
@@ -990,6 +1067,29 @@ def test_package_binds_each_repetition_to_its_receipts() -> None:
         ValidationError,
         match=r"declared arm and repetition",
     ):
+        FindingEvidencePackage.model_validate_json(json.dumps(payload))
+
+
+def test_package_rejects_cross_examination_authority_not_cited_by_receipts() -> None:
+    payload = _dataset_package().model_dump(mode="json")
+    payload["occurrence"]["cross_examination"]["response_evidence"][
+        "current_baseline_authorities"
+    ] = ["source_self_reported"]
+    _rebind_occurrence(payload)
+
+    with pytest.raises(ValidationError, match="authorities must match cited evidence"):
+        FindingEvidencePackage.model_validate_json(json.dumps(payload))
+
+
+def test_package_requires_cross_examination_pointers_from_every_repetition() -> None:
+    payload = _dataset_package().model_dump(mode="json")
+    current_baseline = payload["occurrence"]["cross_examination"]["current_baseline"]
+    current_baseline["response_evidence_pointer_ids"] = current_baseline[
+        "response_evidence_pointer_ids"
+    ][:1]
+    _rebind_occurrence(payload)
+
+    with pytest.raises(ValidationError, match="channel pointers must match every receipt"):
         FindingEvidencePackage.model_validate_json(json.dumps(payload))
 
 

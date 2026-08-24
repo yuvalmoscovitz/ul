@@ -27,12 +27,18 @@ from ul.dataset_invariants import (
     evaluate_dataset_invariant_rules,
 )
 from ul_core.dataset import ObservedAgentOutput, ObservedOutcome, SemanticFrame
-from ul_core.evaluation import EnvironmentStateEvidence, ExecutionEvidence
+from ul_core.evaluation import (
+    EnvironmentStateEvidence,
+    ExecutionEvidence,
+    ProbeExecutionEvent,
+    ProbeObservation,
+)
 
 from ul_cli.finding_reference import finding_public_reference
 from ul_cli.report_contract import (
     CapturedJson,
     CrossExaminationArm,
+    CrossExaminationEvidenceAvailability,
     EvidenceArtifact,
     EvidencePointer,
     FindingCategory,
@@ -76,6 +82,7 @@ EvidenceAuthority = Literal[
     "independent_observer",
 ]
 _MAXIMUM_CAPTURED_JSON_BYTES = 250_000
+_MAXIMUM_STATE_CAPTURED_JSON_BYTES = 1_000_000
 _MAXIMUM_RUN_RECEIPT_BYTES = 1_000_000
 _MAXIMUM_ADAPTED_PACKAGE_BYTES = 16_000_000
 _MAXIMUM_ADAPTED_REPETITIONS = 1_000
@@ -668,11 +675,11 @@ def _execution_receipt(
         category_json_pointer=category_json_pointer,
         rule_definition=rule_definition,
         target_config_sha256=execution_evidence.environment_config_sha256,
-        state_before_json_pointer="/initial_state/value",
-        state_after_json_pointer="/final_state/value",
         lifecycle_json_pointer="/lifecycle",
         limitations=tuple(receipt_limitations),
         execution_available=execution_available,
+        trajectory_observations=execution_evidence.observations,
+        trajectory_events=execution_evidence.execution_events,
         historical_reference_value=historical_reference_value,
         historical_reference_present=historical_reference_present,
     )
@@ -725,16 +732,18 @@ def _receipt_from_values(
     category_json_pointer: str,
     rule_definition: DatasetInvariantRule | None,
     target_config_sha256: str | None = None,
-    state_before_json_pointer: str = "/state_before",
-    state_after_json_pointer: str = "/state_after",
     lifecycle_json_pointer: str | None = "/lifecycle",
     limitations: tuple[str, ...] = (),
     execution_available: bool = True,
+    trajectory_observations: tuple[ProbeObservation, ...] = (),
+    trajectory_events: tuple[ProbeExecutionEvent, ...] = (),
     historical_reference_value: JsonValue | None = None,
     historical_reference_present: bool = False,
 ) -> _ReceiptBuild:
     pointers: list[EvidencePointer] = []
     retained_artifacts: dict[str, EvidenceArtifact] = {}
+    default_artifact_value = _json_value(artifact)
+    default_evidence_artifact: EvidenceArtifact | None = None
 
     def add_pointer(
         *,
@@ -745,9 +754,24 @@ def _receipt_from_values(
         source_id: str,
         pointer_artifact: object = artifact,
         retain_artifact: bool = False,
+        maximum_capture_bytes: int = _MAXIMUM_CAPTURED_JSON_BYTES,
     ) -> str:
-        artifact_value = _json_value(pointer_artifact)
-        retained_artifact = _evidence_artifact(artifact_value) if retain_artifact else None
+        nonlocal default_evidence_artifact
+        artifact_value = (
+            default_artifact_value
+            if pointer_artifact is artifact
+            else _json_value(pointer_artifact)
+        )
+        if retain_artifact and pointer_artifact is artifact:
+            if default_evidence_artifact is None:
+                default_evidence_artifact = _evidence_artifact(default_artifact_value)
+            retained_artifact = default_evidence_artifact
+        else:
+            retained_artifact = (
+                _evidence_artifact(artifact_value, maximum_capture_bytes)
+                if retain_artifact
+                else None
+            )
         artifact_sha256 = (
             retained_artifact.artifact_sha256
             if retained_artifact is not None
@@ -827,18 +851,80 @@ def _receipt_from_values(
             raise ValueError("stateful receipts require observed initial and final state")
         state_before_pointer_id = add_pointer(
             kind="state",
-            json_pointer=state_before_json_pointer,
+            json_pointer="/initial_state/value",
             pointer_arm=arm,
             authority=state_before_authority,
             source_id=state_before_source_id,
+            pointer_artifact={
+                "initial_state": {
+                    "value": state_before,
+                    "authority": state_before_authority,
+                    "source_id": state_before_source_id,
+                }
+            },
+            retain_artifact=True,
+            maximum_capture_bytes=_MAXIMUM_STATE_CAPTURED_JSON_BYTES,
         )
         state_after_pointer_id = add_pointer(
             kind="state",
-            json_pointer=state_after_json_pointer,
+            json_pointer="/final_state/value",
             pointer_arm=arm,
             authority=state_after_authority,
             source_id=state_after_source_id,
+            pointer_artifact={
+                "final_state": {
+                    "value": state_after,
+                    "authority": state_after_authority,
+                    "source_id": state_after_source_id,
+                }
+            },
+            retain_artifact=True,
+            maximum_capture_bytes=_MAXIMUM_STATE_CAPTURED_JSON_BYTES,
         )
+    trace_evidence_pointer_ids = tuple(
+        (
+            *(
+                add_pointer(
+                    kind="trace",
+                    json_pointer="/value",
+                    pointer_arm=arm,
+                    authority=observation.authority,
+                    source_id=observation.source_id,
+                    pointer_artifact={
+                        "value": observation.model_dump(mode="json"),
+                        "authority": observation.authority,
+                        "source_id": observation.source_id,
+                    },
+                    retain_artifact=True,
+                )
+                for observation in trajectory_observations
+                if any(
+                    (
+                        observation.traces,
+                        observation.tool_calls,
+                        observation.handoffs,
+                        observation.errors,
+                    )
+                )
+            ),
+            *(
+                add_pointer(
+                    kind="trace",
+                    json_pointer="/value",
+                    pointer_arm=arm,
+                    authority="invoker_self_reported",
+                    source_id=context.invoker_source_id,
+                    pointer_artifact={
+                        "value": event.model_dump(mode="json"),
+                        "authority": "invoker_self_reported",
+                        "source_id": context.invoker_source_id,
+                    },
+                    retain_artifact=True,
+                )
+                for event in trajectory_events
+            ),
+        )
+    )
     category_pointer_ids: tuple[str, ...] = ()
     if category is not None and category_value is not None:
         category_pointer_kind = "rule" if category == "customer_invariant_violation" else "action"
@@ -887,6 +973,26 @@ def _receipt_from_values(
         ProvenanceReceipt(role="observer", id=source_id)
         for source_id in sorted(observer_source_ids)
     )
+    trajectory_provenance = {
+        (
+            "observer" if observation.authority == "independent_observer" else "target",
+            observation.source_id,
+        )
+        for observation in trajectory_observations
+        if any(
+            (
+                observation.traces,
+                observation.tool_calls,
+                observation.handoffs,
+                observation.errors,
+            )
+        )
+    }
+    provenance.extend(
+        ProvenanceReceipt(role=cast(Literal["observer", "target"], role), id=source_id)
+        for role, source_id in sorted(trajectory_provenance)
+        if not any(item.role == role and item.id == source_id for item in provenance)
+    )
     provenance.sort(key=lambda item: (item.role, item.id, item.version or ""))
     receipt_limitations = set(limitations)
     if response_value is None:
@@ -908,6 +1014,25 @@ def _receipt_from_values(
         },
         _MAXIMUM_RUN_RECEIPT_BYTES,
         "run receipt exceeds the 1 MB JSON limit",
+    )
+    trajectory_evidence_status: Literal["complete", "incomplete", "unavailable"] = (
+        "complete"
+        if any(
+            observation.status == "complete"
+            and any(
+                (
+                    observation.traces,
+                    observation.tool_calls,
+                    observation.handoffs,
+                    observation.errors,
+                )
+            )
+            for observation in trajectory_observations
+        )
+        or trajectory_events
+        else "incomplete"
+        if trace_evidence_pointer_ids
+        else "unavailable"
     )
     content = RunReceiptContent(
         repetition=repetition,
@@ -937,7 +1062,7 @@ def _receipt_from_values(
             StateReceipt(
                 evidence=ReceiptEvidenceValue(
                     evidence_pointer_id=state_before_pointer_id,
-                    value=_bounded_capture_json(state_before),
+                    value=_bounded_capture_json(state_before, _MAXIMUM_STATE_CAPTURED_JSON_BYTES),
                 )
             )
             if state_before_pointer_id is not None
@@ -947,7 +1072,7 @@ def _receipt_from_values(
             StateReceipt(
                 evidence=ReceiptEvidenceValue(
                     evidence_pointer_id=state_after_pointer_id,
-                    value=_bounded_capture_json(state_after),
+                    value=_bounded_capture_json(state_after, _MAXIMUM_STATE_CAPTURED_JSON_BYTES),
                 )
             )
             if state_after_pointer_id is not None
@@ -962,6 +1087,8 @@ def _receipt_from_values(
             ),
         ),
         provenance=tuple(provenance),
+        trace_evidence_pointer_ids=trace_evidence_pointer_ids,
+        trajectory_evidence_status=trajectory_evidence_status,
         redaction=context.redaction,
         evidence_pointers=tuple(sorted(pointers, key=lambda pointer: pointer.pointer_id)),
         limitations=tuple(sorted(receipt_limitations)),
@@ -1091,6 +1218,73 @@ def _baseline_drift_signal(
     return "observed" if drift_deltas else "not_observed"
 
 
+def _cross_examination_availability(
+    *,
+    fact: Literal["response", "trajectory", "committed_state"],
+    source_receipts: list[_ReceiptBuild],
+    probe_receipts: list[_ReceiptBuild],
+) -> CrossExaminationEvidenceAvailability:
+    achieved = "verified" if fact == "committed_state" else "observed"
+
+    def arm(
+        receipts: list[_ReceiptBuild],
+    ) -> tuple[
+        Literal["observed", "verified", "unavailable"],
+        int,
+        tuple[EvidenceAuthority, ...],
+    ]:
+        if fact == "response":
+            covered = sum(receipt.response_pointer_id is not None for receipt in receipts)
+            pointer_kind = "response"
+        elif fact == "trajectory":
+            covered = sum(
+                receipt.receipt.content.trajectory_evidence_status == "complete"
+                for receipt in receipts
+            )
+            pointer_kind = "trace"
+        else:
+            covered = sum(
+                receipt.receipt.content.state_before is not None
+                and receipt.receipt.content.state_after is not None
+                for receipt in receipts
+            )
+            pointer_kind = "state"
+        authorities = cast(
+            tuple[EvidenceAuthority, ...],
+            tuple(
+                sorted(
+                    {
+                        pointer.authority
+                        for receipt in receipts
+                        for pointer in receipt.receipt.content.evidence_pointers
+                        if pointer.kind == pointer_kind
+                        and not (fact == "response" and pointer.arm == "shared")
+                    }
+                )
+            ),
+        )
+        return (
+            achieved if receipts and covered == len(receipts) else "unavailable",
+            covered,
+            authorities,
+        )
+
+    current_baseline, baseline_covered, baseline_authorities = arm(source_receipts)
+    variation, variation_covered, variation_authorities = arm(probe_receipts)
+    return CrossExaminationEvidenceAvailability(
+        fact=fact,
+        conclusion=(
+            achieved if current_baseline == achieved and variation == achieved else "unavailable"
+        ),
+        current_baseline=current_baseline,
+        variation=variation,
+        current_baseline_covered_repetitions=baseline_covered,
+        variation_covered_repetitions=variation_covered,
+        current_baseline_authorities=baseline_authorities,
+        variation_authorities=variation_authorities,
+    )
+
+
 def _dataset_cross_examination(
     *,
     operator_id: str,
@@ -1133,6 +1327,36 @@ def _dataset_cross_examination(
             }
         )
     )
+    current_trajectory_pointer_ids = tuple(
+        sorted(
+            pointer_id
+            for receipt in source_receipts
+            for pointer_id in receipt.receipt.content.trace_evidence_pointer_ids
+        )
+    )
+    variation_trajectory_pointer_ids = tuple(
+        sorted(
+            pointer_id
+            for receipt in probe_receipts
+            for pointer_id in receipt.receipt.content.trace_evidence_pointer_ids
+        )
+    )
+    current_state_pointer_ids = tuple(
+        sorted(
+            pointer.pointer_id
+            for receipt in source_receipts
+            for pointer in receipt.receipt.content.evidence_pointers
+            if pointer.kind == "state"
+        )
+    )
+    variation_state_pointer_ids = tuple(
+        sorted(
+            pointer.pointer_id
+            for receipt in probe_receipts
+            for pointer in receipt.receipt.content.evidence_pointers
+            if pointer.kind == "state"
+        )
+    )
     if not historical_pointer_ids or not current_pointer_ids or not variation_pointer_ids:
         raise ValueError("response-level cross-examination requires all three evidence arms")
     baseline_observed = sum(receipt.execution_available for receipt in source_receipts)
@@ -1152,6 +1376,8 @@ def _dataset_cross_examination(
         current_baseline=CrossExaminationArm(
             role="current_baseline",
             response_evidence_pointer_ids=current_pointer_ids,
+            trajectory_evidence_pointer_ids=current_trajectory_pointer_ids,
+            committed_state_evidence_pointer_ids=current_state_pointer_ids,
             requested_repetitions=requested,
             observed_repetitions=baseline_observed,
             inconclusive_repetitions=requested - baseline_observed,
@@ -1160,6 +1386,8 @@ def _dataset_cross_examination(
         variation=CrossExaminationArm(
             role="variation",
             response_evidence_pointer_ids=variation_pointer_ids,
+            trajectory_evidence_pointer_ids=variation_trajectory_pointer_ids,
+            committed_state_evidence_pointer_ids=variation_state_pointer_ids,
             requested_repetitions=len(probe_receipts),
             observed_repetitions=variation_observed,
             inconclusive_repetitions=len(probe_receipts) - variation_observed,
@@ -1177,13 +1405,20 @@ def _dataset_cross_examination(
             "inconclusive" if incomplete else "observed" if unstable else "not_observed"
         ),
         material_delta_evidence_pointer_ids=material_delta_pointer_ids,
-        evidence_level=(
-            "committed_state_verified"
-            if all(
-                receipt.receipt.content.evidence_scope == "response_and_state"
-                for receipt in (*source_receipts, *probe_receipts)
-            )
-            else "response_observed"
+        response_evidence=_cross_examination_availability(
+            fact="response",
+            source_receipts=source_receipts,
+            probe_receipts=probe_receipts,
+        ),
+        trajectory_evidence=_cross_examination_availability(
+            fact="trajectory",
+            source_receipts=source_receipts,
+            probe_receipts=probe_receipts,
+        ),
+        committed_state_evidence=_cross_examination_availability(
+            fact="committed_state",
+            source_receipts=source_receipts,
+            probe_receipts=probe_receipts,
         ),
         limitations=(
             "causality_not_established",
@@ -1366,7 +1601,11 @@ def _package(
                             cross_examination.current_baseline,
                             cross_examination.variation,
                         )
-                        for pointer_id in arm.response_evidence_pointer_ids
+                        for pointer_id in (
+                            *arm.response_evidence_pointer_ids,
+                            *arm.trajectory_evidence_pointer_ids,
+                            *arm.committed_state_evidence_pointer_ids,
+                        )
                     )
                     if cross_examination is not None
                     else ()
@@ -1455,7 +1694,7 @@ def _package(
         sorted(artifacts_by_digest.values(), key=lambda artifact: artifact.artifact_sha256)
     )
     package_values = {
-        "schema_version": "1.1.0",
+        "schema_version": "1.2.0",
         "disclosure": "private",
         "occurrence": occurrence.model_dump(mode="json"),
         "private_references": {
@@ -1785,10 +2024,13 @@ def _sha256(value: JsonValue) -> str:
     return hashlib.sha256(_canonical_json(value).encode("utf-8")).hexdigest()
 
 
-def _bounded_capture_json(value: JsonValue) -> CapturedJson:
+def _bounded_capture_json(
+    value: JsonValue,
+    maximum_bytes: int = _MAXIMUM_CAPTURED_JSON_BYTES,
+) -> CapturedJson:
     canonical_json = _bounded_canonical_json(
         value,
-        _MAXIMUM_CAPTURED_JSON_BYTES,
+        maximum_bytes,
         "captured JSON exceeds its byte limit",
     )
     return CapturedJson(
@@ -1797,8 +2039,11 @@ def _bounded_capture_json(value: JsonValue) -> CapturedJson:
     )
 
 
-def _evidence_artifact(value: JsonValue) -> EvidenceArtifact:
-    capture = _bounded_capture_json(value)
+def _evidence_artifact(
+    value: JsonValue,
+    maximum_bytes: int = _MAXIMUM_CAPTURED_JSON_BYTES,
+) -> EvidenceArtifact:
+    capture = _bounded_capture_json(value, maximum_bytes)
     return EvidenceArtifact(artifact_sha256=capture.sha256, value=capture)
 
 

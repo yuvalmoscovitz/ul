@@ -197,6 +197,27 @@ public-safe normalized view when present and retains its existing fallback for t
 projection. The private normalized evidence remains independently inspectable and is not used to
 reintroduce prohibited fields into derived public summaries.
 
+The final cross-examination reports three conclusions separately for the fresh baseline and the
+variation: response evidence observed or unavailable, trajectory evidence observed or unavailable,
+and committed-state verification verified or unavailable. Each arm lists its own covered/requested
+repetition count and only the authorities present for that arm. A response-only execution can still
+report a correlated trajectory; `response_state_evidence_scope` describes only response and state
+capture, not trajectory availability.
+Committed state is verified only when authoritative before/after state evidence covers every
+relevant repetition in both execution arms. Partial coverage stays explicit and makes the overall
+conclusion unavailable; it is never rendered as a pass. Human and JSON reports contain the same
+safe conclusions and omit raw response, trace, state, and secret values.
+
+Structured execution events emitted by UL's invoker count as invoker-self-reported trajectory
+evidence even when no external observation spans are available. Trace and state pointers retain
+their channel envelopes independently, binding authority and source to the captured artifact while
+allowing valid state snapshots up to the execution channel limit without duplicating a whole run.
+
+This separation follows the signal boundaries in the
+[OpenInference semantic conventions](https://github.com/Arize-ai/openinference/blob/main/spec/semantic_conventions.md),
+where agent, tool, and model operations are represented as trace spans rather than response claims,
+and the [OpenTelemetry GenAI semantic conventions](https://opentelemetry.io/docs/specs/semconv/gen-ai/).
+
 The campaign receipt binds the semantic provider and endpoint, model, render model, equivalence
 model, input/output/token/response/time bounds, data policy, target receipt, and command-wide call,
 wall-time, and cost status. Normal evidence records the same semantic settings plus dataset,

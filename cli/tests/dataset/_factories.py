@@ -55,6 +55,11 @@ def _trial_set(
     trials = tuple(
         SimpleNamespace(
             repetition=repetition,
+            target_output=(
+                SimpleNamespace(raw_output={"status": "ok"})
+                if repetition in grouped_repetitions
+                else None
+            ),
             inconclusive_reasons=(
                 () if repetition in grouped_repetitions else ("target execution failed",)
             ),
