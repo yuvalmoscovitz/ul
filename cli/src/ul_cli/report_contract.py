@@ -363,6 +363,8 @@ class FindingCrossExamination(_StrictModel):
             or self.variation.role != "variation"
         ):
             raise ValueError("cross-examination arms must match their declared roles")
+        if len(self.historical_reference.response_evidence_pointer_ids) != 1:
+            raise ValueError("cross-examination requires one historical response reference")
         _validate_sorted_unique(
             self.material_delta_evidence_pointer_ids,
             "cross-examination material delta evidence pointer IDs",
@@ -817,6 +819,18 @@ class FindingEvidencePackage(_StrictModel):
         if referenced_receipt_ids != set(receipt_ids):
             raise ValueError("package receipts must exactly match repetition references")
         receipts_by_id = {receipt.receipt_id: receipt for receipt in self.receipts}
+        historical_reference_pointer_ids = tuple(
+            receipt.content.historical_reference_response.evidence_pointer_id
+            for receipt in self.receipts
+            if receipt.content.historical_reference_response is not None
+        )
+        expected_historical_reference_pointer_ids = (
+            self.occurrence.cross_examination.historical_reference.response_evidence_pointer_ids
+            if self.occurrence.cross_examination is not None
+            else ()
+        )
+        if historical_reference_pointer_ids != expected_historical_reference_pointer_ids:
+            raise ValueError("package must retain exactly the cited historical response reference")
         pointers: dict[str, EvidencePointer] = {}
         pointers_by_receipt: dict[str, set[str]] = {}
         for receipt in self.receipts:

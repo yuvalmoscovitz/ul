@@ -131,7 +131,9 @@ def adapt_dataset_behavior_finding(
     source_receipts: list[_ReceiptBuild] = []
     probe_receipts: list[_ReceiptBuild] = []
     repetition_evidence: list[_BehaviorRepetitionEvidence] = []
-    for baseline_trial, probe_trial in zip(baseline_trials, trial_set.trials, strict=True):
+    for receipt_index, (baseline_trial, probe_trial) in enumerate(
+        zip(baseline_trials, trial_set.trials, strict=True)
+    ):
         evidence = _behavior_repetition_evidence(
             finding,
             baseline_trial,
@@ -151,6 +153,7 @@ def adapt_dataset_behavior_finding(
                 category_value=evidence.source_value,
                 context=context,
                 historical_reference_value=result.source.raw_observed_output,
+                historical_reference_present=receipt_index == 0,
             )
         )
         probe_receipts.append(
@@ -482,6 +485,7 @@ def _dataset_receipt(
     context: FindingAdapterContext,
     rule_definition: DatasetInvariantRule | None = None,
     historical_reference_value: JsonValue | None = None,
+    historical_reference_present: bool = False,
 ) -> _ReceiptBuild:
     if execution_evidence is not None:
         return _execution_receipt(
@@ -495,6 +499,7 @@ def _dataset_receipt(
             category_json_pointer=category_json_pointer,
             rule_definition=rule_definition,
             historical_reference_value=historical_reference_value,
+            historical_reference_present=historical_reference_present,
         )
     if target_output is None:
         return _unavailable_receipt(
@@ -506,6 +511,8 @@ def _dataset_receipt(
             category_json_pointer=category_json_pointer,
             context=context,
             rule_definition=rule_definition,
+            historical_reference_value=historical_reference_value,
+            historical_reference_present=historical_reference_present,
         )
     return _receipt_from_values(
         repetition=repetition,
@@ -532,6 +539,7 @@ def _dataset_receipt(
         category_json_pointer=category_json_pointer,
         rule_definition=rule_definition,
         historical_reference_value=historical_reference_value,
+        historical_reference_present=historical_reference_present,
         limitations=("model_provenance_unavailable",),
     )
 
@@ -546,6 +554,8 @@ def _unavailable_receipt(
     category_json_pointer: str,
     context: FindingAdapterContext,
     rule_definition: DatasetInvariantRule | None = None,
+    historical_reference_value: JsonValue | None = None,
+    historical_reference_present: bool = False,
 ) -> _ReceiptBuild:
     unavailable_limitation = (
         "source_execution_unavailable" if arm == "source" else "probe_execution_unavailable"
@@ -576,6 +586,8 @@ def _unavailable_receipt(
         lifecycle_json_pointer=None,
         limitations=("model_provenance_unavailable", unavailable_limitation),
         execution_available=False,
+        historical_reference_value=historical_reference_value,
+        historical_reference_present=historical_reference_present,
     )
 
 
@@ -591,6 +603,7 @@ def _execution_receipt(
     category_json_pointer: str = "",
     rule_definition: DatasetInvariantRule | None = None,
     historical_reference_value: JsonValue | None = None,
+    historical_reference_present: bool = False,
 ) -> _ReceiptBuild:
     state_before = (
         execution_evidence.initial_state.value
@@ -661,6 +674,7 @@ def _execution_receipt(
         limitations=tuple(receipt_limitations),
         execution_available=execution_available,
         historical_reference_value=historical_reference_value,
+        historical_reference_present=historical_reference_present,
     )
 
 
@@ -717,6 +731,7 @@ def _receipt_from_values(
     limitations: tuple[str, ...] = (),
     execution_available: bool = True,
     historical_reference_value: JsonValue | None = None,
+    historical_reference_present: bool = False,
 ) -> _ReceiptBuild:
     pointers: list[EvidencePointer] = []
     retained_artifacts: dict[str, EvidenceArtifact] = {}
@@ -784,7 +799,7 @@ def _receipt_from_values(
             retain_artifact=True,
         )
     historical_reference_pointer_id = None
-    if historical_reference_value is not None:
+    if historical_reference_present:
         historical_reference_pointer_id = add_pointer(
             kind="response",
             json_pointer="",
@@ -908,7 +923,6 @@ def _receipt_from_values(
                 value=_bounded_capture_json(historical_reference_value),
             )
             if historical_reference_pointer_id is not None
-            and historical_reference_value is not None
             else None
         ),
         response=(

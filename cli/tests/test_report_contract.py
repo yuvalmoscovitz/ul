@@ -207,7 +207,7 @@ def _receipt(
     lifecycle_pointer = _pointer(f"{prefix}.lifecycle", "lifecycle", arm)
     pointers = [input_pointer, response_pointer, action_pointer, lifecycle_pointer]
     historical_reference_pointer = None
-    if arm == "source":
+    if arm == "source" and repetition == 1 and not stateful:
         historical_reference_pointer = _pointer(
             f"{prefix}.historical-reference",
             "response",
