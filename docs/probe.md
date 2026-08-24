@@ -8,7 +8,8 @@ Never point UL at production or at an agent that can cause real-world effects.
 
 ## 1. Provide grounded examples
 
-Create `interactions.jsonl` with one to ten observed interactions:
+Create `interactions.jsonl` with observed interactions. The guided campaign uses the first ten by
+default and accepts an explicit `--limit` up to 100:
 
 ```json
 {"id":"case-1","input":"Return the status for ticket 42.","output":{"status":"open"}}
@@ -228,7 +229,7 @@ projection is incompatible with the saved run configuration.
 When no trusted provider pricing is configured, the confirmation says monetary cost is unknown and
 unbounded. Confirming that receipt accepts this uncertainty; it is not a cost guarantee.
 
-## 4. Run the bounded pilot
+## 4. Run a bounded campaign
 
 Configure the existing UL semantic provider only when you are ready for the displayed budget:
 
@@ -236,12 +237,19 @@ Configure the existing UL semantic provider only when you are ready for the disp
 export OPEN_ROUTER_API_KEY=YOUR_SECRET_FROM_A_SECRET_MANAGER
 export UL_LIVE=true
 
-ul probe interactions.jsonl --target agent:run
+ul probe interactions.jsonl \
+  --target agent:run \
+  --operator input.surface.typing_noise \
+  --limit 10 \
+  --repetitions 1 \
+  --output .ul/runs/probe-evidence.jsonl
 ```
 
-Confirm the paid/network campaign prompt. The pilot runs one original and one accepted probe for
-each of at most ten examples, with one repetition. It writes the normal private UL evidence JSONL
-and prints the normal unified report. A hosted UL account is not required.
+Repeat `--operator` to combine qualified augmentations. Discover available values with
+`ul augmentations list --mode dataset_variation`. Repetitions apply to both the fresh original and
+every accepted variation. UL includes these choices and their request, token, time, and known cost
+bounds in the paid/network confirmation receipt. It writes normal private UL evidence JSONL and
+prints the unified report. A hosted UL account is not required.
 
 For automation, bind both confirmations to the exact digests printed by a prior dry review:
 
@@ -255,8 +263,9 @@ ul probe interactions.jsonl \
 Changing executable/module bytes, target configuration, semantic provider endpoint, data policy,
 or the bounded campaign invalidates the corresponding digest.
 
-After reviewing the pilot, use the copy-ready command printed by UL with `--confirmation-run` to
-repeat every original/probe arm three times under a newly displayed budget and a new evidence path.
+After reviewing a screening run, use the copy-ready command printed by UL. It keeps the selected
+operators and limit, raises repetitions to at least three, displays the new bound, and writes to a
+new evidence path.
 
 Failures always name their stage, stable reason code, safe explanation, one remediation, and whether
 the target is safe to reuse. Terminal failures omit customer exceptions and private target output.

@@ -216,6 +216,37 @@ def test_declining_target_confirmation_imports_nothing_and_calls_nothing(
     assert not (tmp_path / ".ul").exists()
 
 
+def test_invalid_campaign_operator_fails_before_target_load(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (tmp_path / "customer_agent.py").write_text(
+        "from pathlib import Path\n"
+        "Path('module-imported').write_text('yes')\n"
+        "def run(value): return value\n",
+        encoding="utf-8",
+    )
+    dataset = _write_dataset(tmp_path)
+    monkeypatch.chdir(tmp_path)
+
+    result = runner.invoke(
+        app,
+        [
+            "probe",
+            str(dataset),
+            "--target",
+            "customer_agent:run",
+            "--operator",
+            "unknown.operator",
+        ],
+    )
+
+    assert result.exit_code == 2
+    assert "unknown augmentation operator reference" in result.output
+    assert not (tmp_path / "module-imported").exists()
+    assert not (tmp_path / ".ul").exists()
+
+
 def test_callable_smoke_proves_target_call_and_decline_makes_zero_semantic_calls(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -242,7 +273,8 @@ def test_callable_smoke_proves_target_call_and_decline_makes_zero_semantic_calls
     assert "Case: case-1:smoke" in result.output
     assert "Echo grounded example 1." not in result.output
     assert "Evidence level: response only" in result.output
-    assert "Source interactions: 10 (maximum 10)" in result.output
+    assert "Source interactions: 10 (limit 10)" in result.output
+    assert "Operators: input.surface.typing_noise" in result.output
     assert "Original agent invocations: 10" in result.output
     assert "Probe agent invocations: 10" in result.output
     assert "Repetitions: 1" in result.output
@@ -253,8 +285,9 @@ def test_callable_smoke_proves_target_call_and_decline_makes_zero_semantic_calls
     assert len((tmp_path / ".ul" / "review-history.key").read_bytes()) == 32
     assert saved["target_kind"] == "python_callable"
     assert len(saved["target_confirmation_sha256"]) == 64
-    assert saved["limit"] == 10
-    assert saved["repetitions"] == 1
+    assert saved["schema_version"] == 3
+    assert "limit" not in saved
+    assert "repetitions" not in saved
 
 
 def test_direct_authenticated_http_smoke_maps_request_and_response_once(
@@ -828,7 +861,7 @@ def test_campaign_receipt_binds_models_bounds_and_command_wide_smoke_wall(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     _write_callable(tmp_path)
-    records = probe_module._load_pilot_records(_write_dataset(tmp_path))
+    records = probe_module._load_campaign_records(_write_dataset(tmp_path))
     monkeypatch.chdir(tmp_path)
     resolved = probe_module._resolve_target("customer_agent:run", allow_insecure_http=False)
     settings = probe_module.load_dataset_semantic_settings()
@@ -840,15 +873,42 @@ def test_campaign_receipt_binds_models_bounds_and_command_wide_smoke_wall(
         target_calls_per_execution=1,
         settings=settings,
     )
-    original = probe_module._campaign_confirmation(plan, settings, resolved)
+    original = probe_module._campaign_confirmation(plan, settings, resolved, case_limit=10)
     changed = probe_module._campaign_confirmation(
         plan,
         settings.model_copy(update={"model": "different-model", "max_output_tokens": 1234}),
         resolved,
+        case_limit=10,
     )
 
     assert original.semantic_settings_sha256 != changed.semantic_settings_sha256
     assert probe_module._model_sha256(original) != probe_module._model_sha256(changed)
+    different_operator_plan = probe_module.create_dataset_campaign_plan(
+        records=records,
+        selected_operator_ids=probe_module.validate_operator_ids(["input.surface.case_variation"]),
+        repetitions=1,
+        target_calls_per_execution=1,
+        settings=settings,
+    )
+    different_operator_confirmation = probe_module._campaign_confirmation(
+        different_operator_plan,
+        settings,
+        resolved,
+        case_limit=10,
+    )
+    different_limit_confirmation = probe_module._campaign_confirmation(
+        plan,
+        settings,
+        resolved,
+        case_limit=11,
+    )
+    assert original.campaign_plan_sha256 != different_operator_confirmation.campaign_plan_sha256
+    assert probe_module._model_sha256(original) != probe_module._model_sha256(
+        different_operator_confirmation
+    )
+    assert probe_module._model_sha256(original) != probe_module._model_sha256(
+        different_limit_confirmation
+    )
     assert original.maximum_wall_seconds >= resolved.maximum_active_target_seconds
     assert original.monetary_cost_status == "unknown_unbounded"
 
@@ -871,7 +931,9 @@ def test_campaign_receipt_binds_models_bounds_and_command_wide_smoke_wall(
         encoding="utf-8",
     )
     http_target = probe_module._resolve_target(str(http_config), allow_insecure_http=False)
-    http_confirmation = probe_module._campaign_confirmation(plan, settings, http_target)
+    http_confirmation = probe_module._campaign_confirmation(
+        plan, settings, http_target, case_limit=10
+    )
     expected_http_wall = (
         (1 + plan.calls.repetition_executions) * probe_module._TARGET_TIMEOUT_SECONDS
         + plan.calls.total_semantic_model * settings.timeout_seconds
@@ -879,7 +941,7 @@ def test_campaign_receipt_binds_models_bounds_and_command_wide_smoke_wall(
     assert http_confirmation.maximum_wall_seconds == expected_http_wall
 
 
-def test_copy_ready_confirmation_run_reuses_bound_config_and_rebudgets(
+def test_flexible_campaign_controls_reuse_bound_config_and_rebudget(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -895,11 +957,25 @@ def test_copy_ready_confirmation_run_reuses_bound_config_and_rebudgets(
 
     pilot = runner.invoke(app, base_arguments, input="y\nn\n")
     (tmp_path / ".ul" / "review-history.key").unlink()
-    confirmation = runner.invoke(app, [*base_arguments, "--confirmation-run"], input="y\nn\n")
+    confirmation = runner.invoke(
+        app,
+        [
+            *base_arguments,
+            "--operator",
+            "input.surface.rephrase",
+            "--limit",
+            "1",
+            "--repetitions",
+            "3",
+        ],
+        input="y\nn\n",
+    )
 
     assert pilot.exit_code == 0, pilot.output
     assert confirmation.exit_code == 0, confirmation.output
     assert "Using saved project config:" in confirmation.output
+    assert "Operators: input.surface.rephrase" in confirmation.output
+    assert "Source interactions: 1 (limit 1)" in confirmation.output
     assert "Repetitions: 3" in confirmation.output
     assert "Original agent invocations: 3" in confirmation.output
     assert "Probe agent invocations: 3" in confirmation.output
@@ -1284,7 +1360,7 @@ def test_paused_probe_action_blocks_before_repeating_completed_smoke(
         str(output),
     ]
     if checkpoint_tamper == "running":
-        probe_arguments.append("--confirmation-run")
+        probe_arguments.extend(("--repetitions", "3"))
     result = runner.invoke(app, probe_arguments, input="y\ny\n")
 
     assert result.exit_code == 130, result.output
@@ -1462,6 +1538,12 @@ def test_paused_probe_action_resumes_after_terminal_trial_without_replay(
             "agent:run",
             "--output",
             str(output),
+            "--operator",
+            "input.surface.rephrase",
+            "--limit",
+            "1",
+            "--repetitions",
+            "2",
         ],
         input="y\ny\n",
     )
@@ -1499,12 +1581,14 @@ def test_paused_probe_action_resumes_after_terminal_trial_without_replay(
     assert "Reusing durable smoke and evaluator preflight checkpoints" in nested_results[0].output
     assert "UL run report" in nested_results[0].output
     assert "stage=terminal" in nested_results[0].output
+    assert "Operators: input.surface.rephrase" in nested_results[0].output
+    assert "Repetitions: 2" in nested_results[0].output
     assert preflight_calls == 1
     assert len(invocations.read_text().splitlines()) == 3
     evidence_lines = [json.loads(line) for line in output.read_text().splitlines()]
     assert len(evidence_lines) == 2
     assert evidence_lines[0]["record_type"] == "dataset_durable_run"
-    assert evidence_lines[1]["execution_plan"]["repetitions"] == 1
+    assert evidence_lines[1]["execution_plan"]["repetitions"] == 2
     journal_records = [
         json.loads(line)
         for line in output.with_name(f"{output.name}.trials.jsonl").read_text().splitlines()
@@ -1512,7 +1596,7 @@ def test_paused_probe_action_resumes_after_terminal_trial_without_replay(
     completed_units = {
         record["unit"]["arm"] for record in journal_records if record["state"] == "completed"
     }
-    assert completed_units == {"original", "probe"}
+    assert completed_units == {"original"}
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="symlink creation requires privileges")
@@ -1615,6 +1699,7 @@ def test_confirmed_flow_composes_campaign_and_normal_report(
     assert plan.calls.repetitions == 1
     assert called["report"] == (output, {})
     assert "Stronger confirmation:" in result.output
+    assert "--repetitions 3" in result.output
 
 
 @pytest.mark.parametrize(
@@ -1725,6 +1810,12 @@ def test_public_documentation_flow_runs_real_callable_campaign_and_report(
             str(config),
             "--output",
             str(output),
+            "--operator",
+            "input.surface.rephrase",
+            "--limit",
+            "1",
+            "--repetitions",
+            "2",
         ],
         input="y\ny\n",
     )
@@ -1735,6 +1826,12 @@ def test_public_documentation_flow_runs_real_callable_campaign_and_report(
     assert "UL run report" in result.output
     assert "Evidence type: dataset evaluation" in result.output
     assert "Stronger confirmation:" in result.output
+    assert "Operators: input.surface.rephrase" in result.output
+    assert "Source interactions: 1 (limit 1)" in result.output
+    assert "Repetitions: 2" in result.output
+    assert "--repetitions 3" in result.output
+    evidence = json.loads(output.read_text().splitlines()[1])
+    assert evidence["technical_details"]["baseline"]["trial_set"]["requested_repetitions"] == 2
     for stage in (
         "smoke",
         "preflight",
@@ -1761,8 +1858,8 @@ def test_public_documentation_flow_runs_real_callable_campaign_and_report(
     evidence_lines = [json.loads(line) for line in output.read_text().splitlines()]
     assert evidence_lines[0]["record_type"] == "dataset_durable_run"
     evidence = evidence_lines[1]
-    assert evidence["execution_plan"]["repetitions"] == 1
-    assert evidence["execution_plan"]["dataset_planned_target_calls"] == 2
+    assert evidence["execution_plan"]["repetitions"] == 2
+    assert evidence["execution_plan"]["dataset_planned_target_calls"] == 4
     assert evidence["run_context"]["semantic_settings"]["provider"] == "openrouter"
     assert evidence["run_context"]["semantic_settings"]["model"]
     assert evidence["run_context"]["target"]["kind"] == "probe_target"
