@@ -9,8 +9,10 @@ import re
 import stat
 import sys
 import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from types import SimpleNamespace
+from typing import cast
 
 import pytest
 import typer
@@ -252,6 +254,213 @@ def test_callable_smoke_proves_target_call_and_decline_makes_zero_semantic_calls
     assert len(saved["target_confirmation_sha256"]) == 64
     assert saved["limit"] == 10
     assert saved["repetitions"] == 1
+
+
+def test_direct_authenticated_http_smoke_maps_request_and_response_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    received_requests: list[object] = []
+    received_authorization: list[str | None] = []
+
+    class TargetHandler(BaseHTTPRequestHandler):
+        def do_POST(self) -> None:
+            content_length = int(self.headers["Content-Length"])
+            received_requests.append(json.loads(self.rfile.read(content_length)))
+            received_authorization.append(self.headers.get("Authorization"))
+            response = json.dumps({"result": "mapped live response"}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(response)))
+            self.end_headers()
+            self.wfile.write(response)
+
+        def log_message(self, format: str, *args: object) -> None:
+            del format, args
+
+    try:
+        server = ThreadingHTTPServer(("127.0.0.1", 0), TargetHandler)
+    except PermissionError:
+        pytest.skip("the test environment does not allow binding a loopback server")
+    server_thread = threading.Thread(target=server.serve_forever)
+    server_thread.start()
+    secret = "Bearer private-test-secret"
+    try:
+        dataset = _write_dataset(tmp_path)
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv("UL_ENVIRONMENT_AGENT_TOKEN", secret)
+
+        async def unexpected_preflight(*args: object, **kwargs: object) -> None:
+            raise AssertionError("semantic preflight must not run before paid confirmation")
+
+        monkeypatch.setattr(probe_module, "preflight_evaluator", unexpected_preflight)
+        result = runner.invoke(
+            app,
+            [
+                "probe",
+                str(dataset),
+                "--target",
+                f"http://127.0.0.1:{server.server_port}/invoke",
+                "--request-json-template",
+                '{"payload":{"prompt":"{{input}}"}}',
+                "--response-json-pointer",
+                "/result",
+                "--header-from-env",
+                "Authorization=UL_ENVIRONMENT_AGENT_TOKEN",
+                "--allow-insecure-http",
+            ],
+            input="y\nn\n",
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+        server_thread.join()
+
+    assert result.exit_code == 0, result.output
+    assert received_requests == [{"payload": {"prompt": "Echo grounded example 1."}}]
+    assert received_authorization == [secret]
+    assert "Response structure: str;" in result.output
+    assert "Evidence level: response only" in result.output
+    assert "No semantic-model calls were made" in result.output
+    assert secret not in result.output
+    assert secret not in (tmp_path / ".ul" / "probe.json").read_text()
+
+
+def test_direct_http_rejects_echoed_nonstandard_header_before_semantic_evaluation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    received_header: list[str | None] = []
+    secret = "private-workspace-value"
+
+    class TargetHandler(BaseHTTPRequestHandler):
+        def do_POST(self) -> None:
+            received_header.append(self.headers.get("X-Workspace"))
+            content_length = int(self.headers["Content-Length"])
+            self.rfile.read(content_length)
+            response = json.dumps({"response": secret}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(response)))
+            self.end_headers()
+            self.wfile.write(response)
+
+        def log_message(self, format: str, *args: object) -> None:
+            del format, args
+
+    try:
+        server = ThreadingHTTPServer(("127.0.0.1", 0), TargetHandler)
+    except PermissionError:
+        pytest.skip("the test environment does not allow binding a loopback server")
+    server_thread = threading.Thread(target=server.serve_forever)
+    server_thread.start()
+    semantic_calls = 0
+    try:
+        dataset = _write_dataset(tmp_path)
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv("UL_ENVIRONMENT_WORKSPACE", secret)
+
+        async def unexpected_preflight(*args: object, **kwargs: object) -> None:
+            nonlocal semantic_calls
+            semantic_calls += 1
+
+        monkeypatch.setattr(probe_module, "preflight_evaluator", unexpected_preflight)
+        result = runner.invoke(
+            app,
+            [
+                "probe",
+                str(dataset),
+                "--target",
+                f"http://127.0.0.1:{server.server_port}/invoke",
+                "--header-from-env",
+                "X-Workspace=UL_ENVIRONMENT_WORKSPACE",
+                "--allow-insecure-http",
+            ],
+            input="y\n",
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+        server_thread.join()
+
+    assert result.exit_code == 2
+    assert received_header == [secret]
+    assert "Reason: PROBE_SMOKE_INCONCLUSIVE" in result.output
+    assert semantic_calls == 0
+    assert secret not in result.output
+    assert not (tmp_path / ".ul" / "probe.json").exists()
+    assert all(secret.encode() not in path.read_bytes() for path in (tmp_path / ".ul").iterdir())
+
+
+def test_direct_openai_http_preset_builds_existing_response_only_target(tmp_path: Path) -> None:
+    resolved = probe_module._resolve_target(
+        "https://agent.example.test/v1/chat/completions",
+        allow_insecure_http=False,
+        http_preset="openai-chat",
+        agent_model="test-agent-model",
+        header_from_env=[],
+    )
+
+    assert resolved.kind == "http"
+    config = cast(probe_module.JsonHttpTargetConfig, resolved.config)
+    assert config.model_dump(mode="json")["execute"] == {
+        "url": "https://agent.example.test/v1/chat/completions",
+        "request_json_template": {
+            "model": "test-agent-model",
+            "messages": [{"role": "user", "content": "{{input}}"}],
+        },
+        "response_json_pointer": "/choices/0/message/content",
+    }
+    assert resolved.calls_per_execution == 1
+    assert resolved.supports_state_observation is False
+
+
+def test_direct_http_target_rejects_remote_plaintext_even_with_opt_in() -> None:
+    with pytest.raises(probe_module.ProbeFailure, match="exact loopback"):
+        probe_module._resolve_target(
+            "http://agent.example.test/invoke",
+            allow_insecure_http=True,
+        )
+
+
+@pytest.mark.parametrize(
+    "direct_http_arguments",
+    (
+        ("--http-preset", "generic-json"),
+        ("--http-preset", "openai-chat"),
+        ("--request-json-template", '{"input":"{{input}}"}'),
+        ("--response-json-pointer", "/response"),
+        ("--agent-model", "test-model"),
+        ("--header-from-env", "X-Test=UL_ENVIRONMENT_TEST"),
+        ("--allow-insecure-http",),
+    ),
+)
+def test_callable_rejects_every_direct_http_mapping_option(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    direct_http_arguments: tuple[str, ...],
+) -> None:
+    _write_callable(tmp_path)
+    dataset = _write_dataset(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("UL_ENVIRONMENT_TEST", "private-test-value")
+
+    result = runner.invoke(
+        app,
+        [
+            "probe",
+            str(dataset),
+            "--target",
+            "customer_agent:run",
+            *direct_http_arguments,
+        ],
+    )
+
+    assert result.exit_code == 2
+    assert "Reason: PROBE_TARGET_INVALID" in result.output
+    assert "HTTP" in result.output
+    assert not (tmp_path / "target-invocations.jsonl").exists()
+    assert not (tmp_path / ".ul").exists()
 
 
 def test_private_smoke_output_requires_explicit_flag(
@@ -842,6 +1051,158 @@ def test_probe_quarantine_fsyncs_private_state_and_directory(
     assert stat.S_IFDIR in synced_file_types
     safety_state = next((tmp_path / ".ul").glob("probe-quarantine-*.json"))
     assert json.loads(safety_state.read_text())["status"] == "quarantined"
+
+
+@pytest.mark.parametrize(
+    ("mapping_arguments", "expected_request", "response_value"),
+    (
+        (
+            ("--http-preset", "openai-chat", "--agent-model", "test-agent-model"),
+            {
+                "model": "test-agent-model",
+                "messages": [{"role": "user", "content": "Return ticket 42."}],
+            },
+            {"choices": [{"message": {"content": {"action": "lookup", "ticket": 42}}}]},
+        ),
+        (
+            (
+                "--request-json-template",
+                '{"custom":{"prompt":"{{input}}"}}',
+                "--response-json-pointer",
+                "/custom/result",
+            ),
+            {"custom": {"prompt": "Return ticket 42."}},
+            {"custom": {"result": {"action": "lookup", "ticket": 42}}},
+        ),
+    ),
+)
+def test_authenticated_direct_http_pause_resume_preserves_mapping_options(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mapping_arguments: tuple[str, ...],
+    expected_request: dict[str, object],
+    response_value: dict[str, object],
+) -> None:
+    received_requests: list[object] = []
+    received_headers: list[str | None] = []
+
+    class TargetHandler(BaseHTTPRequestHandler):
+        def do_POST(self) -> None:
+            content_length = int(self.headers["Content-Length"])
+            received_requests.append(json.loads(self.rfile.read(content_length)))
+            received_headers.append(self.headers.get("X-Agent-Key"))
+            response = json.dumps(response_value).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(response)))
+            self.end_headers()
+            self.wfile.write(response)
+
+        def log_message(self, format: str, *args: object) -> None:
+            del format, args
+
+    try:
+        server = ThreadingHTTPServer(("127.0.0.1", 0), TargetHandler)
+    except PermissionError:
+        pytest.skip("the test environment does not allow binding a loopback server")
+    server_thread = threading.Thread(target=server.serve_forever)
+    server_thread.start()
+    output = tmp_path / "evidence.jsonl"
+    dataset = tmp_path / "examples.jsonl"
+    dataset.write_text(
+        '{"id":"case-1","input":"Return ticket 42.","output":{"action":"lookup","ticket":42}}\n',
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("UL_ENVIRONMENT_AGENT_KEY", "private-agent-key")
+    monkeypatch.setenv("UL_LIVE", "true")
+    monkeypatch.setenv("OPEN_ROUTER_API_KEY", "test-key")
+    preflight_calls = 0
+
+    async def clean_room_preflight(_settings: object) -> object:
+        nonlocal preflight_calls
+        preflight_calls += 1
+        return _evaluator_preflight()
+
+    async def load_clean_room_preflight(_output: Path, _settings: object) -> tuple[object, Path]:
+        return _evaluator_preflight(), _output.with_name(f"{_output.name}.preflight.json")
+
+    create_runtime = probe_module.create_campaign_progress_runtime
+    runtime_calls = 0
+
+    def create_paused_runtime(**arguments: object) -> object:
+        nonlocal runtime_calls
+        runtime_calls += 1
+        runtime = create_runtime(**arguments)
+        if runtime_calls == 1:
+            runtime.control.request_pause()
+        return runtime
+
+    monkeypatch.setattr(probe_module, "preflight_evaluator", clean_room_preflight)
+    monkeypatch.setattr(probe_module, "load_evaluator_preflight", load_clean_room_preflight)
+    monkeypatch.setattr(probe_module, "create_campaign_progress_runtime", create_paused_runtime)
+    monkeypatch.setattr(
+        campaign_runner_module,
+        "create_semantic_model_deconstructor",
+        lambda _settings: _CleanRoomSemanticModel(),
+    )
+    endpoint = f"http://127.0.0.1:{server.server_port}/invoke"
+    try:
+        result = runner.invoke(
+            app,
+            [
+                "probe",
+                str(dataset),
+                "--target",
+                endpoint,
+                "--output",
+                str(output),
+                *mapping_arguments,
+                "--header-from-env",
+                "X-Agent-Key=UL_ENVIRONMENT_AGENT_KEY",
+                "--allow-insecure-http",
+            ],
+            input="y\ny\n",
+        )
+
+        assert result.exit_code == 130, result.output
+        action_match = re.search(
+            r'next_argv=\["ul","action","([0-9a-f]{64})"\]',
+            result.output,
+        )
+        assert action_match is not None
+        receipt = progress_action_module._read_progress_action(action_match.group(1))
+        for argument in (*mapping_arguments, "X-Agent-Key=UL_ENVIRONMENT_AGENT_KEY"):
+            assert argument in receipt.argv
+
+        nested_results = []
+
+        def invoke_trusted_cli(
+            argv: tuple[str, ...],
+            *,
+            check: bool,
+            cwd: str,
+        ) -> SimpleNamespace:
+            assert check is False
+            assert Path(cwd) == tmp_path
+            nested = runner.invoke(app, list(argv[4:]))
+            nested_results.append(nested)
+            return SimpleNamespace(returncode=nested.exit_code)
+
+        monkeypatch.setattr(progress_action_module.subprocess, "run", invoke_trusted_cli)
+        action_result = runner.invoke(app, ["action", action_match.group(1)])
+    finally:
+        server.shutdown()
+        server.server_close()
+        server_thread.join()
+
+    assert action_result.exit_code == 0, nested_results[0].output
+    assert nested_results[0].exit_code == 0, nested_results[0].output
+    assert "Reusing durable smoke and evaluator preflight checkpoints" in nested_results[0].output
+    assert preflight_calls == 1
+    assert received_requests[:2] == [expected_request, expected_request]
+    assert len(received_requests) == 3
+    assert received_headers == ["private-agent-key"] * 3
 
 
 @pytest.mark.parametrize(

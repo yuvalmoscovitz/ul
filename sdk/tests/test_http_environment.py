@@ -479,7 +479,7 @@ async def test_isolated_response_rejects_partial_or_keyed_authorization_credenti
     assert "private-agent-token" not in evidence.model_dump_json()
 
 
-async def test_isolated_response_allows_reflected_routing_header() -> None:
+async def test_isolated_response_rejects_reflected_nonstandard_header_value() -> None:
     raw_config = _isolated_response_config().model_dump(mode="json")
     raw_config["headers_from_env"] = {"X-Tenant-ID": "UL_ENVIRONMENT_TENANT_ID"}
 
@@ -497,8 +497,9 @@ async def test_isolated_response_allows_reflected_routing_header() -> None:
             )
             evidence = await environment.execute(_case("hello", max_calls=1))
 
-    assert evidence.lifecycle.terminal_status == "succeeded"
-    assert evidence.final_response == "payments-test"
+    assert evidence.lifecycle.failure_code == "response_contains_credential"
+    assert "payments-test" not in evidence.model_dump_json()
+    assert evidence.final_response is None
 
 
 async def test_isolated_response_turning_to_tools_is_a_mapping_failure() -> None:
@@ -1478,6 +1479,12 @@ async def test_requires_confirmation_and_explicit_insecure_transport_opt_in() ->
     with pytest.raises(ValueError, match="insecure transport opt-in"):
         JsonHttpEnvironmentConnection.from_config(
             _config("http://environment.example.test"), test_environment_confirmed=True
+        )
+    with pytest.raises(ValueError, match="exact loopback"):
+        JsonHttpEnvironmentConnection.from_config(
+            _config("http://environment.example.test"),
+            test_environment_confirmed=True,
+            allow_insecure_http=True,
         )
 
 

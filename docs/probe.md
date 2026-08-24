@@ -44,6 +44,24 @@ ul probe interactions.jsonl --target local-target.json
 ul probe interactions.jsonl --target http-target.json
 ```
 
+For a synchronous JSON test endpoint, pass its URL directly. The default sends
+`{"input":"{{input}}"}` and selects `/response` from the returned JSON:
+
+```bash
+export UL_ENVIRONMENT_AGENT_TOKEN='Bearer replace-me'
+
+ul probe interactions.jsonl \
+  --target https://agent.test/invoke \
+  --header-from-env Authorization=UL_ENVIRONMENT_AGENT_TOKEN
+```
+
+Use `--http-preset openai-chat --agent-model TEST_MODEL` for an OpenAI-compatible chat
+completion endpoint. For another JSON shape, use `--request-json-template` and
+`--response-json-pointer`. Header options contain only dedicated `UL_ENVIRONMENT_*` variable
+names; their secret values are never placed in target configuration, evidence, diagnostics, or
+confirmation text. Direct HTTP targets must be isolated per request and safe for test traffic.
+Plain HTTP is restricted to an exact loopback URL and also requires `--allow-insecure-http`.
+
 UL binds the resolved executable, the direct Python module and UL worker, allowlisted environment
 value digests, and command arguments that resolve to files. Repeat `--target-artifact PATH` for
 every transitive Python helper, command script, bundle, or other executable dependency that is not
