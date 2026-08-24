@@ -1479,6 +1479,12 @@ async def test_requires_confirmation_and_explicit_insecure_transport_opt_in() ->
         JsonHttpEnvironmentConnection.from_config(
             _config("http://environment.example.test"), test_environment_confirmed=True
         )
+    with pytest.raises(ValueError, match="exact loopback"):
+        JsonHttpEnvironmentConnection.from_config(
+            _config("http://environment.example.test"),
+            test_environment_confirmed=True,
+            allow_insecure_http=True,
+        )
 
 
 async def test_public_validation_resolves_headers(monkeypatch: pytest.MonkeyPatch) -> None:

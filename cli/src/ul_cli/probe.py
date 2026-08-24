@@ -58,6 +58,7 @@ from ul.outcome_projection import OutcomeProjection, OutcomeProjectionError
 from ul.probe_execution import OutcomeProjectionExecutionError
 from ul_core.models import ConversationRole, ConversationTurn
 
+from ul_cli.dataset.environment.initialize import create_isolated_response_target_config
 from ul_cli.dataset.evaluation.command import preflight_evaluator
 from ul_cli.dataset.evaluation.operators import dataset_operator_identity, validate_operator_ids
 from ul_cli.dataset.evaluation.records import (
@@ -837,7 +838,7 @@ def probe(
     target: Annotated[
         str,
         typer.Option(
-            help=("Python module:callable, or a local/HTTP target configuration JSON file.")
+            help=("HTTP(S) URL, Python module:callable, or local/HTTP target configuration JSON.")
         ),
     ],
     output: Annotated[
@@ -847,6 +848,29 @@ def probe(
     target_artifact: Annotated[
         list[Path] | None,
         typer.Option(help="Additional command worker artifact to hash and bind; repeat as needed."),
+    ] = None,
+    http_preset: Annotated[
+        Literal["generic-json", "openai-chat"],
+        typer.Option(help="Request/response shape used when --target is an HTTP URL."),
+    ] = "generic-json",
+    request_json_template: Annotated[
+        str | None,
+        typer.Option(help="JSON containing one {{input}} value; overrides the direct HTTP preset."),
+    ] = None,
+    response_json_pointer: Annotated[
+        str | None,
+        typer.Option(help="RFC 6901 pointer to the direct HTTP response value."),
+    ] = None,
+    agent_model: Annotated[
+        str | None,
+        typer.Option(help="Model sent by the direct HTTP openai-chat preset."),
+    ] = None,
+    header_from_env: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--header-from-env",
+            help="HTTP_HEADER=UL_ENVIRONMENT_VARIABLE; repeat for credentials or routing.",
+        ),
     ] = None,
     confirm_target: Annotated[
         str | None,
@@ -922,6 +946,11 @@ def probe(
             target,
             allow_insecure_http=allow_insecure_http,
             explicit_artifacts=tuple(target_artifact or ()),
+            http_preset=http_preset,
+            request_json_template=request_json_template,
+            response_json_pointer=response_json_pointer,
+            agent_model=agent_model,
+            header_from_env=header_from_env,
         )
         existing_config = _check_probe_config_binding(data, resolved_target)
         try:
@@ -1187,6 +1216,11 @@ def probe(
                 output,
                 allow_insecure_http=allow_insecure_http,
                 target_artifacts=tuple(target_artifact or ()),
+                http_preset=http_preset,
+                request_json_template=request_json_template,
+                response_json_pointer=response_json_pointer,
+                agent_model=agent_model,
+                header_from_env=tuple(header_from_env or ()),
             )
             console.print("")
             report_evidence(output)
@@ -1248,17 +1282,45 @@ def _resolve_target(
     *,
     allow_insecure_http: bool,
     explicit_artifacts: tuple[Path, ...] = (),
+    http_preset: Literal["generic-json", "openai-chat"] = "generic-json",
+    request_json_template: str | None = None,
+    response_json_pointer: str | None = None,
+    agent_model: str | None = None,
+    header_from_env: list[str] | None = None,
 ) -> _ResolvedTarget:
     try:
+        if target.casefold().startswith(("https://", "http://")):
+            if explicit_artifacts:
+                raise ValueError("--target-artifact applies only to local targets")
+            http_config = create_isolated_response_target_config(
+                target,
+                isolated_preset=http_preset,
+                environment_id="probe-http-" + hashlib.sha256(target.encode()).hexdigest()[:16],
+                request_json_template=request_json_template,
+                response_json_pointer=response_json_pointer,
+                agent_model=agent_model,
+                header_from_env=header_from_env,
+            )
+            return _http_target(target, http_config, allow_insecure_http=allow_insecure_http)
         target_path = Path(target)
         if target_path.is_file():
+            if (
+                http_preset != "generic-json"
+                or request_json_template is not None
+                or response_json_pointer is not None
+                or agent_model is not None
+                or header_from_env
+            ):
+                raise ValueError("direct HTTP mapping options require an HTTP URL target")
             return _resolve_configured_target(
                 target_path,
                 allow_insecure_http=allow_insecure_http,
                 explicit_artifacts=explicit_artifacts,
             )
         if ":" not in target:
-            raise ValueError("target must be module:callable or a target configuration JSON file")
+            raise ValueError(
+                "target must be an HTTP(S) URL, module:callable, or target configuration JSON file"
+            )
         config = PythonCallableTargetConfig(
             target_id="probe-" + hashlib.sha256(target.encode()).hexdigest()[:16],
             working_directory=Path.cwd().resolve(),
@@ -1272,8 +1334,8 @@ def _resolve_target(
             "target load",
             "PROBE_TARGET_INVALID",
             str(error),
-            "Use an importable module:callable or validate the target config with its "
-            "advanced check.",
+            "Use an HTTP(S) URL, importable module:callable, or validate the target config with "
+            "its advanced check.",
             target_safe_to_reuse=True,
         ) from None
 
@@ -1293,33 +1355,47 @@ def _resolve_configured_target(
             test_environment_confirmed=True,
             allow_insecure_http=allow_insecure_http,
         )
-        digest = json_http_environment_config_sha256(http_config)
-        confirmation = _TargetConfirmation(kind="http", reference=str(path), config_sha256=digest)
-        return _ResolvedTarget(
-            reference=str(path),
-            kind="http",
-            config=http_config,
-            config_sha256=digest,
-            calls_per_execution=json_http_environment_calls_per_execution(http_config),
-            maximum_executions=1_000,
-            maximum_active_target_seconds=None,
-            supports_state_observation=json_http_environment_capabilities(
-                http_config
-            ).supports_state_observation,
-            confirmation=confirmation,
-            confirmation_sha256=_model_sha256(confirmation),
-            create_connection=lambda maximum_calls, maximum_seconds: (
-                JsonHttpEnvironmentConnection.from_config(
-                    http_config,
-                    test_environment_confirmed=True,
-                    allow_insecure_http=allow_insecure_http,
-                    max_environment_api_calls=maximum_calls,
-                )
-            ),
-            revalidate_identity=lambda: None,
-        )
+        return _http_target(str(path), http_config, allow_insecure_http=allow_insecure_http)
     plan = create_local_target_dry_run_plan(local_config)
     return _local_target(str(path), local_config, plan.config_sha256, explicit_artifacts)
+
+
+def _http_target(
+    reference: str,
+    config: JsonHttpTargetConfig,
+    *,
+    allow_insecure_http: bool,
+) -> _ResolvedTarget:
+    validate_json_http_environment_configuration(
+        config,
+        test_environment_confirmed=True,
+        allow_insecure_http=allow_insecure_http,
+    )
+    digest = json_http_environment_config_sha256(config)
+    confirmation = _TargetConfirmation(kind="http", reference=reference, config_sha256=digest)
+    return _ResolvedTarget(
+        reference=reference,
+        kind="http",
+        config=config,
+        config_sha256=digest,
+        calls_per_execution=json_http_environment_calls_per_execution(config),
+        maximum_executions=1_000,
+        maximum_active_target_seconds=None,
+        supports_state_observation=json_http_environment_capabilities(
+            config
+        ).supports_state_observation,
+        confirmation=confirmation,
+        confirmation_sha256=_model_sha256(confirmation),
+        create_connection=lambda maximum_calls, maximum_seconds: (
+            JsonHttpEnvironmentConnection.from_config(
+                config,
+                test_environment_confirmed=True,
+                allow_insecure_http=allow_insecure_http,
+                max_environment_api_calls=maximum_calls,
+            )
+        ),
+        revalidate_identity=lambda: None,
+    )
 
 
 def _local_target(
@@ -1378,6 +1454,8 @@ def _confirm_target(resolved_target: _ResolvedTarget, *, confirmed_digest: str |
     if resolved_target.kind == "http":
         http_config = cast(JsonHttpTargetConfig, resolved_target.config)
         console.print(f"  Endpoint: {json_http_environment_config_urls(http_config)[0]}")
+        if not resolved_target.supports_state_observation:
+            console.print("Every request must start from isolated test state.")
     console.print("Use only a dedicated test target that cannot cause real-world effects.")
     if confirmed_digest is not None:
         if confirmed_digest != resolved_target.confirmation_sha256:
@@ -1389,7 +1467,10 @@ def _confirm_target(resolved_target: _ResolvedTarget, *, confirmed_digest: str |
                 target_safe_to_reuse=True,
             )
         return
-    if not typer.confirm("Trust this exact target digest and continue with one smoke call?"):
+    if not typer.confirm(
+        "Trust this exact target digest, attest the conditions above, and continue with one "
+        "smoke call?"
+    ):
         raise ProbeFailure(
             "target load",
             "PROBE_TARGET_NOT_CONFIRMED",
@@ -2195,6 +2276,11 @@ def _print_stronger_run(
     *,
     allow_insecure_http: bool,
     target_artifacts: tuple[Path, ...],
+    http_preset: Literal["generic-json", "openai-chat"],
+    request_json_template: str | None,
+    response_json_pointer: str | None,
+    agent_model: str | None,
+    header_from_env: tuple[str, ...],
 ) -> None:
     arguments = [
         "ul",
@@ -2208,6 +2294,16 @@ def _print_stronger_run(
     ]
     if allow_insecure_http:
         arguments.append("--allow-insecure-http")
+    if http_preset != "generic-json":
+        arguments.extend(("--http-preset", http_preset))
+    if request_json_template is not None:
+        arguments.extend(("--request-json-template", request_json_template))
+    if response_json_pointer is not None:
+        arguments.extend(("--response-json-pointer", response_json_pointer))
+    if agent_model is not None:
+        arguments.extend(("--agent-model", agent_model))
+    for mapping in header_from_env:
+        arguments.extend(("--header-from-env", mapping))
     for artifact in target_artifacts:
         arguments.extend(("--target-artifact", str(artifact)))
     command = subprocess.list2cmdline(arguments) if os.name == "nt" else shlex.join(arguments)

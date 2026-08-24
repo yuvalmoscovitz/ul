@@ -9,8 +9,10 @@ import re
 import stat
 import sys
 import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from types import SimpleNamespace
+from typing import cast
 
 import pytest
 import typer
@@ -252,6 +254,107 @@ def test_callable_smoke_proves_target_call_and_decline_makes_zero_semantic_calls
     assert len(saved["target_confirmation_sha256"]) == 64
     assert saved["limit"] == 10
     assert saved["repetitions"] == 1
+
+
+def test_direct_authenticated_http_smoke_maps_request_and_response_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    received_requests: list[object] = []
+    received_authorization: list[str | None] = []
+
+    class TargetHandler(BaseHTTPRequestHandler):
+        def do_POST(self) -> None:
+            content_length = int(self.headers["Content-Length"])
+            received_requests.append(json.loads(self.rfile.read(content_length)))
+            received_authorization.append(self.headers.get("Authorization"))
+            response = json.dumps({"result": "mapped live response"}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(response)))
+            self.end_headers()
+            self.wfile.write(response)
+
+        def log_message(self, format: str, *args: object) -> None:
+            del format, args
+
+    try:
+        server = ThreadingHTTPServer(("127.0.0.1", 0), TargetHandler)
+    except PermissionError:
+        pytest.skip("the test environment does not allow binding a loopback server")
+    server_thread = threading.Thread(target=server.serve_forever)
+    server_thread.start()
+    secret = "Bearer private-test-secret"
+    try:
+        dataset = _write_dataset(tmp_path)
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv("UL_ENVIRONMENT_AGENT_TOKEN", secret)
+
+        async def unexpected_preflight(*args: object, **kwargs: object) -> None:
+            raise AssertionError("semantic preflight must not run before paid confirmation")
+
+        monkeypatch.setattr(probe_module, "preflight_evaluator", unexpected_preflight)
+        result = runner.invoke(
+            app,
+            [
+                "probe",
+                str(dataset),
+                "--target",
+                f"http://127.0.0.1:{server.server_port}/invoke",
+                "--request-json-template",
+                '{"payload":{"prompt":"{{input}}"}}',
+                "--response-json-pointer",
+                "/result",
+                "--header-from-env",
+                "Authorization=UL_ENVIRONMENT_AGENT_TOKEN",
+                "--allow-insecure-http",
+            ],
+            input="y\nn\n",
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+        server_thread.join()
+
+    assert result.exit_code == 0, result.output
+    assert received_requests == [{"payload": {"prompt": "Echo grounded example 1."}}]
+    assert received_authorization == [secret]
+    assert "Response structure: str;" in result.output
+    assert "Evidence level: response only" in result.output
+    assert "No semantic-model calls were made" in result.output
+    assert secret not in result.output
+    assert secret not in (tmp_path / ".ul" / "probe.json").read_text()
+
+
+def test_direct_openai_http_preset_builds_existing_response_only_target(tmp_path: Path) -> None:
+    resolved = probe_module._resolve_target(
+        "https://agent.example.test/v1/chat/completions",
+        allow_insecure_http=False,
+        http_preset="openai-chat",
+        agent_model="test-agent-model",
+        header_from_env=[],
+    )
+
+    assert resolved.kind == "http"
+    config = cast(probe_module.JsonHttpTargetConfig, resolved.config)
+    assert config.model_dump(mode="json")["execute"] == {
+        "url": "https://agent.example.test/v1/chat/completions",
+        "request_json_template": {
+            "model": "test-agent-model",
+            "messages": [{"role": "user", "content": "{{input}}"}],
+        },
+        "response_json_pointer": "/choices/0/message/content",
+    }
+    assert resolved.calls_per_execution == 1
+    assert resolved.supports_state_observation is False
+
+
+def test_direct_http_target_rejects_remote_plaintext_even_with_opt_in() -> None:
+    with pytest.raises(probe_module.ProbeFailure, match="exact loopback"):
+        probe_module._resolve_target(
+            "http://agent.example.test/invoke",
+            allow_insecure_http=True,
+        )
 
 
 def test_private_smoke_output_requires_explicit_flag(

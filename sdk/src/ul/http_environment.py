@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import ipaddress
 import json
 import math
 import os
@@ -146,7 +147,7 @@ class JsonHttpLifecycleCallConfig(BaseModel):
     @field_validator("url")
     @classmethod
     def validate_url(cls, url: str) -> str:
-        _validate_endpoint(url, allow_insecure_http=True)
+        _validate_endpoint(url, allow_insecure_http=True, allow_remote_insecure_http=True)
         return url
 
     @field_validator("request_json_template", mode="before")
@@ -256,7 +257,7 @@ class JsonHttpLifecycleExecuteTurnConfig(BaseModel):
     @field_validator("url")
     @classmethod
     def validate_url(cls, url: str) -> str:
-        _validate_endpoint(url, allow_insecure_http=True)
+        _validate_endpoint(url, allow_insecure_http=True, allow_remote_insecure_http=True)
         return url
 
     @field_validator("request_json_template", mode="before")
@@ -286,7 +287,7 @@ class JsonHttpIsolatedExecuteConfig(BaseModel):
     @field_validator("url")
     @classmethod
     def validate_url(cls, url: str) -> str:
-        _validate_endpoint(url, allow_insecure_http=True)
+        _validate_endpoint(url, allow_insecure_http=True, allow_remote_insecure_http=True)
         return url
 
     @field_validator("request_json_template", mode="before")
@@ -313,7 +314,7 @@ class JsonHttpTimeoutAfterCommitConfig(BaseModel):
     @field_validator("url")
     @classmethod
     def validate_url(cls, url: str) -> str:
-        _validate_endpoint(url, allow_insecure_http=True)
+        _validate_endpoint(url, allow_insecure_http=True, allow_remote_insecure_http=True)
         return url
 
 
@@ -1828,7 +1829,12 @@ def _endpoint_origin(endpoint: str) -> tuple[str, str, int]:
     return parsed.scheme, hostname.casefold(), parsed.port or default_port
 
 
-def _validate_endpoint(endpoint: str, allow_insecure_http: bool) -> str:
+def _validate_endpoint(
+    endpoint: str,
+    allow_insecure_http: bool,
+    *,
+    allow_remote_insecure_http: bool = False,
+) -> str:
     if (
         not endpoint
         or endpoint != endpoint.strip()
@@ -1850,8 +1856,16 @@ def _validate_endpoint(endpoint: str, allow_insecure_http: bool) -> str:
         raise ValueError("endpoint must be a valid HTTP(S) URL") from None
     if "?" in endpoint or "#" in endpoint:
         raise ValueError("endpoint must not contain a query or fragment")
-    if parsed_endpoint.scheme == "http" and not allow_insecure_http:
-        raise ValueError("HTTP endpoints require explicit insecure transport opt-in")
+    if parsed_endpoint.scheme == "http":
+        if not allow_insecure_http:
+            raise ValueError("HTTP endpoints require explicit insecure transport opt-in")
+        hostname = parsed_endpoint.hostname.casefold()
+        try:
+            loopback = ipaddress.ip_address(hostname).is_loopback
+        except ValueError:
+            loopback = hostname == "localhost"
+        if not loopback and not allow_remote_insecure_http:
+            raise ValueError("plain HTTP is allowed only for an exact loopback target")
     return endpoint
 
 
