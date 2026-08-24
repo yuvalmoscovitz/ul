@@ -25,6 +25,7 @@ from ul import (
 from ul_cli import probe as probe_module
 from ul_cli import progress_action as progress_action_module
 from ul_cli.dataset.evaluation import runner as campaign_runner_module
+from ul_cli.local_target_resolution import resolve_local_target
 from ul_cli.main import app
 from ul_core.dataset import (
     EvidenceReference,
@@ -650,16 +651,23 @@ def test_python_declared_helpers_and_allowlisted_environment_are_bound(
     helper.write_text("VALUE = 1\n", encoding="utf-8")
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("CUSTOMER_MODE", "test-a")
-    config = probe_module.PythonCallableTargetConfig(
-        target_id="bound-agent",
-        working_directory=tmp_path,
-        interpreter=Path(sys.executable).resolve(),
-        target="customer_agent:run",
-        environment_allowlist=("CUSTOMER_MODE",),
+    config = tmp_path / "target.json"
+    config.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "kind": "python_callable",
+                "target_id": "bound-agent",
+                "working_directory": str(tmp_path),
+                "interpreter": str(Path(sys.executable).resolve()),
+                "target": "customer_agent:run",
+                "environment_allowlist": ["CUSTOMER_MODE"],
+            }
+        ),
+        encoding="utf-8",
     )
-    plan = probe_module.create_local_target_dry_run_plan(config)
-    resolved = probe_module._local_target(
-        "customer_agent:run", config, plan.config_sha256, (helper,)
+    resolved = probe_module._local_target(  # pyright: ignore[reportPrivateUsage]
+        resolve_local_target(str(config), explicit_artifacts=(helper,))
     )
 
     assert str(helper.resolve()) in {item.path for item in resolved.confirmation.artifacts}

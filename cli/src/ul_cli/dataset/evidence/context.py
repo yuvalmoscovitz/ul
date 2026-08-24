@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import Literal
 
+from pydantic import JsonValue
 from ul import DatasetSemanticSettings, InteractionRecord
 from ul.dataset_invariants import DatasetInvariantSuite
 from ul.http_environment import JsonHttpTargetConfig
@@ -24,6 +25,7 @@ def build_dataset_evidence_run_context(
     repetitions: int,
     invariant_suite: DatasetInvariantSuite | None,
     target_config: JsonHttpTargetConfig | None,
+    target_receipt: dict[str, JsonValue] | None = None,
     settings: DatasetSemanticSettings,
     redaction_policy_sha256: str | None = None,
     redaction_coverage: tuple[DatasetEvidenceRedactionCoverage, ...] = (),
@@ -37,6 +39,7 @@ def build_dataset_evidence_run_context(
         repetitions=repetitions,
         invariant_suite_sha256=(invariant_suite.sha256 if invariant_suite is not None else None),
         target_config=target_config,
+        target_receipt=target_receipt,
         semantic_settings=DatasetEvidenceSemanticSettings(
             provider=settings.semantic_provider_id,
             endpoint_sha256=settings.semantic_endpoint_sha256,

@@ -6,7 +6,6 @@ import json
 import os
 import re
 import shlex
-import shutil
 import stat
 import subprocess
 import sys
@@ -24,7 +23,6 @@ else:
 
 import httpx
 import typer
-import ul.local_target as local_target_module
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, ValidationError
 from ul import (
     DatasetEvaluationResult,
@@ -47,12 +45,8 @@ from ul.http_environment import (
     validate_json_http_environment_configuration,
 )
 from ul.local_target import (
-    CommandTargetConfig,
     LocalTargetConfig,
     LocalTargetConnection,
-    PythonCallableTargetConfig,
-    create_local_target_dry_run_plan,
-    load_local_target_config,
 )
 from ul.outcome_projection import OutcomeProjection, OutcomeProjectionError
 from ul.probe_execution import OutcomeProjectionExecutionError
@@ -108,6 +102,7 @@ from ul_cli.dataset_trial_journal import (
     persist_dataset_run_manifest,
     read_dataset_run_manifest,
 )
+from ul_cli.local_target_resolution import ResolvedLocalTarget, resolve_local_target
 from ul_cli.pattern_identity import (
     ensure_project_pattern_identity_key,
     ensure_project_review_history_key,
@@ -687,149 +682,6 @@ def _outcome_projection(resolved_target: _ResolvedTarget) -> OutcomeProjection |
     return resolved_target.config.outcome
 
 
-def _artifact_identity(path: Path) -> _ArtifactIdentity:
-    resolved = path.resolve(strict=True)
-    path_status = os.lstat(resolved)
-    descriptor = os.open(resolved, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
-    try:
-        descriptor_status = os.fstat(descriptor)
-        if (
-            not stat.S_ISREG(descriptor_status.st_mode)
-            or descriptor_status.st_size > 256 * 1024 * 1024
-            or not os.path.samestat(path_status, descriptor_status)
-        ):
-            raise ValueError("target artifact must be a stable bounded regular file")
-        digest = hashlib.sha256()
-        while chunk := os.read(descriptor, 1024 * 1024):
-            digest.update(chunk)
-    finally:
-        os.close(descriptor)
-    return _ArtifactIdentity(path=str(resolved), sha256=digest.hexdigest())
-
-
-def _resolve_executable(value: Path | str, working_directory: Path) -> Path:
-    candidate = Path(value)
-    if not candidate.is_absolute() and candidate.parent != Path("."):
-        candidate = working_directory / candidate
-    if candidate.parent == Path("."):
-        found = shutil.which(str(candidate))
-        if found is None:
-            raise ValueError("target executable was not found")
-        candidate = Path(found)
-    return candidate.resolve(strict=True)
-
-
-def _python_module_artifacts(
-    config: PythonCallableTargetConfig, explicit_artifacts: tuple[Path, ...]
-) -> tuple[_ArtifactIdentity, ...]:
-    module_name = config.target.partition(":")[0]
-    current = config.working_directory.resolve(strict=True)
-    paths: list[Path] = []
-    parts = module_name.split(".")
-    for index, part in enumerate(parts):
-        module_file = current / f"{part}.py"
-        package = current / part
-        final = index == len(parts) - 1
-        if final and module_file.is_file():
-            paths.append(module_file)
-            break
-        init_file = package / "__init__.py"
-        if not init_file.is_file():
-            raise ValueError("Python target module must resolve to source inside working_directory")
-        paths.append(init_file)
-        current = package
-    worker = Path(local_target_module.__file__).with_name("_local_worker.py")
-    paths.append(worker)
-    for path in explicit_artifacts:
-        candidate = path if path.is_absolute() else config.working_directory / path
-        paths.append(candidate)
-    identities: dict[str, _ArtifactIdentity] = {}
-    for path in paths:
-        identity = _artifact_identity(path)
-        identities[identity.path] = identity
-    return tuple(identities.values())
-
-
-def _command_artifacts(
-    config: CommandTargetConfig, explicit_artifacts: tuple[Path, ...]
-) -> tuple[_ArtifactIdentity, ...]:
-    executable = _resolve_executable(config.argv[0], config.working_directory)
-    artifacts = [_artifact_identity(executable)]
-    for argument in config.argv[1:]:
-        candidate = Path(argument)
-        if not candidate.is_absolute():
-            candidate = config.working_directory / candidate
-        if candidate.is_file():
-            identity = _artifact_identity(candidate)
-            if identity not in artifacts:
-                artifacts.append(identity)
-    for path in explicit_artifacts:
-        candidate = path if path.is_absolute() else config.working_directory / path
-        identity = _artifact_identity(candidate)
-        if identity not in artifacts:
-            artifacts.append(identity)
-    generic_prefixes = ("bash", "node", "python", "ruby", "sh")
-    if executable.name.startswith(generic_prefixes) and len(artifacts) == 1:
-        raise ValueError(
-            "generic command workers require --target-artifact for their script or artifact"
-        )
-    return tuple(artifacts)
-
-
-def _local_target_confirmation(
-    reference: str,
-    config: LocalTargetConfig,
-    digest: str,
-    explicit_artifacts: tuple[Path, ...] = (),
-) -> _TargetConfirmation:
-    if isinstance(config, PythonCallableTargetConfig):
-        executable = _artifact_identity(
-            _resolve_executable(config.interpreter, config.working_directory)
-        )
-        artifacts = _python_module_artifacts(config, explicit_artifacts)
-        callable_name = config.target
-    else:
-        artifacts = _command_artifacts(config, explicit_artifacts)
-        executable = artifacts[0]
-        callable_name = None
-    return _TargetConfirmation(
-        kind=config.kind,
-        reference=reference,
-        config_sha256=digest,
-        executable=executable,
-        artifacts=artifacts,
-        environment=tuple(
-            _EnvironmentIdentity(
-                name=name,
-                value_sha256=hashlib.sha256(os.environ[name].encode()).hexdigest(),
-            )
-            for name in sorted(config.environment_allowlist)
-        ),
-        callable=callable_name,
-    )
-
-
-def _require_same_confirmation(
-    expected: _TargetConfirmation,
-    reference: str,
-    config: LocalTargetConfig,
-    digest: str,
-    explicit_artifacts: tuple[Path, ...],
-) -> None:
-    try:
-        current = _local_target_confirmation(reference, config, digest, explicit_artifacts)
-    except (OSError, ValueError):
-        current = None
-    if current != expected:
-        raise ProbeFailure(
-            "target load",
-            "PROBE_TARGET_IDENTITY_CHANGED",
-            "A confirmed executable or target artifact changed before launch.",
-            "Review the new target identity and rerun the command.",
-            target_safe_to_reuse=True,
-        )
-
-
 def probe(
     data: Annotated[
         Path,
@@ -1330,18 +1182,7 @@ def _resolve_target(
             )
         if allow_insecure_http:
             raise ValueError("--allow-insecure-http requires an HTTP URL or config target")
-        if ":" not in target:
-            raise ValueError(
-                "target must be an HTTP(S) URL, module:callable, or target configuration JSON file"
-            )
-        config = PythonCallableTargetConfig(
-            target_id="probe-" + hashlib.sha256(target.encode()).hexdigest()[:16],
-            working_directory=Path.cwd().resolve(),
-            interpreter=Path(sys.executable).resolve(),
-            target=target,
-        )
-        plan = create_local_target_dry_run_plan(config)
-        return _local_target(target, config, plan.config_sha256, explicit_artifacts)
+        return _local_target(resolve_local_target(target, explicit_artifacts=explicit_artifacts))
     except (OSError, RuntimeError, ValidationError, ValueError) as error:
         raise ProbeFailure(
             "target load",
@@ -1360,7 +1201,7 @@ def _resolve_configured_target(
     explicit_artifacts: tuple[Path, ...],
 ) -> _ResolvedTarget:
     try:
-        local_config = load_local_target_config(path)
+        local_target = resolve_local_target(str(path), explicit_artifacts=explicit_artifacts)
     except ValueError:
         http_config = load_json_http_environment_config(path)
         validate_json_http_environment_configuration(
@@ -1371,8 +1212,7 @@ def _resolve_configured_target(
         return _http_target(str(path), http_config, allow_insecure_http=allow_insecure_http)
     if allow_insecure_http:
         raise ValueError("--allow-insecure-http requires an HTTP URL or config target")
-    plan = create_local_target_dry_run_plan(local_config)
-    return _local_target(str(path), local_config, plan.config_sha256, explicit_artifacts)
+    return _local_target(local_target)
 
 
 def _http_target(
@@ -1414,43 +1254,56 @@ def _http_target(
 
 
 def _local_target(
-    reference: str,
-    config: LocalTargetConfig,
-    digest: str,
-    explicit_artifacts: tuple[Path, ...] = (),
+    local_target: ResolvedLocalTarget,
 ) -> _ResolvedTarget:
-    confirmation = _local_target_confirmation(reference, config, digest, explicit_artifacts)
+    local_confirmation = local_target.confirmation
+    confirmation = _TargetConfirmation(
+        kind=local_confirmation.kind,
+        reference=local_confirmation.reference,
+        config_sha256=local_confirmation.config_sha256,
+        executable=_ArtifactIdentity(
+            path=local_confirmation.executable.path,
+            sha256=local_confirmation.executable.sha256,
+        ),
+        artifacts=tuple(
+            _ArtifactIdentity(path=artifact.path, sha256=artifact.sha256)
+            for artifact in local_confirmation.artifacts
+        ),
+        environment=tuple(
+            _EnvironmentIdentity(
+                name=environment.name,
+                value_sha256=environment.value_sha256,
+            )
+            for environment in local_confirmation.environment
+        ),
+        callable=local_confirmation.callable,
+    )
+
+    def revalidate_identity() -> None:
+        try:
+            local_target.revalidate_identity()
+        except ValueError:
+            raise ProbeFailure(
+                "target load",
+                "PROBE_TARGET_IDENTITY_CHANGED",
+                "A confirmed executable or target artifact changed before launch.",
+                "Review the new target identity and rerun the command.",
+                target_safe_to_reuse=True,
+            ) from None
+
     return _ResolvedTarget(
-        reference=reference,
-        kind=config.kind,
-        config=config,
-        config_sha256=digest,
+        reference=local_target.reference,
+        kind=local_target.kind,
+        config=local_target.config,
+        config_sha256=local_target.config_sha256,
         calls_per_execution=1,
-        maximum_executions=config.limits.max_executions,
-        maximum_active_target_seconds=config.limits.total_execution_timeout_seconds,
+        maximum_executions=local_target.maximum_executions,
+        maximum_active_target_seconds=local_target.maximum_active_target_seconds,
         supports_state_observation=False,
         confirmation=confirmation,
         confirmation_sha256=_model_sha256(confirmation),
-        create_connection=lambda maximum_calls, maximum_seconds: LocalTargetConnection.from_config(
-            config.model_copy(
-                update={
-                    "limits": config.limits.model_copy(
-                        update={
-                            "max_executions": maximum_calls,
-                            "total_execution_timeout_seconds": (
-                                maximum_seconds
-                                if maximum_seconds is not None
-                                else config.limits.total_execution_timeout_seconds
-                            ),
-                        }
-                    )
-                }
-            ),
-            customer_code_execution_confirmed=True,
-        ),
-        revalidate_identity=lambda: _require_same_confirmation(
-            confirmation, reference, config, digest, explicit_artifacts
-        ),
+        create_connection=local_target.create_connection,
+        revalidate_identity=revalidate_identity,
     )
 
 

@@ -547,8 +547,19 @@ class CampaignProgressTracker:
         return False
 
 
-def create_campaign_next_commands(evidence_path: Path) -> CampaignNextCommands:
+def create_campaign_next_commands(
+    evidence_path: Path,
+    *,
+    resume_argv: tuple[str, ...] | None = None,
+) -> CampaignNextCommands:
     resolved_evidence_path = evidence_path.resolve()
+    effective_resume_argv = resume_argv or (
+        "ul",
+        "dataset",
+        "evaluate",
+        "--resume",
+        str(resolved_evidence_path),
+    )
     return CampaignNextCommands(
         inspect_findings=CampaignNextCommand(
             action="inspect_findings",
@@ -561,7 +572,7 @@ def create_campaign_next_commands(evidence_path: Path) -> CampaignNextCommands:
             action="resume",
             argv=create_progress_action(
                 "dataset_resume",
-                ("ul", "dataset", "evaluate", "--resume", str(resolved_evidence_path)),
+                effective_resume_argv,
             ),
         ),
         diagnose=CampaignNextCommand(
