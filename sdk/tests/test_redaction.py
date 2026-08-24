@@ -172,6 +172,37 @@ def test_policy_rejects_unsupported_or_irreversible_input_selectors() -> None:
     assert literal_rule.literal == "(a+)+$"
 
 
+def test_policy_rejects_protected_literals_and_placeholders_in_pointer_tokens() -> None:
+    with pytest.raises(ValidationError, match="pointer tokens"):
+        RedactionPolicy(
+            rules=(
+                RedactionRule(name="email", literal=_SECRET),
+                RedactionRule(name="token", selector=f"/{_SECRET}/token"),
+            )
+        )
+
+    with pytest.raises(ValidationError, match="pointer tokens"):
+        RedactionPolicy(
+            rules=(
+                RedactionRule(
+                    name="token",
+                    selector="/__UL_SECRET_email_00000000000000000000000000000000__/token",
+                ),
+            )
+        )
+
+
+def test_engine_fails_closed_for_protected_mapping_keys(tmp_path: Path) -> None:
+    redaction = engine(tmp_path)
+
+    with pytest.raises(RedactionBoundaryError, match="failed closed"):
+        redaction.transform({_SECRET: "value"}, location="input")
+
+    placeholder = redaction.store.pseudonymize("email", _SECRET)
+    with pytest.raises(RedactionBoundaryError, match="failed closed"):
+        redaction.transform({placeholder: "value"}, location="input")
+
+
 def test_provider_only_text_remove_uses_an_empty_substring(tmp_path: Path) -> None:
     private_directory = tmp_path / "private-remove"
     private_directory.mkdir(mode=0o700)

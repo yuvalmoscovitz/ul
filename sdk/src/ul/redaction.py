@@ -111,6 +111,17 @@ class RedactionPolicy(ULModel):
         ]
         if len(pointer_targets) != len(set(pointer_targets)):
             raise ValueError("a JSON pointer may be selected only once per location")
+        protected_literals = tuple(rule.literal for rule in self.rules if rule.literal is not None)
+        for rule in self.rules:
+            if rule.selector == _TEXT_SELECTOR:
+                continue
+            for token in _parse_json_pointer(rule.selector):
+                if _PLACEHOLDER_PATTERN.search(token) or any(
+                    literal in token for literal in protected_literals
+                ):
+                    raise ValueError(
+                        "JSON pointer tokens cannot contain protected literals or placeholders"
+                    )
         return self
 
     @property
@@ -343,6 +354,10 @@ class RedactionEngine:
             raise RedactionBoundaryError() from None
         if encoded_value_size > _MAXIMUM_VALUE_BYTES:
             raise RedactionBoundaryError()
+        _validate_mapping_keys(
+            value,
+            tuple(rule.literal for rule in self.policy.rules if rule.literal is not None),
+        )
         self.store.validate_placeholders(value)
         transformed = _copy_json(value)
         matches_by_rule: Counter[str] = Counter()
@@ -870,6 +885,21 @@ def _find_placeholders(value: JsonValue) -> list[str]:
     if isinstance(value, dict):
         return [placeholder for item in value.values() for placeholder in _find_placeholders(item)]
     return []
+
+
+def _validate_mapping_keys(value: JsonValue, protected_literals: tuple[str, ...]) -> None:
+    if isinstance(value, list):
+        for item in value:
+            _validate_mapping_keys(item, protected_literals)
+        return
+    if not isinstance(value, dict):
+        return
+    for key, item in value.items():
+        if _PLACEHOLDER_PATTERN.search(key) or any(
+            literal in key for literal in protected_literals
+        ):
+            raise RedactionBoundaryError()
+        _validate_mapping_keys(item, protected_literals)
 
 
 def _escape_pointer_token(token: str) -> str:

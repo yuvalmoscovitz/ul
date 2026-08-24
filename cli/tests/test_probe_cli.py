@@ -588,6 +588,106 @@ def test_direct_authenticated_http_smoke_maps_request_and_response_once(
     assert secret not in (tmp_path / ".ul" / "probe.json").read_text()
 
 
+@pytest.mark.parametrize("save_generated_config", (False, True))
+def test_structured_http_target_runs_real_smoke_and_campaign(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    save_generated_config: bool,
+) -> None:
+    received_requests: list[object] = []
+
+    class TargetHandler(BaseHTTPRequestHandler):
+        def do_POST(self) -> None:
+            content_length = int(self.headers["Content-Length"])
+            received_requests.append(json.loads(self.rfile.read(content_length)))
+            response = json.dumps({"result": {"action": "lookup", "ticket": 42}}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(response)))
+            self.end_headers()
+            self.wfile.write(response)
+
+        def log_message(self, format: str, *args: object) -> None:
+            del format, args
+
+    try:
+        server = ThreadingHTTPServer(("127.0.0.1", 0), TargetHandler)
+    except PermissionError:
+        pytest.skip("the test environment does not allow binding a loopback server")
+    server_thread = threading.Thread(target=server.serve_forever)
+    server_thread.start()
+    dataset = tmp_path / "structured.jsonl"
+    dataset.write_text(
+        json.dumps(
+            {
+                "id": "structured-case",
+                "input": {
+                    "request": {"message": "Return ticket 42."},
+                    "tenant": "test",
+                },
+                "augmentation_target": "/request/message",
+                "output": {"action": "lookup", "ticket": 42},
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    output = tmp_path / "evidence.jsonl"
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("UL_LIVE", "true")
+    monkeypatch.setenv("OPEN_ROUTER_API_KEY", "test-key")
+
+    async def clean_room_preflight(_settings: object) -> object:
+        return _evaluator_preflight()
+
+    monkeypatch.setattr(probe_module, "preflight_evaluator", clean_room_preflight)
+    monkeypatch.setattr(
+        campaign_runner_module,
+        "create_semantic_model_deconstructor",
+        lambda _settings: _CleanRoomSemanticModel(),
+    )
+    arguments = [
+        "probe",
+        str(dataset),
+        "--target",
+        f"http://127.0.0.1:{server.server_port}/invoke",
+        "--request-json-template",
+        '{"payload":"{{input}}"}',
+        "--response-json-pointer",
+        "/result",
+        "--allow-insecure-http",
+        "--output",
+        str(output),
+    ]
+    config_path = tmp_path / "http-target.json"
+    if save_generated_config:
+        arguments.extend(("--save-target-config", str(config_path)))
+    try:
+        result = runner.invoke(app, arguments, input="y\ny\n")
+    finally:
+        server.shutdown()
+        server.server_close()
+        server_thread.join()
+
+    assert result.exit_code == 0, result.output
+    assert len(received_requests) == 3
+    payloads = [cast(dict[str, object], request)["payload"] for request in received_requests]
+    assert payloads[0] == {
+        "request": {"message": "Return ticket 42."},
+        "tenant": "test",
+    }
+    assert payloads[1] == payloads[0]
+    assert cast(dict[str, object], payloads[2])["tenant"] == "test"
+    assert (
+        cast(dict[str, object], cast(dict[str, object], payloads[2])["request"])["message"]
+        != "Return ticket 42."
+    )
+    if save_generated_config:
+        assert load_json_http_environment_config(config_path).execute.request_json_template == {
+            "payload": "{{input}}"
+        }
+
+
 def test_direct_http_rejects_echoed_nonstandard_header_before_semantic_evaluation(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1928,6 +2028,74 @@ def test_confirmed_flow_composes_campaign_and_normal_report(
     assert called["report"] == (output, {})
     assert "Stronger confirmation:" in result.output
     assert "--repetitions 3" in result.output
+
+
+@pytest.mark.parametrize("save_generated_config", (False, True))
+def test_stronger_run_preserves_canonical_local_target_configuration(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    save_generated_config: bool,
+) -> None:
+    _write_callable(tmp_path)
+    dataset = _write_dataset(tmp_path)
+    output = tmp_path / ".ul" / "runs" / "evidence.jsonl"
+    config_path = tmp_path / "target.json"
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("CUSTOMER_AGENT_TOKEN", "private-agent-key")
+    monkeypatch.setenv("UL_LIVE", "true")
+    monkeypatch.setenv("OPEN_ROUTER_API_KEY", "test-key")
+
+    def fake_campaign(**kwargs: object) -> tuple[DatasetEvaluationResult, ...]:
+        created_output = cast(Path, kwargs["output"])
+        created_output.parent.mkdir(parents=True, exist_ok=True)
+        created_output.write_text("evidence\n", encoding="utf-8")
+        return ()
+
+    monkeypatch.setattr(probe_module, "_run_campaign", fake_campaign)
+    monkeypatch.setattr(probe_module, "print_dataset_results", lambda *args, **kwargs: None)
+    monkeypatch.setattr(probe_module, "report_evidence", lambda *args, **kwargs: None)
+    stronger_commands: list[str] = []
+    original_console_print = probe_module.console.print
+
+    def capture_stronger_command(value: object, *args: object, **kwargs: object) -> None:
+        if str(value).startswith("Stronger confirmation:"):
+            stronger_commands.append(str(value))
+        original_console_print(value, *args, **kwargs)
+
+    monkeypatch.setattr(probe_module.console, "print", capture_stronger_command)
+    arguments = [
+        "probe",
+        str(dataset),
+        "--target",
+        "customer_agent:run",
+        "--target-working-directory",
+        str(tmp_path),
+        "--target-interpreter",
+        sys.executable,
+        "--target-environment-variable",
+        "CUSTOMER_AGENT_TOKEN",
+        "--output",
+        str(output),
+    ]
+    if save_generated_config:
+        arguments.extend(("--save-target-config", str(config_path)))
+
+    result = runner.invoke(app, arguments, input="y\ny\n")
+
+    assert result.exit_code == 0, result.output
+    assert len(stronger_commands) == 1
+    stronger_command = stronger_commands[0]
+    if save_generated_config:
+        assert str(config_path.resolve()) in stronger_command
+        assert "--target-working-directory" not in stronger_command
+        assert "--target-interpreter" not in stronger_command
+        assert "--target-environment-variable" not in stronger_command
+    else:
+        assert "--target customer_agent:run" in stronger_command
+        assert f"--target-working-directory {tmp_path}" in stronger_command
+        assert f"--target-interpreter {Path(sys.executable).resolve()}" in stronger_command
+        assert "--target-environment-variable CUSTOMER_AGENT_TOKEN" in stronger_command
+    assert "private-agent-key" not in stronger_command
 
 
 @pytest.mark.parametrize(

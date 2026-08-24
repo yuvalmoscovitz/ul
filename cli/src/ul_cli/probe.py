@@ -1147,7 +1147,7 @@ def probe(
         try:
             _print_stronger_run(
                 data,
-                target,
+                resolved_target.reference,
                 output,
                 allow_insecure_http=allow_insecure_http,
                 target_artifacts=tuple(target_artifact or ()),
@@ -1159,6 +1159,10 @@ def probe(
                 selected_operator_ids=selected_operator_ids,
                 limit=limit,
                 repetitions=repetitions,
+                target_working_directory=target_working_directory,
+                target_interpreter=target_interpreter,
+                target_environment_variables=tuple(target_environment_variable or ()),
+                generated_target_config=save_target_config is not None,
             )
             console.print("")
             report_evidence(output)
@@ -2300,6 +2304,10 @@ def _print_stronger_run(
     selected_operator_ids: tuple[str, ...],
     limit: int,
     repetitions: int,
+    target_working_directory: Path | None,
+    target_interpreter: Path | None,
+    target_environment_variables: tuple[str, ...],
+    generated_target_config: bool,
 ) -> None:
     arguments = [
         "ul",
@@ -2318,16 +2326,25 @@ def _print_stronger_run(
         arguments.extend(("--operator", operator_reference))
     if allow_insecure_http:
         arguments.append("--allow-insecure-http")
-    if http_preset is not None:
-        arguments.extend(("--http-preset", http_preset))
-    if request_json_template is not None:
-        arguments.extend(("--request-json-template", request_json_template))
-    if response_json_pointer is not None:
-        arguments.extend(("--response-json-pointer", response_json_pointer))
-    if agent_model is not None:
-        arguments.extend(("--agent-model", agent_model))
-    for mapping in header_from_env:
-        arguments.extend(("--header-from-env", mapping))
+    if not generated_target_config:
+        if http_preset is not None:
+            arguments.extend(("--http-preset", http_preset))
+        if request_json_template is not None:
+            arguments.extend(("--request-json-template", request_json_template))
+        if response_json_pointer is not None:
+            arguments.extend(("--response-json-pointer", response_json_pointer))
+        if agent_model is not None:
+            arguments.extend(("--agent-model", agent_model))
+        for mapping in header_from_env:
+            arguments.extend(("--header-from-env", mapping))
+        if target_working_directory is not None:
+            arguments.extend(
+                ("--target-working-directory", str(target_working_directory.resolve()))
+            )
+        if target_interpreter is not None:
+            arguments.extend(("--target-interpreter", str(target_interpreter.resolve())))
+        for name in target_environment_variables:
+            arguments.extend(("--target-environment-variable", name))
     for artifact in target_artifacts:
         arguments.extend(("--target-artifact", str(artifact)))
     command = subprocess.list2cmdline(arguments) if os.name == "nt" else shlex.join(arguments)
