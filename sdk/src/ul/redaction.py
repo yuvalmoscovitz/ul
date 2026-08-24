@@ -111,6 +111,17 @@ class RedactionPolicy(ULModel):
         ]
         if len(pointer_targets) != len(set(pointer_targets)):
             raise ValueError("a JSON pointer may be selected only once per location")
+        protected_literals = tuple(rule.literal for rule in self.rules if rule.literal is not None)
+        for rule in self.rules:
+            if rule.selector == _TEXT_SELECTOR:
+                continue
+            for token in _parse_json_pointer(rule.selector):
+                if _PLACEHOLDER_PATTERN.search(token) or any(
+                    literal in token for literal in protected_literals
+                ):
+                    raise ValueError(
+                        "JSON pointer tokens cannot contain protected literals or placeholders"
+                    )
         return self
 
     @property
@@ -190,6 +201,28 @@ class LocalPseudonymStore:
                     else json.dumps(original, ensure_ascii=False, separators=(",", ":"))
                 )
         return _PLACEHOLDER_PATTERN.sub(lambda match: decoded[match.group()], value)
+
+    def rehydrate_value(self, value: JsonValue) -> JsonValue:
+        if isinstance(value, str):
+            placeholders = _PLACEHOLDER_PATTERN.findall(value)
+            if len(placeholders) == 1 and placeholders[0] == value:
+                with self._locked_state() as state:
+                    mappings = cast(dict[str, str], state["mappings"])
+                    encoded_value = mappings.get(value)
+                    if encoded_value is None:
+                        raise RedactionBoundaryError()
+                    try:
+                        return cast(
+                            JsonValue, json.loads(base64.b64decode(encoded_value, validate=True))
+                        )
+                    except (ValueError, json.JSONDecodeError):
+                        raise RedactionBoundaryError() from None
+            return self.rehydrate_text(value)
+        if isinstance(value, list):
+            return [self.rehydrate_value(item) for item in value]
+        if isinstance(value, dict):
+            return {key: self.rehydrate_value(item) for key, item in value.items()}
+        return value
 
     def validate_placeholders(self, value: JsonValue) -> None:
         placeholders = tuple(dict.fromkeys(_find_placeholders(value)))
@@ -321,6 +354,10 @@ class RedactionEngine:
             raise RedactionBoundaryError() from None
         if encoded_value_size > _MAXIMUM_VALUE_BYTES:
             raise RedactionBoundaryError()
+        _validate_mapping_keys(
+            value,
+            tuple(rule.literal for rule in self.policy.rules if rule.literal is not None),
+        )
         self.store.validate_placeholders(value)
         transformed = _copy_json(value)
         matches_by_rule: Counter[str] = Counter()
@@ -484,22 +521,27 @@ class RedactedSemanticPipeline:
     def protect_record(
         self, record: InteractionRecord | UserInputRecord
     ) -> InteractionRecord | UserInputRecord:
-        protected_input = self.engine.transform(record.raw_input, location="input").value
-        if not isinstance(protected_input, str):
-            raise RedactionBoundaryError()
         if isinstance(record, InteractionRecord):
+            try:
+                protected_record = record.with_input_value(
+                    self.engine.transform(record.input_value, location="input").value
+                )
+            except ValueError:
+                raise RedactionBoundaryError() from None
             protected_output = self.engine.transform(
                 record.raw_observed_output, location="output"
             ).value
-            return record.model_copy(
-                update={"raw_input": protected_input, "raw_observed_output": protected_output}
-            )
+            return protected_record.model_copy(update={"raw_observed_output": protected_output})
+        protected_input = self.engine.transform(record.raw_input, location="input").value
+        if not isinstance(protected_input, str):
+            raise RedactionBoundaryError()
         return record.model_copy(update={"raw_input": protected_input})
 
     def dry_run(self, record: InteractionRecord | UserInputRecord) -> tuple[RedactionCoverage, ...]:
-        coverage = [
-            self.engine.transform(record.raw_input, location="input", dry_run=True).coverage
-        ]
+        input_value = (
+            record.input_value if isinstance(record, InteractionRecord) else record.raw_input
+        )
+        coverage = [self.engine.transform(input_value, location="input", dry_run=True).coverage]
         if isinstance(record, InteractionRecord):
             coverage.append(
                 self.engine.transform(
@@ -608,7 +650,19 @@ class RehydratingEnvironmentConnection:
                             update={"content": self._engine.store.rehydrate_text(turn.content)}
                         )
                         for turn in case.turns
-                    )
+                    ),
+                    "probe_context": {
+                        **case.probe_context,
+                        **(
+                            {
+                                "ul.target.input": self._engine.store.rehydrate_value(
+                                    case.probe_context["ul.target.input"]
+                                )
+                            }
+                            if "ul.target.input" in case.probe_context
+                            else {}
+                        ),
+                    },
                 }
             )
         except RedactionBoundaryError:
@@ -831,6 +885,21 @@ def _find_placeholders(value: JsonValue) -> list[str]:
     if isinstance(value, dict):
         return [placeholder for item in value.values() for placeholder in _find_placeholders(item)]
     return []
+
+
+def _validate_mapping_keys(value: JsonValue, protected_literals: tuple[str, ...]) -> None:
+    if isinstance(value, list):
+        for item in value:
+            _validate_mapping_keys(item, protected_literals)
+        return
+    if not isinstance(value, dict):
+        return
+    for key, item in value.items():
+        if _PLACEHOLDER_PATTERN.search(key) or any(
+            literal in key for literal in protected_literals
+        ):
+            raise RedactionBoundaryError()
+        _validate_mapping_keys(item, protected_literals)
 
 
 def _escape_pointer_token(token: str) -> str:

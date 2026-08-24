@@ -754,11 +754,6 @@ class JsonHttpEnvironmentConnection:
             ) from None
 
     async def _invoke_probe_request(self, request: ProbeRequest) -> ProbeResult:
-        if not isinstance(request.turn.input, str):
-            raise CapabilityExecutionError(
-                "response_mapping",
-                "HTTP target requires a text turn input",
-            )
         config = self._config
         if isinstance(config, JsonHttpIsolatedResponseConfig):
             response = await self._post_for_json(
@@ -2195,7 +2190,7 @@ def _replace_request_placeholders(
     *,
     case_id: str,
     turn_id: str | None = None,
-    raw_input: str | None = None,
+    raw_input: JsonValue = None,
     probe_context: dict[str, JsonValue] | None = None,
 ) -> JsonValue:
     if template == _INPUT_PLACEHOLDER:
@@ -2246,7 +2241,7 @@ def _replace_bounded_request_placeholders(
     *,
     case_id: str,
     turn_id: str,
-    raw_input: str,
+    raw_input: JsonValue,
     probe_context: dict[str, JsonValue],
     maximum_bytes: int,
 ) -> JsonValue:

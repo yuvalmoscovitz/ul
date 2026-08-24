@@ -15,7 +15,22 @@ default and accepts an explicit `--limit` up to 100:
 {"id":"case-1","input":"Return the status for ticket 42.","output":{"status":"open"}}
 ```
 
-Historical output grounds the semantic comparison; it is not treated as the expected answer.
+The historical observed output is reference evidence for semantic comparison, not a correctness
+oracle.
+
+Optional JSON metadata stays on the private interaction record without changing this short format:
+
+```json
+{"id":"case-1","input":"Return ticket 42.","output":{"status":"open"},"metadata":{"source":"approved-production-sample"}}
+```
+
+Inputs and observed outputs may be structured JSON. For a structured input, add one RFC 6901
+`augmentation_target` selecting the non-empty text UL may vary; UL sends the complete structure to
+the target for both the original and each variation:
+
+```json
+{"id":"case-2","input":{"request":{"message":"Return ticket 42."},"tenant":"test"},"augmentation_target":"/request/message","output":{"ticket":{"id":42,"status":"open"}},"metadata":{"source":"approved-production-sample"}}
+```
 
 ## 2. Point UL at a callable
 
@@ -58,7 +73,10 @@ ul probe interactions.jsonl \
 
 Use `--http-preset openai-chat --agent-model TEST_MODEL` for an OpenAI-compatible chat
 completion endpoint. For another JSON shape, use `--request-json-template` and
-`--response-json-pointer`. Header options contain only dedicated `UL_ENVIRONMENT_*` variable
+`--response-json-pointer`. The `{{input}}` placeholder is one complete JSON leaf: with a
+structured dataset input, `--request-json-template '{"payload":"{{input}}"}'` sends the full
+object at `payload` without stringifying it. Header options contain only dedicated
+`UL_ENVIRONMENT_*` variable
 names; their secret values are never placed in target configuration, evidence, diagnostics, or
 confirmation text. Direct HTTP targets must be isolated per request and safe for test traffic.
 Plain HTTP is restricted to an exact loopback URL and also requires `--allow-insecure-http`.
@@ -70,6 +88,25 @@ resolved directly from the target declaration. UL validates every declared artif
 before launch; it does not claim undeclared transitive dependencies are bound.
 
 Plain local HTTP also requires `--allow-insecure-http`. HTTP is never the implicit default.
+
+### Save a reusable target configuration
+
+For a callable that needs a different working directory, interpreter, or environment variables,
+provide only environment-variable names and save the validated target configuration to a new path:
+
+```bash
+ul probe interactions.jsonl \
+  --target package.agent:invoke \
+  --target-working-directory /path/to/project \
+  --target-interpreter /path/to/project/.venv/bin/python \
+  --target-environment-variable AGENT_TOKEN \
+  --save-target-config target.json
+```
+
+The generated file is private, is never overwritten, and contains the allowlisted name
+`AGENT_TOKEN`, not its value. The same option works with direct HTTP mapping flags, including
+`--request-json-template`, `--response-json-pointer`, and `--header-from-env`. A later run can use
+the generated artifact directly with `--target target.json`.
 
 ### Optional deterministic outcome projection
 

@@ -5,7 +5,12 @@ from pathlib import Path
 from typing import cast
 
 from pydantic import JsonValue, ValidationError
-from ul import InteractionRecord, RichInteractionCase, project_rich_interaction_case
+from ul import (
+    InteractionRecord,
+    RichInteractionCase,
+    project_rich_interaction_case,
+)
+from ul_core.dataset import resolve_json_pointer
 
 _MAXIMUM_DATASET_BYTES = 10_000_000
 _MAXIMUM_DATASET_RECORDS = 100
@@ -57,9 +62,14 @@ def load_interaction_records(path: Path) -> tuple[InteractionRecord, ...]:
             raise DatasetInputError(f"{dataset_name} line {line_number}: record must be an object")
         payload = cast(dict[str, JsonValue], untyped_payload)
         payload_fields = set(payload)
-        shorthand_fields = {"id", "input", "output"}
-        if payload_fields & {"input", "output"} and payload_fields != shorthand_fields:
-            missing_fields = sorted(shorthand_fields - payload_fields)
+        required_shorthand_fields = {"id", "input", "output"}
+        optional_shorthand_fields = {"metadata", "augmentation_target"}
+        shorthand_fields = required_shorthand_fields | optional_shorthand_fields
+        if payload_fields & {"input", "output"} and (
+            not required_shorthand_fields <= payload_fields
+            or not payload_fields <= shorthand_fields
+        ):
+            missing_fields = sorted(required_shorthand_fields - payload_fields)
             unknown_fields = sorted(payload_fields - shorthand_fields)
             details: list[str] = []
             if missing_fields:
@@ -67,17 +77,42 @@ def load_interaction_records(path: Path) -> tuple[InteractionRecord, ...]:
             if unknown_fields:
                 details.append("unknown field(s)")
             raise DatasetInputError(
-                f"{dataset_name} line {line_number}: expected exactly id, input, output "
+                f"{dataset_name} line {line_number}: expected id, input, output and optional "
+                "metadata or augmentation_target "
                 f"({'; '.join(details)})"
             )
         try:
-            if payload_fields == shorthand_fields:
+            if required_shorthand_fields <= payload_fields:
+                input_value = payload["input"]
+                augmentation_target = payload.get("augmentation_target")
+                if isinstance(input_value, str):
+                    if augmentation_target is not None:
+                        raise ValueError("string input does not need an augmentation target")
+                    raw_input = input_value
+                    structured_input = None
+                    structured_input_target = None
+                else:
+                    if not isinstance(augmentation_target, str):
+                        raise ValueError(
+                            "structured input requires an augmentation_target JSON pointer"
+                        )
+                    selected_input = resolve_json_pointer(input_value, augmentation_target)
+                    if not isinstance(selected_input, str) or not selected_input:
+                        raise ValueError(
+                            "augmentation_target must select non-empty text in structured input"
+                        )
+                    raw_input = selected_input
+                    structured_input = input_value
+                    structured_input_target = augmentation_target
                 projected_records = (
                     InteractionRecord.model_validate(
                         {
                             "id": payload["id"],
-                            "raw_input": payload["input"],
+                            "raw_input": raw_input,
                             "raw_observed_output": payload["output"],
+                            "metadata": payload.get("metadata", {}),
+                            "structured_input": structured_input,
+                            "structured_input_target": structured_input_target,
                         }
                     ),
                 )
@@ -100,7 +135,9 @@ def load_interaction_records(path: Path) -> tuple[InteractionRecord, ...]:
             raise DatasetInputError(
                 f"{dataset_name} line {line_number}: invalid {field_summary}"
             ) from None
-        except ValueError:
+        except ValueError as error:
+            if required_shorthand_fields <= payload_fields:
+                raise DatasetInputError(f"{dataset_name} line {line_number}: {error}") from None
             raise DatasetInputError(
                 f"{dataset_name} line {line_number}: invalid rich interaction case"
             ) from None

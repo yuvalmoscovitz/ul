@@ -172,6 +172,37 @@ def test_policy_rejects_unsupported_or_irreversible_input_selectors() -> None:
     assert literal_rule.literal == "(a+)+$"
 
 
+def test_policy_rejects_protected_literals_and_placeholders_in_pointer_tokens() -> None:
+    with pytest.raises(ValidationError, match="pointer tokens"):
+        RedactionPolicy(
+            rules=(
+                RedactionRule(name="email", literal=_SECRET),
+                RedactionRule(name="token", selector=f"/{_SECRET}/token"),
+            )
+        )
+
+    with pytest.raises(ValidationError, match="pointer tokens"):
+        RedactionPolicy(
+            rules=(
+                RedactionRule(
+                    name="token",
+                    selector="/__UL_SECRET_email_00000000000000000000000000000000__/token",
+                ),
+            )
+        )
+
+
+def test_engine_fails_closed_for_protected_mapping_keys(tmp_path: Path) -> None:
+    redaction = engine(tmp_path)
+
+    with pytest.raises(RedactionBoundaryError, match="failed closed"):
+        redaction.transform({_SECRET: "value"}, location="input")
+
+    placeholder = redaction.store.pseudonymize("email", _SECRET)
+    with pytest.raises(RedactionBoundaryError, match="failed closed"):
+        redaction.transform({placeholder: "value"}, location="input")
+
+
 def test_provider_only_text_remove_uses_an_empty_substring(tmp_path: Path) -> None:
     private_directory = tmp_path / "private-remove"
     private_directory.mkdir(mode=0o700)
@@ -258,12 +289,14 @@ class _RecordingEnvironment:
 
     def __init__(self) -> None:
         self.inputs: list[str] = []
+        self.probe_contexts: list[dict[str, object]] = []
 
     def api_calls_for_case(self, case: EvaluationCase) -> int:
         return len(case.turns)
 
     async def execute(self, case: EvaluationCase) -> ExecutionEvidence:
         self.inputs.extend(turn.content for turn in case.turns)
+        self.probe_contexts.append(case.probe_context)
         response = {"ok": True, "contact": _SECRET}
         state = {"last_contact": _SECRET}
         return ExecutionEvidence(
@@ -383,6 +416,54 @@ async def test_pipeline_is_one_boundary_and_environment_rehydrates(tmp_path: Pat
         assert metadata == {"redaction_policy_sha256": policy().digest}
         assert _SECRET not in json.dumps(metadata)
     assert _SECRET not in protected_source.model_dump_json()
+
+
+@pytest.mark.asyncio
+async def test_structured_input_is_protected_and_rehydrated_only_for_target(
+    tmp_path: Path,
+) -> None:
+    token = "private-structured-token"
+    private_directory = tmp_path / "private"
+    private_directory.mkdir(mode=0o700)
+    redaction = RedactionEngine(
+        RedactionPolicy(
+            rules=(
+                RedactionRule(
+                    name="structured_token",
+                    locations=("input",),
+                    selector="/credentials/token",
+                ),
+            )
+        ),
+        LocalPseudonymStore(private_directory / "pseudonyms.json", _KEY),
+    )
+    pipeline = RedactedSemanticPipeline(_RecordingPipeline(), redaction)
+    source = InteractionRecord(
+        id="record-1",
+        raw_input="Return ticket 42.",
+        raw_observed_output={"status": "open"},
+        structured_input={
+            "request": {"message": "Return ticket 42."},
+            "credentials": {"token": token},
+        },
+        structured_input_target="/request/message",
+    )
+
+    protected_source = pipeline.protect_record(source)
+
+    assert isinstance(protected_source, InteractionRecord)
+    assert pipeline.dry_run(source)[0].matched_values == 1
+    assert token not in protected_source.model_dump_json()
+    environment = _RecordingEnvironment()
+    await pipeline.wrap_environment(environment).execute(
+        evaluation_case_from_inputs(
+            case_id="redaction-case",
+            raw_inputs=(protected_source.raw_input,),
+            max_environment_api_calls=1,
+            timeout_seconds=30,
+        ).model_copy(update={"probe_context": protected_source.probe_context()})
+    )
+    assert environment.probe_contexts[0]["ul.target.input"] == source.structured_input
 
 
 @pytest.mark.asyncio

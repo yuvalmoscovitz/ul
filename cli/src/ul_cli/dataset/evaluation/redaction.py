@@ -59,7 +59,7 @@ def calculate_redaction_coverage(
         matches_by_rule: dict[str, int] = {}
         for record in records:
             value: JsonValue = (
-                record.raw_input if location == "input" else record.raw_observed_output
+                record.input_value if location == "input" else record.raw_observed_output
             )
             coverage = engine.transform(value, location=location, dry_run=True).coverage
             matched_values += coverage.matched_values
@@ -82,16 +82,15 @@ def protect_interaction_records(
 ) -> tuple[InteractionRecord, ...]:
     protected_records: list[InteractionRecord] = []
     for record in records:
-        protected_input = engine.transform(record.raw_input, location="input").value
-        if not isinstance(protected_input, str):
-            raise ValueError("redaction policy did not preserve executable input as text")
+        protected_record = record.with_input_value(
+            engine.transform(record.input_value, location="input").value
+        )
         protected_records.append(
-            record.model_copy(
+            protected_record.model_copy(
                 update={
-                    "raw_input": protected_input,
                     "raw_observed_output": engine.transform(
                         record.raw_observed_output, location="output"
-                    ).value,
+                    ).value
                 }
             )
         )

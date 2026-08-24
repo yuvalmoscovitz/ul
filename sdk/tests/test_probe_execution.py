@@ -69,8 +69,10 @@ class _Observer:
         )
     )
     fail: bool = False
+    requests: list[ObservationRequest] = field(default_factory=list)
 
     async def observe(self, request: ObservationRequest) -> ProbeObservation:
+        self.requests.append(request)
         if self.fail:
             raise RuntimeError("private observer failure")
         return ProbeObservation(
@@ -96,16 +98,20 @@ class _StateEnvironment:
         )
     )
     operations: list[tuple[str, str | None]] = field(default_factory=list)
+    requests: list[StateFixtureRequest] = field(default_factory=list)
 
     def reset(self, request: StateFixtureRequest) -> StateOperationResult:
+        self.requests.append(request)
         self.operations.append(("reset", request.turn_id))
         return _successful_state_operation(request, "reset")
 
     async def setup(self, request: StateFixtureRequest) -> StateOperationResult:
+        self.requests.append(request)
         self.operations.append(("setup", request.turn_id))
         return _successful_state_operation(request, "setup")
 
     def snapshot(self, request: StateFixtureRequest) -> StateSnapshot:
+        self.requests.append(request)
         self.operations.append(("snapshot", request.turn_id))
         return StateSnapshot(
             id="snapshot-1",
@@ -117,6 +123,7 @@ class _StateEnvironment:
         )
 
     def cleanup(self, request: StateFixtureRequest) -> StateOperationResult:
+        self.requests.append(request)
         self.operations.append(("cleanup", request.turn_id))
         return _successful_state_operation(request, "cleanup")
 
@@ -199,6 +206,37 @@ async def test_executor_preserves_structured_case_context_with_correlation_keys(
     assert request_context["ul.turn.id"] == "case-1:turn-1"
     assert request_context["ul.correlation.id"] == invoker.requests[0].correlation_id
     assert request_context["traceparent"].startswith("00-")
+
+
+@pytest.mark.asyncio
+async def test_structured_target_input_is_not_exposed_as_context() -> None:
+    invoker = _Invoker()
+    observer = _Observer()
+    state_environment = _StateEnvironment()
+    executor = ComposedEnvironmentExecutor(
+        invoker,
+        config_sha256=_CONFIG_SHA256,
+        observation_source=observer,
+        state_environment=state_environment,
+        fixture_id="fixture-1",
+    )
+    target_input = {"request": {"message": "Return ticket 42."}, "tenant": "test"}
+
+    await executor.execute(
+        _case("Return ticket 42.").model_copy(
+            update={"probe_context": {"ul.target.input": target_input}}
+        )
+    )
+
+    request = invoker.requests[0]
+    assert request.turn.input == target_input
+    assert "ul.target.input" not in request.context
+    assert observer.requests
+    assert all("ul.target.input" not in request.context for request in observer.requests)
+    assert state_environment.requests
+    assert all(
+        "ul.target.input" not in request.configuration for request in state_environment.requests
+    )
 
 
 @pytest.mark.asyncio

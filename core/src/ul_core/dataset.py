@@ -145,7 +145,8 @@ def resolve_json_pointer(value: JsonValue, pointer: str) -> JsonValue:
 def _replace_json_pointer(value: JsonValue, pointer: str, replacement: str) -> JsonValue:
     copied_value = copy.deepcopy(value)
     tokens = tuple(token.replace("~1", "/").replace("~0", "~") for token in pointer[1:].split("/"))
-    parent = resolve_json_pointer(copied_value, "/" + "/".join(pointer.split("/")[1:-1]))
+    parent_pointer = "/".join(pointer.split("/")[:-1])
+    parent = resolve_json_pointer(copied_value, parent_pointer)
     final_token = tokens[-1]
     if isinstance(parent, dict):
         parent[final_token] = replacement
@@ -158,13 +159,15 @@ def _replace_json_pointer(value: JsonValue, pointer: str, replacement: str) -> J
 
 class UserInputRecord(_StrictULModel):
     schema_version: Literal["1.0.0"] = "1.0.0"
-    id: str = Field(min_length=1)
+    id: str = Field(min_length=1, max_length=500)
     raw_input: str = Field(min_length=1)
-    metadata: dict[str, JsonValue] = Field(default_factory=dict)
+    metadata: dict[str, JsonValue] = Field(default_factory=dict, max_length=100)
 
 
 class InteractionRecord(UserInputRecord):
     raw_observed_output: JsonValue
+    structured_input: JsonValue | None = None
+    structured_input_target: str | None = Field(default=None, max_length=1_000)
     source_case: RichInteractionCase | None = None
     augmentation_target: AugmentationTarget | None = None
 
@@ -172,6 +175,16 @@ class InteractionRecord(UserInputRecord):
     def validate_observed_output(self) -> Self:
         if self.raw_observed_output is None:
             raise ValueError("interaction records require an observed output")
+        if (self.structured_input is None) != (self.structured_input_target is None):
+            raise ValueError("structured input and its augmentation target must be paired")
+        if self.structured_input_target is not None:
+            if not self.structured_input_target.startswith("/"):
+                raise ValueError("structured input target must be an RFC 6901 JSON pointer")
+            selected_input = resolve_json_pointer(
+                self.structured_input, self.structured_input_target
+            )
+            if selected_input != self.raw_input:
+                raise ValueError("structured input target must select the raw input text")
         if (self.source_case is None) != (self.augmentation_target is None):
             raise ValueError("rich interaction source and augmentation target must be paired")
         if self.source_case is not None and self.augmentation_target not in (
@@ -184,7 +197,31 @@ class InteractionRecord(UserInputRecord):
     def source_interaction_id(self) -> str:
         return self.source_case.id if self.source_case is not None else self.id
 
+    def target_input(self, selected_text: str | None = None) -> JsonValue:
+        selected_value = selected_text if selected_text is not None else self.raw_input
+        if self.structured_input is None or self.structured_input_target is None:
+            return selected_value
+        return _replace_json_pointer(
+            self.structured_input, self.structured_input_target, selected_value
+        )
+
+    @property
+    def input_value(self) -> JsonValue:
+        return self.structured_input if self.structured_input is not None else self.raw_input
+
+    def with_input_value(self, value: JsonValue) -> InteractionRecord:
+        if self.structured_input_target is None:
+            if not isinstance(value, str):
+                raise ValueError("executable input must remain text")
+            return self.model_copy(update={"raw_input": value})
+        selected_input = resolve_json_pointer(value, self.structured_input_target)
+        if not isinstance(selected_input, str) or not selected_input:
+            raise ValueError("structured input target must remain non-empty text")
+        return self.model_copy(update={"raw_input": selected_input, "structured_input": value})
+
     def probe_context(self, selected_text: str | None = None) -> dict[str, JsonValue]:
+        if self.structured_input is not None:
+            return {"ul.target.input": self.target_input(selected_text)}
         if self.source_case is None or self.augmentation_target is None:
             return {}
         selected_value = selected_text if selected_text is not None else self.raw_input

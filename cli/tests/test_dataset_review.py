@@ -440,7 +440,7 @@ def test_root_json_report_is_stable_and_omits_private_dataset_fields(tmp_path: P
                     "ulpf_v1_b5dd705fb4db534431680decfe8b221fbebfd049d7b7aba99c2b59af966a2ca3"
                 ),
                 "pattern_snapshot_id": (
-                    "ulps_v1_fe1a8c4612be33a7a5c3c7a773abd2031143d610f630ecc37912ab83b63779a6"
+                    "ulps_v1_3ccd3922dc69be5ed242703375e94be5a63e500fbe54a38d07f204e5600c7699"
                 ),
                 "kind": "behavior_difference",
                 "category": "changed_grounded_effect_argument",
@@ -479,7 +479,7 @@ def test_root_json_report_is_stable_and_omits_private_dataset_fields(tmp_path: P
                         "finding_id": FINDING_ID,
                         "evidence_record_ref": pattern_evidence_reference(
                             _PATTERN_IDENTITY_KEY,
-                            "659e1d52c9acf4f038c8f49b92eff256e38e1c266ffe544219de9a00b88ea25e",
+                            "59e7daa030c7bc549badbfd9e968689033cc02f703626db2acd41da6713dbe13",
                         ),
                         "membership_reasons": [
                             "same_action_shape",

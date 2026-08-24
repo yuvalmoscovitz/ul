@@ -87,9 +87,12 @@ def resolve_local_target(
     explicit_artifacts: tuple[Path, ...] = (),
     working_directory: Path | None = None,
     interpreter: Path | None = None,
+    environment_allowlist: tuple[str, ...] = (),
 ) -> ResolvedLocalTarget:
     path = Path(reference)
     if path.is_file():
+        if working_directory is not None or interpreter is not None or environment_allowlist:
+            raise ValueError("local target options cannot override a target configuration file")
         config = load_local_target_config(path)
     else:
         if ":" not in reference:
@@ -101,6 +104,7 @@ def resolve_local_target(
             working_directory=(working_directory or Path.cwd()).resolve(),
             interpreter=(interpreter or Path(sys.executable)).resolve(),
             target=reference,
+            environment_allowlist=environment_allowlist,
         )
     try:
         plan = create_local_target_dry_run_plan(config)
