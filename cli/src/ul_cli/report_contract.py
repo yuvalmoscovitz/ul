@@ -117,7 +117,7 @@ _PUBLIC_REFERENCE_PATTERN = r"^ulref_v1_[0-9a-f]{64}$"
 _EVIDENCE_POINTER_ID_PATTERN = r"^ulep_v1_[0-9a-f]{64}$"
 _RUN_RECEIPT_ID_PATTERN = r"^ulrr_v1_[0-9a-f]{64}$"
 _REVIEW_REFERENCE_PATTERN = r"^ulreview_v1_[0-9a-f]{64}$"
-_CAPTURED_JSON_BYTES = 250_000
+_CAPTURED_JSON_BYTES = 1_000_000
 _MAXIMUM_FINDING_PACKAGE_BYTES = 16_000_000
 OccurrenceCapability = Literal[
     "cleanup_verification",
@@ -951,6 +951,7 @@ class FindingEvidencePackage(_StrictModel):
         if not set(self.occurrence.evidence_pointer_ids).issubset(pointers):
             raise ValueError("package does not contain every public evidence reference")
         trajectory_complete_receipt_ids: set[str] = set()
+        verified_state_receipt_ids: set[str] = set()
         if self.artifact_retention == "embedded":
             artifacts = {artifact.artifact_sha256: artifact.value for artifact in self.artifacts}
             decoded_artifacts = {
@@ -985,13 +986,36 @@ class FindingEvidencePackage(_StrictModel):
             for receipt in self.receipts:
                 trace_statuses: list[object] = []
                 for pointer_id in receipt.content.trace_evidence_pointer_ids:
-                    observation = _resolve_json_pointer(
-                        decoded_artifacts[pointers[pointer_id].artifact_sha256],
-                        pointers[pointer_id].json_pointer,
+                    pointer = pointers[pointer_id]
+                    artifact_value = decoded_artifacts.get(pointer.artifact_sha256)
+                    if artifact_value is None:
+                        raise ValueError("trace pointers require retained evidence envelopes")
+                    envelope = _resolve_json_pointer(
+                        artifact_value,
+                        pointer.json_pointer.rsplit("/", 1)[0],
                     )
+                    if not isinstance(envelope, dict):
+                        raise ValueError("trace pointers require retained evidence envelopes")
+                    typed_envelope = cast(dict[str, JsonValue], envelope)
+                    if (
+                        typed_envelope.get("authority"),
+                        typed_envelope.get("source_id"),
+                    ) != (pointer.authority, pointer.source_id):
+                        raise ValueError(
+                            "trace pointer authority and source must match retained evidence"
+                        )
+                    observation = _resolve_json_pointer(artifact_value, pointer.json_pointer)
                     if not isinstance(observation, dict):
                         raise ValueError("trace pointers must resolve to observation evidence")
-                    trace_statuses.append(observation.get("status"))
+                    typed_observation = cast(dict[str, JsonValue], observation)
+                    if ("authority" in typed_observation or "source_id" in typed_observation) and (
+                        typed_observation.get("authority"),
+                        typed_observation.get("source_id"),
+                    ) != (pointer.authority, pointer.source_id):
+                        raise ValueError(
+                            "trace pointer authority and source must match observation evidence"
+                        )
+                    trace_statuses.append(observation.get("status", "complete"))
                 expected_trajectory_status = (
                     "complete"
                     if "complete" in trace_statuses
@@ -1003,6 +1027,32 @@ class FindingEvidencePackage(_StrictModel):
                     raise ValueError("trajectory status must match retained observation evidence")
                 if expected_trajectory_status == "complete":
                     trajectory_complete_receipt_ids.add(receipt.receipt_id)
+                state_pointer_ids = tuple(
+                    state.evidence.evidence_pointer_id
+                    for state in (receipt.content.state_before, receipt.content.state_after)
+                    if state is not None
+                )
+                for pointer_id in state_pointer_ids:
+                    pointer = pointers[pointer_id]
+                    artifact_value = decoded_artifacts.get(pointer.artifact_sha256)
+                    if artifact_value is None:
+                        raise ValueError("state pointers require retained evidence envelopes")
+                    envelope = _resolve_json_pointer(
+                        artifact_value,
+                        pointer.json_pointer.rsplit("/", 1)[0],
+                    )
+                    if not isinstance(envelope, dict):
+                        raise ValueError("state pointers require retained evidence envelopes")
+                    typed_envelope = cast(dict[str, JsonValue], envelope)
+                    if (
+                        typed_envelope.get("authority"),
+                        typed_envelope.get("source_id"),
+                    ) != (pointer.authority, pointer.source_id):
+                        raise ValueError(
+                            "state pointer authority and source must match retained evidence"
+                        )
+                if len(state_pointer_ids) == 2:
+                    verified_state_receipt_ids.add(receipt.receipt_id)
         for repetition in self.occurrence.repetitions:
             allowed_pointer_ids: set[str] = set()
             for expected_arm, receipt_id in (
@@ -1052,6 +1102,7 @@ class FindingEvidencePackage(_StrictModel):
             receipts_by_id,
             pointers,
             trajectory_complete_receipt_ids,
+            verified_state_receipt_ids,
         )
         if (
             len(_canonical_json(self.model_dump(mode="json")).encode("utf-8"))
@@ -1768,6 +1819,7 @@ def _validate_cross_examination_availability(
     receipts_by_id: dict[str, RunReceipt],
     pointers: dict[str, EvidencePointer],
     trajectory_complete_receipt_ids: set[str],
+    verified_state_receipt_ids: set[str],
 ) -> None:
     cross_examination = occurrence.cross_examination
     if cross_examination is None:
@@ -1829,8 +1881,7 @@ def _validate_cross_examination_availability(
                     if state is not None
                 }
                 covered_repetitions = sum(
-                    receipt.state_before is not None and receipt.state_after is not None
-                    for receipt in receipts
+                    receipt_id in verified_state_receipt_ids for receipt_id in receipt_ids
                 )
             if tuple(sorted(arm_pointer_ids)) != getattr(cross_examination_arm, pointer_attribute):
                 raise ValueError("cross-examination channel pointers must match every receipt")

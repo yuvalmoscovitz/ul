@@ -27,7 +27,12 @@ from ul.dataset_invariants import (
     evaluate_dataset_invariant_rules,
 )
 from ul_core.dataset import ObservedAgentOutput, ObservedOutcome, SemanticFrame
-from ul_core.evaluation import EnvironmentStateEvidence, ExecutionEvidence, ProbeObservation
+from ul_core.evaluation import (
+    EnvironmentStateEvidence,
+    ExecutionEvidence,
+    ProbeExecutionEvent,
+    ProbeObservation,
+)
 
 from ul_cli.finding_reference import finding_public_reference
 from ul_cli.report_contract import (
@@ -77,6 +82,7 @@ EvidenceAuthority = Literal[
     "independent_observer",
 ]
 _MAXIMUM_CAPTURED_JSON_BYTES = 250_000
+_MAXIMUM_STATE_CAPTURED_JSON_BYTES = 1_000_000
 _MAXIMUM_RUN_RECEIPT_BYTES = 1_000_000
 _MAXIMUM_ADAPTED_PACKAGE_BYTES = 16_000_000
 _MAXIMUM_ADAPTED_REPETITIONS = 1_000
@@ -669,12 +675,11 @@ def _execution_receipt(
         category_json_pointer=category_json_pointer,
         rule_definition=rule_definition,
         target_config_sha256=execution_evidence.environment_config_sha256,
-        state_before_json_pointer="/initial_state/value",
-        state_after_json_pointer="/final_state/value",
         lifecycle_json_pointer="/lifecycle",
         limitations=tuple(receipt_limitations),
         execution_available=execution_available,
         trajectory_observations=execution_evidence.observations,
+        trajectory_events=execution_evidence.execution_events,
         historical_reference_value=historical_reference_value,
         historical_reference_present=historical_reference_present,
     )
@@ -727,24 +732,18 @@ def _receipt_from_values(
     category_json_pointer: str,
     rule_definition: DatasetInvariantRule | None,
     target_config_sha256: str | None = None,
-    state_before_json_pointer: str = "/state_before",
-    state_after_json_pointer: str = "/state_after",
     lifecycle_json_pointer: str | None = "/lifecycle",
     limitations: tuple[str, ...] = (),
     execution_available: bool = True,
     trajectory_observations: tuple[ProbeObservation, ...] = (),
+    trajectory_events: tuple[ProbeExecutionEvent, ...] = (),
     historical_reference_value: JsonValue | None = None,
     historical_reference_present: bool = False,
 ) -> _ReceiptBuild:
     pointers: list[EvidencePointer] = []
     retained_artifacts: dict[str, EvidenceArtifact] = {}
     default_artifact_value = _json_value(artifact)
-    _validate_json_size(
-        default_artifact_value,
-        _MAXIMUM_RUN_RECEIPT_BYTES,
-        "run receipt artifact exceeds the 1 MB JSON limit",
-    )
-    default_evidence_artifact = _evidence_artifact(default_artifact_value)
+    default_evidence_artifact: EvidenceArtifact | None = None
 
     def add_pointer(
         *,
@@ -755,19 +754,24 @@ def _receipt_from_values(
         source_id: str,
         pointer_artifact: object = artifact,
         retain_artifact: bool = False,
+        maximum_capture_bytes: int = _MAXIMUM_CAPTURED_JSON_BYTES,
     ) -> str:
+        nonlocal default_evidence_artifact
         artifact_value = (
             default_artifact_value
             if pointer_artifact is artifact
             else _json_value(pointer_artifact)
         )
-        retained_artifact = (
-            default_evidence_artifact
-            if retain_artifact and pointer_artifact is artifact
-            else _evidence_artifact(artifact_value)
-            if retain_artifact
-            else None
-        )
+        if retain_artifact and pointer_artifact is artifact:
+            if default_evidence_artifact is None:
+                default_evidence_artifact = _evidence_artifact(default_artifact_value)
+            retained_artifact = default_evidence_artifact
+        else:
+            retained_artifact = (
+                _evidence_artifact(artifact_value, maximum_capture_bytes)
+                if retain_artifact
+                else None
+            )
         artifact_sha256 = (
             retained_artifact.artifact_sha256
             if retained_artifact is not None
@@ -847,37 +851,78 @@ def _receipt_from_values(
             raise ValueError("stateful receipts require observed initial and final state")
         state_before_pointer_id = add_pointer(
             kind="state",
-            json_pointer=state_before_json_pointer,
+            json_pointer="/initial_state/value",
             pointer_arm=arm,
             authority=state_before_authority,
             source_id=state_before_source_id,
+            pointer_artifact={
+                "initial_state": {
+                    "value": state_before,
+                    "authority": state_before_authority,
+                    "source_id": state_before_source_id,
+                }
+            },
             retain_artifact=True,
+            maximum_capture_bytes=_MAXIMUM_STATE_CAPTURED_JSON_BYTES,
         )
         state_after_pointer_id = add_pointer(
             kind="state",
-            json_pointer=state_after_json_pointer,
+            json_pointer="/final_state/value",
             pointer_arm=arm,
             authority=state_after_authority,
             source_id=state_after_source_id,
+            pointer_artifact={
+                "final_state": {
+                    "value": state_after,
+                    "authority": state_after_authority,
+                    "source_id": state_after_source_id,
+                }
+            },
             retain_artifact=True,
+            maximum_capture_bytes=_MAXIMUM_STATE_CAPTURED_JSON_BYTES,
         )
     trace_evidence_pointer_ids = tuple(
-        add_pointer(
-            kind="trace",
-            json_pointer=f"/observations/{observation_index}",
-            pointer_arm=arm,
-            authority=observation.authority,
-            source_id=observation.source_id,
-            retain_artifact=True,
-        )
-        for observation_index, observation in enumerate(trajectory_observations)
-        if any(
-            (
-                observation.traces,
-                observation.tool_calls,
-                observation.handoffs,
-                observation.errors,
-            )
+        (
+            *(
+                add_pointer(
+                    kind="trace",
+                    json_pointer="/value",
+                    pointer_arm=arm,
+                    authority=observation.authority,
+                    source_id=observation.source_id,
+                    pointer_artifact={
+                        "value": observation.model_dump(mode="json"),
+                        "authority": observation.authority,
+                        "source_id": observation.source_id,
+                    },
+                    retain_artifact=True,
+                )
+                for observation in trajectory_observations
+                if any(
+                    (
+                        observation.traces,
+                        observation.tool_calls,
+                        observation.handoffs,
+                        observation.errors,
+                    )
+                )
+            ),
+            *(
+                add_pointer(
+                    kind="trace",
+                    json_pointer="/value",
+                    pointer_arm=arm,
+                    authority="invoker_self_reported",
+                    source_id=context.invoker_source_id,
+                    pointer_artifact={
+                        "value": event.model_dump(mode="json"),
+                        "authority": "invoker_self_reported",
+                        "source_id": context.invoker_source_id,
+                    },
+                    retain_artifact=True,
+                )
+                for event in trajectory_events
+            ),
         )
     )
     category_pointer_ids: tuple[str, ...] = ()
@@ -984,6 +1029,7 @@ def _receipt_from_values(
             )
             for observation in trajectory_observations
         )
+        or trajectory_events
         else "incomplete"
         if trace_evidence_pointer_ids
         else "unavailable"
@@ -1016,7 +1062,7 @@ def _receipt_from_values(
             StateReceipt(
                 evidence=ReceiptEvidenceValue(
                     evidence_pointer_id=state_before_pointer_id,
-                    value=_bounded_capture_json(state_before),
+                    value=_bounded_capture_json(state_before, _MAXIMUM_STATE_CAPTURED_JSON_BYTES),
                 )
             )
             if state_before_pointer_id is not None
@@ -1026,7 +1072,7 @@ def _receipt_from_values(
             StateReceipt(
                 evidence=ReceiptEvidenceValue(
                     evidence_pointer_id=state_after_pointer_id,
-                    value=_bounded_capture_json(state_after),
+                    value=_bounded_capture_json(state_after, _MAXIMUM_STATE_CAPTURED_JSON_BYTES),
                 )
             )
             if state_after_pointer_id is not None
@@ -1978,10 +2024,13 @@ def _sha256(value: JsonValue) -> str:
     return hashlib.sha256(_canonical_json(value).encode("utf-8")).hexdigest()
 
 
-def _bounded_capture_json(value: JsonValue) -> CapturedJson:
+def _bounded_capture_json(
+    value: JsonValue,
+    maximum_bytes: int = _MAXIMUM_CAPTURED_JSON_BYTES,
+) -> CapturedJson:
     canonical_json = _bounded_canonical_json(
         value,
-        _MAXIMUM_CAPTURED_JSON_BYTES,
+        maximum_bytes,
         "captured JSON exceeds its byte limit",
     )
     return CapturedJson(
@@ -1990,8 +2039,11 @@ def _bounded_capture_json(value: JsonValue) -> CapturedJson:
     )
 
 
-def _evidence_artifact(value: JsonValue) -> EvidenceArtifact:
-    capture = _bounded_capture_json(value)
+def _evidence_artifact(
+    value: JsonValue,
+    maximum_bytes: int = _MAXIMUM_CAPTURED_JSON_BYTES,
+) -> EvidenceArtifact:
+    capture = _bounded_capture_json(value, maximum_bytes)
     return EvidenceArtifact(artifact_sha256=capture.sha256, value=capture)
 
 

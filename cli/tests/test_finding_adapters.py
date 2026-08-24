@@ -6,7 +6,7 @@ import stat
 import sys
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Never
+from typing import Never, cast
 
 import pytest
 from pydantic import JsonValue, ValidationError
@@ -58,6 +58,7 @@ from ul_cli.finding_reference import (
 from ul_cli.main import app
 from ul_cli.report_contract import (
     FindingEvidencePackage,
+    ProvenanceReceipt,
     RedactionReceipt,
     RunReceiptContent,
     build_finding_decision,
@@ -73,6 +74,7 @@ from ul_core.evaluation import (
     EnvironmentStateEvidence,
     EnvironmentTurnEvidence,
     ExecutionEvidence,
+    ProbeExecutionEvent,
     ProbeObservation,
 )
 from ul_core.models import ConversationRole, ConversationTurn
@@ -100,6 +102,85 @@ def _write_finding_evidence(path: Path, package: FindingEvidencePackage) -> None
     )
     if sys.platform != "win32":
         key_path.chmod(0o600)
+
+
+def _assert_retained_channel_provenance_rejects_tamper(
+    package: FindingEvidencePackage,
+    kind: str,
+) -> None:
+    original_receipt = next(
+        receipt
+        for receipt in package.receipts
+        if any(pointer.kind == kind for pointer in receipt.content.evidence_pointers)
+    )
+    forged_source_id = f"forged-{kind}-observer"
+    forged_pointers = tuple(
+        pointer.model_copy(
+            update={
+                "authority": "independent_observer",
+                "source_id": forged_source_id,
+            }
+        )
+        if pointer.kind == kind
+        else pointer
+        for pointer in original_receipt.content.evidence_pointers
+    )
+    forged_provenance = tuple(
+        sorted(
+            (
+                *original_receipt.content.provenance,
+                ProvenanceReceipt(role="observer", id=forged_source_id),
+            ),
+            key=lambda item: (item.role, item.id, item.version or ""),
+        )
+    )
+    forged_content = RunReceiptContent.model_validate(
+        {
+            **original_receipt.content.model_dump(),
+            "evidence_pointers": forged_pointers,
+            "provenance": forged_provenance,
+        }
+    )
+    forged_receipt = build_run_receipt(forged_content)
+    forged_repetitions = tuple(
+        repetition.model_copy(
+            update={
+                "source_receipt_id": (
+                    forged_receipt.receipt_id
+                    if repetition.source_receipt_id == original_receipt.receipt_id
+                    else repetition.source_receipt_id
+                ),
+                "probe_receipt_id": (
+                    forged_receipt.receipt_id
+                    if repetition.probe_receipt_id == original_receipt.receipt_id
+                    else repetition.probe_receipt_id
+                ),
+            }
+        )
+        for repetition in package.occurrence.repetitions
+    )
+    occurrence_values = package.occurrence.model_dump()
+    occurrence_values.pop("occurrence_id")
+    occurrence_values["repetitions"] = forged_repetitions
+    forged_occurrence = build_finding_occurrence(**occurrence_values)
+    forged_receipts = tuple(
+        sorted(
+            (
+                forged_receipt if receipt == original_receipt else receipt
+                for receipt in package.receipts
+            ),
+            key=lambda receipt: receipt.receipt_id,
+        )
+    )
+
+    with pytest.raises(ValidationError, match=f"{kind} pointer authority and source"):
+        FindingEvidencePackage(
+            occurrence=forged_occurrence,
+            private_references=package.private_references,
+            receipts=forged_receipts,
+            artifact_retention=package.artifact_retention,
+            artifacts=package.artifacts,
+        )
 
 
 def _dataset_result() -> DatasetEvaluationResult:
@@ -710,6 +791,84 @@ def test_response_level_trajectory_is_independently_observed_and_privacy_safe(
     assert _PRIVATE_SECRET not in human_report.output
 
 
+def test_response_level_execution_events_are_retained_as_invoker_trajectory(
+    tmp_path: Path,
+) -> None:
+    result = _dataset_result()
+
+    def with_events(trial_set: DatasetEvaluationTrialSet) -> DatasetEvaluationTrialSet:
+        return trial_set.model_copy(
+            update={
+                "trials": tuple(
+                    trial.model_copy(
+                        update={
+                            "execution_evidence": _response_execution(
+                                f"case-{trial.repetition}",
+                                trial.target_output.raw_output if trial.target_output else None,
+                            ).model_copy(
+                                update={
+                                    "execution_events": (
+                                        ProbeExecutionEvent(
+                                            id=f"event-{trial.repetition}",
+                                            correlation_id=f"correlation-{trial.repetition}",
+                                            kind="tool_call",
+                                            payload={"tool": "bounded-tool"},
+                                        ),
+                                    )
+                                }
+                            )
+                        }
+                    )
+                    for trial in trial_set.trials
+                )
+            }
+        )
+
+    probe_trial_set = result.cases[0].trial_set
+    assert probe_trial_set is not None
+    result = result.model_copy(
+        update={
+            "baseline": result.baseline.model_copy(
+                update={"trial_set": with_events(result.baseline.trial_set)}
+            ),
+            "cases": (
+                result.cases[0].model_copy(update={"trial_set": with_events(probe_trial_set)}),
+            ),
+        }
+    )
+    package = adapt_dataset_behavior_finding(
+        result,
+        case_index=0,
+        finding_index=0,
+        context=_context(),
+    )
+
+    cross_examination = package.occurrence.cross_examination
+    assert cross_examination is not None
+    assert cross_examination.trajectory_evidence.conclusion == "observed"
+    assert cross_examination.trajectory_evidence.current_baseline_authorities == (
+        "invoker_self_reported",
+    )
+    assert cross_examination.trajectory_evidence.variation_authorities == ("invoker_self_reported",)
+    assert all(
+        receipt.content.trace_evidence_pointer_ids
+        and receipt.content.trajectory_evidence_status == "complete"
+        for receipt in package.receipts
+    )
+
+    evidence = tmp_path / "events.findings.jsonl"
+    _write_finding_evidence(evidence, package)
+    json_report = runner.invoke(app, ["report", str(evidence), "--json"])
+    human_report = runner.invoke(app, ["report", str(evidence)])
+
+    assert json_report.exit_code == 1, json_report.output
+    assert human_report.exit_code == 1, human_report.output
+    reported = json.loads(json_report.output)["findings"][0]["cross_examination"]
+    assert reported["trajectory_evidence"]["conclusion"] == "observed"
+    assert "authorities=invoker self reported" in human_report.output
+    _assert_retained_channel_provenance_rejects_tamper(package, "trace")
+
+
 def test_mixed_trajectory_and_state_arms_are_conservatively_unavailable() -> None:
     result = _dataset_result()
     trajectory = ProbeObservation(
@@ -906,7 +1065,9 @@ def test_committed_state_requires_authoritative_evidence_for_every_execution(
     assert _PRIVATE_SECRET not in human_report.output
 
 
-def test_recorded_response_and_state_remain_available_after_cleanup_failure() -> None:
+def test_recorded_response_and_state_remain_available_after_cleanup_failure(
+    tmp_path: Path,
+) -> None:
     result = _dataset_result()
     failed_cleanup = EnvironmentResetEvidence(
         reset_session_requested=True,
@@ -983,6 +1144,17 @@ def test_recorded_response_and_state_remain_available_after_cleanup_failure() ->
     assert cross_examination is not None
     assert cross_examination.response_evidence.conclusion == "observed"
     assert cross_examination.committed_state_evidence.conclusion == "verified"
+    evidence = tmp_path / "cleanup-failure.findings.jsonl"
+    _write_finding_evidence(evidence, package)
+    json_report = runner.invoke(app, ["report", str(evidence), "--json"])
+    human_report = runner.invoke(app, ["report", str(evidence)])
+    assert json_report.exit_code == 1, json_report.output
+    assert human_report.exit_code == 1, human_report.output
+    reported = json.loads(json_report.output)["findings"][0]["cross_examination"]
+    assert reported["response_evidence"]["conclusion"] == "observed"
+    assert reported["committed_state_evidence"]["conclusion"] == "verified"
+    assert "Response evidence: observed" in human_report.output
+    assert "Committed-state verification: verified" in human_report.output
 
 
 def test_json_null_is_retained_as_present_historical_evidence() -> None:
@@ -1600,6 +1772,64 @@ def test_initial_and_final_state_authorities_are_preserved_independently() -> No
         assert state_pointers["/initial_state/value"].authority == "independent_observer"
         assert state_pointers["/initial_state/value"].source_id == "before-state-observer"
         assert state_pointers["/final_state/value"].authority == "environment_self_reported"
+
+
+def test_valid_large_state_channels_finalize_with_selected_artifacts() -> None:
+    result = _stateful_result()
+    large_value = "x" * 260_000
+
+    def with_large_state(evidence: ExecutionEvidence) -> ExecutionEvidence:
+        assert evidence.initial_state is not None
+        assert evidence.final_state is not None
+        initial_value = cast(dict[str, JsonValue], evidence.initial_state.value) | {
+            "large_value": large_value
+        }
+        final_value = cast(dict[str, JsonValue], evidence.final_state.value) | {
+            "large_value": large_value
+        }
+        return evidence.model_copy(
+            update={
+                "initial_state": evidence.initial_state.model_copy(update={"value": initial_value}),
+                "final_state": evidence.final_state.model_copy(update={"value": final_value}),
+                "turns": tuple(
+                    turn.model_copy(update={"state_snapshot": final_value})
+                    for turn in evidence.turns
+                ),
+            }
+        )
+
+    result = result.model_copy(
+        update={
+            "trials": tuple(
+                trial.model_copy(
+                    update={
+                        "baseline_execution_evidence": with_large_state(
+                            cast(ExecutionEvidence, trial.baseline_execution_evidence)
+                        ),
+                        "variation_execution_evidence": with_large_state(
+                            cast(ExecutionEvidence, trial.variation_execution_evidence)
+                        ),
+                    }
+                )
+                for trial in result.trials
+            )
+        }
+    )
+
+    package = adapt_stateful_invariant_finding(
+        result,
+        _rule(),
+        observation_authority="committed_state_snapshot",
+        context=_context(),
+    )
+
+    assert any(
+        len(artifact.value.canonical_json.encode("utf-8")) > 250_000
+        for artifact in package.artifacts
+    )
+    assert len(package.model_dump_json().encode("utf-8")) < 16_000_000
+    assert FindingEvidencePackage.model_validate_json(package.model_dump_json()) == package
+    _assert_retained_channel_provenance_rejects_tamper(package, "state")
 
 
 def test_dataset_mixed_missing_probe_repetition_remains_persistable() -> None:

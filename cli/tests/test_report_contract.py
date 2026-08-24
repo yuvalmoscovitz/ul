@@ -164,7 +164,13 @@ def _pointer(
             "kind": kind,
             "artifact_sha256": artifact.sha256,
             "record_id": record_id,
-            "json_pointer": "",
+            "json_pointer": (
+                "/initial_state/value"
+                if kind == "state" and ".state.before" in label
+                else "/final_state/value"
+                if kind == "state"
+                else ""
+            ),
             "arm": arm,
             "authority": authority,
             "source_id": source_id,
@@ -173,20 +179,34 @@ def _pointer(
 
 
 def _pointer_artifact_value(record_id: str, kind: str, arm: str) -> JsonValue:
-    return {
+    value: JsonValue = {
         "private": _PRIVATE_CANARY,
         "record_id": record_id,
         "kind": kind,
         "arm": arm,
     }
+    if kind == "state":
+        state_key = "initial_state" if ".state.before" in record_id else "final_state"
+        return {
+            state_key: {
+                "value": value,
+                "authority": "environment_self_reported",
+                "source_id": "environment",
+            }
+        }
+    return value
 
 
 def _evidence(pointer: EvidencePointer, value: JsonValue) -> ReceiptEvidenceValue:
     del value
     assert pointer.record_id is not None
+    artifact_value = _pointer_artifact_value(pointer.record_id, pointer.kind, pointer.arm)
+    state_key = "initial_state" if ".state.before" in pointer.record_id else "final_state"
     return ReceiptEvidenceValue(
         evidence_pointer_id=pointer.pointer_id,
-        value=capture_json(_pointer_artifact_value(pointer.record_id, pointer.kind, pointer.arm)),
+        value=capture_json(
+            artifact_value[state_key]["value"] if pointer.kind == "state" else artifact_value
+        ),
     )
 
 

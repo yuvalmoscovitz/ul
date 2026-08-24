@@ -208,6 +208,11 @@ relevant repetition in both execution arms. Partial coverage stays explicit and 
 conclusion unavailable; it is never rendered as a pass. Human and JSON reports contain the same
 safe conclusions and omit raw response, trace, state, and secret values.
 
+Structured execution events emitted by UL's invoker count as invoker-self-reported trajectory
+evidence even when no external observation spans are available. Trace and state pointers retain
+their channel envelopes independently, binding authority and source to the captured artifact while
+allowing valid state snapshots up to the execution channel limit without duplicating a whole run.
+
 This separation follows the signal boundaries in the
 [OpenInference semantic conventions](https://github.com/Arize-ai/openinference/blob/main/spec/semantic_conventions.md),
 where agent, tool, and model operations are represented as trace spans rather than response claims,

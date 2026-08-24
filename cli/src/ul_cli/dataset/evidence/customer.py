@@ -228,7 +228,9 @@ def _cross_examination_evidence_availability(
         for trial in trial_set.trials:
             execution_evidence = getattr(trial, "execution_evidence", None)
             if fact == "response":
-                present = getattr(trial, "target_output", None) is not None
+                present = (
+                    execution_evidence is not None and execution_evidence.final_response is not None
+                ) or getattr(trial, "target_output", None) is not None
                 if present:
                     authorities.add(
                         "source_self_reported"
@@ -251,6 +253,9 @@ def _cross_examination_evidence_availability(
                 )
                 present = any(observation.status == "complete" for observation in observed)
                 authorities.update(observation.authority for observation in observed)
+                if execution_evidence is not None and execution_evidence.execution_events:
+                    present = True
+                    authorities.add("invoker_self_reported")
             else:
                 initial_state = (
                     execution_evidence.initial_state if execution_evidence is not None else None
