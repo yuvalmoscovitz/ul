@@ -14,6 +14,10 @@ export UL_QUALIFICATION_ROOT="$PWD"
 mkdir -p tmp/ul-55/callable-run tmp/ul-55/http-run
 ```
 
+For the remaining human timing gate, start a timer before the first command and record elapsed time
+after UL prints the smoke result. The qualification report currently records the command count and
+post-install automated runtime, not an unmeasured human setup time.
+
 ## Callable smoke
 
 From the repository root, enter the disposable run directory and run:

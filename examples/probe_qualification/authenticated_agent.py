@@ -9,6 +9,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
+from examples.probe_qualification.receipt import append_private_receipt
+
 _TOKEN_ENVIRONMENT_VARIABLE = "UL_ENVIRONMENT_AGENT_TOKEN"
 
 
@@ -33,8 +35,7 @@ class QualificationRequestHandler(BaseHTTPRequestHandler):
             return
         receipt_path = os.environ.get("UL_QUALIFICATION_RECEIPT")
         if receipt_path:
-            with Path(receipt_path).open("a", encoding="utf-8") as receipt:
-                receipt.write(json.dumps({"input": value}, sort_keys=True) + "\n")
+            append_private_receipt(Path(receipt_path), value)
         self._write_json(HTTPStatus.OK, {"response": {"status": "open", "ticket": 42}})
 
     def log_message(self, format: str, *args: Any) -> None:

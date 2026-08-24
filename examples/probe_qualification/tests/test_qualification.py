@@ -3,6 +3,7 @@ from __future__ import annotations
 import http.client
 import os
 import secrets
+import stat
 import subprocess
 import sys
 import threading
@@ -41,6 +42,7 @@ def _run_smoke(
 def test_public_probe_smoke_is_one_target_call_and_zero_semantic_calls(
     tmp_path: Path,
     target_kind: str,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     receipt = tmp_path / "target-calls.jsonl"
     environment = os.environ.copy()
@@ -48,68 +50,62 @@ def test_public_probe_smoke_is_one_target_call_and_zero_semantic_calls(
     environment["UL_QUALIFICATION_RECEIPT"] = str(receipt)
     server: ThreadingHTTPServer | None = None
     server_thread: threading.Thread | None = None
-    if target_kind == "callable":
-        arguments = [
-            "probe",
-            str(_DATASET),
-            "--target",
-            "examples.probe_qualification.callable_agent:invoke",
-            "--target-working-directory",
-            str(_REPOSITORY_ROOT),
-            "--target-environment-variable",
-            "UL_QUALIFICATION_RECEIPT",
-            "--limit",
-            "1",
-        ]
-    else:
-        token = f"Bearer {secrets.token_urlsafe(24)}"
-        environment["UL_ENVIRONMENT_AGENT_TOKEN"] = token
-        previous_token = os.environ.get("UL_ENVIRONMENT_AGENT_TOKEN")
-        previous_receipt = os.environ.get("UL_QUALIFICATION_RECEIPT")
-        os.environ["UL_ENVIRONMENT_AGENT_TOKEN"] = token
-        os.environ["UL_QUALIFICATION_RECEIPT"] = str(receipt)
-        server = ThreadingHTTPServer(("127.0.0.1", 0), QualificationRequestHandler)
-        server_thread = threading.Thread(target=server.serve_forever)
-        server_thread.start()
-        unauthenticated_client = http.client.HTTPConnection("127.0.0.1", server.server_port)
-        unauthenticated_client.request(
-            "POST",
-            "/invoke",
-            body='{"input":"Return the status for ticket 42."}',
-            headers={"Content-Type": "application/json"},
-        )
-        assert unauthenticated_client.getresponse().status == 401
-        unauthenticated_client.close()
-        arguments = [
-            "probe",
-            str(_DATASET),
-            "--target",
-            f"http://127.0.0.1:{server.server_port}/invoke",
-            "--header-from-env",
-            "Authorization=UL_ENVIRONMENT_AGENT_TOKEN",
-            "--allow-insecure-http",
-            "--limit",
-            "1",
-        ]
+    server_started = False
     try:
+        if target_kind == "callable":
+            arguments = [
+                "probe",
+                str(_DATASET),
+                "--target",
+                "examples.probe_qualification.callable_agent:invoke",
+                "--target-working-directory",
+                str(_REPOSITORY_ROOT),
+                "--target-environment-variable",
+                "UL_QUALIFICATION_RECEIPT",
+                "--limit",
+                "1",
+            ]
+        else:
+            token = f"Bearer {secrets.token_urlsafe(24)}"
+            environment["UL_ENVIRONMENT_AGENT_TOKEN"] = token
+            monkeypatch.setenv("UL_ENVIRONMENT_AGENT_TOKEN", token)
+            monkeypatch.setenv("UL_QUALIFICATION_RECEIPT", str(receipt))
+            server = ThreadingHTTPServer(("127.0.0.1", 0), QualificationRequestHandler)
+            server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+            server_thread.start()
+            server_started = True
+            unauthenticated_client = http.client.HTTPConnection("127.0.0.1", server.server_port)
+            try:
+                unauthenticated_client.request(
+                    "POST",
+                    "/invoke",
+                    body='{"input":"Return the status for ticket 42."}',
+                    headers={"Content-Type": "application/json"},
+                )
+                assert unauthenticated_client.getresponse().status == 401
+            finally:
+                unauthenticated_client.close()
+            arguments = [
+                "probe",
+                str(_DATASET),
+                "--target",
+                f"http://127.0.0.1:{server.server_port}/invoke",
+                "--header-from-env",
+                "Authorization=UL_ENVIRONMENT_AGENT_TOKEN",
+                "--allow-insecure-http",
+                "--limit",
+                "1",
+            ]
         output, elapsed_seconds = _run_smoke(
             arguments, working_directory=tmp_path, environment=environment
         )
     finally:
         if server is not None:
-            server.shutdown()
+            if server_started:
+                server.shutdown()
             server.server_close()
-        if server_thread is not None:
+        if server_thread is not None and server_started:
             server_thread.join()
-        if target_kind == "authenticated_http":
-            if previous_token is None:
-                os.environ.pop("UL_ENVIRONMENT_AGENT_TOKEN", None)
-            else:
-                os.environ["UL_ENVIRONMENT_AGENT_TOKEN"] = previous_token
-            if previous_receipt is None:
-                os.environ.pop("UL_QUALIFICATION_RECEIPT", None)
-            else:
-                os.environ["UL_QUALIFICATION_RECEIPT"] = previous_receipt
     normalized_output = " ".join(output.split())
     assert "Smoke target invocation succeeded" in normalized_output
     assert "Command-wide environment API requests: 3 (includes smoke)" in normalized_output
@@ -117,5 +113,7 @@ def test_public_probe_smoke_is_one_target_call_and_zero_semantic_calls(
     assert "No semantic-model calls were made" in normalized_output
     assert elapsed_seconds < 300
     assert len(receipt.read_text(encoding="utf-8").splitlines()) == 1
+    if os.name != "nt":
+        assert stat.S_IMODE(receipt.stat().st_mode) == 0o600
     if target_kind == "authenticated_http":
         assert environment["UL_ENVIRONMENT_AGENT_TOKEN"] not in output

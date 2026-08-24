@@ -1,13 +1,13 @@
 from __future__ import annotations
 
-import json
 import os
 from pathlib import Path
+
+from examples.probe_qualification.receipt import append_private_receipt
 
 
 def invoke(value: object) -> dict[str, object]:
     receipt_path = os.environ.get("UL_QUALIFICATION_RECEIPT")
     if receipt_path:
-        with Path(receipt_path).open("a", encoding="utf-8") as receipt:
-            receipt.write(json.dumps({"input": value}, sort_keys=True) + "\n")
+        append_private_receipt(Path(receipt_path), value)
     return {"status": "open", "ticket": 42}
