@@ -19,6 +19,7 @@ from ul_cli.main import app
 from ul_cli.report_contract import (
     CapturedJson,
     CrossExaminationArm,
+    CrossExaminationEvidenceAvailability,
     DecisionReadyFinding,
     EvidenceArtifact,
     EvidencePointer,
@@ -64,6 +65,37 @@ def test_report_module_imports_in_a_clean_process() -> None:
     )
 
     assert result.returncode == 0, result.stderr
+
+
+@pytest.mark.parametrize(
+    "values",
+    (
+        {
+            "fact": "trajectory",
+            "conclusion": "verified",
+            "current_baseline": "verified",
+            "variation": "verified",
+            "authorities": ("independent_observer",),
+        },
+        {
+            "fact": "committed_state",
+            "conclusion": "verified",
+            "current_baseline": "verified",
+            "variation": "unavailable",
+            "authorities": ("independent_observer",),
+        },
+        {
+            "fact": "response",
+            "conclusion": "observed",
+            "current_baseline": "observed",
+            "variation": "observed",
+            "authorities": (),
+        },
+    ),
+)
+def test_evidence_availability_rejects_overclaims(values: dict[str, object]) -> None:
+    with pytest.raises(ValidationError):
+        CrossExaminationEvidenceAvailability.model_validate(values)
 
 
 def _sha(value: str) -> str:
@@ -418,7 +450,25 @@ def _dataset_package() -> FindingEvidencePackage:
             augmentation_sensitivity="observed",
             intrinsic_instability="not_observed",
             material_delta_evidence_pointer_ids=action_ids,
-            evidence_level="response_observed",
+            response_evidence=CrossExaminationEvidenceAvailability(
+                fact="response",
+                conclusion="observed",
+                current_baseline="observed",
+                variation="observed",
+                authorities=("source_self_reported",),
+            ),
+            trajectory_evidence=CrossExaminationEvidenceAvailability(
+                fact="trajectory",
+                conclusion="unavailable",
+                current_baseline="unavailable",
+                variation="unavailable",
+            ),
+            committed_state_evidence=CrossExaminationEvidenceAvailability(
+                fact="committed_state",
+                conclusion="unavailable",
+                current_baseline="unavailable",
+                variation="unavailable",
+            ),
             limitations=(
                 "causality_not_established",
                 "correctness_not_verified",

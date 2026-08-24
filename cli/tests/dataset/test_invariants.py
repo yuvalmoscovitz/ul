@@ -181,7 +181,7 @@ def test_extended_invariants_use_new_evidence_schema_and_hide_values_from_termin
     presentation_module._print_invariant_results((invariant_evaluation,))
     terminal_output = capsys.readouterr().out
 
-    assert parsed.schema_version == "1.12.0"
+    assert parsed.schema_version == "1.13.0"
     assert parsed.evaluation_mode == "variance"
     assert parsed.run_context is not None
     assert parsed.run_context.evaluation_mode == "variance"

@@ -6,6 +6,7 @@ import stat
 import sys
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Never
 
 import pytest
 from pydantic import JsonValue, ValidationError
@@ -71,6 +72,7 @@ from ul_core.evaluation import (
     EnvironmentStateEvidence,
     EnvironmentTurnEvidence,
     ExecutionEvidence,
+    ProbeObservation,
 )
 from ul_core.models import ConversationRole, ConversationTurn
 
@@ -340,6 +342,31 @@ def _execution(case_id: str, turn_ids: tuple[str, ...], amount: int) -> Executio
     )
 
 
+def _response_execution(
+    case_id: str,
+    response: JsonValue,
+    *,
+    observation: ProbeObservation | None = None,
+) -> ExecutionEvidence:
+    turn = EnvironmentTurnEvidence(turn_id="turn-1", response=response)
+    return ExecutionEvidence(
+        evidence_scope="response_only",
+        case_id=case_id,
+        environment_id="response-agent",
+        environment_config_sha256=_SHA256,
+        turns=(turn,),
+        final_response=response,
+        observations=(observation,) if observation is not None else (),
+        lifecycle=EnvironmentLifecycleEvidence(
+            terminal_status="succeeded",
+            completed_phases=("execute_turn",),
+            delivery="certain",
+            cleanup="not_attempted",
+            environment_state_uncertain=False,
+        ),
+    )
+
+
 def _rule_evaluation(status: str, amount: int) -> DatasetInvariantRuleEvaluation:
     return DatasetInvariantRuleEvaluation.model_validate(
         {
@@ -571,7 +598,9 @@ def test_dataset_occurrence_cross_examines_all_three_response_arms() -> None:
     assert cross_examination.baseline_drift == "not_observed"
     assert cross_examination.augmentation_sensitivity == "observed"
     assert cross_examination.intrinsic_instability == "not_observed"
-    assert cross_examination.evidence_level == "response_observed"
+    assert cross_examination.response_evidence.conclusion == "observed"
+    assert cross_examination.trajectory_evidence.conclusion == "unavailable"
+    assert cross_examination.committed_state_evidence.conclusion == "unavailable"
     assert cross_examination.current_baseline.requested_repetitions == 2
     assert cross_examination.variation.requested_repetitions == 2
     assert len(cross_examination.historical_reference.response_evidence_pointer_ids) == 1
@@ -588,6 +617,221 @@ def test_dataset_occurrence_cross_examines_all_three_response_arms() -> None:
         "correctness_not_verified",
         "historical_reference_not_an_oracle",
     )
+
+
+def test_response_level_trajectory_is_independently_observed_and_privacy_safe(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    result = _dataset_result()
+    trajectory = ProbeObservation(
+        id="observation-1",
+        source_id="otel-collector",
+        correlation_id="correlation-1",
+        authority="independent_observer",
+        traces=({"private_trace": _PRIVATE_SECRET},),
+    )
+
+    def with_trajectory(trial_set: DatasetEvaluationTrialSet) -> DatasetEvaluationTrialSet:
+        return trial_set.model_copy(
+            update={
+                "trials": tuple(
+                    trial.model_copy(
+                        update={
+                            "execution_evidence": _response_execution(
+                                f"case-{trial.repetition}",
+                                trial.target_output.raw_output if trial.target_output else None,
+                                observation=trajectory.model_copy(
+                                    update={"correlation_id": f"correlation-{trial.repetition}"}
+                                ),
+                            )
+                        }
+                    )
+                    for trial in trial_set.trials
+                )
+            }
+        )
+
+    probe_trial_set = result.cases[0].trial_set
+    assert probe_trial_set is not None
+    result = result.model_copy(
+        update={
+            "baseline": result.baseline.model_copy(
+                update={"trial_set": with_trajectory(result.baseline.trial_set)}
+            ),
+            "cases": (
+                result.cases[0].model_copy(update={"trial_set": with_trajectory(probe_trial_set)}),
+            ),
+        }
+    )
+    package = adapt_dataset_behavior_finding(
+        result,
+        case_index=0,
+        finding_index=0,
+        context=_context(),
+    )
+    cross_examination = package.occurrence.cross_examination
+    assert cross_examination is not None
+    assert cross_examination.response_evidence.conclusion == "observed"
+    assert cross_examination.trajectory_evidence.conclusion == "observed"
+    assert cross_examination.trajectory_evidence.authorities == ("independent_observer",)
+    assert cross_examination.committed_state_evidence.conclusion == "unavailable"
+    assert cross_examination.current_baseline.trajectory_evidence_pointer_ids
+    assert cross_examination.variation.trajectory_evidence_pointer_ids
+
+    evidence = tmp_path / "trajectory.findings.jsonl"
+    _write_finding_evidence(evidence, package)
+
+    def reject_network(*args: object, **kwargs: object) -> Never:
+        del args, kwargs
+        raise AssertionError("offline reporting attempted a network connection")
+
+    monkeypatch.setattr("socket.create_connection", reject_network)
+    json_report = runner.invoke(app, ["report", str(evidence), "--json"])
+    human_report = runner.invoke(app, ["report", str(evidence)])
+
+    assert json_report.exit_code == 1, json_report.output
+    assert human_report.exit_code == 1, human_report.output
+    reported = json.loads(json_report.output)["findings"][0]["cross_examination"]
+    assert reported["trajectory_evidence"]["conclusion"] == "observed"
+    assert "Trajectory evidence: observed" in human_report.output
+    assert "Committed-state verification: unavailable" in human_report.output
+    assert _PRIVATE_SECRET not in json_report.output
+    assert _PRIVATE_SECRET not in human_report.output
+
+
+def test_mixed_trajectory_and_state_arms_are_conservatively_unavailable() -> None:
+    result = _dataset_result()
+    trajectory = ProbeObservation(
+        id="observation-1",
+        source_id="otel-collector",
+        correlation_id="correlation-1",
+        authority="independent_observer",
+        tool_calls=({"name": "bounded-tool"},),
+    )
+
+    def attach(
+        trial_set: DatasetEvaluationTrialSet,
+        *,
+        omit_last_trajectory: bool,
+    ) -> DatasetEvaluationTrialSet:
+        return trial_set.model_copy(
+            update={
+                "trials": tuple(
+                    trial.model_copy(
+                        update={
+                            "execution_evidence": _response_execution(
+                                f"case-{trial.repetition}",
+                                trial.target_output.raw_output if trial.target_output else None,
+                                observation=(
+                                    trajectory.model_copy(
+                                        update={
+                                            "correlation_id": f"correlation-{trial.repetition}",
+                                            "status": "incomplete",
+                                            "limitation": "bounded receiver dropped spans",
+                                        }
+                                    )
+                                    if omit_last_trajectory
+                                    and trial.repetition == trial_set.requested_repetitions
+                                    else trajectory.model_copy(
+                                        update={"correlation_id": f"correlation-{trial.repetition}"}
+                                    )
+                                ),
+                            )
+                        }
+                    )
+                    for trial in trial_set.trials
+                )
+            }
+        )
+
+    probe_trial_set = result.cases[0].trial_set
+    assert probe_trial_set is not None
+    result = result.model_copy(
+        update={
+            "baseline": result.baseline.model_copy(
+                update={"trial_set": attach(result.baseline.trial_set, omit_last_trajectory=False)}
+            ),
+            "cases": (
+                result.cases[0].model_copy(
+                    update={"trial_set": attach(probe_trial_set, omit_last_trajectory=True)}
+                ),
+            ),
+        }
+    )
+    package = adapt_dataset_behavior_finding(
+        result,
+        case_index=0,
+        finding_index=0,
+        context=_context(),
+    )
+    cross_examination = package.occurrence.cross_examination
+    assert cross_examination is not None
+    assert cross_examination.trajectory_evidence.conclusion == "unavailable"
+    assert cross_examination.trajectory_evidence.current_baseline == "observed"
+    assert cross_examination.trajectory_evidence.variation == "unavailable"
+    assert cross_examination.trajectory_evidence.authorities == ("independent_observer",)
+    assert cross_examination.committed_state_evidence.conclusion == "unavailable"
+
+
+def test_committed_state_requires_authoritative_evidence_for_every_execution(
+    tmp_path: Path,
+) -> None:
+    result = _dataset_result()
+
+    def with_state(trial_set: DatasetEvaluationTrialSet) -> DatasetEvaluationTrialSet:
+        return trial_set.model_copy(
+            update={
+                "trials": tuple(
+                    trial.model_copy(
+                        update={
+                            "execution_evidence": _execution(
+                                f"case-{trial.repetition}",
+                                ("turn-1",),
+                                100,
+                            )
+                        }
+                    )
+                    for trial in trial_set.trials
+                )
+            }
+        )
+
+    probe_trial_set = result.cases[0].trial_set
+    assert probe_trial_set is not None
+    result = result.model_copy(
+        update={
+            "baseline": result.baseline.model_copy(
+                update={"trial_set": with_state(result.baseline.trial_set)}
+            ),
+            "cases": (
+                result.cases[0].model_copy(update={"trial_set": with_state(probe_trial_set)}),
+            ),
+        }
+    )
+    package = adapt_dataset_behavior_finding(
+        result,
+        case_index=0,
+        finding_index=0,
+        context=_context(),
+    )
+    cross_examination = package.occurrence.cross_examination
+    assert cross_examination is not None
+    assert cross_examination.committed_state_evidence.conclusion == "verified"
+    assert cross_examination.committed_state_evidence.authorities == ("environment_self_reported",)
+    assert cross_examination.current_baseline.committed_state_evidence_pointer_ids
+    assert cross_examination.variation.committed_state_evidence_pointer_ids
+    evidence = tmp_path / "state.findings.jsonl"
+    _write_finding_evidence(evidence, package)
+    json_report = runner.invoke(app, ["report", str(evidence), "--json"])
+    human_report = runner.invoke(app, ["report", str(evidence)])
+    assert json_report.exit_code == 1, json_report.output
+    assert human_report.exit_code == 1, human_report.output
+    reported = json.loads(json_report.output)["findings"][0]["cross_examination"]
+    assert reported["committed_state_evidence"]["conclusion"] == "verified"
+    assert "Committed-state verification: verified" in human_report.output
+    assert _PRIVATE_SECRET not in json_report.output
+    assert _PRIVATE_SECRET not in human_report.output
 
 
 def test_json_null_is_retained_as_present_historical_evidence() -> None:

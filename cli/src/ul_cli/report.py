@@ -249,6 +249,8 @@ def _print_finding_decision_report(report: FindingDecisionReport, evidence: Path
             f"scope={finding.evidence_scope.replace('_', ' ')}; authorities="
             + ", ".join(authority.replace("_", " ") for authority in finding.evidence_authorities)
         )
+        if finding.cross_examination is not None:
+            _print_cross_examination_evidence(finding.cross_examination, indent="  ")
         typer.echo(
             f"  Review: {finding.review_status}; "
             f"human-confirmed severity={finding.human_confirmed_severity}; "
@@ -635,11 +637,8 @@ def _print_human_report(report: UnifiedReport, evidence: Path) -> None:
                 "    Intrinsic instability: "
                 f"{cross_examination.intrinsic_instability.replace('_', ' ')}"
             )
-            typer.echo(
-                "    Evidence level: "
-                f"{cross_examination.evidence_level.replace('_', ' ')}; "
-                f"material deltas={cross_examination.material_delta_count}"
-            )
+            _print_cross_examination_evidence(cross_examination, indent="    ")
+            typer.echo(f"    Material deltas: {cross_examination.material_delta_count}")
             typer.echo(
                 "    Fresh baseline repetitions: "
                 f"{cross_examination.current_baseline.observed_repetitions}/"
@@ -674,6 +673,25 @@ def _print_human_report(report: UnifiedReport, evidence: Path) -> None:
         typer.echo(
             "Drill-down: inspect the supplied evidence JSON; "
             "no dedicated stateful detail command is available."
+        )
+
+
+def _print_cross_examination_evidence(cross_examination: object, *, indent: str) -> None:
+    for label, attribute in (
+        ("Response evidence", "response_evidence"),
+        ("Trajectory evidence", "trajectory_evidence"),
+        ("Committed-state verification", "committed_state_evidence"),
+    ):
+        availability = getattr(cross_examination, attribute)
+        authorities = (
+            ", ".join(authority.replace("_", " ") for authority in availability.authorities)
+            or "none"
+        )
+        typer.echo(
+            f"{indent}{label}: {availability.conclusion.replace('_', ' ')}; "
+            f"baseline={availability.current_baseline.replace('_', ' ')}; "
+            f"variation={availability.variation.replace('_', ' ')}; "
+            f"authorities={authorities}"
         )
 
 

@@ -5,7 +5,7 @@ import json
 import re
 import unicodedata
 from datetime import datetime
-from typing import Annotated, Literal, Self, cast
+from typing import Annotated, Any, Literal, Self, cast
 
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, ValidationInfo, model_validator
 
@@ -16,6 +16,12 @@ ReportEvidenceType = Literal[
     "timeout_after_commit",
 ]
 ReportReviewStatus = Literal["resolved", "action_required", "inconclusive"]
+
+
+def _is_none(value: object) -> bool:
+    return value is None
+
+
 ReportEvaluationMode = Literal["variance"]
 ReportEvidenceScope = Literal["response_only", "response_and_state"]
 DecisionEvidenceScope = Literal["response_only", "response_and_state", "mixed"]
@@ -149,11 +155,7 @@ DecisionClaimKind = Literal[
     "flag_reason",
 ]
 CrossExaminationSignal = Literal["observed", "not_observed", "inconclusive"]
-CrossExaminationEvidenceLevel = Literal[
-    "response_observed",
-    "trajectory_observed",
-    "committed_state_verified",
-]
+CrossExaminationEvidenceStatus = Literal["observed", "verified", "unavailable"]
 
 
 class VersionedReference(_StrictModel):
@@ -309,6 +311,8 @@ class RepetitionSummary(_StrictModel):
 class CrossExaminationArm(_StrictModel):
     role: Literal["historical_reference", "current_baseline", "variation"]
     response_evidence_pointer_ids: tuple[str, ...] = Field(min_length=1, max_length=1_000)
+    trajectory_evidence_pointer_ids: tuple[str, ...] = Field(default=(), max_length=1_000)
+    committed_state_evidence_pointer_ids: tuple[str, ...] = Field(default=(), max_length=2_000)
     requested_repetitions: int = Field(ge=0)
     observed_repetitions: int = Field(ge=0)
     inconclusive_repetitions: int = Field(ge=0)
@@ -319,6 +323,14 @@ class CrossExaminationArm(_StrictModel):
         _validate_sorted_unique(
             self.response_evidence_pointer_ids,
             "cross-examination response evidence pointer IDs",
+        )
+        _validate_sorted_unique(
+            self.trajectory_evidence_pointer_ids,
+            "cross-examination trajectory evidence pointer IDs",
+        )
+        _validate_sorted_unique(
+            self.committed_state_evidence_pointer_ids,
+            "cross-examination committed-state evidence pointer IDs",
         )
         if self.role == "historical_reference":
             if (
@@ -336,6 +348,35 @@ class CrossExaminationArm(_StrictModel):
         return self
 
 
+class CrossExaminationEvidenceAvailability(_StrictModel):
+    fact: Literal["response", "trajectory", "committed_state"]
+    conclusion: CrossExaminationEvidenceStatus
+    current_baseline: CrossExaminationEvidenceStatus
+    variation: CrossExaminationEvidenceStatus
+    authorities: tuple[EvidenceAuthority, ...] = Field(default=(), max_length=10)
+
+    @model_validator(mode="after")
+    def validate_availability(self) -> Self:
+        achieved = "verified" if self.fact == "committed_state" else "observed"
+        allowed = {achieved, "unavailable"}
+        if {self.conclusion, self.current_baseline, self.variation} - allowed:
+            raise ValueError("evidence conclusion is incompatible with its fact")
+        expected = (
+            achieved
+            if self.current_baseline == achieved and self.variation == achieved
+            else "unavailable"
+        )
+        if self.conclusion != expected:
+            raise ValueError("evidence conclusion must conservatively summarize both arms")
+        if self.authorities != tuple(sorted(set(self.authorities))):
+            raise ValueError("evidence authorities must be sorted and unique")
+        if (
+            self.current_baseline == achieved or self.variation == achieved
+        ) and not self.authorities:
+            raise ValueError("observed evidence requires its authority")
+        return self
+
+
 class FindingCrossExamination(_StrictModel):
     historical_reference: CrossExaminationArm
     current_baseline: CrossExaminationArm
@@ -345,7 +386,9 @@ class FindingCrossExamination(_StrictModel):
     augmentation_sensitivity: CrossExaminationSignal
     intrinsic_instability: CrossExaminationSignal
     material_delta_evidence_pointer_ids: tuple[str, ...] = Field(min_length=1, max_length=1_000)
-    evidence_level: CrossExaminationEvidenceLevel
+    response_evidence: CrossExaminationEvidenceAvailability
+    trajectory_evidence: CrossExaminationEvidenceAvailability
+    committed_state_evidence: CrossExaminationEvidenceAvailability
     limitations: tuple[
         Literal[
             "causality_not_established",
@@ -377,6 +420,29 @@ class FindingCrossExamination(_StrictModel):
         }
         if set(self.limitations) != required_limitations:
             raise ValueError("variance cross-examination requires every interpretation limit")
+        if (
+            self.response_evidence.fact,
+            self.trajectory_evidence.fact,
+            self.committed_state_evidence.fact,
+        ) != ("response", "trajectory", "committed_state"):
+            raise ValueError("cross-examination evidence conclusions must cover every fact")
+        for availability, pointer_attribute, achieved in (
+            (self.response_evidence, "response_evidence_pointer_ids", "observed"),
+            (self.trajectory_evidence, "trajectory_evidence_pointer_ids", "observed"),
+            (
+                self.committed_state_evidence,
+                "committed_state_evidence_pointer_ids",
+                "verified",
+            ),
+        ):
+            for arm_name, arm in (
+                ("current_baseline", self.current_baseline),
+                ("variation", self.variation),
+            ):
+                if getattr(availability, arm_name) == achieved and not getattr(
+                    arm, pointer_attribute
+                ):
+                    raise ValueError("available evidence conclusions require exact pointers")
         unstable = "unstable" in {
             self.current_baseline.stability,
             self.variation.stability,
@@ -484,7 +550,11 @@ class FindingOccurrence(_StrictModel):
                         self.cross_examination.current_baseline,
                         self.cross_examination.variation,
                     )
-                    for pointer_id in arm.response_evidence_pointer_ids
+                    for pointer_id in (
+                        *arm.response_evidence_pointer_ids,
+                        *arm.trajectory_evidence_pointer_ids,
+                        *arm.committed_state_evidence_pointer_ids,
+                    )
                 )
                 if self.cross_examination is not None
                 else ()
@@ -964,6 +1034,7 @@ class DecisionReadyFinding(_StrictModel):
         "customer_rule_evaluated",
     ]
     evidence_authorities: tuple[EvidenceAuthority, ...] = Field(min_length=1, max_length=10)
+    cross_examination: FindingCrossExamination | None = None
     limitations: tuple[FindingDecisionLimitation, ...] = ()
     review_workflow: Literal["dataset_review", "external_review_required"]
     review_status: Literal["needs_review"] = "needs_review"
@@ -1197,6 +1268,7 @@ def build_finding_decision(package: FindingEvidencePackage) -> DecisionReadyFind
         evidence_scope=evidence_scope,
         evidence_level=evidence_level,
         evidence_authorities=evidence_authorities,
+        cross_examination=occurrence.cross_examination,
         limitations=tuple(
             FindingDecisionLimitation(code=code, summary=_LIMITATION_SUMMARIES[code])
             for code in occurrence.limitations
@@ -1556,6 +1628,18 @@ def _validate_occurrence_evidence(
                 for pointer_id in arm.response_evidence_pointer_ids
             ):
                 raise ValueError("current cross-examination arms require response evidence")
+            if any(
+                pointers[pointer_id].kind != "trace"
+                or pointers[pointer_id].arm != expected_pointer_arm
+                for pointer_id in arm.trajectory_evidence_pointer_ids
+            ):
+                raise ValueError("trajectory conclusions require correlated trace evidence")
+            if any(
+                pointers[pointer_id].kind != "state"
+                or pointers[pointer_id].arm != expected_pointer_arm
+                for pointer_id in arm.committed_state_evidence_pointer_ids
+            ):
+                raise ValueError("committed-state conclusions require state evidence")
         if not set(cross_examination.material_delta_evidence_pointer_ids).issubset(
             {
                 pointer_id
@@ -1643,7 +1727,9 @@ class FindingCrossExaminationSummary(_StrictModel):
     augmentation_sensitivity: CrossExaminationSignal
     intrinsic_instability: CrossExaminationSignal
     material_delta_count: int = Field(ge=0)
-    evidence_level: CrossExaminationEvidenceLevel
+    response_evidence: CrossExaminationEvidenceAvailability
+    trajectory_evidence: CrossExaminationEvidenceAvailability
+    committed_state_evidence: CrossExaminationEvidenceAvailability
     limitations: tuple[
         Literal[
             "causality_not_established",
@@ -1664,6 +1750,12 @@ class FindingCrossExaminationSummary(_StrictModel):
             "historical_reference_not_an_oracle",
         }:
             raise ValueError("cross-examination summary requires every interpretation limit")
+        if (
+            self.response_evidence.fact,
+            self.trajectory_evidence.fact,
+            self.committed_state_evidence.fact,
+        ) != ("response", "trajectory", "committed_state"):
+            raise ValueError("summary evidence conclusions must cover every fact")
         baseline_incomplete = self.current_baseline.stability == "inconclusive"
         comparison_incomplete = "inconclusive" in {
             self.current_baseline.stability,
@@ -1707,8 +1799,8 @@ class FindingSummary(_StrictModel):
     violated_repetitions: int | None = Field(default=None, ge=0)
     next_action: FindingNextAction
     summary: FindingSummaryText
-    cross_examination: FindingCrossExaminationSummary | None = Field(
-        default=None, exclude_if=lambda value: value is None
+    cross_examination: FindingCrossExaminationSummary | None = cast(Any, Field)(
+        default=None, exclude_if=_is_none
     )
 
     @model_validator(mode="after")

@@ -27,12 +27,13 @@ from ul.dataset_invariants import (
     evaluate_dataset_invariant_rules,
 )
 from ul_core.dataset import ObservedAgentOutput, ObservedOutcome, SemanticFrame
-from ul_core.evaluation import EnvironmentStateEvidence, ExecutionEvidence
+from ul_core.evaluation import EnvironmentStateEvidence, ExecutionEvidence, ProbeObservation
 
 from ul_cli.finding_reference import finding_public_reference
 from ul_cli.report_contract import (
     CapturedJson,
     CrossExaminationArm,
+    CrossExaminationEvidenceAvailability,
     EvidenceArtifact,
     EvidencePointer,
     FindingCategory,
@@ -106,6 +107,7 @@ class _ReceiptBuild:
     rule_definition_pointer_id: str | None = None
     artifacts: tuple[EvidenceArtifact, ...] = ()
     execution_available: bool = True
+    trajectory_evidence_complete: bool = False
 
 
 @dataclass(frozen=True)
@@ -673,6 +675,7 @@ def _execution_receipt(
         lifecycle_json_pointer="/lifecycle",
         limitations=tuple(receipt_limitations),
         execution_available=execution_available,
+        trajectory_observations=execution_evidence.observations,
         historical_reference_value=historical_reference_value,
         historical_reference_present=historical_reference_present,
     )
@@ -730,6 +733,7 @@ def _receipt_from_values(
     lifecycle_json_pointer: str | None = "/lifecycle",
     limitations: tuple[str, ...] = (),
     execution_available: bool = True,
+    trajectory_observations: tuple[ProbeObservation, ...] = (),
     historical_reference_value: JsonValue | None = None,
     historical_reference_present: bool = False,
 ) -> _ReceiptBuild:
@@ -831,6 +835,7 @@ def _receipt_from_values(
             pointer_arm=arm,
             authority=state_before_authority,
             source_id=state_before_source_id,
+            retain_artifact=True,
         )
         state_after_pointer_id = add_pointer(
             kind="state",
@@ -838,7 +843,27 @@ def _receipt_from_values(
             pointer_arm=arm,
             authority=state_after_authority,
             source_id=state_after_source_id,
+            retain_artifact=True,
         )
+    trace_evidence_pointer_ids = tuple(
+        add_pointer(
+            kind="trace",
+            json_pointer=f"/observations/{observation_index}",
+            pointer_arm=arm,
+            authority=observation.authority,
+            source_id=observation.source_id,
+            retain_artifact=True,
+        )
+        for observation_index, observation in enumerate(trajectory_observations)
+        if any(
+            (
+                observation.traces,
+                observation.tool_calls,
+                observation.handoffs,
+                observation.errors,
+            )
+        )
+    )
     category_pointer_ids: tuple[str, ...] = ()
     if category is not None and category_value is not None:
         category_pointer_kind = "rule" if category == "customer_invariant_violation" else "action"
@@ -886,6 +911,26 @@ def _receipt_from_values(
     provenance.extend(
         ProvenanceReceipt(role="observer", id=source_id)
         for source_id in sorted(observer_source_ids)
+    )
+    trajectory_provenance = {
+        (
+            "observer" if observation.authority == "independent_observer" else "target",
+            observation.source_id,
+        )
+        for observation in trajectory_observations
+        if any(
+            (
+                observation.traces,
+                observation.tool_calls,
+                observation.handoffs,
+                observation.errors,
+            )
+        )
+    }
+    provenance.extend(
+        ProvenanceReceipt(role=cast(Literal["observer", "target"], role), id=source_id)
+        for role, source_id in sorted(trajectory_provenance)
+        if not any(item.role == role and item.id == source_id for item in provenance)
     )
     provenance.sort(key=lambda item: (item.role, item.id, item.version or ""))
     receipt_limitations = set(limitations)
@@ -962,6 +1007,7 @@ def _receipt_from_values(
             ),
         ),
         provenance=tuple(provenance),
+        trace_evidence_pointer_ids=trace_evidence_pointer_ids,
         redaction=context.redaction,
         evidence_pointers=tuple(sorted(pointers, key=lambda pointer: pointer.pointer_id)),
         limitations=tuple(sorted(receipt_limitations)),
@@ -976,6 +1022,18 @@ def _receipt_from_values(
         rule_definition_pointer_id=rule_definition_pointer_id,
         artifacts=tuple(sorted(retained_artifacts.values(), key=lambda item: item.artifact_sha256)),
         execution_available=execution_available,
+        trajectory_evidence_complete=any(
+            observation.status == "complete"
+            and any(
+                (
+                    observation.traces,
+                    observation.tool_calls,
+                    observation.handoffs,
+                    observation.errors,
+                )
+            )
+            for observation in trajectory_observations
+        ),
     )
 
 
@@ -1091,6 +1149,59 @@ def _baseline_drift_signal(
     return "observed" if drift_deltas else "not_observed"
 
 
+def _cross_examination_availability(
+    *,
+    fact: Literal["response", "trajectory", "committed_state"],
+    source_receipts: list[_ReceiptBuild],
+    probe_receipts: list[_ReceiptBuild],
+) -> CrossExaminationEvidenceAvailability:
+    achieved = "verified" if fact == "committed_state" else "observed"
+
+    def arm_status(receipts: list[_ReceiptBuild]) -> Literal["observed", "verified", "unavailable"]:
+        if fact == "response":
+            available = all(
+                receipt.execution_available and receipt.response_pointer_id is not None
+                for receipt in receipts
+            )
+        elif fact == "trajectory":
+            available = all(receipt.trajectory_evidence_complete for receipt in receipts)
+        else:
+            available = all(
+                receipt.execution_available
+                and receipt.receipt.content.evidence_scope == "response_and_state"
+                and receipt.receipt.content.state_before is not None
+                and receipt.receipt.content.state_after is not None
+                for receipt in receipts
+            )
+        return achieved if receipts and available else "unavailable"
+
+    current_baseline = arm_status(source_receipts)
+    variation = arm_status(probe_receipts)
+    authorities = tuple(
+        sorted(
+            {
+                pointer.authority
+                for receipt in (*source_receipts, *probe_receipts)
+                for pointer in receipt.receipt.content.evidence_pointers
+                if (
+                    (fact == "response" and pointer.kind == "response" and pointer.arm != "shared")
+                    or (fact == "trajectory" and pointer.kind == "trace")
+                    or (fact == "committed_state" and pointer.kind == "state")
+                )
+            }
+        )
+    )
+    return CrossExaminationEvidenceAvailability(
+        fact=fact,
+        conclusion=(
+            achieved if current_baseline == achieved and variation == achieved else "unavailable"
+        ),
+        current_baseline=current_baseline,
+        variation=variation,
+        authorities=cast(tuple[EvidenceAuthority, ...], authorities),
+    )
+
+
 def _dataset_cross_examination(
     *,
     operator_id: str,
@@ -1133,6 +1244,36 @@ def _dataset_cross_examination(
             }
         )
     )
+    current_trajectory_pointer_ids = tuple(
+        sorted(
+            pointer_id
+            for receipt in source_receipts
+            for pointer_id in receipt.receipt.content.trace_evidence_pointer_ids
+        )
+    )
+    variation_trajectory_pointer_ids = tuple(
+        sorted(
+            pointer_id
+            for receipt in probe_receipts
+            for pointer_id in receipt.receipt.content.trace_evidence_pointer_ids
+        )
+    )
+    current_state_pointer_ids = tuple(
+        sorted(
+            pointer.pointer_id
+            for receipt in source_receipts
+            for pointer in receipt.receipt.content.evidence_pointers
+            if pointer.kind == "state"
+        )
+    )
+    variation_state_pointer_ids = tuple(
+        sorted(
+            pointer.pointer_id
+            for receipt in probe_receipts
+            for pointer in receipt.receipt.content.evidence_pointers
+            if pointer.kind == "state"
+        )
+    )
     if not historical_pointer_ids or not current_pointer_ids or not variation_pointer_ids:
         raise ValueError("response-level cross-examination requires all three evidence arms")
     baseline_observed = sum(receipt.execution_available for receipt in source_receipts)
@@ -1152,6 +1293,8 @@ def _dataset_cross_examination(
         current_baseline=CrossExaminationArm(
             role="current_baseline",
             response_evidence_pointer_ids=current_pointer_ids,
+            trajectory_evidence_pointer_ids=current_trajectory_pointer_ids,
+            committed_state_evidence_pointer_ids=current_state_pointer_ids,
             requested_repetitions=requested,
             observed_repetitions=baseline_observed,
             inconclusive_repetitions=requested - baseline_observed,
@@ -1160,6 +1303,8 @@ def _dataset_cross_examination(
         variation=CrossExaminationArm(
             role="variation",
             response_evidence_pointer_ids=variation_pointer_ids,
+            trajectory_evidence_pointer_ids=variation_trajectory_pointer_ids,
+            committed_state_evidence_pointer_ids=variation_state_pointer_ids,
             requested_repetitions=len(probe_receipts),
             observed_repetitions=variation_observed,
             inconclusive_repetitions=len(probe_receipts) - variation_observed,
@@ -1177,13 +1322,20 @@ def _dataset_cross_examination(
             "inconclusive" if incomplete else "observed" if unstable else "not_observed"
         ),
         material_delta_evidence_pointer_ids=material_delta_pointer_ids,
-        evidence_level=(
-            "committed_state_verified"
-            if all(
-                receipt.receipt.content.evidence_scope == "response_and_state"
-                for receipt in (*source_receipts, *probe_receipts)
-            )
-            else "response_observed"
+        response_evidence=_cross_examination_availability(
+            fact="response",
+            source_receipts=source_receipts,
+            probe_receipts=probe_receipts,
+        ),
+        trajectory_evidence=_cross_examination_availability(
+            fact="trajectory",
+            source_receipts=source_receipts,
+            probe_receipts=probe_receipts,
+        ),
+        committed_state_evidence=_cross_examination_availability(
+            fact="committed_state",
+            source_receipts=source_receipts,
+            probe_receipts=probe_receipts,
         ),
         limitations=(
             "causality_not_established",
@@ -1366,7 +1518,11 @@ def _package(
                             cross_examination.current_baseline,
                             cross_examination.variation,
                         )
-                        for pointer_id in arm.response_evidence_pointer_ids
+                        for pointer_id in (
+                            *arm.response_evidence_pointer_ids,
+                            *arm.trajectory_evidence_pointer_ids,
+                            *arm.committed_state_evidence_pointer_ids,
+                        )
                     )
                     if cross_examination is not None
                     else ()

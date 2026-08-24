@@ -366,6 +366,7 @@ class _EvidenceRecord(_StrictModel):
         "1.10.0",
         "1.11.0",
         "1.12.0",
+        "1.13.0",
     ]
     evaluation_mode: Literal["variance"] | None = None
     interaction_id: str
@@ -385,14 +386,17 @@ class _EvidenceRecord(_StrictModel):
 
     @model_validator(mode="after")
     def validate_invariant_evaluation(self) -> Self:
-        current_schemas = {"1.8.0", "1.9.0", "1.10.0", "1.11.0", "1.12.0"}
-        if self.schema_version not in {"1.10.0", "1.11.0", "1.12.0"} and "pattern_facets" in (
-            self.model_fields_set
-        ):
+        current_schemas = {"1.8.0", "1.9.0", "1.10.0", "1.11.0", "1.12.0", "1.13.0"}
+        if self.schema_version not in {
+            "1.10.0",
+            "1.11.0",
+            "1.12.0",
+            "1.13.0",
+        } and "pattern_facets" in (self.model_fields_set):
             raise ValueError("vertical pattern facets require evidence schema 1.10.0")
-        if self.schema_version == "1.12.0":
+        if self.schema_version in {"1.12.0", "1.13.0"}:
             if any(case.cross_examination is None for case in self.cases):
-                raise ValueError("evidence schema 1.12.0 requires case cross-examination")
+                raise ValueError("current evidence schemas require case cross-examination")
         elif any("cross_examination" in case.model_fields_set for case in self.cases):
             raise ValueError("legacy evidence cannot contain cross-examination")
         if self.schema_version in current_schemas and self.evaluation_mode is None:
@@ -422,6 +426,7 @@ class _EvidenceRecord(_StrictModel):
                 "1.10.0",
                 "1.11.0",
                 "1.12.0",
+                "1.13.0",
             }
             and "run_context" in self.model_fields_set
         ):
@@ -442,6 +447,7 @@ class _EvidenceRecord(_StrictModel):
             "1.10.0",
             "1.11.0",
             "1.12.0",
+            "1.13.0",
         }:
             raise ValueError("extended invariant results require evidence schema 1.6.0")
         if (
@@ -601,6 +607,7 @@ def validate_dataset_resume_evidence(
                 "1.10.0",
                 "1.11.0",
                 "1.12.0",
+                "1.13.0",
             }
             or evidence.run_context is None
         ):
@@ -2107,7 +2114,7 @@ def _load_evidence(path: Path) -> list[_LoadedEvidenceRecord]:
                 )
             )
     except (ValidationError, ValueError):
-        raise _ReviewInputError("evidence is not valid UL schema through 1.12.0 JSONL") from None
+        raise _ReviewInputError("evidence is not valid UL schema through 1.13.0 JSONL") from None
     return records
 
 

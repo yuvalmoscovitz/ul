@@ -17,7 +17,11 @@ from ul.dataset_invariants import DatasetInvariantEvaluation
 from ul_core.dataset import ObservedOutcome
 
 from ul_cli.dataset_review import DatasetEvidenceRunContext
-from ul_cli.report_contract import PatternVerticalFacets
+from ul_cli.report_contract import (
+    CrossExaminationEvidenceAvailability,
+    EvidenceAuthority,
+    PatternVerticalFacets,
+)
 
 _CUSTOMER_STATUSES = {
     "augmentation_rejected": "VARIATION DISCARDED",
@@ -85,7 +89,7 @@ def build_customer_evidence_record(
     if uses_extended_invariants and run_context is None:
         raise ValueError("extended invariant evidence requires a resumable run context")
     evidence: dict[str, JsonValue] = {
-        "schema_version": "1.12.0",
+        "schema_version": "1.13.0",
         "evaluation_mode": evaluation_mode,
         "interaction_id": result.source.id,
         **(
@@ -179,22 +183,6 @@ def _customer_cross_examination(
     intrinsic_instability = (
         "inconclusive" if comparison_incomplete else "observed" if unstable else "not_observed"
     )
-    executed_trial_sets = tuple(
-        trial_set
-        for trial_set in (baseline_trial_set, variation_trial_set)
-        if trial_set is not None
-    )
-    evidence_level = (
-        "committed_state_verified"
-        if executed_trial_sets
-        and all(
-            (execution_evidence := getattr(trial, "execution_evidence", None)) is not None
-            and execution_evidence.evidence_scope == "response_and_state"
-            for trial_set in executed_trial_sets
-            for trial in trial_set.trials
-        )
-        else "response_observed"
-    )
     return cast(
         JsonValue,
         {
@@ -205,13 +193,98 @@ def _customer_cross_examination(
             "augmentation_sensitivity": augmentation_sensitivity,
             "intrinsic_instability": intrinsic_instability,
             "material_delta_count": len(case.findings),
-            "evidence_level": evidence_level,
+            "response_evidence": _cross_examination_evidence_availability(
+                "response", baseline_trial_set, variation_trial_set
+            ).model_dump(mode="json"),
+            "trajectory_evidence": _cross_examination_evidence_availability(
+                "trajectory", baseline_trial_set, variation_trial_set
+            ).model_dump(mode="json"),
+            "committed_state_evidence": _cross_examination_evidence_availability(
+                "committed_state", baseline_trial_set, variation_trial_set
+            ).model_dump(mode="json"),
             "limitations": [
                 "causality_not_established",
                 "correctness_not_verified",
                 "historical_reference_not_an_oracle",
             ],
         },
+    )
+
+
+def _cross_examination_evidence_availability(
+    fact: Literal["response", "trajectory", "committed_state"],
+    baseline: DatasetEvaluationTrialSet,
+    variation: DatasetEvaluationTrialSet | None,
+) -> CrossExaminationEvidenceAvailability:
+    achieved = "verified" if fact == "committed_state" else "observed"
+
+    def arm(
+        trial_set: DatasetEvaluationTrialSet | None,
+    ) -> tuple[Literal["observed", "verified", "unavailable"], set[EvidenceAuthority]]:
+        if trial_set is None:
+            return "unavailable", set()
+        authorities: set[EvidenceAuthority] = set()
+        available: list[bool] = []
+        for trial in trial_set.trials:
+            execution_evidence = getattr(trial, "execution_evidence", None)
+            if fact == "response":
+                present = not trial.inconclusive_reasons
+                if present:
+                    authorities.add(
+                        "source_self_reported"
+                        if execution_evidence is not None
+                        else "invoker_self_reported"
+                    )
+            elif fact == "trajectory":
+                observations = execution_evidence.observations if execution_evidence else ()
+                observed = tuple(
+                    observation
+                    for observation in observations
+                    if any(
+                        (
+                            observation.traces,
+                            observation.tool_calls,
+                            observation.handoffs,
+                            observation.errors,
+                        )
+                    )
+                )
+                present = any(observation.status == "complete" for observation in observed)
+                authorities.update(observation.authority for observation in observed)
+            else:
+                initial_state = (
+                    execution_evidence.initial_state if execution_evidence is not None else None
+                )
+                final_state = (
+                    execution_evidence.final_state if execution_evidence is not None else None
+                )
+                present = bool(
+                    execution_evidence is not None
+                    and not trial.inconclusive_reasons
+                    and execution_evidence.evidence_scope == "response_and_state"
+                    and initial_state is not None
+                    and final_state is not None
+                )
+                if present and initial_state is not None and final_state is not None:
+                    authorities.update((initial_state.authority, final_state.authority))
+            available.append(present)
+        return (
+            achieved if available and all(available) else "unavailable",
+            authorities,
+        )
+
+    baseline_status, baseline_authorities = arm(baseline)
+    variation_status, variation_authorities = arm(variation)
+    return CrossExaminationEvidenceAvailability(
+        fact=fact,
+        conclusion=(
+            achieved
+            if baseline_status == achieved and variation_status == achieved
+            else "unavailable"
+        ),
+        current_baseline=baseline_status,
+        variation=variation_status,
+        authorities=tuple(sorted(baseline_authorities | variation_authorities)),
     )
 
 
