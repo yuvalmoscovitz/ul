@@ -15,7 +15,9 @@ from ul_core.augmentations.projections import (
     AugmentationChangeSet,
     AugmentationProjection,
     AugmentationTargetSurface,
+    ProjectionContract,
     ProjectionTarget,
+    ProjectionTargetOperation,
 )
 from ul_core.augmentations.registry import (
     AugmentationRegistry,
@@ -32,7 +34,9 @@ __all__ = [
     "AugmentationTargetSurface",
     "BuiltinAugmentationCatalog",
     "BuiltinAugmentationSpec",
+    "ProjectionContract",
     "ProjectionTarget",
+    "ProjectionTargetOperation",
     "builtin_augmentation_catalog",
     "builtin_augmentation_registry",
 ]

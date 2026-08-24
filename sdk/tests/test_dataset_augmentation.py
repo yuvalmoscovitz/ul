@@ -7,6 +7,7 @@ import pytest
 from ul.augmentations.dataset import (
     DatasetAugmentationEngine,
     DatasetAugmentationOperator,
+    DatasetAugmentationResult,
     builtin_dataset_augmentation_operators,
 )
 from ul_core.dataset import (
@@ -1496,6 +1497,34 @@ async def test_engine_keeps_and_rejects_duplicate_generated_inputs() -> None:
     assert "renderer produced an input already generated for this source" in (
         result.candidates[1].failure_reasons
     )
+
+
+async def test_unchanged_and_forged_dataset_change_sets_fail_closed() -> None:
+    record = source_record()
+    original_frame = source_frame(record)
+    candidate_frame = source_frame(record, identifier_prefix="candidate").model_copy(
+        update={"outcomes": ()}
+    )
+    model = DeterministicSemanticModel(
+        {record.id: original_frame}, candidate_frame, record.raw_input
+    )
+
+    unchanged = await DatasetAugmentationEngine(model, model).augment((record,))
+
+    assert unchanged.candidates[0].changed_paths == ()
+    assert not unchanged.candidates[0].passed
+    assert "renderer did not change the source input" in unchanged.candidates[0].failure_reasons
+
+    changed_model = DeterministicSemanticModel({record.id: original_frame}, candidate_frame)
+    valid = await DatasetAugmentationEngine(changed_model, changed_model).augment((record,))
+    forged_candidate = valid.candidates[0].model_copy(update={"changed_paths": ("/inputs/forged",)})
+    with pytest.raises(ValueError, match="change set does not match"):
+        DatasetAugmentationResult(
+            operator_references=valid.operator_references,
+            source_records=valid.source_records,
+            source_frames=valid.source_frames,
+            candidates=(forged_candidate,),
+        )
 
 
 async def test_engine_retains_invalid_candidate_and_continues_to_later_operators() -> None:

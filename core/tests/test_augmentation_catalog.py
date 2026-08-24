@@ -8,6 +8,9 @@ from ul_core.augmentations.definitions import (
     BuiltinAugmentationSpec,
     builtin_augmentation_catalog,
 )
+from ul_core.augmentations.projections import ProjectionContract
+
+_PROJECTION = ProjectionContract(reads=("structured_input",), writes=("structured_input",))
 
 
 def test_builtin_catalog_is_unique_sorted_and_immutable() -> None:
@@ -61,14 +64,17 @@ def test_correction_is_one_catalog_entry_with_two_typed_bindings() -> None:
 
 
 def test_dataset_augmentation_declares_actual_execution_requirements() -> None:
-    requirements = (
-        builtin_augmentation_catalog().get("input.surface.rephrase").bindings[0].requirements
-    )
+    binding = builtin_augmentation_catalog().get("input.surface.rephrase").bindings[0]
+    requirements = binding.requirements
 
     assert requirements.semantic_model is True
     assert requirements.environment is True
     assert requirements.state_observation is True
     assert requirements.customer_evaluator is False
+    assert binding.projection == ProjectionContract(
+        reads=("structured_input", "conversation"),
+        writes=("structured_input", "conversation"),
+    )
 
 
 def test_dataset_applicability_contracts_are_discoverable_before_execution() -> None:
@@ -103,6 +109,7 @@ def test_catalog_rejects_duplicate_references() -> None:
                 stages=("materialization",),
                 execution_owner="augmentation_registry",
                 runtime="example.module:ExampleAugmentation",
+                projection=_PROJECTION,
             ),
         ),
     )
@@ -141,6 +148,7 @@ def test_binding_rejects_owner_mode_mismatch_and_unsafe_environment_fault() -> N
             execution_owner="dataset_cli",
             runtime="example.module:run",
             command="ul dataset evaluate",
+            projection=_PROJECTION,
         )
     with pytest.raises(ValidationError, match="require an environment capability"):
         AugmentationBinding(
@@ -149,6 +157,7 @@ def test_binding_rejects_owner_mode_mismatch_and_unsafe_environment_fault() -> N
             execution_owner="stress_cli",
             runtime="example.module:run",
             command="ul stress timeout-after-commit",
+            projection=_PROJECTION,
         )
 
 
@@ -186,6 +195,7 @@ def test_latest_version_is_selected_before_cli_and_mode_filters() -> None:
                 execution_owner="dataset_cli",
                 runtime="example.module:resolve",
                 command="ul dataset evaluate --operator input.example",
+                projection=_PROJECTION,
             ),
         ),
     )
@@ -203,6 +213,7 @@ def test_latest_version_is_selected_before_cli_and_mode_filters() -> None:
                 stages=("materialization",),
                 execution_owner="augmentation_registry",
                 runtime="example.module:ExampleAugmentation",
+                projection=_PROJECTION,
             ),
         ),
     )

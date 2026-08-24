@@ -16,6 +16,7 @@ from ul import (
     RichInteractionCase,
     SemanticFrame,
     VisibleContextTurn,
+    create_dataset_augmentation_projection,
     project_rich_interaction_case,
 )
 from ul.augmentations.dataset import DatasetAugmentationCandidate
@@ -65,7 +66,8 @@ def _augmentation(source: InteractionRecord) -> DatasetAugmentationResult:
         source_interaction_id=source.id,
         operator_id="input.surface.rephrase",
         operator_version="1.0.0",
-        changed_paths=("/raw_input",),
+        projection=create_dataset_augmentation_projection(source),
+        changed_paths=(source.augmentation_path,),
         augmented_input="Please transfer 100 to Alice.",
         expected_input_frame=source_frame,
         reparsed_input_frame=SemanticFrame(

@@ -13,7 +13,9 @@ from ul_core.augmentations.projections import (
     AugmentationChangeSet,
     AugmentationProjection,
     AugmentationTargetSurface,
+    ProjectionContract,
     ProjectionTarget,
+    ProjectionTargetOperation,
 )
 from ul_core.augmentations.registry import (
     AugmentationRegistry,
@@ -213,7 +215,9 @@ __all__ = [
     "ProductionObservation",
     "ProductionSource",
     "ProductionSourcePage",
+    "ProjectionContract",
     "ProjectionTarget",
+    "ProjectionTargetOperation",
     "PromptManager",
     "PromptTemplateInfo",
     "RichInteractionCase",

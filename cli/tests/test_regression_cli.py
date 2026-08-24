@@ -24,6 +24,7 @@ from ul import (
     InteractionRecord,
     ObservedAgentOutput,
     SemanticFrame,
+    create_dataset_augmentation_projection,
 )
 from ul.augmentations.dataset import DatasetAugmentationCandidate
 from ul.dataset_invariants import (
@@ -250,6 +251,13 @@ def _technical_details() -> dict[str, Any]:
         source_interaction_id="quickstart-payment",
         operator_id="input.surface.disfluency_repeat",
         operator_version="1.0.0",
+        projection=create_dataset_augmentation_projection(
+            InteractionRecord(
+                id="quickstart-payment",
+                raw_input="Pay AC-100.",
+                raw_observed_output={"status": "ok"},
+            )
+        ),
         changed_paths=("/raw_input",),
         augmented_input="Pay pay AC-100.",
         expected_input_frame=source_frame,

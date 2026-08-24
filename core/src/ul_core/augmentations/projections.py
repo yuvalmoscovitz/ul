@@ -1,7 +1,8 @@
-"""Typed read and write projections for controlled augmentation changes."""
+"""Authoritative projection contracts and materialized augmentation targets."""
 
 from __future__ import annotations
 
+import copy
 from typing import Literal, Self, cast
 
 from pydantic import ConfigDict, Field, JsonValue, model_validator
@@ -17,32 +18,71 @@ AugmentationTargetSurface = Literal[
     "policy",
     "environment",
 ]
+ProjectionTargetOperation = Literal["existing", "create"]
+
+_SURFACE_ROOTS: dict[AugmentationTargetSurface, tuple[str, ...]] = {
+    "structured_input": ("/inputs", "/raw_input", "/actions", "/metadata"),
+    "conversation": ("/context", "/conversation"),
+    "state": ("/state", "/artifacts", "/resources", "/actions"),
+    "tool": ("/tool_results", "/actions"),
+    "policy": ("/policies", "/actions"),
+    "environment": ("/environment_events",),
+}
+_MAXIMUM_DIFF_NODES = 100_000
 
 
 class _ProjectionModel(ULModel):
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
 
+class ProjectionContract(_ProjectionModel):
+    reads: tuple[AugmentationTargetSurface, ...] = Field(min_length=1)
+    writes: tuple[AugmentationTargetSurface, ...] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def validate_unique_surfaces(self) -> Self:
+        if len(self.reads) != len(set(self.reads)) or len(self.writes) != len(set(self.writes)):
+            raise ValueError("projection contract surfaces must be unique")
+        return self
+
+    def validate_projection(self, projection: AugmentationProjection) -> None:
+        invalid_reads = tuple(
+            target.id for target in projection.reads if target.surface not in self.reads
+        )
+        invalid_writes = tuple(
+            target.id for target in projection.writes if target.surface not in self.writes
+        )
+        if invalid_reads or invalid_writes:
+            raise ValueError("materialized projection exceeds its authoritative binding contract")
+
+
 class ProjectionTarget(_ProjectionModel):
     id: str = Field(min_length=1, max_length=500)
     surface: AugmentationTargetSurface
-    path: str = Field(max_length=1_000)
+    path: str = Field(min_length=1, max_length=1_000)
     event_id: str | None = Field(default=None, min_length=1, max_length=500)
+    operation: ProjectionTargetOperation = "existing"
 
     @model_validator(mode="after")
-    def validate_event_selector(self) -> Self:
+    def validate_selector(self) -> Self:
         try:
             resolve_json_pointer({}, self.path)
         except ValueError as error:
             if str(error) == "json pointer must follow RFC 6901 syntax":
                 raise ValueError("projection target path must follow RFC 6901 syntax") from None
+        if not any(_path_contains(root, self.path) for root in _SURFACE_ROOTS[self.surface]):
+            raise ValueError("projection target path does not belong to its surface")
         if (self.surface == "environment") != (self.event_id is not None):
             raise ValueError("environment targets require exactly one event identifier")
+        if self.surface == "environment" and _environment_event_index(self.path) is None:
+            raise ValueError("environment target path must select one event")
+        if self.operation == "create" and self.surface != "environment":
+            raise ValueError("only environment event targets may create values")
         return self
 
 
 class AugmentationChangeSet(_ProjectionModel):
-    changed_paths: tuple[str, ...] = Field(min_length=1)
+    changed_paths: tuple[str, ...]
     changed_events: tuple[str, ...] = ()
 
 
@@ -55,6 +95,8 @@ class AugmentationProjection(_ProjectionModel):
         identifiers = tuple(target.id for target in (*self.reads, *self.writes))
         if len(identifiers) != len(set(identifiers)):
             raise ValueError("projection target identifiers must be unique")
+        if any(target.operation == "create" for target in self.reads):
+            raise ValueError("read projection targets cannot create values")
         for index, target in enumerate(self.writes):
             for other in self.writes[index + 1 :]:
                 if _paths_overlap(target.path, other.path):
@@ -63,24 +105,39 @@ class AugmentationProjection(_ProjectionModel):
 
     def read(self, source: JsonValue) -> dict[str, JsonValue]:
         self.validate_source(source)
-        return {target.id: resolve_json_pointer(source, target.path) for target in self.reads}
+        return {
+            target.id: copy.deepcopy(resolve_json_pointer(source, target.path))
+            for target in self.reads
+        }
 
     def validate_source(self, source: JsonValue) -> None:
+        source_events = _validated_events_by_id(source)
         for target in (*self.reads, *self.writes):
+            if target.operation == "create":
+                parent_path = target.path.rsplit("/", 1)[0]
+                parent = resolve_json_pointer(source, parent_path)
+                if not isinstance(parent, list) or _resolves(source, target.path):
+                    raise ValueError(f"projection target {target.id!r} is not a new event location")
+                if target.event_id in source_events:
+                    raise ValueError(
+                        f"projection target {target.id!r} reuses an environment event identifier"
+                    )
+                continue
             try:
                 resolve_json_pointer(source, target.path)
             except ValueError:
                 raise ValueError(
                     f"projection target {target.id!r} does not resolve before execution"
                 ) from None
-        for target in self.reads:
-            if target.event_id is not None and target.event_id not in _events_by_id(source):
-                raise ValueError(
-                    f"projection target {target.id!r} references a missing environment event"
-                )
+            if target.event_id is not None:
+                _validate_event_target(source, target)
 
     def validate_candidate(self, source: JsonValue, candidate: JsonValue) -> AugmentationChangeSet:
         self.validate_source(source)
+        _validated_events_by_id(candidate)
+        for target in self.writes:
+            if target.event_id is not None:
+                _validate_event_target(candidate, target)
         changed_paths = tuple(_changed_paths(source, candidate))
         if not changed_paths:
             raise ValueError("augmentation candidate does not change its source")
@@ -120,36 +177,43 @@ def _paths_overlap(left: str, right: str) -> bool:
 
 
 def _path_contains(container: str, path: str) -> bool:
-    return container == "" or path == container or path.startswith(f"{container}/")
+    return path == container or path.startswith(f"{container}/")
 
 
-def _changed_paths(source: JsonValue, candidate: JsonValue, path: str = "") -> list[str]:
-    if type(source) is not type(candidate):
-        return [path]
-    if isinstance(source, dict) and isinstance(candidate, dict):
-        changed: list[str] = []
-        for key in sorted(set(source) | set(candidate)):
-            child_path = f"{path}/{_encode_token(key)}"
-            if key not in source or key not in candidate:
-                changed.append(child_path)
-            else:
-                changed.extend(_changed_paths(source[key], candidate[key], child_path))
-        return changed
-    if isinstance(source, list) and isinstance(candidate, list):
-        changed = []
-        shared_length = min(len(source), len(candidate))
-        for index in range(shared_length):
-            changed.extend(_changed_paths(source[index], candidate[index], f"{path}/{index}"))
-        changed.extend(
-            f"{path}/{index}" for index in range(shared_length, max(len(source), len(candidate)))
-        )
-        return changed
-    return [] if source == candidate else [path]
+def _changed_paths(source: JsonValue, candidate: JsonValue) -> list[str]:
+    changed: list[str] = []
+    pending: list[tuple[JsonValue, JsonValue, str]] = [(source, candidate, "")]
+    visited = 0
+    while pending:
+        source_value, candidate_value, path = pending.pop()
+        visited += 1
+        if visited > _MAXIMUM_DIFF_NODES:
+            raise ValueError("augmentation candidate diff exceeds the 100000-node limit")
+        if type(source_value) is not type(candidate_value):
+            changed.append(path)
+        elif isinstance(source_value, dict) and isinstance(candidate_value, dict):
+            for key in reversed(sorted(set(source_value) | set(candidate_value))):
+                child_path = f"{path}/{_encode_token(key)}"
+                if key not in source_value or key not in candidate_value:
+                    changed.append(child_path)
+                else:
+                    pending.append((source_value[key], candidate_value[key], child_path))
+        elif isinstance(source_value, list) and isinstance(candidate_value, list):
+            shared_length = min(len(source_value), len(candidate_value))
+            changed.extend(
+                f"{path}/{index}"
+                for index in range(shared_length, max(len(source_value), len(candidate_value)))
+            )
+            for index in reversed(range(shared_length)):
+                pending.append((source_value[index], candidate_value[index], f"{path}/{index}"))
+        elif source_value != candidate_value:
+            changed.append(path)
+    return sorted(changed)
 
 
 def _changed_event_ids(source: JsonValue, candidate: JsonValue) -> tuple[str, ...]:
-    source_events = _events_by_id(source)
-    candidate_events = _events_by_id(candidate)
+    source_events = _validated_events_by_id(source)
+    candidate_events = _validated_events_by_id(candidate)
     return tuple(
         event_id
         for event_id in sorted(set(source_events) | set(candidate_events))
@@ -157,17 +221,53 @@ def _changed_event_ids(source: JsonValue, candidate: JsonValue) -> tuple[str, ..
     )
 
 
-def _events_by_id(value: JsonValue) -> dict[str, JsonValue]:
+def _validated_events_by_id(value: JsonValue) -> dict[str, JsonValue]:
     if not isinstance(value, dict):
         return {}
     raw_events = value.get("environment_events")
-    if not isinstance(raw_events, list):
+    if raw_events is None:
         return {}
+    if not isinstance(raw_events, list):
+        raise ValueError("environment events must be an array")
     events: dict[str, JsonValue] = {}
     for raw_event in raw_events:
-        if isinstance(raw_event, dict) and isinstance(raw_event.get("id"), str):
-            events[cast(str, raw_event["id"])] = cast(JsonValue, raw_event)
+        if not isinstance(raw_event, dict) or not isinstance(raw_event.get("id"), str):
+            raise ValueError("environment events require string identifiers")
+        event_id = cast(str, raw_event["id"])
+        if event_id in events:
+            raise ValueError("environment event identifiers must be unique")
+        events[event_id] = cast(JsonValue, raw_event)
     return events
+
+
+def _validate_event_target(value: JsonValue, target: ProjectionTarget) -> None:
+    event_index = _environment_event_index(target.path)
+    if event_index is None or not isinstance(value, dict):
+        raise ValueError(f"projection target {target.id!r} does not select its environment event")
+    raw_events = value.get("environment_events")
+    if not isinstance(raw_events, list) or event_index >= len(raw_events):
+        raise ValueError(f"projection target {target.id!r} does not select its environment event")
+    raw_event = raw_events[event_index]
+    if not isinstance(raw_event, dict) or raw_event.get("id") != target.event_id:
+        raise ValueError(f"projection target {target.id!r} does not select its environment event")
+
+
+def _environment_event_index(path: str) -> int | None:
+    tokens = path.split("/")
+    if len(tokens) < 3 or tokens[1] != "environment_events":
+        return None
+    token = tokens[2]
+    if not token.isascii() or not token.isdecimal() or (token != "0" and token.startswith("0")):
+        return None
+    return int(token)
+
+
+def _resolves(value: JsonValue, path: str) -> bool:
+    try:
+        resolve_json_pointer(value, path)
+    except ValueError:
+        return False
+    return True
 
 
 def _encode_token(token: str) -> str:

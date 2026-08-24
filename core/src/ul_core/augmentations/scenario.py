@@ -12,6 +12,7 @@ from ul_core.augmentations.projections import (
     AugmentationProjection,
     AugmentationTargetSurface,
     ProjectionTarget,
+    ProjectionTargetOperation,
 )
 from ul_core.augmentations.registry import (
     Applicability,
@@ -75,6 +76,11 @@ class BuiltinAugmentation(ABC):
         projection: AugmentationProjection,
         **updates: object,
     ) -> AugmentationResult:
+        definition = builtin_augmentation_catalog().get(self.metadata.id, self.metadata.version)
+        binding = next(
+            binding for binding in definition.bindings if binding.mode == "scenario_materialization"
+        )
+        binding.projection.validate_projection(projection)
         source_semantics = source.model_dump(mode="json", exclude={"id", "provenance"})
         projection.read(source_semantics)
         candidate_without_lineage = source.model_copy(deep=True, update=updates)
@@ -802,8 +808,9 @@ def _event_result(
                 _target(
                     "scheduled-event",
                     "environment",
-                    "/environment_events",
+                    f"/environment_events/{len(scenario.environment_events)}",
                     event_id=event.id,
+                    operation="create",
                 ),
             ),
         ),
@@ -817,9 +824,16 @@ def _target(
     path: str,
     *,
     event_id: str | None = None,
+    operation: ProjectionTargetOperation = "existing",
 ) -> ProjectionTarget:
     return ProjectionTarget.model_validate(
-        {"id": identifier, "surface": surface, "path": path, "event_id": event_id}
+        {
+            "id": identifier,
+            "surface": surface,
+            "path": path,
+            "event_id": event_id,
+            "operation": operation,
+        }
     )
 
 

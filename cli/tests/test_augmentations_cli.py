@@ -318,6 +318,10 @@ def test_show_json_and_unknown_reference_contract() -> None:
         "id": "input.surface.rephrase",
         "version": "1.0.0",
     }
+    assert payload["augmentation"]["bindings"][0]["projection"] == {
+        "reads": ["structured_input", "conversation"],
+        "writes": ["structured_input", "conversation"],
+    }
     assert missing.exit_code == 2
     assert "unknown augmentation" in missing.output
 
@@ -365,6 +369,10 @@ def test_plan_json_is_stable_complete_and_project_aware(
     rephrase = _planned_augmentation(payload, "input.surface.rephrase")
     assert rephrase["status"] == "ready"
     assert rephrase["command"] == "ul run --operator input.surface.rephrase@1.0.0"
+    assert rephrase["projection"] == {
+        "reads": ["structured_input", "conversation"],
+        "writes": ["structured_input", "conversation"],
+    }
     assert _reason_codes(rephrase) == {"requirements_satisfied"}
 
     frustrated = _planned_augmentation(payload, "input.tone.frustrated")

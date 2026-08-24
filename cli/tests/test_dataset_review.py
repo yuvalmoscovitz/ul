@@ -27,6 +27,7 @@ from ul import (
     InteractionRecord,
     ObservedAgentOutput,
     SemanticFrame,
+    create_dataset_augmentation_projection,
 )
 from ul.augmentations.dataset import DatasetAugmentationCandidate
 from ul.dataset_invariants import DatasetInvariantSuite, JsonValuesEqualInvariant
@@ -204,6 +205,13 @@ def _technical_details() -> dict[str, Any]:
         source_interaction_id="quickstart-payment",
         operator_id="input.surface.disfluency_repeat",
         operator_version="1.0.0",
+        projection=create_dataset_augmentation_projection(
+            InteractionRecord(
+                id="quickstart-payment",
+                raw_input="Pay AC-100.",
+                raw_observed_output={"status": "ok"},
+            )
+        ),
         changed_paths=("/raw_input",),
         augmented_input="Pay pay AC-100.",
         expected_input_frame=source_frame,
@@ -441,7 +449,7 @@ def test_root_json_report_is_stable_and_omits_private_dataset_fields(tmp_path: P
                     "ulpf_v1_b5dd705fb4db534431680decfe8b221fbebfd049d7b7aba99c2b59af966a2ca3"
                 ),
                 "pattern_snapshot_id": (
-                    "ulps_v1_8db5e32d30632d2b9284a006d8279fc3e1c1edaa4cdf4003357fe29600861ee6"
+                    "ulps_v1_9edd3015baa3dc15bcf658ae32a83ce8f838ac74fd8ac46c00c0ae1a8a3af720"
                 ),
                 "kind": "behavior_difference",
                 "category": "changed_grounded_effect_argument",
@@ -480,7 +488,7 @@ def test_root_json_report_is_stable_and_omits_private_dataset_fields(tmp_path: P
                         "finding_id": FINDING_ID,
                         "evidence_record_ref": pattern_evidence_reference(
                             _PATTERN_IDENTITY_KEY,
-                            "807db61be55458704c51fc5098e0b68e40dd75d8b5f586f58cec98d81f355192",
+                            "58747e142523f31429e1fff3b9712d4bdee4b29062a7806869bf9b7c0c1016f8",
                         ),
                         "membership_reasons": [
                             "same_action_shape",

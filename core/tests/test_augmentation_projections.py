@@ -16,9 +16,21 @@ def _source_case() -> dict[str, object]:
     }
 
 
-def _target(identifier: str, surface: str, path: str, event_id: str | None = None):
+def _target(
+    identifier: str,
+    surface: str,
+    path: str,
+    event_id: str | None = None,
+    operation: str = "existing",
+):
     return ProjectionTarget.model_validate(
-        {"id": identifier, "surface": surface, "path": path, "event_id": event_id}
+        {
+            "id": identifier,
+            "surface": surface,
+            "path": path,
+            "event_id": event_id,
+            "operation": operation,
+        }
     )
 
 
@@ -97,3 +109,58 @@ def test_projection_rejects_invalid_missing_conflicting_and_untargeted_changes()
     candidate["inputs"]["tenant"] = "other"  # type: ignore[index]
     with pytest.raises(ValueError, match="untargeted paths"):
         projection.validate_candidate(source, candidate)
+
+
+def test_projection_paths_and_environment_event_identity_fail_closed() -> None:
+    with pytest.raises(ValidationError, match="does not belong to its surface"):
+        _target("wrong-surface", "policy", "/inputs/request/message")
+
+    source = _source_case()
+    source["environment_events"].append(  # type: ignore[union-attr]
+        {"id": "event-2", "kind": "clock", "payload": {"hour": 12}}
+    )
+    mismatched = AugmentationProjection(
+        reads=(_target("read", "structured_input", "/inputs/request/message"),),
+        writes=(
+            _target(
+                "wrong-event",
+                "environment",
+                "/environment_events/0/payload/hour",
+                "event-2",
+            ),
+        ),
+    )
+    with pytest.raises(ValueError, match="does not select its environment event"):
+        mismatched.validate_source(source)
+
+    source["environment_events"][1]["id"] = "event-1"  # type: ignore[index]
+    with pytest.raises(ValueError, match="identifiers must be unique"):
+        mismatched.validate_source(source)
+
+
+def test_projection_reads_are_detached_and_deep_diff_is_iterative() -> None:
+    source = _source_case()
+    projection = AugmentationProjection(
+        reads=(_target("request", "structured_input", "/inputs/request"),),
+        writes=(_target("inputs", "structured_input", "/inputs"),),
+    )
+
+    selected = projection.read(source)["request"]
+    assert isinstance(selected, dict)
+    selected["message"] = "mutated through alias"
+    assert source["inputs"]["request"]["message"] == "Cancel order 7"  # type: ignore[index]
+
+    source_leaf: object = "source"
+    candidate_leaf: object = "candidate"
+    for _ in range(2_000):
+        source_leaf = {"child": source_leaf}
+        candidate_leaf = {"child": candidate_leaf}
+    deep_projection = AugmentationProjection(
+        reads=(_target("deep-read", "structured_input", "/inputs"),),
+        writes=(_target("deep-write", "structured_input", "/inputs"),),
+    )
+    changes = deep_projection.validate_candidate(
+        {"inputs": source_leaf},
+        {"inputs": candidate_leaf},
+    )
+    assert len(changes.changed_paths[0].split("/")) == 2_002

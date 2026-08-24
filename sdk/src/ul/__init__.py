@@ -14,7 +14,9 @@ from ul_core.augmentations.projections import (
     AugmentationChangeSet,
     AugmentationProjection,
     AugmentationTargetSurface,
+    ProjectionContract,
     ProjectionTarget,
+    ProjectionTargetOperation,
 )
 from ul_core.augmentations.registry import builtin_augmentation_registry
 from ul_core.contracts import (
@@ -153,6 +155,7 @@ from ul.augmentations.dataset import (
     DatasetAugmentationResult,
     DatasetAugmentationSkip,
     builtin_dataset_augmentation_operators,
+    create_dataset_augmentation_projection,
     resolve_dataset_augmentation_operator,
 )
 from ul.augmentations.environment_fault import (
@@ -563,7 +566,9 @@ __all__ = [
     "ProductionObservation",
     "ProductionSource",
     "ProductionSourcePage",
+    "ProjectionContract",
     "ProjectionTarget",
+    "ProjectionTargetOperation",
     "PromptManager",
     "PromptTemplateInfo",
     "ProviderDiagnostic",
@@ -643,6 +648,7 @@ __all__ = [
     "builtin_dataset_augmentation_operators",
     "check_deterministic_reset",
     "create_augmentation_qualification_report",
+    "create_dataset_augmentation_projection",
     "create_dataset_regression_case",
     "create_finding_artifact_reference",
     "create_finding_bundle",
