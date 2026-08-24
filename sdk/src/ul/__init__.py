@@ -10,6 +10,12 @@ from ul_core.augmentations.definitions import (
     BuiltinAugmentationSpec,
     builtin_augmentation_catalog,
 )
+from ul_core.augmentations.projections import (
+    AugmentationChangeSet,
+    AugmentationProjection,
+    AugmentationTargetSurface,
+    ProjectionTarget,
+)
 from ul_core.augmentations.registry import builtin_augmentation_registry
 from ul_core.contracts import (
     ObservationSource,
@@ -379,7 +385,9 @@ __all__ = [
     "ActionEffect",
     "AugmentationApplicabilityProfile",
     "AugmentationBinding",
+    "AugmentationChangeSet",
     "AugmentationExecutionOwner",
+    "AugmentationProjection",
     "AugmentationQualificationAttempt",
     "AugmentationQualificationCorpus",
     "AugmentationQualificationCorpusCase",
@@ -395,6 +403,7 @@ __all__ = [
     "AugmentationRef",
     "AugmentationRequirements",
     "AugmentationTarget",
+    "AugmentationTargetSurface",
     "BuiltinAugmentationCatalog",
     "BuiltinAugmentationSpec",
     "CallableEvaluator",
@@ -554,6 +563,7 @@ __all__ = [
     "ProductionObservation",
     "ProductionSource",
     "ProductionSourcePage",
+    "ProjectionTarget",
     "PromptManager",
     "PromptTemplateInfo",
     "ProviderDiagnostic",

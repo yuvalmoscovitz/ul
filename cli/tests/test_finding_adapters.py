@@ -194,6 +194,7 @@ def _dataset_result() -> DatasetEvaluationResult:
         source_interaction_id=source.id,
         operator_id="input.surface.rephrase",
         operator_version="1.0.0",
+        changed_paths=("/raw_input",),
         augmented_input=f"Please pay account {_PRIVATE_SECRET}.",
         expected_input_frame=source_frame,
         reparsed_input_frame=source_frame,

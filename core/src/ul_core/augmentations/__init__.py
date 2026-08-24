@@ -11,6 +11,12 @@ from ul_core.augmentations.definitions import (
     BuiltinAugmentationSpec,
     builtin_augmentation_catalog,
 )
+from ul_core.augmentations.projections import (
+    AugmentationChangeSet,
+    AugmentationProjection,
+    AugmentationTargetSurface,
+    ProjectionTarget,
+)
 from ul_core.augmentations.registry import (
     AugmentationRegistry,
     builtin_augmentation_registry,
@@ -18,11 +24,15 @@ from ul_core.augmentations.registry import (
 
 __all__ = [
     "AugmentationBinding",
+    "AugmentationChangeSet",
+    "AugmentationProjection",
     "AugmentationRef",
     "AugmentationRegistry",
     "AugmentationRequirements",
+    "AugmentationTargetSurface",
     "BuiltinAugmentationCatalog",
     "BuiltinAugmentationSpec",
+    "ProjectionTarget",
     "builtin_augmentation_catalog",
     "builtin_augmentation_registry",
 ]

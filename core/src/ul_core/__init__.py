@@ -9,6 +9,12 @@ from ul_core.augmentations.definitions import (
     BuiltinAugmentationSpec,
     builtin_augmentation_catalog,
 )
+from ul_core.augmentations.projections import (
+    AugmentationChangeSet,
+    AugmentationProjection,
+    AugmentationTargetSurface,
+    ProjectionTarget,
+)
 from ul_core.augmentations.registry import (
     AugmentationRegistry,
     builtin_augmentation_registry,
@@ -132,11 +138,14 @@ from ul_core.prompts import PromptManager, PromptTemplateInfo
 __all__ = [
     "AugmentationApplication",
     "AugmentationBinding",
+    "AugmentationChangeSet",
     "AugmentationExecutionOwner",
+    "AugmentationProjection",
     "AugmentationRef",
     "AugmentationRegistry",
     "AugmentationRequirements",
     "AugmentationTarget",
+    "AugmentationTargetSurface",
     "BuiltinAugmentationCatalog",
     "BuiltinAugmentationSpec",
     "CallableEvaluator",
@@ -204,6 +213,7 @@ __all__ = [
     "ProductionObservation",
     "ProductionSource",
     "ProductionSourcePage",
+    "ProjectionTarget",
     "PromptManager",
     "PromptTemplateInfo",
     "RichInteractionCase",

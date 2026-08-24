@@ -217,6 +217,8 @@ class DatasetAugmentationCandidate(ULModel):
     )
     allowed_change: AllowedChange = "surface_form_only"
     human_review_required: bool = False
+    changed_paths: tuple[str, ...] = Field(min_length=1)
+    changed_events: tuple[str, ...] = ()
     augmented_input: str = Field(min_length=1)
     renderer_metadata: dict[str, JsonValue] = Field(default_factory=dict)
     expected_input_frame: SemanticFrame
@@ -553,6 +555,7 @@ class DatasetAugmentationEngine:
                         operator_version=operator.version,
                         allowed_change=operator.allowed_change,
                         human_review_required=operator.human_review_required,
+                        changed_paths=(record.augmentation_path,),
                         augmented_input=augmented_input,
                         renderer_metadata=renderer_metadata,
                         expected_input_frame=expected_input_frame,

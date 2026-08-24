@@ -11,6 +11,7 @@ from ul_core.augmentations.definitions import (
     BuiltinAugmentationSpec,
     builtin_augmentation_catalog,
 )
+from ul_core.augmentations.projections import AugmentationProjection
 from ul_core.models import OracleRelation, Scenario, ShrinkMetadata, ULModel
 
 
@@ -39,7 +40,9 @@ class AugmentationResult(ULModel):
     augmentation_id: str
     augmentation_version: str
     variant: str = "default"
+    projection: AugmentationProjection
     changed_paths: tuple[str, ...]
+    changed_events: tuple[str, ...] = ()
     oracle_relation: OracleRelation
     shrink: ShrinkMetadata
 

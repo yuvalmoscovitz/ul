@@ -113,6 +113,7 @@ def _evaluation_result(
     candidate = DatasetAugmentationCandidate(
         source_interaction_id=identifier,
         operator_id="input.surface.rephrase",
+        changed_paths=("/raw_input",),
         augmented_input="Please transfer 100 to Alice.",
         expected_input_frame=source_frame,
         reparsed_input_frame=source_frame if has_review_finding else None,

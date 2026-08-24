@@ -209,6 +209,19 @@ class InteractionRecord(UserInputRecord):
     def input_value(self) -> JsonValue:
         return self.structured_input if self.structured_input is not None else self.raw_input
 
+    @property
+    def augmentation_path(self) -> str:
+        if self.source_case is None or self.augmentation_target is None:
+            return self.structured_input_target or "/raw_input"
+        if self.augmentation_target.kind == "input_field":
+            return self.augmentation_target.json_pointer or ""
+        turn_index = next(
+            index
+            for index, turn in enumerate(self.source_case.context)
+            if turn.id == self.augmentation_target.turn_id
+        )
+        return f"/context/{turn_index}/content"
+
     def with_input_value(self, value: JsonValue) -> InteractionRecord:
         if self.structured_input_target is None:
             if not isinstance(value, str):

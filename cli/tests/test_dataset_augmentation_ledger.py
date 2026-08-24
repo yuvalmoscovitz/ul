@@ -65,6 +65,7 @@ def _augmentation(source: InteractionRecord) -> DatasetAugmentationResult:
         source_interaction_id=source.id,
         operator_id="input.surface.rephrase",
         operator_version="1.0.0",
+        changed_paths=("/raw_input",),
         augmented_input="Please transfer 100 to Alice.",
         expected_input_frame=source_frame,
         reparsed_input_frame=SemanticFrame(

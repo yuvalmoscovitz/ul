@@ -250,6 +250,7 @@ def _technical_details() -> dict[str, Any]:
         source_interaction_id="quickstart-payment",
         operator_id="input.surface.disfluency_repeat",
         operator_version="1.0.0",
+        changed_paths=("/raw_input",),
         augmented_input="Pay pay AC-100.",
         expected_input_frame=source_frame,
         reparsed_input_frame=source_frame,
