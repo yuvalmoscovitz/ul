@@ -5,6 +5,7 @@ import hmac
 import json
 import os
 import re
+import shlex
 import stat
 import sys
 import tempfile
@@ -1877,9 +1878,14 @@ def review_dataset_finding(
 
     _print_plain(f"Recorded review {new_review.review_id}: {new_review.status}")
     if new_review.status == "confirmed":
+        save_command = f"ul regression save {shlex.quote(str(evidence))} {shlex.quote(finding_id)}"
+        if reviews is not None:
+            save_command += f" --reviews {shlex.quote(str(reviews_path))}"
+        if selected.kind == "semantic_difference":
+            save_command += " --invariants INVARIANTS.json --rule RULE_ID"
         _print_plain(
-            "Promote this finding with 'ul regression save EVIDENCE FINDING_ID "
-            "--output CASE.json --confirm-versioned-input'."
+            f"Promote this finding with '{save_command} --output CASE.json "
+            "--confirm-versioned-input'. Replace uppercase placeholders first."
         )
     _print_plain(f"Review history: {reviews_path}")
 

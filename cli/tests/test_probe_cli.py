@@ -24,6 +24,7 @@ from ul import (
     load_json_http_environment_config,
     load_local_target_config,
 )
+from ul_cli import dataset_review
 from ul_cli import probe as probe_module
 from ul_cli import progress_action as progress_action_module
 from ul_cli.dataset.evaluation import runner as campaign_runner_module
@@ -186,6 +187,70 @@ class _CleanRoomSemanticModel:
             explanation="The clean-room inputs have the same request.",
             verifier_version="clean-room-test",
         )
+
+
+class _RegressionSemanticModel(_CleanRoomSemanticModel):
+    async def deconstruct(
+        self,
+        record: InteractionRecord | UserInputRecord,
+        reference_frame: SemanticFrame | None = None,
+    ) -> SemanticFrame:
+        if not isinstance(record, InteractionRecord):
+            assert reference_frame is not None
+            return reference_frame.model_copy(update={"interaction_id": record.id})
+        output = cast(dict[str, Any], record.raw_observed_output)
+        return SemanticFrame(
+            interaction_id=record.id,
+            request_units=(
+                RequestUnit(
+                    id="payment-request",
+                    evidence=(
+                        EvidenceReference(
+                            source="input", json_pointer="/raw_input", text_quote=None
+                        ),
+                    ),
+                    confidence=1,
+                    status="explicit",
+                    mode="ask",
+                    predicate="pay_invoice",
+                ),
+            ),
+            outcomes=(
+                ObservedOutcome(
+                    id="payment-outcome",
+                    evidence=(
+                        EvidenceReference(
+                            source="output",
+                            json_pointer="/raw_observed_output/action",
+                            text_quote=None,
+                        ),
+                        EvidenceReference(
+                            source="output",
+                            json_pointer="/raw_observed_output/invoice_reference",
+                            text_quote=None,
+                        ),
+                    ),
+                    confidence=1,
+                    status="observed",
+                    request_unit_ids=("payment-request",),
+                    position=0,
+                    kind="action",
+                    predicate="payment_committed",
+                    fields={"invoice_reference": output["invoice_reference"]},
+                ),
+            ),
+            extractor_version="regression-e2e-test",
+        )
+
+    async def render(
+        self,
+        raw_input: str,
+        instruction: str,
+        *,
+        allow_temporary_value: bool = False,
+    ) -> RenderedUserInput:
+        del instruction, allow_temporary_value
+        return RenderedUserInput(text=f"{raw_input} [accepted variation]")
 
 
 def test_declining_target_confirmation_imports_nothing_and_calls_nothing(
@@ -2408,3 +2473,301 @@ done
     assert "next_action=diagnose" in result.output
     saved = json.loads((tmp_path / ".ul" / "probe.json").read_text())
     assert saved["target_kind"] == "command"
+
+
+def _probe_review_and_save_response_regression(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    target_arguments: list[str],
+) -> tuple[Path, Path]:
+    dataset = tmp_path / "regression-input.jsonl"
+    dataset.write_text(
+        json.dumps(
+            {
+                "id": "invoice-payment",
+                "input": "Pay invoice AC-100.",
+                "output": {
+                    "action": "payment_committed",
+                    "invoice_reference": "AC-100",
+                    "requested_invoice_reference": "AC-100",
+                },
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    evidence = tmp_path / "probe-evidence.jsonl"
+    invariant_suite = tmp_path / "invariants.json"
+    invariant_suite.write_text(
+        json.dumps(
+            {
+                "schema_version": "1.0.0",
+                "observation_source": "target_output",
+                "observation_authority": "agent_response",
+                "rules": [
+                    {
+                        "type": "json_values_equal",
+                        "id": "invoice-matches-request",
+                        "version": "1.0.0",
+                        "description": "The paid invoice must match the requested invoice.",
+                        "severity": "high",
+                        "left_pointer": "/invoice_reference",
+                        "right_pointer": "/requested_invoice_reference",
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    case_path = tmp_path / "invoice.regression.json"
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("UL_LIVE", "true")
+    monkeypatch.setenv("OPEN_ROUTER_API_KEY", "test-key")
+
+    async def clean_room_preflight(settings: object) -> object:
+        del settings
+        return _evaluator_preflight()
+
+    def clean_room_model(settings: object) -> _RegressionSemanticModel:
+        del settings
+        return _RegressionSemanticModel()
+
+    monkeypatch.setattr(probe_module, "preflight_evaluator", clean_room_preflight)
+    monkeypatch.setattr(
+        campaign_runner_module,
+        "create_semantic_model_deconstructor",
+        clean_room_model,
+    )
+    probed = runner.invoke(
+        app,
+        [
+            "probe",
+            str(dataset),
+            *target_arguments,
+            "--output",
+            str(evidence),
+            "--operator",
+            "input.surface.rephrase",
+            "--limit",
+            "1",
+            "--repetitions",
+            "1",
+        ],
+        input="y\ny\n",
+    )
+    assert probed.exit_code == 1, probed.output
+    findings = dataset_review._index_findings(dataset_review._load_evidence(evidence))
+    semantic_finding_ids = [
+        finding_id
+        for finding_id, finding in findings.items()
+        if finding.kind == "semantic_difference"
+    ]
+    assert len(semantic_finding_ids) == 1
+    finding_id = semantic_finding_ids[0]
+
+    reviewed = runner.invoke(
+        app,
+        [
+            "dataset",
+            "review",
+            str(evidence),
+            finding_id,
+            "--status",
+            "confirmed",
+            "--severity",
+            "high",
+            "--reviewer",
+            "payments-risk",
+            "--reason",
+            "The accepted variation pays a different invoice.",
+        ],
+    )
+    assert reviewed.exit_code == 0, reviewed.output
+    assert "--invariants INVARIANTS.json --rule RULE_ID" in reviewed.output.replace("\n", " ")
+
+    missing_customer_criterion = runner.invoke(
+        app,
+        [
+            "regression",
+            "save",
+            str(evidence),
+            finding_id,
+            "--rule",
+            "invoice-matches-request",
+            "--output",
+            str(case_path),
+            "--confirm-versioned-input",
+        ],
+    )
+    assert missing_customer_criterion.exit_code == 2
+    assert "explicit customer criterion" in missing_customer_criterion.output
+    assert not case_path.exists()
+
+    saved = runner.invoke(
+        app,
+        [
+            "regression",
+            "save",
+            str(evidence),
+            finding_id,
+            "--invariants",
+            str(invariant_suite),
+            "--rule",
+            "invoice-matches-request",
+            "--output",
+            str(case_path),
+            "--confirm-versioned-input",
+        ],
+    )
+    assert saved.exit_code == 0, saved.output
+    assert "replace TARGET and TARGET_DIGEST" in saved.output
+    saved_case = json.loads(case_path.read_text())
+    assert saved_case["review_snapshot"]["review_id"] == saved_case["lineage"]["review_id"]
+    return case_path, evidence
+
+
+def test_real_callable_probe_review_save_and_replay_without_bridge(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (tmp_path / "customer_agent.py").write_text(
+        "def run(value):\n"
+        "    changed = '[accepted variation]' in value\n"
+        "    return {'action': 'payment_committed', "
+        "'invoice_reference': 'AC-101' if changed else 'AC-100', "
+        "'requested_invoice_reference': 'AC-100'}\n",
+        encoding="utf-8",
+    )
+    resolved_target = probe_module.resolve_probe_target(
+        "customer_agent:run",
+        allow_insecure_http=False,
+        target_working_directory=tmp_path,
+    )
+    case_path, _ = _probe_review_and_save_response_regression(
+        tmp_path,
+        monkeypatch,
+        target_arguments=[
+            "--target",
+            "customer_agent:run",
+            "--target-working-directory",
+            str(tmp_path),
+        ],
+    )
+    replay_path = tmp_path / "callable-replay.json"
+
+    replayed = runner.invoke(
+        app,
+        [
+            "regression",
+            "replay",
+            str(case_path),
+            "--target",
+            "customer_agent:run",
+            "--target-working-directory",
+            str(tmp_path),
+            "--confirm-target",
+            resolved_target.confirmation_sha256,
+            "--max-target-calls",
+            "1",
+            "--output",
+            str(replay_path),
+        ],
+    )
+
+    assert replayed.exit_code == 1, replayed.output
+    assert "Response evidence: observed" in replayed.output
+    assert "Trajectory evidence: unavailable" in replayed.output
+    assert "Committed-state evidence: unavailable" in replayed.output
+
+
+def test_real_authenticated_http_probe_review_save_and_replay_without_bridge(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    received_authorization: list[str | None] = []
+
+    class RegressionTargetHandler(BaseHTTPRequestHandler):
+        def do_POST(self) -> None:
+            payload = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+            received_authorization.append(self.headers.get("Authorization"))
+            changed = "[accepted variation]" in payload["input"]
+            response = json.dumps(
+                {
+                    "response": {
+                        "action": "payment_committed",
+                        "invoice_reference": "AC-101" if changed else "AC-100",
+                        "requested_invoice_reference": "AC-100",
+                    }
+                }
+            ).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(response)))
+            self.end_headers()
+            self.wfile.write(response)
+
+        def log_message(self, format: str, *args: object) -> None:
+            del format, args
+
+    try:
+        server = ThreadingHTTPServer(("127.0.0.1", 0), RegressionTargetHandler)
+    except PermissionError:
+        pytest.skip("the test environment does not allow binding a loopback server")
+    thread = threading.Thread(target=server.serve_forever)
+    thread.start()
+    secret = "Bearer UL57-private-canary"
+    endpoint = f"http://127.0.0.1:{server.server_port}/invoke"
+    monkeypatch.setenv("UL_ENVIRONMENT_UL57_AGENT_TOKEN", secret)
+    try:
+        resolved_target = probe_module.resolve_probe_target(
+            endpoint,
+            allow_insecure_http=True,
+            response_json_pointer="/response",
+            header_from_env=["Authorization=UL_ENVIRONMENT_UL57_AGENT_TOKEN"],
+        )
+        case_path, _ = _probe_review_and_save_response_regression(
+            tmp_path,
+            monkeypatch,
+            target_arguments=[
+                "--target",
+                endpoint,
+                "--response-json-pointer",
+                "/response",
+                "--header-from-env",
+                "Authorization=UL_ENVIRONMENT_UL57_AGENT_TOKEN",
+                "--allow-insecure-http",
+            ],
+        )
+        replay_path = tmp_path / "http-replay.json"
+        replayed = runner.invoke(
+            app,
+            [
+                "regression",
+                "replay",
+                str(case_path),
+                "--target",
+                endpoint,
+                "--response-json-pointer",
+                "/response",
+                "--header-from-env",
+                "Authorization=UL_ENVIRONMENT_UL57_AGENT_TOKEN",
+                "--confirm-target",
+                resolved_target.confirmation_sha256,
+                "--allow-target-network",
+                "--allow-insecure-http",
+                "--max-target-calls",
+                "1",
+                "--output",
+                str(replay_path),
+            ],
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join()
+
+    assert replayed.exit_code == 1, replayed.output
+    assert received_authorization == [secret, secret, secret, secret]
+    assert secret not in case_path.read_text()
+    assert secret not in replayed.output

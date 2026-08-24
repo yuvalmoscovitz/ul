@@ -27,6 +27,8 @@ from ul.dataset_invariants import (
     JsonValuesEqualInvariant,
     NoNewEffectInvariant,
     UnchangedBetweenCheckpointsInvariant,
+    evaluate_dataset_invariants,
+    load_dataset_invariant_suite,
 )
 from ul.dataset_regression import (
     DatasetRegressionCase,
@@ -100,6 +102,17 @@ def save_dataset_regression(
             ),
         ),
     ] = None,
+    invariants: Annotated[
+        Path | None,
+        typer.Option(
+            dir_okay=False,
+            readable=True,
+            help=(
+                "Customer invariant suite to evaluate against probe evidence that was collected "
+                "without invariants. Required with --rule for semantic findings in that evidence."
+            ),
+        ),
+    ] = None,
     reviews: Annotated[
         Path | None,
         typer.Option(help="Review JSONL; defaults to EVIDENCE with .reviews.jsonl suffix."),
@@ -137,6 +150,7 @@ def save_dataset_regression(
             reviews=reviews or evidence.with_suffix(".reviews.jsonl"),
             finding_id=finding_id,
             rule_ids=tuple(rules or ()),
+            invariant_suite_path=invariants,
             target_config_path=target_config,
         )
         output_stream = _create_private_output(output)
@@ -180,7 +194,8 @@ def save_dataset_regression(
         )
     if case.target.kind == "probe_target":
         _print_safe(
-            "Replay: ul regression replay "
+            "Next, replace TARGET and TARGET_DIGEST with the same probe target/options and its "
+            "confirmation digest, then replay: ul regression replay "
             f"{shlex.quote(str(output))} --target TARGET --confirm-target TARGET_DIGEST "
             "--max-target-calls "
             f"{case.discovery_repetitions} --output replay.json"
@@ -663,15 +678,32 @@ def _build_regression_case(
     reviews: Path,
     finding_id: str,
     rule_ids: tuple[str, ...],
+    invariant_suite_path: Path | None,
     target_config_path: Path | None,
 ) -> DatasetRegressionCase:
     selected = load_confirmed_dataset_finding(evidence, reviews, finding_id)
     loaded_record = selected.evidence_record
     finding_case = selected.case
     active_review = selected.review
+    technical_result = DatasetEvaluationResult.model_validate(
+        loaded_record.evidence.technical_details,
+        strict=False,
+    )
     evaluation = loaded_record.evidence.invariant_evaluation
+    if invariant_suite_path is not None:
+        if evaluation is not None:
+            raise ValueError(
+                "finding evidence already includes customer invariant results; omit --invariants"
+            )
+        evaluation = evaluate_dataset_invariants(
+            technical_result,
+            load_dataset_invariant_suite(invariant_suite_path),
+        )
     if evaluation is None:
-        raise ValueError("finding evidence does not include customer invariant results")
+        raise ValueError(
+            "semantic promotion requires an explicit customer criterion: pass --invariants PATH "
+            "and --rule RULE_ID"
+        )
     variation_evaluations = tuple(
         arm for arm in evaluation.variations if arm.operator_id == finding_case.operator_id
     )
@@ -726,10 +758,6 @@ def _build_regression_case(
         load_json_http_environment_config(target_config_path)
         if target_config_path is not None
         else None
-    )
-    technical_result = DatasetEvaluationResult.model_validate(
-        loaded_record.evidence.technical_details,
-        strict=False,
     )
     return create_dataset_regression_case(
         finding_id=finding_id,

@@ -184,6 +184,8 @@ class DatasetRegressionCase(_StrictModel):
         if self.schema_version == "1.4.0":
             if self.target.kind != "probe_target" or self.review_snapshot is None:
                 raise ValueError("probe regression schema requires target and review snapshots")
+            if self.review_snapshot.review_id != self.lineage.review_id:
+                raise ValueError("probe regression review snapshot must match its lineage")
         elif self.review_snapshot is not None or self.discovery_cross_examination is not None:
             raise ValueError("legacy regression schemas do not include probe snapshots")
         if self.case_id != _case_id(self.model_dump(mode="json", exclude={"case_id"})):
