@@ -413,7 +413,7 @@ def _dataset_package() -> FindingEvidencePackage:
                 inconclusive_repetitions=0,
                 stability="stable",
             ),
-            augmentation_relation=_versioned_ref("input.surface.disfluency_repeat", "1.0.0"),
+            augmentation_relation=_versioned_ref("operator", "private-operator", "1.0.0"),
             baseline_drift="not_observed",
             augmentation_sensitivity="observed",
             intrinsic_instability="not_observed",
