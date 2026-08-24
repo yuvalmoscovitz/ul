@@ -4,14 +4,36 @@ import argparse
 import hmac
 import json
 import os
+import stat
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
-from examples.probe_qualification.receipt import append_private_receipt
-
 _TOKEN_ENVIRONMENT_VARIABLE = "UL_ENVIRONMENT_AGENT_TOKEN"
+
+
+def _append_private_receipt(path: Path, value: object) -> None:
+    flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(path, flags, 0o600)
+    try:
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            raise OSError("qualification receipt is not a regular file")
+        if os.name != "nt":
+            os.fchmod(descriptor, 0o600)
+        with os.fdopen(descriptor, "a", encoding="utf-8") as receipt:
+            descriptor = -1
+            receipt.write(json.dumps({"input": value}, sort_keys=True) + "\n")
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
+def invoke(value: object) -> dict[str, object]:
+    receipt_path = os.environ.get("UL_QUALIFICATION_RECEIPT")
+    if receipt_path:
+        _append_private_receipt(Path(receipt_path), value)
+    return {"status": "open", "ticket": 42}
 
 
 class QualificationRequestHandler(BaseHTTPRequestHandler):
@@ -35,7 +57,7 @@ class QualificationRequestHandler(BaseHTTPRequestHandler):
             return
         receipt_path = os.environ.get("UL_QUALIFICATION_RECEIPT")
         if receipt_path:
-            append_private_receipt(Path(receipt_path), value)
+            _append_private_receipt(Path(receipt_path), value)
         self._write_json(HTTPStatus.OK, {"response": {"status": "open", "ticket": 42}})
 
     def log_message(self, format: str, *args: Any) -> None:

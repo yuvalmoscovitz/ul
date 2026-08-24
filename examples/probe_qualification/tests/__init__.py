@@ -1,1 +1,0 @@
-"""Qualification fixture tests."""

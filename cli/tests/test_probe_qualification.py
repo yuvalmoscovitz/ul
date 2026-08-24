@@ -13,10 +13,13 @@ from pathlib import Path
 
 import pytest
 
-from examples.probe_qualification.authenticated_agent import QualificationRequestHandler
+from cli.tests.fixtures.probe_qualification_targets import QualificationRequestHandler
 
-_REPOSITORY_ROOT = Path(__file__).parents[3]
-_DATASET = _REPOSITORY_ROOT / "examples" / "probe_qualification" / "interactions.jsonl"
+_REPOSITORY_ROOT = Path(__file__).parents[2]
+_DATASET = (
+    _REPOSITORY_ROOT / "cli" / "tests" / "fixtures" / "probe_qualification_interactions.jsonl"
+)
+_FIXTURE_ROOT = _DATASET.parent
 
 
 def _run_smoke(
@@ -57,9 +60,9 @@ def test_public_probe_smoke_is_one_target_call_and_zero_semantic_calls(
                 "probe",
                 str(_DATASET),
                 "--target",
-                "examples.probe_qualification.callable_agent:invoke",
+                "probe_qualification_targets:invoke",
                 "--target-working-directory",
-                str(_REPOSITORY_ROOT),
+                str(_FIXTURE_ROOT),
                 "--target-environment-variable",
                 "UL_QUALIFICATION_RECEIPT",
                 "--limit",

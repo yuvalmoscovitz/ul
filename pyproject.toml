@@ -44,7 +44,6 @@ testpaths = [
     "examples/multiturn_correction/tests",
     "examples/retry_after_successful_commit/tests",
     "examples/timeout_after_commit/tests",
-    "examples/probe_qualification/tests",
 ]
 
 [tool.ruff]
