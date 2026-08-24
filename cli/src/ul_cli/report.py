@@ -24,6 +24,7 @@ from ul_cli.dataset_review import (
 )
 from ul_cli.pattern_identity import PatternIdentityKeyError, load_pattern_identity_key
 from ul_cli.report_contract import (
+    FailurePattern,
     FindingSummary,
     ReportEvidenceType,
     ReportInputError,
@@ -249,16 +250,26 @@ def _print_human_report(report: UnifiedReport, evidence: Path) -> None:
             f"expected={review_counts.expected}, unsupported={review_counts.unsupported}, "
             f"inconclusive={review_counts.inconclusive}"
         )
+    safe_evidence = "".join(
+        character if character.isprintable() else f"\\u{ord(character):04x}"
+        for character in str(evidence)
+    )
+    quoted_evidence = None if _WINDOWS else shlex.quote(safe_evidence)
     if report.patterns:
         typer.echo("")
-        typer.echo(f"Reviewable finding patterns: {len(report.patterns)}")
+        typer.echo(
+            f"Finding patterns: {report.stable_pattern_count} stable pattern(s); "
+            f"{len(report.patterns)} review cohort(s)"
+        )
         typer.echo("Patterns group similar evidence; they do not claim a root cause.")
-        for index, pattern in enumerate(report.patterns, start=1):
+        patterns_by_fingerprint: dict[str, list[FailurePattern]] = {}
+        for pattern in report.patterns:
+            patterns_by_fingerprint.setdefault(pattern.pattern_fingerprint, []).append(pattern)
+        for index, cohorts in enumerate(patterns_by_fingerprint.values(), start=1):
+            pattern = cohorts[0]
             typer.echo("")
             typer.echo(f"Pattern {index}: {pattern.summary}")
             typer.echo(f"  Pattern fingerprint: {pattern.pattern_fingerprint}")
-            typer.echo(f"  Snapshot ID: {pattern.pattern_snapshot_id}")
-            typer.echo(f"  Priority: {pattern.severity}")
             typer.echo(
                 "  Evidence authority: "
                 + ", ".join(
@@ -267,6 +278,12 @@ def _print_human_report(report: UnifiedReport, evidence: Path) -> None:
             )
             for limitation in pattern.evidence_limitations:
                 typer.echo(f"  Evidence limitation: {limitation.replace('_', ' ')}")
+            if pattern.vertical_facets is not None:
+                facets = pattern.vertical_facets.model_dump(exclude_none=True)
+                typer.echo(
+                    "  Customer facets: "
+                    + ", ".join(f"{name}={value}" for name, value in facets.items())
+                )
             if pattern.rule_id is not None:
                 typer.echo(
                     f"  Customer rule: {pattern.rule_id}@{pattern.rule_version} "
@@ -275,30 +292,71 @@ def _print_human_report(report: UnifiedReport, evidence: Path) -> None:
                 typer.echo("  Why grouped: same customer-defined rule.")
             else:
                 typer.echo("  Why grouped: same finding category and private action shape.")
-            typer.echo(
-                f"  Affected: {pattern.finding_count} finding(s) across "
-                f"{pattern.source_case_count} test question(s)"
-            )
-            typer.echo("  Observed under:")
-            for operator in pattern.operators:
-                label = operator.summary or operator.operator_id
-                typer.echo(f"    - {label} ({operator.operator_id}@{operator.operator_version})")
-            typer.echo(
-                "  Review queue: "
-                f"{pattern.needs_review_count} needs review; "
-                f"{pattern.confirmed_count} confirmed"
-            )
-            typer.echo("  Members:")
-            for member in pattern.members:
-                reasons = ", ".join(
-                    reason.replace("_", " ") for reason in member.membership_reasons
+            prior_reviews = [
+                review
+                for review in report.pattern_reviews
+                if review.pattern_fingerprint == pattern.pattern_fingerprint
+            ]
+            typer.echo(f"  Prior decision context: {len(prior_reviews)} decision(s)")
+            for review in prior_reviews:
+                typer.echo(
+                    f"    - {review.pattern_review_id}: {review.status}/{review.severity}; "
+                    f"reviewed_at={review.reviewed_at.isoformat()}; "
+                    f"snapshot={review.pattern_snapshot_id}"
+                )
+            typer.echo(f"  Review cohorts: {len(cohorts)}")
+            for cohort_index, cohort in enumerate(cohorts, start=1):
+                review_status = cohort.members[0].review_status
+                review_severity = cohort.members[0].review_severity
+                typer.echo(f"    Cohort {cohort_index}: review={review_status}/{review_severity}")
+                typer.echo(f"      Snapshot ID: {cohort.pattern_snapshot_id}")
+                typer.echo(f"      Priority: {cohort.severity}")
+                typer.echo(
+                    f"      Affected: {cohort.finding_count} finding(s) across "
+                    f"{cohort.source_case_count} test question(s)"
                 )
                 typer.echo(
-                    f"    - {member.finding_id}: {reasons}; "
-                    f"review={member.review_status}/{member.review_severity}"
+                    f"      Review queue: {cohort.needs_review_count} needs review; "
+                    f"{cohort.confirmed_count} confirmed"
                 )
-            typer.echo("  Next: use the per-finding review commands below.")
-    grouped_finding_count = sum(pattern.finding_count for pattern in report.patterns)
+                typer.echo("      Observed under:")
+                for operator in cohort.operators:
+                    label = operator.summary or operator.operator_id
+                    typer.echo(
+                        f"        - {label} ({operator.operator_id}@{operator.operator_version})"
+                    )
+                if not cohort.needs_review_count:
+                    typer.echo("      Next: inspect occurrence evidence below.")
+                    continue
+                typer.echo("      Decision candidates:")
+                for member in cohort.members:
+                    reasons = ", ".join(
+                        reason.replace("_", " ") for reason in member.membership_reasons
+                    )
+                    typer.echo(
+                        f"        - {member.finding_id}: {reasons}; "
+                        f"review={member.review_status}/{member.review_severity}"
+                    )
+                exception_members = [
+                    member
+                    for sibling in cohorts
+                    if sibling.pattern_snapshot_id != cohort.pattern_snapshot_id
+                    for member in sibling.members
+                    if member.review_status != "needs_review"
+                ]
+                typer.echo("      Exceptions unchanged:")
+                for member in exception_members:
+                    typer.echo(
+                        f"        - {member.finding_id}: "
+                        f"review={member.review_status}/{member.review_severity}"
+                    )
+                typer.echo(
+                    "      Next: ul dataset review-pattern "
+                    f"{quoted_evidence or 'EVIDENCE'} {cohort.pattern_snapshot_id}"
+                )
+    grouped_finding_count = sum(
+        pattern.needs_review_count + pattern.confirmed_count for pattern in report.patterns
+    )
     ungrouped_actionable_count = report.summary.actionable_finding_count - grouped_finding_count
     if ungrouped_actionable_count:
         typer.echo("")
@@ -306,11 +364,6 @@ def _print_human_report(report: UnifiedReport, evidence: Path) -> None:
             f"Additional actionable findings not in the reviewable pattern queue: "
             f"{ungrouped_actionable_count}. Inspect them below."
         )
-    safe_evidence = "".join(
-        character if character.isprintable() else f"\\u{ord(character):04x}"
-        for character in str(evidence)
-    )
-    quoted_evidence = None if _WINDOWS else shlex.quote(safe_evidence)
     for index, finding in enumerate(report.findings, start=1):
         typer.echo("")
         typer.echo(f"Finding {finding.finding_id or index}")

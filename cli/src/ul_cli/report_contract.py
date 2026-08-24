@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import unicodedata
 from datetime import datetime
 from typing import Annotated, Literal, Self
 
@@ -66,6 +67,10 @@ _FINDING_ID_PATTERN = r"^ulf_v1_[0-9a-f]{64}$"
 _PATTERN_FINGERPRINT_PATTERN = r"^ulpf_v1_[0-9a-f]{64}$"
 _PATTERN_SNAPSHOT_ID_PATTERN = r"^ulps_v1_[0-9a-f]{64}$"
 _PATTERN_MECHANISM_PSEUDONYM_PATTERN = r"^ulpm_v1_[0-9a-f]{64}$"
+_PATTERN_EVIDENCE_REFERENCE_PATTERN = r"^ulpe_v1_[0-9a-f]{64}$"
+_PATTERN_REVIEW_ID_PATTERN = (
+    r"^ulpr_[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+)
 _SHA256_PATTERN = r"^[0-9a-f]{64}$"
 _JSON_POINTER_PATTERN = re.compile(r"(?:/(?:[^~/]|~[01])*)*")
 _MAXIMUM_RUN_RECEIPT_BYTES = 1_000_000
@@ -823,8 +828,11 @@ def _pattern_fingerprint(pattern: FailurePattern) -> str:
             "evidence_authorities",
             "evidence_limitations",
             "horizontal_facets",
+            "vertical_facets",
         },
     )
+    if pattern.vertical_facets is None:
+        grouping_facets.pop("vertical_facets")
     canonical_grouping_facets = _canonical_json(grouping_facets).encode("utf-8")
     if len(canonical_grouping_facets) > _MAXIMUM_PATTERN_FINGERPRINT_BYTES:
         raise ValueError("pattern fingerprint input exceeds the size limit")
@@ -1138,10 +1146,36 @@ class PatternHorizontalFacets(_StrictModel):
     mechanism_pseudonym: str = Field(pattern=_PATTERN_MECHANISM_PSEUDONYM_PATTERN)
 
 
+class PatternVerticalFacets(_StrictModel):
+    domain: str | None = Field(default=None, min_length=1, max_length=200)
+    workflow: str | None = Field(default=None, min_length=1, max_length=200)
+    role: str | None = Field(default=None, min_length=1, max_length=200)
+    use_case: str | None = Field(default=None, min_length=1, max_length=200)
+
+    @model_validator(mode="after")
+    def validate_facets(self) -> Self:
+        values = (self.domain, self.workflow, self.role, self.use_case)
+        if not any(value is not None for value in values):
+            raise ValueError("vertical facets require at least one customer value")
+        if any(value is not None and value != value.strip() for value in values):
+            raise ValueError("vertical facet values cannot have surrounding whitespace")
+        if any(
+            value is not None
+            and (
+                value != unicodedata.normalize("NFC", value)
+                or not all(character.isprintable() for character in value)
+            )
+            for value in values
+        ):
+            raise ValueError("vertical facet values must be printable NFC text")
+        return self
+
+
 class PatternMember(_StrictModel):
     finding_id: str = Field(pattern=_FINDING_ID_PATTERN)
+    evidence_record_ref: str = Field(pattern=_PATTERN_EVIDENCE_REFERENCE_PATTERN)
     membership_reasons: tuple[PatternMembershipReason, ...] = Field(min_length=1)
-    review_status: Literal["needs_review", "confirmed"]
+    review_status: FindingReviewStatus
     review_severity: FindingSeverity
 
     @model_validator(mode="after")
@@ -1174,11 +1208,15 @@ class FailurePattern(_StrictModel):
     evidence_authorities: tuple[PatternEvidenceAuthority, ...] = Field(min_length=1)
     evidence_limitations: tuple[PatternEvidenceLimitation, ...] = ()
     horizontal_facets: PatternHorizontalFacets
+    vertical_facets: PatternVerticalFacets | None = None
     finding_count: int = Field(ge=1)
     source_case_count: int = Field(ge=1)
     operators: tuple[PatternOperator, ...] = Field(min_length=1, max_length=100)
     needs_review_count: int = Field(ge=0)
     confirmed_count: int = Field(ge=0)
+    expected_count: int = Field(ge=0)
+    unsupported_count: int = Field(ge=0)
+    inconclusive_count: int = Field(ge=0)
     members: tuple[PatternMember, ...] = Field(min_length=1, max_length=10_000)
 
     @model_validator(mode="after")
@@ -1196,12 +1234,26 @@ class FailurePattern(_StrictModel):
         member_ids = tuple(member.finding_id for member in self.members)
         if member_ids != tuple(sorted(set(member_ids))):
             raise ValueError("pattern members must be sorted and unique")
-        if self.needs_review_count + self.confirmed_count != self.finding_count:
+        if (
+            self.needs_review_count
+            + self.confirmed_count
+            + self.expected_count
+            + self.unsupported_count
+            + self.inconclusive_count
+            != self.finding_count
+        ):
             raise ValueError("pattern review counts must match finding count")
-        if self.needs_review_count != sum(
-            member.review_status == "needs_review" for member in self.members
-        ) or self.confirmed_count != sum(
-            member.review_status == "confirmed" for member in self.members
+        if (
+            self.needs_review_count
+            != sum(member.review_status == "needs_review" for member in self.members)
+            or self.confirmed_count
+            != sum(member.review_status == "confirmed" for member in self.members)
+            or self.expected_count
+            != sum(member.review_status == "expected" for member in self.members)
+            or self.unsupported_count
+            != sum(member.review_status == "unsupported" for member in self.members)
+            or self.inconclusive_count
+            != sum(member.review_status == "inconclusive" for member in self.members)
         ):
             raise ValueError("pattern review counts must match member snapshots")
         operator_keys = tuple(
@@ -1271,6 +1323,34 @@ class ReviewStatusCounts(_StrictModel):
     inconclusive: int = Field(ge=0)
 
 
+class PatternReviewSummary(_StrictModel):
+    pattern_review_id: str = Field(pattern=_PATTERN_REVIEW_ID_PATTERN)
+    pattern_fingerprint: str = Field(pattern=_PATTERN_FINGERPRINT_PATTERN)
+    pattern_snapshot_id: str = Field(pattern=_PATTERN_SNAPSHOT_ID_PATTERN)
+    status: Literal["confirmed", "expected", "unsupported", "inconclusive"]
+    severity: FindingSeverity = "unrated"
+    reviewed_finding_ids: tuple[str, ...] = Field(min_length=1, max_length=10_000)
+    exception_finding_ids: tuple[str, ...] = Field(default=(), max_length=10_000)
+    reviewed_at: datetime
+
+    @model_validator(mode="after")
+    def validate_review(self) -> Self:
+        for values, label in (
+            (self.reviewed_finding_ids, "reviewed finding IDs"),
+            (self.exception_finding_ids, "exception finding IDs"),
+        ):
+            _validate_sorted_unique(values, label)
+            if any(re.fullmatch(_FINDING_ID_PATTERN, value) is None for value in values):
+                raise ValueError(f"{label} must contain finding IDs")
+        if set(self.reviewed_finding_ids) & set(self.exception_finding_ids):
+            raise ValueError("reviewed and exception finding IDs must be disjoint")
+        if self.status != "confirmed" and self.severity != "unrated":
+            raise ValueError("only confirmed pattern reviews can have a rated severity")
+        if self.reviewed_at.tzinfo is None or self.reviewed_at.utcoffset() is None:
+            raise ValueError("pattern review timestamp must include a UTC offset")
+        return self
+
+
 class ReportSummary(_StrictModel):
     finding_count: int = Field(ge=0)
     actionable_finding_count: int = Field(ge=0)
@@ -1294,7 +1374,7 @@ def build_report_summary(findings: tuple[FindingSummary, ...]) -> ReportSummary:
 
 
 class UnifiedReport(_StrictModel):
-    schema_version: Literal["1.6.0"] = "1.6.0"
+    schema_version: Literal["1.7.0"] = "1.7.0"
     evidence_type: ReportEvidenceType
     evidence_schema_versions: tuple[str, ...] = Field(min_length=1)
     evidence_scope: ReportEvidenceScope
@@ -1303,7 +1383,9 @@ class UnifiedReport(_StrictModel):
     review_status: ReportReviewStatus
     exit_code: Literal[0, 1, 2]
     summary: ReportSummary
+    stable_pattern_count: int = Field(default=0, ge=0)
     patterns: tuple[FailurePattern, ...] = ()
+    pattern_reviews: tuple[PatternReviewSummary, ...] = ()
     findings: tuple[FindingSummary, ...] = ()
 
     @model_validator(mode="after")
@@ -1342,6 +1424,22 @@ class UnifiedReport(_StrictModel):
         )
         if len(pattern_ids) != len(set(pattern_ids)) or pattern_ids != expected_pattern_order:
             raise ValueError("patterns must be sorted and unique")
+        if self.stable_pattern_count != len(
+            {pattern.pattern_fingerprint for pattern in self.patterns}
+        ):
+            raise ValueError("stable pattern count must match unique fingerprints")
+        pattern_review_ids = tuple(review.pattern_review_id for review in self.pattern_reviews)
+        expected_review_order = tuple(
+            review.pattern_review_id
+            for review in sorted(
+                self.pattern_reviews,
+                key=lambda review: (review.reviewed_at, review.pattern_review_id),
+            )
+        )
+        if len(pattern_review_ids) != len(set(pattern_review_ids)) or (
+            pattern_review_ids != expected_review_order
+        ):
+            raise ValueError("pattern reviews must be sorted and unique")
         known_findings = {
             finding.finding_id: finding
             for finding in self.findings

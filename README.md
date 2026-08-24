@@ -209,6 +209,16 @@ ul dataset review .ul/runs/EVIDENCE.jsonl FINDING_ID \
   --severity high \
   --reviewer payments-risk \
   --reason "The variation committed payment for the wrong invoice."
+
+# Preview an exact pattern snapshot without writing a decision.
+ul dataset review-pattern .ul/runs/EVIDENCE.jsonl PATTERN_SNAPSHOT_ID
+
+# Apply one decision to only that snapshot's still-unreviewed occurrences.
+ul dataset review-pattern .ul/runs/EVIDENCE.jsonl PATTERN_SNAPSHOT_ID \
+  --status confirmed \
+  --severity high \
+  --reviewer payments-risk \
+  --reason "The reviewed occurrences show the same consequential failure."
 ```
 
 With an explicit evidence path, `ul report` auto-detects dataset evaluation, correction,
@@ -216,14 +226,20 @@ retry-after-successful-commit, and timeout-after-commit evidence. Its default hu
 versioned JSON omit inputs, responses, state, customer descriptions, and arbitrary evidence text.
 For reviewable dataset findings, the report groups matching evidence into deterministic finding
 patterns. Each pattern shows how many test questions are affected, which augmentations it was
-observed under, its review queue, and the exact underlying finding IDs. Patterns are
+observed under, its review queue, occurrence-level exceptions, and the exact underlying finding IDs.
+Pattern decisions are append-only and bind the complete membership and evidence snapshot. Existing
+occurrence decisions are unchanged exceptions, and later matching occurrences remain unreviewed;
+an earlier pattern decision is context only. Patterns are
 evidence-navigation aids, not correctness, causation, or root-cause claims. Inspect-only findings,
 such as unstable behavior without a reviewable semantic difference, remain listed separately.
 Use `ul dataset report EVIDENCE.jsonl` when you need the detailed private dataset review surface.
+The private `.ul/review-history.key` authenticates pattern decisions independently of the rotatable
+pattern identity key. Back it up with the project: pattern review history cannot be verified without
+it.
 Trace replay bundles are not supported by `ul report`.
 
 Reviews are appended to a separate audit file. Evidence is never rewritten. The human report and
-versioned JSON expose review workflow status (`review_status` in report schema `1.4.0`). Exit codes
+versioned JSON expose review workflow status (`review_status` in report schema `1.7.0`). Exit codes
 map to that review status:
 
 - `0` (`resolved`): no actionable finding remains; `expected` and `unsupported` reviews resolve a
@@ -235,7 +251,8 @@ map to that review status:
 
 Review status is workflow state, not an agent correctness verdict.
 
-Save a confirmed finding as a regression:
+Save selected confirmed findings as regressions one occurrence at a time. A pattern decision never
+promotes every member automatically:
 
 ```bash
 ul regression save EVIDENCE.jsonl FINDING_ID \

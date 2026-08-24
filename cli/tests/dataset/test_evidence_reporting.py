@@ -57,13 +57,48 @@ def test_rich_evidence_builds_parses_and_reports_end_to_end(tmp_path: Path) -> N
     evidence_path.write_text(json.dumps(record) + "\n", encoding="utf-8")
     _create_pattern_identity_key(tmp_path)
 
-    assert record["schema_version"] == "1.9.0"
+    assert record["schema_version"] == "1.11.0"
     assert dataset_review.is_reportable_dataset_evidence(evidence_path) is True
     report = runner.invoke(root_app, ["report", str(evidence_path), "--json"])
     assert report.exit_code == 0, report.output
     parsed_report = json.loads(report.output)
-    assert parsed_report["evidence_schema_versions"] == ["1.9.0"]
+    assert parsed_report["evidence_schema_versions"] == ["1.11.0"]
     assert parsed_report["evaluation_mode"] == "variance"
+
+
+def test_customer_pattern_facets_are_copied_only_from_the_reserved_metadata_field() -> None:
+    result = _evaluation_result("interaction-1")
+    result = result.model_copy(
+        update={
+            "source": result.source.model_copy(
+                update={
+                    "metadata": {
+                        "unrelated": {"domain": "ignored"},
+                        "ul_pattern_facets": {
+                            "domain": "payments",
+                            "workflow": "invoice-payment",
+                            "role": "approver",
+                            "use_case": "pay-approved-invoice",
+                        },
+                    }
+                }
+            )
+        }
+    )
+
+    record = customer_module.build_customer_evidence_record(
+        result,
+        repetitions=1,
+        max_environment_api_calls=2,
+        planned_target_calls=2,
+    )
+
+    assert record["pattern_facets"] == {
+        "domain": "payments",
+        "workflow": "invoice-payment",
+        "role": "approver",
+        "use_case": "pay-approved-invoice",
+    }
 
 
 def test_rich_customer_evidence_records_source_target_original_and_lineage() -> None:
@@ -114,7 +149,7 @@ def test_rich_customer_evidence_records_source_target_original_and_lineage() -> 
         planned_target_calls=2,
     )
 
-    assert evidence["schema_version"] == "1.9.0"
+    assert evidence["schema_version"] == "1.11.0"
     assert evidence["interaction_id"] == "cancel-order::message"
     assert evidence["source_record_id"] == "cancel-order"
     assert evidence["augmentation_target"] == {
@@ -219,7 +254,7 @@ def test_customer_evidence_keeps_summary_and_nested_technical_details() -> None:
     assert presentation_module.result_needs_review(result) is True
     assert evidence["interaction_id"] == "case-1"
     assert evidence["original_input"] == "transfer 100 to Alice"
-    assert evidence["schema_version"] == "1.8.0"
+    assert evidence["schema_version"] == "1.10.0"
     assert evidence["evaluation_mode"] == "variance"
     assert evidence["invariant_evaluation"] is None
     assert evidence["current_baseline"]["status"] == "ORIGINAL REPLAY STABLE (3/3 OBSERVED)"
@@ -280,7 +315,7 @@ def test_customer_evidence_keeps_invariants_separate_from_behavioral_findings() 
         invariant_evaluation=invariant_evaluation,
     )
 
-    assert evidence["schema_version"] == "1.8.0"
+    assert evidence["schema_version"] == "1.10.0"
     assert evidence["evaluation_mode"] == "variance"
     assert evidence["cases"] == []
     stored_invariants = cast(dict[str, Any], evidence["invariant_evaluation"])

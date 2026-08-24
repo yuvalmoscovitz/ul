@@ -19,7 +19,10 @@ from ul.dataset_evaluation import DatasetEvaluationFinding, DatasetEvaluationRes
 
 from ul_cli.dataset import create_customer_evidence_record
 from ul_cli.demo_scenario import run_demo_evaluations
-from ul_cli.pattern_identity import ensure_project_pattern_identity_key
+from ul_cli.pattern_identity import (
+    ensure_project_pattern_identity_key,
+    ensure_project_review_history_key,
+)
 
 console = Console()
 
@@ -252,6 +255,7 @@ def run_demo(output: Path | None = None) -> None:
         project_directory = evidence_path.parent / ".ul"
         project_directory.mkdir(mode=0o700, exist_ok=True)
         ensure_project_pattern_identity_key(project_directory)
+        ensure_project_review_history_key(project_directory)
         _save_evidence(results, evidence_path)
     except (OSError, ValueError) as error:
         typer.echo(f"Demo could not run: {error.__class__.__name__}", err=True)

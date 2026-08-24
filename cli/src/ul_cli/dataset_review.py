@@ -1,14 +1,16 @@
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
 import os
 import re
 import stat
 import sys
+import tempfile
 import unicodedata
 from collections.abc import Callable, Generator
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -49,7 +51,15 @@ from ul.http_environment import JsonHttpIsolatedResponseConfig, JsonHttpTargetCo
 from ul.outcome_projection import OutcomeProjection
 from ul_core.augmentations.definitions import builtin_augmentation_catalog
 
-from ul_cli.pattern_identity import pattern_mechanism_pseudonym
+from ul_cli.pattern_identity import (
+    PatternIdentityKeyError,
+    ReviewHistoryKeyError,
+    load_pattern_identity_key,
+    load_review_history_key,
+    pattern_evidence_reference,
+    pattern_mechanism_pseudonym,
+    pattern_review_record_hmac,
+)
 from ul_cli.report_contract import (
     FailurePattern,
     FindingCategory,
@@ -61,6 +71,8 @@ from ul_cli.report_contract import (
     PatternHorizontalFacets,
     PatternMember,
     PatternOperator,
+    PatternReviewSummary,
+    PatternVerticalFacets,
     ReportInputError,
     ReportReviewStatus,
     UnifiedReport,
@@ -87,6 +99,9 @@ _MAXIMUM_SENSITIVE_DISCLOSURE_LINES = 50
 _SHA256_PATTERN = r"^[0-9a-f]{64}$"
 _FINDING_ID_PATTERN = r"^ulf_v1_[0-9a-f]{64}$"
 _REVIEW_ID_PATTERN = r"^ulr_[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+_PATTERN_REVIEW_ID_PATTERN = (
+    r"^ulpr_[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+)
 _DATASET_EVALUATION_PIPELINE_VERSION = "1.4.0"
 _MAXIMUM_PATTERN_EFFECTS = 100
 _MAXIMUM_PATTERN_FIELDS = 100
@@ -124,12 +139,18 @@ class _PatternContext:
     source_case_id: str
     operator_id: str
     evidence_authorities: tuple[PatternEvidenceAuthority, ...]
+    evidence_record_sha256: str
+    vertical_facets: PatternVerticalFacets | None = None
 
     def __post_init__(self) -> None:
         if len(self.private_mechanism_key) != 64 or any(
             character not in "0123456789abcdef" for character in self.private_mechanism_key
         ):
             raise ValueError("private pattern mechanism key must be a lowercase SHA-256 digest")
+        if len(self.evidence_record_sha256) != 64 or any(
+            character not in "0123456789abcdef" for character in self.evidence_record_sha256
+        ):
+            raise ValueError("pattern evidence digest must be a lowercase SHA-256 digest")
 
 
 class _EvidenceReference(_StrictModel):
@@ -332,10 +353,23 @@ class _Case(_StrictModel):
 
 
 class _EvidenceRecord(_StrictModel):
-    schema_version: Literal["1.3.0", "1.4.0", "1.5.0", "1.6.0", "1.7.0", "1.8.0", "1.9.0"]
+    schema_version: Literal[
+        "1.3.0",
+        "1.4.0",
+        "1.5.0",
+        "1.6.0",
+        "1.7.0",
+        "1.8.0",
+        "1.9.0",
+        "1.10.0",
+        "1.11.0",
+    ]
     evaluation_mode: Literal["variance"] | None = None
     interaction_id: str
     source_record_id: str | None = cast(Any, Field)(default=None, exclude_if=_is_none)
+    pattern_facets: PatternVerticalFacets | None = cast(Any, Field)(
+        default=None, exclude_if=_is_none
+    )
     augmentation_target: JsonValue | None = cast(Any, Field)(default=None, exclude_if=_is_none)
     original_input: str
     execution_plan: _ExecutionPlan
@@ -348,15 +382,20 @@ class _EvidenceRecord(_StrictModel):
 
     @model_validator(mode="after")
     def validate_invariant_evaluation(self) -> Self:
-        if self.schema_version in {"1.8.0", "1.9.0"} and self.evaluation_mode is None:
+        current_schemas = {"1.8.0", "1.9.0", "1.10.0", "1.11.0"}
+        if self.schema_version not in {"1.10.0", "1.11.0"} and "pattern_facets" in (
+            self.model_fields_set
+        ):
+            raise ValueError("vertical pattern facets require evidence schema 1.10.0")
+        if self.schema_version in current_schemas and self.evaluation_mode is None:
             raise ValueError(f"evidence schema {self.schema_version} requires an evaluation mode")
-        if self.schema_version in {"1.8.0", "1.9.0"} and (
+        if self.schema_version in current_schemas and (
             not isinstance(self.technical_details, dict)
             or self.technical_details.get("evaluation_mode") != self.evaluation_mode
         ):
             raise ValueError("evidence evaluation mode must match technical details")
         if (
-            self.schema_version not in {"1.8.0", "1.9.0"}
+            self.schema_version not in current_schemas
             and "evaluation_mode" in self.model_fields_set
         ):
             raise ValueError("legacy evidence does not include evaluation mode")
@@ -365,7 +404,16 @@ class _EvidenceRecord(_StrictModel):
         if self.schema_version in {"1.5.0", "1.6.0", "1.7.0"} and self.run_context is None:
             raise ValueError(f"schema {self.schema_version} requires run context")
         if (
-            self.schema_version not in {"1.5.0", "1.6.0", "1.7.0", "1.8.0", "1.9.0"}
+            self.schema_version
+            not in {
+                "1.5.0",
+                "1.6.0",
+                "1.7.0",
+                "1.8.0",
+                "1.9.0",
+                "1.10.0",
+                "1.11.0",
+            }
             and "run_context" in self.model_fields_set
         ):
             raise ValueError("legacy evidence does not include run context")
@@ -382,6 +430,8 @@ class _EvidenceRecord(_StrictModel):
             "1.7.0",
             "1.8.0",
             "1.9.0",
+            "1.10.0",
+            "1.11.0",
         }:
             raise ValueError("extended invariant results require evidence schema 1.6.0")
         if (
@@ -531,7 +581,16 @@ def validate_dataset_resume_evidence(
         except (ValidationError, ValueError):
             raise ValueError("resume evidence is not valid UL JSONL") from None
         if (
-            evidence.schema_version not in {"1.5.0", "1.6.0", "1.7.0", "1.8.0", "1.9.0"}
+            evidence.schema_version
+            not in {
+                "1.5.0",
+                "1.6.0",
+                "1.7.0",
+                "1.8.0",
+                "1.9.0",
+                "1.10.0",
+                "1.11.0",
+            }
             or evidence.run_context is None
         ):
             raise ValueError(
@@ -649,6 +708,7 @@ def _canonical_json_sha256(value: object) -> str:
 
 
 class ReviewRecord(_StrictModel):
+    record_type: Literal["occurrence_review"] = Field(default="occurrence_review", exclude=True)
     schema_version: Literal["1.0.0"] = "1.0.0"
     review_id: str = Field(pattern=_REVIEW_ID_PATTERN)
     evidence_record_sha256: str = Field(pattern=_SHA256_PATTERN)
@@ -659,6 +719,11 @@ class ReviewRecord(_StrictModel):
     reason: str = Field(min_length=1, max_length=4000)
     reviewed_at: datetime
     supersedes_review_id: str | None = Field(default=None, pattern=_REVIEW_ID_PATTERN)
+    origin_pattern_review_id: str | None = cast(Any, Field)(
+        default=None,
+        pattern=_PATTERN_REVIEW_ID_PATTERN,
+        exclude_if=_is_none,
+    )
 
     @model_validator(mode="after")
     def validate_review(self) -> Self:
@@ -671,7 +736,114 @@ class ReviewRecord(_StrictModel):
         return self
 
 
+class PatternOccurrenceDecision(_StrictModel):
+    review_id: str = Field(pattern=_REVIEW_ID_PATTERN)
+    finding_id: str = Field(pattern=_FINDING_ID_PATTERN)
+    evidence_record_sha256: str = Field(pattern=_SHA256_PATTERN)
+
+
+class PatternEvidenceBinding(_StrictModel):
+    finding_id: str = Field(pattern=_FINDING_ID_PATTERN)
+    evidence_record_sha256: str = Field(pattern=_SHA256_PATTERN)
+
+
+class PatternReviewRecord(_StrictModel):
+    record_type: Literal["pattern_review"] = "pattern_review"
+    schema_version: Literal["1.1.0"] = "1.1.0"
+    pattern_review_id: str = Field(pattern=_PATTERN_REVIEW_ID_PATTERN)
+    record_hmac_sha256: str = Field(pattern=_SHA256_PATTERN)
+    grouping_evidence_sha256: str = Field(pattern=_SHA256_PATTERN)
+    pattern_snapshot: FailurePattern
+    status: ReviewStatus
+    severity: ReviewSeverity = "unrated"
+    reviewed_finding_ids: tuple[str, ...] = Field(min_length=1, max_length=10_000)
+    exception_finding_ids: tuple[str, ...] = Field(default=(), max_length=10_000)
+    evidence_record_sha256s: tuple[str, ...] = Field(min_length=1, max_length=100)
+    evidence_bindings: tuple[PatternEvidenceBinding, ...] = Field(min_length=1, max_length=10_000)
+    occurrence_decisions: tuple[PatternOccurrenceDecision, ...] = Field(
+        min_length=1, max_length=10_000
+    )
+    reviewer: str = Field(min_length=1, max_length=200)
+    reason: str = Field(min_length=1, max_length=4000)
+    reviewed_at: datetime
+
+    @model_validator(mode="after")
+    def validate_review(self) -> Self:
+        if not self.reviewer.strip() or not self.reason.strip():
+            raise ValueError("reviewer and reason must contain non-whitespace text")
+        if self.status != "confirmed" and self.severity != "unrated":
+            raise ValueError("only confirmed patterns can have a rated severity")
+        if self.reviewed_at.tzinfo is None or self.reviewed_at.utcoffset() != UTC.utcoffset(None):
+            raise ValueError("reviewed_at must use UTC")
+        for values in (self.reviewed_finding_ids, self.exception_finding_ids):
+            if values != tuple(sorted(set(values))):
+                raise ValueError("pattern review finding IDs must be sorted and unique")
+        reviewed = set(self.reviewed_finding_ids)
+        exceptions = set(self.exception_finding_ids)
+        if reviewed & exceptions:
+            raise ValueError("reviewed and exception findings must be disjoint")
+        members = {member.finding_id: member for member in self.pattern_snapshot.members}
+        if reviewed != set(members) or any(
+            member.review_status != "needs_review" for member in members.values()
+        ):
+            raise ValueError("pattern review can decide only an exact needs-review cohort")
+        decision_ids = tuple(decision.finding_id for decision in self.occurrence_decisions)
+        review_ids = tuple(decision.review_id for decision in self.occurrence_decisions)
+        if decision_ids != self.reviewed_finding_ids:
+            raise ValueError("pattern occurrence decisions must match reviewed findings")
+        if len(review_ids) != len(set(review_ids)):
+            raise ValueError("pattern occurrence decision IDs must be unique")
+        binding_ids = tuple(binding.finding_id for binding in self.evidence_bindings)
+        if any(
+            re.fullmatch(_SHA256_PATTERN, value) is None for value in self.evidence_record_sha256s
+        ):
+            raise ValueError("pattern evidence manifest must contain SHA-256 digests")
+        if binding_ids != tuple(sorted(set(binding_ids))):
+            raise ValueError("pattern evidence bindings must be sorted and unique")
+        if not (reviewed | exceptions <= set(binding_ids)):
+            raise ValueError("pattern members and exceptions require evidence bindings")
+        return self
+
+    def derived_reviews(self) -> tuple[ReviewRecord, ...]:
+        return tuple(
+            ReviewRecord(
+                review_id=decision.review_id,
+                evidence_record_sha256=decision.evidence_record_sha256,
+                finding_id=decision.finding_id,
+                status=self.status,
+                severity=self.severity,
+                reviewer=self.reviewer,
+                reason=self.reason,
+                reviewed_at=self.reviewed_at,
+                origin_pattern_review_id=self.pattern_review_id,
+            )
+            for decision in self.occurrence_decisions
+        )
+
+    def hmac_payload(self) -> dict[str, Any]:
+        return self.model_dump(mode="json", exclude={"record_hmac_sha256"})
+
+    def summary(self) -> PatternReviewSummary:
+        return PatternReviewSummary(
+            pattern_review_id=self.pattern_review_id,
+            pattern_fingerprint=self.pattern_snapshot.pattern_fingerprint,
+            pattern_snapshot_id=self.pattern_snapshot.pattern_snapshot_id,
+            status=self.status,
+            severity=self.severity,
+            reviewed_finding_ids=self.reviewed_finding_ids,
+            exception_finding_ids=self.exception_finding_ids,
+            reviewed_at=self.reviewed_at,
+        )
+
+
+ReviewHistoryRecord = ReviewRecord | PatternReviewRecord
+
+
 class _ReviewInputError(ValueError):
+    pass
+
+
+class _ReviewCommitUncertainError(OSError):
     pass
 
 
@@ -680,6 +852,12 @@ class _LoadedEvidenceRecord(BaseModel):
 
     evidence: _EvidenceRecord
     sha256: str
+
+
+@dataclass
+class _LockedReviewsFile:
+    path: Path
+    descriptor: int
 
 
 @dataclass(frozen=True)
@@ -714,7 +892,12 @@ def load_confirmed_dataset_finding(
     if selected is None:
         raise ValueError("finding ID was not found in the evidence")
     review_records = _load_reviews(reviews_path)
-    _validate_review_history(review_records, findings)
+    _validate_review_history(
+        review_records,
+        findings,
+        evidence_records,
+        review_history_key=_review_history_key_for_records(evidence_path, review_records),
+    )
     active_review = _active_reviews(review_records).get(finding_id)
     if active_review is None or active_review.status != "confirmed":
         raise ValueError("finding must have an active confirmed review")
@@ -750,7 +933,7 @@ def summarize_dataset_evidence(
             reviews,
             pattern_identity_key=pattern_identity_key,
         )
-    except _ReviewInputError as error:
+    except (PatternIdentityKeyError, ReviewHistoryKeyError, _ReviewInputError) as error:
         raise ReportInputError(str(error)) from None
     except (ValidationError, ValueError):
         raise ReportInputError("dataset evidence cannot be summarized safely") from None
@@ -766,7 +949,12 @@ def _summarize_dataset_evidence(
     evaluation_mode = _dataset_evaluation_mode(evidence_records)
     review_records = _load_reviews(reviews or _default_reviews_path(evidence))
     indexed_findings = _index_findings(evidence_records)
-    _validate_review_history(review_records, indexed_findings)
+    _validate_review_history(
+        review_records,
+        indexed_findings,
+        evidence_records,
+        review_history_key=_review_history_key_for_records(evidence, review_records),
+    )
     active_reviews = _active_reviews(review_records)
 
     finding_summaries: list[FindingSummary] = []
@@ -812,16 +1000,17 @@ def _summarize_dataset_evidence(
                     summary=summary,
                 )
             )
-            if review_status in {"needs_review", "confirmed"}:
-                semantic_finding = indexed_finding.semantic_finding
-                pattern_signature = _behavior_pattern_signature(semantic_finding)
-                if pattern_signature is not None:
-                    pattern_contexts[indexed_finding.finding_id] = _PatternContext(
-                        private_mechanism_key=pattern_signature,
-                        source_case_id=indexed_finding.evidence_record.evidence.interaction_id,
-                        operator_id=indexed_finding.case.operator_id,
-                        evidence_authorities=("model_derived_unverified",),
-                    )
+            semantic_finding = indexed_finding.semantic_finding
+            pattern_signature = _behavior_pattern_signature(semantic_finding)
+            if pattern_signature is not None:
+                pattern_contexts[indexed_finding.finding_id] = _PatternContext(
+                    private_mechanism_key=pattern_signature,
+                    source_case_id=indexed_finding.evidence_record.evidence.interaction_id,
+                    operator_id=indexed_finding.case.operator_id,
+                    evidence_authorities=("model_derived_unverified",),
+                    evidence_record_sha256=indexed_finding.evidence_record.sha256,
+                    vertical_facets=indexed_finding.evidence_record.evidence.pattern_facets,
+                )
             continue
 
         variation_rule = indexed_finding.variation_rule
@@ -862,20 +1051,21 @@ def _summarize_dataset_evidence(
                 summary="The agent violated a customer-defined rule.",
             )
         )
-        if review_status in {"needs_review", "confirmed"}:
-            pattern_signature = _canonical_json_sha256(
-                {
-                    "kind": "customer_invariant_violation",
-                    "rule_id": variation_rule.rule_id,
-                    "rule_version": variation_rule.rule_version,
-                }
-            )
-            pattern_contexts[indexed_finding.finding_id] = _PatternContext(
-                private_mechanism_key=pattern_signature,
-                source_case_id=indexed_finding.evidence_record.evidence.interaction_id,
-                operator_id=indexed_finding.case.operator_id,
-                evidence_authorities=("customer_declared", "deterministic_evaluator"),
-            )
+        pattern_signature = _canonical_json_sha256(
+            {
+                "kind": "customer_invariant_violation",
+                "rule_id": variation_rule.rule_id,
+                "rule_version": variation_rule.rule_version,
+            }
+        )
+        pattern_contexts[indexed_finding.finding_id] = _PatternContext(
+            private_mechanism_key=pattern_signature,
+            source_case_id=indexed_finding.evidence_record.evidence.interaction_id,
+            operator_id=indexed_finding.case.operator_id,
+            evidence_authorities=("customer_declared", "deterministic_evaluator"),
+            evidence_record_sha256=indexed_finding.evidence_record.sha256,
+            vertical_facets=indexed_finding.evidence_record.evidence.pattern_facets,
+        )
 
     for loaded_record in evidence_records:
         for case in loaded_record.evidence.cases:
@@ -1011,7 +1201,18 @@ def _summarize_dataset_evidence(
         review_status=report_review_status,
         exit_code=exit_code,
         summary=summary,
+        stable_pattern_count=len({pattern.pattern_fingerprint for pattern in patterns}),
         patterns=patterns,
+        pattern_reviews=tuple(
+            sorted(
+                (
+                    review.summary()
+                    for review in review_records
+                    if isinstance(review, PatternReviewRecord)
+                ),
+                key=lambda review: (review.reviewed_at, review.pattern_review_id),
+            )
+        ),
         findings=findings,
     )
 
@@ -1055,6 +1256,76 @@ def _behavior_pattern_signature(finding: _Finding) -> str | None:
     if len(canonical_identity) > _MAXIMUM_PATTERN_IDENTITY_BYTES:
         return None
     return hashlib.sha256(canonical_identity).hexdigest()
+
+
+def _indexed_pattern_grouping_descriptor(finding: _IndexedFinding) -> dict[str, object]:
+    observations = finding.case.observations
+    if observations is None:
+        raise _ReviewInputError("pattern finding is missing variation observations")
+    if finding.semantic_finding is not None:
+        mechanism_key = _behavior_pattern_signature(finding.semantic_finding)
+        if mechanism_key is None:
+            raise _ReviewInputError("pattern finding mechanism exceeds grouping limits")
+        category = finding.semantic_finding.category
+        return {
+            "private_mechanism_key": mechanism_key,
+            "kind": "behavior_difference",
+            "category": category,
+            "rule_id": None,
+            "rule_version": None,
+            "summary": _BEHAVIOR_FINDING_SUMMARIES[cast(FindingCategory, category)],
+            "declared_severity": None,
+            "stability": observations.stability,
+            "evidence_authorities": ("model_derived_unverified",),
+            "evidence_limitations": ("semantic_model_output_not_independently_verified",),
+            "vertical_facets": (
+                finding.evidence_record.evidence.pattern_facets.model_dump(
+                    mode="json", exclude_none=True
+                )
+                if finding.evidence_record.evidence.pattern_facets is not None
+                else None
+            ),
+        }
+    variation_rule = finding.variation_rule
+    if variation_rule is None:
+        raise _ReviewInputError("pattern invariant finding is missing its rule result")
+    mechanism_key = _canonical_json_sha256(
+        {
+            "kind": "customer_invariant_violation",
+            "rule_id": variation_rule.rule_id,
+            "rule_version": variation_rule.rule_version,
+        }
+    )
+    return {
+        "private_mechanism_key": mechanism_key,
+        "kind": "customer_invariant_violation",
+        "category": "customer_invariant_violation",
+        "rule_id": variation_rule.rule_id,
+        "rule_version": variation_rule.rule_version,
+        "summary": "The agent violated a customer-defined rule.",
+        "declared_severity": variation_rule.severity,
+        "stability": observations.stability,
+        "evidence_authorities": ("customer_declared", "deterministic_evaluator"),
+        "evidence_limitations": (),
+        "vertical_facets": (
+            finding.evidence_record.evidence.pattern_facets.model_dump(
+                mode="json", exclude_none=True
+            )
+            if finding.evidence_record.evidence.pattern_facets is not None
+            else None
+        ),
+    }
+
+
+def _indexed_pattern_grouping_sha256(finding: _IndexedFinding) -> str:
+    return _canonical_json_sha256(_indexed_pattern_grouping_descriptor(finding))
+
+
+def _optional_indexed_pattern_grouping_sha256(finding: _IndexedFinding) -> str | None:
+    try:
+        return _indexed_pattern_grouping_sha256(finding)
+    except _ReviewInputError:
+        return None
 
 
 def _bounded_effect_mechanisms(effects: list[_Effect]) -> list[dict[str, object]] | None:
@@ -1107,6 +1378,13 @@ def _build_failure_patterns(
                 "stability": finding.stability,
                 "evidence_authorities": context.evidence_authorities,
                 "evidence_limitations": finding.evidence_limitations,
+                "review_status": finding.review_status,
+                "review_severity": finding.review_severity,
+                "vertical_facets": (
+                    context.vertical_facets.model_dump(mode="json", exclude_none=True)
+                    if context.vertical_facets is not None
+                    else None
+                ),
             }
         )
         grouped.setdefault(grouping_key, []).append((finding, context))
@@ -1116,12 +1394,8 @@ def _build_failure_patterns(
     for members in grouped.values():
         first = members[0][0]
         first_context = members[0][1]
-        if (
-            first.stability is None
-            or first.review_status not in {"needs_review", "confirmed"}
-            or first.review_severity is None
-        ):
-            raise AssertionError("pattern members require reviewable outcomes")
+        if first.stability is None or first.review_status is None or first.review_severity is None:
+            raise AssertionError("pattern members require occurrence review state")
         operator_keys = sorted(
             {
                 (context.operator_id, finding.operator_version)
@@ -1207,6 +1481,7 @@ def _build_failure_patterns(
                         first_context.private_mechanism_key,
                     ),
                 ),
+                vertical_facets=first_context.vertical_facets,
                 finding_count=len(members),
                 source_case_count=len({context.source_case_id for _, context in members}),
                 operators=tuple(operators),
@@ -1214,18 +1489,28 @@ def _build_failure_patterns(
                     finding.review_status == "needs_review" for finding, _ in members
                 ),
                 confirmed_count=sum(finding.review_status == "confirmed" for finding, _ in members),
+                expected_count=sum(finding.review_status == "expected" for finding, _ in members),
+                unsupported_count=sum(
+                    finding.review_status == "unsupported" for finding, _ in members
+                ),
+                inconclusive_count=sum(
+                    finding.review_status == "inconclusive" for finding, _ in members
+                ),
                 members=tuple(
                     PatternMember(
                         finding_id=finding_id,
-                        membership_reasons=membership_reasons,
-                        review_status=cast(
-                            Literal["needs_review", "confirmed"],
-                            finding.review_status,
+                        evidence_record_ref=pattern_evidence_reference(
+                            pattern_identity_key, context.evidence_record_sha256
                         ),
+                        membership_reasons=membership_reasons,
+                        review_status=cast(FindingReviewStatus, finding.review_status),
                         review_severity=cast(FindingSeverity, finding.review_severity),
                     )
-                    for finding_id, finding in sorted(
-                        ((cast(str, finding.finding_id), finding) for finding, _ in members)
+                    for finding_id, finding, context in sorted(
+                        (
+                            (cast(str, finding.finding_id), finding, context)
+                            for finding, context in members
+                        )
                     )
                 ),
             )
@@ -1292,7 +1577,12 @@ def report_dataset_evidence(
         evidence_records = _load_evidence(evidence)
         review_records = _load_reviews(reviews_path)
         findings = _index_findings(evidence_records)
-        _validate_review_history(review_records, findings)
+        _validate_review_history(
+            review_records,
+            findings,
+            evidence_records,
+            review_history_key=_review_history_key_for_records(evidence, review_records),
+        )
         sensitive_lines: tuple[str, ...] = ()
         if show_sensitive_values:
             if sensitive_finding_id is None:
@@ -1310,7 +1600,7 @@ def report_dataset_evidence(
             )
         elif sensitive_finding_id is not None:
             raise _ReviewInputError("--finding is valid only with --show-sensitive-values")
-    except _ReviewInputError as error:
+    except (PatternIdentityKeyError, ReviewHistoryKeyError, _ReviewInputError) as error:
         raise typer.BadParameter(str(error)) from None
 
     active_reviews = _active_reviews(review_records)
@@ -1341,7 +1631,9 @@ def report_dataset_evidence(
         loaded_record = indexed_finding.evidence_record
         case = indexed_finding.case
         matching_reviews = [
-            review for review in review_records if review.finding_id == indexed_finding.finding_id
+            review
+            for review in _occurrence_review_records(review_records)
+            if review.finding_id == indexed_finding.finding_id
         ]
         latest_review = active_reviews.get(indexed_finding.finding_id)
         _print_plain("")
@@ -1492,9 +1784,14 @@ def review_dataset_finding(
             reviewed_at=datetime.now(UTC),
             supersedes_review_id=supersedes,
         )
-        with _locked_reviews_file(reviews_path) as descriptor:
-            review_records = _read_reviews_descriptor(descriptor)
-            _validate_review_history(review_records, findings)
+        with _locked_reviews_file(reviews_path) as locked_reviews:
+            review_records = _read_reviews_descriptor(locked_reviews.descriptor)
+            _validate_review_history(
+                review_records,
+                findings,
+                evidence_records,
+                review_history_key=_review_history_key_for_records(evidence, review_records),
+            )
             active_review = _active_reviews(review_records).get(finding_id)
             if active_review is None and supersedes is not None:
                 raise _ReviewInputError(
@@ -1511,18 +1808,25 @@ def review_dataset_finding(
                 )
                 + "\n"
             ).encode()
-            if os.fstat(descriptor).st_size + len(encoded_review) > _MAXIMUM_REVIEWS_BYTES:
+            if (
+                os.fstat(locked_reviews.descriptor).st_size + len(encoded_review)
+                > _MAXIMUM_REVIEWS_BYTES
+            ):
                 raise _ReviewInputError("review file exceeds the 10 MB limit")
-            remaining = memoryview(encoded_review)
-            while remaining:
-                written = os.write(descriptor, remaining)
-                if written == 0:
-                    raise OSError("could not append review")
-                remaining = remaining[written:]
-            os.fsync(descriptor)
-    except (ValidationError, _ReviewInputError) as error:
+            _append_review_atomically(locked_reviews, encoded_review)
+    except (
+        ValidationError,
+        PatternIdentityKeyError,
+        ReviewHistoryKeyError,
+        _ReviewInputError,
+    ) as error:
         message = "review fields are invalid" if isinstance(error, ValidationError) else str(error)
         raise typer.BadParameter(message) from None
+    except _ReviewCommitUncertainError:
+        raise typer.BadParameter(
+            "review was replaced but directory durability could not be confirmed; "
+            "inspect the review history before retrying"
+        ) from None
     except OSError as error:
         raise typer.BadParameter(
             f"cannot safely update review file ({error.__class__.__name__})"
@@ -1530,6 +1834,236 @@ def review_dataset_finding(
 
     _print_plain(f"Recorded review {new_review.review_id}: {new_review.status}")
     _print_plain(f"Review history: {reviews_path}")
+
+
+def review_dataset_pattern(
+    evidence: Annotated[
+        Path,
+        typer.Argument(
+            exists=True, dir_okay=False, readable=True, help="Evaluation evidence JSONL."
+        ),
+    ],
+    pattern_snapshot_id: Annotated[
+        str,
+        typer.Argument(help="Exact pattern snapshot ID shown by 'ul report'."),
+    ],
+    status: Annotated[
+        ReviewStatus | None,
+        typer.Option(help="Human judgment to apply after previewing the exact snapshot."),
+    ] = None,
+    reviewer: Annotated[
+        str | None,
+        typer.Option(help="Person or team making the judgment."),
+    ] = None,
+    reason: Annotated[
+        str | None,
+        typer.Option(help="Why this judgment applies to the reviewed occurrences."),
+    ] = None,
+    severity: Annotated[
+        ReviewSeverity,
+        typer.Option(help="Consequence severity; only confirmed patterns may be rated."),
+    ] = "unrated",
+    reviews: Annotated[
+        Path | None,
+        typer.Option(help="Review JSONL; defaults to EVIDENCE with .reviews.jsonl suffix."),
+    ] = None,
+) -> None:
+    """Preview or append a decision bound to one exact pattern snapshot."""
+    reviews_path = reviews or _default_reviews_path(evidence)
+    try:
+        evidence_records = _load_evidence(evidence)
+        findings = _index_findings(evidence_records)
+        review_records = _load_reviews(reviews_path)
+        pattern_identity_key = load_pattern_identity_key(evidence)
+        _validate_review_history(
+            review_records,
+            findings,
+            evidence_records,
+            review_history_key=_review_history_key_for_records(evidence, review_records),
+        )
+        report = _summarize_dataset_evidence(
+            evidence,
+            reviews_path,
+            pattern_identity_key=pattern_identity_key,
+        )
+        matching_patterns = [
+            pattern
+            for pattern in report.patterns
+            if pattern.pattern_snapshot_id == pattern_snapshot_id
+        ]
+        if len(matching_patterns) != 1:
+            raise _ReviewInputError(
+                "pattern snapshot was not found; rerun 'ul report' and use its exact snapshot ID"
+            )
+        pattern = matching_patterns[0]
+        reviewed_finding_ids = tuple(
+            member.finding_id
+            for member in pattern.members
+            if member.review_status == "needs_review"
+        )
+        exception_members = tuple(
+            sorted(
+                (
+                    member
+                    for sibling in report.patterns
+                    if sibling.pattern_fingerprint == pattern.pattern_fingerprint
+                    and sibling.pattern_snapshot_id != pattern.pattern_snapshot_id
+                    for member in sibling.members
+                ),
+                key=lambda member: member.finding_id,
+            )
+        )
+        exception_finding_ids = tuple(member.finding_id for member in exception_members)
+        if not reviewed_finding_ids:
+            raise _ReviewInputError("pattern snapshot has no unreviewed occurrences to decide")
+        _print_pattern_review_preview(
+            pattern,
+            reviewed_finding_ids=reviewed_finding_ids,
+            exception_members=exception_members,
+            prior_reviews=tuple(
+                review
+                for review in report.pattern_reviews
+                if review.pattern_fingerprint == pattern.pattern_fingerprint
+            ),
+        )
+        if status is None:
+            if reviewer is not None or reason is not None or severity != "unrated":
+                raise _ReviewInputError("--reviewer, --reason, and --severity require --status")
+            _print_plain("No review was written.")
+            return
+        if reviewer is None or reason is None:
+            raise _ReviewInputError("--status requires --reviewer and --reason")
+        review_history_key = load_review_history_key(evidence)
+        reviewed_at = datetime.now(UTC)
+        occurrence_decisions: list[PatternOccurrenceDecision] = []
+        for finding_id in reviewed_finding_ids:
+            selected = findings.get(finding_id)
+            if selected is None:
+                raise _ReviewInputError("evidence changed; rerun the pattern preview")
+            occurrence_decisions.append(
+                PatternOccurrenceDecision(
+                    review_id=f"ulr_{uuid4()}",
+                    evidence_record_sha256=selected.evidence_record.sha256,
+                    finding_id=finding_id,
+                )
+            )
+        pattern_review = PatternReviewRecord(
+            pattern_review_id=f"ulpr_{uuid4()}",
+            record_hmac_sha256="0" * 64,
+            grouping_evidence_sha256=_indexed_pattern_grouping_sha256(
+                findings[reviewed_finding_ids[0]]
+            ),
+            pattern_snapshot=pattern,
+            status=status,
+            severity=severity,
+            reviewed_finding_ids=reviewed_finding_ids,
+            exception_finding_ids=exception_finding_ids,
+            evidence_record_sha256s=tuple(record.sha256 for record in evidence_records),
+            evidence_bindings=tuple(
+                PatternEvidenceBinding(
+                    finding_id=finding_id,
+                    evidence_record_sha256=indexed_finding.evidence_record.sha256,
+                )
+                for finding_id, indexed_finding in sorted(findings.items())
+            ),
+            occurrence_decisions=tuple(occurrence_decisions),
+            reviewer=reviewer,
+            reason=reason,
+            reviewed_at=reviewed_at,
+        )
+        pattern_review = pattern_review.model_copy(
+            update={
+                "record_hmac_sha256": pattern_review_record_hmac(
+                    review_history_key,
+                    pattern_review.hmac_payload(),
+                )
+            }
+        )
+        encoded_record = (
+            json.dumps(
+                pattern_review.model_dump(mode="json"),
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+            + "\n"
+        ).encode()
+        with _locked_reviews_file(reviews_path) as locked_reviews:
+            current_records = _read_reviews_descriptor(locked_reviews.descriptor)
+            if current_records != review_records:
+                raise _ReviewInputError("review history changed; rerun the pattern preview")
+            _validate_review_history(
+                [*current_records, pattern_review],
+                findings,
+                evidence_records,
+                review_history_key=review_history_key,
+            )
+            if len(current_records) + 1 > _MAXIMUM_REVIEW_RECORDS:
+                raise _ReviewInputError("review file exceeds the 10,000 record limit")
+            if (
+                os.fstat(locked_reviews.descriptor).st_size + len(encoded_record)
+                > _MAXIMUM_REVIEWS_BYTES
+            ):
+                raise _ReviewInputError("review file exceeds the 10 MB limit")
+            _append_review_atomically(locked_reviews, encoded_record)
+    except (
+        ValidationError,
+        PatternIdentityKeyError,
+        ReviewHistoryKeyError,
+        _ReviewInputError,
+    ) as error:
+        message = "review fields are invalid" if isinstance(error, ValidationError) else str(error)
+        raise typer.BadParameter(message) from None
+    except _ReviewCommitUncertainError:
+        raise typer.BadParameter(
+            "review was replaced but directory durability could not be confirmed; "
+            "inspect the review history before retrying"
+        ) from None
+    except OSError as error:
+        raise typer.BadParameter(
+            f"cannot safely update review file ({error.__class__.__name__})"
+        ) from None
+
+    _print_plain(f"Recorded pattern review {pattern_review.pattern_review_id}: {status}")
+    _print_plain(f"Bound snapshot: {pattern_snapshot_id}")
+    _print_plain(f"Reviewed occurrences: {len(reviewed_finding_ids)}")
+    _print_plain(f"Exceptions unchanged: {len(exception_finding_ids)}")
+    _print_plain("Future matching occurrences remain needs_review; this decision is context only.")
+    if status == "confirmed":
+        _print_plain(
+            "Promote selected occurrences one at a time with 'ul regression save EVIDENCE "
+            "FINDING_ID ...'."
+        )
+    _print_plain(f"Review history: {reviews_path}")
+
+
+def _print_pattern_review_preview(
+    pattern: FailurePattern,
+    *,
+    reviewed_finding_ids: tuple[str, ...],
+    exception_members: tuple[PatternMember, ...],
+    prior_reviews: tuple[PatternReviewSummary, ...],
+) -> None:
+    _print_plain("Pattern review preview")
+    _print_plain(f"Pattern fingerprint: {pattern.pattern_fingerprint}")
+    _print_plain(f"Exact snapshot: {pattern.pattern_snapshot_id}")
+    _print_plain(f"Summary: {pattern.summary}")
+    _print_plain(f"Decision candidates ({len(reviewed_finding_ids)}):")
+    for finding_id in reviewed_finding_ids:
+        _print_plain(f"  {finding_id}")
+    _print_plain(f"Exceptions unchanged ({len(exception_members)}):")
+    for member in exception_members:
+        _print_plain(f"  {member.finding_id}: {member.review_status}/{member.review_severity}")
+    _print_plain(f"Prior decisions for this fingerprint: {len(prior_reviews)}")
+    for review in prior_reviews:
+        _print_plain(
+            f"  {review.pattern_review_id}: {review.status}/{review.severity}; "
+            f"reviewed_at={review.reviewed_at.isoformat()}; "
+            f"snapshot={review.pattern_snapshot_id}"
+        )
+    _print_plain(
+        "Limitation: grouping supports navigation and review; it does not establish causation, "
+        "production prevalence, correctness, or a shared root cause."
+    )
 
 
 def _default_reviews_path(evidence: Path) -> Path:
@@ -1560,7 +2094,7 @@ def _load_evidence(path: Path) -> list[_LoadedEvidenceRecord]:
                 )
             )
     except (ValidationError, ValueError):
-        raise _ReviewInputError("evidence is not valid UL schema through 1.9.0 JSONL") from None
+        raise _ReviewInputError("evidence is not valid UL schema through 1.11.0 JSONL") from None
     return records
 
 
@@ -1597,15 +2131,11 @@ def is_reportable_dataset_evidence(path: Path) -> bool:
     return True
 
 
-def _load_reviews(path: Path) -> list[ReviewRecord]:
+def _load_reviews(path: Path) -> list[ReviewHistoryRecord]:
     try:
         descriptor = _open_regular_file(path, os.O_RDONLY)
         try:
-            _lock_file(descriptor, exclusive=False)
-            try:
-                return _read_reviews_descriptor(descriptor)
-            finally:
-                _unlock_file(descriptor)
+            return _read_reviews_descriptor(descriptor)
         finally:
             os.close(descriptor)
     except FileNotFoundError:
@@ -1616,7 +2146,7 @@ def _load_reviews(path: Path) -> list[ReviewRecord]:
         ) from None
 
 
-def _read_reviews_descriptor(descriptor: int) -> list[ReviewRecord]:
+def _read_reviews_descriptor(descriptor: int) -> list[ReviewHistoryRecord]:
     size = os.fstat(descriptor).st_size
     if size > _MAXIMUM_REVIEWS_BYTES:
         raise _ReviewInputError("review file exceeds the 10 MB limit")
@@ -1633,9 +2163,30 @@ def _read_reviews_descriptor(descriptor: int) -> list[ReviewRecord]:
     if any(not line.strip() for line in raw_lines):
         raise _ReviewInputError("review file contains an empty JSONL record")
     try:
-        return [ReviewRecord.model_validate_json(line) for line in raw_lines]
-    except (ValidationError, ValueError):
+        records: list[ReviewHistoryRecord] = []
+        for line in raw_lines:
+            raw_value: object = json.loads(line, object_pairs_hook=_reject_duplicate_json_keys)
+            if not isinstance(raw_value, dict):
+                raise ValueError("review rows must be objects")
+            raw_record = cast(dict[str, object], raw_value)
+            if raw_record.get("record_type", "occurrence_review") == "occurrence_review":
+                records.append(ReviewRecord.model_validate_json(line))
+            elif raw_record.get("record_type") == "pattern_review":
+                records.append(PatternReviewRecord.model_validate_json(line))
+            else:
+                raise ValueError("unknown review record type")
+        return records
+    except (json.JSONDecodeError, ValidationError, ValueError):
         raise _ReviewInputError("review file is not valid review JSONL") from None
+
+
+def _reject_duplicate_json_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate JSON key")
+        result[key] = value
+    return result
 
 
 def _read_bounded_regular_file(path: Path, maximum_bytes: int) -> bytes:
@@ -1686,20 +2237,87 @@ def _open_regular_file(path: Path, flags: int) -> int:
 
 
 @contextmanager
-def _locked_reviews_file(path: Path) -> Generator[int]:
-    descriptor = _open_regular_file(path, os.O_RDWR | os.O_APPEND | os.O_CREAT)
+def _locked_reviews_file(path: Path) -> Generator[_LockedReviewsFile]:
+    lock_descriptor = _open_regular_file(_reviews_lock_path(path), os.O_RDWR | os.O_CREAT)
     locked = False
+    reviews_file: _LockedReviewsFile | None = None
     try:
-        _set_private_file_permissions(descriptor)
-        _lock_file(descriptor, exclusive=True)
+        _set_private_file_permissions(lock_descriptor)
+        _lock_file(lock_descriptor, exclusive=True)
         locked = True
-        yield descriptor
+        descriptor = _open_regular_file(path, os.O_RDWR | os.O_CREAT)
+        _set_private_file_permissions(descriptor)
+        reviews_file = _LockedReviewsFile(path=path, descriptor=descriptor)
+        yield reviews_file
     finally:
         try:
+            if reviews_file is not None and reviews_file.descriptor >= 0:
+                os.close(reviews_file.descriptor)
             if locked:
-                _unlock_file(descriptor)
+                _unlock_file(lock_descriptor)
         finally:
-            os.close(descriptor)
+            os.close(lock_descriptor)
+
+
+def _reviews_lock_path(path: Path) -> Path:
+    return path.with_name(f".{path.name}.lock")
+
+
+def _append_review_atomically(
+    locked_reviews: _LockedReviewsFile,
+    encoded_record: bytes,
+) -> None:
+    descriptor = locked_reviews.descriptor
+    existing_status = os.fstat(descriptor)
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    existing = b""
+    while len(existing) < existing_status.st_size:
+        chunk = os.read(descriptor, min(65_536, existing_status.st_size - len(existing)))
+        if not chunk:
+            raise OSError("review file changed while preparing the update")
+        existing += chunk
+    temporary_descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{locked_reviews.path.name}.",
+        suffix=".tmp",
+        dir=locked_reviews.path.parent,
+    )
+    temporary_path = Path(temporary_name)
+    try:
+        _set_private_file_permissions(temporary_descriptor)
+        remaining = memoryview(existing + encoded_record)
+        while remaining:
+            written = os.write(temporary_descriptor, remaining)
+            if written == 0:
+                raise OSError("could not write review transaction")
+            remaining = remaining[written:]
+        os.fsync(temporary_descriptor)
+        os.close(temporary_descriptor)
+        temporary_descriptor = -1
+        current_status = os.stat(locked_reviews.path, follow_symlinks=False)
+        if not os.path.samestat(existing_status, current_status):
+            raise OSError("review file changed while preparing the update")
+        os.close(descriptor)
+        locked_reviews.descriptor = -1
+        os.replace(temporary_path, locked_reviews.path)
+        try:
+            _fsync_directory(locked_reviews.path.parent)
+        except OSError as error:
+            raise _ReviewCommitUncertainError from error
+    finally:
+        if temporary_descriptor >= 0:
+            os.close(temporary_descriptor)
+        with suppress(FileNotFoundError):
+            temporary_path.unlink()
+
+
+def _fsync_directory(path: Path) -> None:
+    if sys.platform == "win32":
+        return
+    descriptor = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
 
 
 def _lock_file(descriptor: int, *, exclusive: bool) -> None:
@@ -2035,14 +2653,149 @@ def _canonical_json_string(value: str) -> bytes:
     return json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
 
 
-def _validate_review_history(
-    reviews: list[ReviewRecord],
+def _validate_pattern_review_snapshot(
+    review: PatternReviewRecord,
     findings: dict[str, _IndexedFinding],
+    evidence_records: list[_LoadedEvidenceRecord],
+    active_by_finding: dict[str, ReviewRecord],
+) -> None:
+    manifest = review.evidence_record_sha256s
+    current_manifest = tuple(record.sha256 for record in evidence_records)
+    if current_manifest[: len(manifest)] != manifest:
+        raise _ReviewInputError("pattern review evidence manifest is not a current prefix")
+    manifest_digests = set(manifest)
+    expected_binding_ids = tuple(
+        sorted(
+            finding_id
+            for finding_id, finding in findings.items()
+            if finding.evidence_record.sha256 in manifest_digests
+        )
+    )
+    if tuple(binding.finding_id for binding in review.evidence_bindings) != expected_binding_ids:
+        raise _ReviewInputError("pattern review bindings do not cover its evidence manifest")
+    bound_finding_ids: list[str] = []
+    for binding in review.evidence_bindings:
+        finding = findings.get(binding.finding_id)
+        if finding is None:
+            raise _ReviewInputError("pattern review evidence binding is no longer available")
+        if binding.evidence_record_sha256 != finding.evidence_record.sha256:
+            raise _ReviewInputError("pattern review evidence binding does not match its record")
+        bound_finding_ids.append(binding.finding_id)
+    matching_finding_ids = tuple(
+        sorted(
+            finding_id
+            for finding_id in bound_finding_ids
+            if _optional_indexed_pattern_grouping_sha256(findings[finding_id])
+            == review.grouping_evidence_sha256
+        )
+    )
+    reviewed_finding_ids = tuple(
+        finding_id for finding_id in matching_finding_ids if finding_id not in active_by_finding
+    )
+    exception_finding_ids = tuple(
+        finding_id for finding_id in matching_finding_ids if finding_id in active_by_finding
+    )
+    if reviewed_finding_ids != review.reviewed_finding_ids:
+        raise _ReviewInputError("pattern review does not bind the exact unreviewed cohort")
+    if exception_finding_ids != review.exception_finding_ids:
+        raise _ReviewInputError("pattern review exceptions do not match reviewed sibling cohorts")
+    snapshot = review.pattern_snapshot
+    selected = [findings[finding_id] for finding_id in reviewed_finding_ids]
+    descriptor = _indexed_pattern_grouping_descriptor(selected[0])
+    if (
+        snapshot.kind != descriptor["kind"]
+        or snapshot.category != descriptor["category"]
+        or snapshot.rule_id != descriptor["rule_id"]
+        or snapshot.rule_version != descriptor["rule_version"]
+        or snapshot.summary != descriptor["summary"]
+        or snapshot.stability != descriptor["stability"]
+        or snapshot.evidence_authorities != descriptor["evidence_authorities"]
+        or snapshot.evidence_limitations != descriptor["evidence_limitations"]
+        or (
+            snapshot.vertical_facets.model_dump(mode="json", exclude_none=True)
+            if snapshot.vertical_facets is not None
+            else None
+        )
+        != descriptor["vertical_facets"]
+    ):
+        raise _ReviewInputError("pattern review snapshot does not match its evidence grouping")
+    expected_operator_keys = tuple(
+        sorted({(finding.case.operator_id, finding.case.operator_version) for finding in selected})
+    )
+    if (
+        tuple((operator.operator_id, operator.operator_version) for operator in snapshot.operators)
+        != expected_operator_keys
+    ):
+        raise _ReviewInputError("pattern review operators do not match its evidence cohort")
+    if snapshot.source_case_count != len(
+        {finding.evidence_record.evidence.interaction_id for finding in selected}
+    ):
+        raise _ReviewInputError("pattern review source count does not match its evidence cohort")
+    expected_severity = cast(FindingSeverity, descriptor["declared_severity"] or "unrated")
+    if snapshot.severity != expected_severity:
+        raise _ReviewInputError("pattern review severity does not match its evidence cohort")
+
+
+def _validate_review_history(
+    reviews: list[ReviewHistoryRecord],
+    findings: dict[str, _IndexedFinding],
+    evidence_records: list[_LoadedEvidenceRecord],
+    *,
+    review_history_key: bytes | None,
 ) -> None:
     reviews_by_id: dict[str, ReviewRecord] = {}
+    pattern_reviews_by_id: dict[str, PatternReviewRecord] = {}
+    pattern_snapshot_ids: set[str] = set()
     superseded_ids: set[str] = set()
     active_by_finding: dict[str, ReviewRecord] = {}
+    historical_active_by_finding: dict[str, ReviewRecord] = {}
     for review in reviews:
+        if isinstance(review, PatternReviewRecord):
+            if review_history_key is None:
+                raise _ReviewInputError(
+                    "pattern review history requires the project review history key"
+                )
+            expected_hmac = pattern_review_record_hmac(
+                review_history_key,
+                review.hmac_payload(),
+            )
+            if not hmac.compare_digest(review.record_hmac_sha256, expected_hmac):
+                raise _ReviewInputError("pattern review authentication does not match its record")
+            if review.pattern_review_id in pattern_reviews_by_id:
+                raise _ReviewInputError("review file contains a duplicate pattern review ID")
+            snapshot_id = review.pattern_snapshot.pattern_snapshot_id
+            if snapshot_id in pattern_snapshot_ids:
+                raise _ReviewInputError("pattern snapshot already has a decision")
+            for member in review.pattern_snapshot.members:
+                selected = findings.get(member.finding_id)
+                if selected is None:
+                    raise _ReviewInputError(
+                        "pattern review references a finding outside this evidence"
+                    )
+            if any(finding_id not in findings for finding_id in review.exception_finding_ids):
+                raise _ReviewInputError(
+                    "pattern review exception references a finding outside this evidence"
+                )
+            _validate_pattern_review_snapshot(
+                review,
+                findings,
+                evidence_records,
+                historical_active_by_finding,
+            )
+            pattern_reviews_by_id[review.pattern_review_id] = review
+            pattern_snapshot_ids.add(snapshot_id)
+            for derived_review in review.derived_reviews():
+                historical_active_by_finding[derived_review.finding_id] = derived_review
+        else:
+            historical_active_by_finding[review.finding_id] = review
+    occurrence_reviews = tuple(
+        occurrence_review
+        for review in reviews
+        for occurrence_review in (
+            review.derived_reviews() if isinstance(review, PatternReviewRecord) else (review,)
+        )
+    )
+    for review in occurrence_reviews:
         if review.review_id in reviews_by_id:
             raise _ReviewInputError("review file contains a duplicate review ID")
         selected = findings.get(review.finding_id)
@@ -2050,6 +2803,12 @@ def _validate_review_history(
             raise _ReviewInputError("review references a finding outside this evidence")
         if review.evidence_record_sha256 != selected.evidence_record.sha256:
             raise _ReviewInputError("review evidence digest does not match the evidence record")
+        if review.origin_pattern_review_id is not None:
+            pattern_review = pattern_reviews_by_id.get(review.origin_pattern_review_id)
+            if pattern_review is None:
+                raise _ReviewInputError("occurrence review references an unknown pattern review")
+            if review.finding_id not in pattern_review.reviewed_finding_ids:
+                raise _ReviewInputError("pattern review did not select this occurrence")
         current_active = active_by_finding.get(review.finding_id)
         if current_active is None:
             if review.supersedes_review_id is not None:
@@ -2067,8 +2826,32 @@ def _validate_review_history(
         active_by_finding[review.finding_id] = review
 
 
-def _active_reviews(reviews: list[ReviewRecord]) -> dict[str, ReviewRecord]:
-    return {review.finding_id: review for review in reviews}
+def _review_history_key_for_records(
+    evidence: Path,
+    reviews: list[ReviewHistoryRecord],
+) -> bytes | None:
+    if any(isinstance(review, PatternReviewRecord) for review in reviews):
+        return load_review_history_key(evidence)
+    return None
+
+
+def _active_reviews(reviews: list[ReviewHistoryRecord]) -> dict[str, ReviewRecord]:
+    active: dict[str, ReviewRecord] = {}
+    for occurrence_review in _occurrence_review_records(reviews):
+        active[occurrence_review.finding_id] = occurrence_review
+    return active
+
+
+def _occurrence_review_records(
+    reviews: list[ReviewHistoryRecord],
+) -> tuple[ReviewRecord, ...]:
+    return tuple(
+        occurrence_review
+        for review in reviews
+        for occurrence_review in (
+            review.derived_reviews() if isinstance(review, PatternReviewRecord) else (review,)
+        )
+    )
 
 
 def _observations_summary(observations: _Observations | None) -> str:

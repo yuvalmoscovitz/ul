@@ -101,6 +101,7 @@ def test_demo_shows_three_generic_findings_without_credentials_and_retains_valid
 
     evidence_path = Path(evidence_match.group(1))
     assert evidence_path.is_file()
+    assert len((evidence_path.parent / ".ul" / "review-history.key").read_bytes()) == 32
     evidence_records = [
         json.loads(line) for line in evidence_path.read_text(encoding="utf-8").splitlines()
     ]
