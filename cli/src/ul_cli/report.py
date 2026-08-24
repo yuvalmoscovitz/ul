@@ -29,6 +29,8 @@ from ul_cli.finding_reference import (
 from ul_cli.pattern_identity import PatternIdentityKeyError, load_pattern_identity_key
 from ul_cli.report_contract import (
     FailurePattern,
+    FindingCrossExamination,
+    FindingCrossExaminationSummary,
     FindingDecisionReport,
     FindingEvidencePackage,
     FindingSummary,
@@ -207,7 +209,9 @@ def _print_finding_decision_report(report: FindingDecisionReport, evidence: Path
     typer.echo("UL decision-ready finding report")
     typer.echo(f"Disclosure: {report.disclosure}; private receipts are not shown")
     typer.echo(f"Campaign: {report.campaign_ref}")
-    typer.echo(f"Evidence scope: {report.evidence_scope.replace('_', ' ')}")
+    typer.echo(
+        f"Response/state evidence scope: {report.response_state_evidence_scope.replace('_', ' ')}"
+    )
     typer.echo(f"Review status: {report.review_status} (exit {report.exit_code})")
     typer.echo(f"Findings: {len(report.findings)}")
     safe_evidence = "".join(
@@ -244,9 +248,9 @@ def _print_finding_decision_report(report: FindingDecisionReport, evidence: Path
             f"{repetitions.reproducibility}"
         )
         typer.echo(
-            "  Evidence: "
-            f"level={finding.evidence_level.replace('_', ' ')}; "
-            f"scope={finding.evidence_scope.replace('_', ' ')}; authorities="
+            "  Response/state evidence: "
+            f"level={finding.response_state_evidence_level.replace('_', ' ')}; "
+            f"scope={finding.response_state_evidence_scope.replace('_', ' ')}; authorities="
             + ", ".join(authority.replace("_", " ") for authority in finding.evidence_authorities)
         )
         if finding.cross_examination is not None:
@@ -412,7 +416,7 @@ def _summarize_stateful_stress_result(result: StatefulStressResult) -> UnifiedRe
     return UnifiedReport(
         evidence_type=evidence_type,
         evidence_schema_versions=(result.schema_version,),
-        evidence_scope="response_and_state",
+        response_state_evidence_scope="response_and_state",
         review_status=review_status,
         exit_code=exit_code,
         summary=build_report_summary(findings),
@@ -462,10 +466,10 @@ def _print_human_report(report: UnifiedReport, evidence: Path) -> None:
             "(historical output is not an expected answer; correctness not assessed)"
         )
     typer.echo(
-        "Evidence scope: "
+        "Response/state evidence scope: "
         + (
             "response only"
-            if report.evidence_scope == "response_only"
+            if report.response_state_evidence_scope == "response_only"
             else "response and committed state"
         )
     )
@@ -676,23 +680,35 @@ def _print_human_report(report: UnifiedReport, evidence: Path) -> None:
         )
 
 
-def _print_cross_examination_evidence(cross_examination: object, *, indent: str) -> None:
+def _print_cross_examination_evidence(
+    cross_examination: FindingCrossExamination | FindingCrossExaminationSummary,
+    *,
+    indent: str,
+) -> None:
     for label, attribute in (
         ("Response evidence", "response_evidence"),
         ("Trajectory evidence", "trajectory_evidence"),
         ("Committed-state verification", "committed_state_evidence"),
     ):
         availability = getattr(cross_examination, attribute)
-        authorities = (
-            ", ".join(authority.replace("_", " ") for authority in availability.authorities)
-            or "none"
-        )
-        typer.echo(
-            f"{indent}{label}: {availability.conclusion.replace('_', ' ')}; "
-            f"baseline={availability.current_baseline.replace('_', ' ')}; "
-            f"variation={availability.variation.replace('_', ' ')}; "
-            f"authorities={authorities}"
-        )
+        typer.echo(f"{indent}{label}: {availability.conclusion.replace('_', ' ')}")
+        for arm_label, availability_arm, cross_examination_arm in (
+            ("baseline", "current_baseline", cross_examination.current_baseline),
+            ("variation", "variation", cross_examination.variation),
+        ):
+            authorities = (
+                ", ".join(
+                    authority.replace("_", " ")
+                    for authority in getattr(availability, f"{availability_arm}_authorities")
+                )
+                or "none"
+            )
+            status = getattr(availability, availability_arm).replace("_", " ")
+            typer.echo(
+                f"{indent}  {arm_label}={status}; "
+                f"coverage={getattr(availability, f'{availability_arm}_covered_repetitions')}"
+                f"/{cross_examination_arm.requested_repetitions}; authorities={authorities}"
+            )
 
 
 def _read_bounded_regular_file(path: Path) -> bytes:

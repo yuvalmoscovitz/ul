@@ -220,9 +220,9 @@ def _cross_examination_evidence_availability(
 
     def arm(
         trial_set: DatasetEvaluationTrialSet | None,
-    ) -> tuple[Literal["observed", "verified", "unavailable"], set[EvidenceAuthority]]:
+    ) -> tuple[Literal["observed", "verified", "unavailable"], int, set[EvidenceAuthority]]:
         if trial_set is None:
-            return "unavailable", set()
+            return "unavailable", 0, set()
         authorities: set[EvidenceAuthority] = set()
         available: list[bool] = []
         for trial in trial_set.trials:
@@ -269,11 +269,12 @@ def _cross_examination_evidence_availability(
             available.append(present)
         return (
             achieved if available and all(available) else "unavailable",
+            sum(available),
             authorities,
         )
 
-    baseline_status, baseline_authorities = arm(baseline)
-    variation_status, variation_authorities = arm(variation)
+    baseline_status, baseline_covered, baseline_authorities = arm(baseline)
+    variation_status, variation_covered, variation_authorities = arm(variation)
     return CrossExaminationEvidenceAvailability(
         fact=fact,
         conclusion=(
@@ -283,7 +284,10 @@ def _cross_examination_evidence_availability(
         ),
         current_baseline=baseline_status,
         variation=variation_status,
-        authorities=tuple(sorted(baseline_authorities | variation_authorities)),
+        current_baseline_covered_repetitions=baseline_covered,
+        variation_covered_repetitions=variation_covered,
+        current_baseline_authorities=tuple(sorted(baseline_authorities)),
+        variation_authorities=tuple(sorted(variation_authorities)),
     )
 
 

@@ -59,6 +59,7 @@ from ul_cli.main import app
 from ul_cli.report_contract import (
     FindingEvidencePackage,
     RedactionReceipt,
+    RunReceiptContent,
     build_finding_decision,
     build_finding_occurrence,
     build_run_receipt,
@@ -674,7 +675,10 @@ def test_response_level_trajectory_is_independently_observed_and_privacy_safe(
     assert cross_examination is not None
     assert cross_examination.response_evidence.conclusion == "observed"
     assert cross_examination.trajectory_evidence.conclusion == "observed"
-    assert cross_examination.trajectory_evidence.authorities == ("independent_observer",)
+    assert cross_examination.trajectory_evidence.current_baseline_authorities == (
+        "independent_observer",
+    )
+    assert cross_examination.trajectory_evidence.variation_authorities == ("independent_observer",)
     assert cross_examination.committed_state_evidence.conclusion == "unavailable"
     assert cross_examination.current_baseline.trajectory_evidence_pointer_ids
     assert cross_examination.variation.trajectory_evidence_pointer_ids
@@ -695,6 +699,12 @@ def test_response_level_trajectory_is_independently_observed_and_privacy_safe(
     reported = json.loads(json_report.output)["findings"][0]["cross_examination"]
     assert reported["trajectory_evidence"]["conclusion"] == "observed"
     assert "Trajectory evidence: observed" in human_report.output
+    assert "baseline=observed; coverage=2/2; authorities=independent observer" in (
+        human_report.output
+    )
+    assert "variation=observed; coverage=2/2; authorities=independent observer" in (
+        human_report.output
+    )
     assert "Committed-state verification: unavailable" in human_report.output
     assert _PRIVATE_SECRET not in json_report.output
     assert _PRIVATE_SECRET not in human_report.output
@@ -770,8 +780,65 @@ def test_mixed_trajectory_and_state_arms_are_conservatively_unavailable() -> Non
     assert cross_examination.trajectory_evidence.conclusion == "unavailable"
     assert cross_examination.trajectory_evidence.current_baseline == "observed"
     assert cross_examination.trajectory_evidence.variation == "unavailable"
-    assert cross_examination.trajectory_evidence.authorities == ("independent_observer",)
+    assert cross_examination.trajectory_evidence.current_baseline_covered_repetitions == 2
+    assert cross_examination.trajectory_evidence.variation_covered_repetitions == 1
+    assert cross_examination.trajectory_evidence.current_baseline_authorities == (
+        "independent_observer",
+    )
+    assert cross_examination.trajectory_evidence.variation_authorities == ("independent_observer",)
     assert cross_examination.committed_state_evidence.conclusion == "unavailable"
+
+    incomplete_receipt = next(
+        receipt
+        for receipt in package.receipts
+        if receipt.content.trajectory_evidence_status == "incomplete"
+    )
+    tampered_content = RunReceiptContent.model_validate(
+        {
+            **incomplete_receipt.content.model_dump(),
+            "trajectory_evidence_status": "complete",
+        }
+    )
+    tampered_receipt = build_run_receipt(tampered_content)
+    tampered_repetitions = tuple(
+        repetition.model_copy(
+            update={
+                "source_receipt_id": (
+                    tampered_receipt.receipt_id
+                    if repetition.source_receipt_id == incomplete_receipt.receipt_id
+                    else repetition.source_receipt_id
+                ),
+                "probe_receipt_id": (
+                    tampered_receipt.receipt_id
+                    if repetition.probe_receipt_id == incomplete_receipt.receipt_id
+                    else repetition.probe_receipt_id
+                ),
+            }
+        )
+        for repetition in package.occurrence.repetitions
+    )
+    occurrence_values = package.occurrence.model_dump()
+    occurrence_values.pop("occurrence_id")
+    occurrence_values["repetitions"] = tampered_repetitions
+    tampered_occurrence = build_finding_occurrence(**occurrence_values)
+    tampered_receipts = tuple(
+        sorted(
+            (
+                tampered_receipt if receipt == incomplete_receipt else receipt
+                for receipt in package.receipts
+            ),
+            key=lambda receipt: receipt.receipt_id,
+        )
+    )
+
+    with pytest.raises(ValidationError, match="retained observation evidence"):
+        FindingEvidencePackage(
+            occurrence=tampered_occurrence,
+            private_references=package.private_references,
+            receipts=tampered_receipts,
+            artifact_retention=package.artifact_retention,
+            artifacts=package.artifacts,
+        )
 
 
 def test_committed_state_requires_authoritative_evidence_for_every_execution(
@@ -818,7 +885,12 @@ def test_committed_state_requires_authoritative_evidence_for_every_execution(
     cross_examination = package.occurrence.cross_examination
     assert cross_examination is not None
     assert cross_examination.committed_state_evidence.conclusion == "verified"
-    assert cross_examination.committed_state_evidence.authorities == ("environment_self_reported",)
+    assert cross_examination.committed_state_evidence.current_baseline_authorities == (
+        "environment_self_reported",
+    )
+    assert cross_examination.committed_state_evidence.variation_authorities == (
+        "environment_self_reported",
+    )
     assert cross_examination.current_baseline.committed_state_evidence_pointer_ids
     assert cross_examination.variation.committed_state_evidence_pointer_ids
     evidence = tmp_path / "state.findings.jsonl"

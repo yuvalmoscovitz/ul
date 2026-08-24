@@ -11,6 +11,7 @@ from typer.testing import CliRunner
 from ul import (
     AugmentationTarget,
     CaseFixtureReference,
+    DatasetEvaluationFinding,
     DatasetEvaluationResult,
     DatasetEvaluationTrialSet,
     RichInteractionCase,
@@ -145,6 +146,37 @@ def test_response_evidence_remains_observed_when_semantic_evaluation_is_inconclu
 
     response_evidence = record["cases"][0]["cross_examination"]["response_evidence"]
     assert response_evidence["conclusion"] == "observed"
+
+
+def test_customer_evidence_rejects_cross_examination_claims_not_in_technical_details(
+    tmp_path: Path,
+) -> None:
+    result = _evaluation_result("forged-trajectory", has_review_finding=True)
+    record = customer_module.build_customer_evidence_record(
+        result,
+        repetitions=1,
+        max_environment_api_calls=2,
+        planned_target_calls=2,
+    )
+    trajectory = record["cases"][0]["cross_examination"]["trajectory_evidence"]
+    trajectory.update(
+        {
+            "conclusion": "observed",
+            "current_baseline": "observed",
+            "variation": "observed",
+            "current_baseline_covered_repetitions": 1,
+            "variation_covered_repetitions": 1,
+            "current_baseline_authorities": ["independent_observer"],
+            "variation_authorities": ["independent_observer"],
+        }
+    )
+    evidence_path = tmp_path / "forged.jsonl"
+    evidence_path.write_text(json.dumps(record) + "\n", encoding="utf-8")
+
+    report = runner.invoke(root_app, ["report", str(evidence_path), "--json"])
+
+    assert report.exit_code == 2
+    assert "unsupported evidence" in report.output
 
 
 @pytest.mark.parametrize(
@@ -318,7 +350,7 @@ def test_unified_report_surfaces_response_only_scope_and_limitations(tmp_path: P
     assert json_report.exit_code == 0, json_report.output
     parsed_report = json.loads(json_report.output)
     assert parsed_report["evaluation_mode"] == "variance"
-    assert parsed_report["evidence_scope"] == "response_only"
+    assert parsed_report["response_state_evidence_scope"] == "response_only"
     assert parsed_report["capability_limitations"] == [
         "cleanup_verification",
         "conversation_replay",
@@ -326,7 +358,7 @@ def test_unified_report_surfaces_response_only_scope_and_limitations(tmp_path: P
     ]
     assert human_report.exit_code == 0, human_report.output
     assert "Evaluation mode: variance" in human_report.output
-    assert "Evidence scope: response only" in human_report.output
+    assert "Response/state evidence scope: response only" in human_report.output
     assert "Not verified: committed state, cleanup, or multi-turn conversations." in (
         human_report.output
     )
@@ -689,35 +721,24 @@ def test_duplicate_semantic_findings_get_stable_unique_reportable_ids(tmp_path: 
     assert finding_ids == reordered_finding_ids
     assert all(re.fullmatch(r"ulf_v1_[0-9a-f]{64}", finding_id) for finding_id in finding_ids)
 
-    candidate = SimpleNamespace(
-        operator_id="input.surface.rephrase",
-        operator_version="1.0.0",
-        augmented_input="Please transfer 100 to Alice.",
-        passed=True,
-        failure_reasons=(),
-    )
-    case = SimpleNamespace(
-        candidate=candidate,
-        verdict="divergence_needs_review",
-        trial_set=_trial_set(representative_effect=first_observed),
-        findings=(first_finding, second_finding),
-        inconclusive_reasons=(),
-    )
-    result = cast(
-        DatasetEvaluationResult,
-        SimpleNamespace(
-            source=SimpleNamespace(id="case-1", raw_input="Transfer 100 to Alice."),
-            baseline=SimpleNamespace(
-                verdict="no_divergence",
-                trial_set=_trial_set(representative_effect=first_reference),
-                inconclusive_reasons=(),
-            ),
-            cases=(case,),
-            model_dump=lambda **kwargs: {
-                "evaluation_mode": "variance",
-                "fixture": "duplicate semantic findings",
+    result = _evaluation_result("case-1", has_review_finding=True)
+    typed_findings = tuple(
+        DatasetEvaluationFinding.model_validate(
+            {
+                "category": finding.category,
+                "message": finding.message,
+                "expected_effects": [effect.model_dump() for effect in finding.expected_effects],
+                "observed_effects": [effect.model_dump() for effect in finding.observed_effects],
+                "grounded_field_names": finding.grounded_field_names,
             },
-        ),
+            strict=False,
+        )
+        for finding in (first_finding, second_finding)
+    )
+    result = result.model_copy(
+        update={
+            "cases": (result.cases[0].model_copy(update={"findings": typed_findings}),),
+        }
     )
     evidence = customer_module.build_customer_evidence_record(
         result,

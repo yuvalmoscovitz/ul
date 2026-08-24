@@ -738,6 +738,13 @@ def _receipt_from_values(
 ) -> _ReceiptBuild:
     pointers: list[EvidencePointer] = []
     retained_artifacts: dict[str, EvidenceArtifact] = {}
+    default_artifact_value = _json_value(artifact)
+    _validate_json_size(
+        default_artifact_value,
+        _MAXIMUM_RUN_RECEIPT_BYTES,
+        "run receipt artifact exceeds the 1 MB JSON limit",
+    )
+    default_evidence_artifact = _evidence_artifact(default_artifact_value)
 
     def add_pointer(
         *,
@@ -749,8 +756,18 @@ def _receipt_from_values(
         pointer_artifact: object = artifact,
         retain_artifact: bool = False,
     ) -> str:
-        artifact_value = _json_value(pointer_artifact)
-        retained_artifact = _evidence_artifact(artifact_value) if retain_artifact else None
+        artifact_value = (
+            default_artifact_value
+            if pointer_artifact is artifact
+            else _json_value(pointer_artifact)
+        )
+        retained_artifact = (
+            default_evidence_artifact
+            if retain_artifact and pointer_artifact is artifact
+            else _evidence_artifact(artifact_value)
+            if retain_artifact
+            else None
+        )
         artifact_sha256 = (
             retained_artifact.artifact_sha256
             if retained_artifact is not None
@@ -1163,38 +1180,51 @@ def _cross_examination_availability(
 ) -> CrossExaminationEvidenceAvailability:
     achieved = "verified" if fact == "committed_state" else "observed"
 
-    def arm_status(receipts: list[_ReceiptBuild]) -> Literal["observed", "verified", "unavailable"]:
+    def arm(
+        receipts: list[_ReceiptBuild],
+    ) -> tuple[
+        Literal["observed", "verified", "unavailable"],
+        int,
+        tuple[EvidenceAuthority, ...],
+    ]:
         if fact == "response":
-            available = all(receipt.response_pointer_id is not None for receipt in receipts)
+            covered = sum(receipt.response_pointer_id is not None for receipt in receipts)
+            pointer_kind = "response"
         elif fact == "trajectory":
-            available = all(
+            covered = sum(
                 receipt.receipt.content.trajectory_evidence_status == "complete"
                 for receipt in receipts
             )
+            pointer_kind = "trace"
         else:
-            available = all(
+            covered = sum(
                 receipt.receipt.content.state_before is not None
                 and receipt.receipt.content.state_after is not None
                 for receipt in receipts
             )
-        return achieved if receipts and available else "unavailable"
-
-    current_baseline = arm_status(source_receipts)
-    variation = arm_status(probe_receipts)
-    authorities = tuple(
-        sorted(
-            {
-                pointer.authority
-                for receipt in (*source_receipts, *probe_receipts)
-                for pointer in receipt.receipt.content.evidence_pointers
-                if (
-                    (fact == "response" and pointer.kind == "response" and pointer.arm != "shared")
-                    or (fact == "trajectory" and pointer.kind == "trace")
-                    or (fact == "committed_state" and pointer.kind == "state")
+            pointer_kind = "state"
+        authorities = cast(
+            tuple[EvidenceAuthority, ...],
+            tuple(
+                sorted(
+                    {
+                        pointer.authority
+                        for receipt in receipts
+                        for pointer in receipt.receipt.content.evidence_pointers
+                        if pointer.kind == pointer_kind
+                        and not (fact == "response" and pointer.arm == "shared")
+                    }
                 )
-            }
+            ),
         )
-    )
+        return (
+            achieved if receipts and covered == len(receipts) else "unavailable",
+            covered,
+            authorities,
+        )
+
+    current_baseline, baseline_covered, baseline_authorities = arm(source_receipts)
+    variation, variation_covered, variation_authorities = arm(probe_receipts)
     return CrossExaminationEvidenceAvailability(
         fact=fact,
         conclusion=(
@@ -1202,7 +1232,10 @@ def _cross_examination_availability(
         ),
         current_baseline=current_baseline,
         variation=variation,
-        authorities=cast(tuple[EvidenceAuthority, ...], authorities),
+        current_baseline_covered_repetitions=baseline_covered,
+        variation_covered_repetitions=variation_covered,
+        current_baseline_authorities=baseline_authorities,
+        variation_authorities=variation_authorities,
     )
 
 

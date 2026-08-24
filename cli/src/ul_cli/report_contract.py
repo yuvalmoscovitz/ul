@@ -353,7 +353,10 @@ class CrossExaminationEvidenceAvailability(_StrictModel):
     conclusion: CrossExaminationEvidenceStatus
     current_baseline: CrossExaminationEvidenceStatus
     variation: CrossExaminationEvidenceStatus
-    authorities: tuple[EvidenceAuthority, ...] = Field(default=(), max_length=10)
+    current_baseline_covered_repetitions: int = Field(default=0, ge=0)
+    variation_covered_repetitions: int = Field(default=0, ge=0)
+    current_baseline_authorities: tuple[EvidenceAuthority, ...] = Field(default=(), max_length=10)
+    variation_authorities: tuple[EvidenceAuthority, ...] = Field(default=(), max_length=10)
 
     @model_validator(mode="after")
     def validate_availability(self) -> Self:
@@ -368,12 +371,24 @@ class CrossExaminationEvidenceAvailability(_StrictModel):
         )
         if self.conclusion != expected:
             raise ValueError("evidence conclusion must conservatively summarize both arms")
-        if self.authorities != tuple(sorted(set(self.authorities))):
-            raise ValueError("evidence authorities must be sorted and unique")
-        if (
-            self.current_baseline == achieved or self.variation == achieved
-        ) and not self.authorities:
-            raise ValueError("observed evidence requires its authority")
+        for arm_status, covered_repetitions, authorities in (
+            (
+                self.current_baseline,
+                self.current_baseline_covered_repetitions,
+                self.current_baseline_authorities,
+            ),
+            (
+                self.variation,
+                self.variation_covered_repetitions,
+                self.variation_authorities,
+            ),
+        ):
+            if authorities != tuple(sorted(set(authorities))):
+                raise ValueError("evidence authorities must be sorted and unique per arm")
+            if arm_status == achieved and covered_repetitions == 0:
+                raise ValueError("observed evidence requires covered repetitions")
+            if arm_status == achieved and not authorities:
+                raise ValueError("observed evidence requires its per-arm authority")
         return self
 
 
@@ -426,6 +441,22 @@ class FindingCrossExamination(_StrictModel):
             self.committed_state_evidence.fact,
         ) != ("response", "trajectory", "committed_state"):
             raise ValueError("cross-examination evidence conclusions must cover every fact")
+        for availability in (
+            self.response_evidence,
+            self.trajectory_evidence,
+            self.committed_state_evidence,
+        ):
+            for availability_arm, cross_examination_arm in (
+                ("current_baseline", self.current_baseline),
+                ("variation", self.variation),
+            ):
+                covered = getattr(availability, f"{availability_arm}_covered_repetitions")
+                status = getattr(availability, availability_arm)
+                if covered > cross_examination_arm.requested_repetitions:
+                    raise ValueError("evidence coverage cannot exceed requested repetitions")
+                achieved = "verified" if availability.fact == "committed_state" else "observed"
+                if (status == achieved) != (covered == cross_examination_arm.requested_repetitions):
+                    raise ValueError("evidence status must match complete repetition coverage")
         for availability, pointer_attribute, achieved in (
             (self.response_evidence, "response_evidence_pointer_ids", "observed"),
             (self.trajectory_evidence, "trajectory_evidence_pointer_ids", "observed"),
@@ -919,15 +950,20 @@ class FindingEvidencePackage(_StrictModel):
                 pointers[pointer.pointer_id] = pointer
         if not set(self.occurrence.evidence_pointer_ids).issubset(pointers):
             raise ValueError("package does not contain every public evidence reference")
+        trajectory_complete_receipt_ids: set[str] = set()
         if self.artifact_retention == "embedded":
             artifacts = {artifact.artifact_sha256: artifact.value for artifact in self.artifacts}
+            decoded_artifacts = {
+                digest: json.loads(artifact.canonical_json)
+                for digest, artifact in artifacts.items()
+            }
             for pointer_id in self.occurrence.evidence_pointer_ids:
                 pointer = pointers[pointer_id]
                 artifact = artifacts.get(pointer.artifact_sha256)
                 if artifact is None:
                     raise ValueError("package does not retain every cited evidence artifact")
                 _resolve_json_pointer(
-                    json.loads(artifact.canonical_json),
+                    decoded_artifacts[pointer.artifact_sha256],
                     pointer.json_pointer,
                 )
             receipt_values = tuple(
@@ -940,12 +976,33 @@ class FindingEvidencePackage(_StrictModel):
                 artifact = artifacts.get(pointer.artifact_sha256)
                 if artifact is not None and not _receipt_value_matches_artifact(
                     _resolve_json_pointer(
-                        json.loads(artifact.canonical_json),
+                        decoded_artifacts[pointer.artifact_sha256],
                         pointer.json_pointer,
                     ),
                     receipt_value,
                 ):
                     raise ValueError("receipt value must match its retained evidence artifact")
+            for receipt in self.receipts:
+                trace_statuses: list[object] = []
+                for pointer_id in receipt.content.trace_evidence_pointer_ids:
+                    observation = _resolve_json_pointer(
+                        decoded_artifacts[pointers[pointer_id].artifact_sha256],
+                        pointers[pointer_id].json_pointer,
+                    )
+                    if not isinstance(observation, dict):
+                        raise ValueError("trace pointers must resolve to observation evidence")
+                    trace_statuses.append(observation.get("status"))
+                expected_trajectory_status = (
+                    "complete"
+                    if "complete" in trace_statuses
+                    else "incomplete"
+                    if trace_statuses
+                    else "unavailable"
+                )
+                if receipt.content.trajectory_evidence_status != expected_trajectory_status:
+                    raise ValueError("trajectory status must match retained observation evidence")
+                if expected_trajectory_status == "complete":
+                    trajectory_complete_receipt_ids.add(receipt.receipt_id)
         for repetition in self.occurrence.repetitions:
             allowed_pointer_ids: set[str] = set()
             for expected_arm, receipt_id in (
@@ -994,6 +1051,7 @@ class FindingEvidencePackage(_StrictModel):
             self.occurrence,
             receipts_by_id,
             pointers,
+            trajectory_complete_receipt_ids,
         )
         if (
             len(_canonical_json(self.model_dump(mode="json")).encode("utf-8"))
@@ -1037,8 +1095,8 @@ class DecisionReadyFinding(_StrictModel):
     headline: FindingSummaryText
     claims: tuple[FindingDecisionClaim, ...] = Field(min_length=4, max_length=4)
     repetition_summary: RepetitionSummary
-    evidence_scope: DecisionEvidenceScope
-    evidence_level: Literal[
+    response_state_evidence_scope: DecisionEvidenceScope
+    response_state_evidence_level: Literal[
         "response_observed",
         "response_and_state_observed",
         "customer_rule_evaluated",
@@ -1081,7 +1139,7 @@ class FindingDecisionReport(_StrictModel):
     disclosure: Literal["safe"] = "safe"
     evidence_schema_versions: tuple[str, ...] = Field(min_length=1, max_length=100)
     campaign_ref: str = Field(pattern=_PUBLIC_REFERENCE_PATTERN)
-    evidence_scope: DecisionEvidenceScope
+    response_state_evidence_scope: DecisionEvidenceScope
     review_status: Literal["action_required", "inconclusive"]
     exit_code: Literal[1, 2]
     findings: tuple[DecisionReadyFinding, ...] = Field(min_length=1, max_length=10_000)
@@ -1096,11 +1154,11 @@ class FindingDecisionReport(_StrictModel):
         if any(finding.campaign_ref != self.campaign_ref for finding in self.findings):
             raise ValueError("decision report campaign must match every finding")
         expected_scope: DecisionEvidenceScope = (
-            self.findings[0].evidence_scope
-            if len({finding.evidence_scope for finding in self.findings}) == 1
+            self.findings[0].response_state_evidence_scope
+            if len({finding.response_state_evidence_scope for finding in self.findings}) == 1
             else "mixed"
         )
-        if self.evidence_scope != expected_scope:
+        if self.response_state_evidence_scope != expected_scope:
             raise ValueError("decision report evidence scope must summarize its findings")
         expected_status = (
             "inconclusive"
@@ -1275,8 +1333,8 @@ def build_finding_decision(package: FindingEvidencePackage) -> DecisionReadyFind
             ),
         ),
         repetition_summary=occurrence.repetition_summary,
-        evidence_scope=evidence_scope,
-        evidence_level=evidence_level,
+        response_state_evidence_scope=evidence_scope,
+        response_state_evidence_level=evidence_level,
         evidence_authorities=evidence_authorities,
         cross_examination=occurrence.cross_examination,
         limitations=tuple(
@@ -1308,7 +1366,7 @@ def build_finding_decision_report(
     campaign_refs = {finding.campaign_ref for finding in findings}
     if len(campaign_refs) != 1:
         raise ValueError("finding decision report requires one campaign")
-    scopes = {finding.evidence_scope for finding in findings}
+    scopes = {finding.response_state_evidence_scope for finding in findings}
     evidence_scope = cast(DecisionEvidenceScope, scopes.pop() if len(scopes) == 1 else "mixed")
     review_status = (
         "inconclusive"
@@ -1324,7 +1382,7 @@ def build_finding_decision_report(
             )
         ),
         campaign_ref=campaign_refs.pop(),
-        evidence_scope=evidence_scope,
+        response_state_evidence_scope=evidence_scope,
         review_status=review_status,
         exit_code=2 if review_status == "inconclusive" else 1,
         findings=findings,
@@ -1709,6 +1767,7 @@ def _validate_cross_examination_availability(
     occurrence: FindingOccurrence,
     receipts_by_id: dict[str, RunReceipt],
     pointers: dict[str, EvidencePointer],
+    trajectory_complete_receipt_ids: set[str],
 ) -> None:
     cross_examination = occurrence.cross_examination
     if cross_examination is None:
@@ -1731,8 +1790,6 @@ def _validate_cross_examination_availability(
         ),
     )
     for availability, pointer_attribute, achieved in channel_contracts:
-        channel_pointer_ids: set[str] = set()
-        expected_arm_statuses: dict[str, str] = {}
         for availability_arm, receipt_arm, cross_examination_arm in (
             ("current_baseline", "source", cross_examination.current_baseline),
             ("variation", "probe", cross_examination.variation),
@@ -1754,17 +1811,15 @@ def _validate_cross_examination_availability(
                     for receipt in receipts
                     if receipt.response is not None
                 }
-                fully_observed = bool(receipts) and all(
-                    receipt.response is not None for receipt in receipts
-                )
+                covered_repetitions = sum(receipt.response is not None for receipt in receipts)
             elif availability.fact == "trajectory":
                 arm_pointer_ids = {
                     pointer_id
                     for receipt in receipts
                     for pointer_id in receipt.trace_evidence_pointer_ids
                 }
-                fully_observed = bool(receipts) and all(
-                    receipt.trajectory_evidence_status == "complete" for receipt in receipts
+                covered_repetitions = sum(
+                    receipt_id in trajectory_complete_receipt_ids for receipt_id in receipt_ids
                 )
             else:
                 arm_pointer_ids = {
@@ -1773,24 +1828,29 @@ def _validate_cross_examination_availability(
                     for state in (receipt.state_before, receipt.state_after)
                     if state is not None
                 }
-                fully_observed = bool(receipts) and all(
+                covered_repetitions = sum(
                     receipt.state_before is not None and receipt.state_after is not None
                     for receipt in receipts
                 )
             if tuple(sorted(arm_pointer_ids)) != getattr(cross_examination_arm, pointer_attribute):
                 raise ValueError("cross-examination channel pointers must match every receipt")
-            channel_pointer_ids.update(arm_pointer_ids)
-            expected_arm_statuses[availability_arm] = achieved if fully_observed else "unavailable"
-        if any(
-            getattr(availability, arm_name) != expected_status
-            for arm_name, expected_status in expected_arm_statuses.items()
-        ):
-            raise ValueError("cross-examination availability must match receipt coverage")
-        expected_authorities = tuple(
-            sorted({pointers[pointer_id].authority for pointer_id in channel_pointer_ids})
-        )
-        if availability.authorities != expected_authorities:
-            raise ValueError("cross-examination authorities must match cited evidence")
+            expected_status = (
+                achieved if receipts and covered_repetitions == len(receipts) else "unavailable"
+            )
+            if (
+                getattr(availability, availability_arm) != expected_status
+                or getattr(
+                    availability,
+                    f"{availability_arm}_covered_repetitions",
+                )
+                != covered_repetitions
+            ):
+                raise ValueError("cross-examination availability must match receipt coverage")
+            expected_authorities = tuple(
+                sorted({pointers[pointer_id].authority for pointer_id in arm_pointer_ids})
+            )
+            if getattr(availability, f"{availability_arm}_authorities") != expected_authorities:
+                raise ValueError("cross-examination authorities must match cited evidence")
 
 
 class CrossExaminationRunSummary(_StrictModel):
@@ -2207,10 +2267,10 @@ def build_report_summary(findings: tuple[FindingSummary, ...]) -> ReportSummary:
 
 
 class UnifiedReport(_StrictModel):
-    schema_version: Literal["1.7.0"] = "1.7.0"
+    schema_version: Literal["1.8.0"] = "1.8.0"
     evidence_type: ReportEvidenceType
     evidence_schema_versions: tuple[str, ...] = Field(min_length=1)
-    evidence_scope: ReportEvidenceScope
+    response_state_evidence_scope: ReportEvidenceScope
     evaluation_mode: ReportEvaluationMode | None = None
     capability_limitations: tuple[ReportCapabilityLimitation, ...] = ()
     review_status: ReportReviewStatus
@@ -2227,13 +2287,20 @@ class UnifiedReport(_StrictModel):
             raise ValueError("evaluation mode is available only for dataset reports")
         if self.capability_limitations != tuple(sorted(set(self.capability_limitations))):
             raise ValueError("capability limitations must be sorted and unique")
-        if self.evidence_scope == "response_only" and self.capability_limitations != (
-            "cleanup_verification",
-            "conversation_replay",
-            "state_observation",
+        if (
+            self.response_state_evidence_scope == "response_only"
+            and self.capability_limitations
+            != (
+                "cleanup_verification",
+                "conversation_replay",
+                "state_observation",
+            )
         ):
             raise ValueError("response-only reports must name every unverified capability")
-        if self.evidence_scope == "response_and_state" and self.capability_limitations:
+        if (
+            self.response_state_evidence_scope == "response_and_state"
+            and self.capability_limitations
+        ):
             raise ValueError("response-and-state reports cannot name adapter limitations")
         if self.evidence_schema_versions != tuple(sorted(set(self.evidence_schema_versions))):
             raise ValueError("evidence schema versions must be sorted and unique")

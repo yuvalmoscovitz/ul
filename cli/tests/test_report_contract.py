@@ -455,7 +455,10 @@ def _dataset_package() -> FindingEvidencePackage:
                 conclusion="observed",
                 current_baseline="observed",
                 variation="observed",
-                authorities=("independent_observer",),
+                current_baseline_covered_repetitions=2,
+                variation_covered_repetitions=2,
+                current_baseline_authorities=("independent_observer",),
+                variation_authorities=("independent_observer",),
             ),
             trajectory_evidence=CrossExaminationEvidenceAvailability(
                 fact="trajectory",
@@ -705,7 +708,7 @@ def test_dataset_and_stateful_packages_share_decision_ready_explanations(
     assert finding.schema_version == "1.1.0"
     assert finding.classification == classification
     assert finding.review_workflow == workflow
-    assert finding.evidence_level == evidence_level
+    assert finding.response_state_evidence_level == evidence_level
     assert finding.campaign_ref == package.occurrence.campaign_ref
     assert finding.case_ref == package.occurrence.case_ref
     assert finding.operator == package.occurrence.operator
@@ -864,7 +867,7 @@ def test_stateful_finding_package_uses_same_safe_offline_report(
 
     assert result.exit_code == 1, result.output
     assert "Classification: customer rule violation" in result.output
-    assert "Evidence scope: response and state" in result.output
+    assert "Response/state evidence scope: response and state" in result.output
     assert "workflow=external review required" in result.output
     assert "Inspect the private normalized receipt" in result.output
     assert "Resolve private references and receipt" in result.output
@@ -892,8 +895,8 @@ def test_stateful_finding_package_uses_same_safe_offline_report(
 def test_decision_report_supports_mixed_evidence_scopes_in_one_campaign() -> None:
     report = build_finding_decision_report((_dataset_package(), _stateful_package()))
 
-    assert report.evidence_scope == "mixed"
-    assert {finding.evidence_scope for finding in report.findings} == {
+    assert report.response_state_evidence_scope == "mixed"
+    assert {finding.response_state_evidence_scope for finding in report.findings} == {
         "response_only",
         "response_and_state",
     }
@@ -1049,9 +1052,9 @@ def test_package_binds_each_repetition_to_its_receipts() -> None:
 
 def test_package_rejects_cross_examination_authority_not_cited_by_receipts() -> None:
     payload = _dataset_package().model_dump(mode="json")
-    payload["occurrence"]["cross_examination"]["response_evidence"]["authorities"] = [
-        "source_self_reported"
-    ]
+    payload["occurrence"]["cross_examination"]["response_evidence"][
+        "current_baseline_authorities"
+    ] = ["source_self_reported"]
     _rebind_occurrence(payload)
 
     with pytest.raises(ValidationError, match="authorities must match cited evidence"):

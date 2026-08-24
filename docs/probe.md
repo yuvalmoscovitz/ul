@@ -199,8 +199,10 @@ reintroduce prohibited fields into derived public summaries.
 
 The final cross-examination reports three conclusions separately for the fresh baseline and the
 variation: response evidence observed or unavailable, trajectory evidence observed or unavailable,
-and committed-state verification verified or unavailable. Each conclusion lists only the authority
-of evidence actually present. A response-only execution can still report a correlated trajectory.
+and committed-state verification verified or unavailable. Each arm lists its own covered/requested
+repetition count and only the authorities present for that arm. A response-only execution can still
+report a correlated trajectory; `response_state_evidence_scope` describes only response and state
+capture, not trajectory availability.
 Committed state is verified only when authoritative before/after state evidence covers every
 relevant repetition in both execution arms. Partial coverage stays explicit and makes the overall
 conclusion unavailable; it is never rendered as a pass. Human and JSON reports contain the same
