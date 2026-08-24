@@ -30,7 +30,12 @@ def test_root_help_leads_with_demo_and_observed_interaction_probe() -> None:
     assert "See UL's model-free augment-and-compare workflow" in normalized_output
     assert "Probe observed interactions against a safe callable or HTTP" in normalized_output
     assert "Configure an advanced stateful-evidence project" in normalized_output
-    assert normalized_output.index(" probe ") < normalized_output.index(" init ")
+    commands = normalized_output.rsplit("Commands", maxsplit=1)[1]
+    probe_command = re.search(r"\bprobe\b", commands)
+    init_command = re.search(r"\binit\b", commands)
+    assert probe_command is not None
+    assert init_command is not None
+    assert probe_command.start() < init_command.start()
 
 
 def test_readme_quickstart_leads_with_probe_and_keeps_stateful_upgrade() -> None:
