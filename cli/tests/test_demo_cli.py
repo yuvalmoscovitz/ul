@@ -20,12 +20,32 @@ from ul_cli.main import app
 _PROJECT_ROOT = Path(__file__).parents[2]
 
 
-def test_root_help_exposes_model_free_demo() -> None:
+def test_root_help_leads_with_demo_and_observed_interaction_probe() -> None:
     result = CliRunner().invoke(app, ["--help"])
 
     assert result.exit_code == 0
-    assert "demo" in result.output
-    assert "model-free demonstration" in result.output
+    normalized_output = " ".join(result.output.split())
+    assert "Start with 'ul demo'" in normalized_output
+    assert "probe observed interactions with 'ul probe'" in normalized_output
+    assert "See UL's model-free augment-and-compare workflow" in normalized_output
+    assert "Probe observed interactions against a safe callable or HTTP" in normalized_output
+    assert "Configure an advanced stateful-evidence project" in normalized_output
+    assert normalized_output.index(" probe ") < normalized_output.index(" init ")
+
+
+def test_readme_quickstart_leads_with_probe_and_keeps_stateful_upgrade() -> None:
+    readme = (_PROJECT_ROOT / "README.md").read_text(encoding="utf-8")
+    quickstart = readme[readme.index("## Quickstart") : readme.index("## How it works")]
+
+    assert "ul probe interactions.jsonl --target agent:invoke" in quickstart
+    assert "--target https://agent.test/invoke" in quickstart
+    assert "--header-from-env Authorization=UL_ENVIRONMENT_AGENT_TOKEN" in quickstart
+    assert "not assumed to be correct" in quickstart
+    assert "does not verify trajectory or committed state" in quickstart
+    assert "## Advanced: stateful evidence projects" in quickstart
+    assert quickstart.index("ul probe interactions.jsonl") < quickstart.index(
+        "ul init interactions.jsonl"
+    )
 
 
 @pytest.mark.skipif(os.name == "nt", reason="symlink creation may require Windows privileges")
@@ -94,6 +114,16 @@ def test_demo_shows_three_generic_findings_without_credentials_and_retains_valid
     assert normalized_output.count("Detected by UL's action comparison") == 3
     assert normalized_output.count("Seen in 3/3 runs") == 3
     assert "no custom rules are used here" in normalized_output
+    assert "ul probe interactions.jsonl --target agent:invoke" in normalized_output
+    assert "--target https://agent.test/invoke" in normalized_output
+    assert "--header-from-env Authorization=UL_ENVIRONMENT_AGENT_TOKEN" in normalized_output
+    assert "observed reference evidence, not a correctness oracle" in normalized_output
+    assert "does not verify trajectory or committed state" in normalized_output
+    assert "confirm the exact test target and bounded paid/network campaign" in normalized_output
+    assert "Use ul init and ul run" in normalized_output
+    assert normalized_output.index("ul probe interactions.jsonl") < normalized_output.index(
+        "Use ul init and ul run"
+    )
     evidence_match = re.search(
         r"^Technical evidence saved  (.+)$", completed_process.stdout, re.MULTILINE
     )

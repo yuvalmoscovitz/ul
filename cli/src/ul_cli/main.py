@@ -14,19 +14,22 @@ from ul_cli.project import initialize_project, report_project, run_project
 
 app = typer.Typer(
     name="ul",
-    help="Discover consequential failures in high-risk AI agents.",
+    help=(
+        "Discover consequential failures in high-risk AI agents. "
+        "Start with 'ul demo' or probe observed interactions with 'ul probe'."
+    ),
     no_args_is_help=True,
 )
+app.command("probe")(probe)
+app.command("demo")(run_demo)
 app.add_typer(augmentations_app, name="augmentations")
 app.add_typer(dataset_app, name="dataset")
 app.add_typer(regression_app, name="regression")
 app.add_typer(environment_app, name="environment")
 app.add_typer(stress_app, name="stress")
-app.command("demo")(run_demo)
 app.command("init")(initialize_project)
 app.command("run")(run_project)
 app.command("report")(report_project)
-app.command("probe")(probe)
 app.command("action")(execute_progress_action)
 
 if __name__ == "__main__":

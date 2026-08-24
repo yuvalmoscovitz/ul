@@ -833,7 +833,7 @@ def probe(
         typer.Option("--resume-checkpoint-sha256", hidden=True),
     ] = None,
 ) -> None:
-    """Smoke a real target, then optionally run one bounded active-probe campaign."""
+    """Probe observed interactions against a safe callable or HTTP test target."""
     progress_runtime: CampaignProgressRuntime | None = None
     resolved_target: _ResolvedTarget | None = None
     target_lock_descriptor: int | None = None
