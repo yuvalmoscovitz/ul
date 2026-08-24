@@ -646,7 +646,7 @@ class FindingPrivateReferences(_StrictModel):
 
 
 class FindingEvidencePackage(_StrictModel):
-    schema_version: Literal["1.0.0"] = "1.0.0"
+    schema_version: Literal["1.1.0"] = "1.1.0"
     disclosure: Literal["private"] = "private"
     occurrence: FindingOccurrence
     private_references: FindingPrivateReferences

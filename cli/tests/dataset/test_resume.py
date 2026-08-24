@@ -26,6 +26,7 @@ from ul.dataset_invariants import (
 )
 from ul_cli import dataset_augmentation_ledger as augmentation_ledger_module
 from ul_cli import dataset_review, dataset_trial_journal
+from ul_cli import finding_reference as finding_reference_module
 from ul_cli.dataset.evaluation import command as command_module
 from ul_cli.dataset.evaluation import runner as runner_module
 from ul_cli.dataset.evidence import customer as customer_module
@@ -55,14 +56,16 @@ _ANSI_ESCAPE_PATTERN = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 def test_finding_reference_key_is_stable_across_resume(tmp_path: Path) -> None:
     finding_output = tmp_path / "evidence.jsonl.findings.jsonl"
 
-    created_context = command_module._create_finding_reference_key(finding_output)
-    loaded_context = command_module._load_finding_reference_key(finding_output)
+    created_context = finding_reference_module.create_finding_reference_context(finding_output)
+    loaded_context = finding_reference_module.load_finding_reference_context(finding_output)
 
     assert loaded_context == created_context
     assert len(loaded_context.key) == 32
     if sys.platform != "win32":
         assert (
-            stat.S_IMODE(command_module.finding_reference_key_path(finding_output).stat().st_mode)
+            stat.S_IMODE(
+                finding_reference_module.finding_reference_key_path(finding_output).stat().st_mode
+            )
             == 0o600
         )
 
@@ -77,12 +80,14 @@ def test_finding_reference_key_fsyncs_file_before_parent_directory(
 
     def record_fsync(descriptor: int) -> None:
         fsynced_file_types.append(
-            "directory" if stat.S_ISDIR(command_module.os.fstat(descriptor).st_mode) else "file"
+            "directory"
+            if stat.S_ISDIR(finding_reference_module.os.fstat(descriptor).st_mode)
+            else "file"
         )
 
-    monkeypatch.setattr(command_module.os, "fsync", record_fsync)
+    monkeypatch.setattr(finding_reference_module.os, "fsync", record_fsync)
 
-    command_module._create_finding_reference_key(finding_output)
+    finding_reference_module.create_finding_reference_context(finding_output)
 
     assert fsynced_file_types == ["file", "directory"]
 
@@ -92,7 +97,7 @@ def test_finding_reference_context_rejects_sidecar_without_key(tmp_path: Path) -
     finding_output.write_text("prior snapshot\n", encoding="utf-8")
 
     with pytest.raises(ValueError, match="without its private reference key"):
-        command_module._resolve_finding_reference_context(finding_output)
+        finding_reference_module.resolve_finding_reference_context(finding_output)
 
 
 def test_atomic_finding_snapshot_failure_preserves_published_file(
@@ -767,7 +772,9 @@ def test_all_complete_resume_preserves_prior_review_finding_exit_code(
         encoding="utf-8",
     )
     finding_output = evidence.with_name(f"{evidence.name}.findings.jsonl")
-    original_reference_context = command_module._create_finding_reference_key(finding_output)
+    original_reference_context = finding_reference_module.create_finding_reference_context(
+        finding_output
+    )
     monkeypatch.setattr(command_module, "load_dataset_semantic_settings", _settings)
 
     result = runner.invoke(
@@ -788,8 +795,11 @@ def test_all_complete_resume_preserves_prior_review_finding_exit_code(
     assert result.exit_code == 1, result.output
     assert "Nothing to do" in result.output
     assert finding_output.stat().st_size > 0
-    assert command_module.finding_reference_key_path(finding_output).is_file()
-    assert command_module._load_finding_reference_key(finding_output) == original_reference_context
+    assert finding_reference_module.finding_reference_key_path(finding_output).is_file()
+    assert (
+        finding_reference_module.load_finding_reference_context(finding_output)
+        == original_reference_context
+    )
     decision_report = runner.invoke(root_app, ["report", str(finding_output), "--json"])
     assert decision_report.exit_code == 1, decision_report.output
     assert len(json.loads(decision_report.output)["findings"]) == 1

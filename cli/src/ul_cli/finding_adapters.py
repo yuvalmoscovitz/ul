@@ -29,6 +29,7 @@ from ul.dataset_invariants import (
 from ul_core.dataset import ObservedAgentOutput, ObservedOutcome, SemanticFrame
 from ul_core.evaluation import EnvironmentStateEvidence, ExecutionEvidence
 
+from ul_cli.finding_reference import finding_public_reference
 from ul_cli.report_contract import (
     CapturedJson,
     EvidenceArtifact,
@@ -1253,7 +1254,7 @@ def _package(
         sorted(artifacts_by_digest.values(), key=lambda artifact: artifact.artifact_sha256)
     )
     package_values = {
-        "schema_version": "1.0.0",
+        "schema_version": "1.1.0",
         "disclosure": "private",
         "occurrence": occurrence.model_dump(mode="json"),
         "private_references": {
@@ -1555,9 +1556,12 @@ def _versioned_ref(
 
 
 def _public_ref(context: FindingAdapterContext, namespace: str, *values: str) -> str:
-    message = _canonical_json([context.campaign_id, namespace, *values]).encode("utf-8")
-    digest = hmac.digest(context.reference_key, message, "sha256").hex()
-    return f"ulref_v1_{digest}"
+    return finding_public_reference(
+        context.reference_key,
+        context.campaign_id,
+        namespace,
+        *values,
+    )
 
 
 def _pointer_id(

@@ -4,13 +4,10 @@ import asyncio
 import inspect
 import json
 import os
-import secrets
 import shlex
-import stat
 import sys
 import tempfile
 from contextlib import suppress
-from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Annotated, Any, Literal, TextIO, cast
@@ -81,6 +78,11 @@ from ul_cli.dataset_trial_journal import (
 )
 from ul_cli.environment import TEST_ENVIRONMENT_CONFIRMATION_MESSAGE
 from ul_cli.finding_adapters import FindingAdapterContext, adapt_dataset_finding_packages
+from ul_cli.finding_reference import (
+    FindingReferenceContext,
+    finding_reference_key_path,
+    resolve_finding_reference_context,
+)
 
 from ..evidence.context import build_dataset_evidence_run_context
 from ..evidence.persistence import (
@@ -102,10 +104,7 @@ from ..presentation.evaluation import (
     result_needs_review,
 )
 from ..presentation.runtime import console, print_dataset_plain
-from ..storage.private_files import (
-    create_private_output,
-    open_resume_descriptor,
-)
+from ..storage.private_files import open_resume_descriptor
 from .operators import dataset_operator_identity, validate_operator_ids
 from .records import DatasetInputError, load_interaction_records, validate_model_input_bounds
 from .redaction import (
@@ -118,74 +117,7 @@ from .runner import evaluate_interaction_records, preflight_evaluator
 _MAXIMUM_DATASET_RECORDS = 100
 _MAXIMUM_REPETITIONS = 100
 _DEFAULT_MAXIMUM_ENVIRONMENT_API_CALLS = 100
-_FINDING_REFERENCE_KEY_BYTES = 32
 _MAXIMUM_FINDING_SNAPSHOT_BYTES = 128_000_000
-
-
-@dataclass(frozen=True)
-class _FindingReferenceContext:
-    key: bytes
-    recorded_at: datetime
-
-
-def finding_reference_key_path(finding_output: Path) -> Path:
-    return finding_output.with_name(f"{finding_output.name}.key")
-
-
-def _create_finding_reference_key(finding_output: Path) -> _FindingReferenceContext:
-    reference_key = secrets.token_bytes(_FINDING_REFERENCE_KEY_BYTES)
-    recorded_at = datetime.now(UTC)
-    with create_private_output(finding_reference_key_path(finding_output)) as output_stream:
-        output_stream.write(reference_key.hex() + "\n" + recorded_at.isoformat() + "\n")
-        output_stream.flush()
-        os.fsync(output_stream.fileno())
-    _fsync_directory(finding_output.parent)
-    return _FindingReferenceContext(key=reference_key, recorded_at=recorded_at)
-
-
-def _load_finding_reference_key(finding_output: Path) -> _FindingReferenceContext:
-    descriptor = open_resume_descriptor(finding_reference_key_path(finding_output), writable=False)
-    try:
-        key_status = os.fstat(descriptor)
-        if key_status.st_nlink != 1 or (
-            sys.platform != "win32"
-            and (key_status.st_uid != os.getuid() or stat.S_IMODE(key_status.st_mode) & 0o077)
-        ):
-            raise ValueError("finding reference key must be private and owned by this user")
-        with os.fdopen(descriptor, "r", encoding="ascii") as input_stream:
-            descriptor = -1
-            encoded_context = input_stream.read(200)
-    finally:
-        if descriptor >= 0:
-            os.close(descriptor)
-    context_lines = encoded_context.splitlines()
-    if len(context_lines) != 2:
-        raise ValueError("finding reference context is malformed")
-    try:
-        reference_key = bytes.fromhex(context_lines[0])
-        recorded_at = datetime.fromisoformat(context_lines[1])
-    except ValueError:
-        raise ValueError("finding reference context is malformed") from None
-    if (
-        len(reference_key) != _FINDING_REFERENCE_KEY_BYTES
-        or recorded_at.tzinfo is None
-        or recorded_at.utcoffset() is None
-    ):
-        raise ValueError("finding reference context is malformed")
-    return _FindingReferenceContext(key=reference_key, recorded_at=recorded_at)
-
-
-def _resolve_finding_reference_context(finding_output: Path) -> _FindingReferenceContext:
-    key_output = finding_reference_key_path(finding_output)
-    finding_exists = finding_output.exists() or finding_output.is_symlink()
-    key_exists = key_output.exists() or key_output.is_symlink()
-    if finding_exists and not key_exists:
-        raise ValueError("finding package sidecar exists without its private reference key")
-    return (
-        _load_finding_reference_key(finding_output)
-        if key_exists
-        else _create_finding_reference_key(finding_output)
-    )
 
 
 def _write_finding_package_snapshot(
@@ -195,7 +127,7 @@ def _write_finding_package_snapshot(
     invariant_rules: tuple[DatasetInvariantRule, ...],
     *,
     campaign_id: str,
-    reference_context: _FindingReferenceContext,
+    reference_context: FindingReferenceContext,
 ) -> bool:
     invariant_evaluation_by_interaction = {
         evaluation.interaction_id: evaluation for evaluation in invariant_evaluations
@@ -1128,7 +1060,7 @@ def evaluate_dataset(
         assert run_context is not None
         finding_output = output.with_name(f"{output.name}.findings.jsonl")
         try:
-            finding_reference_context = _resolve_finding_reference_context(finding_output)
+            finding_reference_context = resolve_finding_reference_context(finding_output)
             _write_finding_package_snapshot(
                 finding_output,
                 resume_evidence.technical_results,
@@ -1287,7 +1219,7 @@ def evaluate_dataset(
     augmentation_ledger_was_created = False
     output_stream: TextIO | None = None
     finding_output = output.with_name(f"{output.name}.findings.jsonl")
-    finding_reference_context: _FindingReferenceContext | None = None
+    finding_reference_context: FindingReferenceContext | None = None
     failure_parameter = "--augmentations-output"
     try:
         if augmentations_output is not None:
@@ -1339,7 +1271,7 @@ def evaluate_dataset(
                 or finding_reference_key_path(finding_output).is_symlink()
             ):
                 raise ValueError("new finding package outputs already exist")
-            finding_reference_context = _resolve_finding_reference_context(finding_output)
+            finding_reference_context = resolve_finding_reference_context(finding_output)
         else:
             assert resume_evidence is not None
             output_stream, locked_resume_evidence = open_resume_output(
@@ -1351,7 +1283,7 @@ def evaluate_dataset(
             if locked_resume_evidence != resume_evidence:
                 output_stream.close()
                 raise ValueError("resume evidence changed after preflight")
-            finding_reference_context = _resolve_finding_reference_context(finding_output)
+            finding_reference_context = resolve_finding_reference_context(finding_output)
     except (OSError, ValueError) as error:
         if augmentation_ledger is not None:
             if augmentation_ledger_was_created:

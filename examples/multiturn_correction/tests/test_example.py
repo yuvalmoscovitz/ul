@@ -11,6 +11,7 @@ from threading import Thread
 from typing import cast
 
 from typer.testing import CliRunner
+from ul_cli.finding_reference import finding_reference_key_path
 from ul_cli.main import app
 from ul_cli.report_contract import FindingEvidencePackage
 
@@ -137,6 +138,7 @@ def test_one_command_runner_confirms_finding_without_model_configuration() -> No
     assert evidence_match is not None
     evidence_path = Path(evidence_match.group(1))
     finding_output = evidence_path.with_name(f"{evidence_path.name}.findings.jsonl")
+    reference_key = finding_reference_key_path(finding_output)
     try:
         assert evidence_path.is_absolute()
         assert evidence_path.parent.name.startswith("multiturn-correction-")
@@ -153,9 +155,13 @@ def test_one_command_runner_confirms_finding_without_model_configuration() -> No
         )
         assert len(finding_packages) == 1
         assert finding_packages[0].artifact_retention == "embedded"
+        assert reference_key.is_file()
+        if os.name != "nt":
+            assert stat.S_IMODE(reference_key.stat().st_mode) == 0o600
         assert not (evidence_path.parent / "target.json").exists()
         assert (_EXAMPLE_DIRECTORY / "target.json").read_bytes() == checked_in_target_before
     finally:
+        reference_key.unlink(missing_ok=True)
         finding_output.unlink(missing_ok=True)
         evidence_path.unlink(missing_ok=True)
         evidence_path.parent.rmdir()

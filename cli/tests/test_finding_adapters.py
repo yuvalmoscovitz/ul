@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import stat
+import sys
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -40,6 +41,7 @@ from ul.dataset_invariants import (
     DatasetInvariantRuleEvaluation,
     JsonValuesEqualInvariant,
 )
+from ul_cli import event_stress as event_stress_module
 from ul_cli.event_stress import write_stateful_finding_packages
 from ul_cli.finding_adapters import (
     FindingAdapterContext,
@@ -47,6 +49,10 @@ from ul_cli.finding_adapters import (
     adapt_dataset_finding_packages,
     adapt_dataset_invariant_finding,
     adapt_stateful_invariant_finding,
+)
+from ul_cli.finding_reference import (
+    create_finding_reference_context,
+    finding_reference_key_path,
 )
 from ul_cli.main import app
 from ul_cli.report_contract import (
@@ -77,8 +83,20 @@ def _context() -> FindingAdapterContext:
     return FindingAdapterContext(
         campaign_id=f"campaign-{_PRIVATE_SECRET}",
         recorded_at=datetime(2026, 8, 23, 12, tzinfo=UTC),
-        reference_key=b"test-only-opaque-reference-key-32-bytes",
+        reference_key=b"test-only-reference-key-32bytes!",
     )
+
+
+def _write_finding_evidence(path: Path, package: FindingEvidencePackage) -> None:
+    context = _context()
+    path.write_text(package.model_dump_json() + "\n", encoding="utf-8")
+    key_path = finding_reference_key_path(path)
+    key_path.write_text(
+        context.reference_key.hex() + "\n" + context.recorded_at.isoformat() + "\n",
+        encoding="ascii",
+    )
+    if sys.platform != "win32":
+        key_path.chmod(0o600)
 
 
 def _dataset_result() -> DatasetEvaluationResult:
@@ -637,7 +655,7 @@ def test_private_receipt_disclosure_includes_cited_embedded_artifacts(tmp_path: 
         context=_context(),
     )
     evidence = tmp_path / "evidence.findings.jsonl"
-    evidence.write_text(package.model_dump_json() + "\n", encoding="utf-8")
+    _write_finding_evidence(evidence, package)
     safe_result = runner.invoke(app, ["report", str(evidence)])
 
     result = runner.invoke(
@@ -1260,3 +1278,118 @@ def test_real_workflow_collectors_emit_canonical_packages_without_calls(tmp_path
     assert stat.S_IMODE(stateful_output.stat().st_mode) == 0o600
     all_packages = (*dataset_packages, *stateful_packages)
     assert all(json.loads(package.model_dump_json()) for package in all_packages)
+
+
+def test_stateful_command_reconciles_findings_from_durable_primary_evidence(
+    tmp_path: Path,
+) -> None:
+    result = _stateful_result().model_copy(update={"required_target_calls": 14})
+    output = tmp_path / "correction-result.json"
+    output.write_text(result.model_dump_json(), encoding="utf-8")
+    if sys.platform != "win32":
+        output.chmod(0o600)
+    case_path = tmp_path / "case.json"
+    case_path.write_text(result.case.model_dump_json(), encoding="utf-8")
+    invariants_path = tmp_path / "invariants.json"
+    invariants_path.write_text(
+        json.dumps(
+            {
+                "schema_version": "1.1.0",
+                "observation_source": "target_output",
+                "observation_authority": "committed_state_snapshot",
+                "rules": [_rule().model_dump(mode="json")],
+            }
+        ),
+        encoding="utf-8",
+    )
+    target_path = tmp_path / "target.json"
+    target_path.write_text(
+        json.dumps(
+            {
+                "version": 5,
+                "environment_id": "reconciliation-test",
+                "reset": {
+                    "url": "http://127.0.0.1:8765/reset",
+                    "generation_json_pointer": "/generation",
+                    "clean_state_json_pointer": "/clean",
+                    "clean_state_value": True,
+                },
+                "setup": {"url": "http://127.0.0.1:8765/setup"},
+                "execute_turn": {
+                    "url": "http://127.0.0.1:8765/execute",
+                    "request_json_template": {
+                        "case_id": "{{case_id}}",
+                        "turn_id": "{{turn_id}}",
+                        "input": "{{input}}",
+                    },
+                },
+                "snapshot": {
+                    "url": "http://127.0.0.1:8765/snapshot",
+                    "request_json_template": {
+                        "case_id": "{{case_id}}",
+                        "turn_id": "{{turn_id}}",
+                    },
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    finding_output = event_stress_module.stateful_finding_output(output)
+    reference_context = create_finding_reference_context(finding_output)
+
+    command = [
+        "stress",
+        "correction",
+        str(case_path),
+        "--environment-config",
+        str(target_path),
+        "--invariants",
+        str(invariants_path),
+        "--repetitions",
+        "1",
+        "--confirm-test-environment",
+        "--allow-insecure-http",
+        "--output",
+        str(output),
+    ]
+    command_result = runner.invoke(app, command)
+
+    assert command_result.exit_code == 1, command_result.output
+    assert finding_output.is_file()
+    assert finding_reference_key_path(finding_output).is_file()
+    assert (
+        event_stress_module.resolve_finding_reference_context(finding_output) == reference_context
+    )
+    report_result = runner.invoke(app, ["report", str(finding_output), "--json"])
+    assert report_result.exit_code == 1, report_result.output
+
+    output.write_text(
+        json.dumps({"schema_version": "1.1.0", "private": _PRIVATE_SECRET}),
+        encoding="utf-8",
+    )
+    malformed_result = runner.invoke(app, command)
+    assert malformed_result.exit_code == 2
+    assert "existing private output" in malformed_result.output
+    assert "safely" in malformed_result.output
+    assert "reconciled" in malformed_result.output
+    assert _PRIVATE_SECRET not in malformed_result.output
+
+
+def test_stateful_finding_snapshot_failure_preserves_published_file(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    finding_output = tmp_path / "evidence.json.findings.jsonl"
+    finding_output.write_bytes(b"prior snapshot\n")
+
+    def fail_write(descriptor: int, value: object) -> int:
+        del descriptor, value
+        raise OSError("simulated disk full")
+
+    monkeypatch.setattr(event_stress_module.os, "write", fail_write)
+
+    with pytest.raises(OSError, match="simulated disk full"):
+        event_stress_module._replace_stateful_finding_snapshot(
+            finding_output, b"replacement snapshot\n"
+        )
+    assert finding_output.read_bytes() == b"prior snapshot\n"

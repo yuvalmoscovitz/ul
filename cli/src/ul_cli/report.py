@@ -22,6 +22,10 @@ from ul_cli.dataset_review import (
     report_dataset_evidence,
     summarize_dataset_evidence,
 )
+from ul_cli.finding_reference import (
+    load_finding_reference_context,
+    validate_finding_private_references,
+)
 from ul_cli.pattern_identity import PatternIdentityKeyError, load_pattern_identity_key
 from ul_cli.report_contract import (
     FailurePattern,
@@ -175,6 +179,9 @@ def _load_finding_packages(path: Path) -> tuple[FindingEvidencePackage, ...]:
     occurrence_ids = tuple(package.occurrence.occurrence_id for package in packages)
     if len(occurrence_ids) != len(set(occurrence_ids)):
         raise ValueError("finding package file contains a duplicate occurrence")
+    reference_context = load_finding_reference_context(path)
+    for package in packages:
+        validate_finding_private_references(package, reference_context.key)
     return tuple(packages)
 
 

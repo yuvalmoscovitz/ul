@@ -3,6 +3,8 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import subprocess
+import sys
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Literal
@@ -12,6 +14,7 @@ from pydantic import JsonValue, ValidationError
 from typer.testing import CliRunner
 from ul_cli import report as report_module
 from ul_cli import report_contract as report_contract_module
+from ul_cli.finding_reference import finding_public_reference, finding_reference_key_path
 from ul_cli.main import app
 from ul_cli.report_contract import (
     CapturedJson,
@@ -45,25 +48,56 @@ from ul_cli.report_contract import (
 )
 
 _PRIVATE_CANARY = "customer@example.com:account-secret-canary"
+_REFERENCE_KEY = b"0123456789abcdef0123456789abcdef"
+_CAMPAIGN_ID = "private-campaign"
 runner = CliRunner()
+
+
+def test_report_module_imports_in_a_clean_process() -> None:
+    result = subprocess.run(
+        [sys.executable, "-c", "from ul_cli import report"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
 
 
 def _sha(value: str) -> str:
     return hashlib.sha256(value.encode()).hexdigest()
 
 
-def _public_ref(value: str) -> str:
-    return f"ulref_v1_{_sha(value)}"
+def _public_ref(namespace: str, *values: str, campaign_id: str = _CAMPAIGN_ID) -> str:
+    return finding_public_reference(_REFERENCE_KEY, campaign_id, namespace, *values)
 
 
-def _versioned_ref(identifier: str, version: str) -> VersionedReference:
+def _versioned_ref(namespace: str, identifier: str, version: str) -> VersionedReference:
     return VersionedReference(
-        id=_public_ref(f"id:{identifier}"),
-        version=_public_ref(f"version:{version}"),
+        id=_public_ref(namespace, identifier),
+        version=_public_ref(f"{namespace}-version", version),
     )
 
 
-_RULE = _versioned_ref("final-amount-matches-corrected", "1.0.0")
+_RULE = _versioned_ref("rule", "private-rule", "1.0.0")
+
+
+def _write_package_evidence(
+    path: Path,
+    *packages: FindingEvidencePackage,
+    reference_key: bytes = _REFERENCE_KEY,
+) -> None:
+    path.write_text(
+        "".join(package.model_dump_json() + "\n" for package in packages),
+        encoding="utf-8",
+    )
+    key_path = finding_reference_key_path(path)
+    key_path.write_text(
+        reference_key.hex() + "\n2026-08-23T00:00:00+00:00\n",
+        encoding="ascii",
+    )
+    if os.name != "nt":
+        key_path.chmod(0o600)
 
 
 def _rebind_occurrence(payload: dict[str, object]) -> None:
@@ -322,12 +356,12 @@ def _dataset_package() -> FindingEvidencePackage:
     occurrence = build_finding_occurrence(
         kind="behavior_difference",
         category="changed_grounded_effect_argument",
-        campaign_ref=_public_ref("campaign"),
-        source_interaction_ref=_public_ref("source-interaction"),
-        fixture=_versioned_ref("accounts-payable", "1.0.0"),
-        case_ref=_public_ref("dataset-case"),
-        operator=_versioned_ref("input.surface.disfluency_repeat", "1.0.0"),
-        bundle=_versioned_ref("surface-noise", "1.0.0"),
+        campaign_ref=_public_ref("campaign", _CAMPAIGN_ID),
+        source_interaction_ref=_public_ref("source-interaction", "private-source"),
+        fixture=_versioned_ref("fixture", "accounts-payable", "1.0.0"),
+        case_ref=_public_ref("case", "private-case"),
+        operator=_versioned_ref("operator", "private-operator", "1.0.0"),
+        bundle=_versioned_ref("bundle", "surface-noise", "1.0.0"),
         probe_change=ProbeChange(
             kind="input",
             source_descriptor="recorded_input",
@@ -339,7 +373,7 @@ def _dataset_package() -> FindingEvidencePackage:
             ObservedDelta(
                 kind="action",
                 change="changed",
-                subject_ref=_public_ref("payment.invoice_reference"),
+                subject_ref=_public_ref("subject", "payment.invoice_reference"),
                 source_state="observed",
                 probe_state="observed",
                 evidence_pointer_ids=action_ids,
@@ -347,7 +381,7 @@ def _dataset_package() -> FindingEvidencePackage:
             ObservedDelta(
                 kind="response",
                 change="changed",
-                subject_ref=_public_ref("agent-response"),
+                subject_ref=_public_ref("subject", "agent-response"),
                 source_state="observed",
                 probe_state="observed",
                 evidence_pointer_ids=response_ids,
@@ -440,11 +474,12 @@ def _stateful_package() -> FindingEvidencePackage:
     occurrence = build_finding_occurrence(
         kind="customer_invariant_violation",
         category="customer_invariant_violation",
-        campaign_ref=_public_ref("campaign"),
-        fixture=_versioned_ref("accounts-payable", "1.0.0"),
-        case_ref=_public_ref("stateful-case"),
+        campaign_ref=_public_ref("campaign", _CAMPAIGN_ID),
+        fixture=_versioned_ref("fixture", "accounts-payable", "1.0.0"),
+        case_ref=_public_ref("case", "private-case"),
         operator=_versioned_ref(
-            "conversation.correction_after_first_response",
+            "operator",
+            "private-operator",
             "1.0.0",
         ),
         probe_change=ProbeChange(
@@ -458,7 +493,7 @@ def _stateful_package() -> FindingEvidencePackage:
             ObservedDelta(
                 kind="rule",
                 change="violated",
-                subject_ref=_public_ref("customer-rule"),
+                subject_ref=_public_ref("subject", "customer-rule"),
                 rule=_RULE,
                 source_state="satisfied",
                 probe_state="violated",
@@ -467,7 +502,7 @@ def _stateful_package() -> FindingEvidencePackage:
             ObservedDelta(
                 kind="state",
                 change="changed",
-                subject_ref=_public_ref("final-amount"),
+                subject_ref=_public_ref("subject", "final-amount"),
                 source_state="observed",
                 probe_state="observed",
                 evidence_pointer_ids=state_ids,
@@ -507,6 +542,7 @@ def test_dataset_and_stateful_workflows_share_an_auditable_package_contract() ->
     for package in (_dataset_package(), _stateful_package()):
         round_trip = FindingEvidencePackage.model_validate_json(package.model_dump_json())
         assert round_trip == package
+        assert package.schema_version == "1.1.0"
         assert len(package.occurrence.repetitions) == 2
         assert all(item.evidence_pointer_ids for item in package.occurrence.repetitions)
 
@@ -582,7 +618,7 @@ def test_finding_package_report_human_json_and_private_receipt_share_one_contrac
 ) -> None:
     package = _dataset_package()
     evidence = tmp_path / "dataset-evidence.jsonl.findings.jsonl"
-    evidence.write_text(package.model_dump_json() + "\n", encoding="utf-8")
+    _write_package_evidence(evidence, package)
     expected = build_finding_decision_report((package,))
 
     human = runner.invoke(app, ["report", str(evidence)])
@@ -621,13 +657,60 @@ def test_finding_package_report_human_json_and_private_receipt_share_one_contrac
     assert all(receipt.receipt_id in private.output for receipt in package.receipts)
 
 
+@pytest.mark.parametrize(
+    ("package", "field"),
+    (
+        *(
+            (_dataset_package(), field)
+            for field in (
+                "campaign_id",
+                "case_id",
+                "source_interaction_id",
+                "operator_id",
+                "operator_version",
+            )
+        ),
+        *(
+            (_stateful_package(), field)
+            for field in (
+                "campaign_id",
+                "case_id",
+                "operator_id",
+                "operator_version",
+                "rule_id",
+                "rule_version",
+            )
+        ),
+    ),
+)
+def test_finding_package_report_rejects_tampered_private_reference_resolution(
+    tmp_path: Path,
+    package: FindingEvidencePackage,
+    field: str,
+) -> None:
+    private_values = package.private_references.model_dump()
+    private_values[field] = f"tampered-{field}"
+    tampered_package = package.model_copy(
+        update={"private_references": FindingPrivateReferences.model_validate(private_values)}
+    )
+    evidence = tmp_path / f"tampered-{field}.findings.jsonl"
+    _write_package_evidence(evidence, tampered_package)
+
+    result = runner.invoke(app, ["report", str(evidence), "--json"])
+
+    assert result.exit_code == 2
+    assert "finding package evidence cannot be" in result.output
+    assert "summarized" in result.output
+    assert "safely" in result.output
+
+
 def test_private_receipt_disclosure_fails_before_partial_output_when_over_cap(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     package = _dataset_package()
     evidence = tmp_path / "dataset-evidence.jsonl.findings.jsonl"
-    evidence.write_text(package.model_dump_json() + "\n", encoding="utf-8")
+    _write_package_evidence(evidence, package)
     monkeypatch.setattr(report_module, "_MAXIMUM_PRIVATE_RECEIPT_BYTES", 100)
 
     result = runner.invoke(
@@ -653,7 +736,7 @@ def test_stateful_finding_package_uses_same_safe_offline_report(
 ) -> None:
     package = _stateful_package()
     evidence = tmp_path / "stateful-evidence.json.findings.jsonl"
-    evidence.write_text(package.model_dump_json() + "\n", encoding="utf-8")
+    _write_package_evidence(evidence, package)
 
     def unexpected_primary_report(*args: object, **kwargs: object) -> None:
         raise AssertionError("finding package report attempted a primary evidence workflow")
@@ -700,7 +783,10 @@ def test_decision_report_supports_mixed_evidence_scopes_in_one_campaign() -> Non
 
 def test_decision_report_rejects_packages_from_different_campaigns() -> None:
     payload = _stateful_package().model_dump(mode="json")
-    payload["occurrence"]["campaign_ref"] = _public_ref("another-campaign")
+    payload["occurrence"]["campaign_ref"] = _public_ref(
+        "campaign", "another-campaign", campaign_id="another-campaign"
+    )
+    payload["private_references"]["campaign_id"] = "another-campaign"
     _rebind_occurrence(payload)
     other_campaign = FindingEvidencePackage.model_validate_json(json.dumps(payload))
 
@@ -711,7 +797,7 @@ def test_decision_report_rejects_packages_from_different_campaigns() -> None:
 def test_finding_package_report_detects_contract_without_filename_suffix(tmp_path: Path) -> None:
     package = _dataset_package()
     evidence = tmp_path / "renamed-evidence.jsonl"
-    evidence.write_text(package.model_dump_json() + "\n", encoding="utf-8")
+    _write_package_evidence(evidence, package)
 
     result = runner.invoke(app, ["report", str(evidence), "--json"])
 
@@ -738,7 +824,7 @@ def test_finding_package_report_rejects_primary_review_sidecar_option(tmp_path: 
     package = _dataset_package()
     evidence = tmp_path / "dataset-evidence.jsonl.findings.jsonl"
     reviews = tmp_path / "reviews.jsonl"
-    evidence.write_text(package.model_dump_json() + "\n", encoding="utf-8")
+    _write_package_evidence(evidence, package)
     reviews.write_text("", encoding="utf-8")
 
     result = runner.invoke(
@@ -757,7 +843,7 @@ def test_decision_ready_report_rejects_unresolved_external_artifacts(tmp_path: P
         update={"artifact_retention": "external", "artifacts": ()}
     )
     evidence = tmp_path / "external.findings.jsonl"
-    evidence.write_text(package.model_dump_json() + "\n", encoding="utf-8")
+    _write_package_evidence(evidence, package)
 
     result = runner.invoke(app, ["report", str(evidence), "--json"])
 
@@ -773,8 +859,8 @@ def test_finding_package_report_rejects_duplicate_keys_and_symlinks(tmp_path: Pa
     duplicate = tmp_path / "duplicate.findings.jsonl"
     duplicate.write_text(
         valid.replace(
-            '"schema_version":"1.0.0"',
-            '"schema_version":"1.0.0","schema_version":"1.0.0"',
+            '"schema_version":"1.1.0"',
+            '"schema_version":"1.1.0","schema_version":"1.1.0"',
             1,
         )
         + "\n",
@@ -931,7 +1017,7 @@ def test_behavior_findings_reject_rule_violation_deltas() -> None:
         ObservedDelta(
             kind="rule",
             change="violated",
-            subject_ref=_public_ref("customer-rule"),
+            subject_ref=_public_ref("subject", "customer-rule"),
             rule=_RULE,
             source_state="satisfied",
             probe_state="violated",
@@ -953,7 +1039,7 @@ def test_behavior_findings_reject_rule_violation_deltas() -> None:
 
 def test_occurrence_id_is_bound_to_canonical_claims() -> None:
     payload = _dataset_package().occurrence.model_dump(mode="json")
-    payload["observed_deltas"][0]["subject_ref"] = _public_ref("different-action")
+    payload["observed_deltas"][0]["subject_ref"] = _public_ref("subject", "different-action")
 
     with pytest.raises(ValidationError, match="ID must match its canonical claims"):
         FindingOccurrence.model_validate_json(json.dumps(payload))
