@@ -314,10 +314,18 @@ def print_dataset_results(
     if invariant_evaluations:
         _print_invariant_results(invariant_evaluations)
     console.print(f"Complete evidence: {output}")
+    finding_output = output.with_name(f"{output.name}.findings.jsonl")
+    has_decision_ready_findings = finding_output.is_file() and finding_output.stat().st_size > 0
+    if has_decision_ready_findings:
+        print_dataset_plain(f"Decision-ready findings: {finding_output}")
     if augmentations_output is not None:
         print_dataset_plain(f"Saved augmentations: {augmentations_output}")
     if show_report_guidance:
-        console.print(f"Next: ul dataset report {output}")
+        if has_decision_ready_findings:
+            console.print(f"Next: ul report {finding_output}")
+            console.print(f"Private dataset details: ul dataset report {output}")
+        else:
+            console.print(f"Next: ul dataset report {output}")
 
 
 def result_needs_review(result: DatasetEvaluationResult) -> bool:

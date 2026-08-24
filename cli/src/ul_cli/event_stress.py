@@ -866,6 +866,14 @@ def stateful_finding_output(output: Path) -> Path:
     return output.with_name(f"{output.name}.findings.jsonl")
 
 
+def _print_finding_report_guidance(output: Path) -> None:
+    finding_output = stateful_finding_output(output)
+    if not finding_output.is_file() or finding_output.stat().st_size == 0:
+        return
+    typer.echo(f"Decision-ready findings: {finding_output}")
+    typer.echo(f"Next: ul report {finding_output}")
+
+
 def write_stateful_finding_packages(
     output: Path,
     result: StatefulFindingResult,
@@ -938,6 +946,7 @@ def _print_result(result: CorrectionStressResult, output: Path) -> None:
                 f"Invariant {rule.rule_id}: {rule.status}; arm={arm}; severity={rule.severity}"
             )
     typer.echo(f"Complete evidence: {output}")
+    _print_finding_report_guidance(output)
     if result.status == "failed":
         raise typer.Exit(code=1)
     if result.status == "inconclusive":
@@ -965,6 +974,7 @@ def _print_retry_result(result: RetryAfterSuccessfulCommitStressResult, output: 
             f"severity={baseline_rule.severity}"
         )
     typer.echo(f"Complete evidence: {output}")
+    _print_finding_report_guidance(output)
     if result.status == "failed":
         raise typer.Exit(code=1)
     if result.status == "inconclusive":
@@ -987,6 +997,7 @@ def _print_timeout_after_commit_result(
         typer.echo(f"Invariant {rule.rule_id}: {rule.status}; severity={rule.severity}")
     typer.echo("Exact responses, committed state, and event receipts are in private evidence.")
     typer.echo(f"Complete evidence: {output}")
+    _print_finding_report_guidance(output)
     if result.status == "failed":
         raise typer.Exit(code=1)
     if result.status == "inconclusive":

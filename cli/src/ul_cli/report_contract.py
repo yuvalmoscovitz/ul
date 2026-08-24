@@ -5,7 +5,7 @@ import json
 import re
 import unicodedata
 from datetime import datetime
-from typing import Annotated, Literal, Self
+from typing import Annotated, Literal, Self, cast
 
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, ValidationInfo, model_validator
 
@@ -18,6 +18,7 @@ ReportEvidenceType = Literal[
 ReportReviewStatus = Literal["resolved", "action_required", "inconclusive"]
 ReportEvaluationMode = Literal["variance"]
 ReportEvidenceScope = Literal["response_only", "response_and_state"]
+DecisionEvidenceScope = Literal["response_only", "response_and_state", "mixed"]
 ReportCapabilityLimitation = Literal[
     "cleanup_verification",
     "conversation_replay",
@@ -128,6 +129,25 @@ OccurrenceLimitation = Literal[
     "production_prevalence_not_measured",
     "source_execution_unavailable",
 ]
+EvidenceAuthority = Literal[
+    "customer_declared",
+    "deterministic_evaluator",
+    "invoker_self_reported",
+    "source_self_reported",
+    "environment_self_reported",
+    "independent_observer",
+]
+DecisionFindingClassification = Literal[
+    "observed_variance",
+    "customer_rule_violation",
+    "inconclusive_evidence",
+]
+DecisionClaimKind = Literal[
+    "tested_change",
+    "agent_behavior",
+    "observed_consequence",
+    "flag_reason",
+]
 
 
 class VersionedReference(_StrictModel):
@@ -152,14 +172,7 @@ class EvidencePointer(_StrictModel):
     record_id: str | None = Field(default=None, min_length=1, max_length=500)
     json_pointer: str = Field(max_length=2_000)
     arm: Literal["source", "probe", "shared"]
-    authority: Literal[
-        "customer_declared",
-        "deterministic_evaluator",
-        "invoker_self_reported",
-        "source_self_reported",
-        "environment_self_reported",
-        "independent_observer",
-    ]
+    authority: EvidenceAuthority
     source_id: str = Field(min_length=1, max_length=500)
 
     @model_validator(mode="after")
@@ -669,6 +682,22 @@ class FindingEvidencePackage(_StrictModel):
                     json.loads(artifact.canonical_json),
                     pointer.json_pointer,
                 )
+            receipt_values = tuple(
+                value
+                for receipt in self.receipts
+                for value in _receipt_evidence_values(receipt.content)
+            )
+            for receipt_value in receipt_values:
+                pointer = pointers[receipt_value.evidence_pointer_id]
+                artifact = artifacts.get(pointer.artifact_sha256)
+                if artifact is not None and not _receipt_value_matches_artifact(
+                    _resolve_json_pointer(
+                        json.loads(artifact.canonical_json),
+                        pointer.json_pointer,
+                    ),
+                    receipt_value,
+                ):
+                    raise ValueError("receipt value must match its retained evidence artifact")
         for repetition in self.occurrence.repetitions:
             allowed_pointer_ids: set[str] = set()
             for expected_arm, receipt_id in (
@@ -721,6 +750,116 @@ class FindingEvidencePackage(_StrictModel):
         return self
 
 
+class FindingDecisionClaim(_StrictModel):
+    kind: DecisionClaimKind
+    summary: str = Field(min_length=1, max_length=500)
+    evidence_pointer_ids: tuple[str, ...] = Field(min_length=1, max_length=1_000)
+
+    @model_validator(mode="after")
+    def validate_evidence(self) -> Self:
+        _validate_sorted_unique(self.evidence_pointer_ids, "decision claim evidence pointers")
+        return self
+
+
+class FindingDecisionLimitation(_StrictModel):
+    code: OccurrenceLimitation
+    summary: str = Field(min_length=1, max_length=500)
+
+
+class DecisionReadyFinding(_StrictModel):
+    schema_version: Literal["1.0.0"] = "1.0.0"
+    occurrence_id: str = Field(pattern=_FINDING_ID_PATTERN)
+    campaign_ref: str = Field(pattern=_PUBLIC_REFERENCE_PATTERN)
+    case_ref: str = Field(pattern=_PUBLIC_REFERENCE_PATTERN)
+    operator: VersionedReference
+    probe_change_kind: Literal[
+        "input",
+        "context",
+        "turn_sequence",
+        "state_setup",
+        "event_behavior",
+    ]
+    violated_rule: VersionedReference | None = None
+    classification: DecisionFindingClassification
+    headline: FindingSummaryText
+    claims: tuple[FindingDecisionClaim, ...] = Field(min_length=4, max_length=4)
+    repetition_summary: RepetitionSummary
+    evidence_scope: DecisionEvidenceScope
+    evidence_level: Literal[
+        "response_observed",
+        "response_and_state_observed",
+        "customer_rule_evaluated",
+    ]
+    evidence_authorities: tuple[EvidenceAuthority, ...] = Field(min_length=1, max_length=10)
+    limitations: tuple[FindingDecisionLimitation, ...] = ()
+    review_workflow: Literal["dataset_review", "external_review_required"]
+    review_status: Literal["needs_review"] = "needs_review"
+    human_confirmed_severity: Literal["unrated"] = "unrated"
+    next_action: FindingNextAction
+    next_action_summary: str = Field(min_length=1, max_length=500)
+    receipt_ids: tuple[str, ...] = Field(min_length=1, max_length=2_000)
+
+    @model_validator(mode="after")
+    def validate_decision(self) -> Self:
+        claim_kinds = tuple(claim.kind for claim in self.claims)
+        if claim_kinds != (
+            "tested_change",
+            "agent_behavior",
+            "observed_consequence",
+            "flag_reason",
+        ):
+            raise ValueError("decision claims must be complete and ordered")
+        if self.evidence_authorities != tuple(sorted(set(self.evidence_authorities))):
+            raise ValueError("decision evidence authorities must be sorted and unique")
+        limitation_codes = tuple(limitation.code for limitation in self.limitations)
+        if limitation_codes != tuple(sorted(set(limitation_codes))):
+            raise ValueError("decision limitations must be sorted and unique")
+        _validate_sorted_unique(self.receipt_ids, "decision receipt IDs")
+        if (self.review_workflow == "dataset_review") != (
+            self.next_action == "review_dataset_finding"
+        ):
+            raise ValueError("decision review workflow must match its next action")
+        return self
+
+
+class FindingDecisionReport(_StrictModel):
+    schema_version: Literal["1.0.0"] = "1.0.0"
+    disclosure: Literal["safe"] = "safe"
+    evidence_schema_versions: tuple[str, ...] = Field(min_length=1, max_length=100)
+    campaign_ref: str = Field(pattern=_PUBLIC_REFERENCE_PATTERN)
+    evidence_scope: DecisionEvidenceScope
+    review_status: Literal["action_required", "inconclusive"]
+    exit_code: Literal[1, 2]
+    findings: tuple[DecisionReadyFinding, ...] = Field(min_length=1, max_length=10_000)
+
+    @model_validator(mode="after")
+    def validate_report(self) -> Self:
+        if self.evidence_schema_versions != tuple(sorted(set(self.evidence_schema_versions))):
+            raise ValueError("decision report evidence versions must be sorted and unique")
+        occurrence_ids = tuple(finding.occurrence_id for finding in self.findings)
+        if occurrence_ids != tuple(sorted(set(occurrence_ids))):
+            raise ValueError("decision-ready findings must be sorted and unique")
+        if any(finding.campaign_ref != self.campaign_ref for finding in self.findings):
+            raise ValueError("decision report campaign must match every finding")
+        expected_scope: DecisionEvidenceScope = (
+            self.findings[0].evidence_scope
+            if len({finding.evidence_scope for finding in self.findings}) == 1
+            else "mixed"
+        )
+        if self.evidence_scope != expected_scope:
+            raise ValueError("decision report evidence scope must summarize its findings")
+        expected_status = (
+            "inconclusive"
+            if all(finding.classification == "inconclusive_evidence" for finding in self.findings)
+            else "action_required"
+        )
+        if self.review_status != expected_status:
+            raise ValueError("decision report status must match its findings")
+        if self.exit_code != (2 if self.review_status == "inconclusive" else 1):
+            raise ValueError("decision report exit code must match its status")
+        return self
+
+
 def capture_json(value: JsonValue) -> CapturedJson:
     canonical_json = _canonical_json(value)
     return CapturedJson(
@@ -731,6 +870,210 @@ def capture_json(value: JsonValue) -> CapturedJson:
 
 def build_run_receipt(content: RunReceiptContent) -> RunReceipt:
     return RunReceipt(receipt_id=_run_receipt_id(content), content=content)
+
+
+_AGENT_BEHAVIOR_SUMMARIES: dict[FindingCategory, str] = {
+    "duplicate_effect": "The probe made the agent repeat an observed action.",
+    "unexpected_effect": "The probe made the agent produce a new observed action.",
+    "missing_effect": "The probe made the agent omit an observed source action.",
+    "changed_grounded_effect_argument": (
+        "The probe made the agent change an observed action detail."
+    ),
+    "unstable_behavior": "The agent produced inconsistent observed behavior.",
+}
+_CONSEQUENCE_SUMMARIES: dict[FindingCategory, FindingSummaryText] = {
+    "duplicate_effect": "The changed input made the agent repeat an action.",
+    "unexpected_effect": "The changed input made the agent take a new action.",
+    "missing_effect": "The changed input made the agent skip a baseline action.",
+    "changed_grounded_effect_argument": "The changed input altered an important action detail.",
+    "unstable_behavior": "The changed input produced inconsistent behavior across repetitions.",
+    "customer_invariant_violation": "The agent violated a customer-defined rule.",
+}
+_LIMITATION_SUMMARIES: dict[OccurrenceLimitation, str] = {
+    "correctness_not_verified": (
+        "UL observed a difference; it did not determine whether the behavior was correct."
+    ),
+    "evaluator_provenance_unavailable": "Evaluator provenance was not available.",
+    "model_provenance_unavailable": "Model provenance was not available.",
+    "one_or_more_repetitions_inconclusive": (
+        "At least one requested repetition did not produce conclusive evidence."
+    ),
+    "production_prevalence_not_measured": (
+        "Generated probe repetitions do not measure production prevalence."
+    ),
+    "source_execution_unavailable": (
+        "At least one source execution was unavailable for direct comparison."
+    ),
+}
+
+
+def build_finding_decision(package: FindingEvidencePackage) -> DecisionReadyFinding:
+    if package.artifact_retention != "embedded":
+        raise ValueError("decision-ready findings require embedded evidence artifacts")
+    occurrence = package.occurrence
+    pointers = {
+        pointer.pointer_id: pointer
+        for receipt in package.receipts
+        for pointer in receipt.content.evidence_pointers
+    }
+    tested_change_pointer_ids = tuple(
+        sorted(
+            {
+                *occurrence.probe_change.source_evidence_pointer_ids,
+                *occurrence.probe_change.probe_evidence_pointer_ids,
+            }
+        )
+    )
+    category_pointer_ids = tuple(
+        sorted(
+            {
+                pointer_id
+                for delta in _category_supporting_deltas(occurrence)
+                for pointer_id in delta.evidence_pointer_ids
+            }
+        )
+    )
+    flag_pointer_ids = tuple(
+        sorted({*category_pointer_ids, *occurrence.rule_definition_evidence_pointer_ids})
+    )
+    probe_change_summary = {
+        "input": "UL compared the recorded input with an augmented input.",
+        "context": "UL compared the baseline context with augmented context.",
+        "turn_sequence": "UL compared the baseline turns with augmented turns.",
+        "state_setup": "UL compared declared state setup with modified state setup.",
+        "event_behavior": "UL compared normal event behavior with an injected event behavior.",
+    }[occurrence.probe_change.kind]
+    classification: DecisionFindingClassification = (
+        "inconclusive_evidence"
+        if occurrence.repetition_summary.observed == 0
+        else "customer_rule_violation"
+        if occurrence.kind == "customer_invariant_violation"
+        else "observed_variance"
+    )
+    flag_summary = {
+        "observed_variance": (
+            "UL flagged an observed source-versus-probe difference for human review."
+        ),
+        "customer_rule_violation": ("UL flagged evidence that violated a customer-defined rule."),
+        "inconclusive_evidence": (
+            "UL could not establish a conclusive source-versus-probe result."
+        ),
+    }[classification]
+    receipt_scopes = {receipt.content.evidence_scope for receipt in package.receipts}
+    evidence_scope: DecisionEvidenceScope = (
+        cast(ReportEvidenceScope, receipt_scopes.pop()) if len(receipt_scopes) == 1 else "mixed"
+    )
+    cited_pointer_ids = {
+        *tested_change_pointer_ids,
+        *category_pointer_ids,
+        *flag_pointer_ids,
+    }
+    evidence_authorities = cast(
+        tuple[EvidenceAuthority, ...],
+        tuple(sorted({pointers[pointer_id].authority for pointer_id in cited_pointer_ids})),
+    )
+    next_action_summary = (
+        "Record a human decision in the dataset review workflow."
+        if occurrence.next_action == "review_dataset_finding"
+        else "Inspect the private normalized receipt before making a decision."
+    )
+    agent_behavior_summary = (
+        "The probe arm violated the customer rule."
+        if occurrence.kind == "customer_invariant_violation"
+        else _AGENT_BEHAVIOR_SUMMARIES[occurrence.category]
+    )
+    evidence_level = (
+        "customer_rule_evaluated"
+        if occurrence.kind == "customer_invariant_violation"
+        else "response_and_state_observed"
+        if evidence_scope in {"response_and_state", "mixed"}
+        else "response_observed"
+    )
+    return DecisionReadyFinding(
+        occurrence_id=occurrence.occurrence_id,
+        campaign_ref=occurrence.campaign_ref,
+        case_ref=occurrence.case_ref,
+        operator=occurrence.operator,
+        probe_change_kind=occurrence.probe_change.kind,
+        violated_rule=occurrence.violated_rule,
+        classification=classification,
+        headline=_CONSEQUENCE_SUMMARIES[occurrence.category],
+        claims=(
+            FindingDecisionClaim(
+                kind="tested_change",
+                summary=probe_change_summary,
+                evidence_pointer_ids=tested_change_pointer_ids,
+            ),
+            FindingDecisionClaim(
+                kind="agent_behavior",
+                summary=agent_behavior_summary,
+                evidence_pointer_ids=category_pointer_ids,
+            ),
+            FindingDecisionClaim(
+                kind="observed_consequence",
+                summary=_CONSEQUENCE_SUMMARIES[occurrence.category],
+                evidence_pointer_ids=category_pointer_ids,
+            ),
+            FindingDecisionClaim(
+                kind="flag_reason",
+                summary=flag_summary,
+                evidence_pointer_ids=flag_pointer_ids,
+            ),
+        ),
+        repetition_summary=occurrence.repetition_summary,
+        evidence_scope=evidence_scope,
+        evidence_level=evidence_level,
+        evidence_authorities=evidence_authorities,
+        limitations=tuple(
+            FindingDecisionLimitation(code=code, summary=_LIMITATION_SUMMARIES[code])
+            for code in occurrence.limitations
+        ),
+        review_workflow=(
+            "dataset_review"
+            if occurrence.next_action == "review_dataset_finding"
+            else "external_review_required"
+        ),
+        next_action=occurrence.next_action,
+        next_action_summary=next_action_summary,
+        receipt_ids=tuple(receipt.receipt_id for receipt in package.receipts),
+    )
+
+
+def build_finding_decision_report(
+    packages: tuple[FindingEvidencePackage, ...],
+) -> FindingDecisionReport:
+    if not packages:
+        raise ValueError("finding decision report requires at least one package")
+    findings = tuple(
+        sorted(
+            (build_finding_decision(package) for package in packages),
+            key=lambda finding: finding.occurrence_id,
+        )
+    )
+    campaign_refs = {finding.campaign_ref for finding in findings}
+    if len(campaign_refs) != 1:
+        raise ValueError("finding decision report requires one campaign")
+    scopes = {finding.evidence_scope for finding in findings}
+    evidence_scope = cast(DecisionEvidenceScope, scopes.pop() if len(scopes) == 1 else "mixed")
+    review_status = (
+        "inconclusive"
+        if all(finding.classification == "inconclusive_evidence" for finding in findings)
+        else "action_required"
+    )
+    return FindingDecisionReport(
+        evidence_schema_versions=tuple(
+            sorted(
+                {package.schema_version for package in packages}
+                | {package.occurrence.schema_version for package in packages}
+                | {receipt.schema_version for package in packages for receipt in package.receipts}
+            )
+        ),
+        campaign_ref=campaign_refs.pop(),
+        evidence_scope=evidence_scope,
+        review_status=review_status,
+        exit_code=2 if review_status == "inconclusive" else 1,
+        findings=findings,
+    )
 
 
 def build_finding_occurrence(**values: object) -> FindingOccurrence:
@@ -862,6 +1205,24 @@ def _validate_receipt_value_pointer(
     arm: str,
 ) -> None:
     _validate_pointer(pointers, evidence.evidence_pointer_id, kind, arm)
+
+
+def _receipt_evidence_values(content: RunReceiptContent) -> tuple[ReceiptEvidenceValue, ...]:
+    return (
+        content.input,
+        *((content.response,) if content.response is not None else ()),
+        *(exchange.call for exchange in content.tool_exchanges),
+        *(exchange.result for exchange in content.tool_exchanges if exchange.result is not None),
+        *((content.state_before.evidence,) if content.state_before is not None else ()),
+        *((content.state_after.evidence,) if content.state_after is not None else ()),
+    )
+
+
+def _receipt_value_matches_artifact(
+    artifact_value: JsonValue,
+    receipt_value: ReceiptEvidenceValue,
+) -> bool:
+    return _canonical_json(artifact_value) == receipt_value.value.canonical_json
 
 
 def _validate_pointer(

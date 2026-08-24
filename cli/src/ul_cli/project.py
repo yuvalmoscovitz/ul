@@ -613,11 +613,21 @@ def run_project(
     except BaseException:
         if _has_nonempty_evidence(output):
             _save_latest_evidence(project_root, output)
-            console.print("Next: ul report")
+            finding_output = output.with_name(f"{output.name}.findings.jsonl")
+            console.print(
+                f"Next: ul report {finding_output}"
+                if finding_output.is_file() and finding_output.stat().st_size > 0
+                else "Next: ul report"
+            )
         raise
     if _has_nonempty_evidence(output):
         _save_latest_evidence(project_root, output)
-        console.print("Next: ul report")
+        finding_output = output.with_name(f"{output.name}.findings.jsonl")
+        console.print(
+            f"Next: ul report {finding_output}"
+            if finding_output.is_file() and finding_output.stat().st_size > 0
+            else "Next: ul report"
+        )
 
 
 def report_project(

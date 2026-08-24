@@ -199,10 +199,24 @@ deterministic reset, and preventing real business effects.
 ## Review and regressions
 
 `ul report` is offline. It makes no model or environment calls.
+For canonical `.findings.jsonl` packages, its default human and JSON forms expose only bounded,
+privacy-safe explanations and opaque evidence pointers. Raw inputs, responses, state, tool data,
+and provenance remain inside private normalized receipts and require an explicit per-finding
+disclosure command. The disclosure is capped before any private output is printed.
+Dataset finding sidecars also keep an adjacent private reference key so resumed runs retain one
+privacy-safe campaign identity; preserve that key with the evidence bundle.
 
 ```bash
 ul report
 ul report PRIVATE_EVIDENCE.json --json
+
+# Safe decision-ready explanations over canonical dataset or stateful finding packages.
+ul report PRIVATE_EVIDENCE.json.findings.jsonl
+
+# Explicitly disclose one finding's bounded private normalized receipts.
+ul report PRIVATE_EVIDENCE.json.findings.jsonl \
+  --show-sensitive-values \
+  --finding FINDING_OCCURRENCE_ID
 
 ul dataset review .ul/runs/EVIDENCE.jsonl FINDING_ID \
   --status confirmed \

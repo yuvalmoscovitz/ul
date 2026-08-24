@@ -8,6 +8,7 @@ from pathlib import Path
 
 import pytest
 from pydantic import JsonValue, ValidationError
+from typer.testing import CliRunner
 from ul import (
     DatasetAugmentationResult,
     DatasetEvaluationBaseline,
@@ -47,10 +48,14 @@ from ul_cli.finding_adapters import (
     adapt_dataset_invariant_finding,
     adapt_stateful_invariant_finding,
 )
+from ul_cli.main import app
 from ul_cli.report_contract import (
     FindingEvidencePackage,
     RedactionReceipt,
+    build_finding_decision,
     build_finding_occurrence,
+    build_run_receipt,
+    capture_json,
     serialize_run_receipt,
 )
 from ul_core.dataset import ObservedOutcome
@@ -65,6 +70,7 @@ from ul_core.models import ConversationRole, ConversationTurn
 
 _PRIVATE_SECRET = "private-customer-secret-871"
 _SHA256 = "a" * 64
+runner = CliRunner()
 
 
 def _context() -> FindingAdapterContext:
@@ -618,6 +624,88 @@ def test_packages_embed_every_publicly_cited_private_artifact() -> None:
     }.issubset(artifacts)
 
 
+def test_private_receipt_disclosure_includes_cited_embedded_artifacts(tmp_path: Path) -> None:
+    package = adapt_dataset_invariant_finding(
+        _dataset_result(),
+        _dataset_invariant_evaluation(),
+        _rule(),
+        case_index=0,
+        context=_context(),
+    )
+    evidence = tmp_path / "evidence.findings.jsonl"
+    evidence.write_text(package.model_dump_json() + "\n", encoding="utf-8")
+
+    result = runner.invoke(
+        app,
+        [
+            "report",
+            str(evidence),
+            "--show-sensitive-values",
+            "--finding",
+            package.occurrence.occurrence_id,
+        ],
+    )
+
+    assert result.exit_code == 1, result.output
+    assert '"artifacts": [' in result.output
+    assert all(artifact.artifact_sha256 in result.output for artifact in package.artifacts)
+
+
+def test_embedded_receipt_values_must_match_their_cited_artifacts() -> None:
+    package = adapt_dataset_behavior_finding(
+        _dataset_result(),
+        case_index=0,
+        finding_index=0,
+        context=_context(),
+    )
+    original_receipt = package.receipts[0]
+    changed_content = original_receipt.content.model_copy(
+        update={
+            "input": original_receipt.content.input.model_copy(
+                update={"value": capture_json({"forged": _PRIVATE_SECRET})}
+            )
+        }
+    )
+    changed_receipt = build_run_receipt(changed_content)
+    occurrence_values = package.occurrence.model_dump()
+    occurrence_values.pop("occurrence_id")
+    occurrence_values["repetitions"] = tuple(
+        repetition.model_copy(
+            update={
+                "source_receipt_id": (
+                    changed_receipt.receipt_id
+                    if repetition.source_receipt_id == original_receipt.receipt_id
+                    else repetition.source_receipt_id
+                ),
+                "probe_receipt_id": (
+                    changed_receipt.receipt_id
+                    if repetition.probe_receipt_id == original_receipt.receipt_id
+                    else repetition.probe_receipt_id
+                ),
+            }
+        )
+        for repetition in package.occurrence.repetitions
+    )
+    changed_occurrence = build_finding_occurrence(**occurrence_values)
+    changed_receipts = tuple(
+        sorted(
+            (
+                changed_receipt if receipt.receipt_id == original_receipt.receipt_id else receipt
+                for receipt in package.receipts
+            ),
+            key=lambda receipt: receipt.receipt_id,
+        )
+    )
+
+    with pytest.raises(ValidationError, match="receipt value must match"):
+        FindingEvidencePackage(
+            occurrence=changed_occurrence,
+            receipts=changed_receipts,
+            artifact_retention="embedded",
+            artifacts=package.artifacts,
+        )
+
+
 def test_opaque_references_resist_plain_hash_dictionary_guesses() -> None:
     package = adapt_dataset_behavior_finding(
         _dataset_result(),
@@ -972,6 +1060,7 @@ def test_dataset_mixed_missing_probe_repetition_remains_persistable() -> None:
     assert package.occurrence.repetition_summary.inconclusive == 1
     assert package.occurrence.repetitions[1].outcome == "inconclusive"
     assert package.occurrence.repetitions[1].inconclusive_reason == "target_output_missing"
+    assert build_finding_decision(package).classification == "customer_rule_violation"
 
 
 def test_stateful_mixed_missing_arms_write_canonical_sidecar(tmp_path: Path) -> None:
