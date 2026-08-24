@@ -76,6 +76,66 @@ def test_loader_accepts_shorthand_and_projects_rich_cases(tmp_path: Path) -> Non
     }
 
 
+def test_shorthand_preserves_bounded_metadata_and_structured_json_values(tmp_path: Path) -> None:
+    dataset = tmp_path / "interactions.jsonl"
+    dataset.write_text(
+        json.dumps(
+            {
+                "id": "structured",
+                "input": {
+                    "request": {"message": "Return ticket 42.", "ticket_id": 42},
+                    "mode": "test",
+                },
+                "augmentation_target": "/request/message",
+                "output": {"ticket": {"id": 42, "status": "open"}},
+                "metadata": {"source": "approved-observation", "private_id": "customer-7"},
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    record = load_interaction_records(dataset)[0]
+
+    assert record.raw_input == "Return ticket 42."
+    assert record.raw_observed_output == {"ticket": {"id": 42, "status": "open"}}
+    assert record.metadata == {"source": "approved-observation", "private_id": "customer-7"}
+    assert record.target_input("Return ticket 43.") == {
+        "request": {"message": "Return ticket 43.", "ticket_id": 42},
+        "mode": "test",
+    }
+
+
+def test_structured_shorthand_requires_one_text_augmentation_target(tmp_path: Path) -> None:
+    dataset = tmp_path / "interactions.jsonl"
+    dataset.write_text(
+        json.dumps({"id": "structured", "input": {"message": "Hello"}, "output": "Hi"}) + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="structured input requires an augmentation_target"):
+        load_interaction_records(dataset)
+
+
+def test_shorthand_metadata_is_bounded(tmp_path: Path) -> None:
+    dataset = tmp_path / "interactions.jsonl"
+    dataset.write_text(
+        json.dumps(
+            {
+                "id": "too-much-metadata",
+                "input": "Hello",
+                "output": "Hi",
+                "metadata": {f"key-{index}": index for index in range(101)},
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="invalid metadata"):
+        load_interaction_records(dataset)
+
+
 def test_one_dataset_preserves_ten_fixture_routes(tmp_path: Path) -> None:
     dataset = tmp_path / "fixtures.jsonl"
     cases = [

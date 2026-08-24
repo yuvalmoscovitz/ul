@@ -746,6 +746,36 @@ def probe(
             help="HTTP_HEADER=UL_ENVIRONMENT_VARIABLE; repeat for credentials or routing.",
         ),
     ] = None,
+    target_working_directory: Annotated[
+        Path | None,
+        typer.Option(
+            exists=True,
+            file_okay=False,
+            readable=True,
+            help="Working directory for a direct Python callable target.",
+        ),
+    ] = None,
+    target_interpreter: Annotated[
+        Path | None,
+        typer.Option(
+            exists=True,
+            dir_okay=False,
+            help="Python interpreter for a direct callable target.",
+        ),
+    ] = None,
+    target_environment_variable: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--target-environment-variable",
+            help="Environment variable name allowed for a local target; repeat as needed.",
+        ),
+    ] = None,
+    save_target_config: Annotated[
+        Path | None,
+        typer.Option(
+            help="Write the validated reusable target configuration to this new private file."
+        ),
+    ] = None,
     confirm_target: Annotated[
         str | None,
         typer.Option(
@@ -822,7 +852,12 @@ def probe(
             response_json_pointer=response_json_pointer,
             agent_model=agent_model,
             header_from_env=header_from_env,
+            target_working_directory=target_working_directory,
+            target_interpreter=target_interpreter,
+            target_environment_variables=tuple(target_environment_variable or ()),
         )
+        if save_target_config is not None:
+            _save_generated_target_config(save_target_config, resolved_target.config)
         existing_config = _check_probe_config_binding(data, resolved_target)
         try:
             os.lstat(_probe_target_lock_path(resolved_target))
@@ -1179,6 +1214,9 @@ def _resolve_target(
     response_json_pointer: str | None = None,
     agent_model: str | None = None,
     header_from_env: list[str] | None = None,
+    target_working_directory: Path | None = None,
+    target_interpreter: Path | None = None,
+    target_environment_variables: tuple[str, ...] = (),
 ) -> _ResolvedTarget:
     try:
         direct_http_options_used = (
@@ -1188,9 +1226,16 @@ def _resolve_target(
             or agent_model is not None
             or bool(header_from_env)
         )
+        direct_local_options_used = (
+            target_working_directory is not None
+            or target_interpreter is not None
+            or bool(target_environment_variables)
+        )
         if target.casefold().startswith(("https://", "http://")):
             if explicit_artifacts:
                 raise ValueError("--target-artifact applies only to local targets")
+            if direct_local_options_used:
+                raise ValueError("local target options require a Python callable target")
             http_config = create_isolated_response_target_config(
                 target,
                 isolated_preset=http_preset or "generic-json",
@@ -1205,6 +1250,8 @@ def _resolve_target(
             raise ValueError("direct HTTP mapping options require an HTTP URL target")
         target_path = Path(target)
         if target_path.is_file():
+            if direct_local_options_used:
+                raise ValueError("local target options cannot override a target configuration file")
             return _resolve_configured_target(
                 target_path,
                 allow_insecure_http=allow_insecure_http,
@@ -1212,16 +1259,61 @@ def _resolve_target(
             )
         if allow_insecure_http:
             raise ValueError("--allow-insecure-http requires an HTTP URL or config target")
-        return _local_target(resolve_local_target(target, explicit_artifacts=explicit_artifacts))
+        return _local_target(
+            resolve_local_target(
+                target,
+                explicit_artifacts=explicit_artifacts,
+                working_directory=target_working_directory,
+                interpreter=target_interpreter,
+                environment_allowlist=target_environment_variables,
+            )
+        )
     except (OSError, RuntimeError, ValidationError, ValueError) as error:
         raise ProbeFailure(
             "target load",
             "PROBE_TARGET_INVALID",
             str(error),
-            "Use an HTTP(S) URL, importable module:callable, or validate the target config with "
-            "its advanced check.",
+            "Use an HTTP(S) URL or importable module:callable. For a nonstandard callable, add "
+            "--target-working-directory, --target-interpreter, or "
+            "--target-environment-variable and --save-target-config PATH. For a nonstandard "
+            "HTTP shape, add --request-json-template, --response-json-pointer, and "
+            "--header-from-env, optionally with --save-target-config PATH.",
             target_safe_to_reuse=True,
         ) from None
+
+
+def _save_generated_target_config(path: Path, config: ProbeTargetConfig) -> None:
+    encoded = (
+        json.dumps(
+            config.model_dump(mode="json"),
+            ensure_ascii=False,
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n"
+    )
+    try:
+        with create_private_output(path) as stream:
+            stream.write(encoded)
+            stream.flush()
+            os.fsync(stream.fileno())
+    except FileExistsError:
+        raise ProbeFailure(
+            "target load",
+            "PROBE_TARGET_CONFIG_EXISTS",
+            f"{path} already exists; UL will not overwrite it.",
+            "Choose a new --save-target-config path.",
+            target_safe_to_reuse=True,
+        ) from None
+    except OSError as error:
+        raise ProbeFailure(
+            "target load",
+            "PROBE_TARGET_CONFIG_WRITE_FAILED",
+            f"The target configuration could not be written ({error.__class__.__name__}).",
+            "Choose a writable --save-target-config path and retry.",
+            target_safe_to_reuse=True,
+        ) from None
+    console.print(f"Saved validated target config: {path}")
 
 
 def _resolve_configured_target(

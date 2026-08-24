@@ -202,6 +202,23 @@ async def test_executor_preserves_structured_case_context_with_correlation_keys(
 
 
 @pytest.mark.asyncio
+async def test_structured_target_input_is_not_exposed_as_context() -> None:
+    invoker = _Invoker()
+    executor = ComposedEnvironmentExecutor(invoker, config_sha256=_CONFIG_SHA256)
+    target_input = {"request": {"message": "Return ticket 42."}, "tenant": "test"}
+
+    await executor.execute(
+        _case("Return ticket 42.").model_copy(
+            update={"probe_context": {"ul.target.input": target_input}}
+        )
+    )
+
+    request = invoker.requests[0]
+    assert request.turn.input == target_input
+    assert "ul.target.input" not in request.context
+
+
+@pytest.mark.asyncio
 async def test_missing_observation_does_not_block_probe_execution() -> None:
     executor = ComposedEnvironmentExecutor(
         _Invoker(),

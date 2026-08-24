@@ -11,9 +11,18 @@ was correct or prove that an arbitrary input is compatible with an arbitrary env
 
 ## Structured and multi-turn cases
 
-The three-field `{id, input, output}` JSONL record remains the shortest format. Use a structured
-case when an interaction depends on typed inputs, visible conversation history, or an explicit
-augmentation location. For example, [the cancellation-confirmation case](../examples/quickstart/rich-cancellation.jsonl)
+The three-field `{id, input, output}` JSONL record remains the shortest format. It also accepts a
+bounded optional `metadata` object. `output` is the historical observed/reference value, not a
+correctness oracle. A structured JSON `input` adds one `augmentation_target` RFC 6901 pointer to
+the non-empty text UL may vary while sending the complete value to the target:
+
+```json
+{"id":"ticket-42","input":{"request":{"message":"Return ticket 42."},"tenant":"test"},"augmentation_target":"/request/message","output":{"status":"open"},"metadata":{"source":"approved-observation"}}
+```
+
+Use a rich structured case when an interaction depends on visible conversation history, multiple
+augmentation locations, fixtures, evidence references, or an evaluator. For example,
+[the cancellation-confirmation case](../examples/quickstart/rich-cancellation.jsonl)
 changes only the final user confirmation while retaining the order input and preceding turns.
 
 Each structured case declares one or more `augmentation_targets`. An `input_field` target uses an

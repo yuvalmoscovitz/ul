@@ -21,6 +21,8 @@ from typer.testing import CliRunner
 from ul import (
     DatasetEvaluationResult,
     InteractionRecord,
+    load_json_http_environment_config,
+    load_local_target_config,
 )
 from ul_cli import probe as probe_module
 from ul_cli import progress_action as progress_action_module
@@ -288,6 +290,159 @@ def test_callable_smoke_proves_target_call_and_decline_makes_zero_semantic_calls
     assert saved["schema_version"] == 3
     assert "limit" not in saved
     assert "repetitions" not in saved
+
+
+def test_callable_smoke_receives_structured_input_without_printing_private_metadata(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    private_canary = "PRIVATE-METADATA-CANARY"
+    _write_callable(tmp_path)
+    dataset = tmp_path / "structured.jsonl"
+    dataset.write_text(
+        json.dumps(
+            {
+                "id": "structured-case",
+                "input": {"request": {"message": "Return ticket 42."}, "tenant": "test"},
+                "augmentation_target": "/request/message",
+                "output": {"status": "open"},
+                "metadata": {"private_customer": private_canary},
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(tmp_path)
+
+    result = runner.invoke(
+        app,
+        ["probe", str(dataset), "--target", "customer_agent:run"],
+        input="y\nn\n",
+    )
+
+    assert result.exit_code == 0, result.output
+    invocation = json.loads((tmp_path / "target-invocations.jsonl").read_text())
+    assert invocation == {
+        "request": {"message": "Return ticket 42."},
+        "tenant": "test",
+    }
+    assert private_canary not in result.output
+
+
+def test_probe_generates_valid_secret_free_local_target_config(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    secret_canary = "SECRET-VALUE-CANARY"
+    _write_callable(tmp_path)
+    dataset = _write_dataset(tmp_path)
+    config_path = tmp_path / "target.json"
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("CUSTOMER_AGENT_TOKEN", secret_canary)
+
+    result = runner.invoke(
+        app,
+        [
+            "probe",
+            str(dataset),
+            "--target",
+            "customer_agent:run",
+            "--target-working-directory",
+            str(tmp_path),
+            "--target-interpreter",
+            sys.executable,
+            "--target-environment-variable",
+            "CUSTOMER_AGENT_TOKEN",
+            "--save-target-config",
+            str(config_path),
+        ],
+        input="n\n",
+    )
+
+    assert result.exit_code == 2
+    config = load_local_target_config(config_path)
+    assert config.environment_allowlist == ("CUSTOMER_AGENT_TOKEN",)
+    assert config.working_directory == tmp_path
+    assert secret_canary not in config_path.read_text()
+    assert secret_canary not in result.output
+    if os.name != "nt":
+        assert stat.S_IMODE(config_path.stat().st_mode) == 0o600
+
+
+def test_probe_generates_valid_secret_free_http_target_config(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    secret_canary = "HTTP-SECRET-CANARY"
+    dataset = _write_dataset(tmp_path)
+    config_path = tmp_path / "http-target.json"
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("UL_ENVIRONMENT_CUSTOMER_HTTP_TOKEN", secret_canary)
+
+    result = runner.invoke(
+        app,
+        [
+            "probe",
+            str(dataset),
+            "--target",
+            "https://agent.example.test/invoke",
+            "--request-json-template",
+            '{"request":{"message":"{{input}}"}}',
+            "--response-json-pointer",
+            "/result/message",
+            "--header-from-env",
+            "Authorization=UL_ENVIRONMENT_CUSTOMER_HTTP_TOKEN",
+            "--save-target-config",
+            str(config_path),
+        ],
+        input="n\n",
+    )
+
+    assert result.exit_code == 2
+    config = load_json_http_environment_config(config_path)
+    assert config.headers_from_env == {"Authorization": "UL_ENVIRONMENT_CUSTOMER_HTTP_TOKEN"}
+    assert config.execute.response_json_pointer == "/result/message"
+    assert secret_canary not in config_path.read_text()
+    assert secret_canary not in result.output
+
+
+def test_invalid_target_explains_how_to_generate_a_reusable_config(tmp_path: Path) -> None:
+    dataset = _write_dataset(tmp_path)
+
+    result = runner.invoke(app, ["probe", str(dataset), "--target", "not-importable"])
+
+    assert result.exit_code == 2
+    assert "--target-working-directory" in result.output
+    assert "--target-interpreter" in result.output
+    assert "--save-target-config PATH" in result.output
+
+
+def test_generated_target_config_never_overwrites_customer_file(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _write_callable(tmp_path)
+    dataset = _write_dataset(tmp_path)
+    config_path = tmp_path / "target.json"
+    config_path.write_text("customer-owned", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+
+    result = runner.invoke(
+        app,
+        [
+            "probe",
+            str(dataset),
+            "--target",
+            "customer_agent:run",
+            "--save-target-config",
+            str(config_path),
+        ],
+    )
+
+    assert result.exit_code == 2
+    assert "PROBE_TARGET_CONFIG_EXISTS" in result.output
+    assert config_path.read_text(encoding="utf-8") == "customer-owned"
+    assert not (tmp_path / "target-invocations.jsonl").exists()
 
 
 def test_direct_authenticated_http_smoke_maps_request_and_response_once(
