@@ -840,9 +840,7 @@ class ComposedEnvironmentExecutor:
             correlation_id=correlation_id,
             turn_id=turn_id,
             configuration={
-                key: value
-                for key, value in case.probe_context.items()
-                if key != "ul.target.input"
+                key: value for key, value in case.probe_context.items() if key != "ul.target.input"
             },
         )
 
