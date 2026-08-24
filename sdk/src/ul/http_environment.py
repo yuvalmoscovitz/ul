@@ -549,11 +549,7 @@ class JsonHttpEnvironmentConnection:
             max_request_bytes=max_request_bytes,
             max_response_bytes=max_response_bytes,
         )
-        self._credential_values = (
-            _credential_values_from_headers(self._headers)
-            if isinstance(config, JsonHttpIsolatedResponseConfig)
-            else ()
-        )
+        self._credential_values = _credential_values_from_headers(self._headers)
         self._timeout_seconds = timeout_seconds
         self._max_request_bytes = max_request_bytes
         self._max_response_bytes = max_response_bytes
@@ -1948,14 +1944,6 @@ def _credential_values_from_headers(headers: Mapping[str, str]) -> tuple[str, ..
     credential_values: list[str] = []
     for header_name, value in headers.items():
         normalized_name = header_name.casefold()
-        if not (
-            normalized_name in {"authorization", "proxy-authorization", "cookie"}
-            or any(
-                marker in normalized_name
-                for marker in ("api-key", "apikey", "auth", "credential", "secret", "token")
-            )
-        ):
-            continue
         credential_values.append(value)
         if normalized_name in {"authorization", "proxy-authorization"}:
             _, separator, credential = value.partition(" ")

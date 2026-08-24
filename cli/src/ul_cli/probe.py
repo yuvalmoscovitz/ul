@@ -850,9 +850,9 @@ def probe(
         typer.Option(help="Additional command worker artifact to hash and bind; repeat as needed."),
     ] = None,
     http_preset: Annotated[
-        Literal["generic-json", "openai-chat"],
-        typer.Option(help="Request/response shape used when --target is an HTTP URL."),
-    ] = "generic-json",
+        Literal["generic-json", "openai-chat"] | None,
+        typer.Option(help="Request/response shape for an HTTP URL; defaults to generic-json."),
+    ] = None,
     request_json_template: Annotated[
         str | None,
         typer.Option(help="JSON containing one {{input}} value; overrides the direct HTTP preset."),
@@ -1028,6 +1028,16 @@ def probe(
                 resume_argv.append("--confirmation-run")
             if allow_insecure_http:
                 resume_argv.append("--allow-insecure-http")
+            if http_preset is not None:
+                resume_argv.extend(("--http-preset", http_preset))
+            if request_json_template is not None:
+                resume_argv.extend(("--request-json-template", request_json_template))
+            if response_json_pointer is not None:
+                resume_argv.extend(("--response-json-pointer", response_json_pointer))
+            if agent_model is not None:
+                resume_argv.extend(("--agent-model", agent_model))
+            for mapping in header_from_env or ():
+                resume_argv.extend(("--header-from-env", mapping))
             if diagnostic_artifact is not None:
                 resume_argv.extend(("--diagnostic-artifact", str(diagnostic_artifact.resolve())))
             if show_smoke_response:
@@ -1282,19 +1292,26 @@ def _resolve_target(
     *,
     allow_insecure_http: bool,
     explicit_artifacts: tuple[Path, ...] = (),
-    http_preset: Literal["generic-json", "openai-chat"] = "generic-json",
+    http_preset: Literal["generic-json", "openai-chat"] | None = None,
     request_json_template: str | None = None,
     response_json_pointer: str | None = None,
     agent_model: str | None = None,
     header_from_env: list[str] | None = None,
 ) -> _ResolvedTarget:
     try:
+        direct_http_options_used = (
+            http_preset is not None
+            or request_json_template is not None
+            or response_json_pointer is not None
+            or agent_model is not None
+            or bool(header_from_env)
+        )
         if target.casefold().startswith(("https://", "http://")):
             if explicit_artifacts:
                 raise ValueError("--target-artifact applies only to local targets")
             http_config = create_isolated_response_target_config(
                 target,
-                isolated_preset=http_preset,
+                isolated_preset=http_preset or "generic-json",
                 environment_id="probe-http-" + hashlib.sha256(target.encode()).hexdigest()[:16],
                 request_json_template=request_json_template,
                 response_json_pointer=response_json_pointer,
@@ -1302,21 +1319,17 @@ def _resolve_target(
                 header_from_env=header_from_env,
             )
             return _http_target(target, http_config, allow_insecure_http=allow_insecure_http)
+        if direct_http_options_used:
+            raise ValueError("direct HTTP mapping options require an HTTP URL target")
         target_path = Path(target)
         if target_path.is_file():
-            if (
-                http_preset != "generic-json"
-                or request_json_template is not None
-                or response_json_pointer is not None
-                or agent_model is not None
-                or header_from_env
-            ):
-                raise ValueError("direct HTTP mapping options require an HTTP URL target")
             return _resolve_configured_target(
                 target_path,
                 allow_insecure_http=allow_insecure_http,
                 explicit_artifacts=explicit_artifacts,
             )
+        if allow_insecure_http:
+            raise ValueError("--allow-insecure-http requires an HTTP URL or config target")
         if ":" not in target:
             raise ValueError(
                 "target must be an HTTP(S) URL, module:callable, or target configuration JSON file"
@@ -1356,6 +1369,8 @@ def _resolve_configured_target(
             allow_insecure_http=allow_insecure_http,
         )
         return _http_target(str(path), http_config, allow_insecure_http=allow_insecure_http)
+    if allow_insecure_http:
+        raise ValueError("--allow-insecure-http requires an HTTP URL or config target")
     plan = create_local_target_dry_run_plan(local_config)
     return _local_target(str(path), local_config, plan.config_sha256, explicit_artifacts)
 
@@ -2276,7 +2291,7 @@ def _print_stronger_run(
     *,
     allow_insecure_http: bool,
     target_artifacts: tuple[Path, ...],
-    http_preset: Literal["generic-json", "openai-chat"],
+    http_preset: Literal["generic-json", "openai-chat"] | None,
     request_json_template: str | None,
     response_json_pointer: str | None,
     agent_model: str | None,
@@ -2294,7 +2309,7 @@ def _print_stronger_run(
     ]
     if allow_insecure_http:
         arguments.append("--allow-insecure-http")
-    if http_preset != "generic-json":
+    if http_preset is not None:
         arguments.extend(("--http-preset", http_preset))
     if request_json_template is not None:
         arguments.extend(("--request-json-template", request_json_template))

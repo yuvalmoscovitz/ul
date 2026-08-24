@@ -32,7 +32,7 @@ class _ProgressActionReceipt(ULModel):
         "probe_resume",
         "probe_diagnose",
     ]
-    argv: tuple[str, ...] = Field(min_length=2, max_length=32)
+    argv: tuple[str, ...] = Field(min_length=2, max_length=96)
     working_directory: str = Field(min_length=1)
     nonce: str = Field(pattern=r"^[0-9a-f]{32}$")
 
@@ -120,6 +120,11 @@ def _validate_action_argv(
             "--resume-checkpoint-sha256",
             "--target-artifact",
             "--diagnostic-artifact",
+            "--http-preset",
+            "--request-json-template",
+            "--response-json-pointer",
+            "--agent-model",
+            "--header-from-env",
         }
         flag_options = {
             "--confirmation-run",
