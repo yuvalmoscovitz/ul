@@ -4,8 +4,10 @@ import asyncio
 import inspect
 import json
 import os
-import secrets
 import shlex
+import sys
+import tempfile
+from contextlib import suppress
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Annotated, Any, Literal, TextIO, cast
@@ -16,6 +18,7 @@ from pydantic import ValidationError
 from ul import (
     DatasetAugmentationResult,
     DatasetEvaluationMode,
+    DatasetEvaluationResult,
     DatasetSemanticSettings,
     EvaluatorModelCompatibilityError,
     EvaluatorModelPreflight,
@@ -24,7 +27,11 @@ from ul import (
     ProviderDiagnosticError,
     load_dataset_semantic_settings,
 )
-from ul.dataset_invariants import DatasetInvariantEvaluation, load_dataset_invariant_suite
+from ul.dataset_invariants import (
+    DatasetInvariantEvaluation,
+    DatasetInvariantRule,
+    load_dataset_invariant_suite,
+)
 from ul.http_environment import (
     JsonHttpEnvironmentConnection,
     json_http_environment_calls_per_execution,
@@ -71,6 +78,11 @@ from ul_cli.dataset_trial_journal import (
 )
 from ul_cli.environment import TEST_ENVIRONMENT_CONFIRMATION_MESSAGE
 from ul_cli.finding_adapters import FindingAdapterContext, adapt_dataset_finding_packages
+from ul_cli.finding_reference import (
+    FindingReferenceContext,
+    finding_reference_key_path,
+    resolve_finding_reference_context,
+)
 
 from ..evidence.context import build_dataset_evidence_run_context
 from ..evidence.persistence import (
@@ -92,7 +104,7 @@ from ..presentation.evaluation import (
     result_needs_review,
 )
 from ..presentation.runtime import console, print_dataset_plain
-from ..storage.private_files import create_private_output, open_private_append_output
+from ..storage.private_files import open_resume_descriptor
 from .operators import dataset_operator_identity, validate_operator_ids
 from .records import DatasetInputError, load_interaction_records, validate_model_input_bounds
 from .redaction import (
@@ -105,6 +117,99 @@ from .runner import evaluate_interaction_records, preflight_evaluator
 _MAXIMUM_DATASET_RECORDS = 100
 _MAXIMUM_REPETITIONS = 100
 _DEFAULT_MAXIMUM_ENVIRONMENT_API_CALLS = 100
+_MAXIMUM_FINDING_SNAPSHOT_BYTES = 128_000_000
+
+
+def _write_finding_package_snapshot(
+    finding_output: Path,
+    results: tuple[DatasetEvaluationResult, ...],
+    invariant_evaluations: tuple[DatasetInvariantEvaluation, ...],
+    invariant_rules: tuple[DatasetInvariantRule, ...],
+    *,
+    campaign_id: str,
+    reference_context: FindingReferenceContext,
+) -> bool:
+    invariant_evaluation_by_interaction = {
+        evaluation.interaction_id: evaluation for evaluation in invariant_evaluations
+    }
+    serialized_packages: list[str] = []
+    for result in results:
+        packages = adapt_dataset_finding_packages(
+            result,
+            invariant_evaluation=invariant_evaluation_by_interaction.get(result.source.id),
+            invariant_rules=invariant_rules,
+            context=FindingAdapterContext(
+                campaign_id=campaign_id,
+                recorded_at=reference_context.recorded_at,
+                reference_key=reference_context.key,
+            ),
+        )
+        serialized_packages.extend(
+            json.dumps(
+                package.model_dump(mode="json"),
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            + "\n"
+            for package in packages
+        )
+    snapshot = "".join(serialized_packages).encode("utf-8")
+    if len(snapshot) > _MAXIMUM_FINDING_SNAPSHOT_BYTES:
+        raise ValueError("finding package snapshot exceeds the 128 MB limit")
+    _replace_finding_package_snapshot(finding_output, snapshot)
+    return any(result_needs_review(result) for result in results)
+
+
+def _replace_finding_package_snapshot(finding_output: Path, snapshot: bytes) -> None:
+    lock_output = finding_output.with_name(f".{finding_output.name}.lock")
+    no_follow_flag = getattr(os, "O_NOFOLLOW", 0)
+    with suppress(FileExistsError):
+        lock_descriptor = os.open(
+            lock_output,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | no_follow_flag,
+            0o600,
+        )
+        os.close(lock_descriptor)
+    lock_descriptor = open_resume_descriptor(lock_output, writable=True)
+    temporary_output: Path | None = None
+    try:
+        temporary_descriptor, temporary_name = tempfile.mkstemp(
+            prefix=f".{finding_output.name}.tmp-",
+            dir=finding_output.parent,
+        )
+        temporary_output = Path(temporary_name)
+        try:
+            if sys.platform != "win32":
+                os.fchmod(temporary_descriptor, 0o600)
+            remaining = memoryview(snapshot)
+            while remaining:
+                written = os.write(temporary_descriptor, remaining)
+                if written == 0:
+                    raise OSError("finding package snapshot write was incomplete")
+                remaining = remaining[written:]
+            os.fsync(temporary_descriptor)
+        finally:
+            os.close(temporary_descriptor)
+        os.replace(temporary_output, finding_output)
+        temporary_output = None
+        _fsync_directory(finding_output.parent)
+    finally:
+        if temporary_output is not None:
+            with suppress(OSError):
+                temporary_output.unlink()
+        os.close(lock_descriptor)
+
+
+def _fsync_directory(directory: Path) -> None:
+    if sys.platform == "win32":
+        return
+    directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    directory_descriptor = os.open(directory, directory_flags)
+    try:
+        os.fsync(directory_descriptor)
+    finally:
+        os.close(directory_descriptor)
 
 
 def evaluate_dataset(
@@ -952,6 +1057,24 @@ def evaluate_dataset(
                     f"cannot safely persist augmentations ({message})",
                     param_hint="--augmentations-output",
                 ) from None
+        assert run_context is not None
+        finding_output = output.with_name(f"{output.name}.findings.jsonl")
+        try:
+            finding_reference_context = resolve_finding_reference_context(finding_output)
+            _write_finding_package_snapshot(
+                finding_output,
+                resume_evidence.technical_results,
+                resume_evidence.invariant_evaluations,
+                invariant_suite.rules if invariant_suite is not None else (),
+                campaign_id=run_context.context_sha256,
+                reference_context=finding_reference_context,
+            )
+        except (OSError, ValueError) as error:
+            message = str(error) if isinstance(error, ValueError) else error.__class__.__name__
+            raise typer.BadParameter(
+                f"cannot safely reconcile finding packages ({message})",
+                param_hint="--resume",
+            ) from None
         console.print(
             f"Resume compatible: all {skipped_count} selected interaction(s) are complete in "
             f"{output}. Nothing to do."
@@ -1095,9 +1218,8 @@ def evaluate_dataset(
     augmentation_ledger: DatasetAugmentationLedger | None = None
     augmentation_ledger_was_created = False
     output_stream: TextIO | None = None
-    finding_output_stream: TextIO | None = None
     finding_output = output.with_name(f"{output.name}.findings.jsonl")
-    finding_reference_key = secrets.token_bytes(32)
+    finding_reference_context: FindingReferenceContext | None = None
     failure_parameter = "--augmentations-output"
     try:
         if augmentations_output is not None:
@@ -1142,7 +1264,14 @@ def evaluate_dataset(
             if initial_evidence.processed_ids:
                 output_stream.close()
                 raise ValueError("new evidence output is not empty")
-            finding_output_stream = create_private_output(finding_output)
+            if (
+                finding_output.exists()
+                or finding_output.is_symlink()
+                or finding_reference_key_path(finding_output).exists()
+                or finding_reference_key_path(finding_output).is_symlink()
+            ):
+                raise ValueError("new finding package outputs already exist")
+            finding_reference_context = resolve_finding_reference_context(finding_output)
         else:
             assert resume_evidence is not None
             output_stream, locked_resume_evidence = open_resume_output(
@@ -1154,11 +1283,7 @@ def evaluate_dataset(
             if locked_resume_evidence != resume_evidence:
                 output_stream.close()
                 raise ValueError("resume evidence changed after preflight")
-            finding_output_stream = (
-                open_private_append_output(finding_output)
-                if finding_output.exists()
-                else create_private_output(finding_output)
-            )
+            finding_reference_context = resolve_finding_reference_context(finding_output)
     except (OSError, ValueError) as error:
         if augmentation_ledger is not None:
             if augmentation_ledger_was_created:
@@ -1167,8 +1292,6 @@ def evaluate_dataset(
             augmentation_ledger.close()
         if output_stream is not None and not output_stream.closed:
             output_stream.close()
-        if finding_output_stream is not None and not finding_output_stream.closed:
-            finding_output_stream.close()
         asyncio.run(target.aclose())
         message = str(error) if isinstance(error, ValueError) else error.__class__.__name__
         raise typer.BadParameter(
@@ -1177,11 +1300,11 @@ def evaluate_dataset(
         ) from None
 
     assert output_stream is not None
-    assert finding_output_stream is not None
+    assert finding_reference_context is not None
     has_review_findings = False
     invariant_evaluations: list[DatasetInvariantEvaluation] = []
     try:
-        with output_stream, finding_output_stream:
+        with output_stream:
             evaluation_parameters = inspect.signature(evaluate_interaction_records).parameters
             accepts_extra_arguments = any(
                 parameter.kind is inspect.Parameter.VAR_KEYWORD
@@ -1255,33 +1378,18 @@ def evaluate_dataset(
                     **durable_arguments,
                 )
             results = asyncio.run(evaluation_coroutine)
-            invariant_evaluation_by_interaction = {
-                evaluation.interaction_id: evaluation for evaluation in invariant_evaluations
-            }
-            for result in results:
-                packages = adapt_dataset_finding_packages(
-                    result,
-                    invariant_evaluation=invariant_evaluation_by_interaction.get(result.source.id),
-                    invariant_rules=invariant_suite.rules if invariant_suite is not None else (),
-                    context=FindingAdapterContext(
-                        campaign_id=run_context.context_sha256,
-                        recorded_at=datetime.now(UTC),
-                        reference_key=finding_reference_key,
-                    ),
-                )
-                for package in packages:
-                    finding_output_stream.write(
-                        json.dumps(
-                            package.model_dump(mode="json"),
-                            ensure_ascii=False,
-                            sort_keys=True,
-                            separators=(",", ":"),
-                        )
-                        + "\n"
-                    )
-                has_review_findings |= result_needs_review(result)
-            finding_output_stream.flush()
-            os.fsync(finding_output_stream.fileno())
+            prior_results = resume_evidence.technical_results if resume_evidence is not None else ()
+            prior_invariant_evaluations = (
+                resume_evidence.invariant_evaluations if resume_evidence is not None else ()
+            )
+            has_review_findings = _write_finding_package_snapshot(
+                finding_output,
+                (*prior_results, *results),
+                (*prior_invariant_evaluations, *invariant_evaluations),
+                invariant_suite.rules if invariant_suite is not None else (),
+                campaign_id=run_context.context_sha256,
+                reference_context=finding_reference_context,
+            )
     except CampaignControlRequested:
         raise typer.Exit(code=130) from None
     except (TimeoutError, RuntimeError, ValueError, httpx.HTTPError) as error:

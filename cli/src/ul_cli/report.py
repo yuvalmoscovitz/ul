@@ -22,14 +22,21 @@ from ul_cli.dataset_review import (
     report_dataset_evidence,
     summarize_dataset_evidence,
 )
+from ul_cli.finding_reference import (
+    load_finding_reference_context,
+    validate_finding_private_references,
+)
 from ul_cli.pattern_identity import PatternIdentityKeyError, load_pattern_identity_key
 from ul_cli.report_contract import (
     FailurePattern,
+    FindingDecisionReport,
+    FindingEvidencePackage,
     FindingSummary,
     ReportEvidenceType,
     ReportInputError,
     ReportReviewStatus,
     UnifiedReport,
+    build_finding_decision_report,
     build_report_summary,
 )
 
@@ -41,6 +48,9 @@ _WINDOWS = os.name == "nt"
 
 _MAXIMUM_EVIDENCE_BYTES = 128_000_000
 _MAXIMUM_JSON_DEPTH = 100
+_MAXIMUM_FINDING_PACKAGES = 10_000
+_MAXIMUM_PRIVATE_RECEIPT_BYTES = 64_000
+_MAXIMUM_PRIVATE_RECEIPT_LINES = 1_000
 _EVIDENCE_LABELS: dict[ReportEvidenceType, str] = {
     "dataset_evaluation": "dataset evaluation",
     "correction_after_first_response": "correction after first response",
@@ -62,6 +72,19 @@ def report_evidence(
             "--json cannot be combined with sensitive-value output",
             param_hint="--json",
         )
+    if _is_finding_package_evidence(evidence):
+        if reviews is not None:
+            raise typer.BadParameter(
+                "--reviews is available only for primary dataset evidence",
+                param_hint="--reviews",
+            )
+        _report_finding_packages(
+            evidence,
+            show_sensitive_values=show_sensitive_values,
+            finding=finding,
+            json_output=json_output,
+        )
+        return
     try:
         report = load_unified_report(evidence, reviews=reviews)
     except ReportInputError as error:
@@ -93,6 +116,215 @@ def report_evidence(
 
     if report.exit_code:
         raise typer.Exit(code=report.exit_code)
+
+
+def _report_finding_packages(
+    evidence: Path,
+    *,
+    show_sensitive_values: bool,
+    finding: str | None,
+    json_output: bool,
+) -> None:
+    try:
+        packages = _load_finding_packages(evidence)
+        report = build_finding_decision_report(packages)
+    except (OSError, RecursionError, ValidationError, ValueError) as error:
+        message = (
+            f"cannot safely read finding packages ({error.__class__.__name__})"
+            if isinstance(error, OSError)
+            else "finding package evidence cannot be summarized safely"
+        )
+        raise typer.BadParameter(message, param_hint="EVIDENCE") from None
+    if show_sensitive_values or finding is not None:
+        if not show_sensitive_values or finding is None:
+            raise typer.BadParameter(
+                "private receipt disclosure requires --show-sensitive-values and --finding",
+                param_hint="--show-sensitive-values",
+            )
+        _print_private_finding_receipts(packages, finding)
+    elif json_output:
+        typer.echo(
+            json.dumps(
+                report.model_dump(mode="json"),
+                ensure_ascii=False,
+                indent=2,
+                sort_keys=True,
+            )
+        )
+    else:
+        _print_finding_decision_report(report, evidence)
+    if report.exit_code:
+        raise typer.Exit(code=report.exit_code)
+
+
+def _load_finding_packages(path: Path) -> tuple[FindingEvidencePackage, ...]:
+    raw = _read_bounded_regular_file(path)
+    lines = raw.splitlines()
+    if (
+        not lines
+        or len(lines) > _MAXIMUM_FINDING_PACKAGES
+        or any(not line.strip() for line in lines)
+    ):
+        raise ValueError("finding package file must contain bounded nonempty JSONL records")
+    packages: list[FindingEvidencePackage] = []
+    for line in lines:
+        value = json.loads(
+            line,
+            object_pairs_hook=_reject_duplicate_object_keys,
+            parse_constant=_reject_nonstandard_json_constant,
+            parse_float=_parse_finite_float,
+        )
+        _reject_deep_json(value)
+        packages.append(FindingEvidencePackage.model_validate_json(line))
+    occurrence_ids = tuple(package.occurrence.occurrence_id for package in packages)
+    if len(occurrence_ids) != len(set(occurrence_ids)):
+        raise ValueError("finding package file contains a duplicate occurrence")
+    reference_context = load_finding_reference_context(path)
+    for package in packages:
+        validate_finding_private_references(package, reference_context.key)
+    return tuple(packages)
+
+
+def _is_finding_package_evidence(path: Path) -> bool:
+    try:
+        raw = _read_bounded_regular_file(path)
+        first_line = raw.splitlines()[0]
+        value = json.loads(
+            first_line,
+            object_pairs_hook=_reject_duplicate_object_keys,
+            parse_constant=_reject_nonstandard_json_constant,
+            parse_float=_parse_finite_float,
+        )
+        _reject_deep_json(value)
+    except (IndexError, OSError, RecursionError, ValueError):
+        return path.name.endswith(".findings.jsonl")
+    return isinstance(value, dict) and {"occurrence", "receipts"}.issubset(
+        cast(dict[str, object], value)
+    )
+
+
+def _print_finding_decision_report(report: FindingDecisionReport, evidence: Path) -> None:
+    typer.echo("UL decision-ready finding report")
+    typer.echo(f"Disclosure: {report.disclosure}; private receipts are not shown")
+    typer.echo(f"Campaign: {report.campaign_ref}")
+    typer.echo(f"Evidence scope: {report.evidence_scope.replace('_', ' ')}")
+    typer.echo(f"Review status: {report.review_status} (exit {report.exit_code})")
+    typer.echo(f"Findings: {len(report.findings)}")
+    safe_evidence = "".join(
+        character if character.isprintable() else f"\\u{ord(character):04x}"
+        for character in str(evidence)
+    )
+    quoted_evidence = None if _WINDOWS else shlex.quote(safe_evidence)
+    claim_labels = {
+        "tested_change": "What UL changed",
+        "agent_behavior": "What the agent did differently",
+        "observed_consequence": "Observed consequence",
+        "flag_reason": "Why UL flagged it",
+    }
+    for finding in report.findings:
+        typer.echo("")
+        typer.echo(f"Finding {finding.occurrence_id}")
+        typer.echo(f"  Headline: {finding.headline}")
+        typer.echo(f"  Classification: {finding.classification.replace('_', ' ')}")
+        typer.echo(f"  Case: {finding.case_ref}")
+        typer.echo(f"  Operator: {finding.operator.id}@{finding.operator.version}")
+        typer.echo(f"  Tested change: {finding.probe_change_kind.replace('_', ' ')}")
+        if finding.violated_rule is not None:
+            typer.echo(
+                f"  Customer rule: {finding.violated_rule.id}@{finding.violated_rule.version}"
+            )
+        for claim in finding.claims:
+            typer.echo(f"  {claim_labels[claim.kind]}: {claim.summary}")
+            typer.echo("    Evidence: " + ", ".join(claim.evidence_pointer_ids))
+        repetitions = finding.repetition_summary
+        typer.echo(
+            "  Repetitions: "
+            f"{repetitions.observed}/{repetitions.conclusive} conclusive runs observed it; "
+            f"{repetitions.inconclusive} inconclusive; "
+            f"{repetitions.reproducibility}"
+        )
+        typer.echo(
+            "  Evidence: "
+            f"level={finding.evidence_level.replace('_', ' ')}; "
+            f"scope={finding.evidence_scope.replace('_', ' ')}; authorities="
+            + ", ".join(authority.replace("_", " ") for authority in finding.evidence_authorities)
+        )
+        typer.echo(
+            f"  Review: {finding.review_status}; "
+            f"human-confirmed severity={finding.human_confirmed_severity}; "
+            f"workflow={finding.review_workflow.replace('_', ' ')}"
+        )
+        for limitation in finding.limitations:
+            typer.echo(f"  Limitation: {limitation.summary}")
+        typer.echo(f"  Next action: {finding.next_action_summary}")
+        if finding.review_workflow == "dataset_review" and safe_evidence.endswith(
+            ".findings.jsonl"
+        ):
+            primary_evidence = safe_evidence[: -len(".findings.jsonl")]
+            typer.echo(
+                "  Primary review queue: ul report "
+                f"{shlex.quote(primary_evidence) if not _WINDOWS else 'EVIDENCE'}"
+            )
+        typer.echo(
+            "  Resolve private references and receipt: ul report "
+            f"{quoted_evidence or 'FINDINGS'} --show-sensitive-values "
+            f"--finding {finding.occurrence_id}"
+        )
+
+
+def _print_private_finding_receipts(
+    packages: tuple[FindingEvidencePackage, ...],
+    occurrence_id: str,
+) -> None:
+    matches = [package for package in packages if package.occurrence.occurrence_id == occurrence_id]
+    if len(matches) != 1:
+        raise typer.BadParameter(
+            "finding occurrence was not found in the package evidence",
+            param_hint="--finding",
+        )
+    package = matches[0]
+    pointer_digests = {
+        pointer.artifact_sha256
+        for receipt in package.receipts
+        for pointer in receipt.content.evidence_pointers
+        if pointer.pointer_id in package.occurrence.evidence_pointer_ids
+    }
+    disclosed_artifacts = tuple(
+        artifact for artifact in package.artifacts if artifact.artifact_sha256 in pointer_digests
+    )
+    payload = json.dumps(
+        {
+            "occurrence_id": occurrence_id,
+            "reference_resolution": package.private_references.model_dump(mode="json"),
+            "receipts": [receipt.model_dump(mode="json") for receipt in package.receipts],
+            "artifacts": [artifact.model_dump(mode="json") for artifact in disclosed_artifacts],
+        },
+        ensure_ascii=False,
+        indent=2,
+        sort_keys=True,
+    )
+    sanitized_payload = "".join(
+        character if character.isprintable() or character in "\n\t" else f"\\u{ord(character):04x}"
+        for character in payload
+    )
+    if (
+        len(sanitized_payload.encode("utf-8")) > _MAXIMUM_PRIVATE_RECEIPT_BYTES
+        or len(sanitized_payload.splitlines()) > _MAXIMUM_PRIVATE_RECEIPT_LINES
+    ):
+        raise typer.BadParameter(
+            "selected private receipts exceed the 64 KB or 1,000 line disclosure cap",
+            param_hint="--finding",
+        )
+    typer.echo(
+        "WARNING: showing private normalized receipts; they may contain secrets or PII and "
+        "may be retained in terminal scrollback, CI output, or logs."
+    )
+    typer.echo(
+        "Disclosure receipt: "
+        f"occurrence={occurrence_id}; receipts="
+        + ",".join(receipt.receipt_id for receipt in package.receipts)
+    )
+    typer.echo(sanitized_payload)
 
 
 def load_unified_report(

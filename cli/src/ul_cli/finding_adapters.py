@@ -29,12 +29,14 @@ from ul.dataset_invariants import (
 from ul_core.dataset import ObservedAgentOutput, ObservedOutcome, SemanticFrame
 from ul_core.evaluation import EnvironmentStateEvidence, ExecutionEvidence
 
+from ul_cli.finding_reference import finding_public_reference
 from ul_cli.report_contract import (
     CapturedJson,
     EvidenceArtifact,
     EvidencePointer,
     FindingCategory,
     FindingEvidencePackage,
+    FindingPrivateReferences,
     FindingRepetition,
     LifecycleReceipt,
     ObservedDelta,
@@ -1000,6 +1002,8 @@ def _build_behavior_package(
         context=context,
         violated_rule=None,
         rule_definition_pointer_ids=(),
+        private_rule_id=None,
+        private_rule_version=None,
     )
 
 
@@ -1112,6 +1116,8 @@ def _build_invariant_package(
         context=context,
         violated_rule=versioned_rule,
         rule_definition_pointer_ids=rule_definition_pointer_ids,
+        private_rule_id=rule_definition.id,
+        private_rule_version=rule_definition.version,
         fixture_id=fixture_id,
         fixture_version=fixture_version,
     )
@@ -1133,6 +1139,8 @@ def _package(
     context: FindingAdapterContext,
     violated_rule: VersionedReference | None,
     rule_definition_pointer_ids: tuple[str, ...],
+    private_rule_id: str | None,
+    private_rule_version: str | None,
     fixture_id: str | None = None,
     fixture_version: str | None = None,
 ) -> FindingEvidencePackage:
@@ -1246,9 +1254,19 @@ def _package(
         sorted(artifacts_by_digest.values(), key=lambda artifact: artifact.artifact_sha256)
     )
     package_values = {
-        "schema_version": "1.0.0",
+        "schema_version": "1.1.0",
         "disclosure": "private",
         "occurrence": occurrence.model_dump(mode="json"),
+        "private_references": {
+            "disclosure": "private",
+            "campaign_id": campaign_id,
+            "case_id": case_id,
+            "source_interaction_id": source_interaction_id,
+            "operator_id": operator_id,
+            "operator_version": operator_version,
+            "rule_id": private_rule_id,
+            "rule_version": private_rule_version,
+        },
         "receipts": [receipt.model_dump(mode="json") for receipt in receipts],
         "artifact_retention": "embedded",
         "artifacts": [artifact.model_dump(mode="json") for artifact in artifacts],
@@ -1260,6 +1278,15 @@ def _package(
     )
     return FindingEvidencePackage(
         occurrence=occurrence,
+        private_references=FindingPrivateReferences(
+            campaign_id=campaign_id,
+            case_id=case_id,
+            source_interaction_id=source_interaction_id,
+            operator_id=operator_id,
+            operator_version=operator_version,
+            rule_id=private_rule_id,
+            rule_version=private_rule_version,
+        ),
         receipts=receipts,
         artifact_retention="embedded",
         artifacts=artifacts,
@@ -1529,9 +1556,12 @@ def _versioned_ref(
 
 
 def _public_ref(context: FindingAdapterContext, namespace: str, *values: str) -> str:
-    message = _canonical_json([context.campaign_id, namespace, *values]).encode("utf-8")
-    digest = hmac.digest(context.reference_key, message, "sha256").hex()
-    return f"ulref_v1_{digest}"
+    return finding_public_reference(
+        context.reference_key,
+        context.campaign_id,
+        namespace,
+        *values,
+    )
 
 
 def _pointer_id(

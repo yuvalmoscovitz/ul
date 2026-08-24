@@ -3,10 +3,11 @@ from __future__ import annotations
 import asyncio
 import json
 import os
-import secrets
 import shlex
 import stat
-from datetime import UTC, datetime
+import sys
+import tempfile
+from contextlib import suppress
 from pathlib import Path
 from typing import Annotated, TextIO
 
@@ -72,8 +73,11 @@ from ul_cli.finding_adapters import (
     StatefulFindingResult,
     adapt_stateful_finding_packages,
 )
+from ul_cli.finding_reference import resolve_finding_reference_context
 
 app = typer.Typer(help="Stress stateful agents with ordered conversation events.")
+
+_MAXIMUM_STATEFUL_EVIDENCE_BYTES = 128_000_000
 
 
 @app.command("timeout-after-commit")
@@ -537,6 +541,29 @@ def run_correction_after_first_response(
         typer.echo(f"Potential environment API calls: {plan.required_target_calls}")
         typer.echo("External calls: none")
         return
+    if output is None:
+        raise typer.BadParameter("execution requires --output", param_hint="--output")
+    if output.exists() or output.is_symlink():
+        try:
+            result = CorrectionStressResult.model_validate_json(_read_private_result(output))
+            if (
+                result.case != case
+                or result.requested_repetitions != plan.repetitions
+                or result.required_target_calls != plan.required_target_calls
+            ):
+                raise ValueError("existing output does not match this correction plan")
+            write_stateful_finding_packages(
+                output,
+                result,
+                invariant_suite.rules,
+                observation_authority=invariant_suite.observation_authority,
+            )
+        except (OSError, ValidationError, ValueError):
+            raise typer.BadParameter(
+                "existing private output cannot be safely reconciled"
+            ) from None
+        _print_result(result, output)
+        return
     if not allow_target_network:
         raise typer.BadParameter(
             "execution requires --allow-environment-network",
@@ -547,10 +574,6 @@ def run_correction_after_first_response(
             TEST_ENVIRONMENT_CONFIRMATION_MESSAGE,
             param_hint="--confirm-test-environment",
         )
-    if output is None:
-        raise typer.BadParameter("execution requires --output", param_hint="--output")
-    if output.exists():
-        raise typer.BadParameter("output already exists; UL will not overwrite it")
     if stateful_finding_output(output).exists():
         raise typer.BadParameter("finding output already exists; UL will not overwrite it")
     target = JsonHttpEnvironmentConnection.from_config(
@@ -574,6 +597,7 @@ def run_correction_after_first_response(
         output_stream.write("\n")
         output_stream.flush()
         os.fsync(output_stream.fileno())
+    _fsync_directory(output.parent)
     write_stateful_finding_packages(
         output,
         result,
@@ -639,6 +663,31 @@ def run_retry_after_successful_commit(
         typer.echo(f"Potential environment API calls: {plan.required_target_calls}")
         typer.echo("External calls: none")
         return
+    if output is None:
+        raise typer.BadParameter("execution requires --output", param_hint="--output")
+    if output.exists() or output.is_symlink():
+        try:
+            result = RetryAfterSuccessfulCommitStressResult.model_validate_json(
+                _read_private_result(output)
+            )
+            if (
+                result.case != case
+                or result.requested_repetitions != plan.repetitions
+                or result.required_target_calls != plan.required_target_calls
+            ):
+                raise ValueError("existing output does not match this retry plan")
+            write_stateful_finding_packages(
+                output,
+                result,
+                invariant_suite.rules,
+                observation_authority=invariant_suite.observation_authority,
+            )
+        except (OSError, ValidationError, ValueError):
+            raise typer.BadParameter(
+                "existing private output cannot be safely reconciled"
+            ) from None
+        _print_retry_result(result, output)
+        return
     if not allow_target_network:
         raise typer.BadParameter(
             "execution requires --allow-environment-network",
@@ -649,10 +698,6 @@ def run_retry_after_successful_commit(
             TEST_ENVIRONMENT_CONFIRMATION_MESSAGE,
             param_hint="--confirm-test-environment",
         )
-    if output is None:
-        raise typer.BadParameter("execution requires --output", param_hint="--output")
-    if output.exists():
-        raise typer.BadParameter("output already exists; UL will not overwrite it")
     if stateful_finding_output(output).exists():
         raise typer.BadParameter("finding output already exists; UL will not overwrite it")
     target = JsonHttpEnvironmentConnection.from_config(
@@ -676,6 +721,7 @@ def run_retry_after_successful_commit(
         output_stream.write("\n")
         output_stream.flush()
         os.fsync(output_stream.fileno())
+    _fsync_directory(output.parent)
     write_stateful_finding_packages(
         output,
         result,
@@ -866,6 +912,14 @@ def stateful_finding_output(output: Path) -> Path:
     return output.with_name(f"{output.name}.findings.jsonl")
 
 
+def _print_finding_report_guidance(output: Path) -> None:
+    finding_output = stateful_finding_output(output)
+    if not finding_output.is_file() or finding_output.stat().st_size == 0:
+        return
+    typer.echo(f"Decision-ready findings: {finding_output}")
+    typer.echo(f"Next: ul report {finding_output}")
+
+
 def write_stateful_finding_packages(
     output: Path,
     result: StatefulFindingResult,
@@ -873,31 +927,61 @@ def write_stateful_finding_packages(
     *,
     observation_authority: ObservationAuthority,
 ) -> Path:
+    finding_output = stateful_finding_output(output)
+    reference_context = resolve_finding_reference_context(finding_output)
     packages = adapt_stateful_finding_packages(
         result,
         invariant_rules=invariant_rules,
         observation_authority=observation_authority,
         context=FindingAdapterContext(
             campaign_id=result.case.id,
-            recorded_at=datetime.now(UTC),
-            reference_key=secrets.token_bytes(32),
+            recorded_at=reference_context.recorded_at,
+            reference_key=reference_context.key,
         ),
     )
-    finding_output = stateful_finding_output(output)
-    with _create_private_output(finding_output) as output_stream:
-        for package in packages:
-            output_stream.write(
-                json.dumps(
-                    package.model_dump(mode="json"),
-                    ensure_ascii=False,
-                    sort_keys=True,
-                    separators=(",", ":"),
-                )
-                + "\n"
-            )
-        output_stream.flush()
-        os.fsync(output_stream.fileno())
+    snapshot = "".join(
+        json.dumps(
+            package.model_dump(mode="json"),
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        + "\n"
+        for package in packages
+    ).encode("utf-8")
+    if len(snapshot) > _MAXIMUM_STATEFUL_EVIDENCE_BYTES:
+        raise ValueError("finding package snapshot exceeds the 128 MB limit")
+    _replace_stateful_finding_snapshot(finding_output, snapshot)
     return finding_output
+
+
+def _replace_stateful_finding_snapshot(finding_output: Path, snapshot: bytes) -> None:
+    temporary_output: Path | None = None
+    try:
+        temporary_descriptor, temporary_name = tempfile.mkstemp(
+            prefix=f".{finding_output.name}.tmp-",
+            dir=finding_output.parent,
+        )
+        temporary_output = Path(temporary_name)
+        try:
+            if sys.platform != "win32":
+                os.fchmod(temporary_descriptor, 0o600)
+            remaining = memoryview(snapshot)
+            while remaining:
+                written = os.write(temporary_descriptor, remaining)
+                if written == 0:
+                    raise OSError("finding package snapshot write was incomplete")
+                remaining = remaining[written:]
+            os.fsync(temporary_descriptor)
+        finally:
+            os.close(temporary_descriptor)
+        os.replace(temporary_output, finding_output)
+        temporary_output = None
+        _fsync_directory(finding_output.parent)
+    finally:
+        if temporary_output is not None:
+            with suppress(OSError):
+                temporary_output.unlink()
 
 
 def _print_result(result: CorrectionStressResult, output: Path) -> None:
@@ -938,6 +1022,7 @@ def _print_result(result: CorrectionStressResult, output: Path) -> None:
                 f"Invariant {rule.rule_id}: {rule.status}; arm={arm}; severity={rule.severity}"
             )
     typer.echo(f"Complete evidence: {output}")
+    _print_finding_report_guidance(output)
     if result.status == "failed":
         raise typer.Exit(code=1)
     if result.status == "inconclusive":
@@ -965,6 +1050,7 @@ def _print_retry_result(result: RetryAfterSuccessfulCommitStressResult, output: 
             f"severity={baseline_rule.severity}"
         )
     typer.echo(f"Complete evidence: {output}")
+    _print_finding_report_guidance(output)
     if result.status == "failed":
         raise typer.Exit(code=1)
     if result.status == "inconclusive":
@@ -987,6 +1073,7 @@ def _print_timeout_after_commit_result(
         typer.echo(f"Invariant {rule.rule_id}: {rule.status}; severity={rule.severity}")
     typer.echo("Exact responses, committed state, and event receipts are in private evidence.")
     typer.echo(f"Complete evidence: {output}")
+    _print_finding_report_guidance(output)
     if result.status == "failed":
         raise typer.Exit(code=1)
     if result.status == "inconclusive":
@@ -1187,3 +1274,45 @@ def _create_private_output(path: Path) -> TextIO:
     except BaseException:
         os.close(descriptor)
         raise
+
+
+def _read_private_result(path: Path) -> str:
+    path_status = path.lstat()
+    if not stat.S_ISREG(path_status.st_mode):
+        raise OSError("existing output is not a regular file")
+    descriptor = os.open(
+        path,
+        os.O_RDONLY
+        | getattr(os, "O_NOFOLLOW", 0)
+        | (os.O_BINARY if sys.platform == "win32" else 0),
+    )
+    try:
+        descriptor_status = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(descriptor_status.st_mode)
+            or (path_status.st_dev, path_status.st_ino)
+            != (descriptor_status.st_dev, descriptor_status.st_ino)
+            or descriptor_status.st_size > _MAXIMUM_STATEFUL_EVIDENCE_BYTES
+        ):
+            raise OSError("existing output cannot be safely reconciled")
+        remaining = descriptor_status.st_size
+        chunks: list[bytes] = []
+        while remaining:
+            chunk = os.read(descriptor, min(remaining, 1_048_576))
+            if not chunk:
+                raise OSError("existing output changed while reading")
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        return b"".join(chunks).decode("utf-8")
+    finally:
+        os.close(descriptor)
+
+
+def _fsync_directory(directory: Path) -> None:
+    if sys.platform == "win32":
+        return
+    descriptor = os.open(directory, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)

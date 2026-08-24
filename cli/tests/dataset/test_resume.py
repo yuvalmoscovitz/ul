@@ -26,11 +26,13 @@ from ul.dataset_invariants import (
 )
 from ul_cli import dataset_augmentation_ledger as augmentation_ledger_module
 from ul_cli import dataset_review, dataset_trial_journal
+from ul_cli import finding_reference as finding_reference_module
 from ul_cli.dataset.evaluation import command as command_module
 from ul_cli.dataset.evaluation import runner as runner_module
 from ul_cli.dataset.evidence import customer as customer_module
 from ul_cli.dataset.evidence import persistence as persistence_module
 from ul_cli.main import app as root_app
+from ul_core.dataset import ObservedOutcome
 
 from ._factories import (
     _evaluation_result,
@@ -49,6 +51,83 @@ from ._files import (
 
 runner = CliRunner()
 _ANSI_ESCAPE_PATTERN = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+
+
+def test_finding_reference_key_is_stable_across_resume(tmp_path: Path) -> None:
+    finding_output = tmp_path / "evidence.jsonl.findings.jsonl"
+
+    created_context = finding_reference_module.create_finding_reference_context(finding_output)
+    loaded_context = finding_reference_module.load_finding_reference_context(finding_output)
+
+    assert loaded_context == created_context
+    assert len(loaded_context.key) == 32
+    if sys.platform != "win32":
+        assert (
+            stat.S_IMODE(
+                finding_reference_module.finding_reference_key_path(finding_output).stat().st_mode
+            )
+            == 0o600
+        )
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="directory fsync is POSIX-only")
+def test_finding_reference_key_fsyncs_file_before_parent_directory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    finding_output = tmp_path / "evidence.jsonl.findings.jsonl"
+    fsynced_file_types: list[str] = []
+
+    def record_fsync(descriptor: int) -> None:
+        fsynced_file_types.append(
+            "directory"
+            if stat.S_ISDIR(finding_reference_module.os.fstat(descriptor).st_mode)
+            else "file"
+        )
+
+    monkeypatch.setattr(finding_reference_module.os, "fsync", record_fsync)
+
+    finding_reference_module.create_finding_reference_context(finding_output)
+
+    assert fsynced_file_types == ["file", "directory"]
+
+
+def test_finding_reference_context_rejects_sidecar_without_key(tmp_path: Path) -> None:
+    finding_output = tmp_path / "evidence.jsonl.findings.jsonl"
+    finding_output.write_text("prior snapshot\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="without its private reference key"):
+        finding_reference_module.resolve_finding_reference_context(finding_output)
+
+
+def test_atomic_finding_snapshot_failure_preserves_published_file(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    finding_output = tmp_path / "evidence.jsonl.findings.jsonl"
+    finding_output.write_bytes(b"prior snapshot\n")
+
+    def failed_write(descriptor: int, value: object) -> int:
+        del descriptor, value
+        raise OSError("simulated disk full")
+
+    monkeypatch.setattr(command_module.os, "write", failed_write)
+
+    with pytest.raises(OSError, match="simulated disk full"):
+        command_module._replace_finding_package_snapshot(finding_output, b"new snapshot\n")
+    assert finding_output.read_bytes() == b"prior snapshot\n"
+
+
+def test_atomic_finding_snapshot_keeps_open_reader_on_complete_old_version(
+    tmp_path: Path,
+) -> None:
+    finding_output = tmp_path / "evidence.jsonl.findings.jsonl"
+    finding_output.write_bytes(b"prior snapshot\n")
+
+    with finding_output.open("rb") as old_reader:
+        command_module._replace_finding_package_snapshot(finding_output, b"new snapshot\n")
+        assert old_reader.read() == b"prior snapshot\n"
+    assert finding_output.read_bytes() == b"new snapshot\n"
 
 
 def test_resume_rejects_incomplete_durable_sidecars_before_legacy_fallback(
@@ -632,6 +711,52 @@ def test_all_complete_resume_preserves_prior_review_finding_exit_code(
     _write_dataset(dataset, [_record()])
     _write_target_config(target_config)
     evaluation_result = _evaluation_result("interaction-1", has_review_finding=True)
+    observed_action = ObservedOutcome(
+        id="created-transfer",
+        confidence=1,
+        status="observed",
+        position=0,
+        kind="action",
+        predicate="create_transfer",
+        fields={"amount": 100},
+    )
+    evaluation_case = evaluation_result.cases[0]
+    assert evaluation_case.trial_set is not None
+    probe_trial = evaluation_case.trial_set.trials[0]
+    assert probe_trial.observed_frame is not None
+    evaluation_result = evaluation_result.model_copy(
+        update={
+            "cases": (
+                evaluation_case.model_copy(
+                    update={
+                        "findings": (
+                            evaluation_case.findings[0].model_copy(
+                                update={"observed_effects": (observed_action,)}
+                            ),
+                        ),
+                        "trial_set": evaluation_case.trial_set.model_copy(
+                            update={
+                                "trials": (
+                                    probe_trial.model_copy(
+                                        update={
+                                            "observed_frame": probe_trial.observed_frame.model_copy(
+                                                update={"outcomes": (observed_action,)}
+                                            )
+                                        }
+                                    ),
+                                ),
+                                "outcome_groups": (
+                                    evaluation_case.trial_set.outcome_groups[0].model_copy(
+                                        update={"representative_effects": (observed_action,)}
+                                    ),
+                                ),
+                            }
+                        ),
+                    }
+                ),
+            )
+        }
+    )
     run_context = _run_context((evaluation_result.source,))
     evidence.write_text(
         json.dumps(
@@ -645,6 +770,10 @@ def test_all_complete_resume_preserves_prior_review_finding_exit_code(
         )
         + "\n",
         encoding="utf-8",
+    )
+    finding_output = evidence.with_name(f"{evidence.name}.findings.jsonl")
+    original_reference_context = finding_reference_module.create_finding_reference_context(
+        finding_output
     )
     monkeypatch.setattr(command_module, "load_dataset_semantic_settings", _settings)
 
@@ -665,6 +794,15 @@ def test_all_complete_resume_preserves_prior_review_finding_exit_code(
 
     assert result.exit_code == 1, result.output
     assert "Nothing to do" in result.output
+    assert finding_output.stat().st_size > 0
+    assert finding_reference_module.finding_reference_key_path(finding_output).is_file()
+    assert (
+        finding_reference_module.load_finding_reference_context(finding_output)
+        == original_reference_context
+    )
+    decision_report = runner.invoke(root_app, ["report", str(finding_output), "--json"])
+    assert decision_report.exit_code == 1, decision_report.output
+    assert len(json.loads(decision_report.output)["findings"]) == 1
 
 
 @pytest.mark.parametrize(
