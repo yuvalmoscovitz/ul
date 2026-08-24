@@ -834,6 +834,85 @@ def test_committed_state_requires_authoritative_evidence_for_every_execution(
     assert _PRIVATE_SECRET not in human_report.output
 
 
+def test_recorded_response_and_state_remain_available_after_cleanup_failure() -> None:
+    result = _dataset_result()
+    failed_cleanup = EnvironmentResetEvidence(
+        reset_session_requested=True,
+        reset_session_acknowledged=False,
+        reset_env_requested=True,
+        reset_env_acknowledged=False,
+    )
+
+    def with_failed_cleanup(trial_set: DatasetEvaluationTrialSet) -> DatasetEvaluationTrialSet:
+        return trial_set.model_copy(
+            update={
+                "trials": tuple(
+                    trial.model_copy(
+                        update={
+                            "execution_evidence": _execution(
+                                f"case-{trial.repetition}",
+                                ("turn-1",),
+                                100,
+                            ).model_copy(
+                                update={
+                                    "lifecycle": EnvironmentLifecycleEvidence(
+                                        terminal_status="failed",
+                                        completed_phases=("initial_reset", "execute_turn"),
+                                        failed_phase="cleanup_reset",
+                                        failure_code="reset_env_not_acknowledged",
+                                        failure_reason="cleanup reset was not acknowledged",
+                                        delivery="certain",
+                                        cleanup="failed",
+                                        cleanup_failure_code="reset_env_not_acknowledged",
+                                        cleanup_failure_reason=(
+                                            "cleanup reset was not acknowledged"
+                                        ),
+                                        environment_state_uncertain=True,
+                                        initial_reset=EnvironmentResetEvidence(
+                                            reset_session_requested=True,
+                                            reset_session_acknowledged=True,
+                                            reset_env_requested=True,
+                                            reset_env_acknowledged=True,
+                                        ),
+                                        cleanup_reset=failed_cleanup,
+                                    )
+                                }
+                            )
+                        }
+                    )
+                    for trial in trial_set.trials
+                )
+            }
+        )
+
+    probe_trial_set = result.cases[0].trial_set
+    assert probe_trial_set is not None
+    result = result.model_copy(
+        update={
+            "baseline": result.baseline.model_copy(
+                update={"trial_set": with_failed_cleanup(result.baseline.trial_set)}
+            ),
+            "cases": (
+                result.cases[0].model_copy(
+                    update={"trial_set": with_failed_cleanup(probe_trial_set)}
+                ),
+            ),
+        }
+    )
+
+    package = adapt_dataset_behavior_finding(
+        result,
+        case_index=0,
+        finding_index=0,
+        context=_context(),
+    )
+
+    cross_examination = package.occurrence.cross_examination
+    assert cross_examination is not None
+    assert cross_examination.response_evidence.conclusion == "observed"
+    assert cross_examination.committed_state_evidence.conclusion == "verified"
+
+
 def test_json_null_is_retained_as_present_historical_evidence() -> None:
     result = _dataset_result()
     result = result.model_copy(

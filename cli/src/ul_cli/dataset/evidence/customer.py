@@ -228,7 +228,7 @@ def _cross_examination_evidence_availability(
         for trial in trial_set.trials:
             execution_evidence = getattr(trial, "execution_evidence", None)
             if fact == "response":
-                present = not trial.inconclusive_reasons
+                present = getattr(trial, "target_output", None) is not None
                 if present:
                     authorities.add(
                         "source_self_reported"
@@ -260,7 +260,6 @@ def _cross_examination_evidence_availability(
                 )
                 present = bool(
                     execution_evidence is not None
-                    and not trial.inconclusive_reasons
                     and execution_evidence.evidence_scope == "response_and_state"
                     and initial_state is not None
                     and final_state is not None

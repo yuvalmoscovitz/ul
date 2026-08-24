@@ -12,6 +12,7 @@ from ul import (
     AugmentationTarget,
     CaseFixtureReference,
     DatasetEvaluationResult,
+    DatasetEvaluationTrialSet,
     RichInteractionCase,
     project_rich_interaction_case,
 )
@@ -105,6 +106,45 @@ def test_cross_examination_json_and_offline_cli_present_the_same_safe_facts(
     assert "Committed-state verification: unavailable" in human_report.output
     assert "Transfer 100 to Alice" not in human_report.output
     assert "private-case-canary" not in human_report.output
+
+
+def test_response_evidence_remains_observed_when_semantic_evaluation_is_inconclusive() -> None:
+    result = _evaluation_result("semantic-inconclusive", has_review_finding=True)
+
+    def semantic_failure(trial_set: DatasetEvaluationTrialSet) -> DatasetEvaluationTrialSet:
+        return trial_set.model_copy(
+            update={
+                "trials": tuple(
+                    trial.model_copy(update={"inconclusive_reasons": ("semantic_parse_failed",)})
+                    for trial in trial_set.trials
+                )
+            }
+        )
+
+    variation_trial_set = result.cases[0].trial_set
+    assert variation_trial_set is not None
+    result = result.model_copy(
+        update={
+            "baseline": result.baseline.model_copy(
+                update={"trial_set": semantic_failure(result.baseline.trial_set)}
+            ),
+            "cases": (
+                result.cases[0].model_copy(
+                    update={"trial_set": semantic_failure(variation_trial_set)}
+                ),
+            ),
+        }
+    )
+
+    record = customer_module.build_customer_evidence_record(
+        result,
+        repetitions=1,
+        max_environment_api_calls=2,
+        planned_target_calls=2,
+    )
+
+    response_evidence = record["cases"][0]["cross_examination"]["response_evidence"]
+    assert response_evidence["conclusion"] == "observed"
 
 
 @pytest.mark.parametrize(

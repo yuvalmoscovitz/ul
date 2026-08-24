@@ -467,7 +467,7 @@ class FindingCrossExamination(_StrictModel):
 
 
 class FindingOccurrence(_StrictModel):
-    schema_version: Literal["1.0.0"] = "1.0.0"
+    schema_version: Literal["1.1.0"] = "1.1.0"
     occurrence_id: str = Field(pattern=_FINDING_ID_PATTERN)
     kind: FindingKind
     category: FindingCategory
@@ -725,6 +725,7 @@ class RunReceiptContent(_StrictModel):
     lifecycle: tuple[LifecycleReceipt, ...] = Field(min_length=1, max_length=10)
     provenance: tuple[ProvenanceReceipt, ...] = Field(min_length=1, max_length=100)
     trace_evidence_pointer_ids: tuple[str, ...] = Field(default=(), max_length=1_000)
+    trajectory_evidence_status: Literal["complete", "incomplete", "unavailable"] = "unavailable"
     usage: UsageReceipt | None = None
     redaction: RedactionReceipt | None = None
     evidence_pointers: tuple[EvidencePointer, ...] = Field(min_length=1, max_length=1_000)
@@ -785,6 +786,10 @@ class RunReceiptContent(_StrictModel):
                 _validate_pointer(pointers, pointer_id, "lifecycle", self.arm)
         for pointer_id in self.trace_evidence_pointer_ids:
             _validate_pointer(pointers, pointer_id, "trace", self.arm)
+        if (self.trajectory_evidence_status == "unavailable") != (
+            not self.trace_evidence_pointer_ids
+        ):
+            raise ValueError("trajectory status must match retained trace evidence")
         for values, label in (
             (self.trace_evidence_pointer_ids, "trace evidence pointer IDs"),
             (self.limitations, "receipt limitations"),
@@ -820,7 +825,7 @@ class RunReceiptContent(_StrictModel):
 
 
 class RunReceipt(_StrictModel):
-    schema_version: Literal["1.0.0"] = "1.0.0"
+    schema_version: Literal["1.1.0"] = "1.1.0"
     receipt_id: str = Field(pattern=_RUN_RECEIPT_ID_PATTERN)
     content: RunReceiptContent
 
@@ -851,7 +856,7 @@ class FindingPrivateReferences(_StrictModel):
 
 
 class FindingEvidencePackage(_StrictModel):
-    schema_version: Literal["1.1.0"] = "1.1.0"
+    schema_version: Literal["1.2.0"] = "1.2.0"
     disclosure: Literal["private"] = "private"
     occurrence: FindingOccurrence
     private_references: FindingPrivateReferences
@@ -985,6 +990,11 @@ class FindingEvidencePackage(_StrictModel):
         if not supporting_delta_pointer_ids.issubset(observed_repetition_pointer_ids):
             raise ValueError("aggregate observed deltas must come only from observed repetitions")
         _validate_occurrence_evidence(self.occurrence, pointers)
+        _validate_cross_examination_availability(
+            self.occurrence,
+            receipts_by_id,
+            pointers,
+        )
         if (
             len(_canonical_json(self.model_dump(mode="json")).encode("utf-8"))
             > _MAXIMUM_FINDING_PACKAGE_BYTES
@@ -1010,7 +1020,7 @@ class FindingDecisionLimitation(_StrictModel):
 
 
 class DecisionReadyFinding(_StrictModel):
-    schema_version: Literal["1.0.0"] = "1.0.0"
+    schema_version: Literal["1.1.0"] = "1.1.0"
     occurrence_id: str = Field(pattern=_FINDING_ID_PATTERN)
     campaign_ref: str = Field(pattern=_PUBLIC_REFERENCE_PATTERN)
     case_ref: str = Field(pattern=_PUBLIC_REFERENCE_PATTERN)
@@ -1067,7 +1077,7 @@ class DecisionReadyFinding(_StrictModel):
 
 
 class FindingDecisionReport(_StrictModel):
-    schema_version: Literal["1.0.0"] = "1.0.0"
+    schema_version: Literal["1.1.0"] = "1.1.0"
     disclosure: Literal["safe"] = "safe"
     evidence_schema_versions: tuple[str, ...] = Field(min_length=1, max_length=100)
     campaign_ref: str = Field(pattern=_PUBLIC_REFERENCE_PATTERN)
@@ -1693,6 +1703,94 @@ def _validate_occurrence_evidence(
             for pointer_id in violation_delta.evidence_pointer_ids
         ):
             raise ValueError("rule violations require evaluator or independent evidence")
+
+
+def _validate_cross_examination_availability(
+    occurrence: FindingOccurrence,
+    receipts_by_id: dict[str, RunReceipt],
+    pointers: dict[str, EvidencePointer],
+) -> None:
+    cross_examination = occurrence.cross_examination
+    if cross_examination is None:
+        return
+    channel_contracts = (
+        (
+            cross_examination.response_evidence,
+            "response_evidence_pointer_ids",
+            "observed",
+        ),
+        (
+            cross_examination.trajectory_evidence,
+            "trajectory_evidence_pointer_ids",
+            "observed",
+        ),
+        (
+            cross_examination.committed_state_evidence,
+            "committed_state_evidence_pointer_ids",
+            "verified",
+        ),
+    )
+    for availability, pointer_attribute, achieved in channel_contracts:
+        channel_pointer_ids: set[str] = set()
+        expected_arm_statuses: dict[str, str] = {}
+        for availability_arm, receipt_arm, cross_examination_arm in (
+            ("current_baseline", "source", cross_examination.current_baseline),
+            ("variation", "probe", cross_examination.variation),
+        ):
+            receipt_ids = tuple(
+                receipt_id
+                for repetition in occurrence.repetitions
+                for receipt_id in (
+                    repetition.source_receipt_id
+                    if receipt_arm == "source"
+                    else repetition.probe_receipt_id,
+                )
+                if receipt_id is not None
+            )
+            receipts = tuple(receipts_by_id[receipt_id].content for receipt_id in receipt_ids)
+            if availability.fact == "response":
+                arm_pointer_ids = {
+                    receipt.response.evidence_pointer_id
+                    for receipt in receipts
+                    if receipt.response is not None
+                }
+                fully_observed = bool(receipts) and all(
+                    receipt.response is not None for receipt in receipts
+                )
+            elif availability.fact == "trajectory":
+                arm_pointer_ids = {
+                    pointer_id
+                    for receipt in receipts
+                    for pointer_id in receipt.trace_evidence_pointer_ids
+                }
+                fully_observed = bool(receipts) and all(
+                    receipt.trajectory_evidence_status == "complete" for receipt in receipts
+                )
+            else:
+                arm_pointer_ids = {
+                    state.evidence.evidence_pointer_id
+                    for receipt in receipts
+                    for state in (receipt.state_before, receipt.state_after)
+                    if state is not None
+                }
+                fully_observed = bool(receipts) and all(
+                    receipt.state_before is not None and receipt.state_after is not None
+                    for receipt in receipts
+                )
+            if tuple(sorted(arm_pointer_ids)) != getattr(cross_examination_arm, pointer_attribute):
+                raise ValueError("cross-examination channel pointers must match every receipt")
+            channel_pointer_ids.update(arm_pointer_ids)
+            expected_arm_statuses[availability_arm] = achieved if fully_observed else "unavailable"
+        if any(
+            getattr(availability, arm_name) != expected_status
+            for arm_name, expected_status in expected_arm_statuses.items()
+        ):
+            raise ValueError("cross-examination availability must match receipt coverage")
+        expected_authorities = tuple(
+            sorted({pointers[pointer_id].authority for pointer_id in channel_pointer_ids})
+        )
+        if availability.authorities != expected_authorities:
+            raise ValueError("cross-examination authorities must match cited evidence")
 
 
 class CrossExaminationRunSummary(_StrictModel):

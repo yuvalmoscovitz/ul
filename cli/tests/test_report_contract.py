@@ -455,7 +455,7 @@ def _dataset_package() -> FindingEvidencePackage:
                 conclusion="observed",
                 current_baseline="observed",
                 variation="observed",
-                authorities=("source_self_reported",),
+                authorities=("independent_observer",),
             ),
             trajectory_evidence=CrossExaminationEvidenceAvailability(
                 fact="trajectory",
@@ -656,7 +656,9 @@ def test_dataset_and_stateful_workflows_share_an_auditable_package_contract() ->
     for package in (_dataset_package(), _stateful_package()):
         round_trip = FindingEvidencePackage.model_validate_json(package.model_dump_json())
         assert round_trip == package
-        assert package.schema_version == "1.1.0"
+        assert package.schema_version == "1.2.0"
+        assert package.occurrence.schema_version == "1.1.0"
+        assert all(receipt.schema_version == "1.1.0" for receipt in package.receipts)
         assert len(package.occurrence.repetitions) == 2
         assert all(item.evidence_pointer_ids for item in package.occurrence.repetitions)
 
@@ -700,6 +702,7 @@ def test_dataset_and_stateful_packages_share_decision_ready_explanations(
     }
 
     assert isinstance(finding, DecisionReadyFinding)
+    assert finding.schema_version == "1.1.0"
     assert finding.classification == classification
     assert finding.review_workflow == workflow
     assert finding.evidence_level == evidence_level
@@ -724,6 +727,7 @@ def test_dataset_and_stateful_packages_share_decision_ready_explanations(
     assert "private-record" not in finding.model_dump_json()
 
     report = build_finding_decision_report((package,))
+    assert report.schema_version == "1.1.0"
     assert FindingDecisionReport.model_validate_json(report.model_dump_json()) == report
 
 
@@ -973,8 +977,8 @@ def test_finding_package_report_rejects_duplicate_keys_and_symlinks(tmp_path: Pa
     duplicate = tmp_path / "duplicate.findings.jsonl"
     duplicate.write_text(
         valid.replace(
-            '"schema_version":"1.1.0"',
-            '"schema_version":"1.1.0","schema_version":"1.1.0"',
+            '"schema_version":"1.2.0"',
+            '"schema_version":"1.2.0","schema_version":"1.2.0"',
             1,
         )
         + "\n",
@@ -1040,6 +1044,29 @@ def test_package_binds_each_repetition_to_its_receipts() -> None:
         ValidationError,
         match=r"declared arm and repetition",
     ):
+        FindingEvidencePackage.model_validate_json(json.dumps(payload))
+
+
+def test_package_rejects_cross_examination_authority_not_cited_by_receipts() -> None:
+    payload = _dataset_package().model_dump(mode="json")
+    payload["occurrence"]["cross_examination"]["response_evidence"]["authorities"] = [
+        "source_self_reported"
+    ]
+    _rebind_occurrence(payload)
+
+    with pytest.raises(ValidationError, match="authorities must match cited evidence"):
+        FindingEvidencePackage.model_validate_json(json.dumps(payload))
+
+
+def test_package_requires_cross_examination_pointers_from_every_repetition() -> None:
+    payload = _dataset_package().model_dump(mode="json")
+    current_baseline = payload["occurrence"]["cross_examination"]["current_baseline"]
+    current_baseline["response_evidence_pointer_ids"] = current_baseline[
+        "response_evidence_pointer_ids"
+    ][:1]
+    _rebind_occurrence(payload)
+
+    with pytest.raises(ValidationError, match="channel pointers must match every receipt"):
         FindingEvidencePackage.model_validate_json(json.dumps(payload))
 
 

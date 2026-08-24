@@ -107,7 +107,6 @@ class _ReceiptBuild:
     rule_definition_pointer_id: str | None = None
     artifacts: tuple[EvidenceArtifact, ...] = ()
     execution_available: bool = True
-    trajectory_evidence_complete: bool = False
 
 
 @dataclass(frozen=True)
@@ -954,6 +953,24 @@ def _receipt_from_values(
         _MAXIMUM_RUN_RECEIPT_BYTES,
         "run receipt exceeds the 1 MB JSON limit",
     )
+    trajectory_evidence_status: Literal["complete", "incomplete", "unavailable"] = (
+        "complete"
+        if any(
+            observation.status == "complete"
+            and any(
+                (
+                    observation.traces,
+                    observation.tool_calls,
+                    observation.handoffs,
+                    observation.errors,
+                )
+            )
+            for observation in trajectory_observations
+        )
+        else "incomplete"
+        if trace_evidence_pointer_ids
+        else "unavailable"
+    )
     content = RunReceiptContent(
         repetition=repetition,
         arm=arm,
@@ -1008,6 +1025,7 @@ def _receipt_from_values(
         ),
         provenance=tuple(provenance),
         trace_evidence_pointer_ids=trace_evidence_pointer_ids,
+        trajectory_evidence_status=trajectory_evidence_status,
         redaction=context.redaction,
         evidence_pointers=tuple(sorted(pointers, key=lambda pointer: pointer.pointer_id)),
         limitations=tuple(sorted(receipt_limitations)),
@@ -1022,18 +1040,6 @@ def _receipt_from_values(
         rule_definition_pointer_id=rule_definition_pointer_id,
         artifacts=tuple(sorted(retained_artifacts.values(), key=lambda item: item.artifact_sha256)),
         execution_available=execution_available,
-        trajectory_evidence_complete=any(
-            observation.status == "complete"
-            and any(
-                (
-                    observation.traces,
-                    observation.tool_calls,
-                    observation.handoffs,
-                    observation.errors,
-                )
-            )
-            for observation in trajectory_observations
-        ),
     )
 
 
@@ -1159,17 +1165,15 @@ def _cross_examination_availability(
 
     def arm_status(receipts: list[_ReceiptBuild]) -> Literal["observed", "verified", "unavailable"]:
         if fact == "response":
+            available = all(receipt.response_pointer_id is not None for receipt in receipts)
+        elif fact == "trajectory":
             available = all(
-                receipt.execution_available and receipt.response_pointer_id is not None
+                receipt.receipt.content.trajectory_evidence_status == "complete"
                 for receipt in receipts
             )
-        elif fact == "trajectory":
-            available = all(receipt.trajectory_evidence_complete for receipt in receipts)
         else:
             available = all(
-                receipt.execution_available
-                and receipt.receipt.content.evidence_scope == "response_and_state"
-                and receipt.receipt.content.state_before is not None
+                receipt.receipt.content.state_before is not None
                 and receipt.receipt.content.state_after is not None
                 for receipt in receipts
             )
@@ -1611,7 +1615,7 @@ def _package(
         sorted(artifacts_by_digest.values(), key=lambda artifact: artifact.artifact_sha256)
     )
     package_values = {
-        "schema_version": "1.1.0",
+        "schema_version": "1.2.0",
         "disclosure": "private",
         "occurrence": occurrence.model_dump(mode="json"),
         "private_references": {
