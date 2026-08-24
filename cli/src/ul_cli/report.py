@@ -259,7 +259,7 @@ def _print_finding_decision_report(report: FindingDecisionReport, evidence: Path
                 f"{shlex.quote(primary_evidence) if not _WINDOWS else 'EVIDENCE'}"
             )
         typer.echo(
-            "  Private receipt: ul report "
+            "  Resolve private references and receipt: ul report "
             f"{quoted_evidence or 'FINDINGS'} --show-sensitive-values "
             f"--finding {finding.occurrence_id}"
         )
@@ -288,6 +288,7 @@ def _print_private_finding_receipts(
     payload = json.dumps(
         {
             "occurrence_id": occurrence_id,
+            "reference_resolution": package.private_references.model_dump(mode="json"),
             "receipts": [receipt.model_dump(mode="json") for receipt in package.receipts],
             "artifacts": [artifact.model_dump(mode="json") for artifact in disclosed_artifacts],
         },

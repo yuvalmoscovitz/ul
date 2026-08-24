@@ -202,7 +202,9 @@ deterministic reset, and preventing real business effects.
 For canonical `.findings.jsonl` packages, its default human and JSON forms expose only bounded,
 privacy-safe explanations and opaque evidence pointers. Raw inputs, responses, state, tool data,
 and provenance remain inside private normalized receipts and require an explicit per-finding
-disclosure command. The disclosure is capped before any private output is printed.
+disclosure command. That command also resolves opaque case, operator, and customer-rule references
+to the private configured identities needed for investigation. The disclosure is capped before any
+private output is printed.
 Dataset finding sidecars also keep an adjacent private reference key so resumed runs retain one
 privacy-safe campaign identity; preserve that key with the evidence bundle.
 

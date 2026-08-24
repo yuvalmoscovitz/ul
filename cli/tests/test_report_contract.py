@@ -21,6 +21,7 @@ from ul_cli.report_contract import (
     FindingDecisionReport,
     FindingEvidencePackage,
     FindingOccurrence,
+    FindingPrivateReferences,
     FindingRepetition,
     LifecycleReceipt,
     ObservedDelta,
@@ -138,6 +139,17 @@ def _embedded_package(
             )
     return FindingEvidencePackage(
         occurrence=occurrence,
+        private_references=FindingPrivateReferences(
+            campaign_id="private-campaign",
+            case_id="private-case",
+            source_interaction_id=(
+                "private-source" if occurrence.source_interaction_ref is not None else None
+            ),
+            operator_id="private-operator",
+            operator_version="1.0.0",
+            rule_id="private-rule" if occurrence.violated_rule is not None else None,
+            rule_version="1.0.0" if occurrence.violated_rule is not None else None,
+        ),
         receipts=receipts,
         artifact_retention="embedded",
         artifacts=tuple(sorted(artifacts.values(), key=lambda artifact: artifact.artifact_sha256)),
@@ -605,6 +617,7 @@ def test_finding_package_report_human_json_and_private_receipt_share_one_contrac
     assert "WARNING: showing private normalized receipts" in private.output
     assert "Disclosure receipt:" in private.output
     assert _PRIVATE_CANARY in private.output
+    assert "private-operator" in private.output
     assert all(receipt.receipt_id in private.output for receipt in package.receipts)
 
 
@@ -653,10 +666,26 @@ def test_stateful_finding_package_uses_same_safe_offline_report(
     assert "Evidence scope: response and state" in result.output
     assert "workflow=external review required" in result.output
     assert "Inspect the private normalized receipt" in result.output
+    assert "Resolve private references and receipt" in result.output
     assert package.occurrence.violated_rule is not None
     assert package.occurrence.violated_rule.id in result.output
     assert package.occurrence.violated_rule.version in result.output
     assert _PRIVATE_CANARY not in result.output
+    assert package.private_references.rule_id is not None
+
+    private = runner.invoke(
+        app,
+        [
+            "report",
+            str(evidence),
+            "--show-sensitive-values",
+            "--finding",
+            package.occurrence.occurrence_id,
+        ],
+    )
+    assert private.exit_code == 1, private.output
+    assert package.private_references.operator_id in private.output
+    assert package.private_references.rule_id in private.output
 
 
 def test_decision_report_supports_mixed_evidence_scopes_in_one_campaign() -> None:

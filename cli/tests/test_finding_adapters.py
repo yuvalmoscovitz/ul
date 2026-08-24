@@ -587,7 +587,11 @@ def test_adapters_bind_every_repetition_to_its_exact_arm_receipts() -> None:
     mismatched_occurrence = build_finding_occurrence(**occurrence_values)
 
     with pytest.raises(ValidationError, match="exactly match repetition references"):
-        FindingEvidencePackage(occurrence=mismatched_occurrence, receipts=package.receipts)
+        FindingEvidencePackage(
+            occurrence=mismatched_occurrence,
+            private_references=package.private_references,
+            receipts=package.receipts,
+        )
 
 
 def test_stateful_adapter_rejects_a_rule_definition_from_another_authority() -> None:
@@ -634,6 +638,7 @@ def test_private_receipt_disclosure_includes_cited_embedded_artifacts(tmp_path: 
     )
     evidence = tmp_path / "evidence.findings.jsonl"
     evidence.write_text(package.model_dump_json() + "\n", encoding="utf-8")
+    safe_result = runner.invoke(app, ["report", str(evidence)])
 
     result = runner.invoke(
         app,
@@ -647,7 +652,13 @@ def test_private_receipt_disclosure_includes_cited_embedded_artifacts(tmp_path: 
     )
 
     assert result.exit_code == 1, result.output
+    assert safe_result.exit_code == 1, safe_result.output
+    assert package.private_references.operator_id not in safe_result.output
+    assert package.private_references.rule_id is not None
+    assert package.private_references.rule_id not in safe_result.output
     assert '"artifacts": [' in result.output
+    assert package.private_references.operator_id in result.output
+    assert package.private_references.rule_id in result.output
     assert all(artifact.artifact_sha256 in result.output for artifact in package.artifacts)
 
 
@@ -700,6 +711,7 @@ def test_embedded_receipt_values_must_match_their_cited_artifacts() -> None:
     with pytest.raises(ValidationError, match="receipt value must match"):
         FindingEvidencePackage(
             occurrence=changed_occurrence,
+            private_references=package.private_references,
             receipts=changed_receipts,
             artifact_retention="embedded",
             artifacts=package.artifacts,

@@ -628,16 +628,42 @@ class RunReceipt(_StrictModel):
         return self
 
 
+class FindingPrivateReferences(_StrictModel):
+    disclosure: Literal["private"] = "private"
+    campaign_id: str = Field(min_length=1, max_length=500)
+    case_id: str = Field(min_length=1, max_length=500)
+    source_interaction_id: str | None = Field(default=None, min_length=1, max_length=500)
+    operator_id: str = Field(min_length=1, max_length=500)
+    operator_version: str = Field(min_length=1, max_length=100)
+    rule_id: str | None = Field(default=None, min_length=1, max_length=500)
+    rule_version: str | None = Field(default=None, min_length=1, max_length=100)
+
+    @model_validator(mode="after")
+    def validate_rule_reference(self) -> Self:
+        if (self.rule_id is None) != (self.rule_version is None):
+            raise ValueError("private rule ID and version must be provided together")
+        return self
+
+
 class FindingEvidencePackage(_StrictModel):
     schema_version: Literal["1.0.0"] = "1.0.0"
     disclosure: Literal["private"] = "private"
     occurrence: FindingOccurrence
+    private_references: FindingPrivateReferences
     receipts: tuple[RunReceipt, ...] = Field(min_length=1, max_length=2_000)
     artifact_retention: Literal["external", "embedded"] = "external"
     artifacts: tuple[EvidenceArtifact, ...] = Field(default=(), max_length=4_000)
 
     @model_validator(mode="after")
     def validate_package(self) -> Self:
+        if (self.occurrence.source_interaction_ref is None) != (
+            self.private_references.source_interaction_id is None
+        ):
+            raise ValueError("private source reference must match the public occurrence shape")
+        if (self.occurrence.kind == "customer_invariant_violation") != (
+            self.private_references.rule_id is not None
+        ):
+            raise ValueError("private rule reference must match the finding kind")
         artifact_digests = tuple(artifact.artifact_sha256 for artifact in self.artifacts)
         if artifact_digests != tuple(sorted(set(artifact_digests))):
             raise ValueError("retained evidence artifacts must be sorted and unique")
