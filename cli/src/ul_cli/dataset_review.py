@@ -1876,6 +1876,11 @@ def review_dataset_finding(
         ) from None
 
     _print_plain(f"Recorded review {new_review.review_id}: {new_review.status}")
+    if new_review.status == "confirmed":
+        _print_plain(
+            "Promote this finding with 'ul regression save EVIDENCE FINDING_ID "
+            "--output CASE.json --confirm-versioned-input'."
+        )
     _print_plain(f"Review history: {reviews_path}")
 
 

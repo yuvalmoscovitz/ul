@@ -2379,3 +2379,8 @@ def _print_failure(failure: ProbeFailure, *, diagnostic_artifact: Path | None) -
             print_dataset_plain(f"Private diagnostic: {diagnostic_artifact}")
         except OSError:
             print_dataset_plain("Private diagnostic could not be written.")
+
+
+resolve_probe_target = _resolve_target
+confirm_probe_target = _confirm_target
+probe_target_evidence_receipt = _target_evidence_receipt

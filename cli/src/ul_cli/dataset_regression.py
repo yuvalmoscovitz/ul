@@ -8,10 +8,11 @@ import stat
 import sys
 import unicodedata
 from pathlib import Path
-from typing import Annotated, TextIO
+from typing import Annotated, Literal, TextIO
 
 import typer
 from pydantic import ValidationError
+from ul import DatasetEvaluationResult
 from ul.dataset_invariants import (
     DatasetInvariantRule,
     DatasetInvariantRuleEvaluation,
@@ -29,6 +30,8 @@ from ul.dataset_invariants import (
 )
 from ul.dataset_regression import (
     DatasetRegressionCase,
+    DatasetRegressionResult,
+    DatasetRegressionReviewSnapshot,
     DatasetRegressionRunResult,
     create_dataset_regression_case,
     dataset_regression_target_config_sha256,
@@ -43,11 +46,18 @@ from ul.http_environment import (
     json_http_environment_config_urls,
     load_json_http_environment_config,
 )
+from ul.local_target import LocalTargetConnection
 
 from ul_cli.dataset_review import (
     load_confirmed_dataset_finding,
 )
 from ul_cli.environment import TEST_ENVIRONMENT_CONFIRMATION_MESSAGE
+from ul_cli.probe import (
+    ProbeFailure,
+    confirm_probe_target,
+    probe_target_evidence_receipt,
+    resolve_probe_target,
+)
 
 app = typer.Typer(help="Save and replay confirmed dataset findings.")
 
@@ -67,20 +77,19 @@ def save_dataset_regression(
         str,
         typer.Argument(help="Confirmed semantic or customer-invariant finding ID to save."),
     ],
-    target_config: Annotated[
-        Path,
-        typer.Option(
-            "--environment-config",
-            exists=True,
-            dir_okay=False,
-            readable=True,
-            help="Target configuration to snapshot.",
-        ),
-    ],
     output: Annotated[
         Path,
         typer.Option(help="New private JSON regression case file."),
     ],
+    target_config: Annotated[
+        Path | None,
+        typer.Option(
+            "--environment-config",
+            dir_okay=False,
+            readable=True,
+            help="Legacy stateful environment configuration to snapshot.",
+        ),
+    ] = None,
     rules: Annotated[
         list[str] | None,
         typer.Option(
@@ -101,8 +110,8 @@ def save_dataset_regression(
             "--confirm-versioned-input",
             help=(
                 "Confirm the exact raw input, literal environment-template values, and selected "
-                "customer-rule definitions, which may be sensitive and are not auto-redacted, "
-                "are appropriate to store and version."
+                "customer-rule definitions plus any observed output and review context, which may "
+                "be sensitive and are not auto-redacted, are appropriate to store and version."
             ),
         ),
     ] = False,
@@ -110,10 +119,9 @@ def save_dataset_regression(
     """Create a portable case from a confirmed semantic or invariant finding."""
     if not confirm_versioned_input:
         raise typer.BadParameter(
-            "saving requires confirmation that the exact raw input and literal "
-            "environment-template values plus selected customer-rule definitions may be sensitive, "
-            "are not "
-            "auto-redacted, and are appropriate to store and version",
+            "saving requires confirmation that exact input/output evidence, review context, "
+            "literal environment-template values, and selected customer-rule definitions may be "
+            "sensitive, are not auto-redacted, and are appropriate to store and version",
             param_hint="--confirm-versioned-input",
         )
     if rules is not None and len(rules) != len(set(rules)):
@@ -153,14 +161,33 @@ def save_dataset_regression(
         os.fsync(output_stream.fileno())
 
     _print_safe(f"Saved regression case {case.case_id}: {output}")
-    _print_safe(
-        "The case stores the exact raw input, which may be sensitive and is not auto-redacted, "
-        "plus selected customer-rule definitions and the declared observation authority. Rule "
-        "literals, allowed sets, and literal request-template values are copied unredacted. "
-        "Header authentication remains environment-backed. "
-        "The embedded environment config is customer-declared at case creation, is not verified as "
-        "the discovery target, and is never executed by replay."
-    )
+    if case.target.kind == "probe_target":
+        _print_safe(
+            "The case stores the exact observed input/output, accepted variation, customer-rule "
+            "definitions, human review snapshot, and secret-safe discovery target receipt. These "
+            "private values may be sensitive and are not auto-redacted. Header authentication "
+            "values remain environment-backed. Historical output remains reference evidence, not "
+            "a correctness oracle."
+        )
+    else:
+        _print_safe(
+            "The case stores the exact raw input, which may be sensitive and is not auto-redacted, "
+            "plus selected customer-rule definitions and the declared observation authority. Rule "
+            "literals, allowed sets, and literal request-template values are copied unredacted. "
+            "Header authentication remains environment-backed. The embedded environment config is "
+            "customer-declared at case creation, is not verified as the discovery target, and is "
+            "never executed by replay."
+        )
+    if case.target.kind == "probe_target":
+        _print_safe(
+            "Replay: ul regression replay "
+            f"{shlex.quote(str(output))} --target TARGET --confirm-target TARGET_DIGEST "
+            "--max-target-calls "
+            f"{case.discovery_repetitions} --output replay.json"
+        )
+        return
+    if case.target.config is None or target_config is None:
+        raise AssertionError("validated environment regression requires its target config")
     insecure_http_option = (
         " --allow-insecure-http"
         if any(
@@ -192,20 +219,70 @@ def replay_saved_dataset_regression(
             help="Saved regression case JSON.",
         ),
     ],
-    target_config: Annotated[
-        Path,
-        typer.Option(
-            "--environment-config",
-            exists=True,
-            dir_okay=False,
-            readable=True,
-            help="Separately trusted environment API config whose digest must match the case.",
-        ),
-    ],
     output: Annotated[
         Path,
         typer.Option(help="New private JSON replay evidence file."),
     ],
+    target_config: Annotated[
+        Path | None,
+        typer.Option(
+            "--environment-config",
+            dir_okay=False,
+            readable=True,
+            help="Separately trusted environment API config whose digest must match the case.",
+        ),
+    ] = None,
+    target_reference: Annotated[
+        str | None,
+        typer.Option(
+            "--target",
+            help="The same callable, command/config, or HTTP target used by ul probe.",
+        ),
+    ] = None,
+    confirm_target: Annotated[
+        str | None,
+        typer.Option(help="Exact target confirmation digest displayed by this command."),
+    ] = None,
+    target_artifact: Annotated[
+        list[Path] | None,
+        typer.Option(help="Local target artifact to bind; repeat as needed."),
+    ] = None,
+    target_working_directory: Annotated[
+        Path | None,
+        typer.Option(help="Working directory for a direct Python callable target."),
+    ] = None,
+    target_interpreter: Annotated[
+        Path | None,
+        typer.Option(help="Python interpreter for a direct callable target."),
+    ] = None,
+    target_environment_variable: Annotated[
+        list[str] | None,
+        typer.Option(help="Environment variable exposed to a local target; repeat as needed."),
+    ] = None,
+    http_preset: Annotated[
+        Literal["generic-json", "openai-chat"] | None,
+        typer.Option(help="Direct HTTP request/response preset."),
+    ] = None,
+    request_json_template: Annotated[
+        str | None,
+        typer.Option(help="Direct HTTP JSON request template."),
+    ] = None,
+    response_json_pointer: Annotated[
+        str | None,
+        typer.Option(help="JSON pointer selecting the direct HTTP response value."),
+    ] = None,
+    agent_model: Annotated[
+        str | None,
+        typer.Option(help="Model value for the openai-chat HTTP preset."),
+    ] = None,
+    header_from_env: Annotated[
+        list[str] | None,
+        typer.Option(help="HTTP Header=ENV_VAR mapping; repeat as needed."),
+    ] = None,
+    allow_probe_target_network: Annotated[
+        bool,
+        typer.Option("--allow-target-network", help="Allow requests to a probe HTTP target."),
+    ] = False,
     allow_target_network: Annotated[
         bool,
         typer.Option(
@@ -223,6 +300,7 @@ def replay_saved_dataset_regression(
     max_target_calls: Annotated[
         int,
         typer.Option(
+            "--max-target-calls",
             "--max-environment-api-calls",
             min=1,
             help="Maximum environment API requests authorized for this replay.",
@@ -232,49 +310,80 @@ def replay_saved_dataset_regression(
     """Replay the exact saved variation without semantic-model calls."""
     try:
         regression_case = load_dataset_regression_case(case_path)
-        trusted_target_config = load_json_http_environment_config(target_config)
-        if _target_config_sha256(trusted_target_config) != regression_case.target.config_sha256:
-            raise ValueError("trusted environment config digest does not match the regression case")
+        if (target_config is None) == (target_reference is None):
+            raise ValueError("pass exactly one of --target or --environment-config")
+        if target_reference is not None:
+            if regression_case.target.kind != "probe_target":
+                raise ValueError("this regression requires --environment-config")
+            resolved_target = resolve_probe_target(
+                target_reference,
+                allow_insecure_http=allow_insecure_http,
+                explicit_artifacts=tuple(target_artifact or ()),
+                http_preset=http_preset,
+                request_json_template=request_json_template,
+                response_json_pointer=response_json_pointer,
+                agent_model=agent_model,
+                header_from_env=header_from_env,
+                target_working_directory=target_working_directory,
+                target_interpreter=target_interpreter,
+                target_environment_variables=tuple(target_environment_variable or ()),
+            )
+            if probe_target_evidence_receipt(resolved_target) != regression_case.target.receipt:
+                raise ValueError("resolved target identity does not match the regression case")
+            if resolved_target.kind == "http" and not allow_probe_target_network:
+                raise ValueError("HTTP target replay requires --allow-target-network")
+            confirm_probe_target(resolved_target, confirmed_digest=confirm_target)
+            resolved_target.revalidate_identity()
+            requested_target_calls = (
+                regression_case.discovery_repetitions * resolved_target.calls_per_execution
+            )
+            if requested_target_calls > max_target_calls:
+                raise ValueError(
+                    f"case requires {requested_target_calls} target calls, exceeding "
+                    f"--max-target-calls {max_target_calls}; explicitly raise the call budget"
+                )
+            target = resolved_target.create_connection(
+                requested_target_calls,
+                resolved_target.maximum_active_target_seconds,
+            )
+        else:
+            if regression_case.target.kind != "environment_http":
+                raise ValueError("this regression requires --target")
+            if target_config is None:
+                raise AssertionError("validated environment replay requires its config")
+            trusted_target_config = load_json_http_environment_config(target_config)
+            if _target_config_sha256(trusted_target_config) != regression_case.target.config_sha256:
+                raise ValueError(
+                    "trusted environment config digest does not match the regression case"
+                )
+            requested_target_calls = (
+                regression_case.discovery_repetitions
+                * json_http_environment_calls_per_execution(trusted_target_config)
+            )
+            if requested_target_calls > max_target_calls:
+                raise ValueError(
+                    f"case requires {requested_target_calls} environment API calls, exceeding "
+                    f"--max-target-calls {max_target_calls}; explicitly raise the call budget"
+                )
+            if not allow_target_network:
+                raise ValueError("environment replay requires --allow-environment-network")
+            if not confirm_test_environment:
+                raise ValueError(TEST_ENVIRONMENT_CONFIRMATION_MESSAGE)
+            target = JsonHttpEnvironmentConnection.from_config(
+                trusted_target_config,
+                test_environment_confirmed=True,
+                allow_insecure_http=allow_insecure_http,
+                max_environment_api_calls=max_target_calls,
+            )
+    except ProbeFailure as error:
+        raise typer.BadParameter(_terminal_safe(error.explanation)) from None
     except (ValidationError, ValueError, RuntimeError) as error:
         raise typer.BadParameter(_terminal_safe(str(error))) from None
-
-    requested_target_calls = (
-        regression_case.discovery_repetitions
-        * json_http_environment_calls_per_execution(trusted_target_config)
-    )
-    if requested_target_calls > max_target_calls:
-        raise typer.BadParameter(
-            f"case requires {requested_target_calls} environment API calls, exceeding "
-            f"--max-environment-api-calls {max_target_calls}; explicitly raise the call budget",
-            param_hint="--max-environment-api-calls",
-        )
-
-    if not allow_target_network:
-        raise typer.BadParameter(
-            "replay requires --allow-environment-network",
-            param_hint="--allow-environment-network",
-        )
-    if not confirm_test_environment:
-        raise typer.BadParameter(
-            TEST_ENVIRONMENT_CONFIRMATION_MESSAGE,
-            param_hint="--confirm-test-environment",
-        )
     if output.exists():
         raise typer.BadParameter(
             "output already exists; UL will not overwrite it", param_hint="--output"
         )
 
-    try:
-        target = JsonHttpEnvironmentConnection.from_config(
-            trusted_target_config,
-            test_environment_confirmed=True,
-            allow_insecure_http=allow_insecure_http,
-            max_environment_api_calls=max_target_calls,
-        )
-    except (ValueError, RuntimeError) as error:
-        raise typer.BadParameter(
-            _terminal_safe(str(error)), param_hint="--environment-config"
-        ) from None
     try:
         output_stream = _create_private_output(output)
     except OSError as error:
@@ -283,34 +392,57 @@ def replay_saved_dataset_regression(
             f"cannot create replay output ({error.__class__.__name__})", param_hint="--output"
         ) from None
 
-    try:
-        with output_stream:
-            replay_result = asyncio.run(
-                replay_dataset_regression(
-                    regression_case,
-                    target,
-                    allow_network_egress=True,
-                    max_target_calls=max_target_calls,
-                )
+    with output_stream:
+        replay_result = asyncio.run(
+            _replay_regression_and_close(
+                regression_case,
+                target,
+                max_target_calls=max_target_calls,
             )
-            json.dump(
-                replay_result.model_dump(mode="json"),
-                output_stream,
-                ensure_ascii=False,
-                indent=2,
-            )
-            output_stream.write("\n")
-            output_stream.flush()
-            os.fsync(output_stream.fileno())
-    finally:
-        asyncio.run(target.aclose())
+        )
+        json.dump(
+            replay_result.model_dump(mode="json"),
+            output_stream,
+            ensure_ascii=False,
+            indent=2,
+        )
+        output_stream.write("\n")
+        output_stream.flush()
+        os.fsync(output_stream.fileno())
 
     _print_safe(f"Regression {regression_case.case_id}: {replay_result.status}")
+    if regression_case.target.kind == "probe_target":
+        response_evidence = (
+            "observed"
+            if any(item.status == "observed" for item in replay_result.executions)
+            else "unavailable"
+        )
+        _print_safe(f"Response evidence: {response_evidence}")
+        _print_safe("Trajectory evidence: unavailable")
+        _print_safe("Committed-state evidence: unavailable")
     _print_safe(f"Complete replay evidence: {output}")
     if replay_result.status == "failed":
         raise typer.Exit(code=1)
     if replay_result.status == "inconclusive":
         raise typer.Exit(code=2)
+
+
+async def _replay_regression_and_close(
+    regression_case: DatasetRegressionCase,
+    target: JsonHttpEnvironmentConnection | LocalTargetConnection,
+    *,
+    max_target_calls: int,
+) -> DatasetRegressionResult:
+    try:
+        return await replay_dataset_regression(
+            regression_case,
+            target,
+            allow_network_egress=True,
+            max_target_calls=max_target_calls,
+            target_receipt=regression_case.target.receipt,
+        )
+    finally:
+        await target.aclose()
 
 
 @app.command("run")
@@ -366,6 +498,10 @@ def run_saved_dataset_regressions(
         trusted_target_config = load_json_http_environment_config(target_config)
         trusted_target_config_sha256 = _target_config_sha256(trusted_target_config)
         for regression_case in regression_cases:
+            if regression_case.target.kind != "environment_http":
+                raise ValueError(
+                    f"case {regression_case.case_id} uses a probe target; replay it with --target"
+                )
             if regression_case.target.config_sha256 != trusted_target_config_sha256:
                 raise ValueError(
                     f"case {regression_case.case_id} environment config digest does not match "
@@ -373,7 +509,9 @@ def run_saved_dataset_regressions(
                 )
         requested_target_calls = sum(
             regression_case.discovery_repetitions
-            * json_http_environment_calls_per_execution(regression_case.target.config)
+            * json_http_environment_calls_per_execution(
+                _environment_regression_target_config(regression_case)
+            )
             for regression_case in regression_cases
         )
         if requested_target_calls > max_target_calls:
@@ -525,7 +663,7 @@ def _build_regression_case(
     reviews: Path,
     finding_id: str,
     rule_ids: tuple[str, ...],
-    target_config_path: Path,
+    target_config_path: Path | None,
 ) -> DatasetRegressionCase:
     selected = load_confirmed_dataset_finding(evidence, reviews, finding_id)
     loaded_record = selected.evidence_record
@@ -574,7 +712,25 @@ def _build_regression_case(
             raise ValueError(f"rule {rule_id!r} uses inconsistent definitions")
         selected_rules.append(baseline_definition)
 
-    trusted_target_config = load_json_http_environment_config(target_config_path)
+    run_context = loaded_record.evidence.run_context
+    probe_target_receipt = (
+        run_context.target.receipt
+        if run_context is not None and run_context.target.kind == "probe_target"
+        else None
+    )
+    if probe_target_receipt is not None and target_config_path is not None:
+        raise ValueError("probe findings do not accept --environment-config")
+    if probe_target_receipt is None and target_config_path is None:
+        raise ValueError("legacy environment findings require --environment-config")
+    trusted_target_config = (
+        load_json_http_environment_config(target_config_path)
+        if target_config_path is not None
+        else None
+    )
+    technical_result = DatasetEvaluationResult.model_validate(
+        loaded_record.evidence.technical_details,
+        strict=False,
+    )
     return create_dataset_regression_case(
         finding_id=finding_id,
         evidence_sha256=loaded_record.sha256,
@@ -584,7 +740,27 @@ def _build_regression_case(
         operator_version=finding_case.operator_version,
         original_input=loaded_record.evidence.original_input,
         variation_input=finding_case.augmented_input,
+        historical_reference_output=technical_result.source.raw_observed_output,
+        augmentation_target=finding_case.augmentation_target,
         target_config=trusted_target_config,
+        target_receipt=probe_target_receipt,
+        review_snapshot=(
+            DatasetRegressionReviewSnapshot(
+                review_id=active_review.review_id,
+                status="confirmed",
+                severity=active_review.severity,
+                reviewer=active_review.reviewer,
+                reason=active_review.reason,
+                reviewed_at=active_review.reviewed_at.isoformat(),
+            )
+            if probe_target_receipt is not None
+            else None
+        ),
+        discovery_cross_examination=(
+            finding_case.cross_examination.model_dump(mode="json")
+            if probe_target_receipt is not None and finding_case.cross_examination is not None
+            else None
+        ),
         source_suite_sha256=evaluation.suite_sha256,
         observation_authority=evaluation.observation_authority,
         state_observation_authority=(
@@ -661,6 +837,14 @@ def _invariant_rule_definition(rule: DatasetInvariantRuleResult) -> DatasetInvar
 
 def _target_config_sha256(config: JsonHttpTargetConfig) -> str:
     return dataset_regression_target_config_sha256(config)
+
+
+def _environment_regression_target_config(
+    regression_case: DatasetRegressionCase,
+) -> JsonHttpTargetConfig:
+    if regression_case.target.kind != "environment_http" or regression_case.target.config is None:
+        raise ValueError("regression case does not contain an environment target config")
+    return regression_case.target.config
 
 
 def _create_private_output(path: Path) -> TextIO:

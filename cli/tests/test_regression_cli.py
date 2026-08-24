@@ -35,6 +35,11 @@ from ul.dataset_invariants import (
 )
 from ul_cli import dataset_regression as regression_cli
 from ul_cli import dataset_review
+from ul_cli import probe as probe_cli
+from ul_cli.dataset_review import (
+    DatasetEvidenceSemanticSettings,
+    create_dataset_evidence_run_context,
+)
 from ul_cli.main import app
 
 runner = CliRunner()
@@ -320,6 +325,40 @@ def _technical_details() -> dict[str, Any]:
 def _write_evidence(path: Path) -> None:
     path.write_text(
         json.dumps(_evidence_record(), ensure_ascii=False, separators=(",", ":")) + "\n",
+        encoding="utf-8",
+    )
+
+
+def _write_probe_evidence(path: Path, target_receipt: dict[str, Any]) -> None:
+    record = _evidence_record()
+    technical_result = DatasetEvaluationResult.model_validate(
+        record["technical_details"], strict=False
+    )
+    invariant_evaluation = cast(dict[str, Any], record["invariant_evaluation"])
+    run_context = create_dataset_evidence_run_context(
+        selected_records=(technical_result.source,),
+        operators=(("input.surface.disfluency_repeat", "1.0.0"),),
+        repetitions=3,
+        invariant_suite_sha256=cast(str, invariant_evaluation["suite_sha256"]),
+        target_receipt=target_receipt,
+        semantic_settings=DatasetEvidenceSemanticSettings(
+            provider="test",
+            endpoint_sha256="b" * 64,
+            model="test",
+            render_model="test",
+            equivalence_model="test",
+            max_input_chars=100_000,
+            max_output_tokens=1_000,
+            max_render_tokens=1_000,
+            max_response_bytes=1_000_000,
+            timeout_seconds=30,
+        ),
+    )
+    record["schema_version"] = "1.8.0"
+    record["evaluation_mode"] = "variance"
+    record["run_context"] = run_context.model_dump(mode="json")
+    path.write_text(
+        json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n",
         encoding="utf-8",
     )
 
@@ -1078,3 +1117,248 @@ def test_replay_escapes_terminal_controls_from_untrusted_case_errors(tmp_path: P
     assert "\x1b[31mPWN" not in replayed.output
     assert "\\u001b[31mPWN" in replayed.output
     assert not result_path.exists()
+
+
+class _ResponseOnlyServer(ThreadingHTTPServer):
+    authorization_headers: list[str | None]
+    requests: list[dict[str, Any]]
+
+
+class _ResponseOnlyHandler(BaseHTTPRequestHandler):
+    def do_POST(self) -> None:
+        server = cast(_ResponseOnlyServer, self.server)
+        payload = cast(
+            dict[str, Any],
+            json.loads(self.rfile.read(int(self.headers.get("Content-Length", "0")))),
+        )
+        server.requests.append(payload)
+        server.authorization_headers.append(self.headers.get("Authorization"))
+        response = json.dumps(
+            {
+                "response": {
+                    "invoice_reference": "AC-101",
+                    "requested_invoice_reference": "AC-100",
+                    "amount": "12600",
+                    "requested_amount": "12500",
+                }
+            }
+        ).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(response)))
+        self.end_headers()
+        self.wfile.write(response)
+
+    def log_message(self, format: str, *args: object) -> None:
+        return
+
+
+@contextmanager
+def _response_only_server() -> Generator[tuple[_ResponseOnlyServer, str]]:
+    server = _ResponseOnlyServer(("127.0.0.1", 0), _ResponseOnlyHandler)
+    server.authorization_headers = []
+    server.requests = []
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    host, port = cast(tuple[str, int], server.server_address)
+    try:
+        yield server, f"http://{host}:{port}/invoke"
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+    assert not thread.is_alive()
+
+
+def test_confirmed_direct_http_probe_finding_replays_with_same_secret_safe_target(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    secret = "UL57-HTTP-SECRET-CANARY"
+    monkeypatch.setenv("UL_ENVIRONMENT_UL57_AGENT_TOKEN", secret)
+    evidence = tmp_path / "probe-evidence.jsonl"
+    case_path = tmp_path / "http.regression.json"
+    result_path = tmp_path / "http.replay.json"
+
+    with _response_only_server() as (server, endpoint):
+        resolved_target = probe_cli._resolve_target(
+            endpoint,
+            allow_insecure_http=True,
+            header_from_env=["Authorization=UL_ENVIRONMENT_UL57_AGENT_TOKEN"],
+        )
+        _write_probe_evidence(evidence, probe_cli._target_evidence_receipt(resolved_target))
+        _confirm_finding(evidence)
+
+        saved = runner.invoke(
+            app,
+            [
+                "regression",
+                "save",
+                str(evidence),
+                FINDING_ID,
+                "--rule",
+                RULE_ID,
+                "--output",
+                str(case_path),
+                "--confirm-versioned-input",
+            ],
+        )
+        assert saved.exit_code == 0, saved.output
+        saved_case_text = case_path.read_text()
+        saved_case = json.loads(saved_case_text)
+        assert secret not in saved_case_text
+        assert saved_case["variation"]["historical_reference_output"] == {}
+        assert saved_case["review_snapshot"]["status"] == "confirmed"
+        assert saved_case["target"]["receipt"]["supports_state_observation"] is False
+
+        replayed = runner.invoke(
+            app,
+            [
+                "regression",
+                "replay",
+                str(case_path),
+                "--target",
+                endpoint,
+                "--header-from-env",
+                "Authorization=UL_ENVIRONMENT_UL57_AGENT_TOKEN",
+                "--confirm-target",
+                resolved_target.confirmation_sha256,
+                "--allow-target-network",
+                "--allow-insecure-http",
+                "--max-target-calls",
+                "3",
+                "--output",
+                str(result_path),
+            ],
+        )
+
+    assert replayed.exit_code == 1, replayed.output
+    assert server.authorization_headers == [secret, secret, secret]
+    assert len(server.requests) == 3
+    assert "Response evidence: observed" in replayed.output
+    assert "Trajectory evidence: unavailable" in replayed.output
+    assert "Committed-state evidence: unavailable" in replayed.output
+    assert secret not in replayed.output
+
+
+def test_probe_regression_rejects_changed_http_target_before_execution(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("UL_ENVIRONMENT_UL57_AGENT_TOKEN", "secret")
+    evidence = tmp_path / "probe-evidence.jsonl"
+    case_path = tmp_path / "http.regression.json"
+    result_path = tmp_path / "http.replay.json"
+    with _response_only_server() as (discovery_server, discovery_endpoint):
+        resolved_target = probe_cli._resolve_target(
+            discovery_endpoint,
+            allow_insecure_http=True,
+            header_from_env=["Authorization=UL_ENVIRONMENT_UL57_AGENT_TOKEN"],
+        )
+        _write_probe_evidence(evidence, probe_cli._target_evidence_receipt(resolved_target))
+        _confirm_finding(evidence)
+        saved = runner.invoke(
+            app,
+            [
+                "regression",
+                "save",
+                str(evidence),
+                FINDING_ID,
+                "--rule",
+                RULE_ID,
+                "--output",
+                str(case_path),
+                "--confirm-versioned-input",
+            ],
+        )
+        assert saved.exit_code == 0, saved.output
+        assert discovery_server.requests == []
+
+    with _response_only_server() as (changed_server, changed_endpoint):
+        replayed = runner.invoke(
+            app,
+            [
+                "regression",
+                "replay",
+                str(case_path),
+                "--target",
+                changed_endpoint,
+                "--header-from-env",
+                "Authorization=UL_ENVIRONMENT_UL57_AGENT_TOKEN",
+                "--allow-target-network",
+                "--allow-insecure-http",
+                "--max-target-calls",
+                "3",
+                "--output",
+                str(result_path),
+            ],
+        )
+
+    assert replayed.exit_code == 2
+    assert "does not match" in replayed.output
+    assert changed_server.requests == []
+    assert not result_path.exists()
+
+
+def test_confirmed_callable_probe_finding_replays_without_environment_bridge(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (tmp_path / "customer_agent.py").write_text(
+        """
+def invoke(value):
+    return {
+        "invoice_reference": "AC-101",
+        "requested_invoice_reference": "AC-100",
+        "amount": "12600",
+        "requested_amount": "12500",
+    }
+""".lstrip(),
+        encoding="utf-8",
+    )
+    evidence = tmp_path / "probe-evidence.jsonl"
+    case_path = tmp_path / "callable.regression.json"
+    result_path = tmp_path / "callable.replay.json"
+    resolved_target = probe_cli._resolve_target(
+        "customer_agent:invoke",
+        allow_insecure_http=False,
+        target_working_directory=tmp_path,
+    )
+    _write_probe_evidence(evidence, probe_cli._target_evidence_receipt(resolved_target))
+    _confirm_finding(evidence)
+    saved = runner.invoke(
+        app,
+        [
+            "regression",
+            "save",
+            str(evidence),
+            FINDING_ID,
+            "--rule",
+            RULE_ID,
+            "--output",
+            str(case_path),
+            "--confirm-versioned-input",
+        ],
+    )
+    assert saved.exit_code == 0, saved.output
+    monkeypatch.chdir(tmp_path)
+
+    replayed = runner.invoke(
+        app,
+        [
+            "regression",
+            "replay",
+            str(case_path),
+            "--target",
+            "customer_agent:invoke",
+            "--target-working-directory",
+            str(tmp_path),
+            "--confirm-target",
+            resolved_target.confirmation_sha256,
+            "--max-target-calls",
+            "3",
+            "--output",
+            str(result_path),
+        ],
+    )
+
+    assert replayed.exit_code == 1, replayed.output
+    assert "Response evidence: observed" in replayed.output
+    assert json.loads(case_path.read_text())["target"]["kind"] == "probe_target"
