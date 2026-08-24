@@ -3,6 +3,25 @@
 See ``README.md`` beside this file for the complete operator index.
 """
 
+from ul_core.augmentations.authoring import (
+    AugmentationDefinition,
+    AugmentationLibrary,
+    AugmentationRuntimeBinding,
+    AugmentationRuntimeKind,
+    AugmentationValidatorRuntime,
+    ConversationModifierBinding,
+    ConversationModifierRuntime,
+    DeterministicTransformBinding,
+    DeterministicTransformRuntime,
+    EnvironmentScheduleBinding,
+    EnvironmentScheduleRuntime,
+    FaultControlBinding,
+    FaultControlRuntime,
+    RegisteredAugmentation,
+    SemanticRendererBinding,
+    SemanticRendererRuntime,
+    ValidatorBinding,
+)
 from ul_core.augmentations.definitions import (
     AugmentationBinding,
     AugmentationRef,
@@ -21,22 +40,41 @@ from ul_core.augmentations.projections import (
 )
 from ul_core.augmentations.registry import (
     AugmentationRegistry,
+    ValidationResult,
     builtin_augmentation_registry,
 )
 
 __all__ = [
     "AugmentationBinding",
     "AugmentationChangeSet",
+    "AugmentationDefinition",
+    "AugmentationLibrary",
     "AugmentationProjection",
     "AugmentationRef",
     "AugmentationRegistry",
     "AugmentationRequirements",
+    "AugmentationRuntimeBinding",
+    "AugmentationRuntimeKind",
     "AugmentationTargetSurface",
+    "AugmentationValidatorRuntime",
     "BuiltinAugmentationCatalog",
     "BuiltinAugmentationSpec",
+    "ConversationModifierBinding",
+    "ConversationModifierRuntime",
+    "DeterministicTransformBinding",
+    "DeterministicTransformRuntime",
+    "EnvironmentScheduleBinding",
+    "EnvironmentScheduleRuntime",
+    "FaultControlBinding",
+    "FaultControlRuntime",
     "ProjectionContract",
     "ProjectionTarget",
     "ProjectionTargetOperation",
+    "RegisteredAugmentation",
+    "SemanticRendererBinding",
+    "SemanticRendererRuntime",
+    "ValidationResult",
+    "ValidatorBinding",
     "builtin_augmentation_catalog",
     "builtin_augmentation_registry",
 ]
