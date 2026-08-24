@@ -83,6 +83,11 @@ from ul_cli.finding_reference import (
     finding_reference_key_path,
     resolve_finding_reference_context,
 )
+from ul_cli.local_target_resolution import (
+    ResolvedLocalTarget,
+    local_target_evidence_receipt,
+    resolve_local_target,
+)
 
 from ..evidence.context import build_dataset_evidence_run_context
 from ..evidence.persistence import (
@@ -233,6 +238,27 @@ def evaluate_dataset(
             dir_okay=False,
             readable=True,
             help="Connection to the customer's agent environment API.",
+        ),
+    ] = None,
+    target: Annotated[
+        str | None,
+        typer.Option(
+            "--target",
+            help="Python module:callable or local callable/command target configuration JSON.",
+        ),
+    ] = None,
+    target_artifact: Annotated[
+        list[Path] | None,
+        typer.Option(
+            "--target-artifact",
+            help="Additional command worker artifact to hash and bind; repeat as needed.",
+        ),
+    ] = None,
+    confirm_target: Annotated[
+        str | None,
+        typer.Option(
+            "--confirm-target",
+            help="Confirm the exact local executable, artifacts, environment, and callable digest.",
         ),
     ] = None,
     output: Annotated[
@@ -397,13 +423,17 @@ def evaluate_dataset(
     higher-precedence controls. OpenRouter remains the default; set
     UL_DATASET_SEMANTIC_PROVIDER=openai-compatible for a customer-controlled endpoint.
 
-    UL calls only the configured customer-managed environment API through an explicit
+    UL calls only the explicitly configured customer test target. Local callable and command
+    targets run in a bounded child process. HTTP environments use their explicit
     reset/setup/execute/snapshot lifecycle. Production observations are passive source data and
-    cannot select or configure the execution destination.
+    cannot select the execution destination.
 
     Example: ul dataset evaluate interactions.jsonl --environment-config environment.json
     --allow-environment-network --confirm-test-environment
     --output results.jsonl
+
+    Local: ul dataset evaluate interactions.jsonl --target agent:invoke
+    --confirm-test-environment --confirm-target DIGEST --output results.jsonl
 
     Discover operators: ul augmentations list --mode dataset_variation
     Augmentation retention: --augmentations-output PATH or --no-save-augmentations
@@ -479,6 +509,19 @@ def evaluate_dataset(
         if redaction_state is None and recorded_command.redaction_state_path is not None:
             redaction_state = Path(recorded_command.redaction_state_path)
     repetitions = repetitions or 3
+    if environment_config is not None and target is not None:
+        raise typer.BadParameter(
+            "--target cannot be combined with --environment-config",
+            param_hint="--target",
+        )
+    if target_artifact and target is None:
+        raise typer.BadParameter(
+            "--target-artifact requires --target", param_hint="--target-artifact"
+        )
+    if confirm_target is not None and target is None:
+        raise typer.BadParameter(
+            "--confirm-target requires --target", param_hint="--confirm-target"
+        )
     if repetitions > _MAXIMUM_REPETITIONS:
         raise typer.BadParameter(
             f"repetitions cannot exceed {_MAXIMUM_REPETITIONS}",
@@ -572,12 +615,12 @@ def evaluate_dataset(
             selected_records = protect_interaction_records(selected_records, redaction_engine)
         all_selected_records = selected_records
         if not dry_run and resume is None:
-            if environment_config is None:
+            if environment_config is None and target is None:
                 raise typer.BadParameter(
-                    "execution requires --environment-config",
-                    param_hint="--environment-config",
+                    "execution requires --target or --environment-config",
+                    param_hint="--target",
                 )
-            if not allow_environment_network:
+            if environment_config is not None and not allow_environment_network:
                 raise typer.BadParameter(
                     "execution requires --allow-environment-network",
                     param_hint="--allow-environment-network",
@@ -587,6 +630,14 @@ def evaluate_dataset(
                     TEST_ENVIRONMENT_CONFIRMATION_MESSAGE,
                     param_hint="--confirm-test-environment",
                 )
+        loaded_local_target: ResolvedLocalTarget | None = (
+            resolve_local_target(
+                target,
+                explicit_artifacts=tuple(target_artifact or ()),
+            )
+            if target is not None
+            else None
+        )
         loaded_target_config = (
             load_json_http_environment_config(environment_config)
             if environment_config is not None
@@ -597,6 +648,13 @@ def evaluate_dataset(
                 else None
             )
         )
+        if (
+            resume is not None
+            and recorded_manifest_for_resume is not None
+            and recorded_manifest_for_resume.run_context.target.kind == "probe_target"
+            and loaded_local_target is None
+        ):
+            raise ValueError("local target resume requires the same explicit --target")
         if expected_environment_origin is not None:
             if loaded_target_config is None:
                 raise ValueError("saved environment origin requires --environment-config")
@@ -633,8 +691,17 @@ def evaluate_dataset(
                     "committed-state invariants require the stateful-lifecycle adapter tier; "
                     "isolated-response targets provide response evidence only"
                 )
+        if (
+            loaded_local_target is not None
+            and invariant_suite is not None
+            and invariant_suite.observation_authority == "committed_state_snapshot"
+        ):
+            raise ValueError(
+                "committed-state invariants require the stateful-lifecycle adapter tier; "
+                "local targets provide response evidence only"
+            )
         normalized_target_config = loaded_target_config
-        if resume is not None and normalized_target_config is None:
+        if resume is not None and normalized_target_config is None and loaded_local_target is None:
             raise ValueError("--resume requires a recorded or explicit environment configuration")
         target_calls_per_execution = (
             json_http_environment_calls_per_execution(normalized_target_config)
@@ -680,13 +747,18 @@ def evaluate_dataset(
                 repetitions=repetitions,
                 invariant_suite=invariant_suite,
                 target_config=normalized_target_config,
+                target_receipt=(
+                    local_target_evidence_receipt(loaded_local_target)
+                    if loaded_local_target is not None
+                    else None
+                ),
                 settings=settings,
                 redaction_policy_sha256=(
                     redaction_engine.policy.digest if redaction_engine is not None else None
                 ),
                 redaction_coverage=redaction_coverage,
             )
-            if normalized_target_config is not None
+            if normalized_target_config is not None or loaded_local_target is not None
             else None
         )
         augmentation_generation_context = create_dataset_augmentation_generation_context(
@@ -972,13 +1044,15 @@ def evaluate_dataset(
         )
 
     if dry_run:
+        if loaded_local_target is not None:
+            _print_local_target_identity(loaded_local_target)
         print_dataset_plan(
             record_count=len(records),
             selected_count=len(selected_records),
             skipped_count=skipped_count,
             operator_ids=selected_operators,
             evaluation_mode=evaluation_mode,
-            target_configured=environment_config is not None,
+            target_configured=environment_config is not None or target is not None,
             target_endpoint=(
                 json_http_environment_config_urls(loaded_target_config)[0]
                 if loaded_target_config is not None
@@ -1090,10 +1164,10 @@ def evaluate_dataset(
             raise typer.Exit(code=1)
         raise typer.Exit(code=0)
 
-    if loaded_target_config is None:
+    if loaded_target_config is None and loaded_local_target is None:
         raise typer.BadParameter(
-            "execution requires a recorded or explicit environment configuration",
-            param_hint="--environment-config",
+            "execution requires a recorded or explicit target",
+            param_hint="--target",
         )
     if not confirm_test_environment:
         raise typer.BadParameter(
@@ -1126,19 +1200,31 @@ def evaluate_dataset(
         )
 
     try:
-        assert loaded_target_config is not None
-        if not allow_environment_network:
-            raise ValueError("environment execution requires --allow-environment-network")
-        target = JsonHttpEnvironmentConnection.from_config(
-            loaded_target_config,
-            test_environment_confirmed=True,
-            allow_insecure_http=allow_insecure_http,
-            max_environment_api_calls=max_environment_api_calls,
-        )
+        if loaded_local_target is not None:
+            _print_local_target_identity(loaded_local_target)
+            if confirm_target != loaded_local_target.confirmation_sha256:
+                raise ValueError(
+                    "local execution requires --confirm-target with the exact displayed digest"
+                )
+            loaded_local_target.revalidate_identity()
+            execution_target = loaded_local_target.create_connection(
+                campaign_plan.calls.total_environment_api,
+                loaded_local_target.maximum_active_target_seconds,
+            )
+        else:
+            assert loaded_target_config is not None
+            if not allow_environment_network:
+                raise ValueError("environment execution requires --allow-environment-network")
+            execution_target = JsonHttpEnvironmentConnection.from_config(
+                loaded_target_config,
+                test_environment_confirmed=True,
+                allow_insecure_http=allow_insecure_http,
+                max_environment_api_calls=max_environment_api_calls,
+            )
     except ValueError as error:
         raise typer.BadParameter(
             str(error),
-            param_hint="--environment-config",
+            param_hint="--target" if loaded_local_target is not None else "--environment-config",
         ) from None
 
     progress_runtime = create_campaign_progress_runtime(
@@ -1191,7 +1277,7 @@ def evaluate_dataset(
                 progress_runtime.control,
                 flush_progress_boundary,
             ):
-                asyncio.run(target.aclose())
+                asyncio.run(execution_target.aclose())
                 if trial_journal is not None:
                     trial_journal.close()
                 raise typer.Exit(code=130)
@@ -1199,14 +1285,14 @@ def evaluate_dataset(
             progress_runtime.tracker.emit(status="failed", stage="terminal")
             if trial_journal is not None:
                 trial_journal.close()
-            asyncio.run(target.aclose())
+            asyncio.run(execution_target.aclose())
             print_dataset_plain(f"Evaluation stopped before campaign execution: {error}")
             raise typer.Exit(code=2) from None
         except (OSError, ValueError) as error:
             progress_runtime.tracker.emit(status="failed", stage="terminal")
             if trial_journal is not None:
                 trial_journal.close()
-            asyncio.run(target.aclose())
+            asyncio.run(execution_target.aclose())
             message = str(error) if isinstance(error, ValueError) else error.__class__.__name__
             raise typer.BadParameter(
                 f"cannot safely persist evaluator preflight ({message})",
@@ -1292,7 +1378,7 @@ def evaluate_dataset(
             augmentation_ledger.close()
         if output_stream is not None and not output_stream.closed:
             output_stream.close()
-        asyncio.run(target.aclose())
+        asyncio.run(execution_target.aclose())
         message = str(error) if isinstance(error, ValueError) else error.__class__.__name__
         raise typer.BadParameter(
             f"cannot safely open persistence file ({message})",
@@ -1336,7 +1422,7 @@ def evaluate_dataset(
                     selected_records,
                     selected_operators,
                     settings,
-                    target,
+                    execution_target,
                     output_stream,
                     repetitions=repetitions,
                     max_environment_api_calls=max_environment_api_calls,
@@ -1360,7 +1446,7 @@ def evaluate_dataset(
                     selected_records,
                     selected_operators,
                     settings,
-                    target,
+                    execution_target,
                     output_stream,
                     repetitions=repetitions,
                     max_environment_api_calls=max_environment_api_calls,
@@ -1451,6 +1537,26 @@ def evaluate_dataset(
         raise typer.Exit(code=2)
     if has_review_findings or (resume_evidence is not None and resume_evidence.has_review_findings):
         raise typer.Exit(code=1)
+
+
+def _print_local_target_identity(target: ResolvedLocalTarget) -> None:
+    confirmation = target.confirmation
+    print_dataset_plain("UL active-probe target")
+    print_dataset_plain(f"  Kind: {target.kind}")
+    print_dataset_plain(f"  Config sha256: {target.config_sha256}")
+    print_dataset_plain(f"  Confirmation sha256: {target.confirmation_sha256}")
+    print_dataset_plain(
+        f"  Executable: {confirmation.executable.path} ({confirmation.executable.sha256})"
+    )
+    for artifact in confirmation.artifacts:
+        print_dataset_plain(f"  Artifact: {artifact.path} ({artifact.sha256})")
+    for environment in confirmation.environment:
+        print_dataset_plain(
+            f"  Environment: {environment.name} value sha256 {environment.value_sha256}"
+        )
+    if confirmation.callable is not None:
+        print_dataset_plain(f"  Callable: {confirmation.callable}")
+    print_dataset_plain("Use only a dedicated test target that cannot cause real-world effects.")
 
 
 def _manifest_incompatibility_reason(

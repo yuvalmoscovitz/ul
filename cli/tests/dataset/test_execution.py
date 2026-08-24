@@ -1,3 +1,5 @@
+# ruff: noqa: E501
+
 from __future__ import annotations
 
 import json
@@ -28,7 +30,17 @@ from ul_cli.dataset_trial_journal import (
     open_dataset_trial_journal,
     read_dataset_run_manifest,
 )
+from ul_cli.local_target_resolution import resolve_local_target
 from ul_cli.main import app as root_app
+from ul_core.dataset import (
+    EvidenceReference,
+    ObservedOutcome,
+    RenderedUserInput,
+    RequestUnit,
+    SemanticEquivalenceAssessment,
+    SemanticFrame,
+    UserInputRecord,
+)
 
 from ._factories import (
     _evaluator_preflight,
@@ -42,6 +54,92 @@ from ._files import (
 
 runner = CliRunner()
 _ANSI_ESCAPE_PATTERN = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+
+
+class _LocalEvaluationSemanticModel:
+    async def __aenter__(self) -> _LocalEvaluationSemanticModel:
+        return self
+
+    async def __aexit__(self, *args: object) -> None:
+        return None
+
+    def reuse_preflight(self, result: object) -> None:
+        del result
+
+    async def deconstruct(
+        self,
+        record: InteractionRecord | UserInputRecord,
+        reference_frame: SemanticFrame | None = None,
+    ) -> SemanticFrame:
+        if not isinstance(record, InteractionRecord):
+            assert reference_frame is not None
+            return reference_frame.model_copy(update={"interaction_id": record.id})
+        return SemanticFrame(
+            interaction_id=record.id,
+            request_units=(
+                RequestUnit(
+                    id="lookup-request",
+                    evidence=(
+                        EvidenceReference(
+                            source="input",
+                            json_pointer="/raw_input",
+                            text_quote=None,
+                        ),
+                    ),
+                    confidence=1,
+                    status="explicit",
+                    mode="ask",
+                    predicate="lookup",
+                ),
+            ),
+            outcomes=(
+                ObservedOutcome(
+                    id="lookup-outcome",
+                    evidence=(
+                        EvidenceReference(
+                            source="output",
+                            json_pointer="/raw_observed_output/action",
+                            text_quote=None,
+                        ),
+                        EvidenceReference(
+                            source="output",
+                            json_pointer="/raw_observed_output/ticket",
+                            text_quote=None,
+                        ),
+                    ),
+                    confidence=1,
+                    status="observed",
+                    request_unit_ids=("lookup-request",),
+                    position=0,
+                    kind="action",
+                    predicate="lookup",
+                    fields={"ticket": 42},
+                ),
+            ),
+            extractor_version="local-evaluation-test",
+        )
+
+    async def render(
+        self,
+        raw_input: str,
+        instruction: str,
+        *,
+        allow_temporary_value: bool = False,
+    ) -> RenderedUserInput:
+        del instruction, allow_temporary_value
+        return RenderedUserInput(text=raw_input)
+
+    async def verify(
+        self,
+        source_input: str,
+        candidate_input: str,
+    ) -> SemanticEquivalenceAssessment:
+        del source_input, candidate_input
+        return SemanticEquivalenceAssessment(
+            verdict="equivalent",
+            explanation="The requests are equivalent.",
+            verifier_version="local-evaluation-test",
+        )
 
 
 @pytest.fixture(autouse=True)
@@ -156,6 +254,200 @@ def test_execution_requires_config_network_confirmation_environment_and_output(
         assert result.exit_code != 0
         normalized_output = " ".join(_ANSI_ESCAPE_PATTERN.sub("", result.output).split())
         assert expected_error in normalized_output
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+def test_full_dataset_evaluation_runs_local_callable_through_worker_boundary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    asynchronous: bool,
+) -> None:
+    dataset = tmp_path / "interactions.jsonl"
+    output = tmp_path / "results.jsonl"
+    dataset.write_text(
+        '{"id":"case-1","input":"Return status for ticket 42.",'
+        '"output":{"action":"lookup","ticket":42}}\n',
+        encoding="utf-8",
+    )
+    function_prefix = "async " if asynchronous else ""
+    await_statement = "    await asyncio.sleep(0)\n" if asynchronous else ""
+    (tmp_path / "customer_agent.py").write_text(
+        "import asyncio\n\n"
+        f"{function_prefix}def run(value):\n"
+        f"{await_statement}"
+        "    return {'action': 'lookup', 'ticket': 42, 'received': value}\n",
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("UL_LIVE", "true")
+    monkeypatch.setenv("OPEN_ROUTER_API_KEY", "test-key")
+    semantic_model = _LocalEvaluationSemanticModel()
+
+    async def successful_preflight(_settings: object) -> object:
+        return _evaluator_preflight()
+
+    monkeypatch.setattr(command_module, "load_dataset_semantic_settings", _settings)
+    monkeypatch.setattr(command_module, "preflight_evaluator", successful_preflight)
+    monkeypatch.setattr(
+        runner_module,
+        "create_semantic_model_deconstructor",
+        lambda _settings: semantic_model,
+    )
+    target = resolve_local_target("customer_agent:run")
+
+    result = runner.invoke(
+        root_app,
+        [
+            "dataset",
+            "evaluate",
+            str(dataset),
+            "--target",
+            "customer_agent:run",
+            "--confirm-target",
+            target.confirmation_sha256,
+            "--confirm-test-environment",
+            "--repetitions",
+            "2",
+            "--output",
+            str(output),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    saved = json.loads(output.read_text(encoding="utf-8").splitlines()[1])
+    assert saved["run_context"]["target"]["kind"] == "probe_target"
+    assert saved["run_context"]["fixture"]["status"] == "not_required"
+    assert saved["run_context"]["target"]["receipt"]["supports_state_observation"] is False
+    assert len(saved["technical_details"]["baseline"]["trial_set"]["trials"]) == 2
+    assert (
+        saved["technical_details"]["baseline"]["trial_set"]["trials"][0]["execution_evidence"][
+            "final_response"
+        ]["ticket"]
+        == 42
+    )
+    if not asynchronous:
+        missing_target_resume = runner.invoke(
+            root_app,
+            ["dataset", "evaluate", "--resume", str(output), "--dry-run"],
+        )
+        assert missing_target_resume.exit_code == 2
+        normalized_resume_error = " ".join(
+            _ANSI_ESCAPE_PATTERN.sub("", missing_target_resume.output).split()
+        )
+        assert "local target resume requires the same explicit --target" in normalized_resume_error
+        resumed = runner.invoke(
+            root_app,
+            [
+                "dataset",
+                "evaluate",
+                "--resume",
+                str(output),
+                "--target",
+                "customer_agent:run",
+                "--confirm-target",
+                target.confirmation_sha256,
+                "--dry-run",
+            ],
+        )
+        assert resumed.exit_code == 0, resumed.output
+        assert "Resume compatible: 1 complete interaction(s) skipped; 0 remaining" in (
+            resumed.output
+        )
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX executable-script test")
+def test_full_dataset_evaluation_runs_command_target_through_worker_boundary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    dataset = tmp_path / "interactions.jsonl"
+    output = tmp_path / "results.jsonl"
+    dataset.write_text(
+        '{"id":"case-1","input":"Return status for ticket 42.",'
+        '"output":{"action":"lookup","ticket":42}}\n',
+        encoding="utf-8",
+    )
+    command = tmp_path / "command-worker"
+    command.write_text(
+        r"""#!/bin/sh
+read -r line
+printf '%s\n' '{"protocol_version":"1.0.0","type":"ready","request_id":"startup","runtime":{"name":"sh","version":"1"}}'
+while read -r line; do
+  request_id=$(printf '%s' "$line" | /usr/bin/sed -n 's/.*"request_id":"\([^"]*\)".*/\1/p')
+  case "$line" in
+    *'"type":"session_start"'*)
+      session_id=$(printf '%s' "$line" | /usr/bin/sed -n 's/.*"session_id":"\([^"]*\)".*/\1/p')
+      printf '{"protocol_version":"1.0.0","type":"session_ready","request_id":"%s","session_id":"%s"}\n' "$request_id" "$session_id"
+      ;;
+    *'"type":"invoke"'*)
+      printf '{"protocol_version":"1.0.0","type":"result","request_id":"%s","response":{"action":"lookup","ticket":42},"execution_events":[]}\n' "$request_id"
+      ;;
+    *'"type":"shutdown"'*)
+      printf '%s\n' '{"protocol_version":"1.0.0","type":"shutdown_complete","request_id":"shutdown"}'
+      exit 0
+      ;;
+  esac
+done
+""",
+        encoding="utf-8",
+    )
+    command.chmod(0o700)
+    config = tmp_path / "target.json"
+    config.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "kind": "command",
+                "target_id": "dataset-command-agent",
+                "working_directory": str(tmp_path),
+                "argv": [str(command)],
+                "environment_allowlist": [],
+                "limits": {},
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("UL_LIVE", "true")
+    monkeypatch.setenv("OPEN_ROUTER_API_KEY", "test-key")
+
+    async def successful_preflight(_settings: object) -> object:
+        return _evaluator_preflight()
+
+    monkeypatch.setattr(command_module, "load_dataset_semantic_settings", _settings)
+    monkeypatch.setattr(command_module, "preflight_evaluator", successful_preflight)
+    monkeypatch.setattr(
+        runner_module,
+        "create_semantic_model_deconstructor",
+        lambda _settings: _LocalEvaluationSemanticModel(),
+    )
+    resolved_target = resolve_local_target(str(config))
+    result = runner.invoke(
+        root_app,
+        [
+            "dataset",
+            "evaluate",
+            str(dataset),
+            "--target",
+            str(config),
+            "--confirm-target",
+            resolved_target.confirmation_sha256,
+            "--confirm-test-environment",
+            "--repetitions",
+            "1",
+            "--output",
+            str(output),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    saved = json.loads(output.read_text(encoding="utf-8").splitlines()[1])
+    receipt = saved["run_context"]["target"]["receipt"]
+    assert receipt["kind"] == "command"
+    assert receipt["supports_state_observation"] is False
+    assert saved["technical_details"]["baseline"]["trial_set"]["trials"][0]["execution_evidence"][
+        "final_response"
+    ] == {"action": "lookup", "ticket": 42}
 
 
 def test_execution_refuses_to_overwrite_output_before_model_setup(
