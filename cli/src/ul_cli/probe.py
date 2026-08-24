@@ -702,7 +702,7 @@ def probe(
         typer.Option(
             "--operator",
             help=(
-                "Qualified augmentation ID; repeat as needed. Run "
+                "Available dataset augmentation ID; repeat as needed. Run "
                 "'ul augmentations list --mode dataset_variation' for values."
             ),
         ),

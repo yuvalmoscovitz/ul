@@ -185,11 +185,12 @@ request content.
 Only after a
 successful smoke does UL save private target/dataset bindings in `.ul/probe.json`.
 
-UL then selects at most ten examples, recommends the low-risk
-`input.surface.typing_noise` operator, and shows exact original/probe target calls, environment API
-requests, maximum semantic calls, completion-token bound, monetary-estimate availability, one
-repetition, and maximum active wall time. Declining the second confirmation stops with zero semantic
-calls.
+UL uses the configured case limit and repetitions. Their defaults are ten examples and one
+repetition. The default operator is `input.surface.typing_noise`; `--operator` selects one or more
+available dataset augmentations. Before execution, UL shows exact original/probe target calls,
+environment API requests, maximum semantic calls, completion-token bound, monetary-estimate
+availability, selected repetitions, and maximum active wall time. Declining the second confirmation
+stops with zero semantic calls.
 
 Raw target response, normalized result, trajectory/tool observations, and independently observed
 state remain four separate evidence channels. A target-declared outcome is authoritative only as a
@@ -245,7 +246,7 @@ ul probe interactions.jsonl \
   --output .ul/runs/probe-evidence.jsonl
 ```
 
-Repeat `--operator` to combine qualified augmentations. Discover available values with
+Repeat `--operator` to combine available dataset augmentations. Discover selectable values with
 `ul augmentations list --mode dataset_variation`. Repetitions apply to both the fresh original and
 every accepted variation. UL includes these choices and their request, token, time, and known cost
 bounds in the paid/network confirmation receipt. It writes normal private UL evidence JSONL and
