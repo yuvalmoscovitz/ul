@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from ul import (
     AugmentationDefinition,
-    AugmentationLibrary,
     AugmentationProjection,
     AugmentationRef,
     ConversationModifierBinding,
@@ -16,6 +15,7 @@ from ul import (
     SemanticRendererBinding,
     ValidationResult,
     ValidatorBinding,
+    builtin_augmentation_library,
 )
 
 
@@ -63,7 +63,7 @@ conversation_projection = ProjectionContract(reads=("conversation",), writes=("c
 environment_projection = ProjectionContract(reads=("state",), writes=("environment",))
 semantic_instruction = "Preserve task meaning while applying the requested communication change."
 
-library = AugmentationLibrary()
+library = builtin_augmentation_library()
 registration = library.register(
     definition,
     DeterministicTransformBinding(

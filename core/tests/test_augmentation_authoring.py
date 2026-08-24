@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
+from threading import Barrier
 from typing import cast
 
 import pytest
@@ -16,8 +18,13 @@ from ul_core.augmentations import (
     ProjectionContract,
     SemanticRendererBinding,
     ValidatorBinding,
+    builtin_augmentation_catalog,
+    builtin_augmentation_library,
 )
-from ul_core.augmentations.authoring import AugmentationRuntimeBinding
+from ul_core.augmentations.authoring import (
+    AugmentationRuntimeBinding,
+    DeterministicTransformRuntime,
+)
 from ul_core.augmentations.registry import ValidationResult
 from ul_core.models import ConversationTurn, EnvironmentEvent, Scenario
 
@@ -119,6 +126,28 @@ def test_private_author_registers_and_resolves_every_runtime_kind() -> None:
         assert library.get_binding(product_definition.ref.id, binding.kind) is binding
 
 
+def test_builtin_and_private_operators_share_the_same_library_contract() -> None:
+    library = builtin_augmentation_library()
+    catalog = builtin_augmentation_catalog()
+
+    assert len(library.list(latest_only=False)) == len(catalog.augmentations)
+    rephrase = library.get("input.surface.rephrase")
+    assert rephrase.definition.ref == catalog.get("input.surface.rephrase").ref
+    assert {binding.kind for binding in rephrase.bindings} == {
+        "semantic_renderer",
+        "validator",
+    }
+    correction = library.get("conversation.correction_after_first_response")
+    assert {binding.kind for binding in correction.bindings} == {
+        "deterministic_transform",
+        "conversation_modifier",
+    }
+
+    private_definition = definition()
+    library.register(private_definition, bindings(private_definition.ref)[0])
+    assert library.get(private_definition.ref.id).definition == private_definition
+
+
 def test_registration_is_atomic_when_a_late_binding_has_a_mismatched_reference() -> None:
     product_definition = definition()
     candidate_bindings = list(bindings(product_definition.ref))
@@ -171,8 +200,35 @@ def test_binding_rejects_runtime_with_the_wrong_protocol() -> None:
             projection=ProjectionContract(
                 reads=("structured_input",), writes=("structured_input",)
             ),
-            runtime=cast(object, object()),
+            runtime=cast(DeterministicTransformRuntime, object()),
         )
+
+
+def test_binding_rejects_non_callable_and_wrong_shape_runtime_members() -> None:
+    product_definition = definition()
+
+    class NonCallableTransform:
+        ref = product_definition.ref
+        transform = 42
+
+    class WrongShapeTransform:
+        ref = product_definition.ref
+
+        def transform(self) -> Scenario:
+            raise AssertionError
+
+    for runtime, message in (
+        (NonCallableTransform(), "transform member must be callable"),
+        (WrongShapeTransform(), "transform member must accept 2 positional arguments"),
+    ):
+        with pytest.raises(ValidationError, match=message):
+            DeterministicTransformBinding(
+                ref=product_definition.ref,
+                projection=ProjectionContract(
+                    reads=("structured_input",), writes=("structured_input",)
+                ),
+                runtime=runtime,  # type: ignore[arg-type]
+            )
 
 
 def test_specialized_bindings_reject_mismatched_projection_surfaces() -> None:
@@ -180,21 +236,87 @@ def test_specialized_bindings_reject_mismatched_projection_surfaces() -> None:
     runtime = PrivateRuntimes(product_definition.ref)
     input_projection = ProjectionContract(reads=("structured_input",), writes=("structured_input",))
 
-    with pytest.raises(ValidationError, match="must write conversation"):
+    with pytest.raises(ValidationError, match="may only write conversation"):
         ConversationModifierBinding(
             ref=product_definition.ref,
             projection=input_projection,
             runtime=runtime,
         )
-    with pytest.raises(ValidationError, match="must write environment"):
+    with pytest.raises(ValidationError, match="may only write environment"):
         EnvironmentScheduleBinding(
             ref=product_definition.ref,
             projection=input_projection,
             runtime=runtime,
         )
-    with pytest.raises(ValidationError, match="must write environment"):
+    with pytest.raises(ValidationError, match="may only write environment"):
         FaultControlBinding(
             ref=product_definition.ref,
             projection=input_projection,
             runtime=runtime,
         )
+
+
+def test_specialized_bindings_reject_extra_write_surfaces() -> None:
+    product_definition = definition()
+    runtime = PrivateRuntimes(product_definition.ref)
+
+    with pytest.raises(ValidationError, match="structured input or conversation"):
+        SemanticRendererBinding(
+            ref=product_definition.ref,
+            projection=ProjectionContract(
+                reads=("structured_input",),
+                writes=("structured_input", "environment"),
+            ),
+            runtime=runtime,
+            instruction="Preserve meaning.",
+        )
+    with pytest.raises(ValidationError, match="may only write conversation"):
+        ConversationModifierBinding(
+            ref=product_definition.ref,
+            projection=ProjectionContract(
+                reads=("conversation",), writes=("conversation", "environment")
+            ),
+            runtime=runtime,
+        )
+    for binding_type in (EnvironmentScheduleBinding, FaultControlBinding):
+        with pytest.raises(ValidationError, match="may only write environment"):
+            binding_type(
+                ref=product_definition.ref,
+                projection=ProjectionContract(reads=("state",), writes=("environment", "policy")),
+                runtime=runtime,
+            )
+
+
+def test_concurrent_duplicate_registration_has_one_winner() -> None:
+    product_definition = definition()
+    rendezvous = Barrier(2)
+
+    class RacingRuntime(PrivateRuntimes):
+        def __init__(self) -> None:
+            pass
+
+        @property
+        def ref(self) -> AugmentationRef:
+            rendezvous.wait(timeout=5)
+            return product_definition.ref
+
+    def register(runtime: RacingRuntime) -> object:
+        binding = DeterministicTransformBinding(
+            ref=product_definition.ref,
+            projection=ProjectionContract(
+                reads=("structured_input",), writes=("structured_input",)
+            ),
+            runtime=runtime,
+        )
+        try:
+            return library.register(product_definition, binding)
+        except ValueError as error:
+            return error
+
+    library = AugmentationLibrary()
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        outcomes = tuple(executor.map(register, (RacingRuntime(), RacingRuntime())))
+
+    assert sum(not isinstance(outcome, ValueError) for outcome in outcomes) == 1
+    assert sum(isinstance(outcome, ValueError) for outcome in outcomes) == 1
+    assert len(library.list()) == 1

@@ -17,10 +17,13 @@ from ul_core.augmentations.authoring import (
     EnvironmentScheduleRuntime,
     FaultControlBinding,
     FaultControlRuntime,
+    InstalledRuntimeBinding,
     RegisteredAugmentation,
+    RegisteredRuntimeBinding,
     SemanticRendererBinding,
     SemanticRendererRuntime,
     ValidatorBinding,
+    builtin_augmentation_library,
 )
 from ul_core.augmentations.registry import ValidationResult
 
@@ -59,11 +62,14 @@ __all__ = [
     "EnvironmentScheduleRuntime",
     "FaultControlBinding",
     "FaultControlRuntime",
+    "InstalledRuntimeBinding",
     "RegisteredAugmentation",
+    "RegisteredRuntimeBinding",
     "SemanticRendererBinding",
     "SemanticRendererRuntime",
     "ValidationResult",
     "ValidatorBinding",
+    "builtin_augmentation_library",
     "builtin_dataset_augmentation_operators",
     "create_augmentation_qualification_report",
     "create_dataset_augmentation_projection",

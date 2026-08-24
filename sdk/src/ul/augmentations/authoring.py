@@ -14,10 +14,13 @@ from ul_core.augmentations.authoring import (
     EnvironmentScheduleRuntime,
     FaultControlBinding,
     FaultControlRuntime,
+    InstalledRuntimeBinding,
     RegisteredAugmentation,
+    RegisteredRuntimeBinding,
     SemanticRendererBinding,
     SemanticRendererRuntime,
     ValidatorBinding,
+    builtin_augmentation_library,
 )
 from ul_core.augmentations.definitions import AugmentationRef
 from ul_core.augmentations.projections import AugmentationProjection, ProjectionContract
@@ -42,11 +45,14 @@ __all__ = [
     "EnvironmentScheduleRuntime",
     "FaultControlBinding",
     "FaultControlRuntime",
+    "InstalledRuntimeBinding",
     "ProjectionContract",
     "RegisteredAugmentation",
+    "RegisteredRuntimeBinding",
     "Scenario",
     "SemanticRendererBinding",
     "SemanticRendererRuntime",
     "ValidationResult",
     "ValidatorBinding",
+    "builtin_augmentation_library",
 ]
