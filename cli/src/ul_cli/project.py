@@ -254,7 +254,7 @@ def initialize_project(
         typer.Option(help="Allow a local HTTP environment API."),
     ] = False,
 ) -> None:
-    """Configure this project once for `ul run` and `ul report`."""
+    """Configure an advanced stateful-evidence project for `ul run`."""
     if evaluation_mode != "variance":
         raise typer.BadParameter(
             f"evaluation mode '{evaluation_mode}' is not implemented; use 'variance'. "
@@ -548,7 +548,7 @@ def run_project(
         typer.Option(help="Resume the latest run with evidence instead of starting a new run."),
     ] = False,
 ) -> None:
-    """Run the configured project, with optional one-run overrides."""
+    """Run an advanced project configured by `ul init`."""
     if (json_output or show_sensitive_values) and not dry_run:
         option = "--show-sensitive-values" if show_sensitive_values else "--json"
         raise typer.BadParameter(f"{option} requires --dry-run", param_hint=option)

@@ -12,7 +12,7 @@ def run_demo(
         typer.Option(help="New private evidence file; defaults to UL's private data directory."),
     ] = None,
 ) -> None:
-    """Show a model-free demonstration of a dataset evaluation."""
+    """See UL's model-free augment-and-compare workflow."""
     from ul_cli.demo_runner import run_demo as execute_demo
 
     execute_demo(output=output)

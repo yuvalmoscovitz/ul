@@ -39,155 +39,121 @@ connected agent is required.
 
 ## Quickstart
 
-Create a JSONL dataset with one interaction per line:
+Start with observed interactions and the test entry point your agent already exposes. Create
+`interactions.jsonl` with one interaction per line:
 
 ```json
-{"id":"case-1","input":"Pay AC-100.","output":{"action":"payment_committed","invoice":"AC-100"}}
+{"id":"case-1","input":"Return the status for ticket 42.","output":{"status":"open"}}
 ```
 
-Configure UL once:
+`output` is the response that was observed historically. UL uses it as reference evidence; it is
+not assumed to be correct.
+
+### Probe a Python callable
+
+If your existing `agent.py` contains:
+
+```python
+def invoke(value):
+    return {"response": value}
+```
+
+point UL at it directly:
 
 ```bash
-ul init interactions.jsonl \
-  --environment-url https://your-environment.example \
-  --fixture-id standard-account \
-  --fixture-version v1 \
-  --allow-environment-network \
-  --confirm-test-environment
+ul probe interactions.jsonl --target agent:invoke
 ```
 
-The generated `.ul/environment.json` uses UL's full `stateful-lifecycle` adapter. Your environment
-implements reset, execute-turn, and snapshot requests. Reset asks separately for a fresh agent
-session and a clean external environment; both are required by default. If you already have a custom
-mapping, use `--environment-config environment.json` instead of `--environment-url`.
-The fixture identity names the resettable business state used by the run. Change its version whenever
-that state or setup logic changes. See [Design valid test cases](docs/test-cases.md).
-For objective assertions, model-judged rubrics, pairwise preference, and human review in custom SDK
-workflows, see [Customer-defined evaluators](docs/evaluators.md).
-To probe a Python callable or an explicit local command without hosting an HTTP server, see
-[Local process targets](docs/local-targets.md).
-To add reset and authoritative committed-state inspection with ordinary Python callbacks, including
-beside an existing response-only HTTP agent, see [Composable state hooks](docs/state-hooks.md).
-For the shortest smoke-first journey from grounded examples to a bounded active probe, see
-[Guided active-probe quickstart](docs/probe.md).
+UL validates the dataset and target first. It then asks you to confirm the exact safe test target
+before making one original smoke call. No semantic-model call happens before that smoke succeeds.
 
-To connect an existing response-only JSON endpoint that starts every request from isolated state:
+### Probe an authenticated JSON endpoint
+
+For a synchronous endpoint that accepts `{"input": ...}` and returns `{"response": ...}`:
 
 ```bash
-export UL_ENVIRONMENT_AGENT_TOKEN='Bearer replace-me'
+export UL_ENVIRONMENT_AGENT_TOKEN='Bearer secret-from-your-secret-manager'
 
-ul init interactions.jsonl \
-  --environment-url https://your-environment.example/v1/chat/completions \
-  --adapter-tier isolated-response \
-  --isolated-preset openai-chat \
-  --agent-model your-test-model \
-  --header-from-env Authorization=UL_ENVIRONMENT_AGENT_TOKEN \
-  --allow-environment-network \
-  --confirm-test-environment \
-  --confirm-request-isolation \
-  --confirm-safe-test-target
+ul probe interactions.jsonl \
+  --target https://agent.test/invoke \
+  --header-from-env Authorization=UL_ENVIRONMENT_AGENT_TOKEN
 ```
 
-This translates the OpenAI-style request and response shape into UL's internal contract; no
-UL-specific endpoint is required. `generic-json` is the default preset (`{"input":"{{input}}"}`
-and `/response`). For another JSON shape, use `--request-json-template` and
-`--response-json-pointer`. Header values come only from the named `UL_ENVIRONMENT_*` variables and
-are never written to the config. The separate confirmations attest that this is a test target,
-every request starts fresh and is isolated from every other request, and requests cannot cause
-real-world effects. Without a separately composed state observer, UL records response evidence only
-at this tier and rejects committed-state invariants, conversations, timeout-after-commit checks, and
-other state-dependent stress tests. Use [composable state hooks](docs/state-hooks.md) to inspect a
-local test fixture, or move to `stateful-lifecycle` when the HTTP environment owns state control.
+UL reads the secret from the named `UL_ENVIRONMENT_*` variable. It does not place the value in the
+target configuration, evidence, diagnostics, or confirmation text. Never put credentials in the
+URL. Direct endpoints must start each request from isolated test state and must not cause real-world
+effects. For OpenAI-compatible chat endpoints and custom JSON shapes, see the
+[guided probe reference](docs/probe.md).
 
-The endpoint URL cannot contain credentials, a query string, or a fragment. Put credentials in
-`--header-from-env`; use a custom adapter when the endpoint requires query parameters.
+### Augment and compare
 
-Verify the adapter before spending money on model calls:
-
-```bash
-ul environment check .ul/environment.json \
-  --probe "Return environment health only; do not take action." \
-  --allow-environment-network \
-  --confirm-test-environment \
-  --confirm-harmless-probe
-
-ul run --dry-run
-```
-
-Then run and report:
+After the smoke result, UL shows the target-call, semantic-call, token, time, repetition, and known
+cost bounds for a small campaign. It runs only after a second confirmation. Configure the campaign
+without changing integration paths:
 
 ```bash
 export OPEN_ROUTER_API_KEY=YOUR_SECRET_FROM_A_SECRET_MANAGER
 export UL_LIVE=true
 
+ul probe interactions.jsonl \
+  --target agent:invoke \
+  --operator input.surface.typing_noise \
+  --limit 10 \
+  --repetitions 1 \
+  --output .ul/runs/probe-evidence.jsonl
+```
+
+UL replays the original input against the current agent, invokes controlled variations, and
+cross-examines the historical reference, fresh baseline, and variation. A single repetition is
+screening evidence. The report keeps response, trajectory, and committed-state conclusions
+separate. A response-only target does not verify trajectory or committed state; unavailable evidence
+is never shown as passed. Run `ul report .ul/runs/probe-evidence.jsonl` for the offline report.
+
+See [Guided active-probe quickstart](docs/probe.md) for structured inputs, target presets, reusable
+secret-free target configurations, stronger repetitions, resumability, and full evidence details.
+
+## Advanced: stateful evidence projects
+
+Use `ul init` and `ul run` after response-level value is visible when UL must reset a disposable
+fixture and independently inspect committed state:
+
+```bash
+ul init interactions.jsonl \
+  --environment-url https://your-test-environment.example \
+  --fixture-id standard-account \
+  --fixture-version v1 \
+  --allow-environment-network \
+  --confirm-test-environment
+
+ul run --dry-run
 ul run
 ul report
 ```
 
-`ul init` stores private project settings under `.ul/`. `ul run` discovers that directory from the
-current directory or a parent and writes a new evidence file. `ul report` opens the latest
-reportable run. Use `ul run --resume` after an interruption.
+This environment implements reset, execute-turn, and snapshot requests. It is an optional stronger
+evidence tier, not a prerequisite for probing an agent. See [Design valid test cases](docs/test-cases.md),
+[Composable state hooks](docs/state-hooks.md), [Local process targets](docs/local-targets.md), and
+[Customer-defined evaluators](docs/evaluators.md) for advanced configuration.
 
-One-run overrides do not change the saved project:
-
-```bash
-ul run --limit 3 --repetitions 3 --operator input.surface.rephrase
-```
-
-Inspect which built-in augmentations the current project can run:
+Inspect available augmentations at any time:
 
 ```bash
-ul augmentations enabled
 ul augmentations list --mode dataset_variation
-ul augmentations plan
 ul augmentations plan input.surface.typing_noise
-ul augmentations plan --json
 ```
-
-The planner classifies every augmentation as ready, blocked, or manual and explains why. It checks
-local configuration only; it makes no model, environment, or network calls and does not prove that
-the configured services are reachable.
-
-Configure the augmentations used by future `ul run` commands:
-
-```bash
-ul augmentations enable input.surface.typing_noise  # `add` is an alias
-ul augmentations disable input.surface.rephrase     # `remove` is an alias
-ul augmentations reset                              # restore recommended defaults
-ul run --dry-run                                    # verify the saved selection and call budget
-ul run --dry-run --json                             # machine-readable campaign plan
-ul run --dry-run --show-sensitive-values            # include private saved candidate inputs
-```
-
-These commands update only the current project's private `.ul/config.json`. Enabling a currently
-blocked augmentation still saves the selection and prints its required data and configuration steps.
-Catalog entries without a dataset CLI binding cannot be enabled for `ul run`; use their focused
-`ul augmentations plan ID` output to find the supported command or SDK path.
-
-The run dry-run classifies every operator for each selected interaction, explains conditional or
-ineligible cases, and separates baseline, variation, repetition, retry, evaluator, token, and
-environment-call budgets. Planning makes no model or environment requests. When a resumable
-augmentation ledger already contains a deterministic candidate, the candidate input is included for
-inspection only with the explicit `--show-sensitive-values` opt-in; monetary estimates stay
-unavailable unless trusted model pricing is configured.
-
-During a run, successful identical semantic requests reuse a private in-memory cache bounded to 256
-entries and 16 MiB of serialized responses, then cleared when the evaluator closes. Complete
-evidence and terminal output report actual semantic provider calls separately from private cache
-hits.
 
 ## How it works
 
 ```text
 recorded interaction
   → realistic input variation
-  → fresh environment runs for original and variation
-  → comparison of responses and committed state
+  → fresh target calls for original and variation
+  → comparison of responses and available evidence
   → evidence for human review
   → confirmed regression case
 ```
 
-With the default `stateful-lifecycle` tier, every repetition uses this lifecycle:
+With the optional `stateful-lifecycle` tier, every repetition uses this lifecycle:
 
 ```text
 reset → optional setup → initial snapshot → execute turn → snapshot → cleanup reset

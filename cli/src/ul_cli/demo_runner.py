@@ -228,15 +228,26 @@ def _print_report(results: tuple[DatasetEvaluationResult, ...], evidence_path: P
     console.print()
     console.print("[bold cyan]Try this workflow with your agent[/bold cyan]")
     console.print(
-        "1. Export recorded interactions to interactions.jsonl (one interaction per line)."
+        '1. Save observed interactions as JSONL: {"id":"case-1","input":"...",'
+        '"output":{"observed":"..."}}'
     )
     console.print(
-        "2. Point UL at a safe test environment that can reset, run a turn, and show state."
+        "2. Choose an existing callable or synchronous JSON endpoint that is isolated and safe "
+        "for test traffic."
+    )
+    console.print("3. Start: [bold]ul probe interactions.jsonl --target agent:invoke[/bold]")
+    console.print(
+        "   HTTP: [bold]ul probe interactions.jsonl --target https://agent.test/invoke "
+        "--header-from-env Authorization=UL_ENVIRONMENT_AGENT_TOKEN[/bold]"
     )
     console.print(
-        "3. Start: [bold]ul init interactions.jsonl --environment-url "
-        "https://your-test-environment.example --allow-environment-network "
-        "--confirm-test-environment[/bold]"
+        "[dim]The saved output is observed reference evidence, not a correctness oracle. "
+        "A response-only target does not verify trajectory or committed state. UL asks you to "
+        "confirm the exact test target and bounded paid/network campaign before it runs.[/dim]"
+    )
+    console.print(
+        "[dim]Need authoritative state evidence later? Use ul init and ul run with an isolated "
+        "stateful lifecycle environment.[/dim]"
     )
 
 
