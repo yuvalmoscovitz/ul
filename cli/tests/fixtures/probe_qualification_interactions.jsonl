@@ -1,0 +1,1 @@
+{"id":"ticket-status","input":"Return the status for ticket 42.","output":{"status":"open","ticket":42}}
