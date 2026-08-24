@@ -73,7 +73,10 @@ ul probe interactions.jsonl \
 
 Use `--http-preset openai-chat --agent-model TEST_MODEL` for an OpenAI-compatible chat
 completion endpoint. For another JSON shape, use `--request-json-template` and
-`--response-json-pointer`. Header options contain only dedicated `UL_ENVIRONMENT_*` variable
+`--response-json-pointer`. The `{{input}}` placeholder is one complete JSON leaf: with a
+structured dataset input, `--request-json-template '{"payload":"{{input}}"}'` sends the full
+object at `payload` without stringifying it. Header options contain only dedicated
+`UL_ENVIRONMENT_*` variable
 names; their secret values are never placed in target configuration, evidence, diagnostics, or
 confirmation text. Direct HTTP targets must be isolated per request and safe for test traffic.
 Plain HTTP is restricted to an exact loopback URL and also requires `--allow-insecure-http`.
