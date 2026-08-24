@@ -544,7 +544,7 @@ def test_default_limit_and_repetitions_fit_the_default_call_budget(tmp_path: Pat
 
     assert result.exit_code == 0, result.output
     assert "Selected interactions: 10" in result.output
-    assert "Operators: input.surface.rephrase" in result.output
+    assert "Operators: input.surface.typing_noise" in result.output
     assert "Potential environment API calls: up to 60" in result.output
 
 
@@ -567,7 +567,9 @@ def test_direct_http_target_requires_tls_or_explicit_loopback_exception(tmp_path
     )
 
     assert result.exit_code != 0
-    normalized_output = " ".join(result.output.replace("│", "").split())
+    normalized_output = " ".join(
+        _ANSI_ESCAPE_PATTERN.sub("", result.output).replace("│", "").split()
+    )
     assert "insecure transport opt-in" in normalized_output
 
 
@@ -622,7 +624,9 @@ def test_direct_http_execution_requires_exact_target_confirmation_before_output(
     )
 
     assert result.exit_code != 0
-    normalized_output = " ".join(result.output.replace("│", "").split())
+    normalized_output = " ".join(
+        _ANSI_ESCAPE_PATTERN.sub("", result.output).replace("│", "").split()
+    )
     assert (
         "HTTP execution requires --confirm-target with the exact displayed digest"
         in normalized_output
@@ -662,7 +666,7 @@ def test_direct_http_execution_requires_network_opt_in_before_output(tmp_path: P
 
     assert result.exit_code != 0
     assert "HTTP target execution requires --allow-environment-network" in " ".join(
-        result.output.replace("│", "").split()
+        _ANSI_ESCAPE_PATTERN.sub("", result.output).replace("│", "").split()
     )
     assert not output.exists()
 
@@ -691,6 +695,6 @@ def test_direct_http_target_requires_explicit_safety_attestations_before_output(
 
     assert result.exit_code != 0
     assert "direct HTTP targets require --confirm-request-isolation" in " ".join(
-        result.output.replace("│", "").split()
+        _ANSI_ESCAPE_PATTERN.sub("", result.output).replace("│", "").split()
     )
     assert not output.exists()

@@ -102,7 +102,12 @@ from ul_cli.dataset_trial_journal import (
     persist_dataset_run_manifest,
     read_dataset_run_manifest,
 )
-from ul_cli.http_target_resolution import resolve_http_target, resolve_http_target_config
+from ul_cli.http_target_resolution import (
+    ResolvedHttpTarget,
+    http_target_evidence_receipt,
+    resolve_http_target,
+    resolve_http_target_config,
+)
 from ul_cli.local_target_resolution import ResolvedLocalTarget, resolve_local_target
 from ul_cli.pattern_identity import (
     ensure_project_pattern_identity_key,
@@ -221,6 +226,7 @@ class _ResolvedTarget:
     confirmation_sha256: str
     create_connection: Callable[[int, float | None], ProbeTargetConnection]
     revalidate_identity: Callable[[], None]
+    resolved_http_target: ResolvedHttpTarget | None = None
 
 
 @dataclass(frozen=True)
@@ -656,6 +662,8 @@ def _semantic_settings_snapshot(
 
 
 def _target_evidence_receipt(resolved_target: _ResolvedTarget) -> dict[str, JsonValue]:
+    if resolved_target.resolved_http_target is not None:
+        return http_target_evidence_receipt(resolved_target.resolved_http_target)
     confirmation = resolved_target.confirmation
     outcome_projection = _outcome_projection(resolved_target)
     return {
@@ -1403,6 +1411,7 @@ def _http_target(
             )
         ),
         revalidate_identity=lambda: None,
+        resolved_http_target=resolved_http_target,
     )
 
 

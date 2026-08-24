@@ -240,7 +240,8 @@ Only after a
 successful smoke does UL save private target/dataset bindings in `.ul/probe.json`.
 
 UL uses the configured case limit and repetitions. Their defaults are ten examples and one
-repetition. The default operator is `input.surface.rephrase`; `--operator` selects one or more
+repetition. The shared `ul probe` and `ul dataset evaluate` default operator is
+`input.surface.typing_noise`; `--operator` selects one or more
 available dataset augmentations. Before execution, UL shows exact original/probe target calls,
 environment API requests, maximum semantic calls, completion-token bound, monetary-estimate
 availability, selected repetitions, and maximum active wall time. Declining the second confirmation

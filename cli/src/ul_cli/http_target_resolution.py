@@ -12,6 +12,7 @@ from pydantic import BaseModel, ConfigDict, Field, JsonValue
 from ul.http_environment import (
     JsonHttpIsolatedResponseConfig,
     JsonHttpTargetConfig,
+    json_http_environment_capabilities,
     json_http_environment_config_sha256,
     load_json_http_environment_config,
     validate_json_http_environment_configuration,
@@ -63,6 +64,32 @@ class ResolvedHttpTarget:
     @property
     def confirmation_sha256(self) -> str:
         return self.confirmation.sha256
+
+
+def http_target_evidence_receipt(
+    resolved_target: ResolvedHttpTarget,
+) -> dict[str, JsonValue]:
+    outcome_projection = resolved_target.config.outcome
+    return {
+        "kind": "http",
+        "config_sha256": resolved_target.config_sha256,
+        "confirmation_sha256": resolved_target.confirmation_sha256,
+        "supports_state_observation": json_http_environment_capabilities(
+            resolved_target.config
+        ).supports_state_observation,
+        "executable_sha256": None,
+        "artifact_sha256": [],
+        "environment": [
+            item.model_dump(mode="json") for item in resolved_target.confirmation.environment
+        ],
+        "callable": None,
+        "outcome_projection": (
+            outcome_projection.model_dump(mode="json") if outcome_projection is not None else None
+        ),
+        "outcome_projection_sha256": (
+            outcome_projection.digest if outcome_projection is not None else None
+        ),
+    }
 
 
 def create_isolated_response_target_config(

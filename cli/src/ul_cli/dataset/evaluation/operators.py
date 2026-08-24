@@ -6,7 +6,7 @@ from ul_core.augmentations.definitions import builtin_augmentation_catalog
 from ..presentation.runtime import console
 from .records import DatasetInputError
 
-DEFAULT_DATASET_OPERATOR = "input.surface.rephrase"
+DEFAULT_DATASET_OPERATOR = "input.surface.typing_noise"
 
 
 def list_dataset_operators() -> None:
@@ -36,7 +36,7 @@ def validate_operator_ids(operator_ids: list[str] | None) -> tuple[str, ...]:
 
 def validate_dataset_operator_ids(operator_ids: list[str] | None) -> tuple[str, ...]:
     """Resolve and validate dataset augmentation operator references."""
-    return validate_operator_ids(operator_ids)
+    return validate_operator_ids(operator_ids or ["input.surface.rephrase"])
 
 
 def dataset_operator_identity(reference: str) -> tuple[str, str]:

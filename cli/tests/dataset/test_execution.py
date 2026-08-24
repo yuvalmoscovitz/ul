@@ -32,6 +32,7 @@ from ul_cli.dataset_trial_journal import (
 )
 from ul_cli.http_target_resolution import (
     create_isolated_response_target_config,
+    http_target_evidence_receipt,
     resolve_http_target,
 )
 from ul_cli.local_target_resolution import resolve_local_target
@@ -1484,9 +1485,10 @@ def test_http_target_contract_runs_authenticated_loopback_and_resumes(
     assert received_requests == [{"message": "Transfer 100 to Alice."}]
     assert observed_outputs == [{"action": "lookup", "ticket": 42}]
     manifest = read_dataset_run_manifest(manifest_path(output))
-    assert manifest.run_context.target.kind == "environment_http"
-    assert manifest.run_context.target.config is not None
-    assert manifest.run_context.target.config.headers_from_env == {
+    assert manifest.run_context.target.kind == "probe_target"
+    assert manifest.run_context.target.receipt == http_target_evidence_receipt(resolved_target)
+    assert manifest.effective_command.http_target_config is not None
+    assert manifest.effective_command.http_target_config.headers_from_env == {
         "Authorization": "UL_ENVIRONMENT_CUSTOMER_TOKEN"
     }
     persisted_text = "\n".join(

@@ -341,7 +341,7 @@ def test_callable_smoke_proves_target_call_and_decline_makes_zero_semantic_calls
     assert "Echo grounded example 1." not in result.output
     assert "Evidence level: response only" in result.output
     assert "Source interactions: 10 (limit 10)" in result.output
-    assert "Operators: input.surface.rephrase" in result.output
+    assert "Operators: input.surface.typing_noise" in result.output
     assert "Original agent invocations: 10" in result.output
     assert "Probe agent invocations: 10" in result.output
     assert "Repetitions: 1" in result.output

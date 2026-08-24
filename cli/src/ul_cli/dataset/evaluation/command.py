@@ -14,7 +14,7 @@ from typing import Annotated, Any, Literal, TextIO, cast
 
 import httpx
 import typer
-from pydantic import ValidationError
+from pydantic import JsonValue, ValidationError
 from ul import (
     DatasetAugmentationResult,
     DatasetEvaluationMode,
@@ -34,6 +34,7 @@ from ul.dataset_invariants import (
 )
 from ul.http_environment import (
     JsonHttpEnvironmentConnection,
+    JsonHttpTargetConfig,
     json_http_environment_calls_per_execution,
     json_http_environment_capabilities,
     json_http_environment_config_sha256,
@@ -84,7 +85,9 @@ from ul_cli.finding_reference import (
     resolve_finding_reference_context,
 )
 from ul_cli.http_target_resolution import (
+    HttpTargetConfirmation,
     ResolvedHttpTarget,
+    http_target_evidence_receipt,
     resolve_http_target,
     resolve_http_target_config,
 )
@@ -249,7 +252,10 @@ def evaluate_dataset(
         str | None,
         typer.Option(
             "--target",
-            help=("HTTP(S) URL, Python module:callable, or local/HTTP target configuration JSON."),
+            help=(
+                "Isolated-response HTTP(S) URL, Python module:callable, or local/HTTP target "
+                "configuration JSON."
+            ),
         ),
     ] = None,
     target_artifact: Annotated[
@@ -335,7 +341,7 @@ def evaluate_dataset(
             "--operator",
             help=(
                 "Augmentation ID. Run 'ul augmentations list --mode dataset_variation' "
-                "for values; repeat as needed."
+                "for values; repeat as needed. Defaults to input.surface.typing_noise."
             ),
         ),
     ] = None,
@@ -466,12 +472,18 @@ def evaluate_dataset(
     reset/setup/execute/snapshot lifecycle. Production observations are passive source data and
     cannot select the execution destination.
 
+    Pass --target URL for an existing response-only JSON agent without writing a UL config. Direct
+    HTTP targets use the generic-json mapping by default, must isolate every request, and cannot
+    provide committed-state evidence without a separate state observer.
+
+    ul probe and this command both default to input.surface.typing_noise when --operator is omitted.
+
     Example: ul dataset evaluate interactions.jsonl --environment-config environment.json
     --allow-environment-network --confirm-test-environment
     --output results.jsonl
 
-    Target: ul dataset evaluate interactions.jsonl --target agent:invoke
-    --confirm-test-environment --confirm-target DIGEST --output results.jsonl
+    Direct HTTP: ul dataset evaluate interactions.jsonl --target https://agent.test/invoke
+    --confirm-request-isolation --confirm-safe-test-target --dry-run
 
     Discover operators: ul augmentations list --mode dataset_variation
     Augmentation retention: --augmentations-output PATH or --no-save-augmentations
@@ -724,12 +736,7 @@ def evaluate_dataset(
             else (
                 load_json_http_environment_config(environment_config)
                 if environment_config is not None
-                else (
-                    recorded_manifest_for_resume.run_context.target.config
-                    if recorded_manifest_for_resume is not None
-                    and recorded_manifest_for_resume.run_context.target.kind == "environment_http"
-                    else None
-                )
+                else _recorded_http_target_config(recorded_manifest_for_resume)
             )
         )
         recorded_http_confirmation = (
@@ -756,6 +763,7 @@ def evaluate_dataset(
             resume is not None
             and recorded_manifest_for_resume is not None
             and recorded_manifest_for_resume.run_context.target.kind == "probe_target"
+            and recorded_manifest_for_resume.effective_command.http_target_config is None
             and loaded_local_target is None
         ):
             raise ValueError("local target resume requires the same explicit --target")
@@ -859,6 +867,9 @@ def evaluate_dataset(
             else load_dataset_semantic_settings()
         )
         validate_model_input_bounds(selected_records, settings.max_input_chars)
+        direct_http_target_receipt = _direct_http_target_receipt(
+            resolved_http_target, recorded_manifest_for_resume
+        )
         run_context = (
             build_dataset_evidence_run_context(
                 selected_records=selected_records,
@@ -866,11 +877,13 @@ def evaluate_dataset(
                 evaluation_mode=evaluation_mode,
                 repetitions=repetitions,
                 invariant_suite=invariant_suite,
-                target_config=normalized_target_config,
+                target_config=(
+                    None if direct_http_target_receipt is not None else normalized_target_config
+                ),
                 target_receipt=(
                     local_target_evidence_receipt(loaded_local_target)
                     if loaded_local_target is not None
-                    else None
+                    else direct_http_target_receipt
                 ),
                 settings=settings,
                 redaction_policy_sha256=(
@@ -1035,14 +1048,11 @@ def evaluate_dataset(
                     else None
                 )
             ),
-            http_target_confirmation=(
-                resolved_http_target.confirmation
-                if resolved_http_target is not None
-                else (
-                    recorded_manifest_for_resume.effective_command.http_target_confirmation
-                    if recorded_manifest_for_resume is not None
-                    else None
-                )
+            http_target_confirmation=_recorded_or_resolved_http_confirmation(
+                resolved_http_target, recorded_manifest_for_resume
+            ),
+            http_target_config=_resolved_or_recorded_http_target_config(
+                resolved_http_target, recorded_manifest_for_resume
             ),
         )
         run_manifest_path = manifest_path(output)
@@ -1699,6 +1709,55 @@ def evaluate_dataset(
         raise typer.Exit(code=2)
     if has_review_findings or (resume_evidence is not None and resume_evidence.has_review_findings):
         raise typer.Exit(code=1)
+
+
+def _recorded_http_target_config(
+    recorded_manifest: DatasetRunManifest | None,
+) -> JsonHttpTargetConfig | None:
+    if recorded_manifest is None:
+        return None
+    direct_http_config = recorded_manifest.effective_command.http_target_config
+    if direct_http_config is not None:
+        return direct_http_config
+    if recorded_manifest.run_context.target.kind == "environment_http":
+        return recorded_manifest.run_context.target.config
+    return None
+
+
+def _direct_http_target_receipt(
+    resolved_target: ResolvedHttpTarget | None,
+    recorded_manifest: DatasetRunManifest | None,
+) -> dict[str, JsonValue] | None:
+    if resolved_target is not None:
+        return http_target_evidence_receipt(resolved_target)
+    if (
+        recorded_manifest is not None
+        and recorded_manifest.effective_command.http_target_config is not None
+    ):
+        return recorded_manifest.run_context.target.receipt
+    return None
+
+
+def _recorded_or_resolved_http_confirmation(
+    resolved_target: ResolvedHttpTarget | None,
+    recorded_manifest: DatasetRunManifest | None,
+) -> HttpTargetConfirmation | None:
+    if resolved_target is not None:
+        return resolved_target.confirmation
+    if recorded_manifest is not None:
+        return recorded_manifest.effective_command.http_target_confirmation
+    return None
+
+
+def _resolved_or_recorded_http_target_config(
+    resolved_target: ResolvedHttpTarget | None,
+    recorded_manifest: DatasetRunManifest | None,
+) -> JsonHttpTargetConfig | None:
+    if resolved_target is not None:
+        return resolved_target.config
+    if recorded_manifest is not None:
+        return recorded_manifest.effective_command.http_target_config
+    return None
 
 
 def _print_local_target_identity(target: ResolvedLocalTarget) -> None:
