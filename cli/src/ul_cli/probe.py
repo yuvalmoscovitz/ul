@@ -39,10 +39,7 @@ from ul.http_environment import (
     JsonHttpTargetConfig,
     json_http_environment_calls_per_execution,
     json_http_environment_capabilities,
-    json_http_environment_config_sha256,
     json_http_environment_config_urls,
-    load_json_http_environment_config,
-    validate_json_http_environment_configuration,
 )
 from ul.local_target import (
     LocalTargetConfig,
@@ -52,9 +49,12 @@ from ul.outcome_projection import OutcomeProjection, OutcomeProjectionError
 from ul.probe_execution import OutcomeProjectionExecutionError
 from ul_core.models import ConversationRole, ConversationTurn
 
-from ul_cli.dataset.environment.initialize import create_isolated_response_target_config
 from ul_cli.dataset.evaluation.command import preflight_evaluator
-from ul_cli.dataset.evaluation.operators import dataset_operator_identity, validate_operator_ids
+from ul_cli.dataset.evaluation.operators import (
+    DEFAULT_DATASET_OPERATOR,
+    dataset_operator_identity,
+    validate_operator_ids,
+)
 from ul_cli.dataset.evaluation.records import (
     DatasetInputError,
     load_interaction_records,
@@ -102,6 +102,7 @@ from ul_cli.dataset_trial_journal import (
     persist_dataset_run_manifest,
     read_dataset_run_manifest,
 )
+from ul_cli.http_target_resolution import resolve_http_target, resolve_http_target_config
 from ul_cli.local_target_resolution import ResolvedLocalTarget, resolve_local_target
 from ul_cli.pattern_identity import (
     ensure_project_pattern_identity_key,
@@ -111,7 +112,6 @@ from ul_cli.report import report_evidence
 
 _DEFAULT_LIMIT = 10
 _DEFAULT_REPETITIONS = 1
-_DEFAULT_OPERATOR = "input.surface.typing_noise"
 _MAXIMUM_DATASET_RECORDS = 100
 _MAXIMUM_REPETITIONS = 100
 _TARGET_TIMEOUT_SECONDS = 30.0
@@ -840,7 +840,7 @@ def probe(
     try:
         records = _load_campaign_records(data, limit=limit)
         try:
-            selected_operator_ids = validate_operator_ids(operator or [_DEFAULT_OPERATOR])
+            selected_operator_ids = validate_operator_ids(operator or [DEFAULT_DATASET_OPERATOR])
         except DatasetInputError as error:
             raise typer.BadParameter(str(error), param_hint="--operator") from None
         resolved_target = _resolve_target(
@@ -1257,16 +1257,20 @@ def _resolve_target(
                 raise ValueError("--target-artifact applies only to local targets")
             if direct_local_options_used:
                 raise ValueError("local target options require a Python callable target")
-            http_config = create_isolated_response_target_config(
+            resolved_http_target = resolve_http_target(
                 target,
-                isolated_preset=http_preset or "generic-json",
-                environment_id="probe-http-" + hashlib.sha256(target.encode()).hexdigest()[:16],
+                allow_insecure_http=allow_insecure_http,
+                http_preset=http_preset,
                 request_json_template=request_json_template,
                 response_json_pointer=response_json_pointer,
                 agent_model=agent_model,
                 header_from_env=header_from_env,
             )
-            return _http_target(target, http_config, allow_insecure_http=allow_insecure_http)
+            return _http_target(
+                resolved_http_target.reference,
+                resolved_http_target.config,
+                allow_insecure_http=allow_insecure_http,
+            )
         if direct_http_options_used:
             raise ValueError("direct HTTP mapping options require an HTTP URL target")
         target_path = Path(target)
@@ -1349,14 +1353,13 @@ def _resolve_configured_target(
             str(canonical_path), explicit_artifacts=explicit_artifacts
         )
     except ValueError:
-        http_config = load_json_http_environment_config(canonical_path)
-        validate_json_http_environment_configuration(
-            http_config,
-            test_environment_confirmed=True,
-            allow_insecure_http=allow_insecure_http,
+        resolved_http_target = resolve_http_target(
+            str(canonical_path), allow_insecure_http=allow_insecure_http
         )
         return _http_target(
-            str(canonical_path), http_config, allow_insecure_http=allow_insecure_http
+            resolved_http_target.reference,
+            resolved_http_target.config,
+            allow_insecure_http=allow_insecure_http,
         )
     if allow_insecure_http:
         raise ValueError("--allow-insecure-http requires an HTTP URL or config target")
@@ -1369,13 +1372,13 @@ def _http_target(
     *,
     allow_insecure_http: bool,
 ) -> _ResolvedTarget:
-    validate_json_http_environment_configuration(
-        config,
-        test_environment_confirmed=True,
-        allow_insecure_http=allow_insecure_http,
+    resolved_http_target = resolve_http_target_config(
+        reference, config, allow_insecure_http=allow_insecure_http
     )
-    digest = json_http_environment_config_sha256(config)
-    confirmation = _TargetConfirmation(kind="http", reference=reference, config_sha256=digest)
+    digest = resolved_http_target.config_sha256
+    confirmation = _TargetConfirmation.model_validate(
+        resolved_http_target.confirmation.model_dump()
+    )
     return _ResolvedTarget(
         reference=reference,
         kind="http",

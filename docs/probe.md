@@ -81,6 +81,20 @@ names; their secret values are never placed in target configuration, evidence, d
 confirmation text. Direct HTTP targets must be isolated per request and safe for test traffic.
 Plain HTTP is restricted to an exact loopback URL and also requires `--allow-insecure-http`.
 
+The same URL, preset, request template, response pointer, model, and environment-backed headers
+work in the configurable runner. Inspect the target digest and complete call bounds first:
+
+```bash
+ul dataset evaluate interactions.jsonl \
+  --target https://agent.test/invoke \
+  --header-from-env Authorization=UL_ENVIRONMENT_AGENT_TOKEN \
+  --dry-run
+```
+
+Execution additionally requires `--allow-environment-network`, `--confirm-test-environment`, the
+displayed `--confirm-target` digest, and `--output`. Pause/resume uses the private recorded target
+snapshot, so header secret values never enter a resume command or run artifact.
+
 UL binds the resolved executable, the direct Python module and UL worker, allowlisted environment
 value digests, and command arguments that resolve to files. Repeat `--target-artifact PATH` for
 every transitive Python helper, command script, bundle, or other executable dependency that is not
@@ -223,7 +237,7 @@ Only after a
 successful smoke does UL save private target/dataset bindings in `.ul/probe.json`.
 
 UL uses the configured case limit and repetitions. Their defaults are ten examples and one
-repetition. The default operator is `input.surface.typing_noise`; `--operator` selects one or more
+repetition. The default operator is `input.surface.rephrase`; `--operator` selects one or more
 available dataset augmentations. Before execution, UL shows exact original/probe target calls,
 environment API requests, maximum semantic calls, completion-token bound, monetary-estimate
 availability, selected repetitions, and maximum active wall time. Declining the second confirmation

@@ -341,7 +341,7 @@ def test_callable_smoke_proves_target_call_and_decline_makes_zero_semantic_calls
     assert "Echo grounded example 1." not in result.output
     assert "Evidence level: response only" in result.output
     assert "Source interactions: 10 (limit 10)" in result.output
-    assert "Operators: input.surface.typing_noise" in result.output
+    assert "Operators: input.surface.rephrase" in result.output
     assert "Original agent invocations: 10" in result.output
     assert "Probe agent invocations: 10" in result.output
     assert "Repetitions: 1" in result.output
@@ -716,6 +716,8 @@ def test_structured_http_target_runs_real_smoke_and_campaign(
         str(dataset),
         "--target",
         f"http://127.0.0.1:{server.server_port}/invoke",
+        "--operator",
+        "input.surface.typing_noise",
         "--request-json-template",
         '{"payload":"{{input}}"}',
         "--response-json-pointer",
@@ -1630,9 +1632,11 @@ def test_authenticated_direct_http_pause_resume_preserves_mapping_options(
             [
                 "probe",
                 str(dataset),
-                "--target",
-                endpoint,
-                "--output",
+                    "--target",
+                    endpoint,
+                    "--operator",
+                    "input.surface.typing_noise",
+                    "--output",
                 str(output),
                 *mapping_arguments,
                 "--header-from-env",
@@ -1749,6 +1753,8 @@ def test_paused_probe_action_blocks_before_repeating_completed_smoke(
         str(dataset),
         "--target",
         "agent:run",
+        "--operator",
+        "input.surface.typing_noise",
         "--output",
         str(output),
     ]

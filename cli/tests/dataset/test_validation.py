@@ -543,4 +543,83 @@ def test_default_limit_and_repetitions_fit_the_default_call_budget(tmp_path: Pat
 
     assert result.exit_code == 0, result.output
     assert "Selected interactions: 10" in result.output
+    assert "Operators: input.surface.rephrase" in result.output
     assert "Potential environment API calls: up to 60" in result.output
+
+
+def test_direct_http_target_requires_tls_or_explicit_loopback_exception(tmp_path: Path) -> None:
+    dataset = tmp_path / "interactions.jsonl"
+    _write_dataset(dataset, [_record()])
+
+    result = runner.invoke(
+        root_app,
+        [
+            "dataset",
+            "evaluate",
+            str(dataset),
+            "--target",
+            "http://127.0.0.1:8765/invoke",
+            "--dry-run",
+        ],
+    )
+
+    assert result.exit_code != 0
+    normalized_output = " ".join(result.output.replace("│", "").split())
+    assert "insecure transport opt-in" in normalized_output
+
+
+def test_direct_http_mapping_options_reject_non_http_targets(tmp_path: Path) -> None:
+    dataset = tmp_path / "interactions.jsonl"
+    _write_dataset(dataset, [_record()])
+
+    result = runner.invoke(
+        root_app,
+        [
+            "dataset",
+            "evaluate",
+            str(dataset),
+            "--target",
+            "customer_agent:run",
+            "--response-json-pointer",
+            "/response",
+            "--dry-run",
+        ],
+    )
+
+    assert result.exit_code != 0
+    assert "direct HTTP mapping options require an HTTP URL target" in " ".join(
+        result.output.split()
+    )
+
+
+def test_direct_http_execution_requires_exact_target_confirmation_before_output(
+    tmp_path: Path,
+) -> None:
+    dataset = tmp_path / "interactions.jsonl"
+    output = tmp_path / "results.jsonl"
+    _write_dataset(dataset, [_record()])
+
+    result = runner.invoke(
+        root_app,
+        [
+            "dataset",
+            "evaluate",
+            str(dataset),
+            "--target",
+            "https://agent.example.test/invoke",
+            "--allow-environment-network",
+            "--confirm-test-environment",
+            "--confirm-target",
+            "0" * 64,
+            "--output",
+            str(output),
+        ],
+    )
+
+    assert result.exit_code != 0
+    normalized_output = " ".join(result.output.replace("│", "").split())
+    assert (
+        "HTTP execution requires --confirm-target with the exact displayed digest"
+        in normalized_output
+    )
+    assert not output.exists()

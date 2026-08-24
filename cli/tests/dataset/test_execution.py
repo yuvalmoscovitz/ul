@@ -30,6 +30,10 @@ from ul_cli.dataset_trial_journal import (
     open_dataset_trial_journal,
     read_dataset_run_manifest,
 )
+from ul_cli.http_target_resolution import (
+    create_isolated_response_target_config,
+    resolve_http_target,
+)
 from ul_cli.local_target_resolution import resolve_local_target
 from ul_cli.main import app as root_app
 from ul_core.dataset import (
@@ -1263,3 +1267,219 @@ def test_target_config_runs_nested_request_and_response_against_loopback(
     output_lines = output.read_text(encoding="utf-8").splitlines()
     assert json.loads(output_lines[0])["record_type"] == "dataset_durable_run"
     assert output_lines[1] == '{"saved":true}'
+
+
+@pytest.mark.parametrize("target_mode", ("direct", "saved"))
+def test_http_target_contract_runs_authenticated_loopback_and_resumes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    target_mode: str,
+) -> None:
+    secret_canary = "UL59-HTTP-SECRET-CANARY"
+    received_requests: list[object] = []
+
+    class TargetHandler(BaseHTTPRequestHandler):
+        def do_POST(self) -> None:
+            if self.headers.get("Authorization") != secret_canary:
+                self.send_response(401)
+                self.end_headers()
+                return
+            content_length = int(self.headers["Content-Length"])
+            received_requests.append(json.loads(self.rfile.read(content_length)))
+            response = json.dumps(
+                {"result": {"action": "lookup", "ticket": 42}}
+            ).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(response)))
+            self.end_headers()
+            self.wfile.write(response)
+
+        def log_message(self, format: str, *args: object) -> None:
+            pass
+
+    try:
+        server = ThreadingHTTPServer(("127.0.0.1", 0), TargetHandler)
+    except PermissionError:
+        pytest.skip("the test environment does not allow binding a loopback server")
+    server_thread = threading.Thread(target=server.serve_forever)
+    server_thread.start()
+    try:
+        dataset = tmp_path / "interactions.jsonl"
+        output = tmp_path / "results.jsonl"
+        target_config = tmp_path / "target.json"
+        _write_dataset(dataset, [_record()])
+        monkeypatch.setenv("UL_ENVIRONMENT_CUSTOMER_TOKEN", secret_canary)
+        monkeypatch.setenv("OPEN_ROUTER_API_KEY", "test-key")
+        url = f"http://127.0.0.1:{server.server_port}/invoke"
+        direct_options = {
+            "allow_insecure_http": True,
+            "request_json_template": '{"message":"{{input}}"}',
+            "response_json_pointer": "/result",
+            "header_from_env": [
+                "Authorization=UL_ENVIRONMENT_CUSTOMER_TOKEN"
+            ],
+        }
+        if target_mode == "saved":
+            config = create_isolated_response_target_config(
+                url,
+                request_json_template=cast(str, direct_options["request_json_template"]),
+                response_json_pointer=cast(str, direct_options["response_json_pointer"]),
+                header_from_env=cast(list[str], direct_options["header_from_env"]),
+            )
+            target_config.write_text(
+                json.dumps(config.model_dump(mode="json", exclude_none=True)),
+                encoding="utf-8",
+            )
+            target_reference = str(target_config)
+            target_arguments = ["--target", target_reference]
+            resolved_target = resolve_http_target(
+                target_reference, allow_insecure_http=True
+            )
+        else:
+            target_reference = url
+            target_arguments = [
+                "--target",
+                target_reference,
+                "--request-json-template",
+                cast(str, direct_options["request_json_template"]),
+                "--response-json-pointer",
+                cast(str, direct_options["response_json_pointer"]),
+                "--header-from-env",
+                cast(list[str], direct_options["header_from_env"])[0],
+            ]
+            resolved_target = resolve_http_target(target_reference, **direct_options)
+
+        observed_outputs: list[object] = []
+
+        async def evaluate_once(
+            records: tuple[Any, ...],
+            operator_ids: tuple[str, ...],
+            settings: object,
+            target: Any,
+            output_stream: Any,
+            **options: object,
+        ) -> tuple[object, ...]:
+            del operator_ids, settings, options
+            async with target:
+                case = evaluation_case_from_inputs(
+                    case_id="ul-case-00000000000000000000000000000000",
+                    raw_inputs=(records[0].raw_input,),
+                    max_environment_api_calls=5,
+                    timeout_seconds=30,
+                )
+                evidence = await target.execute(case)
+                observed_outputs.append(evidence.turns[0].response)
+            output_stream.write('{"saved":true}\n')
+            return ()
+
+        monkeypatch.setattr(command_module, "load_dataset_semantic_settings", _settings)
+        monkeypatch.setattr(command_module, "evaluate_interaction_records", evaluate_once)
+        arguments = [
+            "dataset",
+            "evaluate",
+            str(dataset),
+            *target_arguments,
+            "--allow-insecure-http",
+            "--allow-environment-network",
+            "--confirm-test-environment",
+            "--confirm-target",
+            resolved_target.confirmation_sha256,
+            "--operator",
+            "input.surface.case_variation",
+            "--repetitions",
+            "2",
+            "--output",
+            str(output),
+        ]
+        if target_mode == "direct":
+            create_runtime = command_module.create_campaign_progress_runtime
+
+            def create_paused_runtime(**options: object) -> object:
+                runtime = create_runtime(**options)
+                runtime.control.request_pause()
+                return runtime
+
+            monkeypatch.setattr(
+                command_module,
+                "create_campaign_progress_runtime",
+                create_paused_runtime,
+            )
+            paused = runner.invoke(root_app, arguments)
+            assert paused.exit_code == 130, paused.output
+            assert received_requests == []
+            action_id_match = re.search(
+                r'next_argv=\["ul","action","([0-9a-f]{64})"\]', paused.output
+            )
+            assert action_id_match is not None
+            receipt = json.loads(
+                (
+                    tmp_path
+                    / "action-state"
+                    / f"{action_id_match.group(1)}.json"
+                ).read_text(encoding="utf-8")
+            )
+            assert receipt["argv"] == [
+                "ul",
+                "dataset",
+                "evaluate",
+                "--resume",
+                str(output.resolve()),
+            ]
+            changed_target = resolve_http_target(
+                target_reference,
+                allow_insecure_http=True,
+                request_json_template=cast(str, direct_options["request_json_template"]),
+                response_json_pointer="/changed",
+                header_from_env=cast(list[str], direct_options["header_from_env"]),
+            )
+            changed = runner.invoke(
+                root_app,
+                [
+                    "dataset",
+                    "evaluate",
+                    "--resume",
+                    str(output),
+                    "--target",
+                    target_reference,
+                    "--request-json-template",
+                    cast(str, direct_options["request_json_template"]),
+                    "--response-json-pointer",
+                    "/changed",
+                    "--header-from-env",
+                    cast(list[str], direct_options["header_from_env"])[0],
+                    "--confirm-target",
+                    changed_target.confirmation_sha256,
+                ],
+            )
+            assert changed.exit_code != 0
+            assert "resume_incompatible:target" in " ".join(changed.output.split())
+            assert received_requests == []
+            monkeypatch.setattr(
+                command_module,
+                "create_campaign_progress_runtime",
+                create_runtime,
+            )
+            result = runner.invoke(root_app, receipt["argv"][1:])
+        else:
+            result = runner.invoke(root_app, arguments)
+    finally:
+        server.shutdown()
+        server.server_close()
+        server_thread.join()
+
+    assert result.exit_code == 0, result.output
+    assert received_requests == [{"message": "Transfer 100 to Alice."}]
+    assert observed_outputs == [{"action": "lookup", "ticket": 42}]
+    manifest = read_dataset_run_manifest(manifest_path(output))
+    assert manifest.run_context.target.kind == "environment_http"
+    assert manifest.run_context.target.config is not None
+    assert manifest.run_context.target.config.headers_from_env == {
+        "Authorization": "UL_ENVIRONMENT_CUSTOMER_TOKEN"
+    }
+    persisted_text = "\n".join(
+        path.read_text(encoding="utf-8")
+        for path in tmp_path.iterdir()
+        if path.is_file()
+    )
+    assert secret_canary not in persisted_text
