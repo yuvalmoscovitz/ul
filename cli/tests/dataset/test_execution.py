@@ -14,6 +14,7 @@ from typing import Any, cast
 import pytest
 from typer.testing import CliRunner
 from ul import (
+    DatasetSemanticPreparationError,
     InteractionRecord,
     JsonHttpEnvironmentConfig,
     ProviderDiagnostic,
@@ -23,6 +24,7 @@ from ul.environment import evaluation_case_from_inputs
 from ul_cli import progress_action as progress_action_module
 from ul_cli.dataset.evaluation import command as command_module
 from ul_cli.dataset.evaluation import runner as runner_module
+from ul_cli.dataset.evidence import customer as customer_module
 from ul_cli.dataset.evidence import persistence as persistence_module
 from ul_cli.dataset_trial_journal import (
     journal_path,
@@ -721,8 +723,11 @@ def test_execution_rejects_missing_header_secret_before_model_or_output(
     assert not output.exists()
 
 
+@pytest.mark.parametrize("has_source_preparation_failure", (False, True))
 def test_execution_creates_private_explicit_output(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    has_source_preparation_failure: bool,
 ) -> None:
     dataset = tmp_path / "interactions.jsonl"
     output = tmp_path / "results.jsonl"
@@ -755,8 +760,9 @@ def test_execution_creates_private_explicit_output(
         evaluator_preflight: object,
         trial_journal: object,
         progress_plan: Any,
+        source_preparation_failures: list[Any],
     ) -> tuple[object, ...]:
-        del settings, target, run_context, augmentation_ledger, saved_augmentations
+        del settings, target, augmentation_ledger, saved_augmentations
         assert evaluator_preflight == _evaluator_preflight()
         assert redaction_engine is None
         captured_records.extend(record.id for record in records)
@@ -765,7 +771,19 @@ def test_execution_creates_private_explicit_output(
         assert max_environment_api_calls == 100
         assert planned_target_calls == 30
         assert progress_plan.calls.total_environment_api == 30
-        output_stream.write('{"saved":true}\n')
+        if has_source_preparation_failure:
+            failure = customer_module.build_source_preparation_failure_evidence(
+                records[0],
+                DatasetSemanticPreparationError(),
+                repetitions=repetitions,
+                max_environment_api_calls=max_environment_api_calls,
+                planned_target_calls=planned_target_calls,
+                run_context=cast(Any, run_context),
+            )
+            source_preparation_failures.append(failure)
+            output_stream.write(failure.model_dump_json(exclude_none=True) + "\n")
+        else:
+            output_stream.write('{"saved":true}\n')
         output_stream.flush()
         return ()
 
@@ -794,17 +812,24 @@ def test_execution_creates_private_explicit_output(
         ],
     )
 
-    assert result.exit_code == 0, result.output
+    assert result.exit_code == (2 if has_source_preparation_failure else 0), result.output
     assert captured_records == ["interaction-1"]
     output_lines = output.read_text(encoding="utf-8").splitlines()
     assert json.loads(output_lines[0])["record_type"] == "dataset_durable_run"
-    assert output_lines[1] == '{"saved":true}'
+    if has_source_preparation_failure:
+        assert json.loads(output_lines[1])["record_type"] == "source_preparation_failure"
+        assert "Source preparation failures: 1" in result.output
+        assert "failed stage=terminal" in result.output
+    else:
+        assert output_lines[1] == '{"saved":true}'
     assert stat.S_IMODE(output.stat().st_mode) == 0o600
     assert "Complete evidence" in result.output
     assert "Next: ul dataset report" in result.output
     assert "Transfer 100" not in result.output
     report_position = result.output.index("stage=report")
-    completion_position = result.output.index("completed stage=terminal")
+    completion_position = result.output.index(
+        "failed stage=terminal" if has_source_preparation_failure else "completed stage=terminal"
+    )
     assert report_position < completion_position
     assert result.output.count("next_action=") == 1
 

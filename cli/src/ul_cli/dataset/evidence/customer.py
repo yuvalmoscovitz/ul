@@ -42,7 +42,7 @@ _BEHAVIORAL_LIMITATIONS = (
 )
 
 
-def build_source_preparation_failure_record(
+def build_source_preparation_failure_evidence(
     source: InteractionRecord,
     error: DatasetSourcePreparationError,
     *,
@@ -50,7 +50,7 @@ def build_source_preparation_failure_record(
     max_environment_api_calls: int,
     planned_target_calls: int,
     run_context: DatasetEvidenceRunContext,
-) -> dict[str, JsonValue]:
+) -> DatasetSourcePreparationFailureEvidence:
     augmentation_target = getattr(source, "augmentation_target", None)
     evidence = DatasetSourcePreparationFailureEvidence(
         interaction_id=source.id,
@@ -76,7 +76,7 @@ def build_source_preparation_failure_record(
         ),
         run_context=run_context,
     )
-    return cast(dict[str, JsonValue], evidence.model_dump(mode="json", exclude_none=True))
+    return evidence
 
 
 def build_customer_evidence_record(

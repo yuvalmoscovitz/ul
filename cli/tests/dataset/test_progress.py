@@ -327,6 +327,7 @@ def test_source_preparation_failures_do_not_abort_a_ten_source_campaign(
     failed_ids = {"source-2", "source-7"}
     target_started_ids: list[str] = []
     journal_states: dict[str, str] = {}
+    collected_source_failures: list[Any] = []
 
     class AsyncContext:
         async def __aenter__(self) -> object:
@@ -355,6 +356,12 @@ def test_source_preparation_failures_do_not_abort_a_ten_source_campaign(
             }
 
         def terminal(self, unit: DatasetTrialUnit, state: str, _reason: str) -> None:
+            if state == "errored":
+                durable_records = [
+                    json.loads(line) for line in evidence_path.read_text().splitlines()
+                ]
+                assert durable_records[-1]["record_type"] == "source_preparation_failure"
+                assert durable_records[-1]["interaction_id"] == unit.interaction_id
             journal_states[unit.id] = state
 
         def flush(self) -> None:
@@ -411,6 +418,7 @@ def test_source_preparation_failures_do_not_abort_a_ten_source_campaign(
                 run_context=run_context,
                 evaluator_preflight=cast(Any, object()),
                 trial_journal=cast(Any, FakeJournal()),
+                source_preparation_failures=collected_source_failures,
             )
 
     results = asyncio.run(run())
@@ -426,7 +434,16 @@ def test_source_preparation_failures_do_not_abort_a_ten_source_campaign(
     assert len(evidence_lines) == 10
     failures = [line for line in evidence_lines if line.get("record_type")]
     assert [failure["interaction_id"] for failure in failures] == ["source-2", "source-7"]
+    assert [failure.interaction_id for failure in collected_source_failures] == [
+        "source-2",
+        "source-7",
+    ]
     assert all("raw_input" not in failure for failure in failures)
+    for field_name in ("interaction_id", "source_record_id"):
+        oversized_failure = {**failures[0], field_name: "x" * 501}
+        oversized_path = tmp_path / f"oversized-{field_name}.jsonl"
+        oversized_path.write_text(json.dumps(oversized_failure) + "\n", encoding="utf-8")
+        assert dataset_review.is_reportable_dataset_evidence(oversized_path) is False
     snapshot = dataset_review.validate_dataset_resume_evidence(
         evidence_path.read_bytes(),
         expected_context=run_context,

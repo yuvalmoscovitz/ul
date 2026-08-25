@@ -347,8 +347,13 @@ class DatasetSourcePreparationFailureEvidence(_StrictModel):
     schema_version: Literal["1.0.0"] = "1.0.0"
     record_type: Literal["source_preparation_failure"] = "source_preparation_failure"
     evaluation_mode: Literal["variance"] = "variance"
-    interaction_id: str = Field(min_length=1)
-    source_record_id: str | None = cast(Any, Field)(default=None, exclude_if=_is_none)
+    interaction_id: str = Field(min_length=1, max_length=500)
+    source_record_id: str | None = cast(Any, Field)(
+        default=None,
+        min_length=1,
+        max_length=500,
+        exclude_if=_is_none,
+    )
     failure_stage: Literal["semantic_preparation"] = "semantic_preparation"
     reason_code: Literal[
         "source_semantic_preparation_failed",
@@ -566,6 +571,7 @@ class _EvidenceRecord(_StrictModel):
 @dataclass(frozen=True)
 class DatasetResumeEvidence:
     processed_ids: frozenset[str]
+    source_preparation_failures: tuple[DatasetSourcePreparationFailureEvidence, ...]
     has_review_findings: bool
     invariant_evaluations: tuple[DatasetInvariantEvaluation, ...]
     technical_results: tuple[DatasetEvaluationResult, ...]
@@ -676,6 +682,7 @@ def validate_dataset_resume_evidence(
     if not raw_lines:
         return DatasetResumeEvidence(
             processed_ids=frozenset(),
+            source_preparation_failures=(),
             has_review_findings=False,
             invariant_evaluations=(),
             technical_results=(),
@@ -690,6 +697,7 @@ def validate_dataset_resume_evidence(
     has_review_findings = False
     invariant_evaluations: list[DatasetInvariantEvaluation] = []
     technical_results: list[DatasetEvaluationResult] = []
+    source_preparation_failures: list[DatasetSourcePreparationFailureEvidence] = []
     for raw_line in raw_lines:
         try:
             decoded_line: object = json.loads(raw_line)
@@ -725,6 +733,7 @@ def validate_dataset_resume_evidence(
             if source_failure.source_record_id != expected_source_record_id:
                 raise ValueError("resume source failure does not match the selected dataset")
             processed_ids.add(source_failure.interaction_id)
+            source_preparation_failures.append(source_failure)
             continue
         try:
             evidence = _EvidenceRecord.model_validate_json(raw_line)
@@ -815,6 +824,7 @@ def validate_dataset_resume_evidence(
         processed_ids.add(evidence.interaction_id)
     return DatasetResumeEvidence(
         processed_ids=frozenset(processed_ids),
+        source_preparation_failures=tuple(source_preparation_failures),
         has_review_findings=has_review_findings,
         invariant_evaluations=tuple(invariant_evaluations),
         technical_results=tuple(technical_results),

@@ -32,12 +32,15 @@ from ul.local_target import LocalTargetConnection
 
 from ul_cli.dataset_augmentation_ledger import DatasetAugmentationLedger
 from ul_cli.dataset_campaign import DatasetCampaignPlan
-from ul_cli.dataset_review import DatasetEvidenceRunContext
+from ul_cli.dataset_review import (
+    DatasetEvidenceRunContext,
+    DatasetSourcePreparationFailureEvidence,
+)
 from ul_cli.dataset_trial_journal import DatasetTrialJournal
 
 from ..evidence.customer import (
     build_customer_evidence_record,
-    build_source_preparation_failure_record,
+    build_source_preparation_failure_evidence,
 )
 from ..progress import (
     CampaignControlRequested,
@@ -79,6 +82,7 @@ async def evaluate_interaction_records(
     complete_progress: bool = True,
     environment_calls_per_target_call: int = 1,
     isolate_source_preparation_failures: bool = True,
+    source_preparation_failures: list[DatasetSourcePreparationFailureEvidence] | None = None,
 ) -> tuple[DatasetEvaluationResult, ...]:
     if environment_calls_per_target_call < 1:
         raise ValueError("environment calls per target call must be positive")
@@ -110,6 +114,7 @@ async def evaluate_interaction_records(
     initial_target_calls, _, initial_environment_calls, _ = progress_tracker.actual_usage
     actual_target_calls = 0
     active_trial: tuple[int, DatasetTrialUnit] | None = None
+    had_source_preparation_failure = False
 
     def durable_flush() -> None:
         if trial_journal is not None:
@@ -256,12 +261,35 @@ async def evaluate_interaction_records(
                         trial_terminal_callback=trial_terminal,
                     )
                 except DatasetSourcePreparationError as error:
+                    had_source_preparation_failure = True
                     if not isolate_source_preparation_failures:
                         raise
                     if active_trial is not None:
                         raise AssertionError(
                             "source preparation failures must precede target delivery"
                         ) from error
+                    if run_context is None:
+                        raise AssertionError(
+                            "source preparation failure evidence requires a run context"
+                        ) from error
+                    failure_evidence = build_source_preparation_failure_evidence(
+                        record,
+                        error,
+                        repetitions=repetitions,
+                        max_environment_api_calls=max_environment_api_calls,
+                        planned_target_calls=planned_target_calls,
+                        run_context=run_context,
+                    )
+                    output_stream.write(
+                        json.dumps(
+                            failure_evidence.model_dump(mode="json", exclude_none=True),
+                            ensure_ascii=False,
+                        )
+                        + "\n"
+                    )
+                    durable_flush()
+                    if source_preparation_failures is not None:
+                        source_preparation_failures.append(failure_evidence)
                     failed_units = 0
                     units = [
                         DatasetTrialUnit(
@@ -295,25 +323,6 @@ async def evaluate_interaction_records(
                             case_number=case_number,
                             failed_units=failed_units,
                         )
-                    if run_context is None:
-                        raise AssertionError(
-                            "source preparation failure evidence requires a run context"
-                        ) from error
-                    output_stream.write(
-                        json.dumps(
-                            build_source_preparation_failure_record(
-                                record,
-                                error,
-                                repetitions=repetitions,
-                                max_environment_api_calls=max_environment_api_calls,
-                                planned_target_calls=planned_target_calls,
-                                run_context=run_context,
-                            ),
-                            ensure_ascii=False,
-                        )
-                        + "\n"
-                    )
-                    durable_flush()
                     continue
                 except (DatasetTargetDeliveryUncertain, asyncio.CancelledError):
                     signal_control.target_call_finished()
@@ -375,5 +384,8 @@ async def evaluate_interaction_records(
                 durable_flush()
                 results.append(result)
     if complete_progress:
-        progress_tracker.emit(status="completed", stage="terminal")
+        progress_tracker.emit(
+            status="failed" if had_source_preparation_failure else "completed",
+            stage="terminal",
+        )
     return tuple(results)
