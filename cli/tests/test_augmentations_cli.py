@@ -437,6 +437,29 @@ def test_plan_reads_declared_capabilities_without_constructing_external_clients(
     assert "environment_capability_missing" not in _reason_codes(timeout)
 
 
+def test_bundle_plan_uses_configured_project_runtime_readiness(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _initialize_project(tmp_path, monkeypatch)
+
+    result = runner.invoke(
+        app,
+        ["augmentations", "bundles", "plan", "everyday-customers", "--json"],
+    )
+
+    assert result.exit_code == 0, result.output
+    plan = json.loads(result.output)
+    assert plan["totals"]["cases"] == 1
+    assert plan["totals"]["planned_probes"] == 0
+    assert plan["totals"]["blocked_probes"] == 3
+    assert all(probe["status"] == "blocked" for probe in plan["probes"])
+    assert all(
+        any("Semantic model calls are disabled" in reason for reason in probe["reasons"])
+        for probe in plan["probes"]
+    )
+    assert all("operator is not qualified" in probe["reasons"] for probe in plan["probes"])
+
+
 def test_plan_without_a_project_still_classifies_every_catalog_item(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -140,7 +140,12 @@ Inspect available augmentations at any time:
 ```bash
 ul augmentations list --mode dataset_variation
 ul augmentations plan input.surface.typing_noise
+ul augmentations bundles plan everyday-customers --case CASE_ID \
+  --source-feature "production interaction"
 ```
+
+Named bundles are versioned operator-selection and budget policies. See
+[Plan named augmentation bundles](docs/augmentation-bundles.md).
 
 ## How it works
 
