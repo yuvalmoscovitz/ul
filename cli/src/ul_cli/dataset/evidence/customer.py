@@ -12,7 +12,7 @@ from ul import (
     DatasetEvaluationTrialSet,
     DatasetTargetLifecycleFailure,
 )
-from ul.dataset_evaluation import compare_action_outcomes
+from ul.dataset_evaluation import compare_observed_outcomes
 from ul.dataset_invariants import DatasetInvariantEvaluation
 from ul_core.dataset import ObservedOutcome
 
@@ -89,7 +89,7 @@ def build_customer_evidence_record(
     if uses_extended_invariants and run_context is None:
         raise ValueError("extended invariant evidence requires a resumable run context")
     evidence: dict[str, JsonValue] = {
-        "schema_version": "1.13.0",
+        "schema_version": "1.14.0",
         "evaluation_mode": evaluation_mode,
         "interaction_id": result.source.id,
         **(
@@ -163,7 +163,7 @@ def _customer_cross_examination(
     else:
         historical_frame = source_frames[0]
         try:
-            baseline_deltas = compare_action_outcomes(
+            baseline_deltas = compare_observed_outcomes(
                 historical_frame,
                 current_baseline_frame,
                 result.source.raw_input,
@@ -504,8 +504,25 @@ def _finding_id(
             "augmented_input": augmented_input,
             "category": finding.category,
             "grounded_field_names": sorted(finding.grounded_field_names),
-            "reference_action_semantics": _normalized_action_semantics(finding.expected_effects),
-            "observed_action_semantics": _normalized_action_semantics(finding.observed_effects),
+            **(
+                {
+                    "reference_response_semantics": _normalized_response_semantics(
+                        finding.expected_effects
+                    ),
+                    "observed_response_semantics": _normalized_response_semantics(
+                        finding.observed_effects
+                    ),
+                }
+                if finding.category == "changed_response"
+                else {
+                    "reference_action_semantics": _normalized_outcome_semantics(
+                        finding.expected_effects
+                    ),
+                    "observed_action_semantics": _normalized_outcome_semantics(
+                        finding.observed_effects
+                    ),
+                }
+            ),
         },
     )
     if duplicate_ordinal is not None:
@@ -519,7 +536,7 @@ def _finding_id(
     return f"ulf_v1_{hashlib.sha256(canonical_json.encode('utf-8')).hexdigest()}"
 
 
-def _normalized_action_semantics(effects: tuple[ObservedOutcome, ...]) -> list[JsonValue]:
+def _normalized_outcome_semantics(effects: tuple[ObservedOutcome, ...]) -> list[JsonValue]:
     signatures = [
         cast(
             JsonValue,
@@ -541,3 +558,19 @@ def _normalized_action_semantics(effects: tuple[ObservedOutcome, ...]) -> list[J
             sort_keys=True,
         ),
     )
+
+
+def _normalized_response_semantics(effects: tuple[ObservedOutcome, ...]) -> list[JsonValue]:
+    return [
+        cast(
+            JsonValue,
+            {
+                "position": effect.position,
+                "kind": effect.kind,
+                "predicate": effect.predicate,
+                "fields": effect.fields,
+                "propositions": list(effect.propositions),
+            },
+        )
+        for effect in effects
+    ]

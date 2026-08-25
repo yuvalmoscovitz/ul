@@ -2008,7 +2008,7 @@ def test_invalid_evidence_diagnostic_lists_current_schema(tmp_path: Path) -> Non
     result = runner.invoke(app, ["dataset", "report", str(evidence)])
 
     assert result.exit_code != 0
-    assert "1.13.0" in result.output
+    assert "1.14.0" in result.output
 
 
 def test_malformed_extra_field_and_digest_mismatch_reviews_are_rejected(tmp_path: Path) -> None:

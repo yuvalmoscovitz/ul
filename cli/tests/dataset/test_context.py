@@ -26,8 +26,8 @@ _ANSI_ESCAPE_PATTERN = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 def test_run_context_uses_current_pipeline() -> None:
     record = _evaluation_result("interaction-1").source
     run_context = _run_context((record,))
-    assert run_context.schema_version == "1.3.0"
-    assert run_context.pipeline_version == "1.4.0"
+    assert run_context.schema_version == "1.4.0"
+    assert run_context.pipeline_version == "1.5.0"
     assert run_context.evaluation_mode == "variance"
     assert run_context.target.config.reset.reset_session is True
     assert run_context.target.config.reset.reset_env is True
@@ -44,7 +44,7 @@ def test_run_context_records_versioned_fixture_identity() -> None:
         (record,), target_config=JsonHttpEnvironmentConfig.model_validate(raw_config)
     )
 
-    assert run_context.schema_version == "1.3.0"
+    assert run_context.schema_version == "1.4.0"
     assert run_context.fixture.model_dump(mode="json") == {
         "status": "configured",
         "id": "standard-account",

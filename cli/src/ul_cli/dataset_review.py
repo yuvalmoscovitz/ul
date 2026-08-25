@@ -104,7 +104,7 @@ _REVIEW_ID_PATTERN = r"^ulr_[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{
 _PATTERN_REVIEW_ID_PATTERN = (
     r"^ulpr_[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
 )
-_DATASET_EVALUATION_PIPELINE_VERSION = "1.4.0"
+_DATASET_EVALUATION_PIPELINE_VERSION = "1.5.0"
 _MAXIMUM_PATTERN_EFFECTS = 100
 _MAXIMUM_PATTERN_FIELDS = 100
 _MAXIMUM_PATTERN_LABEL_CHARACTERS = 500
@@ -284,8 +284,10 @@ class DatasetEvidenceFixture(_StrictModel):
 
 
 class DatasetEvidenceRunContext(_StrictModel):
-    schema_version: Literal["1.1.0", "1.2.0", "1.3.0"] = "1.3.0"
-    pipeline_version: Literal["1.2.0", "1.3.0", "1.4.0"] = _DATASET_EVALUATION_PIPELINE_VERSION
+    schema_version: Literal["1.1.0", "1.2.0", "1.3.0", "1.4.0"] = "1.4.0"
+    pipeline_version: Literal["1.2.0", "1.3.0", "1.4.0", "1.5.0"] = (
+        _DATASET_EVALUATION_PIPELINE_VERSION
+    )
     selected_dataset_sha256: str = Field(pattern=_SHA256_PATTERN)
     operators: tuple[DatasetEvidenceOperator, ...] = Field(min_length=1)
     evaluation_mode: Literal["variance"] | None = None
@@ -304,17 +306,20 @@ class DatasetEvidenceRunContext(_StrictModel):
             ("1.1.0", "1.2.0"),
             ("1.2.0", "1.3.0"),
             ("1.3.0", "1.4.0"),
+            ("1.4.0", "1.5.0"),
         }:
             raise ValueError("run context schema and pipeline versions must match")
-        if self.schema_version in {"1.2.0", "1.3.0"} and self.evaluation_mode is None:
+        if self.schema_version in {"1.2.0", "1.3.0", "1.4.0"} and self.evaluation_mode is None:
             raise ValueError(
                 f"run context schema {self.schema_version} requires an evaluation mode"
             )
         if self.schema_version == "1.1.0" and "evaluation_mode" in self.model_fields_set:
             raise ValueError("run context schema 1.1.0 does not include evaluation mode")
-        if self.schema_version == "1.3.0" and self.fixture is None:
-            raise ValueError("run context schema 1.3.0 requires fixture identity status")
-        if self.schema_version != "1.3.0" and "fixture" in self.model_fields_set:
+        if self.schema_version in {"1.3.0", "1.4.0"} and self.fixture is None:
+            raise ValueError(
+                f"run context schema {self.schema_version} requires fixture identity status"
+            )
+        if self.schema_version not in {"1.3.0", "1.4.0"} and "fixture" in self.model_fields_set:
             raise ValueError(
                 f"run context schema {self.schema_version} does not include fixture identity"
             )
@@ -368,6 +373,7 @@ class _EvidenceRecord(_StrictModel):
         "1.11.0",
         "1.12.0",
         "1.13.0",
+        "1.14.0",
     ]
     evaluation_mode: Literal["variance"] | None = None
     interaction_id: str
@@ -387,15 +393,24 @@ class _EvidenceRecord(_StrictModel):
 
     @model_validator(mode="after")
     def validate_invariant_evaluation(self) -> Self:
-        current_schemas = {"1.8.0", "1.9.0", "1.10.0", "1.11.0", "1.12.0", "1.13.0"}
+        current_schemas = {
+            "1.8.0",
+            "1.9.0",
+            "1.10.0",
+            "1.11.0",
+            "1.12.0",
+            "1.13.0",
+            "1.14.0",
+        }
         if self.schema_version not in {
             "1.10.0",
             "1.11.0",
             "1.12.0",
             "1.13.0",
+            "1.14.0",
         } and "pattern_facets" in (self.model_fields_set):
             raise ValueError("vertical pattern facets require evidence schema 1.10.0")
-        if self.schema_version in {"1.12.0", "1.13.0"}:
+        if self.schema_version in {"1.12.0", "1.13.0", "1.14.0"}:
             if any(case.cross_examination is None for case in self.cases):
                 raise ValueError("current evidence schemas require case cross-examination")
         elif any("cross_examination" in case.model_fields_set for case in self.cases):
@@ -428,6 +443,7 @@ class _EvidenceRecord(_StrictModel):
                 "1.11.0",
                 "1.12.0",
                 "1.13.0",
+                "1.14.0",
             }
             and "run_context" in self.model_fields_set
         ):
@@ -449,6 +465,7 @@ class _EvidenceRecord(_StrictModel):
             "1.11.0",
             "1.12.0",
             "1.13.0",
+            "1.14.0",
         }:
             raise ValueError("extended invariant results require evidence schema 1.6.0")
         if (
@@ -457,7 +474,7 @@ class _EvidenceRecord(_StrictModel):
             and self.run_context.evaluation_mode != self.evaluation_mode
         ):
             raise ValueError("evidence evaluation mode must match its run context")
-        if self.schema_version == "1.13.0":
+        if self.schema_version in {"1.13.0", "1.14.0"}:
             from ul_cli.dataset.evidence.customer import build_customer_evidence_record
 
             technical_result = DatasetEvaluationResult.model_validate(
@@ -538,7 +555,7 @@ def create_dataset_evidence_run_context(
         else DatasetEvidenceFixture(status="not_required")
     )
     content = {
-        "schema_version": "1.3.0",
+        "schema_version": "1.4.0",
         "pipeline_version": _DATASET_EVALUATION_PIPELINE_VERSION,
         "selected_dataset_sha256": selected_dataset_sha256,
         "operators": [operator.model_dump(mode="json") for operator in operator_snapshots],
@@ -632,6 +649,7 @@ def validate_dataset_resume_evidence(
                 "1.11.0",
                 "1.12.0",
                 "1.13.0",
+                "1.14.0",
             }
             or evidence.run_context is None
         ):
@@ -959,6 +977,7 @@ _BEHAVIOR_FINDING_SUMMARIES: dict[str, FindingSummaryText] = {
     "unexpected_effect": "The changed input made the agent take a new action.",
     "missing_effect": "The changed input made the agent skip a baseline action.",
     "changed_grounded_effect_argument": "The changed input altered an important action detail.",
+    "changed_response": "The changed input changed the agent's observed response.",
     "unstable_behavior": "The changed input produced inconsistent behavior across repetitions.",
 }
 
@@ -1480,6 +1499,8 @@ def _build_failure_patterns(
                     (
                         "same_customer_rule"
                         if first.kind == "customer_invariant_violation"
+                        else "same_response_shape"
+                        if first.category == "changed_response"
                         else "same_action_shape"
                     ),
                     "same_outcome_stability",
@@ -1505,19 +1526,19 @@ def _build_failure_patterns(
                         "rule"
                         if first.kind == "customer_invariant_violation"
                         else "outcome"
-                        if first.category == "unstable_behavior"
+                        if first.category in {"unstable_behavior", "changed_response"}
                         else "action"
                     ),
                     evidence_level=(
                         "evaluated_rule"
                         if first.kind == "customer_invariant_violation"
                         else "model_derived_outcome"
-                        if first.category == "unstable_behavior"
+                        if first.category in {"unstable_behavior", "changed_response"}
                         and "model_derived_unverified" in first.evidence_authorities
                         else "model_derived_action"
                         if "model_derived_unverified" in first.evidence_authorities
                         else "observed_outcome"
-                        if first.category == "unstable_behavior"
+                        if first.category in {"unstable_behavior", "changed_response"}
                         else "observed_action"
                     ),
                     mechanism_pseudonym=pattern_mechanism_pseudonym(
@@ -2148,7 +2169,7 @@ def _load_evidence(path: Path) -> list[_LoadedEvidenceRecord]:
                 )
             )
     except (ValidationError, ValueError):
-        raise _ReviewInputError("evidence is not valid UL schema through 1.13.0 JSONL") from None
+        raise _ReviewInputError("evidence is not valid UL schema through 1.14.0 JSONL") from None
     return records
 
 
