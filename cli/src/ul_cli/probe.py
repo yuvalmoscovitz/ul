@@ -2267,6 +2267,7 @@ def _run_campaign(
                         progress_runtime=progress_runtime,
                         complete_progress=False,
                         environment_calls_per_target_call=(resolved_target.calls_per_execution),
+                        isolate_source_preparation_failures=False,
                         run_context=run_context,
                         evaluator_preflight=evaluator_preflight,
                         trial_journal=trial_journal,

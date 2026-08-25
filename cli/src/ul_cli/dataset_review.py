@@ -21,7 +21,12 @@ from uuid import uuid4
 import typer
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, ValidationError, model_validator
 from rich.console import Console
-from ul import DatasetEvaluationResult, InteractionRecord
+from ul import (
+    DatasetComparisonCompatibilityError,
+    DatasetEvaluationResult,
+    DatasetSemanticPreparationError,
+    InteractionRecord,
+)
 from ul.dataset_invariants import (
     DatasetInvariantArrayUniqueRuleEvaluation,
     DatasetInvariantArrayUniqueTrialEvaluation,
@@ -338,6 +343,43 @@ class DatasetEvidenceRunContext(_StrictModel):
         return self
 
 
+class DatasetSourcePreparationFailureEvidence(_StrictModel):
+    schema_version: Literal["1.0.0"] = "1.0.0"
+    record_type: Literal["source_preparation_failure"] = "source_preparation_failure"
+    evaluation_mode: Literal["variance"] = "variance"
+    interaction_id: str = Field(min_length=1)
+    source_record_id: str | None = cast(Any, Field)(default=None, exclude_if=_is_none)
+    failure_stage: Literal["semantic_preparation"] = "semantic_preparation"
+    reason_code: Literal[
+        "source_semantic_preparation_failed",
+        "source_comparison_surface_incompatible",
+    ]
+    summary: str = Field(min_length=1, max_length=500)
+    remediation: str = Field(min_length=1, max_length=500)
+    execution_plan: _ExecutionPlan
+    run_context: DatasetEvidenceRunContext
+
+    @model_validator(mode="after")
+    def validate_context(self) -> Self:
+        if self.run_context.evaluation_mode != self.evaluation_mode:
+            raise ValueError("source failure evaluation mode must match its run context")
+        if self.execution_plan.repetitions != self.run_context.repetitions:
+            raise ValueError("source failure repetitions must match its run context")
+        expected_text = {
+            "source_semantic_preparation_failed": (
+                DatasetSemanticPreparationError.explanation,
+                DatasetSemanticPreparationError.remediation,
+            ),
+            "source_comparison_surface_incompatible": (
+                DatasetComparisonCompatibilityError.explanation,
+                DatasetComparisonCompatibilityError.remediation,
+            ),
+        }[self.reason_code]
+        if (self.summary, self.remediation) != expected_text:
+            raise ValueError("source failure guidance must match its reason code")
+        return self
+
+
 class _Baseline(_StrictModel):
     status: str
     observations: _Observations
@@ -650,6 +692,41 @@ def validate_dataset_resume_evidence(
     technical_results: list[DatasetEvaluationResult] = []
     for raw_line in raw_lines:
         try:
+            decoded_line: object = json.loads(raw_line)
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            raise ValueError("resume evidence is not valid UL JSONL") from None
+        decoded_record = (
+            cast(dict[str, object], decoded_line) if isinstance(decoded_line, dict) else None
+        )
+        if (
+            decoded_record is not None
+            and decoded_record.get("record_type") == "source_preparation_failure"
+        ):
+            try:
+                source_failure = DatasetSourcePreparationFailureEvidence.model_validate_json(
+                    raw_line
+                )
+            except (ValidationError, ValueError):
+                raise ValueError("resume evidence is not valid UL JSONL") from None
+            if source_failure.run_context != expected_context:
+                raise ValueError("resume evidence is incompatible with the current evaluation plan")
+            if source_failure.interaction_id in processed_ids:
+                raise ValueError("resume evidence contains duplicate interaction IDs")
+            selected_record = selected_records_by_id.get(source_failure.interaction_id)
+            if selected_record is None:
+                raise ValueError(
+                    "resume evidence contains an interaction outside the selected dataset"
+                )
+            expected_source_record_id = (
+                selected_record.source_interaction_id
+                if getattr(selected_record, "augmentation_target", None) is not None
+                else None
+            )
+            if source_failure.source_record_id != expected_source_record_id:
+                raise ValueError("resume source failure does not match the selected dataset")
+            processed_ids.add(source_failure.interaction_id)
+            continue
+        try:
             evidence = _EvidenceRecord.model_validate_json(raw_line)
         except (ValidationError, ValueError):
             raise ValueError("resume evidence is not valid UL JSONL") from None
@@ -930,6 +1007,12 @@ class _LoadedEvidenceRecord(BaseModel):
     sha256: str
 
 
+@dataclass(frozen=True)
+class _LoadedEvidenceDocument:
+    records: list[_LoadedEvidenceRecord]
+    source_failures: tuple[DatasetSourcePreparationFailureEvidence, ...]
+
+
 @dataclass
 class _LockedReviewsFile:
     path: Path
@@ -1022,8 +1105,10 @@ def _summarize_dataset_evidence(
     *,
     pattern_identity_key: bytes,
 ) -> UnifiedReport:
-    evidence_records = _load_evidence(evidence)
-    evaluation_mode = _dataset_evaluation_mode(evidence_records)
+    evidence_document = _load_evidence_document(evidence)
+    evidence_records = evidence_document.records
+    source_failures = evidence_document.source_failures
+    evaluation_mode = _dataset_evaluation_mode(evidence_records, source_failures)
     review_records = _load_reviews(reviews or _default_reviews_path(evidence))
     indexed_findings = _index_findings(evidence_records)
     _validate_review_history(
@@ -1237,7 +1322,8 @@ def _summarize_dataset_evidence(
     if summary.actionable_finding_count:
         report_review_status: ReportReviewStatus = "action_required"
     elif (
-        summary.review_status_counts.inconclusive
+        source_failures
+        or summary.review_status_counts.inconclusive
         or "not_evaluable" in invariant_statuses
         or _dataset_evidence_is_inconclusive(evidence_records)
     ):
@@ -1252,7 +1338,7 @@ def _summarize_dataset_evidence(
         loaded_record.evidence.run_context.target
         for loaded_record in evidence_records
         if loaded_record.evidence.run_context is not None
-    )
+    ) + tuple(source_failure.run_context.target for source_failure in source_failures)
     response_only_targets = tuple(
         (
             target.kind == "probe_target"
@@ -1268,7 +1354,10 @@ def _summarize_dataset_evidence(
     return UnifiedReport(
         evidence_type="dataset_evaluation",
         evidence_schema_versions=tuple(
-            sorted({record.evidence.schema_version for record in evidence_records})
+            sorted(
+                {record.evidence.schema_version for record in evidence_records}
+                | ({"source-preparation-failure/1.0.0"} if source_failures else set())
+            )
         ),
         response_state_evidence_scope=("response_only" if response_only else "response_and_state"),
         evaluation_mode=evaluation_mode,
@@ -1298,10 +1387,14 @@ def _summarize_dataset_evidence(
 
 def _dataset_evaluation_mode(
     records: list[_LoadedEvidenceRecord],
+    source_failures: tuple[DatasetSourcePreparationFailureEvidence, ...] = (),
 ) -> Literal["variance"] | None:
     evaluation_modes: set[Literal["variance"] | None] = {
         record.evidence.evaluation_mode for record in records
     }
+    evaluation_modes.update(failure.evaluation_mode for failure in source_failures)
+    if not evaluation_modes:
+        return None
     if len(evaluation_modes) != 1:
         raise _ReviewInputError("evidence combines incompatible evaluation modes")
     return next(iter(evaluation_modes))
@@ -1655,7 +1748,9 @@ def report_dataset_evidence(
     """Show findings and their human review state without model or network calls."""
     reviews_path = reviews or _default_reviews_path(evidence)
     try:
-        evidence_records = _load_evidence(evidence)
+        evidence_document = _load_evidence_document(evidence)
+        evidence_records = evidence_document.records
+        source_failures = evidence_document.source_failures
         review_records = _load_reviews(reviews_path)
         findings = _index_findings(evidence_records)
         _validate_review_history(
@@ -1694,7 +1789,7 @@ def report_dataset_evidence(
         status_counts[active_review.status if active_review else "needs_review"] += 1
 
     _print_plain(f"Dataset finding report: {len(findings)} finding(s)")
-    evaluation_mode = _dataset_evaluation_mode(evidence_records)
+    evaluation_mode = _dataset_evaluation_mode(evidence_records, source_failures)
     if evaluation_mode is not None:
         _print_plain(
             f"Evaluation mode: {evaluation_mode} (historical output is not an expected answer; "
@@ -1703,6 +1798,14 @@ def report_dataset_evidence(
     _print_plain(
         "Reviews: " + ", ".join(f"{status}={count}" for status, count in status_counts.items())
     )
+    _print_plain(f"Source preparation failures: {len(source_failures)}")
+    for source_failure in source_failures:
+        _print_plain("")
+        _print_plain(f"Source preparation failure {source_failure.interaction_id}")
+        _print_plain(f"Stage: {source_failure.failure_stage}")
+        _print_plain(f"Reason: {source_failure.reason_code}")
+        _print_plain(f"Summary: {source_failure.summary}")
+        _print_plain(f"Next: {source_failure.remediation}")
     if show_sensitive_values:
         _print_plain(
             "WARNING: showing selected invariant values; they may contain secrets or PII and "
@@ -2161,7 +2264,7 @@ def _default_reviews_path(evidence: Path) -> Path:
     return evidence.with_suffix(".reviews.jsonl")
 
 
-def _load_evidence(path: Path) -> list[_LoadedEvidenceRecord]:
+def _load_evidence_document(path: Path) -> _LoadedEvidenceDocument:
     try:
         raw = _read_bounded_regular_file(path, _MAXIMUM_EVIDENCE_BYTES)
     except OSError as error:
@@ -2176,17 +2279,53 @@ def _load_evidence(path: Path) -> list[_LoadedEvidenceRecord]:
     if any(not raw_line.strip() for raw_line in raw_lines):
         raise _ReviewInputError("evidence contains an empty JSONL record")
     records: list[_LoadedEvidenceRecord] = []
+    source_failures: list[DatasetSourcePreparationFailureEvidence] = []
+    successful_interaction_ids: set[str] = set()
+    failed_interaction_ids: set[str] = set()
     try:
         for raw_line in raw_lines:
-            records.append(
-                _LoadedEvidenceRecord(
+            decoded_line: object = json.loads(raw_line)
+            decoded_record = (
+                cast(dict[str, object], decoded_line) if isinstance(decoded_line, dict) else None
+            )
+            if (
+                decoded_record is not None
+                and decoded_record.get("record_type") == "source_preparation_failure"
+            ):
+                source_failure = DatasetSourcePreparationFailureEvidence.model_validate_json(
+                    raw_line
+                )
+                interaction_id = source_failure.interaction_id
+                if (
+                    interaction_id in successful_interaction_ids
+                    or interaction_id in failed_interaction_ids
+                ):
+                    raise ValueError("duplicate interaction ID")
+                failed_interaction_ids.add(interaction_id)
+                source_failures.append(source_failure)
+            else:
+                loaded_record = _LoadedEvidenceRecord(
                     evidence=_EvidenceRecord.model_validate_json(raw_line),
                     sha256=hashlib.sha256(raw_line).hexdigest(),
                 )
-            )
-    except (ValidationError, ValueError):
-        raise _ReviewInputError("evidence is not valid UL schema through 1.14.0 JSONL") from None
-    return records
+                interaction_id = loaded_record.evidence.interaction_id
+                if interaction_id in failed_interaction_ids:
+                    raise ValueError("duplicate interaction ID")
+                successful_interaction_ids.add(interaction_id)
+                records.append(loaded_record)
+    except (UnicodeDecodeError, json.JSONDecodeError, ValidationError, ValueError):
+        raise _ReviewInputError(
+            "evidence is not valid UL dataset evidence JSONL; expected success schema through "
+            "1.14.0 or source-preparation-failure/1.0.0"
+        ) from None
+    return _LoadedEvidenceDocument(
+        records=records,
+        source_failures=tuple(source_failures),
+    )
+
+
+def _load_evidence(path: Path) -> list[_LoadedEvidenceRecord]:
+    return _load_evidence_document(path).records
 
 
 def dataset_durable_run_marker_manifest_sha256(raw_line: bytes) -> str | None:
@@ -2216,7 +2355,7 @@ def dataset_durable_run_marker_manifest_sha256(raw_line: bytes) -> str | None:
 
 def is_reportable_dataset_evidence(path: Path) -> bool:
     try:
-        _load_evidence(path)
+        _load_evidence_document(path)
     except _ReviewInputError:
         return False
     return True

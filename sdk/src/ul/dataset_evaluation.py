@@ -70,7 +70,22 @@ class DatasetTargetDeliveryUncertain(RuntimeError):
     """Execution was interrupted after target delivery may have begun."""
 
 
-class DatasetComparisonCompatibilityError(ValueError):
+class DatasetSourcePreparationError(ValueError):
+    code: str
+    explanation: str
+    remediation: str
+
+
+class DatasetSemanticPreparationError(DatasetSourcePreparationError):
+    code = "source_semantic_preparation_failed"
+    explanation = "The recorded interaction could not be prepared for semantic probing."
+    remediation = "Inspect the source-preparation failure and correct the recorded interaction."
+
+    def __init__(self) -> None:
+        super().__init__(self.explanation)
+
+
+class DatasetComparisonCompatibilityError(DatasetSourcePreparationError):
     code = "source_comparison_surface_incompatible"
     explanation = "The recorded output has no coherent action or grounded response to compare."
     remediation = (
@@ -393,10 +408,13 @@ class DatasetEvaluationRunner:
             raise ValueError("repetitions must be a positive integer")
         starting_actual_calls, starting_cache_hits = self._semantic_call_metrics()
         if precomputed_augmentation is None:
-            augmentation = await self._augmentation_engine.augment(
-                (source,), operator_ids=operator_ids
-            )
-            _validate_precomputed_augmentation(source, augmentation, operator_ids=None)
+            try:
+                augmentation = await self._augmentation_engine.augment(
+                    (source,), operator_ids=operator_ids
+                )
+                _validate_precomputed_augmentation(source, augmentation, operator_ids=None)
+            except ValueError:
+                raise DatasetSemanticPreparationError from None
             if augmentation_checkpoint_callback is not None:
                 augmentation_checkpoint_callback(augmentation)
         else:

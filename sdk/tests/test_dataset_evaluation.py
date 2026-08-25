@@ -19,6 +19,7 @@ from ul.dataset_evaluation import (
     DatasetEvaluationResult,
     DatasetEvaluationTrial,
     DatasetEvaluationTrialSet,
+    DatasetSemanticPreparationError,
     DatasetTargetDeliveryUncertain,
     DatasetTrialUnit,
 )
@@ -292,6 +293,17 @@ class InvalidObservedOutputPipeline(DeterministicSemanticPipeline):
         reference_frame: SemanticFrame | None = None,
     ) -> SemanticFrame:
         if isinstance(record, InteractionRecord) and record.id != "source":
+            raise ValueError("untrusted provider validation detail")
+        return await super().deconstruct(record, reference_frame)
+
+
+class InvalidSourcePipeline(DeterministicSemanticPipeline):
+    async def deconstruct(
+        self,
+        record: InteractionRecord | UserInputRecord,
+        reference_frame: SemanticFrame | None = None,
+    ) -> SemanticFrame:
+        if isinstance(record, InteractionRecord) and record.id == "source":
             raise ValueError("untrusted provider validation detail")
         return await super().deconstruct(record, reference_frame)
 
@@ -1118,6 +1130,23 @@ async def test_invalid_observed_output_frame_is_retained_as_inconclusive() -> No
         "semantically deconstructed",
     )
     assert target.raw_inputs == ["Transfer 100 to Alice."]
+
+
+async def test_source_preparation_validation_failure_is_sanitized_before_delivery() -> None:
+    semantic_pipeline = InvalidSourcePipeline((_source_outcomes()[0],))
+    target = DeterministicEnvironment()
+    runner = DatasetEvaluationRunner(
+        DatasetAugmentationEngine(semantic_pipeline, semantic_pipeline),
+        semantic_pipeline,
+        target,
+    )
+
+    with pytest.raises(DatasetSemanticPreparationError) as raised:
+        await runner.run(_source())
+
+    assert raised.value.code == "source_semantic_preparation_failed"
+    assert "untrusted provider validation detail" not in str(raised.value)
+    assert target.raw_inputs == []
 
 
 async def test_structured_action_object_supports_its_grounded_fields() -> None:
