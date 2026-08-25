@@ -5,6 +5,7 @@ import os
 import stat
 from pathlib import Path
 
+import pytest
 from typer.testing import CliRunner
 from ul_cli.main import app
 
@@ -50,9 +51,13 @@ def _write_bfcl_sources(
                                         "description": "Optional calculation settings.",
                                         "properties": {
                                             "rounded": {
-                                                "type": "bool",
+                                                "type": "Boolean",
                                                 "description": "Round the result.",
-                                            }
+                                            },
+                                            "issuer": {
+                                                "type": "",
+                                                "description": "Issuer name.",
+                                            },
                                         },
                                     },
                                 },
@@ -125,6 +130,13 @@ def test_bfcl_ingest_produces_valid_rich_ul_dataset(tmp_path: Path) -> None:
     assert function["parameters"]["type"] == "object"
     assert function["parameters"]["properties"]["value"]["type"] == "number"
     assert function["parameters"]["properties"]["options"]["type"] == "object"
+    assert (
+        function["parameters"]["properties"]["options"]["properties"]["rounded"]["type"]
+        == "boolean"
+    )
+    assert (
+        function["parameters"]["properties"]["options"]["properties"]["issuer"]["type"] == "string"
+    )
     assert record["inputs"]["openai_tool_name_map"] == {"math_calculate": "math.calculate"}
     assert record["augmentation_targets"] == [
         {
@@ -218,3 +230,108 @@ def test_bfcl_ingest_never_overwrites_output(tmp_path: Path) -> None:
     assert result.exit_code == 2
     assert "will not overwrite" in result.output
     assert output.read_text(encoding="utf-8") == "keep me"
+
+
+def test_bfcl_ingest_rejects_category_mislabelling(tmp_path: Path) -> None:
+    questions, answers = _write_bfcl_sources(tmp_path, count=1)
+    output = tmp_path / "cohort.jsonl"
+    arguments = _ingest_arguments(questions, answers, output, limit=1)
+    arguments[arguments.index("simple_python")] = "parallel"
+
+    result = runner.invoke(app, arguments)
+
+    assert result.exit_code == 2
+    assert "Invalid value for --category" in result.output
+    assert "do not match category" in result.output
+    assert not output.exists()
+
+
+def test_bfcl_ingest_preserves_single_turn_system_context(tmp_path: Path) -> None:
+    questions, answers = _write_bfcl_sources(tmp_path, count=1)
+    question = json.loads(questions.read_text(encoding="utf-8"))
+    question["question"][0].insert(
+        0,
+        {"role": "system", "content": "Use tools for calculations."},
+    )
+    questions.write_text(json.dumps(question) + "\n", encoding="utf-8")
+    output = tmp_path / "cohort.jsonl"
+
+    result = runner.invoke(app, _ingest_arguments(questions, answers, output, limit=1))
+
+    assert result.exit_code == 0, result.output
+    record = json.loads(output.read_text(encoding="utf-8"))
+    assert record["inputs"]["messages"][0] == {
+        "role": "system",
+        "content": "Use tools for calculations.",
+    }
+    assert record["augmentation_targets"][0]["json_pointer"] == "/inputs/messages/1/content"
+
+
+def test_bfcl_ingest_rejects_unknown_schema_types(tmp_path: Path) -> None:
+    questions, answers = _write_bfcl_sources(tmp_path, count=1)
+    question = json.loads(questions.read_text(encoding="utf-8"))
+    question["function"][0]["parameters"]["properties"]["value"]["type"] = "mystery"
+    questions.write_text(json.dumps(question) + "\n", encoding="utf-8")
+    output = tmp_path / "cohort.jsonl"
+
+    result = runner.invoke(app, _ingest_arguments(questions, answers, output, limit=1))
+
+    assert result.exit_code == 2
+    assert "unsupported BFCL schema type" in result.output
+    assert not output.exists()
+
+
+def test_bfcl_ingest_rejects_excessive_schema_depth(tmp_path: Path) -> None:
+    questions, answers = _write_bfcl_sources(tmp_path, count=1)
+    question = json.loads(questions.read_text(encoding="utf-8"))
+    nested_schema: dict[str, object] = {"type": "string"}
+    for index in range(110):
+        nested_schema = {
+            "type": "object",
+            "properties": {f"level_{index}": nested_schema},
+        }
+    question["function"][0]["parameters"] = nested_schema
+    questions.write_text(json.dumps(question) + "\n", encoding="utf-8")
+    output = tmp_path / "cohort.jsonl"
+
+    result = runner.invoke(app, _ingest_arguments(questions, answers, output, limit=1))
+
+    assert result.exit_code == 2
+    assert "BFCL schema is too deep" in result.output
+    assert not output.exists()
+
+
+def test_bfcl_ingest_attributes_invalid_answer_file(tmp_path: Path) -> None:
+    questions, answers = _write_bfcl_sources(tmp_path, count=1)
+    answers.write_text("not json\n", encoding="utf-8")
+    output = tmp_path / "cohort.jsonl"
+
+    result = runner.invoke(app, _ingest_arguments(questions, answers, output, limit=1))
+
+    assert result.exit_code == 2
+    assert "Invalid value for POSSIBLE_ANSWERS" in result.output
+    assert not output.exists()
+
+
+def test_bfcl_ingest_does_not_publish_interrupted_output(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    questions, answers = _write_bfcl_sources(tmp_path, count=2)
+    output = tmp_path / "cohort.jsonl"
+
+    def fail_fsync(_descriptor: int) -> None:
+        raise OSError("simulated interruption")
+
+    monkeypatch.setattr(os, "fsync", fail_fsync)
+    failed = runner.invoke(app, _ingest_arguments(questions, answers, output, limit=2))
+
+    assert failed.exit_code == 2
+    assert "cannot create output file" in failed.output
+    assert not output.exists()
+    assert not list(tmp_path.glob(".cohort.jsonl.tmp-*"))
+
+    monkeypatch.undo()
+    retried = runner.invoke(app, _ingest_arguments(questions, answers, output, limit=2))
+    assert retried.exit_code == 0, retried.output
+    assert len(output.read_text(encoding="utf-8").splitlines()) == 2

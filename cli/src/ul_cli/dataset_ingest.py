@@ -5,12 +5,15 @@ import math
 import os
 import stat
 import sys
+import tempfile
 import unicodedata
+from contextlib import suppress
 from pathlib import Path
 from typing import Annotated, TextIO, cast
 
 import typer
 from pydantic import ValidationError
+from ul import RichInteractionCase
 from ul.otlp_ingest import OtlpIngestResult, OtlpMappingConfig, parse_otlp_traces
 from ul.trace_replay import TraceReplayBundle, materialize_trace_replay_bundle
 
@@ -110,7 +113,10 @@ def ingest_bfcl_dataset(
             limit=limit,
         )
     except BfclInputError as error:
-        raise typer.BadParameter(_terminal_safe(str(error)), param_hint="QUESTIONS") from None
+        raise typer.BadParameter(
+            _terminal_safe(str(error)),
+            param_hint=error.param_hint or "QUESTIONS",
+        ) from None
 
     if dry_run:
         _print_safe(
@@ -123,18 +129,12 @@ def ingest_bfcl_dataset(
 
     assert output is not None
     try:
-        output_stream = _create_private_output(output)
+        _write_private_bfcl_cohort(output, result.records)
     except OSError as error:
         raise typer.BadParameter(
             f"cannot create output file ({error.__class__.__name__})",
             param_hint="--output",
         ) from None
-    with output_stream:
-        for record in result.records:
-            output_stream.write(record.model_dump_json())
-            output_stream.write("\n")
-        output_stream.flush()
-        os.fsync(output_stream.fileno())
     _print_safe(f"Prepared {len(result.records)} BFCL interaction(s) → {output}")
     _print_safe(f"Next: inspect the bounded plan with 'ul dataset evaluate {output} --dry-run'.")
 
@@ -463,6 +463,45 @@ def _create_private_output(path: Path) -> TextIO:
     except BaseException:
         os.close(descriptor)
         raise
+
+
+def _write_private_bfcl_cohort(path: Path, records: tuple[RichInteractionCase, ...]) -> None:
+    temporary_path: Path | None = None
+    try:
+        descriptor, temporary_name = tempfile.mkstemp(
+            prefix=f".{path.name}.tmp-",
+            dir=path.parent,
+        )
+        temporary_path = Path(temporary_name)
+        try:
+            if sys.platform != "win32":
+                os.fchmod(descriptor, 0o600)
+            with os.fdopen(descriptor, "w", encoding="utf-8") as output_stream:
+                for record in records:
+                    output_stream.write(record.model_dump_json())
+                    output_stream.write("\n")
+                output_stream.flush()
+                os.fsync(output_stream.fileno())
+        except BaseException:
+            with suppress(OSError):
+                os.close(descriptor)
+            raise
+        os.link(temporary_path, path)
+        _fsync_directory(path.parent)
+    finally:
+        if temporary_path is not None:
+            with suppress(OSError):
+                temporary_path.unlink()
+
+
+def _fsync_directory(directory: Path) -> None:
+    if sys.platform == "win32":
+        return
+    descriptor = os.open(directory, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
 
 
 def _reject_duplicate_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
