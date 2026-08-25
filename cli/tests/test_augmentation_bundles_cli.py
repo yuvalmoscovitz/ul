@@ -49,18 +49,21 @@ def test_customer_can_preview_a_bounded_bundle_without_external_calls() -> None:
     assert plan["composition"] == "independent_only"
     assert plan["totals"] == {
         "cases": 2,
-        "planned_probes": 6,
+        "planned_probes": 0,
+        "blocked_probes": 6,
         "skipped_probes": 0,
-        "model_calls": 22,
-        "target_calls": 6,
-        "maximum_duration_seconds": 540,
-        "maximum_cost_usd": 1.5,
-        "mutating_probes": 6,
+        "model_calls": 0,
+        "target_calls": 0,
+        "maximum_duration_seconds": 0,
+        "maximum_cost_usd": 0.0,
+        "mutating_probes": 0,
     }
     assert plan["inspection_model_calls"] == 0
     assert plan["inspection_target_calls"] == 0
     assert plan["inspection_network_requests"] == 0
     assert all(probe["source_case_id"] == probe["source_parent_id"] for probe in plan["probes"])
+    assert {probe["status"] for probe in plan["probes"]} == {"blocked"}
+    assert all("operator is not qualified" in probe["reasons"] for probe in plan["probes"])
 
 
 def test_bundle_preview_shows_skips_exact_changes_evidence_and_reset_needs() -> None:

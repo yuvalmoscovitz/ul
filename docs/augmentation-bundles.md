@@ -22,7 +22,7 @@ ul augmentations bundles plan everyday-customers \
 When a UL project is configured, omit `--case` to use the configured dataset and case limit. The
 preview makes no model, target, or network calls. Human output and `--json` both show:
 
-- applicability or an explicit skip reason;
+- applicability plus an explicit blocked or skip reason;
 - the exact controlled write surfaces and expected relation;
 - required response, state, evaluator, and human-review evidence;
 - maximum model calls, target calls, duration, authorized cost, mutation risk, and reset needs;

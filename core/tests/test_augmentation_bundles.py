@@ -2,12 +2,17 @@ import pytest
 from ul_core.augmentations.bundles import (
     AugmentationBundle,
     AugmentationBundleBudget,
+    BundleBindingReadiness,
     BundleOperatorPolicy,
     BundleSourceCase,
     builtin_augmentation_bundle_catalog,
     plan_augmentation_bundle,
 )
-from ul_core.augmentations.definitions import AugmentationRef
+from ul_core.augmentations.definitions import (
+    AugmentationRef,
+    BuiltinAugmentationCatalog,
+    builtin_augmentation_catalog,
+)
 
 
 def test_builtin_bundles_are_versioned_selection_and_budget_policies() -> None:
@@ -45,6 +50,8 @@ def test_bundle_plan_fans_out_independently_and_exposes_bounded_work() -> None:
                 available_features=frozenset(("production interaction",)),
             ),
         ),
+        binding_readiness=_ready(bundle),
+        catalog=_qualified_catalog(),
     )
 
     assert plan.composition == "independent_only"
@@ -82,7 +89,12 @@ def test_bundle_plan_reports_skips_and_deduplicates_canonical_probes() -> None:
         budget=_budget(maximum_fan_out_per_case=1),
     )
 
-    plan = plan_augmentation_bundle(bundle, (BundleSourceCase(id="case-1"),))
+    plan = plan_augmentation_bundle(
+        bundle,
+        (BundleSourceCase(id="case-1"),),
+        binding_readiness=_ready(bundle),
+        catalog=_qualified_catalog(),
+    )
 
     assert len(plan.probes) == 1
     assert plan.probes[0].status == "skipped"
@@ -122,7 +134,12 @@ def test_bundle_plan_enforces_every_hard_bound() -> None:
         )
 
         with pytest.raises(ValueError, match=expected):
-            plan_augmentation_bundle(bundle, (source,))
+            plan_augmentation_bundle(
+                bundle,
+                (source,),
+                binding_readiness=_ready(bundle),
+                catalog=_qualified_catalog(),
+            )
 
 
 def test_bundle_plan_rejects_chained_composition_and_mutation_without_reset() -> None:
@@ -183,9 +200,87 @@ def test_bundle_plan_enforces_fan_out_and_mutation_bounds() -> None:
     )
 
     with pytest.raises(ValueError, match="fan-out"):
-        plan_augmentation_bundle(fan_out_bundle, (source,))
+        plan_augmentation_bundle(
+            fan_out_bundle,
+            (source,),
+            binding_readiness=_ready(fan_out_bundle),
+            catalog=_qualified_catalog(),
+        )
     with pytest.raises(ValueError, match="mutating probes"):
-        plan_augmentation_bundle(mutation_bundle, (source,))
+        plan_augmentation_bundle(
+            mutation_bundle,
+            (source,),
+            binding_readiness=_ready(mutation_bundle),
+            catalog=_qualified_catalog(),
+        )
+
+
+def test_bundle_plan_blocks_missing_runtime_readiness_and_unqualified_operators() -> None:
+    bundle = builtin_augmentation_bundle_catalog().get("everyday-customers")
+    source = BundleSourceCase(
+        id="case-1",
+        available_features=frozenset(("production interaction",)),
+    )
+    missing_runtime = tuple(
+        BundleBindingReadiness(
+            ref=policy.ref,
+            mode=policy.mode,
+            ready=False,
+            reasons=("semantic model is unavailable",),
+        )
+        for policy in bundle.operators
+    )
+
+    missing_plan = plan_augmentation_bundle(
+        bundle,
+        (source,),
+        binding_readiness=missing_runtime,
+        catalog=_qualified_catalog(),
+    )
+    unqualified_plan = plan_augmentation_bundle(
+        bundle,
+        (source,),
+        binding_readiness=_ready(bundle),
+    )
+
+    assert {probe.status for probe in missing_plan.probes} == {"blocked"}
+    assert all("semantic model is unavailable" in probe.reasons for probe in missing_plan.probes)
+    assert missing_plan.totals.planned_probes == 0
+    assert missing_plan.totals.blocked_probes == 3
+    assert missing_plan.totals.model_calls == 0
+    assert {probe.status for probe in unqualified_plan.probes} == {"blocked"}
+    assert all("operator is not qualified" in probe.reasons for probe in unqualified_plan.probes)
+
+
+def test_bundle_plan_rejects_conflicting_canonical_policies() -> None:
+    first = BundleOperatorPolicy(
+        ref=AugmentationRef(id="input.surface.typing_noise", version="1.0.0"),
+        mode="dataset_variation",
+        model_calls=0,
+        target_calls=0,
+        maximum_duration_seconds=1,
+        maximum_cost_usd=0,
+    )
+    conflicting = first.model_copy(update={"model_calls": 999})
+    bundle = AugmentationBundle(
+        id="conflicting-policy",
+        version="1.0.0",
+        summary="A test bundle.",
+        operators=(first, conflicting),
+        budget=_budget().model_copy(update={"maximum_model_calls": 0, "maximum_target_calls": 0}),
+    )
+    source = BundleSourceCase(
+        id="case-1",
+        available_features=frozenset(("production interaction",)),
+    )
+
+    with pytest.raises(ValueError, match="canonically equivalent bundle policies conflict"):
+        plan_augmentation_bundle(
+            bundle,
+            (source,),
+            binding_readiness=_ready(bundle),
+            catalog=_qualified_catalog(),
+        )
 
 
 def _budget(*, maximum_fan_out_per_case: int = 3) -> AugmentationBundleBudget:
@@ -197,4 +292,21 @@ def _budget(*, maximum_fan_out_per_case: int = 3) -> AugmentationBundleBudget:
         maximum_duration_seconds=1_000,
         maximum_cost_usd=100,
         maximum_mutating_probes=100,
+    )
+
+
+def _ready(bundle: AugmentationBundle) -> tuple[BundleBindingReadiness, ...]:
+    return tuple(
+        BundleBindingReadiness(ref=policy.ref, mode=policy.mode, ready=True)
+        for policy in bundle.operators
+    )
+
+
+def _qualified_catalog() -> BuiltinAugmentationCatalog:
+    catalog = builtin_augmentation_catalog()
+    return BuiltinAugmentationCatalog(
+        augmentations=tuple(
+            definition.model_copy(update={"qualification_status": "qualified"})
+            for definition in catalog.augmentations
+        )
     )

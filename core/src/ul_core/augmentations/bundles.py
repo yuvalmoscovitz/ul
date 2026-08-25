@@ -16,7 +16,7 @@ from ul_core.augmentations.definitions import (
 from ul_core.models import ULModel
 
 BundleMutationRisk = Literal["none", "state", "fault"]
-BundlePlanStatus = Literal["planned", "skipped"]
+BundlePlanStatus = Literal["planned", "blocked", "skipped"]
 
 _BUNDLE_ID_PATTERN = r"^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$"
 
@@ -62,6 +62,19 @@ class BundleSourceCase(ULModel):
     available_features: frozenset[str] = frozenset()
 
 
+class BundleBindingReadiness(ULModel):
+    ref: AugmentationRef
+    mode: AugmentationMode
+    ready: bool
+    reasons: tuple[str, ...] = ()
+
+    @model_validator(mode="after")
+    def validate_reasons(self) -> Self:
+        if self.ready == bool(self.reasons):
+            raise ValueError("ready bindings omit reasons and blocked bindings require reasons")
+        return self
+
+
 class BundleProbePlan(ULModel):
     source_case_id: str
     source_parent_id: str
@@ -85,6 +98,7 @@ class BundleProbePlan(ULModel):
 class BundlePlanTotals(ULModel):
     cases: int = Field(ge=1)
     planned_probes: int = Field(ge=0)
+    blocked_probes: int = Field(ge=0)
     skipped_probes: int = Field(ge=0)
     model_calls: int = Field(ge=0)
     target_calls: int = Field(ge=0)
@@ -151,6 +165,7 @@ def plan_augmentation_bundle(
     bundle: AugmentationBundle,
     source_cases: tuple[BundleSourceCase, ...],
     *,
+    binding_readiness: tuple[BundleBindingReadiness, ...],
     catalog: BuiltinAugmentationCatalog | None = None,
 ) -> AugmentationBundlePlan:
     if not source_cases:
@@ -162,8 +177,9 @@ def plan_augmentation_bundle(
         raise ValueError("bundle source case identifiers must be unique")
 
     definitions = catalog or builtin_augmentation_catalog()
+    readiness_by_binding = _readiness_by_binding(binding_readiness)
     probes: list[BundleProbePlan] = []
-    canonical_ids: set[str] = set()
+    canonical_policies: dict[str, BundleOperatorPolicy] = {}
     for source in source_cases:
         fan_out = 0
         for policy in bundle.operators:
@@ -182,16 +198,29 @@ def plan_augmentation_bundle(
                 for feature in binding.requirements.required_source_features
                 if feature not in source.available_features
             )
-            status: BundlePlanStatus = "skipped" if missing_features else "planned"
+            readiness = readiness_by_binding.get((policy.ref.id, policy.ref.version, policy.mode))
+            blocking_reasons = (
+                ("runtime readiness was not supplied",) if readiness is None else readiness.reasons
+            )
+            if str(definition.implementation_status) != "implemented":
+                blocking_reasons = (*blocking_reasons, "operator is not implemented")
+            if str(definition.qualification_status) != "qualified":
+                blocking_reasons = (*blocking_reasons, "operator is not qualified")
+            status: BundlePlanStatus = (
+                "skipped" if missing_features else "blocked" if blocking_reasons else "planned"
+            )
             canonical_id = _canonical_probe_id(
                 source.id,
                 policy.ref,
                 policy.mode,
                 binding.projection.writes,
             )
-            if canonical_id in canonical_ids:
+            previous_policy = canonical_policies.get(canonical_id)
+            if previous_policy is not None:
+                if previous_policy != policy:
+                    raise ValueError("canonically equivalent bundle policies conflict")
                 continue
-            canonical_ids.add(canonical_id)
+            canonical_policies[canonical_id] = policy
             if status == "planned":
                 fan_out += 1
                 if fan_out > bundle.budget.maximum_fan_out_per_case:
@@ -199,7 +228,10 @@ def plan_augmentation_bundle(
             reasons = (
                 ("missing source features: " + ", ".join(missing_features),)
                 if missing_features
-                else (definition.applicability_rule,)
+                else (
+                    *blocking_reasons,
+                    definition.applicability_rule,
+                )
             )
             probes.append(
                 BundleProbePlan(
@@ -228,10 +260,13 @@ def plan_augmentation_bundle(
             )
 
     planned = tuple(probe for probe in probes if probe.status == "planned")
+    blocked = sum(probe.status == "blocked" for probe in probes)
+    skipped = sum(probe.status == "skipped" for probe in probes)
     totals = BundlePlanTotals(
         cases=len(source_cases),
         planned_probes=len(planned),
-        skipped_probes=len(probes) - len(planned),
+        blocked_probes=blocked,
+        skipped_probes=skipped,
         model_calls=sum(probe.model_calls for probe in planned),
         target_calls=sum(probe.target_calls for probe in planned),
         maximum_duration_seconds=sum(probe.maximum_duration_seconds for probe in planned),
@@ -260,6 +295,21 @@ def _required_evidence(requirements: AugmentationRequirements) -> tuple[str, ...
     if requirements.human_review:
         evidence.append("human_review")
     return tuple(evidence)
+
+
+def _readiness_by_binding(
+    readiness: tuple[BundleBindingReadiness, ...],
+) -> dict[tuple[str, str, AugmentationMode], BundleBindingReadiness]:
+    indexed: dict[tuple[str, str, AugmentationMode], BundleBindingReadiness] = {}
+    for item in readiness:
+        key = (item.ref.id, item.ref.version, item.mode)
+        previous = indexed.get(key)
+        if previous is not None:
+            if previous != item:
+                raise ValueError("bundle binding readiness contains a conflict")
+            continue
+        indexed[key] = item
+    return indexed
 
 
 def _canonical_probe_id(
