@@ -39,6 +39,76 @@ The default evidence mapping supports the final answer plus initial and final st
 HTTP evaluators use normalized `EvaluationSubject` fields. Supply `subject_builder` to
 `evaluate_case` when a customer environment records those fields in its own response shape.
 
+Every evaluation result includes evaluator reliability. An evaluator without a matching calibration
+report is explicitly `uncalibrated`; a report created for an older rubric, prompt, model, or judge
+configuration does not carry forward after that input changes.
+
+## Calibrate before a campaign
+
+Calibration tests the evaluator against categorical examples before its findings are trusted. A
+suite requires a known-good example, a known-bad example, and a borderline example repeated at least
+twice. Optional human labels expose reviewer disagreement independently of judge disagreement.
+
+```python
+from ul import (
+    EvaluatorCalibrationExample,
+    EvaluationSubject,
+    calibrate_evaluator,
+    evaluate_case,
+)
+
+calibration = await calibrate_evaluator(
+    evaluator,
+    (
+        EvaluatorCalibrationExample(
+            id="known-good",
+            kind="known_good",
+            subject=EvaluationSubject(agent_status="succeeded", answer=known_good_answer),
+            expected_passed=True,
+            human_labels=(True, True),
+        ),
+        EvaluatorCalibrationExample(
+            id="known-bad",
+            kind="known_bad",
+            subject=EvaluationSubject(agent_status="succeeded", answer=known_bad_answer),
+            expected_passed=False,
+            human_labels=(False, False),
+        ),
+        EvaluatorCalibrationExample(
+            id="borderline",
+            kind="borderline",
+            subject=EvaluationSubject(agent_status="succeeded", answer=borderline_answer),
+            expected_passed=True,
+            repetitions=3,
+            human_labels=(True, False),
+        ),
+    ),
+    judge=judge,
+)
+
+campaign_result = await evaluate_case(
+    case,
+    environment,
+    judge=judge,
+    calibration_reports={evaluator.id: calibration},
+)
+assert campaign_result.evaluation_results.reliability[0].status in {
+    "reliable",
+    "unreliable",
+}
+```
+
+The report retains per-run judgments and directly lists `false_positive_examples`,
+`false_negative_examples`, `unstable_examples`, and `human_disagreement_examples`. Its aggregate
+`human_agreement` compares categorical judge outcomes with the supplied expected labels. A report is
+`unreliable` when it contains a misclassification, repeated-run instability, human disagreement, or
+an evaluator error.
+
+`OpenAICompatibleEvaluatorJudge` derives its version from the packaged judge prompt, requested model,
+endpoint, data policy, and bounded request configuration. Credentials are intentionally excluded, so
+key rotation does not invalidate calibration. Custom judges must pass an `EvaluatorJudgeVersion` to
+both `calibrate_evaluator` and `evaluate_case`.
+
 ## Judge and pairwise evaluators
 
 Pass a configured judge for natural-language rubrics or pairwise preference. External processing

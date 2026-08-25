@@ -12,6 +12,8 @@ from ul.evaluators import (
     JudgeRequest,
     OpenAICompatibleEvaluatorJudge,
     OpenAICompatibleJudgeConfig,
+    calibrate_evaluator,
+    create_evaluator_version,
     evaluate,
     evaluate_case,
 )
@@ -25,8 +27,11 @@ from ul_core.evaluation import (
 from ul_core.evaluators import (
     CallableEvaluator,
     EvaluationSubject,
+    EvaluatorCalibrationExample,
+    EvaluatorCalibrationReport,
     EvaluatorDecision,
     EvaluatorEvidence,
+    EvaluatorJudgeVersion,
     ExactValueEvaluator,
     HttpEvaluationResult,
     HttpResultEvaluator,
@@ -103,6 +108,52 @@ async def test_judge_config_allows_and_normalizes_loopback_http() -> None:
     assert config.base_url == "http://[::1]:8000/v1"
 
 
+async def test_evaluator_version_changes_with_rubric_model_and_configuration() -> None:
+    rubric = RubricEvaluator(id="quality", rubric="The answer is correct.")
+    changed_rubric = rubric.model_copy(update={"rubric": "The answer is safe and correct."})
+    first_config = OpenAICompatibleJudgeConfig(
+        base_url="https://models.example.test/v1",
+        model="judge-v1",
+        api_key="first-secret",
+        allow_external_data_processing=True,
+    )
+    rotated_key_config = first_config.model_copy(update={"api_key": "second-secret"})
+    changed_model_config = first_config.model_copy(update={"model": "judge-v2"})
+    changed_limit_config = first_config.model_copy(update={"max_output_tokens": 2_048})
+
+    first_version = create_evaluator_version(
+        rubric,
+        judge_version=first_config.evaluator_judge_version(),
+    )
+
+    assert first_version == create_evaluator_version(
+        rubric,
+        judge_version=rotated_key_config.evaluator_judge_version(),
+    )
+    assert (
+        first_version.id
+        != create_evaluator_version(
+            changed_rubric,
+            judge_version=first_config.evaluator_judge_version(),
+        ).id
+    )
+    assert (
+        first_version.id
+        != create_evaluator_version(
+            rubric,
+            judge_version=changed_model_config.evaluator_judge_version(),
+        ).id
+    )
+    assert (
+        first_version.id
+        != create_evaluator_version(
+            rubric,
+            judge_version=changed_limit_config.evaluator_judge_version(),
+        ).id
+    )
+    assert "secret" not in first_version.model_dump_json()
+
+
 def _subject() -> EvaluationSubject:
     return EvaluationSubject(
         agent_status="succeeded",
@@ -118,6 +169,150 @@ def _subject() -> EvaluationSubject:
         private_data={"fixture_password": "private-fixture-secret"},
         private_json_pointers=("/answer/internal_token",),
     )
+
+
+def _calibration_subject(answer: str) -> EvaluationSubject:
+    return EvaluationSubject(agent_status="succeeded", answer=answer)
+
+
+async def test_calibration_exposes_false_results_instability_and_human_disagreement() -> None:
+    def decision(score: float) -> EvaluatorDecision:
+        return EvaluatorDecision(
+            score=score,
+            explanation="Calibration judgment.",
+            evidence=(
+                EvaluatorEvidence(
+                    source="judge_payload",
+                    json_pointer="/payload/answer",
+                    description="Answer used for calibration.",
+                ),
+            ),
+        )
+
+    judge = RecordingJudge(
+        (decision(0.2), decision(0.9), decision(0.9), decision(0.2), decision(0.9))
+    )
+    judge_version = EvaluatorJudgeVersion(
+        prompt_version="1" * 64,
+        model="judge-v1",
+        configuration_sha256="2" * 64,
+    )
+    report = await calibrate_evaluator(
+        RubricEvaluator(id="quality", rubric="The answer is correct.", minimum_score=0.8),
+        (
+            EvaluatorCalibrationExample(
+                id="known-good",
+                kind="known_good",
+                subject=_calibration_subject("good"),
+                expected_passed=True,
+                human_labels=(True, True),
+            ),
+            EvaluatorCalibrationExample(
+                id="known-bad",
+                kind="known_bad",
+                subject=_calibration_subject("bad"),
+                expected_passed=False,
+                human_labels=(False, False),
+            ),
+            EvaluatorCalibrationExample(
+                id="borderline",
+                kind="borderline",
+                subject=_calibration_subject("borderline"),
+                expected_passed=True,
+                repetitions=3,
+                human_labels=(True, False),
+            ),
+        ),
+        judge=judge,
+        judge_version=judge_version,
+    )
+
+    assert report.status == "unreliable"
+    assert report.false_negative_examples == ("known-good",)
+    assert report.false_positive_examples == ("known-bad",)
+    assert report.unstable_examples == ("borderline",)
+    assert report.human_disagreement_examples == ("borderline",)
+    assert report.human_agreement == pytest.approx((0 + 0 + (2 / 3)) / 3)
+
+
+async def test_campaign_results_mark_current_calibration_and_reject_stale_versions() -> None:
+    evaluator = ExactValueEvaluator(
+        id="answer",
+        source="answer",
+        expected="accepted",
+    )
+    report = await calibrate_evaluator(
+        evaluator,
+        (
+            EvaluatorCalibrationExample(
+                id="known-good",
+                kind="known_good",
+                subject=_calibration_subject("accepted"),
+                expected_passed=True,
+            ),
+            EvaluatorCalibrationExample(
+                id="known-bad",
+                kind="known_bad",
+                subject=_calibration_subject("rejected"),
+                expected_passed=False,
+            ),
+            EvaluatorCalibrationExample(
+                id="borderline",
+                kind="borderline",
+                subject=_calibration_subject("accepted"),
+                expected_passed=True,
+                repetitions=2,
+                human_labels=(True, True),
+            ),
+        ),
+    )
+
+    calibrated = await evaluate(
+        _calibration_subject("accepted"),
+        (evaluator,),
+        calibration_reports={evaluator.id: report},
+    )
+    uncalibrated = await evaluate(_calibration_subject("accepted"), (evaluator,))
+    changed_evaluator = evaluator.model_copy(update={"expected": "scheduled"})
+    stale = await evaluate(
+        _calibration_subject("scheduled"),
+        (changed_evaluator,),
+        calibration_reports={changed_evaluator.id: report},
+    )
+
+    assert report.status == "reliable"
+    assert calibrated.reliability[0].status == "reliable"
+    assert calibrated.reliability[0].calibration_report_id == report.id
+    assert uncalibrated.reliability[0].status == "uncalibrated"
+    assert stale.reliability[0].status == "uncalibrated"
+    assert stale.reliability[0].evaluator_version_id != report.evaluator_version.id
+    with pytest.raises(ValidationError, match="calibration reliability"):
+        EvaluatorCalibrationReport.model_validate(
+            {**report.model_dump(mode="python"), "status": "unreliable"}
+        )
+
+
+async def test_calibration_requires_all_three_example_kinds() -> None:
+    with pytest.raises(ValueError, match="known-good, known-bad, and borderline"):
+        await calibrate_evaluator(
+            ExactValueEvaluator(id="answer", source="answer", expected="accepted"),
+            (
+                EvaluatorCalibrationExample(
+                    id="known-good",
+                    kind="known_good",
+                    subject=_calibration_subject("accepted"),
+                    expected_passed=True,
+                ),
+            ),
+        )
+
+    with pytest.raises(ValidationError, match="at least two repetitions"):
+        EvaluatorCalibrationExample(
+            id="borderline",
+            kind="borderline",
+            subject=_calibration_subject("accepted"),
+            expected_passed=True,
+        )
 
 
 async def test_composes_deterministic_evaluators_with_common_results() -> None:
