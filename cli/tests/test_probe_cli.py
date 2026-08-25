@@ -357,6 +357,37 @@ def test_callable_smoke_proves_target_call_and_decline_makes_zero_semantic_calls
     assert "repetitions" not in saved
 
 
+def test_callable_missing_dependency_reports_selected_interpreter_remediation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (tmp_path / "customer_agent.py").write_text(
+        "import dependency_not_installed_for_ul_test\n\ndef run(value):\n    return value\n",
+        encoding="utf-8",
+    )
+    dataset = _write_dataset(tmp_path)
+    monkeypatch.chdir(tmp_path)
+
+    result = runner.invoke(
+        app,
+        [
+            "probe",
+            str(dataset),
+            "--target",
+            "customer_agent:run",
+            "--target-interpreter",
+            sys.executable,
+        ],
+        input="y\n",
+    )
+
+    assert result.exit_code == 2
+    assert "Reason: PROBE_TARGET_LOAD_FAILED" in result.output
+    assert "could not load the target callable" in result.output
+    assert "install the callable's dependencies" in result.output
+    assert "Target safe to reuse: yes" in result.output
+
+
 def test_callable_smoke_receives_structured_input_without_printing_private_metadata(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

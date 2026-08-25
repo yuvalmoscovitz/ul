@@ -7,8 +7,10 @@ import json
 import os
 import signal
 import stat
+import subprocess
 import sys
 import time
+import venv
 from pathlib import Path
 from typing import cast
 
@@ -123,6 +125,79 @@ def pid_agent(value):
 """.lstrip(),
         encoding="utf-8",
     )
+
+
+def _write_virtualenv_only_target(tmp_path: Path, interpreter: Path) -> None:
+    site_packages = Path(
+        subprocess.run(
+            [
+                interpreter,
+                "-c",
+                "import site; print(site.getsitepackages()[0])",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+    )
+    (site_packages / "customer_dependency.py").write_text(
+        "def identify(value): return {'environment': 'customer-venv', 'value': value}\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "customer_agent.py").write_text(
+        "from customer_dependency import identify\n\ndef run(value):\n    return identify(value)\n",
+        encoding="utf-8",
+    )
+
+
+async def _assert_virtualenv_target_runs(tmp_path: Path, interpreter: Path) -> None:
+    _write_virtualenv_only_target(tmp_path, interpreter)
+    subprocess.run(
+        [interpreter, "-c", "import customer_dependency"],
+        check=True,
+        cwd=tmp_path,
+    )
+    config = _python_config(tmp_path, "customer_agent:run").model_copy(
+        update={"interpreter": interpreter}
+    )
+
+    async with LocalTargetConnection(config, customer_code_execution_confirmed=True) as connection:
+        evidence = tuple(
+            [
+                await connection.execute(_case(f"case-{index}", value))
+                for index, value in enumerate(("smoke", "baseline", "variation"), start=1)
+            ]
+        )
+
+    assert [item.final_response for item in evidence] == [
+        {"environment": "customer-venv", "value": value}
+        for value in ("smoke", "baseline", "variation")
+    ]
+    runtime = _runtime_payload(evidence[0].execution_events[0].payload)
+    assert runtime["selected_executable"] == str(interpreter)
+    assert runtime["resolved_executable"] == str(interpreter.resolve())
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX virtualenv symlink layout")
+@pytest.mark.asyncio
+async def test_python_worker_preserves_selected_posix_virtualenv(tmp_path: Path) -> None:
+    virtualenv = tmp_path / ".venv"
+    venv.EnvBuilder(with_pip=False, symlinks=True).create(virtualenv)
+    interpreter = virtualenv / "bin" / "python"
+    assert interpreter.is_symlink()
+
+    await _assert_virtualenv_target_runs(tmp_path, interpreter)
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows virtualenv Scripts layout")
+@pytest.mark.asyncio
+async def test_python_worker_preserves_selected_windows_virtualenv(tmp_path: Path) -> None:
+    virtualenv = tmp_path / ".venv"
+    venv.EnvBuilder(with_pip=False).create(virtualenv)
+    interpreter = virtualenv / "Scripts" / "python.exe"
+    assert interpreter.is_file()
+
+    await _assert_virtualenv_target_runs(tmp_path, interpreter)
 
 
 @pytest.mark.asyncio
@@ -407,6 +482,8 @@ def test_dry_run_validates_and_never_imports_target(tmp_path: Path) -> None:
     assert plan.target_id == "local-python"
     assert plan.target_kind == "python_callable"
     assert plan.worker_command[0] == sys.executable
+    assert plan.selected_executable == sys.executable
+    assert plan.resolved_executable == str(Path(sys.executable).resolve())
     assert plan.maximum_executions == 100
     assert plan.maximum_active_wall_seconds == 302
     assert not marker.exists()
@@ -716,6 +793,18 @@ def test_windows_branch_wraps_target_in_kill_on_close_job_supervisor(tmp_path: P
     assert "_JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE" in supervisor_source
     assert "AssignProcessToJobObject" in supervisor_source
     assert "subprocess.Popen(command, shell=False" in supervisor_source
+
+
+def test_windows_python_worker_uses_selected_scripts_interpreter_layout(tmp_path: Path) -> None:
+    selected_interpreter = tmp_path / ".venv" / "Scripts" / "python.exe"
+    config = _python_config(tmp_path, "customer_agent:run").model_copy(
+        update={"interpreter": selected_interpreter}
+    )
+    with _open_executable_identity(Path(sys.executable)) as (_, identity):
+        supervised = _supervised_target_command(config, identity, platform="win32")
+
+    separator = supervised.index("--")
+    assert supervised[separator + 1] == str(selected_interpreter)
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX executable-script test")

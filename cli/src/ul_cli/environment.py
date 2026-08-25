@@ -581,6 +581,10 @@ def _remediation_for_code(code: str) -> str:
             "Inspect transport health and environment state; do not retry an ambiguous execute "
             "blindly."
         ),
+        "target_load_failed": (
+            "Verify the target working directory and install its dependencies into the selected "
+            "Python interpreter."
+        ),
         "environment_state_uncertain": (
             "Quarantine and independently reset the environment before reuse."
         ),

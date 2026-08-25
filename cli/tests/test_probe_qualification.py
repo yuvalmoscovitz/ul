@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import http.client
+import json
 import os
 import secrets
 import stat
@@ -8,6 +9,7 @@ import subprocess
 import sys
 import threading
 import time
+import venv
 from http.server import ThreadingHTTPServer
 from pathlib import Path
 
@@ -39,6 +41,77 @@ def _run_smoke(
     elapsed_seconds = time.monotonic() - started_at
     assert result.returncode == 0, result.stdout + result.stderr
     return result.stdout + result.stderr, elapsed_seconds
+
+
+def _write_virtualenv_only_callable(tmp_path: Path, interpreter: Path) -> Path:
+    site_packages = Path(
+        subprocess.run(
+            [interpreter, "-c", "import site; print(site.getsitepackages()[0])"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+    )
+    (site_packages / "customer_dependency.py").write_text(
+        "def transform(value): return {'dependency': 'customer-venv', 'value': value}\n",
+        encoding="utf-8",
+    )
+    target = tmp_path / "customer_agent.py"
+    target.write_text(
+        "import json\n"
+        "import os\n"
+        "from pathlib import Path\n"
+        "from customer_dependency import transform\n\n"
+        "def invoke(value):\n"
+        "    result = transform(value)\n"
+        "    receipt = Path(os.environ['UL_QUALIFICATION_RECEIPT'])\n"
+        "    with receipt.open('a', encoding='utf-8') as stream:\n"
+        "        stream.write(json.dumps(result) + '\\n')\n"
+        "    return result\n",
+        encoding="utf-8",
+    )
+    return target
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX virtualenv symlink layout")
+def test_public_probe_uses_selected_virtualenv_with_private_dependency(tmp_path: Path) -> None:
+    virtualenv = tmp_path / ".venv"
+    venv.EnvBuilder(with_pip=False, symlinks=True).create(virtualenv)
+    interpreter = virtualenv / "bin" / "python"
+    assert interpreter.is_symlink()
+    _write_virtualenv_only_callable(tmp_path, interpreter)
+    receipt = tmp_path / "target-calls.jsonl"
+    target_config = tmp_path / "target.json"
+    environment = os.environ.copy()
+    environment["UL_QUALIFICATION_RECEIPT"] = str(receipt)
+
+    output, _ = _run_smoke(
+        [
+            "probe",
+            str(_DATASET),
+            "--target",
+            "customer_agent:invoke",
+            "--target-working-directory",
+            str(tmp_path),
+            "--target-interpreter",
+            str(interpreter),
+            "--target-environment-variable",
+            "UL_QUALIFICATION_RECEIPT",
+            "--save-target-config",
+            str(target_config),
+            "--limit",
+            "1",
+        ],
+        working_directory=tmp_path,
+        environment=environment,
+    )
+
+    normalized_output = " ".join(output.split())
+    assert "Smoke target invocation succeeded" in normalized_output
+    assert "Selected executable:" in normalized_output
+    assert "Executable identity:" in normalized_output
+    assert json.loads(target_config.read_text(encoding="utf-8"))["interpreter"] == str(interpreter)
+    assert "customer-venv" in receipt.read_text(encoding="utf-8")
 
 
 @pytest.mark.parametrize("target_kind", ("callable", "authenticated_http"))
