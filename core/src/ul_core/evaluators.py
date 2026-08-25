@@ -298,11 +298,7 @@ class EvaluatorCalibrationExampleResult(_StrictModel):
         observed_outcomes = {(result.status, result.score, result.label) for result in self.results}
         expected_unstable = self.kind == "borderline" and len(observed_outcomes) > 1
         expected_human_disagreement = len(set(self.human_labels)) > 1
-        expected_human_agreement = (
-            sum(passed == self.expected_passed for passed in judged_passes) / len(judged_passes)
-            if judged_passes
-            else None
-        )
+        expected_human_agreement = _human_agreement(judged_passes, self.human_labels)
         if self.false_positive != expected_false_positive:
             raise ValueError("false-positive summary does not match judgments")
         if self.false_negative != expected_false_negative:
@@ -431,3 +427,17 @@ def _sha256_json(value: JsonValue) -> str:
         sort_keys=True,
     )
     return hashlib.sha256(serialized.encode()).hexdigest()
+
+
+def _human_agreement(
+    judged_passes: tuple[bool, ...],
+    human_labels: tuple[bool, ...],
+) -> float | None:
+    if not judged_passes or not human_labels:
+        return None
+    comparisons = tuple(
+        judged_passed == human_label
+        for judged_passed in judged_passes
+        for human_label in human_labels
+    )
+    return sum(comparisons) / len(comparisons)

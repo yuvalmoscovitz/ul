@@ -57,6 +57,32 @@ class RecordingJudge:
         return self.decisions.pop(0)
 
 
+class VersionedRecordingJudge(RecordingJudge):
+    def __init__(
+        self,
+        decisions: tuple[EvaluatorDecision, ...],
+        version: EvaluatorJudgeVersion,
+    ) -> None:
+        super().__init__(decisions)
+        self.version = version
+
+
+class HangingJudge:
+    def __init__(self, version: EvaluatorJudgeVersion) -> None:
+        self.version = version
+        self.requests: list[JudgeRequest] = []
+        self.cancelled = False
+
+    async def evaluate(self, request: JudgeRequest) -> EvaluatorDecision:
+        self.requests.append(request)
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            self.cancelled = True
+            raise
+        raise AssertionError("unreachable")
+
+
 @pytest.mark.parametrize(
     "base_url",
     [
@@ -175,22 +201,53 @@ def _calibration_subject(answer: str) -> EvaluationSubject:
     return EvaluationSubject(agent_status="succeeded", answer=answer)
 
 
-async def test_calibration_exposes_false_results_instability_and_human_disagreement() -> None:
-    def decision(score: float) -> EvaluatorDecision:
-        return EvaluatorDecision(
-            score=score,
-            explanation="Calibration judgment.",
-            evidence=(
-                EvaluatorEvidence(
-                    source="judge_payload",
-                    json_pointer="/payload/answer",
-                    description="Answer used for calibration.",
-                ),
-            ),
-        )
+def _minimal_calibration_examples() -> tuple[EvaluatorCalibrationExample, ...]:
+    return (
+        EvaluatorCalibrationExample(
+            id="known-good",
+            kind="known_good",
+            subject=_calibration_subject("good"),
+            expected_passed=True,
+        ),
+        EvaluatorCalibrationExample(
+            id="known-bad",
+            kind="known_bad",
+            subject=_calibration_subject("bad"),
+            expected_passed=False,
+        ),
+        EvaluatorCalibrationExample(
+            id="borderline",
+            kind="borderline",
+            subject=_calibration_subject("borderline"),
+            expected_passed=True,
+            repetitions=2,
+        ),
+    )
 
+
+def _rubric_decision(score: float) -> EvaluatorDecision:
+    return EvaluatorDecision(
+        score=score,
+        explanation="Calibration judgment.",
+        evidence=(
+            EvaluatorEvidence(
+                source="judge_payload",
+                json_pointer="/payload/answer",
+                description="Answer used for calibration.",
+            ),
+        ),
+    )
+
+
+async def test_calibration_exposes_false_results_instability_and_human_disagreement() -> None:
     judge = RecordingJudge(
-        (decision(0.2), decision(0.9), decision(0.9), decision(0.2), decision(0.9))
+        (
+            _rubric_decision(0.2),
+            _rubric_decision(0.9),
+            _rubric_decision(0.9),
+            _rubric_decision(0.2),
+            _rubric_decision(0.9),
+        )
     )
     judge_version = EvaluatorJudgeVersion(
         prompt_version="1" * 64,
@@ -225,6 +282,7 @@ async def test_calibration_exposes_false_results_instability_and_human_disagreem
         ),
         judge=judge,
         judge_version=judge_version,
+        maximum_judge_calls=5,
     )
 
     assert report.status == "unreliable"
@@ -232,7 +290,8 @@ async def test_calibration_exposes_false_results_instability_and_human_disagreem
     assert report.false_positive_examples == ("known-bad",)
     assert report.unstable_examples == ("borderline",)
     assert report.human_disagreement_examples == ("borderline",)
-    assert report.human_agreement == pytest.approx((0 + 0 + (2 / 3)) / 3)
+    assert tuple(example.human_agreement for example in report.examples) == (0, 0, 0.5)
+    assert report.human_agreement == pytest.approx(1 / 6)
 
 
 async def test_campaign_results_mark_current_calibration_and_reject_stale_versions() -> None:
@@ -281,6 +340,8 @@ async def test_campaign_results_mark_current_calibration_and_reject_stale_versio
     )
 
     assert report.status == "reliable"
+    assert tuple(example.human_agreement for example in report.examples) == (None, None, 1)
+    assert report.human_agreement == 1
     assert calibrated.reliability[0].status == "reliable"
     assert calibrated.reliability[0].calibration_report_id == report.id
     assert uncalibrated.reliability[0].status == "uncalibrated"
@@ -313,6 +374,121 @@ async def test_calibration_requires_all_three_example_kinds() -> None:
             subject=_calibration_subject("accepted"),
             expected_passed=True,
         )
+
+
+async def test_mixed_campaign_keeps_deterministic_calibration_current() -> None:
+    deterministic = ExactValueEvaluator(
+        id="answer",
+        source="answer",
+        expected="accepted",
+    )
+    deterministic_report = await calibrate_evaluator(
+        deterministic,
+        (
+            _minimal_calibration_examples()[0].model_copy(
+                update={"subject": _calibration_subject("accepted")}
+            ),
+            _minimal_calibration_examples()[1].model_copy(
+                update={"subject": _calibration_subject("rejected")}
+            ),
+            _minimal_calibration_examples()[2].model_copy(
+                update={"subject": _calibration_subject("accepted")}
+            ),
+        ),
+    )
+    assert all(example.human_agreement is None for example in deterministic_report.examples)
+    assert deterministic_report.human_agreement is None
+    judge_version = EvaluatorJudgeVersion(
+        prompt_version="1" * 64,
+        model="judge-v1",
+        configuration_sha256="2" * 64,
+    )
+    judge = VersionedRecordingJudge((_rubric_decision(0.9),), judge_version)
+
+    campaign = await evaluate(
+        _calibration_subject("accepted"),
+        (
+            deterministic,
+            RubricEvaluator(id="quality", rubric="The answer is correct."),
+        ),
+        judge=judge,
+        calibration_reports={deterministic.id: deterministic_report},
+    )
+
+    assert campaign.reliability[0].status == "reliable"
+    assert campaign.reliability[0].evaluator_version_id == (
+        deterministic_report.evaluator_version.id
+    )
+    assert campaign.reliability[1].status == "uncalibrated"
+
+
+async def test_conflicting_explicit_judge_version_fails_before_campaign_or_calibration() -> None:
+    configured_version = EvaluatorJudgeVersion(
+        prompt_version="1" * 64,
+        model="judge-v1",
+        configuration_sha256="2" * 64,
+    )
+    conflicting_version = configured_version.model_copy(update={"model": "judge-v2"})
+    judge = VersionedRecordingJudge((), configured_version)
+    evaluator = RubricEvaluator(id="quality", rubric="The answer is correct.")
+
+    with pytest.raises(ValueError, match="does not match the configured judge"):
+        await evaluate(
+            _calibration_subject("answer"),
+            (evaluator,),
+            judge=judge,
+            judge_version=conflicting_version,
+        )
+    with pytest.raises(ValueError, match="does not match the configured judge"):
+        await calibrate_evaluator(
+            evaluator,
+            _minimal_calibration_examples(),
+            judge=judge,
+            judge_version=conflicting_version,
+            maximum_judge_calls=4,
+        )
+
+    assert judge.requests == []
+
+
+async def test_calibration_rejects_aggregate_judge_calls_before_invocation() -> None:
+    judge_version = EvaluatorJudgeVersion(
+        prompt_version="1" * 64,
+        model="judge-v1",
+        configuration_sha256="2" * 64,
+    )
+    judge = VersionedRecordingJudge((), judge_version)
+
+    with pytest.raises(ValueError, match="authorized judge call budget"):
+        await calibrate_evaluator(
+            RubricEvaluator(id="quality", rubric="The answer is correct."),
+            _minimal_calibration_examples(),
+            judge=judge,
+            maximum_judge_calls=3,
+        )
+
+    assert judge.requests == []
+
+
+async def test_calibration_aggregate_timeout_cancels_the_active_judge_call() -> None:
+    judge_version = EvaluatorJudgeVersion(
+        prompt_version="1" * 64,
+        model="judge-v1",
+        configuration_sha256="2" * 64,
+    )
+    judge = HangingJudge(judge_version)
+
+    with pytest.raises(TimeoutError):
+        await calibrate_evaluator(
+            RubricEvaluator(id="quality", rubric="The answer is correct."),
+            _minimal_calibration_examples(),
+            judge=judge,
+            maximum_judge_calls=4,
+            timeout_seconds=0.01,
+        )
+
+    assert len(judge.requests) == 1
+    assert judge.cancelled
 
 
 async def test_composes_deterministic_evaluators_with_common_results() -> None:

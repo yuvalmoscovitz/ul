@@ -84,6 +84,7 @@ calibration = await calibrate_evaluator(
         ),
     ),
     judge=judge,
+    maximum_judge_calls=5,
 )
 
 campaign_result = await evaluate_case(
@@ -100,14 +101,17 @@ assert campaign_result.evaluation_results.reliability[0].status in {
 
 The report retains per-run judgments and directly lists `false_positive_examples`,
 `false_negative_examples`, `unstable_examples`, and `human_disagreement_examples`. Its aggregate
-`human_agreement` compares categorical judge outcomes with the supplied expected labels. A report is
+`human_agreement` compares categorical judge outcomes with the supplied human labels. It remains
+unset when no human labels are supplied. A report is
 `unreliable` when it contains a misclassification, repeated-run instability, human disagreement, or
 an evaluator error.
 
 `OpenAICompatibleEvaluatorJudge` derives its version from the packaged judge prompt, requested model,
 endpoint, data policy, and bounded request configuration. Credentials are intentionally excluded, so
 key rotation does not invalidate calibration. Custom judges must pass an `EvaluatorJudgeVersion` to
-both `calibrate_evaluator` and `evaluate_case`.
+both `calibrate_evaluator` and `evaluate_case`. Judge-backed calibration also requires an explicit
+`maximum_judge_calls` authorization. UL validates the complete plan before the first judge request,
+caps it at 100 calls and 100 examples, and applies a bounded aggregate timeout.
 
 ## Judge and pairwise evaluators
 
