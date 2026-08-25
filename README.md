@@ -1,73 +1,106 @@
 # UL
 
-See the [augmentation library index](core/src/ul_core/augmentations/README.md) for every built-in
-augmentation, its surface, controlled change, expected relation, and code location.
-
 [![CI](https://github.com/yuvalmoscovitz/ul/actions/workflows/ci.yml/badge.svg)](https://github.com/yuvalmoscovitz/ul/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![Python 3.12+](https://img.shields.io/badge/Python-3.12%2B-blue.svg)](pyproject.toml)
 
-UL finds consequential failures in high-risk AI agents. It takes recorded interactions, creates
-realistic variations, runs them against a customer-provided environment, and produces evidence
-for human review.
+**Discover consequential behavior changes in high-risk AI agents before they reach production.**
 
-UL does not test production systems, decide which behavior is correct, prove causality, or estimate
-a production failure rate.
+UL takes a few observed interactions and a safe entry point to your existing agent. It creates
+controlled variations, calls the current agent, and produces private, reviewable evidence of
+baseline drift, augmentation sensitivity, instability, and inconclusive results.
 
-> UL is early-stage. APIs and evidence schemas may change.
+[Quickstart](#quickstart) · [How it works](#how-it-works) · [Documentation](#documentation) ·
+[Contributing](CONTRIBUTING.md) · [Security](SECURITY.md)
 
-## Install
-
-You need Python 3.12+ and [`uv`](https://docs.astral.sh/uv/).
-
-```bash
-uv tool install git+https://github.com/yuvalmoscovitz/ul.git
-```
-
-If `uv` reports that its tool directory is not on `PATH`, run `uv tool update-shell`.
-
-## Try the demo
-
-Run the first no-key product experience:
-
-```bash
-ul demo
-```
-
-The demo evaluates two fake customer requests with three common input augmentations: typing errors,
-a frustrated tone, and a short message. It shows three repeatable behavior changes in the same
-evidence format used by dataset evaluations. It makes no model or network calls, so no API key or
-connected agent is required.
+> [!IMPORTANT]
+> UL is early-stage software with no published release yet. APIs and evidence schemas may change.
+> Use disposable test targets only. UL does not decide which behavior is correct, prove causality,
+> or estimate a production failure rate.
 
 ## Quickstart
 
-Start with observed interactions and the test entry point your agent already exposes. Create
-`interactions.jsonl` with one interaction per line:
+You need Python 3.12+, [`uv`](https://docs.astral.sh/uv/), a safe test entry point to your agent,
+and at least one interaction you have already observed.
 
-```json
-{"id":"case-1","input":"Return the status for ticket 42.","output":{"status":"open"}}
-```
+### 1. Install UL
 
-`output` is the response that was observed historically. UL uses it as reference evidence; it is
-not assumed to be correct.
-
-### Probe a Python callable
-
-If your existing `agent.py` contains:
-
-```python
-def invoke(value):
-    return {"response": value}
-```
-
-point UL at it directly:
+Until the first release, install the current source version from GitHub:
 
 ```bash
-ul probe interactions.jsonl --target agent:invoke
+uv tool install git+https://github.com/yuvalmoscovitz/ul.git
+ul --help
 ```
 
-UL validates the dataset and target first. It then asks you to confirm the exact safe test target
-before making one original smoke call. No semantic-model call happens before that smoke succeeds.
+If `ul --help` does not show UL's agent-testing commands, run `uv tool update-shell`, open a new
+terminal, and verify that `command -v ul` resolves to the uv tool directory.
 
-### Probe an authenticated JSON endpoint
+### 2. Add an observed interaction
+
+Create `interactions.jsonl` with one JSON object per line:
+
+```json
+{"id":"case-1","input":"Refund order ORD-42 for 49 USD.","output":{"action":"refund","status":"approved","order_id":"ORD-42","amount":49}}
+```
+
+`output` is what the agent returned historically. UL treats it as reference evidence, not as a
+correct answer.
+
+### 3. Point UL at your real agent
+
+Assume your existing application exposes a Python callable named `support_agent:invoke`. The
+callable receives the JSON value from `input`, makes its normal test-provider calls, and returns a
+bounded text or JSON response.
+
+Set the credentials used by your agent and by UL's semantic evaluation. Values remain in the
+environment; only explicitly allowlisted variable names reach the isolated agent process.
+
+```bash
+export OPEN_ROUTER_API_KEY=your-key-from-a-secret-manager
+export UL_LIVE=true
+```
+
+Run one bounded campaign:
+
+```bash
+ul probe interactions.jsonl \
+  --target support_agent:invoke \
+  --target-environment-variable OPEN_ROUTER_API_KEY \
+  --operator input.surface.typing_noise \
+  --limit 1 \
+  --repetitions 1 \
+  --output .ul/runs/probe-evidence.jsonl
+```
+
+UL first validates the dataset and target, then asks you to confirm the exact test target before
+making one smoke call. The smoke uses one target call and zero UL semantic-model calls. If it
+succeeds, UL shows the campaign's target-call, semantic-call, token, time, repetition, and known
+cost bounds before asking for a second confirmation.
+
+The campaign replays the original input against the current agent, invokes the controlled
+variation, and compares the historical response, fresh baseline, and variation. Stop at either
+confirmation if the target or bounds are not safe.
+
+> [!NOTE]
+> The current semantic campaign expects the observed interaction to contain an identifiable
+> business action or outcome. An answer-only agent may pass smoke but fail campaign preparation.
+
+### 4. Review the evidence
+
+```bash
+ul report .ul/runs/probe-evidence.jsonl
+```
+
+The report is offline: it makes no model or target calls. Raw inputs and responses remain in the
+private evidence bundle. The default report exposes bounded explanations and opaque evidence
+pointers for human review.
+
+Exit status `0` means no actionable finding remains, `1` means review is required, and `2` means
+the result is inconclusive. These are workflow states, not correctness verdicts.
+
+## Other target types
+
+### Authenticated JSON endpoint
 
 For a synchronous endpoint that accepts `{"input": ...}` and returns `{"response": ...}`:
 
@@ -76,316 +109,107 @@ export UL_ENVIRONMENT_AGENT_TOKEN='Bearer secret-from-your-secret-manager'
 
 ul probe interactions.jsonl \
   --target https://agent.test/invoke \
-  --header-from-env Authorization=UL_ENVIRONMENT_AGENT_TOKEN
-```
-
-UL reads the secret from the named `UL_ENVIRONMENT_*` variable. It does not place the value in the
-target configuration, evidence, diagnostics, or confirmation text. Never put credentials in the
-URL. Direct endpoints must start each request from isolated test state and must not cause real-world
-effects. For OpenAI-compatible chat endpoints and custom JSON shapes, see the
-[guided probe reference](docs/probe.md).
-
-### Augment and compare
-
-After the smoke result, UL shows the target-call, semantic-call, token, time, repetition, and known
-cost bounds for a small campaign. It runs only after a second confirmation. Configure the campaign
-without changing integration paths:
-
-```bash
-export OPEN_ROUTER_API_KEY=YOUR_SECRET_FROM_A_SECRET_MANAGER
-export UL_LIVE=true
-
-ul probe interactions.jsonl \
-  --target agent:invoke \
+  --header-from-env Authorization=UL_ENVIRONMENT_AGENT_TOKEN \
   --operator input.surface.typing_noise \
-  --limit 10 \
+  --limit 1 \
   --repetitions 1 \
   --output .ul/runs/probe-evidence.jsonl
 ```
 
-UL replays the original input against the current agent, invokes controlled variations, and
-cross-examines the historical reference, fresh baseline, and variation. A single repetition is
-screening evidence. The report keeps response, trajectory, and committed-state conclusions
-separate. A response-only target does not verify trajectory or committed state; unavailable evidence
-is never shown as passed. Run `ul report .ul/runs/probe-evidence.jsonl` for the offline report.
+Never put credentials in a URL or target configuration. Direct endpoints must start each request
+from isolated test state and must not cause real-world effects. See the
+[guided probe reference](docs/probe.md) for OpenAI-compatible endpoints, custom JSON mappings,
+async callables, subprocesses, structured inputs, stronger repetitions, and resumable runs.
 
-See [Guided active-probe quickstart](docs/probe.md) for structured inputs, target presets, reusable
-secret-free target configurations, stronger repetitions, resumability, and full evidence details.
+### Reusable local target configuration
 
-## Advanced: stateful evidence projects
-
-Use `ul init` and `ul run` after response-level value is visible when UL must reset a disposable
-fixture and independently inspect committed state:
+If the callable needs a different interpreter, working directory, or environment allowlist, save a
+secret-free target configuration:
 
 ```bash
-ul init interactions.jsonl \
-  --environment-url https://your-test-environment.example \
-  --fixture-id standard-account \
-  --fixture-version v1 \
-  --allow-environment-network \
-  --confirm-test-environment
-
-ul run --dry-run
-ul run
-ul report
+ul probe interactions.jsonl \
+  --target package.agent:invoke \
+  --target-working-directory /path/to/project \
+  --target-interpreter /path/to/project/.venv/bin/python \
+  --target-environment-variable AGENT_API_KEY \
+  --save-target-config target.json
 ```
 
-This environment implements reset, execute-turn, and snapshot requests. It is an optional stronger
-evidence tier, not a prerequisite for probing an agent. See [Design valid test cases](docs/test-cases.md),
-[Composable state hooks](docs/state-hooks.md), [Local process targets](docs/local-targets.md), and
-[Customer-defined evaluators](docs/evaluators.md) for advanced configuration.
-
-Inspect available augmentations at any time:
-
-```bash
-ul augmentations list --mode dataset_variation
-ul augmentations plan input.surface.typing_noise
-```
+The file contains environment-variable names and integrity bindings, never credential values.
 
 ## How it works
 
 ```text
-recorded interaction
-  → realistic input variation
-  → fresh target calls for original and variation
-  → comparison of responses and available evidence
-  → evidence for human review
-  → confirmed regression case
+observed interaction + safe agent target
+                ↓
+validate locally, then make one smoke call
+                ↓
+generate a controlled input variation
+                ↓
+call the current agent on original and variation
+                ↓
+compare behavior and available evidence
+                ↓
+write private evidence for human review
 ```
 
-With the optional `stateful-lifecycle` tier, every repetition uses this lifecycle:
+UL reports evidence by authority level:
 
-```text
-reset → optional setup → initial snapshot → execute turn → snapshot → cleanup reset
-```
+- **Response observed** — the minimum; UL compares returned text or JSON.
+- **Trajectory observed** — optional messages, tool events, or correlated traces.
+- **Committed state verified** — optional independent reset and snapshot hooks.
+- **Customer criteria applied** — optional deterministic rules, rubrics, or review.
 
-UL only calls the configured customer-owned environment. The environment is responsible for isolation,
-deterministic reset, and preventing real business effects.
+Missing trajectory or state evidence is reported as unavailable, never passed. A target-reported
+tool call does not prove that a real-world effect committed.
 
-## Review and regressions
+## Safety and privacy
 
-`ul report` is offline. It makes no model or environment calls.
-For canonical `.findings.jsonl` packages, its default human and JSON forms expose only bounded,
-privacy-safe explanations and opaque evidence pointers. Raw inputs, responses, state, tool data,
-and provenance remain inside private normalized receipts and require an explicit per-finding
-disclosure command. That command also resolves opaque case, operator, and customer-rule references
-to the private configured identities needed for investigation. The disclosure is capped before any
-private output is printed.
-Dataset finding sidecars also keep an adjacent private reference key so resumed runs retain one
-privacy-safe campaign identity; preserve that key with the evidence bundle.
+- Use only isolated, disposable test targets. Never probe production systems.
+- UL confirms code execution or network access before the first target call and confirms paid
+  campaign bounds separately.
+- Secrets are referenced by environment-variable name and are excluded from target configuration,
+  confirmation text, diagnostics, and public reports.
+- Evidence is private by default and may contain agent inputs and responses. Store it accordingly.
+- A single repetition is screening evidence. Use repetition and independent state observation for
+  stronger conclusions.
 
-```bash
-ul report
-ul report PRIVATE_EVIDENCE.json --json
+Read [Privacy and redaction](docs/privacy.md), [Security](SECURITY.md), and the full
+[guided probe safety contract](docs/probe.md) before testing sensitive systems.
 
-# Safe decision-ready explanations over canonical dataset or stateful finding packages.
-ul report PRIVATE_EVIDENCE.json.findings.jsonl
+## Documentation
 
-# Explicitly disclose one finding's bounded private normalized receipts.
-ul report PRIVATE_EVIDENCE.json.findings.jsonl \
-  --show-sensitive-values \
-  --finding FINDING_OCCURRENCE_ID
+- [Guided active probing](docs/probe.md) — target options, campaign controls, output projections,
+  resumability, and evidence details.
+- [Designing test cases](docs/test-cases.md) — observed interactions, fixtures, and invariants.
+- [Local process targets](docs/local-targets.md) — callable and subprocess isolation.
+- [State hooks](docs/state-hooks.md) — independently verify committed state.
+- [Customer-defined evaluators](docs/evaluators.md) — add explicit correctness criteria.
+- [Finding export](docs/finding-export.md) — inspect and exchange decision-ready findings.
+- [Augmentation library](core/src/ul_core/augmentations/README.md) — available controlled changes.
 
-ul dataset review .ul/runs/EVIDENCE.jsonl FINDING_ID \
-  --status confirmed \
-  --severity high \
-  --reviewer payments-risk \
-  --reason "The variation committed payment for the wrong invoice."
+For an offline synthetic tour with no API key or network access, run `ul demo`. It demonstrates the
+evidence format, but it is not a real-agent onboarding or qualification run.
 
-# Preview an exact pattern snapshot without writing a decision.
-ul dataset review-pattern .ul/runs/EVIDENCE.jsonl PATTERN_SNAPSHOT_ID
+## Stateful and trace-based testing
 
-# Apply one decision to only that snapshot's still-unreviewed occurrences.
-ul dataset review-pattern .ul/runs/EVIDENCE.jsonl PATTERN_SNAPSHOT_ID \
-  --status confirmed \
-  --severity high \
-  --reviewer payments-risk \
-  --reason "The reviewed occurrences show the same consequential failure."
-```
+After response-level probing works, use `ul init` and `ul run` to add reset and committed-state
+snapshots for disposable fixtures. Use `ul dataset ingest otlp` to build test cases from OTLP and
+OpenInference traces. These are optional stronger evidence paths, not quickstart prerequisites.
 
-With an explicit evidence path, `ul report` auto-detects dataset evaluation, correction,
-retry-after-successful-commit, and timeout-after-commit evidence. Its default human summary and
-versioned JSON omit inputs, responses, state, customer descriptions, and arbitrary evidence text.
-For reviewable dataset findings, the report groups matching evidence into deterministic finding
-patterns. Each pattern shows how many test questions are affected, which augmentations it was
-observed under, its review queue, occurrence-level exceptions, and the exact underlying finding IDs.
-Pattern decisions are append-only and bind the complete membership and evidence snapshot. Existing
-occurrence decisions are unchanged exceptions, and later matching occurrences remain unreviewed;
-an earlier pattern decision is context only. Patterns are
-evidence-navigation aids, not correctness, causation, or root-cause claims. Inspect-only findings,
-such as unstable behavior without a reviewable semantic difference, remain listed separately.
-Use `ul dataset report EVIDENCE.jsonl` when you need the detailed private dataset review surface.
-The private `.ul/review-history.key` authenticates pattern decisions independently of the rotatable
-pattern identity key. Back it up with the project: pattern review history cannot be verified without
-it.
-Trace replay bundles are not supported by `ul report`.
-
-Reviews are appended to a separate audit file. Evidence is never rewritten. The human report and
-versioned JSON expose review workflow status (`review_status` in report schema `1.7.0`). Exit codes
-map to that review status:
-
-- `0` (`resolved`): no actionable finding remains; `expected` and `unsupported` reviews resolve a
-  finding.
-- `1` (`action_required`): a finding needs review, is confirmed, or an unreviewed declared rule was
-  violated.
-- `2` (`inconclusive`): the evaluation or a finding review is inconclusive and no actionable
-  finding remains.
-
-Review status is workflow state, not an agent correctness verdict.
-
-Save selected confirmed findings as regressions one occurrence at a time. A pattern decision never
-promotes every member automatically. For a response-only callable or authenticated HTTP probe,
-no environment bridge is required. Confirm the finding, provide a customer invariant that is
-satisfied by the fresh original-input probe response and violated by the accepted variation, save
-it, then replay the same target:
-
-```bash
-ul regression save EVIDENCE.jsonl FINDING_ID \
-  --invariants invariants.json \
-  --rule RULE_ID \
-  --output regressions/finding.json \
-  --confirm-versioned-input
-
-ul regression replay regressions/finding.json \
-  --target agent:run \
-  --confirm-target TARGET_DIGEST \
-  --max-target-calls 3 \
-  --output replay.json
-```
-
-Use the same HTTP mapping and environment-backed authentication options at replay that were used by
-`ul probe`; the saved secret-safe target receipt must match. Historical and semantic outputs remain
-reference evidence, never a correctness oracle. `ul regression run` is the legacy multi-case path
-for stateful environment regressions; response-only probe regressions use `ul regression replay`.
-
-## Configuration
-
-Project defaults are saved by `ul init`. Common options include:
-
-- `--invariants invariants.json` for deterministic customer rules.
-- `--redaction-policy redaction.json --redaction-state STATE` for provider-boundary redaction.
-- `--no-save-augmentations` when local augmentation retention is prohibited.
-- `--allow-insecure-http` for an exact local HTTP environment.
-- `--limit`, `--repetitions`, `--operator`, and `--max-environment-api-calls` for run scope.
-
-### State-transition rules
-
-Invariant schema `1.2.0` can check what changed between the snapshots immediately before and after
-each agent turn:
-
-```json
-{
-  "schema_version": "1.2.0",
-  "observation_source": "target_output",
-  "observation_authority": "committed_state_snapshot",
-  "rules": [{
-    "type": "exactly_one_new_effect",
-    "id": "one-payment-per-turn",
-    "version": "1.0.0",
-    "description": "Each turn must append exactly one payment.",
-    "severity": "critical",
-    "before_checkpoint": "before_turn",
-    "after_checkpoint": "after_turn",
-    "observation_pointer": "/committed_effects"
-  }]
-}
-```
-
-Use `no_new_effect` when a turn must not append anything, or
-`unchanged_between_checkpoints` when a value must stay unchanged. Effect arrays must be append-only;
-rewrites, removals, and reordering are reported as not evaluable. See the runnable
-[retry-after-commit rules](examples/retry_after_successful_commit/invariants.json).
-
-See [Privacy and redaction](docs/privacy.md) for the policy schema and data-flow details.
-
-OpenRouter is the default semantic-model provider. For a customer-controlled OpenAI-compatible
-endpoint:
-
-```bash
-export UL_DATASET_SEMANTIC_PROVIDER=openai-compatible
-export UL_DATASET_OPENAI_BASE_URL=https://models.example.com/v1
-export UL_DATASET_OPENAI_API_KEY=YOUR_SECRET_FROM_A_SECRET_MANAGER
-export UL_DATASET_MODEL=your-semantic-model
-export UL_LIVE=true
-```
-
-Secrets belong in environment variables or a secret manager, never in datasets or configuration
-files. Environment header mappings may reference only dedicated `UL_ENVIRONMENT_*` environment variables.
-
-## Traces and stateful stress
-
-Import OTLP traces without sending data to a model:
-
-```bash
-ul dataset ingest otlp traces.json --output interactions.jsonl
-```
-
-Create an approved replay bundle and stress a selected conversation:
-
-```bash
-ul dataset ingest otlp traces.json \
-  --mapping examples/otlp_mapping.json \
-  --replay-output trace-replay.json
-
-ul stress trace trace-replay.json \
-  --environment-config .ul/environment.json \
-  --case-id CASE_ID \
-  --dry-run
-```
-
-Run the highest-priority replay cases as one bounded campaign:
-
-```bash
-ul stress trace-replay-campaign trace-replay.json \
-  --environment-config .ul/environment.json \
-  --limit 10 \
-  --max-environment-api-calls 100 \
-  --dry-run
-```
-
-The dry run does not require environment credential values. It explains priority signals, shows
-per-case and cumulative call budgets, and prints a copy-ready execution command without revealing
-recorded content or making external calls. The private campaign result contains every case replay
-plus deterministic groups for drift and inconclusive outcomes. This is a ranked reproducibility
-check; it does not apply the suggested stress focuses or input augmentations. A completed campaign
-exits `0` even when drift needs review, while an inconclusive campaign exits `2`.
-
-Other stateful operators cover correction, retry-after-commit, and timeout-after-commit scenarios.
-Run `ul stress --help` for the available commands.
-
-## Local examples
-
-From a source checkout:
-
-```bash
-uv sync
-
-# No model key required.
-uv run python -m examples.retry_after_successful_commit.run
-
-# Full synthetic-agent example.
-export OPEN_ROUTER_API_KEY=YOUR_SECRET_FROM_A_SECRET_MANAGER
-export UL_LIVE=true
-uv run python -m examples.quickstart.run
-```
-
-Useful examples:
-
-- [Quickstart agent](examples/quickstart/README.md)
-- [Retry after successful commit](examples/retry_after_successful_commit/README.md)
-- [Timeout after commit](examples/timeout_after_commit/README.md)
-- [Multi-turn correction](examples/multiturn_correction/README.md)
-- [Accounts payable](examples/accounts_payable/README.md)
+Run `ul --help`, `ul stress --help`, and `ul dataset --help` for the complete CLI surface.
 
 ## Development
 
 ```bash
+git clone https://github.com/yuvalmoscovitz/ul.git
+cd ul
 uv sync --locked
-uv run --frozen ruff format --check .
 uv run --frozen ruff check .
+uv run --frozen ruff format --check .
 uv run --frozen pyright
 uv run --frozen pytest -q
 ```
 
-See [VISION.md](VISION.md), [Contributing](CONTRIBUTING.md), [Security](SECURITY.md), and the
-[MIT License](LICENSE).
+See [Contributing](CONTRIBUTING.md) before opening a pull request. Report vulnerabilities through
+the private process in [Security](SECURITY.md). UL is available under the [MIT License](LICENSE).

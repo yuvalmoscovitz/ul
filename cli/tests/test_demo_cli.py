@@ -33,19 +33,19 @@ def test_root_help_leads_with_demo_and_observed_interaction_probe() -> None:
     assert [command.name for command in app.registered_commands[:2]] == ["probe", "demo"]
 
 
-def test_readme_quickstart_leads_with_probe_and_keeps_stateful_upgrade() -> None:
+def test_readme_quickstart_leads_with_a_real_probe_and_keeps_demo_secondary() -> None:
     readme = (_PROJECT_ROOT / "README.md").read_text(encoding="utf-8")
     quickstart = readme[readme.index("## Quickstart") : readme.index("## How it works")]
+    normalized_quickstart = " ".join(quickstart.split())
 
-    assert "ul probe interactions.jsonl --target agent:invoke" in quickstart
-    assert "--target https://agent.test/invoke" in quickstart
-    assert "--header-from-env Authorization=UL_ENVIRONMENT_AGENT_TOKEN" in quickstart
-    assert "not assumed to be correct" in quickstart
-    assert "does not verify trajectory or committed state" in quickstart
-    assert "## Advanced: stateful evidence projects" in quickstart
-    assert quickstart.index("ul probe interactions.jsonl") < quickstart.index(
-        "ul init interactions.jsonl"
-    )
+    assert "--target support_agent:invoke" in normalized_quickstart
+    assert "--target-environment-variable OPEN_ROUTER_API_KEY" in normalized_quickstart
+    assert "--target https://agent.test/invoke" in normalized_quickstart
+    assert "--header-from-env Authorization=UL_ENVIRONMENT_AGENT_TOKEN" in normalized_quickstart
+    assert "reference evidence, not as a correct answer" in normalized_quickstart
+    assert "ul demo" not in normalized_quickstart
+    assert "it is not a real-agent onboarding or qualification run" in readme
+    assert readme.index("## Quickstart") < readme.index("## Stateful and trace-based testing")
 
 
 @pytest.mark.skipif(os.name == "nt", reason="symlink creation may require Windows privileges")
