@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import inspect
 import ipaddress
 import json
+import math
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from copy import deepcopy
 from types import TracebackType
@@ -18,10 +20,16 @@ from ul_core.evaluators import (
     CallableEvaluator,
     EvaluationResults,
     EvaluationSubject,
+    EvaluatorCalibrationExample,
+    EvaluatorCalibrationExampleResult,
+    EvaluatorCalibrationReport,
     EvaluatorDecision,
     EvaluatorEvidence,
+    EvaluatorJudgeVersion,
+    EvaluatorReliability,
     EvaluatorResult,
     EvaluatorSpec,
+    EvaluatorVersion,
     ExactValueEvaluator,
     HttpResultEvaluator,
     HumanReviewEvaluator,
@@ -37,6 +45,9 @@ from ul_core.prompts import PromptManager
 from ul.environment import validate_execution_evidence
 
 _PROMPTS = PromptManager.instance()
+_MAXIMUM_CALIBRATION_EXAMPLES = 100
+_MAXIMUM_CALIBRATION_JUDGE_CALLS = 100
+_MAXIMUM_CALIBRATION_TIMEOUT_SECONDS = 300.0
 
 EvaluatorCallable = Callable[[EvaluationSubject], EvaluatorDecision | Awaitable[EvaluatorDecision]]
 EvaluationSubjectBuilder = Callable[
@@ -89,6 +100,18 @@ class OpenAICompatibleJudgeConfig(ULModel):
     def validate_and_normalize_base_url(self) -> Self:
         object.__setattr__(self, "base_url", _validated_judge_base_url(self.base_url))
         return self
+
+    def evaluator_judge_version(self) -> EvaluatorJudgeVersion:
+        prompt_version = _PROMPTS.get_template_info("evaluation.judge").version
+        configuration = self.model_dump(
+            mode="json",
+            exclude={"api_key", "model"},
+        )
+        return EvaluatorJudgeVersion(
+            prompt_version=prompt_version,
+            model=self.model,
+            configuration_sha256=_sha256_json(configuration),
+        )
 
 
 def _validated_judge_base_url(value: str) -> str:
@@ -163,6 +186,10 @@ class OpenAICompatibleEvaluatorJudge:
             follow_redirects=False,
             trust_env=False,
         )
+
+    @property
+    def version(self) -> EvaluatorJudgeVersion:
+        return self.config.evaluator_judge_version()
 
     async def __aenter__(self) -> Self:
         return self
@@ -259,6 +286,8 @@ async def evaluate_case(
     judge: EvaluatorJudge | None = None,
     callables: Mapping[str, EvaluatorCallable] | None = None,
     subject_builder: EvaluationSubjectBuilder | None = None,
+    calibration_reports: Mapping[str, EvaluatorCalibrationReport] | None = None,
+    judge_version: EvaluatorJudgeVersion | None = None,
 ) -> EvaluationCaseResult:
     environment_api_calls = environment.api_calls_for_case(case)
     if type(environment_api_calls) is not int or not (
@@ -279,6 +308,8 @@ async def evaluate_case(
                 case.evaluators,
                 judge=judge,
                 callables=callables,
+                calibration_reports=calibration_reports,
+                judge_version=judge_version,
             ),
         )
     except RuntimeError:
@@ -292,6 +323,8 @@ async def evaluate_case(
                 case.evaluators,
                 judge=judge,
                 callables=callables,
+                calibration_reports=calibration_reports,
+                judge_version=judge_version,
             ),
         )
     validate_execution_evidence(case, environment, execution_evidence)
@@ -327,6 +360,8 @@ async def evaluate_case(
             case.evaluators,
             judge=judge,
             callables=callables,
+            calibration_reports=calibration_reports,
+            judge_version=judge_version,
         ),
     )
 
@@ -350,7 +385,15 @@ async def evaluate(
     *,
     judge: EvaluatorJudge | None = None,
     callables: Mapping[str, EvaluatorCallable] | None = None,
+    calibration_reports: Mapping[str, EvaluatorCalibrationReport] | None = None,
+    judge_version: EvaluatorJudgeVersion | None = None,
 ) -> EvaluationResults:
+    has_judge_backed_evaluator = any(
+        isinstance(evaluator, (RubricEvaluator, PairwiseEvaluator)) for evaluator in evaluators
+    )
+    resolved_judge_version = (
+        _resolve_judge_version(judge, judge_version) if has_judge_backed_evaluator else None
+    )
     results: list[EvaluatorResult] = []
     for evaluator in evaluators:
         if subject.agent_status != "succeeded":
@@ -381,7 +424,264 @@ async def evaluate(
                     explanation="The evaluator could not produce a valid result.",
                 )
             )
-    return EvaluationResults(results=tuple(results))
+    reliability = tuple(
+        _evaluator_reliability(
+            evaluator,
+            judge_version=resolved_judge_version,
+            calibration_report=(calibration_reports or {}).get(evaluator.id),
+        )
+        for evaluator in evaluators
+    )
+    return EvaluationResults(results=tuple(results), reliability=reliability)
+
+
+def create_evaluator_version(
+    evaluator: EvaluatorSpec,
+    *,
+    judge_version: EvaluatorJudgeVersion | None = None,
+) -> EvaluatorVersion:
+    evaluator_payload = evaluator.model_dump(mode="json")
+    evaluator_sha256 = _sha256_json(evaluator_payload)
+    resolved_judge_version = (
+        judge_version if isinstance(evaluator, (RubricEvaluator, PairwiseEvaluator)) else None
+    )
+    version_payload: dict[str, JsonValue] = {
+        "evaluator": evaluator_payload,
+        "judge": (
+            resolved_judge_version.model_dump(mode="json")
+            if resolved_judge_version is not None
+            else None
+        ),
+    }
+    return EvaluatorVersion(
+        id=f"ulev_v1_{_sha256_json(version_payload)}",
+        evaluator_id=evaluator.id,
+        evaluator_type=evaluator.type,
+        evaluator_sha256=evaluator_sha256,
+        judge=resolved_judge_version,
+    )
+
+
+async def calibrate_evaluator(
+    evaluator: EvaluatorSpec,
+    examples: tuple[EvaluatorCalibrationExample, ...],
+    *,
+    judge: EvaluatorJudge | None = None,
+    callables: Mapping[str, EvaluatorCallable] | None = None,
+    judge_version: EvaluatorJudgeVersion | None = None,
+    maximum_judge_calls: int | None = None,
+    timeout_seconds: float = _MAXIMUM_CALIBRATION_TIMEOUT_SECONDS,
+) -> EvaluatorCalibrationReport:
+    if len(examples) > _MAXIMUM_CALIBRATION_EXAMPLES:
+        raise ValueError(f"calibration exceeds {_MAXIMUM_CALIBRATION_EXAMPLES} examples")
+    example_ids = tuple(example.id for example in examples)
+    if len(example_ids) != len(set(example_ids)):
+        raise ValueError("calibration example identifiers must be unique")
+    example_kinds = {example.kind for example in examples}
+    required_kinds = {"known_good", "known_bad", "borderline"}
+    if not required_kinds <= example_kinds:
+        raise ValueError("calibration requires known-good, known-bad, and borderline examples")
+    judge_backed = isinstance(evaluator, (RubricEvaluator, PairwiseEvaluator))
+    resolved_judge_version = _resolve_judge_version(judge, judge_version) if judge_backed else None
+    if judge_backed and resolved_judge_version is None:
+        raise ValueError("judge-backed calibration requires a versioned judge configuration")
+    planned_judge_calls = sum(example.repetitions for example in examples) if judge_backed else 0
+    if judge_backed:
+        if type(maximum_judge_calls) is not int or not (
+            1 <= maximum_judge_calls <= _MAXIMUM_CALIBRATION_JUDGE_CALLS
+        ):
+            raise ValueError(
+                "judge-backed calibration requires maximum_judge_calls between "
+                f"1 and {_MAXIMUM_CALIBRATION_JUDGE_CALLS}"
+            )
+        if planned_judge_calls > maximum_judge_calls:
+            raise ValueError("calibration exceeds the authorized judge call budget")
+    elif maximum_judge_calls is not None:
+        raise ValueError("deterministic calibration does not accept a judge call budget")
+    if (
+        type(timeout_seconds) not in {int, float}
+        or not math.isfinite(timeout_seconds)
+        or not (0 < timeout_seconds <= _MAXIMUM_CALIBRATION_TIMEOUT_SECONDS)
+    ):
+        raise ValueError(
+            "calibration timeout must be positive and at most "
+            f"{_MAXIMUM_CALIBRATION_TIMEOUT_SECONDS:g} seconds"
+        )
+
+    async with asyncio.timeout(timeout_seconds):
+        example_results = await _run_calibration_examples(
+            evaluator,
+            examples,
+            judge=judge,
+            callables=callables,
+            judge_version=resolved_judge_version,
+        )
+
+    false_positive_examples = tuple(
+        result.example_id for result in example_results if result.false_positive
+    )
+    false_negative_examples = tuple(
+        result.example_id for result in example_results if result.false_negative
+    )
+    unstable_examples = tuple(result.example_id for result in example_results if result.unstable)
+    human_disagreement_examples = tuple(
+        result.example_id for result in example_results if result.human_disagreement
+    )
+    comparable_results = tuple(
+        result.human_agreement for result in example_results if result.human_agreement is not None
+    )
+    human_agreement = (
+        sum(comparable_results) / len(comparable_results) if comparable_results else None
+    )
+    unreliable = any(
+        (
+            false_positive_examples,
+            false_negative_examples,
+            unstable_examples,
+            human_disagreement_examples,
+            any(
+                judgment.status not in {"passed", "failed"}
+                for result in example_results
+                for judgment in result.results
+            ),
+        )
+    )
+    evaluator_version = create_evaluator_version(
+        evaluator,
+        judge_version=resolved_judge_version,
+    )
+    report_payload: dict[str, JsonValue] = {
+        "evaluator_version": evaluator_version.model_dump(mode="json"),
+        "examples": [result.model_dump(mode="json") for result in example_results],
+    }
+    return EvaluatorCalibrationReport(
+        id=f"ulec_v1_{_sha256_json(report_payload)}",
+        evaluator_version=evaluator_version,
+        status="unreliable" if unreliable else "reliable",
+        examples=example_results,
+        false_positive_examples=false_positive_examples,
+        false_negative_examples=false_negative_examples,
+        unstable_examples=unstable_examples,
+        human_disagreement_examples=human_disagreement_examples,
+        human_agreement=human_agreement,
+    )
+
+
+async def _run_calibration_examples(
+    evaluator: EvaluatorSpec,
+    examples: tuple[EvaluatorCalibrationExample, ...],
+    *,
+    judge: EvaluatorJudge | None,
+    callables: Mapping[str, EvaluatorCallable] | None,
+    judge_version: EvaluatorJudgeVersion | None,
+) -> tuple[EvaluatorCalibrationExampleResult, ...]:
+    example_results: list[EvaluatorCalibrationExampleResult] = []
+    for example in examples:
+        judgments: list[EvaluatorResult] = []
+        for _ in range(example.repetitions):
+            evaluated = await evaluate(
+                example.subject,
+                (evaluator,),
+                judge=judge,
+                callables=callables,
+                judge_version=judge_version,
+            )
+            judgments.append(evaluated.results[0])
+        judged_passes = tuple(
+            judgment.status == "passed"
+            for judgment in judgments
+            if judgment.status in {"passed", "failed"}
+        )
+        false_positive = example.kind == "known_bad" and any(judged_passes)
+        false_negative = example.kind == "known_good" and any(
+            not passed for passed in judged_passes
+        )
+        observed_outcomes = {
+            (judgment.status, judgment.score, judgment.label) for judgment in judgments
+        }
+        unstable = example.kind == "borderline" and len(observed_outcomes) > 1
+        human_disagreement = len(set(example.human_labels)) > 1
+        human_agreement = _human_agreement(judged_passes, example.human_labels)
+        example_results.append(
+            EvaluatorCalibrationExampleResult(
+                example_id=example.id,
+                kind=example.kind,
+                expected_passed=example.expected_passed,
+                human_labels=example.human_labels,
+                results=tuple(judgments),
+                false_positive=false_positive,
+                false_negative=false_negative,
+                unstable=unstable,
+                human_disagreement=human_disagreement,
+                human_agreement=human_agreement,
+            )
+        )
+
+    return tuple(example_results)
+
+
+def _evaluator_reliability(
+    evaluator: EvaluatorSpec,
+    *,
+    judge_version: EvaluatorJudgeVersion | None,
+    calibration_report: EvaluatorCalibrationReport | None,
+) -> EvaluatorReliability:
+    version = create_evaluator_version(evaluator, judge_version=judge_version)
+    if calibration_report is None or calibration_report.evaluator_version.id != version.id:
+        return EvaluatorReliability(
+            evaluator_id=evaluator.id,
+            evaluator_version_id=version.id,
+            status="uncalibrated",
+        )
+    return EvaluatorReliability(
+        evaluator_id=evaluator.id,
+        evaluator_version_id=version.id,
+        status=calibration_report.status,
+        calibration_report_id=calibration_report.id,
+    )
+
+
+def _judge_version(judge: EvaluatorJudge | None) -> EvaluatorJudgeVersion | None:
+    version = getattr(judge, "version", None)
+    return version if isinstance(version, EvaluatorJudgeVersion) else None
+
+
+def _resolve_judge_version(
+    judge: EvaluatorJudge | None,
+    explicit_version: EvaluatorJudgeVersion | None,
+) -> EvaluatorJudgeVersion | None:
+    exposed_version = _judge_version(judge)
+    if (
+        exposed_version is not None
+        and explicit_version is not None
+        and exposed_version != explicit_version
+    ):
+        raise ValueError("explicit judge version does not match the configured judge")
+    return exposed_version or explicit_version
+
+
+def _sha256_json(value: JsonValue) -> str:
+    serialized = json.dumps(
+        value,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    return hashlib.sha256(serialized.encode()).hexdigest()
+
+
+def _human_agreement(
+    judged_passes: tuple[bool, ...],
+    human_labels: tuple[bool, ...],
+) -> float | None:
+    if not judged_passes or not human_labels:
+        return None
+    comparisons = tuple(
+        judged_passed == human_label
+        for judged_passed in judged_passes
+        for human_label in human_labels
+    )
+    return sum(comparisons) / len(comparisons)
 
 
 async def _evaluate_one(
