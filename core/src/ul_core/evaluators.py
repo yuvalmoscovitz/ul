@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import hashlib
+import json
+import math
 from typing import Annotated, Literal, Self, cast
 
 from pydantic import (
@@ -226,6 +229,215 @@ class EvaluatorResult(_StrictModel):
     evidence: tuple[EvaluatorEvidence, ...] = Field(default=(), max_length=20)
 
 
+class EvaluatorJudgeVersion(_StrictModel):
+    schema_version: Literal["1.0.0"] = "1.0.0"
+    prompt_version: str = Field(pattern=r"^[0-9a-f]{64}$")
+    model: str = Field(min_length=1, max_length=200)
+    configuration_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
+class EvaluatorVersion(_StrictModel):
+    schema_version: Literal["1.0.0"] = "1.0.0"
+    id: str = Field(pattern=r"^ulev_v1_[0-9a-f]{64}$")
+    evaluator_id: str = Field(min_length=1, max_length=200)
+    evaluator_type: str = Field(min_length=1, max_length=100)
+    evaluator_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    judge: EvaluatorJudgeVersion | None = None
+
+
+class EvaluatorCalibrationExample(_StrictModel):
+    schema_version: Literal["1.0.0"] = "1.0.0"
+    id: str = Field(min_length=1, max_length=500)
+    kind: Literal["known_good", "known_bad", "borderline"]
+    subject: EvaluationSubject
+    expected_passed: bool
+    repetitions: int = Field(default=1, ge=1, le=20)
+    human_labels: tuple[bool, ...] = Field(default=(), max_length=100)
+
+    @model_validator(mode="after")
+    def validate_reference(self) -> Self:
+        if self.kind == "known_good" and not self.expected_passed:
+            raise ValueError("known-good examples must expect a passing judgment")
+        if self.kind == "known_bad" and self.expected_passed:
+            raise ValueError("known-bad examples must expect a failing judgment")
+        if self.kind == "borderline" and self.repetitions < 2:
+            raise ValueError("borderline examples require at least two repetitions")
+        return self
+
+
+class EvaluatorCalibrationExampleResult(_StrictModel):
+    schema_version: Literal["1.0.0"] = "1.0.0"
+    example_id: str = Field(min_length=1, max_length=500)
+    kind: Literal["known_good", "known_bad", "borderline"]
+    expected_passed: bool
+    human_labels: tuple[bool, ...] = Field(default=(), max_length=100)
+    results: tuple[EvaluatorResult, ...] = Field(min_length=1, max_length=20)
+    false_positive: bool = False
+    false_negative: bool = False
+    unstable: bool = False
+    human_disagreement: bool = False
+    human_agreement: float | None = Field(default=None, ge=0, le=1)
+
+    @model_validator(mode="after")
+    def validate_summary(self) -> Self:
+        if self.kind == "known_good" and not self.expected_passed:
+            raise ValueError("known-good results must expect a passing judgment")
+        if self.kind == "known_bad" and self.expected_passed:
+            raise ValueError("known-bad results must expect a failing judgment")
+        if self.kind == "borderline" and len(self.results) < 2:
+            raise ValueError("borderline results require at least two judgments")
+        judged_passes = tuple(
+            result.status == "passed"
+            for result in self.results
+            if result.status in {"passed", "failed"}
+        )
+        expected_false_positive = self.kind == "known_bad" and any(judged_passes)
+        expected_false_negative = self.kind == "known_good" and any(
+            not passed for passed in judged_passes
+        )
+        observed_outcomes = {(result.status, result.score, result.label) for result in self.results}
+        expected_unstable = self.kind == "borderline" and len(observed_outcomes) > 1
+        expected_human_disagreement = len(set(self.human_labels)) > 1
+        expected_human_agreement = _human_agreement(judged_passes, self.human_labels)
+        if self.false_positive != expected_false_positive:
+            raise ValueError("false-positive summary does not match judgments")
+        if self.false_negative != expected_false_negative:
+            raise ValueError("false-negative summary does not match judgments")
+        if self.unstable != expected_unstable:
+            raise ValueError("instability summary does not match repeated judgments")
+        if self.human_disagreement != expected_human_disagreement:
+            raise ValueError("human disagreement does not match human labels")
+        if self.human_agreement is None or expected_human_agreement is None:
+            if self.human_agreement != expected_human_agreement:
+                raise ValueError("human agreement does not match judgments")
+        elif not math.isclose(self.human_agreement, expected_human_agreement):
+            raise ValueError("human agreement does not match judgments")
+        return self
+
+
+class EvaluatorCalibrationReport(_StrictModel):
+    schema_version: Literal["1.0.0"] = "1.0.0"
+    id: str = Field(pattern=r"^ulec_v1_[0-9a-f]{64}$")
+    evaluator_version: EvaluatorVersion
+    status: Literal["reliable", "unreliable"]
+    examples: tuple[EvaluatorCalibrationExampleResult, ...] = Field(min_length=3)
+    false_positive_examples: tuple[str, ...] = ()
+    false_negative_examples: tuple[str, ...] = ()
+    unstable_examples: tuple[str, ...] = ()
+    human_disagreement_examples: tuple[str, ...] = ()
+    human_agreement: float | None = Field(default=None, ge=0, le=1)
+
+    @model_validator(mode="after")
+    def validate_report(self) -> Self:
+        example_ids = tuple(example.example_id for example in self.examples)
+        if len(example_ids) != len(set(example_ids)):
+            raise ValueError("calibration result identifiers must be unique")
+        if not {"known_good", "known_bad", "borderline"} <= {
+            example.kind for example in self.examples
+        }:
+            raise ValueError("calibration requires known-good, known-bad, and borderline results")
+        if any(
+            result.evaluator_id != self.evaluator_version.evaluator_id
+            or result.evaluator_type != self.evaluator_version.evaluator_type
+            for example in self.examples
+            for result in example.results
+        ):
+            raise ValueError("calibration judgments must match the evaluator version")
+        expected_false_positives = tuple(
+            example.example_id for example in self.examples if example.false_positive
+        )
+        expected_false_negatives = tuple(
+            example.example_id for example in self.examples if example.false_negative
+        )
+        expected_unstable = tuple(
+            example.example_id for example in self.examples if example.unstable
+        )
+        expected_human_disagreement = tuple(
+            example.example_id for example in self.examples if example.human_disagreement
+        )
+        summaries = (
+            (self.false_positive_examples, expected_false_positives),
+            (self.false_negative_examples, expected_false_negatives),
+            (self.unstable_examples, expected_unstable),
+            (self.human_disagreement_examples, expected_human_disagreement),
+        )
+        if any(actual != expected for actual, expected in summaries):
+            raise ValueError("calibration report summaries do not match example results")
+        comparable_agreement = tuple(
+            example.human_agreement
+            for example in self.examples
+            if example.human_agreement is not None
+        )
+        expected_agreement = (
+            sum(comparable_agreement) / len(comparable_agreement) if comparable_agreement else None
+        )
+        if self.human_agreement is None or expected_agreement is None:
+            if self.human_agreement != expected_agreement:
+                raise ValueError("report human agreement does not match example results")
+        elif not math.isclose(self.human_agreement, expected_agreement):
+            raise ValueError("report human agreement does not match example results")
+        expected_unreliable = any(
+            (
+                expected_false_positives,
+                expected_false_negatives,
+                expected_unstable,
+                expected_human_disagreement,
+                any(
+                    result.status not in {"passed", "failed"}
+                    for example in self.examples
+                    for result in example.results
+                ),
+            )
+        )
+        if (self.status == "unreliable") != expected_unreliable:
+            raise ValueError("calibration reliability does not match example results")
+        report_payload: dict[str, JsonValue] = {
+            "evaluator_version": self.evaluator_version.model_dump(mode="json"),
+            "examples": [example.model_dump(mode="json") for example in self.examples],
+        }
+        if self.id != f"ulec_v1_{_sha256_json(report_payload)}":
+            raise ValueError("calibration report identifier does not match its contents")
+        return self
+
+
+class EvaluatorReliability(_StrictModel):
+    evaluator_id: str = Field(min_length=1, max_length=200)
+    evaluator_version_id: str = Field(pattern=r"^ulev_v1_[0-9a-f]{64}$")
+    status: Literal["uncalibrated", "reliable", "unreliable"]
+    calibration_report_id: str | None = Field(default=None, pattern=r"^ulec_v1_[0-9a-f]{64}$")
+
+    @model_validator(mode="after")
+    def validate_calibration_reference(self) -> Self:
+        if (self.status == "uncalibrated") != (self.calibration_report_id is None):
+            raise ValueError("only calibrated evaluator reliability can reference a report")
+        return self
+
+
 class EvaluationResults(_StrictModel):
     schema_version: Literal["1.0.0"] = "1.0.0"
     results: tuple[EvaluatorResult, ...]
+    reliability: tuple[EvaluatorReliability, ...] = ()
+
+
+def _sha256_json(value: JsonValue) -> str:
+    serialized = json.dumps(
+        value,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    return hashlib.sha256(serialized.encode()).hexdigest()
+
+
+def _human_agreement(
+    judged_passes: tuple[bool, ...],
+    human_labels: tuple[bool, ...],
+) -> float | None:
+    if not judged_passes or not human_labels:
+        return None
+    comparisons = tuple(
+        judged_passed == human_label
+        for judged_passed in judged_passes
+        for human_label in human_labels
+    )
+    return sum(comparisons) / len(comparisons)
