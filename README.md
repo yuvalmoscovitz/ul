@@ -325,6 +325,9 @@ Import OTLP traces without sending data to a model:
 ul dataset ingest otlp traces.json --output interactions.jsonl
 ```
 
+Prepare deterministic nested 1, 10, and 100-case BFCL V4 cohorts from pinned official source
+files with `ul dataset ingest bfcl`. See [Prepare a reproducible BFCL cohort](docs/bfcl.md).
+
 Create an approved replay bundle and stress a selected conversation:
 
 ```bash

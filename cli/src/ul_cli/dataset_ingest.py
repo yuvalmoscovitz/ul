@@ -14,7 +14,9 @@ from pydantic import ValidationError
 from ul.otlp_ingest import OtlpIngestResult, OtlpMappingConfig, parse_otlp_traces
 from ul.trace_replay import TraceReplayBundle, materialize_trace_replay_bundle
 
-app = typer.Typer(help="Import production traces as a UL dataset.")
+from ul_cli.bfcl_ingest import BfclInputError, materialize_bfcl_cohort
+
+app = typer.Typer(help="Import external evidence as a UL dataset.")
 
 _MAXIMUM_FILE_BYTES = 50_000_000
 _MAXIMUM_RECORDS = 100
@@ -23,6 +25,118 @@ _MAXIMUM_JSON_DEPTH = 100
 
 class _OtlpJsonInputError(ValueError):
     pass
+
+
+@app.command("bfcl")
+def ingest_bfcl_dataset(
+    questions: Annotated[
+        Path,
+        typer.Argument(
+            exists=True,
+            dir_okay=False,
+            readable=True,
+            help="Official BFCL V4 question JSONL file.",
+        ),
+    ],
+    possible_answers: Annotated[
+        Path,
+        typer.Argument(
+            exists=True,
+            dir_okay=False,
+            readable=True,
+            help="Matching official BFCL V4 possible-answer JSONL file.",
+        ),
+    ],
+    category: Annotated[
+        str,
+        typer.Option(help="Exact BFCL test category, such as simple_python."),
+    ],
+    source_revision: Annotated[
+        str,
+        typer.Option(help="Pinned BFCL git revision or immutable release identifier."),
+    ],
+    output: Annotated[
+        Path | None,
+        typer.Option(help="New rich UL JSONL dataset for ul dataset evaluate."),
+    ] = None,
+    seed: Annotated[
+        int,
+        typer.Option(help="Seed for deterministic SHA-256 cohort ranking."),
+    ] = 0,
+    limit: Annotated[
+        int,
+        typer.Option(
+            min=1,
+            max=_MAXIMUM_RECORDS,
+            help=f"Nested cohort size (default: {_MAXIMUM_RECORDS}).",
+        ),
+    ] = _MAXIMUM_RECORDS,
+    dry_run: Annotated[
+        bool,
+        typer.Option(help="Validate and summarize the cohort without writing content."),
+    ] = False,
+) -> None:
+    """Prepare a reproducible BFCL V4 single-turn cohort for UL evaluation."""
+    if output is None and not dry_run:
+        raise typer.BadParameter(
+            "--output is required unless --dry-run is used",
+            param_hint="--output",
+        )
+    if output is not None and output.exists():
+        raise typer.BadParameter(
+            "output already exists; UL will not overwrite it",
+            param_hint="--output",
+        )
+    try:
+        question_bytes = _read_bounded_file(questions, maximum_bytes=_MAXIMUM_FILE_BYTES)
+        answer_bytes = _read_bounded_file(possible_answers, maximum_bytes=_MAXIMUM_FILE_BYTES)
+    except OSError as error:
+        raise typer.BadParameter(
+            f"cannot read BFCL source file ({error.__class__.__name__})",
+            param_hint="QUESTIONS",
+        ) from None
+    if len(question_bytes) > _MAXIMUM_FILE_BYTES or len(answer_bytes) > _MAXIMUM_FILE_BYTES:
+        raise typer.BadParameter(
+            f"BFCL source file exceeds the {_MAXIMUM_FILE_BYTES // 1_000_000} MB limit",
+            param_hint="QUESTIONS",
+        )
+    try:
+        result = materialize_bfcl_cohort(
+            question_bytes,
+            answer_bytes,
+            category=category,
+            source_revision=source_revision,
+            seed=seed,
+            limit=limit,
+        )
+    except BfclInputError as error:
+        raise typer.BadParameter(_terminal_safe(str(error)), param_hint="QUESTIONS") from None
+
+    if dry_run:
+        _print_safe(
+            f"Dry run: {len(result.records)} of {result.source_record_count} BFCL case(s) ready; "
+            "no benchmark content was printed or written."
+        )
+        _print_safe(f"Question SHA-256: {result.question_sha256}")
+        _print_safe(f"Possible-answer SHA-256: {result.answer_sha256}")
+        return
+
+    assert output is not None
+    try:
+        output_stream = _create_private_output(output)
+    except OSError as error:
+        raise typer.BadParameter(
+            f"cannot create output file ({error.__class__.__name__})",
+            param_hint="--output",
+        ) from None
+    with output_stream:
+        for record in result.records:
+            output_stream.write(record.model_dump_json())
+            output_stream.write("\n")
+        output_stream.flush()
+        os.fsync(output_stream.fileno())
+    _print_safe(f"Prepared {len(result.records)} BFCL interaction(s) → {output}")
+    _print_safe(f"Next: inspect the bounded plan with 'ul dataset evaluate {output} --dry-run'.")
 
 
 @app.command("otlp")
