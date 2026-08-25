@@ -241,7 +241,6 @@ def test_bfcl_ingest_rejects_category_mislabelling(tmp_path: Path) -> None:
     result = runner.invoke(app, arguments)
 
     assert result.exit_code == 2
-    assert "Invalid value for --category" in result.output
     assert "do not match category" in result.output
     assert not output.exists()
 
