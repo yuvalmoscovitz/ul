@@ -60,7 +60,7 @@ export OPEN_ROUTER_API_KEY=your-key-from-a-secret-manager
 export UL_LIVE=true
 ```
 
-Run one bounded campaign:
+Run one small campaign:
 
 ```bash
 ul probe interactions.jsonl \
@@ -74,8 +74,9 @@ ul probe interactions.jsonl \
 
 UL first validates the dataset and target, then asks you to confirm the exact test target before
 making one smoke call. The smoke uses one target call and zero UL semantic-model calls. If it
-succeeds, UL shows the campaign's target-call, semantic-call, token, time, repetition, and known
-cost bounds before asking for a second confirmation.
+succeeds, UL shows the campaign's target-call, semantic-call, token, time, and repetition bounds,
+plus the monetary-cost status, before asking for a second confirmation. Monetary cost may be
+`UNKNOWN AND UNBOUNDED` when no trusted pricing is configured; stop unless that risk is acceptable.
 
 The campaign replays the original input against the current agent, invokes the controlled
 variation, and compares the historical response, fresh baseline, and variation. Stop at either
@@ -166,8 +167,9 @@ tool call does not prove that a real-world effect committed.
 ## Safety and privacy
 
 - Use only isolated, disposable test targets. Never probe production systems.
-- UL confirms code execution or network access before the first target call and confirms paid
-  campaign bounds separately.
+- UL confirms code execution or network access before the first target call. Before the campaign,
+  it shows call, token, and time bounds plus monetary-cost status. Stop when monetary cost is unknown
+  or unbounded unless you have independently limited and accepted that risk.
 - Secrets are referenced by environment-variable name and are excluded from target configuration,
   confirmation text, diagnostics, and public reports.
 - Evidence is private by default and may contain agent inputs and responses. Store it accordingly.

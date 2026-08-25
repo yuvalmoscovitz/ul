@@ -43,6 +43,8 @@ def test_readme_quickstart_leads_with_a_real_probe_and_keeps_demo_secondary() ->
     assert "--target https://agent.test/invoke" in normalized_quickstart
     assert "--header-from-env Authorization=UL_ENVIRONMENT_AGENT_TOKEN" in normalized_quickstart
     assert "reference evidence, not as a correct answer" in normalized_quickstart
+    assert "UNKNOWN AND UNBOUNDED" in normalized_quickstart
+    assert "stop unless that risk is acceptable" in normalized_quickstart
     assert "ul demo" not in normalized_quickstart
     assert "it is not a real-agent onboarding or qualification run" in readme
     assert readme.index("## Quickstart") < readme.index("## Stateful and trace-based testing")
