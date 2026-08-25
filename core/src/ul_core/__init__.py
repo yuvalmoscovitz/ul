@@ -22,6 +22,18 @@ from ul_core.augmentations.authoring import (
     ValidatorBinding,
     builtin_augmentation_library,
 )
+from ul_core.augmentations.bundles import (
+    AugmentationBundle,
+    AugmentationBundleBudget,
+    AugmentationBundleCatalog,
+    AugmentationBundlePlan,
+    BundleOperatorPolicy,
+    BundlePlanTotals,
+    BundleProbePlan,
+    BundleSourceCase,
+    builtin_augmentation_bundle_catalog,
+    plan_augmentation_bundle,
+)
 from ul_core.augmentations.definitions import (
     AugmentationBinding,
     AugmentationExecutionOwner,
@@ -165,6 +177,10 @@ from ul_core.prompts import PromptManager, PromptTemplateInfo
 __all__ = [
     "AugmentationApplication",
     "AugmentationBinding",
+    "AugmentationBundle",
+    "AugmentationBundleBudget",
+    "AugmentationBundleCatalog",
+    "AugmentationBundlePlan",
     "AugmentationChangeSet",
     "AugmentationDefinition",
     "AugmentationExecutionOwner",
@@ -180,6 +196,10 @@ __all__ = [
     "AugmentationValidatorRuntime",
     "BuiltinAugmentationCatalog",
     "BuiltinAugmentationSpec",
+    "BundleOperatorPolicy",
+    "BundlePlanTotals",
+    "BundleProbePlan",
+    "BundleSourceCase",
     "CallableEvaluator",
     "CampaignCaseResult",
     "CampaignResult",
@@ -290,6 +310,7 @@ __all__ = [
     "VisibleContextTurn",
     "W3CTraceReference",
     "WorkerTraceFlusher",
+    "builtin_augmentation_bundle_catalog",
     "builtin_augmentation_catalog",
     "builtin_augmentation_library",
     "builtin_augmentation_registry",
@@ -301,6 +322,7 @@ __all__ = [
     "finding_evidence_reference_id",
     "finding_record_id",
     "finding_record_sha256",
+    "plan_augmentation_bundle",
     "project_rich_interaction_case",
     "safe_finding_bundle_id",
 ]
