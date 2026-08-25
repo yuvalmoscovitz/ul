@@ -140,6 +140,24 @@ def test_pre_response_schema_action_and_answer_evidence_still_reports(tmp_path: 
     assert "private legacy answer" not in report.output
 
 
+def test_response_evidence_cannot_be_downgraded_to_pre_response_schema() -> None:
+    result = _evaluation_result("response-downgrade", has_review_finding=True)
+    record = customer_module.build_customer_evidence_record(
+        result,
+        repetitions=1,
+        max_environment_api_calls=2,
+        planned_target_calls=2,
+    )
+    record["schema_version"] = "1.13.0"
+    record["cases"][0]["findings"][0]["category"] = "changed_response"
+    record["technical_details"]["comparison_surface"] = "response"
+    with pytest.raises(
+        ValueError,
+        match=r"response comparison evidence requires schema 1\.14\.0",
+    ):
+        dataset_review._EvidenceRecord.model_validate_json(json.dumps(record))
+
+
 def test_cross_examination_json_and_offline_cli_present_the_same_safe_facts(
     tmp_path: Path,
 ) -> None:
@@ -816,6 +834,44 @@ def test_finding_id_changes_for_meaningful_variation_or_behavior() -> None:
 
     assert finding_id != changed_variation_id
     assert finding_id != changed_behavior_id
+
+
+def test_response_finding_id_excludes_low_entropy_private_response_values() -> None:
+    def response_finding(reference: str, observed: str) -> Any:
+        return SimpleNamespace(
+            category="changed_response",
+            grounded_field_names=(),
+            expected_effects=(
+                SimpleNamespace(
+                    kind="answer",
+                    predicate="returned_response",
+                    fields={"value": reference},
+                    propositions=(),
+                ),
+            ),
+            observed_effects=(
+                SimpleNamespace(
+                    kind="answer",
+                    predicate="returned_response",
+                    fields={"value": observed},
+                    propositions=(),
+                ),
+            ),
+        )
+
+    identifiers = {
+        customer_module._finding_id(
+            interaction_id="case-1",
+            original_input="Should I proceed?",
+            operator_id="input.surface.rephrase",
+            operator_version="1.0.0",
+            augmented_input="Would you proceed?",
+            finding=cast(Any, response_finding(reference, observed)),
+        )
+        for reference, observed in (("yes", "no"), ("no", "yes"), ("allow", "deny"))
+    }
+
+    assert len(identifiers) == 1
 
 
 def test_duplicate_semantic_findings_get_stable_unique_reportable_ids(tmp_path: Path) -> None:

@@ -147,6 +147,7 @@ def adapt_dataset_behavior_finding(
             probe_trial,
             result.source.raw_input,
             result.augmentation.source_frames[0],
+            result.comparison_surface,
         )
         repetition_evidence.append(evidence)
         source_receipts.append(
@@ -1218,6 +1219,7 @@ def _baseline_drift_signal(
             current_baseline_frame,
             result.source.raw_input,
             grounding_frame=historical_frame,
+            comparison_surface=result.comparison_surface,
         )
     except ValueError:
         return "inconclusive"
@@ -1758,6 +1760,7 @@ def _behavior_repetition_evidence(
     probe_trial: DatasetEvaluationTrial,
     source_input: str,
     grounding_frame: SemanticFrame,
+    comparison_surface: Literal["action", "response"],
 ) -> _BehaviorRepetitionEvidence:
     if source_trial.observed_frame is None or probe_trial.observed_frame is None:
         unavailable_arm = "source" if source_trial.observed_frame is None else "probe"
@@ -1782,6 +1785,7 @@ def _behavior_repetition_evidence(
         probe_trial.observed_frame,
         source_input,
         grounding_frame=grounding_frame,
+        comparison_surface=comparison_surface,
     )
     finding_observed = any(
         _behavior_finding_signature(candidate) == _behavior_finding_signature(finding)

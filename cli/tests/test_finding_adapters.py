@@ -321,9 +321,11 @@ def _dataset_category_result(category: str) -> DatasetEvaluationResult:
         "changed_response": ((source_answer,), (changed_answer,)),
     }
     source_actions, probe_actions = actions_by_category[category]
+    comparison_surface = "response" if category == "changed_response" else "action"
 
     def trial_set(arm: str, actions: tuple[ObservedOutcome, ...]) -> DatasetEvaluationTrialSet:
         return DatasetEvaluationTrialSet(
+            comparison_surface=comparison_surface,
             requested_repetitions=2,
             stability="stable",
             trials=tuple(
@@ -375,6 +377,7 @@ def _dataset_category_result(category: str) -> DatasetEvaluationResult:
     candidate = result.cases[0].candidate
     return result.model_copy(
         update={
+            "comparison_surface": comparison_surface,
             "augmentation": result.augmentation.model_copy(
                 update={"source_frames": (grounding_frame,)}
             ),

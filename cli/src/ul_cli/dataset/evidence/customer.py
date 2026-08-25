@@ -168,6 +168,7 @@ def _customer_cross_examination(
                 current_baseline_frame,
                 result.source.raw_input,
                 grounding_frame=historical_frame,
+                comparison_surface=result.comparison_surface,
             )
         except ValueError:
             baseline_drift = "inconclusive"
@@ -505,14 +506,7 @@ def _finding_id(
             "category": finding.category,
             "grounded_field_names": sorted(finding.grounded_field_names),
             **(
-                {
-                    "reference_response_semantics": _normalized_response_semantics(
-                        finding.expected_effects
-                    ),
-                    "observed_response_semantics": _normalized_response_semantics(
-                        finding.observed_effects
-                    ),
-                }
+                {"comparison_surface": "response"}
                 if finding.category == "changed_response"
                 else {
                     "reference_action_semantics": _normalized_outcome_semantics(
@@ -558,19 +552,3 @@ def _normalized_outcome_semantics(effects: tuple[ObservedOutcome, ...]) -> list[
             sort_keys=True,
         ),
     )
-
-
-def _normalized_response_semantics(effects: tuple[ObservedOutcome, ...]) -> list[JsonValue]:
-    return [
-        cast(
-            JsonValue,
-            {
-                "position": effect.position,
-                "kind": effect.kind,
-                "predicate": effect.predicate,
-                "fields": effect.fields,
-                "propositions": list(effect.propositions),
-            },
-        )
-        for effect in effects
-    ]

@@ -262,8 +262,14 @@ class _ResponseOnlySemanticModel(_CleanRoomSemanticModel):
         if not isinstance(record, InteractionRecord):
             assert reference_frame is not None
             return reference_frame.model_copy(update={"interaction_id": record.id})
-        output = cast(dict[str, Any], record.raw_observed_output)
-        recommendation = cast(str, output["recommendation"])
+        output = record.raw_observed_output
+        if isinstance(output, str):
+            recommendation = output
+            output_pointer = "/raw_observed_output"
+        else:
+            output = cast(dict[str, Any], output)
+            recommendation = cast(str, output["recommendation"])
+            output_pointer = "/raw_observed_output/recommendation"
         return SemanticFrame(
             interaction_id=record.id,
             request_units=(
@@ -286,7 +292,7 @@ class _ResponseOnlySemanticModel(_CleanRoomSemanticModel):
                     evidence=(
                         EvidenceReference(
                             source="output",
-                            json_pointer="/raw_observed_output/recommendation",
+                            json_pointer=output_pointer,
                             text_quote=recommendation,
                         ),
                     ),
@@ -311,6 +317,39 @@ class _ResponseOnlySemanticModel(_CleanRoomSemanticModel):
     ) -> RenderedUserInput:
         del instruction, allow_temporary_value
         return RenderedUserInput(text=f"{raw_input} please")
+
+
+class _UnknownOutcomeSemanticModel(_ResponseOnlySemanticModel):
+    async def deconstruct(
+        self,
+        record: InteractionRecord | UserInputRecord,
+        reference_frame: SemanticFrame | None = None,
+    ) -> SemanticFrame:
+        if not isinstance(record, InteractionRecord):
+            assert reference_frame is not None
+            return reference_frame.model_copy(update={"interaction_id": record.id})
+        return SemanticFrame(
+            interaction_id=record.id,
+            outcomes=(
+                ObservedOutcome(
+                    id="tool-result",
+                    evidence=(
+                        EvidenceReference(
+                            source="output",
+                            json_pointer="/raw_observed_output/result",
+                            text_quote=None,
+                        ),
+                    ),
+                    confidence=1,
+                    status="observed",
+                    position=0,
+                    kind="tool_result",
+                    predicate="lookup",
+                    fields={"value": "complete"},
+                ),
+            ),
+            extractor_version="unknown-outcome-test",
+        )
 
 
 def test_declining_target_confirmation_imports_nothing_and_calls_nothing(
@@ -2550,6 +2589,112 @@ def test_public_probe_runs_answer_only_callable_through_real_worker_and_reports_
     assert cross_examination["committed_state_evidence"]["conclusion"] == "unavailable"
     assert all(effect["kind"] == "answer" for effect in finding["reference_effects"])
     assert all(effect["kind"] == "answer" for effect in finding["observed_effects"])
+
+
+def test_public_probe_runs_raw_text_callable_through_real_worker_without_leaking_response(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (tmp_path / "agent.py").write_text(
+        "from pathlib import Path\n\n"
+        "def run(value):\n"
+        "    with Path('target-invocations').open('a', encoding='utf-8') as stream:\n"
+        "        stream.write('called\\n')\n"
+        "    return ('Retry the login. RAW_TEXT_PRIVATE_CANARY' "
+        "if value.endswith(' please') else "
+        "'Escalate to support. RAW_TEXT_PRIVATE_CANARY')\n",
+        encoding="utf-8",
+    )
+    dataset = tmp_path / "interactions.jsonl"
+    dataset.write_text(
+        '{"id":"case-1","input":"I cannot log in. What should I do?",'
+        '"output":"Escalate to support. RAW_TEXT_PRIVATE_CANARY"}\n',
+        encoding="utf-8",
+    )
+    output = tmp_path / "evidence.jsonl"
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("UL_LIVE", "true")
+    monkeypatch.setenv("OPEN_ROUTER_API_KEY", "test-key")
+
+    async def successful_preflight(settings: object) -> object:
+        del settings
+        return _evaluator_preflight()
+
+    monkeypatch.setattr(probe_module, "preflight_evaluator", successful_preflight)
+    monkeypatch.setattr(
+        campaign_runner_module,
+        "create_semantic_model_deconstructor",
+        lambda _settings: _ResponseOnlySemanticModel(),
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "probe",
+            str(dataset),
+            "--target",
+            "agent:run",
+            "--output",
+            str(output),
+            "--operator",
+            "input.surface.rephrase",
+            "--limit",
+            "1",
+        ],
+        input="y\ny\n",
+    )
+
+    assert result.exit_code == 1, result.output
+    assert "RAW_TEXT_PRIVATE_CANARY" not in result.output
+    assert len((tmp_path / "target-invocations").read_text().splitlines()) == 3
+    evidence = json.loads(output.read_text().splitlines()[1])
+    assert evidence["cases"][0]["findings"][0]["category"] == "changed_response"
+
+
+def test_public_probe_maps_source_compatibility_before_campaign_target_invocation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (tmp_path / "agent.py").write_text(
+        "from pathlib import Path\n\n"
+        "def run(value):\n"
+        "    with Path('target-invocations').open('a', encoding='utf-8') as stream:\n"
+        "        stream.write('called\\n')\n"
+        "    return {'result': 'complete'}\n",
+        encoding="utf-8",
+    )
+    dataset = tmp_path / "interactions.jsonl"
+    dataset.write_text(
+        '{"id":"case-1","input":"Look it up.","output":{"result":"complete"}}\n',
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("UL_LIVE", "true")
+    monkeypatch.setenv("OPEN_ROUTER_API_KEY", "test-key")
+
+    async def successful_preflight(settings: object) -> object:
+        del settings
+        return _evaluator_preflight()
+
+    monkeypatch.setattr(probe_module, "preflight_evaluator", successful_preflight)
+    monkeypatch.setattr(
+        campaign_runner_module,
+        "create_semantic_model_deconstructor",
+        lambda _settings: _UnknownOutcomeSemanticModel(),
+    )
+
+    result = runner.invoke(
+        app,
+        ["probe", str(dataset), "--target", "agent:run", "--limit", "1"],
+        input="y\ny\n",
+    )
+
+    assert result.exit_code == 2, result.output
+    assert "PROBE_SOURCE_COMPARISON_INCOMPATIBLE" in result.output
+    assert "no coherent action or grounded response" in result.output
+    assert "Record the agent's returned text or JSON response" in result.output
+    assert "Target safe to reuse: yes" in result.output
+    assert (tmp_path / "target-invocations").read_text().splitlines() == ["called"]
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX executable-script test")

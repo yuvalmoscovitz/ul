@@ -474,6 +474,22 @@ class _EvidenceRecord(_StrictModel):
             and self.run_context.evaluation_mode != self.evaluation_mode
         ):
             raise ValueError("evidence evaluation mode must match its run context")
+        has_response_findings = any(
+            finding.category == "changed_response"
+            for case in self.cases
+            for finding in case.findings
+        )
+        technical_comparison_surface = (
+            self.technical_details.get("comparison_surface")
+            if isinstance(self.technical_details, dict)
+            else None
+        )
+        if self.schema_version != "1.14.0" and (
+            has_response_findings or technical_comparison_surface == "response"
+        ):
+            raise ValueError("response comparison evidence requires schema 1.14.0")
+        if has_response_findings and technical_comparison_surface != "response":
+            raise ValueError("response findings require response comparison technical evidence")
         if self.schema_version in {"1.13.0", "1.14.0"}:
             from ul_cli.dataset.evidence.customer import build_customer_evidence_record
 

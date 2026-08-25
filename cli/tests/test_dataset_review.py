@@ -280,7 +280,13 @@ def _technical_details() -> dict[str, Any]:
             ),
         ),
     )
-    return result.model_dump(mode="json")
+    technical_details = result.model_dump(mode="json")
+    technical_details.pop("comparison_surface")
+    technical_details["baseline"]["trial_set"].pop("comparison_surface")
+    for case in technical_details["cases"]:
+        if case["trial_set"] is not None:
+            case["trial_set"].pop("comparison_surface")
+    return technical_details
 
 
 def _write_evidence(path: Path, records: list[dict[str, Any]] | None = None) -> bytes:

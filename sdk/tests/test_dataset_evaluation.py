@@ -11,6 +11,7 @@ import pytest
 from pydantic import JsonValue, SecretStr, ValidationError
 from ul.augmentations.dataset import DatasetAugmentationEngine, DatasetAugmentationResult
 from ul.dataset_evaluation import (
+    DatasetComparisonCompatibilityError,
     DatasetEvaluationBaseline,
     DatasetEvaluationCase,
     DatasetEvaluationFinding,
@@ -1366,6 +1367,14 @@ async def test_case_model_rejects_inconsistent_execution_and_verdicts() -> None:
     result = await runner.run(
         _source(), operator_ids=("input.surface.rephrase", "input.tone.frustrated")
     )
+    with pytest.raises(ValidationError, match="one explicit comparison surface"):
+        DatasetEvaluationOutcomeGroup(
+            repetitions=(1,),
+            representative_effects=(
+                _source_outcomes()[0],
+                _outcome("answer", 1, kind="answer", fields={"text": "Done"}),
+            ),
+        )
     accepted_case = result.cases[0]
     rejected_candidate = result.cases[1].candidate
 
@@ -1806,16 +1815,24 @@ async def test_runner_compares_answer_only_responses_without_action_authority() 
     result = await runner.run(source)
 
     assert len(target.raw_inputs) == 2
-    assert result.baseline.trial_set.outcome_groups[0].representative_effects == (source_answer,)
+    assert result.comparison_surface == "response"
+    assert result.baseline.trial_set.comparison_surface == "response"
+    assert result.cases[0].trial_set.comparison_surface == "response"
+    expected_response = result.baseline.trial_set.outcome_groups[0].representative_effects
+    observed_response = result.cases[0].trial_set.outcome_groups[0].representative_effects
+    assert expected_response[0].kind == "answer"
+    assert expected_response[0].predicate == "returned_response"
+    assert expected_response[0].fields == {"value": {"answer": "Escalate to support."}}
     assert result.cases[0].verdict == "divergence_needs_review"
     assert result.cases[0].findings == (
         DatasetEvaluationFinding(
             category="changed_response",
             message=("Needs review: the augmented input produced a different observed response."),
-            expected_effects=(source_answer,),
-            observed_effects=(changed_answer,),
+            expected_effects=expected_response,
+            observed_effects=observed_response,
         ),
     )
+    assert DatasetEvaluationResult.model_validate(result.model_dump()) == result
 
 
 async def test_runner_preserves_action_only_comparison_when_source_also_has_an_answer() -> None:
@@ -1843,8 +1860,112 @@ async def test_runner_preserves_action_only_comparison_when_source_also_has_an_a
     result = await runner.run(source)
 
     assert result.cases[0].verdict == "no_divergence"
+    assert result.comparison_surface == "action"
     assert result.cases[0].findings == ()
     assert result.baseline.trial_set.outcome_groups[0].representative_effects == (source_action,)
+
+
+@pytest.mark.parametrize(
+    ("source_output", "changed_output", "source_pointer", "changed_pointer"),
+    (
+        (
+            "Escalate to support.",
+            "Retry the login.",
+            "/raw_observed_output",
+            "/raw_observed_output",
+        ),
+        (
+            {"recommendation": "Escalate to support."},
+            {"recommendation": "Retry the login."},
+            "/raw_observed_output/recommendation",
+            "/raw_observed_output/recommendation",
+        ),
+        (
+            "Support is available during business hours.",
+            "Support is available at all hours.",
+            "/raw_observed_output",
+            "/raw_observed_output",
+        ),
+        (
+            "Transfer 100 to Alice.",
+            "Transfer 200 to Alice.",
+            "/raw_observed_output",
+            "/raw_observed_output",
+        ),
+    ),
+)
+async def test_runner_treats_model_mislabeled_returned_text_as_response(
+    source_output: JsonValue,
+    changed_output: JsonValue,
+    source_pointer: str,
+    changed_pointer: str,
+) -> None:
+    source_fields: dict[str, JsonValue] = {}
+    changed_fields: dict[str, JsonValue] = {}
+    if source_output == "Transfer 100 to Alice.":
+        source_fields = {"amount": 100, "recipient": "Alice"}
+        changed_fields = {"amount": 200, "recipient": "Alice"}
+    source_recommendation = _outcome(
+        "source-recommendation",
+        0,
+        fields=source_fields,
+        evidence=(
+            EvidenceReference(source="output", json_pointer=source_pointer, text_quote=None),
+        ),
+    )
+    changed_recommendation = source_recommendation.model_copy(
+        update={
+            "id": "changed-recommendation",
+            "fields": changed_fields,
+            "evidence": (
+                EvidenceReference(
+                    source="output",
+                    json_pointer=changed_pointer,
+                    text_quote=None,
+                ),
+            ),
+        }
+    )
+    runner, semantic_pipeline, target = _runner(
+        (changed_recommendation,), raw_output=changed_output
+    )
+    semantic_pipeline.source_frame = _frame("source", (source_recommendation,))
+    target.baseline_raw_output = source_output
+
+    result = await runner.run(
+        InteractionRecord(
+            id="source",
+            raw_input="Should I transfer 100 to Alice?",
+            raw_observed_output=source_output,
+        )
+    )
+
+    assert result.comparison_surface == "response"
+    assert result.cases[0].findings[0].category == "changed_response"
+    assert all(
+        effect.kind == "answer"
+        for effect in result.cases[0].findings[0].expected_effects
+        + result.cases[0].findings[0].observed_effects
+    )
+
+
+async def test_runner_preserves_explicit_input_grounded_action_authority() -> None:
+    source_action = _source_outcomes()[0]
+    changed_action = source_action.model_copy(
+        update={"id": "changed", "fields": {"amount": 200, "recipient": "Alice"}}
+    )
+    runner, semantic_pipeline, target = _runner((changed_action,))
+    semantic_pipeline.source_frame = _frame("source", (source_action,))
+    target.baseline_raw_output = _raw_output_for_actions((source_action,))
+
+    result = await runner.run(_source())
+
+    assert result.comparison_surface == "action"
+    assert result.cases[0].findings == ()
+    assert all(
+        effect.kind == "action"
+        for effect in result.baseline.trial_set.outcome_groups[0].representative_effects
+    )
 
 
 async def test_runner_does_not_promote_unknown_outcome_kinds_to_response_semantics() -> None:
@@ -1861,7 +1982,10 @@ async def test_runner_does_not_promote_unknown_outcome_kinds_to_response_semanti
     runner, semantic_pipeline, _ = _runner((changed_unknown,))
     semantic_pipeline.source_frame = _frame("source", (source_unknown,))
 
-    with pytest.raises(ValueError, match="observable action or answer outcome"):
+    with pytest.raises(
+        DatasetComparisonCompatibilityError,
+        match="no coherent action or grounded response",
+    ):
         await runner.run(
             InteractionRecord(
                 id="source",
@@ -1906,7 +2030,10 @@ async def test_runner_rejects_unreliable_source_answers_before_execution(
     runner, semantic_pipeline, target = _runner((source_answer,))
     semantic_pipeline.source_frame = _frame("source", (source_answer,))
 
-    with pytest.raises(ValueError, match="source answer outcomes are inconclusive"):
+    with pytest.raises(
+        DatasetComparisonCompatibilityError,
+        match="no coherent action or grounded response",
+    ):
         await runner.run(
             InteractionRecord(
                 id="source",
@@ -1947,7 +2074,7 @@ async def test_runner_marks_missing_trial_answer_inconclusive_without_action_fal
 
     assert result.cases[0].verdict == "inconclusive"
     assert result.cases[0].findings == ()
-    assert "produced no answer outcome" in result.cases[0].inconclusive_reasons[0]
+    assert "produced no grounded response outcome" in result.cases[0].inconclusive_reasons[0]
 
 
 @pytest.mark.parametrize(
@@ -1977,7 +2104,10 @@ async def test_runner_rejects_inconclusive_source_actions_before_execution(
     runner, semantic_pipeline, target = _runner((_source_outcomes()[0],))
     semantic_pipeline.source_frame = _frame("source", (source_outcome,))
 
-    with pytest.raises(ValueError, match="source action outcomes are inconclusive"):
+    with pytest.raises(
+        DatasetComparisonCompatibilityError,
+        match="no coherent action or grounded response",
+    ):
         await runner.run(_source())
 
     assert target.raw_inputs == []
@@ -1993,7 +2123,10 @@ async def test_runner_rejects_empty_source_action_values_before_execution() -> N
         raw_observed_output=_raw_output_for_actions((source_outcome,)),
     )
 
-    with pytest.raises(ValueError, match="source action outcomes are inconclusive"):
+    with pytest.raises(
+        DatasetComparisonCompatibilityError,
+        match="no coherent action or grounded response",
+    ):
         await runner.run(source)
 
     assert target.raw_inputs == []
@@ -2009,7 +2142,10 @@ async def test_runner_rejects_malformed_numeric_source_input_before_execution() 
         raw_observed_output=_raw_output_for_actions((source_outcome,)),
     )
 
-    with pytest.raises(ValueError, match="source action outcomes are inconclusive"):
+    with pytest.raises(
+        DatasetComparisonCompatibilityError,
+        match="no coherent action or grounded response",
+    ):
         await runner.run(source)
 
     assert target.raw_inputs == []
