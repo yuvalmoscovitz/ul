@@ -219,6 +219,7 @@ from ul.augmentations.qualification import (
     write_augmentation_qualification_report,
 )
 from ul.dataset_evaluation import (
+    DatasetComparisonCompatibilityError,
     DatasetEvaluationBaseline,
     DatasetEvaluationCase,
     DatasetEvaluationFinding,
@@ -466,6 +467,7 @@ __all__ = [
     "DatasetAugmentationOperator",
     "DatasetAugmentationResult",
     "DatasetAugmentationSkip",
+    "DatasetComparisonCompatibilityError",
     "DatasetEvaluationBaseline",
     "DatasetEvaluationCase",
     "DatasetEvaluationFinding",

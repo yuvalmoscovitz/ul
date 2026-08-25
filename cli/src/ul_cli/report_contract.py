@@ -36,6 +36,7 @@ FindingCategory = Literal[
     "unexpected_effect",
     "missing_effect",
     "changed_grounded_effect_argument",
+    "changed_response",
     "unstable_behavior",
     "customer_invariant_violation",
 ]
@@ -57,6 +58,7 @@ FindingSummaryText = Literal[
     "The changed input made the agent take a new action.",
     "The changed input made the agent skip a baseline action.",
     "The changed input altered an important action detail.",
+    "The changed input changed the agent's observed response.",
     "The changed input produced inconsistent behavior across repetitions.",
     "The agent violated a customer-defined rule.",
 ]
@@ -96,6 +98,7 @@ _BEHAVIOR_SUMMARIES: dict[str, str] = {
     "unexpected_effect": "The changed input made the agent take a new action.",
     "missing_effect": "The changed input made the agent skip a baseline action.",
     "changed_grounded_effect_argument": "The changed input altered an important action detail.",
+    "changed_response": "The changed input changed the agent's observed response.",
     "unstable_behavior": "The changed input produced inconsistent behavior across repetitions.",
 }
 
@@ -1242,6 +1245,7 @@ _AGENT_BEHAVIOR_SUMMARIES: dict[FindingCategory, str] = {
     "changed_grounded_effect_argument": (
         "The probe made the agent change an observed action detail."
     ),
+    "changed_response": "The probe changed the agent's observed response.",
     "unstable_behavior": "The agent produced inconsistent observed behavior.",
 }
 _CONSEQUENCE_SUMMARIES: dict[FindingCategory, FindingSummaryText] = {
@@ -1249,6 +1253,7 @@ _CONSEQUENCE_SUMMARIES: dict[FindingCategory, FindingSummaryText] = {
     "unexpected_effect": "The changed input made the agent take a new action.",
     "missing_effect": "The changed input made the agent skip a baseline action.",
     "changed_grounded_effect_argument": "The changed input altered an important action detail.",
+    "changed_response": "The changed input changed the agent's observed response.",
     "unstable_behavior": "The changed input produced inconsistent behavior across repetitions.",
     "customer_invariant_violation": "The agent violated a customer-defined rule.",
 }
@@ -1653,6 +1658,7 @@ def _category_supporting_deltas(
         "unexpected_effect": ("action", "added"),
         "missing_effect": ("action", "removed"),
         "changed_grounded_effect_argument": ("action", "changed"),
+        "changed_response": ("response", "changed"),
         "unstable_behavior": (None, "unstable"),
         "customer_invariant_violation": ("rule", "violated"),
     }[occurrence.category]
@@ -2068,6 +2074,7 @@ class PatternOperator(_StrictModel):
 
 PatternMembershipReason = Literal[
     "same_action_shape",
+    "same_response_shape",
     "same_customer_rule",
     "same_evidence_authority",
     "same_evidence_limitation",
@@ -2221,6 +2228,7 @@ class FailurePattern(_StrictModel):
             "unexpected_effect": ("action", action_evidence_level),
             "missing_effect": ("action", action_evidence_level),
             "changed_grounded_effect_argument": ("action", action_evidence_level),
+            "changed_response": ("outcome", outcome_evidence_level),
             "unstable_behavior": ("outcome", outcome_evidence_level),
             "customer_invariant_violation": ("rule", "evaluated_rule"),
         }[self.category]
@@ -2241,6 +2249,8 @@ class FailurePattern(_StrictModel):
                     (
                         "same_customer_rule"
                         if self.kind == "customer_invariant_violation"
+                        else "same_response_shape"
+                        if self.category == "changed_response"
                         else "same_action_shape"
                     ),
                     "same_outcome_stability",

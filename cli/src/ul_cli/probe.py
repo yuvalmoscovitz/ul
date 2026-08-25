@@ -25,6 +25,7 @@ import httpx
 import typer
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, ValidationError
 from ul import (
+    DatasetComparisonCompatibilityError,
     DatasetEvaluationResult,
     DatasetSemanticSettings,
     EvaluationCase,
@@ -2279,6 +2280,14 @@ def _run_campaign(
                     "PROBE_PAUSED_DURING_CAMPAIGN",
                     "The campaign paused at a durable trial boundary.",
                     "Run the opaque resume action to continue only unfinished trials.",
+                    target_safe_to_reuse=True,
+                ) from None
+            except DatasetComparisonCompatibilityError as error:
+                raise ProbeFailure(
+                    "evaluation",
+                    "PROBE_SOURCE_COMPARISON_INCOMPATIBLE",
+                    error.explanation,
+                    error.remediation,
                     target_safe_to_reuse=True,
                 ) from None
             except Exception:

@@ -12,9 +12,11 @@ from ul import (
     AugmentationTarget,
     CaseFixtureReference,
     DatasetEvaluationFinding,
+    DatasetEvaluationOutcomeGroup,
     DatasetEvaluationResult,
     DatasetEvaluationTrialSet,
     RichInteractionCase,
+    SemanticFrame,
     project_rich_interaction_case,
 )
 from ul.dataset_invariants import (
@@ -25,6 +27,7 @@ from ul_cli.dataset.evidence import customer as customer_module
 from ul_cli.dataset.presentation import evaluation as presentation_module
 from ul_cli.main import app as root_app
 from ul_cli.pattern_identity import ensure_project_pattern_identity_key
+from ul_core.dataset import ObservedOutcome
 from ul_core.evaluation import (
     EnvironmentLifecycleEvidence,
     EnvironmentTurnEvidence,
@@ -65,13 +68,94 @@ def test_rich_evidence_builds_parses_and_reports_end_to_end(tmp_path: Path) -> N
     evidence_path.write_text(json.dumps(record) + "\n", encoding="utf-8")
     _create_pattern_identity_key(tmp_path)
 
-    assert record["schema_version"] == "1.13.0"
+    assert record["schema_version"] == "1.14.0"
     assert dataset_review.is_reportable_dataset_evidence(evidence_path) is True
     report = runner.invoke(root_app, ["report", str(evidence_path), "--json"])
     assert report.exit_code == 0, report.output
     parsed_report = json.loads(report.output)
-    assert parsed_report["evidence_schema_versions"] == ["1.13.0"]
+    assert parsed_report["evidence_schema_versions"] == ["1.14.0"]
     assert parsed_report["evaluation_mode"] == "variance"
+
+
+def test_pre_response_schema_action_and_answer_evidence_still_reports(tmp_path: Path) -> None:
+    result = _evaluation_result("legacy-mixed-outcomes")
+    action = ObservedOutcome(
+        id="transfer",
+        confidence=1,
+        status="observed",
+        position=0,
+        kind="action",
+        predicate="transfer",
+        fields={"amount": 100},
+    )
+    answer = ObservedOutcome(
+        id="confirmation",
+        confidence=1,
+        status="observed",
+        position=1,
+        kind="answer",
+        predicate="confirmation",
+        fields={"text": "private legacy answer"},
+    )
+    historical_frame = SemanticFrame(
+        interaction_id=result.source.id,
+        outcomes=(action, answer),
+        extractor_version="legacy-test",
+    )
+    baseline_trial = result.baseline.trial_set.trials[0]
+    baseline_frame = historical_frame.model_copy(
+        update={"interaction_id": f"{result.source.id}:current_baseline:round-1"}
+    )
+    baseline_trial_set = result.baseline.trial_set.model_copy(
+        update={
+            "trials": (baseline_trial.model_copy(update={"observed_frame": baseline_frame}),),
+            "outcome_groups": (
+                DatasetEvaluationOutcomeGroup(repetitions=(1,), representative_effects=(action,)),
+            ),
+        }
+    )
+    result = result.model_copy(
+        update={
+            "augmentation": result.augmentation.model_copy(
+                update={"source_frames": (historical_frame,)}
+            ),
+            "baseline": result.baseline.model_copy(update={"trial_set": baseline_trial_set}),
+        }
+    )
+    record = customer_module.build_customer_evidence_record(
+        result,
+        repetitions=1,
+        max_environment_api_calls=1,
+        planned_target_calls=1,
+    )
+    record["schema_version"] = "1.13.0"
+    evidence_path = tmp_path / "legacy-mixed.jsonl"
+    evidence_path.write_text(json.dumps(record) + "\n", encoding="utf-8")
+    _create_pattern_identity_key(tmp_path)
+
+    report = runner.invoke(root_app, ["report", str(evidence_path), "--json"])
+
+    assert report.exit_code == 0, report.output
+    assert json.loads(report.output)["evidence_schema_versions"] == ["1.13.0"]
+    assert "private legacy answer" not in report.output
+
+
+def test_response_evidence_cannot_be_downgraded_to_pre_response_schema() -> None:
+    result = _evaluation_result("response-downgrade", has_review_finding=True)
+    record = customer_module.build_customer_evidence_record(
+        result,
+        repetitions=1,
+        max_environment_api_calls=2,
+        planned_target_calls=2,
+    )
+    record["schema_version"] = "1.13.0"
+    record["cases"][0]["findings"][0]["category"] = "changed_response"
+    record["technical_details"]["comparison_surface"] = "response"
+    with pytest.raises(
+        ValueError,
+        match=r"response comparison evidence requires schema 1\.14\.0",
+    ):
+        dataset_review._EvidenceRecord.model_validate_json(json.dumps(record))
 
 
 def test_cross_examination_json_and_offline_cli_present_the_same_safe_facts(
@@ -411,7 +495,7 @@ def test_rich_customer_evidence_records_source_target_original_and_lineage() -> 
         planned_target_calls=2,
     )
 
-    assert evidence["schema_version"] == "1.13.0"
+    assert evidence["schema_version"] == "1.14.0"
     assert evidence["interaction_id"] == "cancel-order::message"
     assert evidence["source_record_id"] == "cancel-order"
     assert evidence["augmentation_target"] == {
@@ -516,7 +600,7 @@ def test_customer_evidence_keeps_summary_and_nested_technical_details() -> None:
     assert presentation_module.result_needs_review(result) is True
     assert evidence["interaction_id"] == "case-1"
     assert evidence["original_input"] == "transfer 100 to Alice"
-    assert evidence["schema_version"] == "1.13.0"
+    assert evidence["schema_version"] == "1.14.0"
     assert evidence["evaluation_mode"] == "variance"
     assert evidence["invariant_evaluation"] is None
     assert evidence["current_baseline"]["status"] == "ORIGINAL REPLAY STABLE (3/3 OBSERVED)"
@@ -577,7 +661,7 @@ def test_customer_evidence_keeps_invariants_separate_from_behavioral_findings() 
         invariant_evaluation=invariant_evaluation,
     )
 
-    assert evidence["schema_version"] == "1.13.0"
+    assert evidence["schema_version"] == "1.14.0"
     assert evidence["evaluation_mode"] == "variance"
     assert evidence["cases"] == []
     stored_invariants = cast(dict[str, Any], evidence["invariant_evaluation"])
@@ -750,6 +834,44 @@ def test_finding_id_changes_for_meaningful_variation_or_behavior() -> None:
 
     assert finding_id != changed_variation_id
     assert finding_id != changed_behavior_id
+
+
+def test_response_finding_id_excludes_low_entropy_private_response_values() -> None:
+    def response_finding(reference: str, observed: str) -> Any:
+        return SimpleNamespace(
+            category="changed_response",
+            grounded_field_names=(),
+            expected_effects=(
+                SimpleNamespace(
+                    kind="answer",
+                    predicate="returned_response",
+                    fields={"value": reference},
+                    propositions=(),
+                ),
+            ),
+            observed_effects=(
+                SimpleNamespace(
+                    kind="answer",
+                    predicate="returned_response",
+                    fields={"value": observed},
+                    propositions=(),
+                ),
+            ),
+        )
+
+    identifiers = {
+        customer_module._finding_id(
+            interaction_id="case-1",
+            original_input="Should I proceed?",
+            operator_id="input.surface.rephrase",
+            operator_version="1.0.0",
+            augmented_input="Would you proceed?",
+            finding=cast(Any, response_finding(reference, observed)),
+        )
+        for reference, observed in (("yes", "no"), ("no", "yes"), ("allow", "deny"))
+    }
+
+    assert len(identifiers) == 1
 
 
 def test_duplicate_semantic_findings_get_stable_unique_reportable_ids(tmp_path: Path) -> None:

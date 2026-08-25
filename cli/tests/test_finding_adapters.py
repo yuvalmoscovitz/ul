@@ -36,7 +36,7 @@ from ul.augmentations.dataset import (
     DatasetAugmentationCandidate,
     DatasetAugmentationOperatorReference,
 )
-from ul.dataset_evaluation import compare_action_outcomes
+from ul.dataset_evaluation import compare_action_outcomes, compare_observed_outcomes
 from ul.dataset_invariants import (
     DatasetInvariantArmEvaluation,
     DatasetInvariantEvaluation,
@@ -302,16 +302,30 @@ def _dataset_category_result(category: str) -> DatasetEvaluationResult:
         update={"id": "changed-payment", "fields": {"account": "another-account"}}
     )
     duplicate_action = source_action.model_copy(update={"id": "duplicate-payment", "position": 1})
+    source_answer = source_action.model_copy(
+        update={
+            "id": "source-answer",
+            "kind": "answer",
+            "predicate": "recommendation",
+            "fields": {"text": _PRIVATE_SECRET},
+        }
+    )
+    changed_answer = source_answer.model_copy(
+        update={"id": "changed-answer", "fields": {"text": "another-answer"}}
+    )
     actions_by_category = {
         "unexpected_effect": ((), (source_action,)),
         "missing_effect": ((source_action,), ()),
         "changed_grounded_effect_argument": ((source_action,), (changed_action,)),
         "duplicate_effect": ((source_action,), (source_action, duplicate_action)),
+        "changed_response": ((source_answer,), (changed_answer,)),
     }
     source_actions, probe_actions = actions_by_category[category]
+    comparison_surface = "response" if category == "changed_response" else "action"
 
     def trial_set(arm: str, actions: tuple[ObservedOutcome, ...]) -> DatasetEvaluationTrialSet:
         return DatasetEvaluationTrialSet(
+            comparison_surface=comparison_surface,
             requested_repetitions=2,
             stability="stable",
             trials=tuple(
@@ -344,19 +358,26 @@ def _dataset_category_result(category: str) -> DatasetEvaluationResult:
         result.cases[0].candidate.operator_id, probe_actions
     ).representative_frame
     assert source_frame is not None and probe_frame is not None
-    finding = next(
-        finding
-        for finding in compare_action_outcomes(
+    findings = (
+        compare_observed_outcomes(
             source_frame,
             probe_frame,
             result.source.raw_input,
             grounding_frame=grounding_frame,
         )
-        if finding.category == category
+        if category == "changed_response"
+        else compare_action_outcomes(
+            source_frame,
+            probe_frame,
+            result.source.raw_input,
+            grounding_frame=grounding_frame,
+        )
     )
+    finding = next(finding for finding in findings if finding.category == category)
     candidate = result.cases[0].candidate
     return result.model_copy(
         update={
+            "comparison_surface": comparison_surface,
             "augmentation": result.augmentation.model_copy(
                 update={"source_frames": (grounding_frame,)}
             ),
@@ -1331,6 +1352,7 @@ def test_baseline_drift_is_descriptive_and_can_coexist_with_sensitivity() -> Non
         "missing_effect",
         "changed_grounded_effect_argument",
         "duplicate_effect",
+        "changed_response",
     ),
 )
 def test_behavior_categories_are_recomputed_from_each_exact_arm(category: str) -> None:

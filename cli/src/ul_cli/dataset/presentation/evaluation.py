@@ -28,6 +28,7 @@ _FINDING_LABELS = {
     "unexpected_effect": "unexpected action",
     "missing_effect": "missing action",
     "changed_grounded_effect_argument": "changed action value",
+    "changed_response": "changed response",
 }
 
 

@@ -1260,6 +1260,43 @@ def test_resume_rejects_changed_evaluation_plan(tmp_path: Path) -> None:
     assert "incompatible with the current evaluation plan" in result.output
 
 
+def test_resume_rejects_pre_response_comparison_context() -> None:
+    evaluation_result = _evaluation_result("interaction-1")
+    current_context = _run_context((evaluation_result.source,))
+    record = cast(
+        dict[str, Any],
+        customer_module.build_customer_evidence_record(
+            evaluation_result,
+            repetitions=1,
+            max_environment_api_calls=2,
+            planned_target_calls=2,
+            run_context=cast(Any, current_context),
+        ),
+    )
+    record["schema_version"] = "1.13.0"
+    legacy_context = cast(dict[str, Any], record["run_context"])
+    legacy_context["schema_version"] = "1.3.0"
+    legacy_context["pipeline_version"] = "1.4.0"
+    legacy_context_content = {
+        key: value
+        for key, value in legacy_context.items()
+        if key not in {"context_sha256", "redaction_policy_sha256", "redaction_coverage"}
+    }
+    legacy_context["context_sha256"] = dataset_review._canonical_json_sha256(legacy_context_content)
+
+    with pytest.raises(
+        ValueError,
+        match="resume evidence is incompatible with the current evaluation plan",
+    ):
+        dataset_review.validate_dataset_resume_evidence(
+            (json.dumps(record) + "\n").encode(),
+            expected_context=cast(Any, current_context),
+            selected_records=(evaluation_result.source,),
+            invariant_suite=None,
+            evidence_projector=customer_module.build_customer_evidence_record,
+        )
+
+
 def test_resume_rejects_evidence_without_terminal_newline(tmp_path: Path) -> None:
     dataset = tmp_path / "interactions.jsonl"
     evidence = tmp_path / "evidence.jsonl"
