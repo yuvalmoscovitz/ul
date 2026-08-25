@@ -191,6 +191,7 @@ class DatasetQuarantineResolution(_StrictModel):
 class DatasetTrialJournalSnapshot:
     recovered_trials: dict[str, DatasetEvaluationTrial]
     terminal_states: dict[str, TrialState]
+    terminal_reason_codes: dict[str, str | None]
     quarantined_unit_ids: frozenset[str]
 
 
@@ -367,6 +368,11 @@ class DatasetTrialJournal:
             for record in self._records
             if record.state in _TERMINAL_STATES
         }
+        terminal_reason_codes = {
+            record.unit.id: record.reason_code
+            for record in self._records
+            if record.state in _TERMINAL_STATES
+        }
         quarantined = {
             unit_id
             for unit_id, state in self._states.items()
@@ -375,6 +381,7 @@ class DatasetTrialJournal:
         return DatasetTrialJournalSnapshot(
             recovered_trials=recovered_trials,
             terminal_states=terminal_states,
+            terminal_reason_codes=terminal_reason_codes,
             quarantined_unit_ids=frozenset(quarantined),
         )
 

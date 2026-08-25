@@ -264,6 +264,7 @@ def print_dataset_results(
     augmentations_output: Path | None = None,
     invariant_evaluations: tuple[DatasetInvariantEvaluation, ...] = (),
     show_report_guidance: bool = True,
+    source_preparation_failure_count: int = 0,
 ) -> None:
     evaluation_modes = {getattr(result, "evaluation_mode", "variance") for result in results}
     if len(evaluation_modes) > 1:
@@ -312,6 +313,11 @@ def print_dataset_results(
         "Semantic evaluator calls: "
         f"{actual_semantic_calls} actual; {semantic_cache_hits} private cache hit(s)"
     )
+    if source_preparation_failure_count:
+        console.print(
+            f"Source preparation failures: {source_preparation_failure_count}; "
+            "no target calls were made for those sources."
+        )
     if invariant_evaluations:
         _print_invariant_results(invariant_evaluations)
     console.print(f"Complete evidence: {output}")

@@ -58,10 +58,15 @@ from ul_cli.dataset_augmentation_ledger import (
     read_augmentation_ledger,
 )
 from ul_cli.dataset_campaign import create_dataset_campaign_plan
-from ul_cli.dataset_review import DatasetEvidenceRunContext, DatasetResumeEvidence
+from ul_cli.dataset_review import (
+    DatasetEvidenceRunContext,
+    DatasetResumeEvidence,
+    DatasetSourcePreparationFailureEvidence,
+)
 from ul_cli.dataset_trial_journal import (
     DatasetRunManifest,
     DatasetTrialJournal,
+    DatasetTrialJournalSnapshot,
     create_dataset_run_manifest,
     create_dataset_trial_journal,
     create_quarantine_resolution,
@@ -131,6 +136,42 @@ _MAXIMUM_DATASET_RECORDS = 100
 _MAXIMUM_REPETITIONS = 100
 _DEFAULT_MAXIMUM_ENVIRONMENT_API_CALLS = 100
 _MAXIMUM_FINDING_SNAPSHOT_BYTES = 128_000_000
+_SOURCE_PREPARATION_REASON_CODES = {
+    "source_semantic_preparation_failed",
+    "source_comparison_surface_incompatible",
+}
+
+
+def _reconcile_source_preparation_failures(
+    trial_journal: DatasetTrialJournal,
+    resume_evidence: DatasetResumeEvidence,
+) -> None:
+    snapshot = trial_journal.snapshot
+    failures_by_interaction_id = {
+        failure.interaction_id: failure for failure in resume_evidence.source_preparation_failures
+    }
+    for unit in trial_journal.manifest.work_plan:
+        failure = failures_by_interaction_id.get(unit.interaction_id)
+        if failure is None:
+            continue
+        terminal_state = snapshot.terminal_states.get(unit.id)
+        if terminal_state is None:
+            trial_journal.terminal(unit, "errored", failure.reason_code)
+            continue
+        reason_code = snapshot.terminal_reason_codes.get(unit.id)
+        if terminal_state == "errored" and reason_code == failure.reason_code:
+            continue
+        if unit.arm == "probe" and terminal_state in {"inapplicable", "rejected"}:
+            continue
+        raise ValueError("source failure evidence conflicts with durable trial state")
+
+
+def _attempted_target_calls(snapshot: DatasetTrialJournalSnapshot) -> int:
+    return sum(
+        state in {"completed", "errored", "inconclusive", "quarantined"}
+        and snapshot.terminal_reason_codes.get(unit_id) not in _SOURCE_PREPARATION_REASON_CODES
+        for unit_id, state in snapshot.terminal_states.items()
+    )
 
 
 def _write_finding_package_snapshot(
@@ -947,6 +988,8 @@ def evaluate_dataset(
                 selected_records=selected_records,
                 invariant_suite=invariant_suite,
             )
+            if trial_journal is not None:
+                _reconcile_source_preparation_failures(trial_journal, resume_evidence)
             if augmentations_output is not None and augmentations_output.exists():
                 augmentation_snapshot = read_augmentation_ledger(
                     augmentations_output,
@@ -1110,9 +1153,22 @@ def evaluate_dataset(
                         )
                 elif resolve_quarantine_after is not None:
                     raise ValueError("resume_incompatible:no_quarantined_trials_to_resolve")
+                source_failure_ids: set[str] = (
+                    {
+                        failure.interaction_id
+                        for failure in resume_evidence.source_preparation_failures
+                    }
+                    if resume_evidence is not None
+                    else set()
+                )
+                terminal_interaction_ids = {
+                    unit.interaction_id
+                    for unit in recorded_manifest.work_plan
+                    if unit.id in trial_journal.snapshot.terminal_states
+                }
                 if (
                     not recorded_manifest.effective_command.save_augmentations
-                    and trial_journal.snapshot.terminal_states
+                    and terminal_interaction_ids - source_failure_ids
                 ):
                     raise ValueError(
                         "resume_incompatible:augmentation_not_durable; start a new output with "
@@ -1294,6 +1350,12 @@ def evaluate_dataset(
             f"Resume compatible: all {skipped_count} selected interaction(s) are complete in "
             f"{output}. Nothing to do."
         )
+        source_preparation_failure_count = len(resume_evidence.source_preparation_failures)
+        if source_preparation_failure_count:
+            console.print(
+                f"Source preparation failures: {source_preparation_failure_count}; "
+                "no target calls were made for those sources."
+            )
         if trial_journal is not None:
             trial_journal.close()
         previous_invariant_exit_code = dataset_invariant_exit_code(
@@ -1303,6 +1365,8 @@ def evaluate_dataset(
             raise typer.Exit(code=previous_invariant_exit_code)
         if resume_evidence.has_review_findings:
             raise typer.Exit(code=1)
+        if source_preparation_failure_count:
+            raise typer.Exit(code=2)
         raise typer.Exit(code=0)
 
     if loaded_target_config is None and loaded_local_target is None:
@@ -1422,12 +1486,10 @@ def evaluate_dataset(
         json_output=progress_json,
     )
     if trial_journal is not None:
-        terminal_states = trial_journal.snapshot.terminal_states
+        journal_snapshot = trial_journal.snapshot
+        terminal_states = journal_snapshot.terminal_states
         progress_runtime.tracker.hydrate_terminal_states(terminal_states)
-        attempted_target_calls = sum(
-            state in {"completed", "errored", "inconclusive", "quarantined"}
-            for state in terminal_states.values()
-        )
+        attempted_target_calls = _attempted_target_calls(journal_snapshot)
         progress_runtime.tracker.record_usage(
             target_calls=attempted_target_calls,
             semantic_calls=None,
@@ -1561,6 +1623,7 @@ def evaluate_dataset(
     assert finding_reference_context is not None
     has_review_findings = False
     invariant_evaluations: list[DatasetInvariantEvaluation] = []
+    source_preparation_failures: list[DatasetSourcePreparationFailureEvidence] = []
     try:
         with output_stream:
             evaluation_parameters = inspect.signature(evaluate_interaction_records).parameters
@@ -1588,6 +1651,8 @@ def evaluate_dataset(
                 "progress_json" in evaluation_parameters or accepts_extra_arguments
             ):
                 durable_arguments["progress_json"] = True
+            if "source_preparation_failures" in evaluation_parameters or accepts_extra_arguments:
+                durable_arguments["source_preparation_failures"] = source_preparation_failures
             evaluation_runner = cast(Any, evaluate_interaction_records)
             if invariant_suite is not None:
                 evaluation_coroutine = evaluation_runner(
@@ -1685,6 +1750,9 @@ def evaluate_dataset(
             f"{len(results)} newly evaluated."
         )
     progress_runtime.tracker.emit(status="running", stage="report")
+    all_source_preparation_failures = (
+        resume_evidence.source_preparation_failures if resume_evidence is not None else ()
+    ) + tuple(source_preparation_failures)
     try:
         print_dataset_results(
             results,
@@ -1692,11 +1760,15 @@ def evaluate_dataset(
             augmentations_output=augmentations_output,
             invariant_evaluations=tuple(invariant_evaluations),
             show_report_guidance=show_report_guidance,
+            source_preparation_failure_count=len(all_source_preparation_failures),
         )
     except Exception:
         progress_runtime.tracker.emit(status="failed", stage="terminal")
         raise
-    progress_runtime.tracker.emit(status="completed", stage="terminal")
+    progress_runtime.tracker.emit(
+        status="failed" if all_source_preparation_failures else "completed",
+        stage="terminal",
+    )
     prior_invariant_evaluations = (
         resume_evidence.invariant_evaluations if resume_evidence is not None else ()
     )
@@ -1709,6 +1781,8 @@ def evaluate_dataset(
         raise typer.Exit(code=2)
     if has_review_findings or (resume_evidence is not None and resume_evidence.has_review_findings):
         raise typer.Exit(code=1)
+    if all_source_preparation_failures:
+        raise typer.Exit(code=2)
 
 
 def _recorded_http_target_config(

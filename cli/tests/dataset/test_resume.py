@@ -12,6 +12,7 @@ import pytest
 from typer.testing import CliRunner
 from ul import (
     DatasetAugmentationResult,
+    DatasetSemanticPreparationError,
     EnvironmentLifecycleEvidence,
     EnvironmentTurnEvidence,
     EvaluatorModelPreflight,
@@ -703,6 +704,52 @@ def test_resume_exits_early_when_all_records_already_processed(
     assert "Estimated completion tokens: 0..0" in dry_run.output
     assert result.exit_code == 0, result.output
     assert "Nothing to do" in result.output
+
+
+def test_all_complete_resume_preserves_source_preparation_failure_exit_code(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    dataset = tmp_path / "interactions.jsonl"
+    evidence = tmp_path / "evidence.jsonl"
+    target_config = tmp_path / "target.json"
+    source = _evaluation_result("interaction-1").source
+    _write_dataset(dataset, [_record("interaction-1")])
+    _write_target_config(target_config)
+    run_context = _run_context((source,))
+    failure = customer_module.build_source_preparation_failure_evidence(
+        source,
+        DatasetSemanticPreparationError(),
+        repetitions=1,
+        max_environment_api_calls=2,
+        planned_target_calls=2,
+        run_context=cast(Any, run_context),
+    )
+    evidence.write_text(failure.model_dump_json(exclude_none=True) + "\n", encoding="utf-8")
+    monkeypatch.setattr(command_module, "load_dataset_semantic_settings", _settings)
+
+    result = runner.invoke(
+        root_app,
+        [
+            "dataset",
+            "evaluate",
+            str(dataset),
+            "--environment-config",
+            str(target_config),
+            "--allow-environment-network",
+            "--confirm-test-environment",
+            "--repetitions",
+            "1",
+            "--operator",
+            "input.surface.rephrase",
+            "--resume",
+            str(evidence),
+        ],
+    )
+
+    assert result.exit_code == 2, result.output
+    assert "Nothing to do" in result.output
+    assert "Source preparation failures: 1" in result.output
 
 
 def test_all_complete_resume_preserves_prior_review_finding_exit_code(

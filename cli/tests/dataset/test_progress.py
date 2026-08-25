@@ -9,15 +9,19 @@ from typing import Any, cast
 
 import pytest
 from rich.console import Console
+from typer.testing import CliRunner
 from ul import (
     DatasetEvaluationResult,
     DatasetEvaluationTrial,
+    DatasetSemanticPreparationError,
     DatasetTargetDeliveryUncertain,
     DatasetTrialUnit,
     InteractionRecord,
 )
+from ul_cli import dataset_review
 from ul_cli import progress_action as progress_action_module
 from ul_cli.dataset.evaluation import runner as runner_module
+from ul_cli.dataset.evidence import customer as customer_module
 from ul_cli.dataset.progress import (
     CampaignControl,
     CampaignProgressTracker,
@@ -27,6 +31,9 @@ from ul_cli.dataset.progress import (
     TerminalCampaignProgressRenderer,
     create_campaign_next_commands,
 )
+from ul_cli.main import app as root_app
+
+from ._factories import _evaluation_result, _run_context
 
 
 def _tracker(publish: object, clock: object) -> CampaignProgressTracker:
@@ -307,6 +314,156 @@ def test_quarantine_status_is_sticky_until_external_cleanup() -> None:
     tracker.trial_skipped(case_number=1, unit=skipped)
 
     assert events[-1].environment == "quarantined"
+
+
+def test_source_preparation_failures_do_not_abort_a_ten_source_campaign(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    evaluation_results = {
+        f"source-{index}": _evaluation_result(f"source-{index}") for index in range(1, 11)
+    }
+    records = tuple(result.source for result in evaluation_results.values())
+    failed_ids = {"source-2", "source-7"}
+    target_started_ids: list[str] = []
+    journal_states: dict[str, str] = {}
+    collected_source_failures: list[Any] = []
+
+    class AsyncContext:
+        async def __aenter__(self) -> object:
+            return self
+
+        async def __aexit__(self, *args: object) -> None:
+            pass
+
+        def reuse_preflight(self, _result: object) -> None:
+            pass
+
+    class FakeJournal:
+        snapshot = SimpleNamespace(recovered_trials={})
+
+        def start(self, unit: DatasetTrialUnit) -> None:
+            journal_states[unit.id] = "running"
+
+        def finish(self, unit: DatasetTrialUnit, _trial: DatasetEvaluationTrial) -> None:
+            journal_states[unit.id] = "completed"
+
+        def is_terminal(self, unit: DatasetTrialUnit) -> bool:
+            return journal_states.get(unit.id) in {
+                "completed",
+                "rejected",
+                "errored",
+            }
+
+        def terminal(self, unit: DatasetTrialUnit, state: str, _reason: str) -> None:
+            if state == "errored":
+                durable_records = [
+                    json.loads(line) for line in evidence_path.read_text().splitlines()
+                ]
+                assert durable_records[-1]["record_type"] == "source_preparation_failure"
+                assert durable_records[-1]["interaction_id"] == unit.interaction_id
+            journal_states[unit.id] = state
+
+        def flush(self) -> None:
+            pass
+
+    class FakeRunner:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            pass
+
+        async def run(
+            self,
+            source: InteractionRecord,
+            **kwargs: object,
+        ) -> DatasetEvaluationResult:
+            if source.id in failed_ids:
+                raise DatasetSemanticPreparationError
+            result = evaluation_results[source.id]
+            cast(Any, kwargs["augmentation_checkpoint_callback"])(result.augmentation)
+            unit = DatasetTrialUnit(
+                interaction_id=source.id,
+                operator_id="current_baseline",
+                arm="original",
+                repetition=1,
+            )
+            target_started_ids.append(source.id)
+            cast(Any, kwargs["trial_started_callback"])(unit)
+            cast(Any, kwargs["trial_terminal_callback"])(
+                unit,
+                result.baseline.trial_set.trials[0],
+            )
+            return result
+
+    monkeypatch.setattr(
+        runner_module,
+        "create_semantic_model_deconstructor",
+        lambda settings: AsyncContext(),
+    )
+    monkeypatch.setattr(runner_module, "DatasetAugmentationEngine", lambda *args: object())
+    monkeypatch.setattr(runner_module, "DatasetEvaluationRunner", FakeRunner)
+    run_context = cast(Any, _run_context(records))
+    evidence_path = tmp_path / "evidence.jsonl"
+
+    async def run() -> tuple[DatasetEvaluationResult, ...]:
+        with evidence_path.open("w", encoding="utf-8") as output_stream:
+            return await runner_module.evaluate_interaction_records(
+                records,
+                ("input.surface.rephrase",),
+                cast(Any, SimpleNamespace()),
+                cast(Any, AsyncContext()),
+                output_stream,
+                repetitions=1,
+                max_environment_api_calls=20,
+                planned_target_calls=20,
+                run_context=run_context,
+                evaluator_preflight=cast(Any, object()),
+                trial_journal=cast(Any, FakeJournal()),
+                source_preparation_failures=collected_source_failures,
+            )
+
+    results = asyncio.run(run())
+
+    assert [result.source.id for result in results] == [
+        source_id for source_id in evaluation_results if source_id not in failed_ids
+    ]
+    assert target_started_ids == [
+        source_id for source_id in evaluation_results if source_id not in failed_ids
+    ]
+    assert sum(state == "errored" for state in journal_states.values()) == 4
+    evidence_lines = [json.loads(line) for line in evidence_path.read_text().splitlines()]
+    assert len(evidence_lines) == 10
+    failures = [line for line in evidence_lines if line.get("record_type")]
+    assert [failure["interaction_id"] for failure in failures] == ["source-2", "source-7"]
+    assert [failure.interaction_id for failure in collected_source_failures] == [
+        "source-2",
+        "source-7",
+    ]
+    assert all("raw_input" not in failure for failure in failures)
+    for field_name in ("interaction_id", "source_record_id"):
+        oversized_failure = {**failures[0], field_name: "x" * 501}
+        oversized_path = tmp_path / f"oversized-{field_name}.jsonl"
+        oversized_path.write_text(json.dumps(oversized_failure) + "\n", encoding="utf-8")
+        assert dataset_review.is_reportable_dataset_evidence(oversized_path) is False
+    snapshot = dataset_review.validate_dataset_resume_evidence(
+        evidence_path.read_bytes(),
+        expected_context=run_context,
+        selected_records=records,
+        invariant_suite=None,
+        evidence_projector=customer_module.build_customer_evidence_record,
+    )
+    assert snapshot.processed_ids == frozenset(evaluation_results)
+    assert len(snapshot.technical_results) == 8
+    unified_report = dataset_review.summarize_dataset_evidence(
+        evidence_path,
+        pattern_identity_key=b"test-pattern-key",
+    )
+    assert unified_report.review_status == "inconclusive"
+    assert unified_report.exit_code == 2
+    report_result = CliRunner().invoke(root_app, ["dataset", "report", str(evidence_path)])
+    assert report_result.exit_code == 0, report_result.output
+    assert "Source preparation failures: 2" in report_result.output
+    assert "Source preparation failure source-2" in report_result.output
+    assert "Source preparation failure source-7" in report_result.output
 
 
 def test_eta_excludes_smoke_preflight_and_human_confirmation_idle() -> None:
