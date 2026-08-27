@@ -302,6 +302,88 @@ async def test_evaluator_preflight_caps_each_sample_at_1024_tokens() -> None:
     await client.aclose()
 
 
+async def test_explicit_non_reasoning_roles_omit_only_reasoning_and_bind_preflight() -> None:
+    request_bodies: list[dict[str, object]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = cast(dict[str, object], json.loads(request.content))
+        request_bodies.append(body)
+        schema_name = cast(dict[str, Any], body["response_format"])["json_schema"]["name"]
+        if schema_name == "evaluator_preflight":
+            return completion('{"compatible":true}')
+        if schema_name == "semantic_frame":
+            return completion(json.dumps(frame_payload()))
+        if schema_name == "rendered_input":
+            return completion('{"rendered_input":"Please pay invoice INV-104."}')
+        return completion(
+            json.dumps(
+                {
+                    "verdict": "equivalent",
+                    "explanation": "Only the phrasing changed.",
+                    "deltas": [],
+                }
+            )
+        )
+
+    configured_settings = settings().model_copy(
+        update={
+            "model": "qwen/qwen3-30b-a3b-instruct-2507",
+            "render_model": "qwen/qwen3-30b-a3b-instruct-2507",
+            "equivalence_model": "deepseek/deepseek-v4-flash",
+            "deconstruct_reasoning": "omitted",
+            "render_reasoning": "omitted",
+        }
+    )
+    client = mock_client(handler)
+    async with create_semantic_model_deconstructor(
+        configured_settings, client=client
+    ) as deconstructor:
+        preflight = await deconstructor.preflight()
+        await deconstructor.deconstruct(interaction())
+        await deconstructor.render(interaction().raw_input, "Use natural phrasing.")
+        await deconstructor.verify(interaction().raw_input, "Please pay invoice INV-104.")
+
+    qwen_requests = [
+        request for request in request_bodies if request["model"] == configured_settings.model
+    ]
+    deepseek_requests = [
+        request
+        for request in request_bodies
+        if request["model"] == configured_settings.equivalence_model
+    ]
+    assert len(qwen_requests) == 4
+    assert all("reasoning" not in request for request in qwen_requests)
+    assert len(deepseek_requests) == 2
+    assert all(request["reasoning"] == {"effort": "low"} for request in deepseek_requests)
+    assert [profile.reasoning_mode for profile in preflight.profiles] == [
+        "omitted",
+        "omitted",
+        "required",
+    ]
+    assert all("reasoning" not in profile.required_parameters for profile in preflight.profiles[:2])
+    assert "reasoning" in preflight.profiles[2].required_parameters
+
+    changed_plan = plan_evaluator_preflight_profiles(
+        configured_settings.model_copy(update={"deconstruct_reasoning": "required"})
+    )
+    with pytest.raises(ValueError, match="does not match"):
+        deconstructor.reuse_preflight(
+            preflight.model_copy(
+                update={
+                    "profiles": tuple(
+                        profile.model_copy(
+                            update={
+                                "reasoning_mode": changed_plan[index].reasoning_mode,
+                            }
+                        )
+                        for index, profile in enumerate(preflight.profiles)
+                    )
+                }
+            )
+        )
+    await client.aclose()
+
+
 async def test_generic_endpoint_deduplicates_without_claiming_parameter_support() -> None:
     request_bodies: list[dict[str, object]] = []
 
@@ -589,6 +671,7 @@ async def test_deconstruct_sends_one_bounded_strict_structured_request() -> None
         "semantic_deconstructor_identity": semantic_deconstructor_identity(settings()).model_dump(
             mode="json"
         ),
+        "semantic_reasoning": {"mode": "required", "effort": "minimal"},
         "prompts": prompt_provenance("semantic.deconstruct"),
     }
     await client.aclose()
@@ -1019,6 +1102,7 @@ async def test_render_keeps_caller_instruction_out_of_the_system_prompt() -> Non
             & 0x7FFF_FFFF,
             "max_tokens": 512,
         },
+        "semantic_reasoning": {"mode": "required", "effort": "none"},
     }
     assert not client.is_closed
     await client.aclose()
@@ -2207,6 +2291,11 @@ async def test_openai_compatible_selection_loads_scoped_environment(
             "UL_DATASET_MAX_RESPONSE_BYTES",
             "1",
             "UL_DATASET_MAX_RESPONSE_BYTES must be between 1024 and 5000000",
+        ),
+        (
+            "UL_DATASET_DECONSTRUCT_REASONING",
+            "auto",
+            "UL_DATASET_DECONSTRUCT_REASONING must be required or omitted",
         ),
     ],
 )
