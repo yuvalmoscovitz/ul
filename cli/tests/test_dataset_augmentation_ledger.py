@@ -13,11 +13,13 @@ from ul import (
     CaseFixtureReference,
     DatasetAugmentationResult,
     InteractionRecord,
+    OpenRouterDatasetSettings,
     RichInteractionCase,
     SemanticFrame,
     VisibleContextTurn,
     create_dataset_augmentation_projection,
     project_rich_interaction_case,
+    semantic_deconstructor_identity,
 )
 from ul.augmentations.dataset import DatasetAugmentationCandidate
 from ul_cli import dataset_augmentation_ledger as ledger_module
@@ -88,6 +90,7 @@ def _context(
     selected_records: tuple[InteractionRecord, ...],
     *,
     model: str = "test/model",
+    include_deconstructor_identity: bool = True,
 ):
     return create_dataset_augmentation_generation_context(
         selected_records=selected_records,
@@ -103,6 +106,11 @@ def _context(
             max_render_tokens=512,
             max_response_bytes=1_000_000,
             timeout_seconds=60.0,
+            deconstructor_identity=(
+                semantic_deconstructor_identity(OpenRouterDatasetSettings())
+                if include_deconstructor_identity
+                else None
+            ),
         ),
     )
 
@@ -174,6 +182,19 @@ def test_generation_context_hash_binds_rich_fixture_context_and_target() -> None
     assert baseline.context_sha256 != changed_fixture.context_sha256
     assert baseline.context_sha256 != changed_context.context_sha256
     assert baseline.context_sha256 != changed_target.context_sha256
+
+
+def test_generation_context_hash_binds_deconstructor_identity() -> None:
+    source = _source()
+    current_context = _context((source,))
+    legacy_context = _context((source,), include_deconstructor_identity=False)
+
+    assert current_context.context_sha256 != legacy_context.context_sha256
+    assert current_context.semantic_settings.deconstructor_identity is not None
+    assert legacy_context.semantic_settings.deconstructor_identity is None
+    legacy_payload = legacy_context.model_dump(mode="json")
+    legacy_payload["semantic_settings"].pop("deconstructor_identity")
+    assert type(legacy_context).model_validate_json(json.dumps(legacy_payload)) == legacy_context
 
 
 def test_resume_rejects_truncated_record(tmp_path: Path) -> None:

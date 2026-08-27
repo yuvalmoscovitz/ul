@@ -33,6 +33,7 @@ from ul import (
     ExecutionEvidence,
     InteractionRecord,
     load_dataset_semantic_settings,
+    semantic_deconstructor_identity,
 )
 from ul.environment import validate_execution_evidence
 from ul.http_environment import (
@@ -659,6 +660,7 @@ def _semantic_settings_snapshot(
         max_render_tokens=settings.max_render_tokens,
         max_response_bytes=settings.max_response_bytes,
         timeout_seconds=settings.timeout_seconds,
+        deconstructor_identity=semantic_deconstructor_identity(settings),
     )
 
 
@@ -2074,6 +2076,7 @@ def _run_campaign(
             max_render_tokens=settings.max_render_tokens,
             max_response_bytes=settings.max_response_bytes,
             timeout_seconds=settings.timeout_seconds,
+            deconstructor_identity=semantic_deconstructor_identity(settings),
         ),
     )
     expected_manifest = create_dataset_run_manifest(

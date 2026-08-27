@@ -26,6 +26,7 @@ from ul import (
     OpenRouterDatasetSettings,
     ProviderDiagnosticError,
     load_dataset_semantic_settings,
+    semantic_deconstructor_identity,
 )
 from ul.dataset_invariants import (
     DatasetInvariantEvaluation,
@@ -952,6 +953,7 @@ def evaluate_dataset(
                 max_render_tokens=settings.max_render_tokens,
                 max_response_bytes=settings.max_response_bytes,
                 timeout_seconds=settings.timeout_seconds,
+                deconstructor_identity=semantic_deconstructor_identity(settings),
             ),
             redaction_policy_sha256=(
                 redaction_engine.policy.digest if redaction_engine is not None else None

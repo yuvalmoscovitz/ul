@@ -26,6 +26,7 @@ from ul import (
     DatasetEvaluationResult,
     DatasetSemanticPreparationError,
     InteractionRecord,
+    SemanticDeconstructorIdentity,
 )
 from ul.dataset_invariants import (
     DatasetInvariantArrayUniqueRuleEvaluation,
@@ -243,6 +244,7 @@ class DatasetEvidenceSemanticSettings(_StrictModel):
     max_render_tokens: int = Field(ge=1)
     max_response_bytes: int = Field(ge=1)
     timeout_seconds: float = Field(gt=0)
+    deconstructor_identity: SemanticDeconstructorIdentity | None = None
 
 
 class DatasetEvidenceRedactionCoverage(_StrictModel):
@@ -337,6 +339,10 @@ class DatasetEvidenceRunContext(_StrictModel):
             context_content.pop("redaction_policy_sha256")
         if not self.redaction_coverage:
             context_content.pop("redaction_coverage")
+        if self.semantic_settings.deconstructor_identity is None:
+            cast(dict[str, object], context_content["semantic_settings"]).pop(
+                "deconstructor_identity"
+            )
         expected_context_sha256 = _canonical_json_sha256(context_content)
         if self.context_sha256 != expected_context_sha256:
             raise ValueError("run context digest must match its canonical content")
@@ -628,7 +634,12 @@ def create_dataset_evidence_run_context(
         "invariant_suite_sha256": invariant_suite_sha256,
         "target": target.model_dump(mode="json"),
         "fixture": fixture.model_dump(mode="json"),
-        "semantic_settings": semantic_settings.model_dump(mode="json"),
+        "semantic_settings": semantic_settings.model_dump(
+            mode="json",
+            exclude={"deconstructor_identity"}
+            if semantic_settings.deconstructor_identity is None
+            else None,
+        ),
     }
     if redaction_policy_sha256 is not None:
         content["redaction_policy_sha256"] = redaction_policy_sha256
