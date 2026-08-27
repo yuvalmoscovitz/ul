@@ -38,6 +38,9 @@ class DatasetAugmentationLedgerSemanticSettings(_StrictModel):
     model: str = Field(min_length=1, max_length=200)
     render_model: str = Field(min_length=1, max_length=200)
     equivalence_model: str = Field(min_length=1, max_length=200)
+    deconstruct_reasoning: Literal["required", "omitted"] = "required"
+    render_reasoning: Literal["required", "omitted"] = "required"
+    equivalence_reasoning: Literal["required", "omitted"] = "required"
     max_input_chars: int = Field(ge=1)
     max_output_tokens: int = Field(ge=1)
     max_render_tokens: int = Field(ge=1)

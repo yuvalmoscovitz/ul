@@ -1335,6 +1335,63 @@ def test_resume_rejects_changed_evaluation_plan(tmp_path: Path) -> None:
     assert "incompatible with the current evaluation plan" in result.output
 
 
+def test_resume_rejects_changed_reasoning_mode(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    dataset = tmp_path / "interactions.jsonl"
+    evidence = tmp_path / "evidence.jsonl"
+    target_config = tmp_path / "target.json"
+    _write_dataset(dataset, [_record()])
+    _write_target_config(target_config)
+    evaluation_result = _evaluation_result("interaction-1")
+    run_context = _run_context(
+        (evaluation_result.source,),
+        settings=_settings(deconstruct_reasoning="omitted"),
+    )
+    required_context = _run_context((evaluation_result.source,))
+    assert (
+        command_module._manifest_incompatibility_reason(
+            cast(Any, run_context), cast(Any, required_context)
+        )
+        == "evaluator.reasoning"
+    )
+    evidence.write_text(
+        json.dumps(
+            customer_module.build_customer_evidence_record(
+                evaluation_result,
+                repetitions=1,
+                max_environment_api_calls=2,
+                planned_target_calls=2,
+                run_context=cast(Any, run_context),
+            )
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(command_module, "load_dataset_semantic_settings", _settings)
+
+    result = runner.invoke(
+        root_app,
+        [
+            "dataset",
+            "evaluate",
+            str(dataset),
+            "--environment-config",
+            str(target_config),
+            "--operator",
+            "input.surface.rephrase",
+            "--repetitions",
+            "1",
+            "--resume",
+            str(evidence),
+            "--dry-run",
+        ],
+    )
+
+    assert result.exit_code != 0
+    assert "incompatible with the current evaluation plan" in result.output
+
+
 def test_resume_rejects_pre_response_comparison_context() -> None:
     evaluation_result = _evaluation_result("interaction-1")
     current_context = _run_context((evaluation_result.source,))

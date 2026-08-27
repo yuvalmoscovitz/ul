@@ -17,6 +17,7 @@ from ._factories import (
     _evaluation_result,
     _isolated_response_target_config,
     _run_context,
+    _settings,
 )
 
 runner = CliRunner()
@@ -32,6 +33,26 @@ def test_run_context_uses_current_pipeline() -> None:
     assert run_context.target.config.reset.reset_session is True
     assert run_context.target.config.reset.reset_env is True
     assert run_context.fixture.status == "missing"
+
+
+def test_run_context_binds_explicit_reasoning_omission() -> None:
+    record = _evaluation_result("interaction-1").source
+    required = cast(Any, _run_context((record,)))
+    omitted = cast(
+        Any,
+        _run_context(
+            (record,),
+            settings=_settings(
+                deconstruct_reasoning="omitted",
+                render_reasoning="omitted",
+            ),
+        ),
+    )
+
+    assert omitted.semantic_settings.deconstruct_reasoning == "omitted"
+    assert omitted.semantic_settings.render_reasoning == "omitted"
+    assert omitted.semantic_settings.equivalence_reasoning == "required"
+    assert omitted.context_sha256 != required.context_sha256
 
 
 def test_run_context_records_versioned_fixture_identity() -> None:

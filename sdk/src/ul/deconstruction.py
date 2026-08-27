@@ -73,6 +73,20 @@ def _render_seed(raw_input: str, instruction: str) -> int:
     return int.from_bytes(digest[:4], "big") & 0x7FFF_FFFF
 
 
+def _reasoning_option(
+    mode: SemanticReasoningMode,
+    effort: Literal["minimal", "none", "low"],
+) -> dict[str, JsonValue] | None:
+    return {"effort": effort} if mode == "required" else None
+
+
+def _reasoning_metadata(
+    mode: SemanticReasoningMode,
+    effort: Literal["minimal", "none", "low"],
+) -> dict[str, JsonValue]:
+    return {"mode": mode, "effort": effort if mode == "required" else None}
+
+
 class SemanticDeconstructorIdentity(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
@@ -217,6 +231,9 @@ class ProviderDiagnosticError(RuntimeError):
         )
 
 
+type SemanticReasoningMode = Literal["required", "omitted"]
+
+
 def _provider_diagnostic(
     error: BaseException,
     *,
@@ -306,6 +323,18 @@ class OpenRouterDatasetSettings(BaseSettings):
         min_length=1,
         max_length=200,
         validation_alias="UL_DATASET_EQUIVALENCE_MODEL",
+    )
+    deconstruct_reasoning: SemanticReasoningMode = Field(
+        default="required",
+        validation_alias="UL_DATASET_DECONSTRUCT_REASONING",
+    )
+    render_reasoning: SemanticReasoningMode = Field(
+        default="required",
+        validation_alias="UL_DATASET_RENDER_REASONING",
+    )
+    equivalence_reasoning: SemanticReasoningMode = Field(
+        default="required",
+        validation_alias="UL_DATASET_EQUIVALENCE_REASONING",
     )
     max_input_chars: int = Field(
         default=50_000,
@@ -410,6 +439,18 @@ class OpenAICompatibleDatasetSettings(BaseSettings):
         default="",
         max_length=200,
         validation_alias="UL_DATASET_EQUIVALENCE_MODEL",
+    )
+    deconstruct_reasoning: SemanticReasoningMode = Field(
+        default="required",
+        validation_alias="UL_DATASET_DECONSTRUCT_REASONING",
+    )
+    render_reasoning: SemanticReasoningMode = Field(
+        default="required",
+        validation_alias="UL_DATASET_RENDER_REASONING",
+    )
+    equivalence_reasoning: SemanticReasoningMode = Field(
+        default="required",
+        validation_alias="UL_DATASET_EQUIVALENCE_REASONING",
     )
     max_input_chars: int = Field(
         default=50_000,
@@ -537,6 +578,9 @@ def _semantic_configuration_error(
         "UL_DATASET_MODEL": "model",
         "UL_DATASET_RENDER_MODEL": "render_model",
         "UL_DATASET_EQUIVALENCE_MODEL": "equivalence_model",
+        "UL_DATASET_DECONSTRUCT_REASONING": "deconstruct_reasoning",
+        "UL_DATASET_RENDER_REASONING": "render_reasoning",
+        "UL_DATASET_EQUIVALENCE_REASONING": "equivalence_reasoning",
         "UL_DATASET_MAX_INPUT_CHARS": "max_input_chars",
         "UL_DATASET_MAX_OUTPUT_TOKENS": "max_output_tokens",
         "UL_DATASET_MAX_RENDER_TOKENS": "max_render_tokens",
@@ -557,6 +601,9 @@ def _semantic_configuration_error(
                     "UL_DATASET_RENDER_MODEL": "render_model",
                     "UL_DATASET_EQUIVALENCE_MODEL": "equivalence_model",
                     "UL_DATASET_MODEL": "model",
+                    "UL_DATASET_DECONSTRUCT_REASONING": "deconstruct_reasoning",
+                    "UL_DATASET_RENDER_REASONING": "render_reasoning",
+                    "UL_DATASET_EQUIVALENCE_REASONING": "equivalence_reasoning",
                 }.items()
                 if environment_name in safe_detail
             ),
@@ -579,6 +626,9 @@ def _semantic_configuration_error(
         "equivalence_model": (
             "UL_DATASET_EQUIVALENCE_MODEL must be 1-200 non-whitespace characters when set"
         ),
+        "deconstruct_reasoning": ("UL_DATASET_DECONSTRUCT_REASONING must be required or omitted"),
+        "render_reasoning": "UL_DATASET_RENDER_REASONING must be required or omitted",
+        "equivalence_reasoning": ("UL_DATASET_EQUIVALENCE_REASONING must be required or omitted"),
         "max_input_chars": "UL_DATASET_MAX_INPUT_CHARS must be between 1 and 1000000",
         "max_output_tokens": "UL_DATASET_MAX_OUTPUT_TOKENS must be between 1 and 32768",
         "max_render_tokens": "UL_DATASET_MAX_RENDER_TOKENS must be between 1 and 4096",
@@ -702,6 +752,7 @@ class EvaluatorModelProfilePreflight(BaseModel):
     requested_model: str = Field(min_length=1, max_length=200)
     routed_model: str = Field(min_length=1, max_length=200)
     upstream_provider: str | None = Field(default=None, max_length=200)
+    reasoning_mode: SemanticReasoningMode
     required_parameters: tuple[str, ...]
     request_options_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     parameter_support: Literal["routing_enforced", "endpoint_accepted_unverified"]
@@ -727,6 +778,7 @@ class EvaluatorPreflightProfilePlan(BaseModel):
 
     roles: tuple[Literal["deconstruct", "render", "equivalence"], ...] = Field(min_length=1)
     requested_model: str = Field(min_length=1, max_length=200)
+    reasoning_mode: SemanticReasoningMode
     max_completion_tokens: int = Field(ge=1)
     required_parameters: tuple[str, ...]
 
@@ -748,7 +800,8 @@ class _EvaluatorPreflightHTTPError(ValueError):
 class _EvaluatorPreflightProfile:
     roles: tuple[Literal["deconstruct", "render", "equivalence"], ...]
     model: str
-    reasoning: dict[str, JsonValue]
+    reasoning_mode: SemanticReasoningMode
+    reasoning: dict[str, JsonValue] | None
     max_tokens: int
     temperature: float
     seed: int
@@ -781,7 +834,7 @@ class SemanticCompletionProvider(Protocol):
     def add_request_options(
         self,
         request_body: dict[str, Any],
-        reasoning: dict[str, JsonValue],
+        reasoning: dict[str, JsonValue] | None,
     ) -> None: ...
 
     def generation_metadata(
@@ -812,7 +865,7 @@ class OpenAICompatibleSemanticProvider:
     def add_request_options(
         self,
         request_body: dict[str, Any],
-        reasoning: dict[str, JsonValue],
+        reasoning: dict[str, JsonValue] | None,
     ) -> None:
         return None
 
@@ -857,9 +910,10 @@ class OpenRouterSemanticProvider(OpenAICompatibleSemanticProvider):
     def add_request_options(
         self,
         request_body: dict[str, Any],
-        reasoning: dict[str, JsonValue],
+        reasoning: dict[str, JsonValue] | None,
     ) -> None:
-        request_body["reasoning"] = reasoning
+        if reasoning is not None:
+            request_body["reasoning"] = reasoning
         request_body["provider"] = {
             "require_parameters": True,
             "data_collection": "deny",
@@ -971,6 +1025,7 @@ class SemanticModelDeconstructor:
                     requested_model=profile.model,
                     routed_model=completion.response.model,
                     upstream_provider=completion.response.provider,
+                    reasoning_mode=profile.reasoning_mode,
                     required_parameters=profile.required_parameters,
                     request_options_sha256=self._profile_request_options_sha256(profile),
                     parameter_support=(
@@ -1040,7 +1095,7 @@ class SemanticModelDeconstructor:
         completion = await self._request(
             operation="deconstruct",
             model=self.settings.model,
-            reasoning={"effort": "minimal"},
+            reasoning=_reasoning_option(self.settings.deconstruct_reasoning, "minimal"),
             max_tokens=self.settings.max_output_tokens,
             temperature=0,
             seed=0,
@@ -1065,6 +1120,9 @@ class SemanticModelDeconstructor:
                         "semantic_deconstructor_identity": _semantic_deconstructor_identity(
                             self.provider.extractor_version
                         ).model_dump(mode="json"),
+                        "semantic_reasoning": _reasoning_metadata(
+                            self.settings.deconstruct_reasoning, "minimal"
+                        ),
                         "prompts": prompt_provenance("semantic.deconstruct"),
                     },
                 }
@@ -1103,7 +1161,7 @@ class SemanticModelDeconstructor:
         completion = await self._request(
             operation="render",
             model=self.settings.render_model,
-            reasoning={"effort": "none"},
+            reasoning=_reasoning_option(self.settings.render_reasoning, "none"),
             max_tokens=self.settings.max_render_tokens,
             temperature=0.7,
             seed=render_seed,
@@ -1139,6 +1197,7 @@ class SemanticModelDeconstructor:
                     "seed": render_seed,
                     "max_tokens": self.settings.max_render_tokens,
                 },
+                "semantic_reasoning": _reasoning_metadata(self.settings.render_reasoning, "none"),
             },
         )
 
@@ -1153,7 +1212,7 @@ class SemanticModelDeconstructor:
         completion = await self._request(
             operation="verify",
             model=self.settings.equivalence_model,
-            reasoning={"effort": "low"},
+            reasoning=_reasoning_option(self.settings.equivalence_reasoning, "low"),
             max_tokens=min(self.settings.max_output_tokens, 1_024),
             temperature=0,
             seed=0,
@@ -1173,6 +1232,9 @@ class SemanticModelDeconstructor:
                     "metadata": {
                         **self._generation_metadata(completion),
                         "requested_model": self.settings.equivalence_model,
+                        "semantic_reasoning": _reasoning_metadata(
+                            self.settings.equivalence_reasoning, "low"
+                        ),
                         "prompts": prompt_provenance("semantic.verify"),
                     },
                 }
@@ -1237,7 +1299,7 @@ class SemanticModelDeconstructor:
         *,
         operation: Literal["deconstruct", "render", "verify", "preflight"],
         model: str,
-        reasoning: dict[str, JsonValue],
+        reasoning: dict[str, JsonValue] | None,
         max_tokens: int,
         temperature: float,
         seed: int,
@@ -1343,7 +1405,7 @@ class SemanticModelDeconstructor:
         *,
         operation: Literal["deconstruct", "render", "verify", "preflight"],
         model: str,
-        reasoning: dict[str, JsonValue],
+        reasoning: dict[str, JsonValue] | None,
         max_tokens: int,
         temperature: float,
         seed: int,
@@ -1386,7 +1448,7 @@ class SemanticModelDeconstructor:
         *,
         api_key: str | None,
         model: str,
-        reasoning: dict[str, JsonValue],
+        reasoning: dict[str, JsonValue] | None,
         max_tokens: int,
         temperature: float,
         seed: int,
@@ -1796,6 +1858,7 @@ def plan_evaluator_preflight_profiles(
         EvaluatorPreflightProfilePlan(
             roles=profile.roles,
             requested_model=profile.model,
+            reasoning_mode=profile.reasoning_mode,
             max_completion_tokens=profile.max_tokens,
             required_parameters=profile.required_parameters,
         )
@@ -1837,7 +1900,8 @@ def _evaluator_preflight_profiles(
         *,
         role: Literal["deconstruct", "render", "equivalence"],
         model: str,
-        reasoning: dict[str, JsonValue],
+        reasoning_mode: SemanticReasoningMode,
+        reasoning: dict[str, JsonValue] | None,
         max_tokens: int,
         temperature: float,
         seed: int,
@@ -1853,6 +1917,7 @@ def _evaluator_preflight_profiles(
         return _EvaluatorPreflightProfile(
             roles=(role,),
             model=model,
+            reasoning_mode=reasoning_mode,
             reasoning=reasoning,
             max_tokens=max_tokens,
             temperature=temperature,
@@ -1865,7 +1930,8 @@ def _evaluator_preflight_profiles(
         profile(
             role="deconstruct",
             model=settings.model,
-            reasoning={"effort": "minimal"},
+            reasoning_mode=settings.deconstruct_reasoning,
+            reasoning=_reasoning_option(settings.deconstruct_reasoning, "minimal"),
             max_tokens=min(settings.max_output_tokens, _PREFLIGHT_MAX_TOKENS),
             temperature=0,
             seed=0,
@@ -1874,7 +1940,8 @@ def _evaluator_preflight_profiles(
         profile(
             role="render",
             model=settings.render_model,
-            reasoning={"effort": "none"},
+            reasoning_mode=settings.render_reasoning,
+            reasoning=_reasoning_option(settings.render_reasoning, "none"),
             max_tokens=min(settings.max_render_tokens, _PREFLIGHT_MAX_TOKENS),
             temperature=0.7,
             seed=render_seed,
@@ -1883,7 +1950,8 @@ def _evaluator_preflight_profiles(
         profile(
             role="equivalence",
             model=settings.equivalence_model,
-            reasoning={"effort": "low"},
+            reasoning_mode=settings.equivalence_reasoning,
+            reasoning=_reasoning_option(settings.equivalence_reasoning, "low"),
             max_tokens=min(settings.max_output_tokens, _PREFLIGHT_MAX_TOKENS),
             temperature=0,
             seed=0,
@@ -1913,6 +1981,7 @@ def _validate_evaluator_preflight(
         (
             profile.roles,
             profile.model,
+            profile.reasoning_mode,
             profile.required_parameters,
             _profile_request_options_sha256(provider, profile),
         )
@@ -1922,6 +1991,7 @@ def _validate_evaluator_preflight(
         (
             profile.roles,
             profile.requested_model,
+            profile.reasoning_mode,
             profile.required_parameters,
             profile.request_options_sha256,
         )
@@ -1965,6 +2035,7 @@ def _profile_request_options_sha256(
 ) -> str:
     request_options: dict[str, Any] = {
         "model": profile.model,
+        "reasoning_mode": profile.reasoning_mode,
         "max_tokens": profile.max_tokens,
         "temperature": profile.temperature,
         "seed": profile.seed,

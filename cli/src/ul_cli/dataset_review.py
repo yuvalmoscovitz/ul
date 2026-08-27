@@ -239,6 +239,9 @@ class DatasetEvidenceSemanticSettings(_StrictModel):
     model: str
     render_model: str
     equivalence_model: str
+    deconstruct_reasoning: Literal["required", "omitted"] = "required"
+    render_reasoning: Literal["required", "omitted"] = "required"
+    equivalence_reasoning: Literal["required", "omitted"] = "required"
     max_input_chars: int = Field(ge=1)
     max_output_tokens: int = Field(ge=1)
     max_render_tokens: int = Field(ge=1)

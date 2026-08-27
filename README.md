@@ -314,6 +314,18 @@ export UL_DATASET_MODEL=your-semantic-model
 export UL_LIVE=true
 ```
 
+When a selected model intentionally does not support reasoning control, omit that request option
+explicitly for only the affected semantic role:
+
+```bash
+export UL_DATASET_DECONSTRUCT_REASONING=omitted
+export UL_DATASET_RENDER_REASONING=omitted
+export UL_DATASET_EQUIVALENCE_REASONING=omitted
+```
+
+The default is `required` for every role. UL records the choice in preflight and resume evidence;
+all other structured-output and sampling capabilities remain required.
+
 Secrets belong in environment variables or a secret manager, never in datasets or configuration
 files. Environment header mappings may reference only dedicated `UL_ENVIRONMENT_*` environment variables.
 
