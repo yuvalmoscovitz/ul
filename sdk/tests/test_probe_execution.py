@@ -4,6 +4,7 @@ import asyncio
 import json
 import threading
 import time
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 
@@ -909,27 +910,36 @@ async def test_timed_out_sync_invocation_is_not_retried_while_still_running() ->
 async def test_sync_runner_is_reusable_before_result_callback_runs(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    import ul.probe_execution as probe_execution_module
     from ul.probe_execution import _SyncAdapterRunner
 
-    loop = asyncio.get_running_loop()
-    original_call_soon_threadsafe = loop.call_soon_threadsafe
+    original_schedule_threadsafe = probe_execution_module._schedule_threadsafe
     first_result_scheduled = threading.Event()
     release_first_worker = threading.Event()
     first_worker_ident: int | None = None
 
-    def block_first_worker_after_scheduling(callback: object, *args: object) -> object:
-        handle = original_call_soon_threadsafe(callback, *args)
-        if threading.get_ident() == first_worker_ident:
+    def block_first_worker_after_scheduling(
+        target_loop: asyncio.AbstractEventLoop,
+        callback: Callable[..., object],
+        *args: object,
+    ) -> None:
+        is_first_worker = threading.get_ident() == first_worker_ident
+        if is_first_worker:
             first_result_scheduled.set()
+        original_schedule_threadsafe(target_loop, callback, *args)
+        if is_first_worker:
             release_first_worker.wait(timeout=1)
-        return handle
 
     def first_operation(value: str) -> str:
         nonlocal first_worker_ident
         first_worker_ident = threading.get_ident()
         return value
 
-    monkeypatch.setattr(loop, "call_soon_threadsafe", block_first_worker_after_scheduling)
+    monkeypatch.setattr(
+        probe_execution_module,
+        "_schedule_threadsafe",
+        block_first_worker_after_scheduling,
+    )
     runner = _SyncAdapterRunner("test-sync-order")
 
     try:
