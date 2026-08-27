@@ -915,19 +915,25 @@ async def test_sync_runner_is_reusable_before_result_callback_runs(
     original_call_soon_threadsafe = loop.call_soon_threadsafe
     first_result_scheduled = threading.Event()
     release_first_worker = threading.Event()
+    first_worker_ident: int | None = None
 
     def block_first_worker_after_scheduling(callback: object, *args: object) -> object:
         handle = original_call_soon_threadsafe(callback, *args)
-        if threading.current_thread().name == "test-sync-order":
+        if threading.get_ident() == first_worker_ident:
             first_result_scheduled.set()
             release_first_worker.wait(timeout=1)
         return handle
+
+    def first_operation(value: str) -> str:
+        nonlocal first_worker_ident
+        first_worker_ident = threading.get_ident()
+        return value
 
     monkeypatch.setattr(loop, "call_soon_threadsafe", block_first_worker_after_scheduling)
     runner = _SyncAdapterRunner("test-sync-order")
 
     try:
-        first = await runner.call(lambda value: value, "first")
+        first = await runner.call(first_operation, "first")
         assert first_result_scheduled.is_set()
         second = await runner.call(lambda value: value, "second")
     finally:
