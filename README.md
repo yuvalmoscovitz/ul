@@ -24,7 +24,7 @@ baseline drift, augmentation sensitivity, instability, and inconclusive results.
 
 ## Quickstart
 
-You need Python 3.12+, [`uv`](https://docs.astral.sh/uv/), a safe test entry point to your agent,
+You need Python 3.12+, [`uv`](https://docs.astral.sh/uv/), a safe synchronous JSON test endpoint,
 and at least one interaction you have already observed.
 
 ### 1. Install UL
@@ -52,14 +52,16 @@ correct answer.
 
 ### 3. Point UL at your real agent
 
-Assume your existing application exposes a Python callable named `support_agent:invoke`. The
-callable receives the JSON value from `input`, makes its normal test-provider calls, and returns a
-bounded text or JSON response.
+Assume your existing application exposes an isolated synchronous endpoint that accepts
+`{"input": ...}` and returns `{"response": ...}`. It must start every request from safe test state
+and must not cause real-world effects.
 
-Set the credentials used by your agent and by UL's semantic evaluation. Values remain in the
-environment; only explicitly allowlisted variable names reach the isolated agent process.
+Set the endpoint credential and the credential used by UL's semantic evaluation. Values remain in
+the environment and are referenced by variable name; never place a credential in the target URL or
+configuration.
 
 ```bash
+export UL_ENVIRONMENT_AGENT_TOKEN='Bearer secret-from-your-secret-manager'
 export OPEN_ROUTER_API_KEY=your-key-from-a-secret-manager
 export UL_LIVE=true
 ```
@@ -68,8 +70,8 @@ Run one small campaign:
 
 ```bash
 ul probe interactions.jsonl \
-  --target support_agent:invoke \
-  --target-environment-variable OPEN_ROUTER_API_KEY \
+  --target https://agent.test/invoke \
+  --header-from-env Authorization=UL_ENVIRONMENT_AGENT_TOKEN \
   --operator input.surface.typing_noise \
   --limit 1 \
   --repetitions 1 \
@@ -105,38 +107,33 @@ the result is inconclusive. These are workflow states, not correctness verdicts.
 
 ## Other target types
 
-### Authenticated JSON endpoint
+### Python callable
 
-For a synchronous endpoint that accepts `{"input": ...}` and returns `{"response": ...}`:
+Use a Python callable only when its module and dependencies are importable by the selected target
+interpreter. A standalone `uv tool` installation is isolated from an ordinary application's
+virtualenv, so the HTTP quickstart above is currently the reliable path for those projects.
 
 ```bash
-export UL_ENVIRONMENT_AGENT_TOKEN='Bearer secret-from-your-secret-manager'
-
 ul probe interactions.jsonl \
-  --target https://agent.test/invoke \
-  --header-from-env Authorization=UL_ENVIRONMENT_AGENT_TOKEN \
+  --target support_agent:invoke \
   --operator input.surface.typing_noise \
   --limit 1 \
   --repetitions 1 \
   --output .ul/runs/probe-evidence.jsonl
 ```
 
-Never put credentials in a URL or target configuration. Direct endpoints must start each request
-from isolated test state and must not cause real-world effects. See the
-[guided probe reference](docs/probe.md) for OpenAI-compatible endpoints, custom JSON mappings,
-async callables, subprocesses, structured inputs, stronger repetitions, and resumable runs.
+See the [guided probe reference](docs/probe.md) for callable isolation, OpenAI-compatible endpoints,
+custom JSON mappings, async callables, subprocesses, structured inputs, stronger repetitions, and
+resumable runs.
 
 ### Reusable local target configuration
 
-If the callable needs a different interpreter, working directory, or environment allowlist, save a
-secret-free target configuration:
+Save repeated HTTP mapping and authentication references in a secret-free target configuration:
 
 ```bash
 ul probe interactions.jsonl \
-  --target package.agent:invoke \
-  --target-working-directory /path/to/project \
-  --target-interpreter /path/to/project/.venv/bin/python \
-  --target-environment-variable AGENT_API_KEY \
+  --target https://agent.test/invoke \
+  --header-from-env Authorization=UL_ENVIRONMENT_AGENT_TOKEN \
   --save-target-config target.json
 ```
 

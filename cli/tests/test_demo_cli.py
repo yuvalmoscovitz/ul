@@ -20,13 +20,13 @@ from ul_cli.main import app
 _PROJECT_ROOT = Path(__file__).parents[2]
 
 
-def test_root_help_leads_with_demo_and_observed_interaction_probe() -> None:
+def test_root_help_leads_with_observed_interaction_probe() -> None:
     result = CliRunner().invoke(app, ["--help"])
 
     assert result.exit_code == 0
     normalized_output = " ".join(result.output.split())
-    assert "Start with 'ul demo'" in normalized_output
-    assert "probe observed interactions with 'ul probe'" in normalized_output
+    assert "Probe observed interactions with 'ul probe'" in normalized_output
+    assert "explore synthetic evidence with 'ul demo'" in normalized_output
     assert "See UL's model-free augment-and-compare workflow" in normalized_output
     assert "Probe observed interactions against a safe callable or HTTP" in normalized_output
     assert "Configure an advanced stateful-evidence project" in normalized_output
@@ -36,16 +36,20 @@ def test_root_help_leads_with_demo_and_observed_interaction_probe() -> None:
 def test_readme_quickstart_leads_with_a_real_probe_and_keeps_demo_secondary() -> None:
     readme = (_PROJECT_ROOT / "README.md").read_text(encoding="utf-8")
     quickstart = readme[readme.index("## Quickstart") : readme.index("## How it works")]
+    primary_quickstart = quickstart[: quickstart.index("## Other target types")]
     normalized_quickstart = " ".join(quickstart.split())
+    normalized_primary_quickstart = " ".join(primary_quickstart.split())
 
+    assert "--target https://agent.test/invoke" in normalized_primary_quickstart
+    assert (
+        "--header-from-env Authorization=UL_ENVIRONMENT_AGENT_TOKEN"
+        in normalized_primary_quickstart
+    )
     assert "--target support_agent:invoke" in normalized_quickstart
-    assert "--target-environment-variable OPEN_ROUTER_API_KEY" in normalized_quickstart
-    assert "--target https://agent.test/invoke" in normalized_quickstart
-    assert "--header-from-env Authorization=UL_ENVIRONMENT_AGENT_TOKEN" in normalized_quickstart
-    assert "reference evidence, not as a correct answer" in normalized_quickstart
-    assert "UNKNOWN AND UNBOUNDED" in normalized_quickstart
-    assert "stop unless that risk is acceptable" in normalized_quickstart
-    assert "ul demo" not in normalized_quickstart
+    assert "reference evidence, not as a correct answer" in normalized_primary_quickstart
+    assert "UNKNOWN AND UNBOUNDED" in normalized_primary_quickstart
+    assert "stop unless that risk is acceptable" in normalized_primary_quickstart
+    assert "ul demo" not in normalized_primary_quickstart
     assert "it is not a real-agent onboarding or qualification run" in readme
     assert readme.index("## Quickstart") < readme.index("## Stateful and trace-based testing")
 
