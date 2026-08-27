@@ -5,15 +5,18 @@ import hashlib
 import json
 import math
 import re
+from collections.abc import Iterator, Mapping
+from types import MappingProxyType
 from typing import Literal, Self, cast
 
-from pydantic import BaseModel, ConfigDict, Field, JsonValue, model_validator
+from pydantic import BaseModel, ConfigDict, Field, JsonValue, field_serializer, model_validator
 
 _JSON_POINTER_PATTERN = re.compile(r"(?:/(?:[^~/]|~[01])*)*")
 _MAXIMUM_NORMALIZED_BYTES = 64_000
 _MAXIMUM_COMPOSE_DEPTH = 100
 _MAXIMUM_COMPOSE_NODES = 10_000
 _MAXIMUM_COMPOSE_FIELDS = 2_000
+_MAXIMUM_COMPOSE_FIELD_NAME = 1_000
 
 
 class OutcomeProjectionError(ValueError):
@@ -37,16 +40,23 @@ class ComposedOutcomeProjection(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
     schema_version: Literal["1.0.0"] = "1.0.0"
-    fields: dict[str, str] = Field(default_factory=dict, max_length=100)
+    fields: Mapping[str, str] = Field(default_factory=dict, max_length=100)
     spread: OutcomeSpreadProjection | None = None
 
     @model_validator(mode="after")
     def validate_contract(self) -> Self:
         if not self.fields and self.spread is None:
             raise ValueError("compose requires fields or spread")
-        if any(not name or len(name) > 1_000 for name in self.fields):
+        if any(not name or len(name) > _MAXIMUM_COMPOSE_FIELD_NAME for name in self.fields):
             raise ValueError("compose field names must contain 1..1000 characters")
+        if any(len(selector) > 1_000 for selector in self.fields.values()):
+            raise ValueError("compose field selectors must contain at most 1000 characters")
+        object.__setattr__(self, "fields", MappingProxyType(dict(self.fields)))
         return self
+
+    @field_serializer("fields")
+    def serialize_fields(self, fields: Mapping[str, str]) -> dict[str, str]:
+        return dict(fields)
 
 
 class OutcomeProjection(BaseModel):
@@ -141,21 +151,22 @@ class OutcomeProjection(BaseModel):
             _validate_common_roles(normalized, self.field_selectors)
         try:
             _validate_json_structure(normalized)
-            encoded = json.dumps(
-                normalized,
-                ensure_ascii=False,
-                separators=(",", ":"),
-                allow_nan=False,
-            ).encode("utf-8")
+            encoded_size = _encoded_json_size(normalized)
         except RecursionError:
             raise OutcomeProjectionError("outcome", "", "exceeds structural limits") from None
+        except OverflowError:
+            raise OutcomeProjectionError(
+                "outcome",
+                "",
+                f"exceeds the {_MAXIMUM_NORMALIZED_BYTES}-byte normalized-result limit",
+            ) from None
         except UnicodeEncodeError:
             raise OutcomeProjectionError("outcome", "", "contains invalid Unicode") from None
         except (TypeError, ValueError):
             raise OutcomeProjectionError(
                 "complete_result", self.complete_result or "", "is not JSON"
             ) from None
-        if len(encoded) > _MAXIMUM_NORMALIZED_BYTES:
+        if encoded_size > _MAXIMUM_NORMALIZED_BYTES:
             raise OutcomeProjectionError(
                 "complete_result" if self.complete_result is not None else "outcome",
                 self.complete_result or "",
@@ -249,6 +260,20 @@ def _compose_outcome(
                     str(error),
                 ) from None
         else:
+            try:
+                _validate_json_structure(spread_object)
+            except RecursionError:
+                raise OutcomeProjectionError(
+                    "compose.spread",
+                    spread.selector,
+                    "exceeds structural limits",
+                ) from None
+            except OverflowError:
+                raise OutcomeProjectionError(
+                    "compose.spread",
+                    spread.selector,
+                    f"exceeds the {_MAXIMUM_NORMALIZED_BYTES}-byte normalized-result limit",
+                ) from None
             spread_fields = spread_object
         collisions = normalized.keys() & spread_fields.keys()
         if collisions:
@@ -334,27 +359,44 @@ def _reject_json_constant(_: str) -> None:
 
 def _flatten_fields(arguments: dict[str, JsonValue]) -> dict[str, JsonValue]:
     flattened: dict[str, JsonValue] = {}
-    pending: list[tuple[str, JsonValue, int]] = [
-        (key, value, 1) for key, value in reversed(tuple(arguments.items()))
+    pending: list[tuple[str, Iterator[tuple[str | int, JsonValue]], int, bool]] = [
+        ("", cast(Iterator[tuple[str | int, JsonValue]], iter(arguments.items())), 0, False)
     ]
     node_count = 0
     while pending:
-        prefix, value, depth = pending.pop()
+        parent_prefix, children, parent_depth, indexed = pending[-1]
+        try:
+            segment, value = next(children)
+        except StopIteration:
+            pending.pop()
+            continue
+        segment_text = f"[{segment}]" if indexed else cast(str, segment)
+        separator = "" if not parent_prefix or indexed else "."
+        if len(parent_prefix) + len(separator) + len(segment_text) > _MAXIMUM_COMPOSE_FIELD_NAME:
+            raise ValueError("exceeds canonical flattening limits")
+        prefix = f"{parent_prefix}{separator}{segment_text}"
+        depth = parent_depth + 1
         node_count += 1
         if depth > _MAXIMUM_COMPOSE_DEPTH or node_count > _MAXIMUM_COMPOSE_NODES:
             raise ValueError("exceeds canonical flattening limits")
-        if isinstance(value, dict):
-            nested_fields = tuple(value.items())
-            if nested_fields:
-                pending.extend(
-                    (f"{prefix}.{key}", nested_value, depth + 1)
-                    for key, nested_value in reversed(nested_fields)
+        if isinstance(value, dict) and value:
+            pending.append(
+                (
+                    prefix,
+                    cast(Iterator[tuple[str | int, JsonValue]], iter(value.items())),
+                    depth,
+                    False,
                 )
-                continue
+            )
+            continue
         elif isinstance(value, list) and value:
-            pending.extend(
-                (f"{prefix}[{index}]", nested_value, depth + 1)
-                for index, nested_value in reversed(tuple(enumerate(value)))
+            pending.append(
+                (
+                    prefix,
+                    cast(Iterator[tuple[str | int, JsonValue]], iter(enumerate(value))),
+                    depth,
+                    True,
+                )
             )
             continue
         if prefix in flattened:
@@ -366,17 +408,41 @@ def _flatten_fields(arguments: dict[str, JsonValue]) -> dict[str, JsonValue]:
 
 
 def _validate_json_structure(value: JsonValue) -> None:
-    pending: list[tuple[JsonValue, int]] = [(value, 0)]
+    pending: list[Iterator[tuple[JsonValue, int, int]]] = [iter(((value, 0, 0),))]
     node_count = 0
+    character_count = 0
     while pending:
-        current, depth = pending.pop()
+        try:
+            current, depth, key_characters = next(pending[-1])
+        except StopIteration:
+            pending.pop()
+            continue
         node_count += 1
         if depth > _MAXIMUM_COMPOSE_DEPTH or node_count > _MAXIMUM_COMPOSE_NODES:
             raise RecursionError
+        character_count += key_characters
+        if isinstance(current, str):
+            character_count += len(current)
+        if character_count > _MAXIMUM_NORMALIZED_BYTES:
+            raise OverflowError
         if isinstance(current, dict):
-            pending.extend((nested, depth + 1) for nested in current.values())
+            pending.append(((nested, depth + 1, len(key)) for key, nested in current.items()))
         elif isinstance(current, list):
-            pending.extend((nested, depth + 1) for nested in current)
+            pending.append((nested, depth + 1, 0) for nested in current)
+
+
+def _encoded_json_size(value: JsonValue) -> int:
+    encoded_size = 0
+    encoder = json.JSONEncoder(
+        ensure_ascii=False,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
+    for chunk in encoder.iterencode(value):
+        encoded_size += len(chunk.encode("utf-8"))
+        if encoded_size > _MAXIMUM_NORMALIZED_BYTES:
+            return encoded_size
+    return encoded_size
 
 
 def _replace_with_private_marker(value: dict[str, JsonValue], pointer: str) -> None:

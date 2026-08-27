@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from typing import cast
 
 import pytest
 from pydantic import ValidationError
@@ -170,6 +171,23 @@ def test_construct_projection_modes_are_mutually_exclusive() -> None:
         )
 
 
+def test_compose_fields_are_immutable_after_confirmation() -> None:
+    projection = OutcomeProjection.model_validate({"compose": {"fields": {"action": "/call/name"}}})
+    assert projection.compose is not None
+    original_digest = projection.digest
+
+    with pytest.raises(TypeError):
+        cast(dict[str, str], projection.compose.fields)["action"] = "/other"
+
+    assert projection.digest == original_digest
+    assert projection.project({"call": {"name": "lookup"}}) == {"action": "lookup"}
+
+
+def test_compose_rejects_oversized_field_selector() -> None:
+    with pytest.raises(ValidationError, match="selectors must contain at most 1000"):
+        OutcomeProjection.model_validate({"compose": {"fields": {"action": "/" + "x" * 1_000}}})
+
+
 @pytest.mark.parametrize(
     ("response", "message"),
     [
@@ -206,6 +224,27 @@ def test_construct_bounds_nested_spread_expansion() -> None:
 
     with pytest.raises(OutcomeProjectionError, match="canonical flattening limits"):
         projection.project({"call": {"name": "lookup", "arguments": json.dumps({"root": nested})}})
+
+
+@pytest.mark.parametrize("flatten", [False, True])
+def test_construct_bounds_wide_existing_object_incrementally(flatten: bool) -> None:
+    projection = OutcomeProjection.model_validate(
+        {
+            "compose": {
+                "spread": {
+                    "selector": "/input",
+                    "flatten": flatten,
+                }
+            }
+        }
+    )
+    wide = {f"field_{index}": index for index in range(10_001)}
+
+    with pytest.raises(
+        OutcomeProjectionError,
+        match=r"structural limits|canonical flattening limits",
+    ):
+        projection.project({"input": wide})
 
 
 def _encoded_construct(
