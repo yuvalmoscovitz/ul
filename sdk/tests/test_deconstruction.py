@@ -1676,6 +1676,49 @@ async def test_deconstruct_rejects_pointer_outside_declared_source() -> None:
     await client.aclose()
 
 
+async def test_grounding_diagnostic_hashes_untrusted_pointer_tokens() -> None:
+    private_pointer_token = "patient-S6212774\n\x1b]8;;https://example.test\x07forged"
+    factor = {
+        **factor_payload(),
+        "evidence": [
+            {
+                "source": "input",
+                "json_pointer": f"/raw_input/{private_pointer_token}",
+                "text_quote": None,
+            }
+        ],
+    }
+    client = mock_client(
+        lambda request: completion(json.dumps({**frame_payload(), "factors": [factor]}))
+    )
+
+    async with create_semantic_model_deconstructor(settings(), client=client) as deconstructor:
+        with pytest.raises(SemanticGroundingError) as grounding_error:
+            await deconstructor.deconstruct(interaction())
+
+    error = grounding_error.value
+    assert error.diagnostic.reason == "pointer_unresolved"
+    assert error.diagnostic.json_pointer is not None
+    assert error.diagnostic.json_pointer.startswith("/raw_input/<pointer-sha256:")
+    rendered = " ".join(
+        (
+            str(error),
+            repr(error),
+            repr(error.diagnostic),
+            error.diagnostic.model_dump_json(),
+        )
+    )
+    for private_value in (
+        private_pointer_token,
+        "S6212774",
+        "https://example.test",
+        "\x1b",
+        "\n",
+    ):
+        assert private_value not in rendered
+    await client.aclose()
+
+
 async def test_deconstruct_rejects_ellipsized_quote_without_repair() -> None:
     request_unit = cast(list[dict[str, object]], frame_payload()["request_units"])[0]
     ellipsized_request = {

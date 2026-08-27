@@ -134,6 +134,16 @@ def _canonical_json_sha256(value: object) -> str:
     return _sha256_text(serialized)
 
 
+def _safe_diagnostic_json_pointer(
+    source: Literal["input", "output"],
+    json_pointer: str,
+) -> str:
+    trusted_root = "/raw_input" if source == "input" else "/raw_observed_output"
+    if json_pointer == trusted_root:
+        return trusted_root
+    return f"{trusted_root}/<pointer-sha256:{_sha256_text(json_pointer)[:12]}>"
+
+
 def _semantic_frame_response_schema(*, observed_output_present: bool) -> dict[str, Any]:
     schema = SemanticFrame.model_json_schema(mode="validation")
     definitions = cast(dict[str, dict[str, Any]], schema["$defs"])
@@ -1691,7 +1701,10 @@ class SemanticModelDeconstructor:
                 collection=collection,
                 element_index=element_index,
                 evidence_index=evidence_index,
-                json_pointer=evidence.json_pointer,
+                json_pointer=_safe_diagnostic_json_pointer(
+                    evidence.source,
+                    evidence.json_pointer,
+                ),
                 reason=reason,
             )
 
