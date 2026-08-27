@@ -149,6 +149,21 @@ def test_tool_call_projection_rejects_invalid_arguments_without_echoing_them(
     assert arguments not in str(caught.value)
 
 
+def test_tool_call_projection_rejects_unpaired_surrogate_with_safe_diagnostic() -> None:
+    projection = OutcomeProjection.model_validate(
+        {"tool_call": {"name": "/call/name", "arguments": "/call/arguments"}}
+    )
+    arguments = '{"value":"' + chr(0xD800) + '"}'
+
+    with pytest.raises(
+        OutcomeProjectionError,
+        match="must resolve to a valid JSON-encoded object string",
+    ) as caught:
+        projection.project({"call": {"name": "lookup", "arguments": arguments}})
+
+    assert caught.value.__cause__ is None
+
+
 def test_tool_call_projection_modes_are_mutually_exclusive() -> None:
     with pytest.raises(ValidationError, match="requires exactly one"):
         OutcomeProjection.model_validate(

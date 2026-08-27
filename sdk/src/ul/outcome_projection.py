@@ -225,7 +225,15 @@ def _project_tool_call(
             projection.arguments,
             "must resolve to a JSON-encoded object string",
         )
-    if len(encoded_arguments.encode("utf-8")) > _MAXIMUM_NORMALIZED_BYTES:
+    try:
+        encoded_argument_size = len(encoded_arguments.encode("utf-8"))
+    except UnicodeEncodeError:
+        raise OutcomeProjectionError(
+            "tool_call.arguments",
+            projection.arguments,
+            "must resolve to a valid JSON-encoded object string",
+        ) from None
+    if encoded_argument_size > _MAXIMUM_NORMALIZED_BYTES:
         raise OutcomeProjectionError(
             "tool_call.arguments",
             projection.arguments,
