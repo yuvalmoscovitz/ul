@@ -20,6 +20,7 @@ from ul import (
     JsonHttpEnvironmentConfig,
     ObservedAgentOutput,
     OutcomeProjection,
+    semantic_deconstructor_identity,
 )
 from ul.dataset_invariants import (
     DatasetInvariantSuite,
@@ -52,6 +53,31 @@ from ._files import (
 
 runner = CliRunner()
 _ANSI_ESCAPE_PATTERN = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+
+
+def test_evidence_run_context_binds_deconstructor_identity() -> None:
+    records = (_evaluation_result("interaction-1").source,)
+    current_context = cast(dataset_review.DatasetEvidenceRunContext, _run_context(records))
+    legacy_context = dataset_review.create_dataset_evidence_run_context(
+        selected_records=records,
+        operators=(("input.surface.rephrase", "1.0.0"),),
+        repetitions=1,
+        invariant_suite_sha256=None,
+        target_config=current_context.target.config,
+        semantic_settings=current_context.semantic_settings.model_copy(
+            update={"deconstructor_identity": None}
+        ),
+    )
+
+    assert current_context.context_sha256 != legacy_context.context_sha256
+    assert current_context.semantic_settings.deconstructor_identity is not None
+    assert legacy_context.semantic_settings.deconstructor_identity is None
+    legacy_payload = legacy_context.model_dump(mode="json")
+    legacy_payload["semantic_settings"].pop("deconstructor_identity")
+    assert (
+        dataset_review.DatasetEvidenceRunContext.model_validate_json(json.dumps(legacy_payload))
+        == legacy_context
+    )
 
 
 def test_finding_reference_key_is_stable_across_resume(tmp_path: Path) -> None:
@@ -399,6 +425,7 @@ def test_resume_skips_already_processed_interaction_ids(
             max_render_tokens=_settings().max_render_tokens,
             max_response_bytes=_settings().max_response_bytes,
             timeout_seconds=_settings().timeout_seconds,
+            deconstructor_identity=semantic_deconstructor_identity(_settings()),
         ),
     )
     with augmentation_ledger_module.create_private_augmentation_ledger(
@@ -619,6 +646,7 @@ def test_resume_dry_run_rejects_ledger_that_disagrees_with_completed_evidence(
             max_render_tokens=_settings().max_render_tokens,
             max_response_bytes=_settings().max_response_bytes,
             timeout_seconds=_settings().timeout_seconds,
+            deconstructor_identity=semantic_deconstructor_identity(_settings()),
         ),
     )
     mismatched_candidate = evaluation_result.augmentation.candidates[0].model_copy(
