@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 import pytest
 from pydantic import ValidationError
 from ul.outcome_projection import OutcomeProjection, OutcomeProjectionError
@@ -59,6 +61,141 @@ def test_complete_result_has_independently_filtered_public_view() -> None:
     assert "secret@example.test" not in str(public)
     assert "never disclose" not in str(public)
     assert "not selected" not in str(public)
+
+
+def test_openai_compatible_tool_call_is_projected_to_a_canonical_action() -> None:
+    projection = OutcomeProjection.model_validate(
+        {
+            "tool_call": {
+                "name": "/choices/0/message/tool_calls/0/function/name",
+                "arguments": "/choices/0/message/tool_calls/0/function/arguments",
+            },
+            "private_json_pointers": ("/patient_id",),
+        }
+    )
+    response = {
+        "choices": [
+            {
+                "message": {
+                    "tool_calls": [
+                        {
+                            "type": "function",
+                            "function": {
+                                "name": "record_observation",
+                                "arguments": json.dumps(
+                                    {
+                                        "patient_id": "private-patient",
+                                        "value": "118/77 mmHg",
+                                        "body": {
+                                            "subject": {"reference": "Patient/private-patient"},
+                                            "category": [{"code": "vital-signs"}],
+                                        },
+                                        "metadata": {},
+                                        "items": [],
+                                    }
+                                ),
+                            },
+                        }
+                    ]
+                }
+            }
+        ]
+    }
+
+    normalized = projection.project(response)
+
+    assert normalized == {
+        "action": "record_observation",
+        "patient_id": "private-patient",
+        "value": "118/77 mmHg",
+        "body.subject.reference": "Patient/private-patient",
+        "body.category[0].code": "vital-signs",
+        "metadata": {},
+        "items": [],
+    }
+    assert projection.public_result(normalized) == {
+        "action": "record_observation",
+        "patient_id": "[PRIVATE]",
+        "value": "118/77 mmHg",
+        "body.subject.reference": "Patient/private-patient",
+        "body.category[0].code": "vital-signs",
+        "metadata": {},
+        "items": [],
+    }
+
+
+@pytest.mark.parametrize(
+    ("arguments", "message"),
+    [
+        ("not JSON", "valid JSON-encoded object string"),
+        ("[]", "JSON-encoded object string"),
+        ('{"ticket":1,"ticket":2}', "valid JSON-encoded object string"),
+        ('{"action":"override"}', "must not contain the reserved action field"),
+        ('{"value":NaN}', "valid JSON-encoded object string"),
+        ('{"body":{"value":1},"body.value":2}', "ambiguous field names"),
+    ],
+)
+def test_tool_call_projection_rejects_invalid_arguments_without_echoing_them(
+    arguments: str,
+    message: str,
+) -> None:
+    projection = OutcomeProjection.model_validate(
+        {"tool_call": {"name": "/call/name", "arguments": "/call/arguments"}}
+    )
+
+    with pytest.raises(OutcomeProjectionError, match=message) as caught:
+        projection.project({"call": {"name": "lookup", "arguments": arguments}})
+
+    assert arguments not in str(caught.value)
+
+
+def test_tool_call_projection_modes_are_mutually_exclusive() -> None:
+    with pytest.raises(ValidationError, match="requires exactly one"):
+        OutcomeProjection.model_validate(
+            {
+                "action": "/result/action",
+                "tool_call": {"name": "/call/name", "arguments": "/call/arguments"},
+            }
+        )
+
+
+@pytest.mark.parametrize(
+    ("response", "message"),
+    [
+        ({"call": {}}, "'tool_call.name' at selector '/call/name' does not resolve"),
+        (
+            {"call": {"name": 7, "arguments": "{}"}},
+            "'tool_call.name' at selector '/call/name' must resolve to a non-empty string",
+        ),
+        (
+            {"call": {"name": "lookup", "arguments": {}}},
+            "'tool_call.arguments' at selector '/call/arguments' must resolve to a "
+            "JSON-encoded object string",
+        ),
+    ],
+)
+def test_tool_call_projection_reports_missing_or_invalid_selected_fields(
+    response: object,
+    message: str,
+) -> None:
+    projection = OutcomeProjection.model_validate(
+        {"tool_call": {"name": "/call/name", "arguments": "/call/arguments"}}
+    )
+
+    with pytest.raises(OutcomeProjectionError, match=message.replace("/", r"\/")):
+        projection.project(response)  # type: ignore[arg-type]
+
+
+def test_tool_call_projection_bounds_nested_argument_expansion() -> None:
+    nested: object = "value"
+    for _ in range(101):
+        nested = {"nested": nested}
+    projection = OutcomeProjection.model_validate(
+        {"tool_call": {"name": "/call/name", "arguments": "/call/arguments"}}
+    )
+
+    with pytest.raises(OutcomeProjectionError, match="canonical flattening limits"):
+        projection.project({"call": {"name": "lookup", "arguments": json.dumps({"root": nested})}})
 
 
 @pytest.mark.parametrize(

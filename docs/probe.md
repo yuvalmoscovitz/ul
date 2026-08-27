@@ -223,6 +223,33 @@ pointers address the normalized object and are replaced with `[PRIVATE]` in the 
 preview. The full normalized result remains private evidence. Projections are bounded to 64 KB and
 do not run code or expressions.
 
+For an OpenAI-compatible function tool call, declare the function name and argument-string
+locations instead of writing an adapter:
+
+```json
+{
+  "outcome": {
+    "schema_version": "1.0.0",
+    "tool_call": {
+      "schema_version": "1.0.0",
+      "name": "/choices/0/message/tool_calls/0/function/name",
+      "arguments": "/choices/0/message/tool_calls/0/function/arguments"
+    }
+  }
+}
+```
+
+UL decodes the selected JSON object and produces `{"action": <function name>, ...fields}`. Nested
+object and array leaves become direct canonical fields such as `body.subject.reference` and
+`items[0].code`, which gives each grounded field one coherent action record. Choose the tool-call
+index explicitly in the pointers when a response can contain several calls. The argument selector
+must resolve to a JSON object encoded as a string, matching the OpenAI-compatible response
+contract. Missing values, malformed JSON, duplicate keys, non-object arguments, an argument named
+`action`, and ambiguous names after flattening fail closed before semantic evaluation. This
+projection does not execute the tool, infer a response shape, or validate model-generated
+arguments against a tool schema; the target remains responsible for validating arguments before
+execution.
+
 ## 3. Inspect the smoke proof
 
 The first result includes a bounded structural summary and digest of the live raw target response,
