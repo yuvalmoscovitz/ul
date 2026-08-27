@@ -11,9 +11,9 @@ from pydantic import BaseModel, ConfigDict, Field, JsonValue, model_validator
 
 _JSON_POINTER_PATTERN = re.compile(r"(?:/(?:[^~/]|~[01])*)*")
 _MAXIMUM_NORMALIZED_BYTES = 64_000
-_MAXIMUM_TOOL_ARGUMENT_DEPTH = 100
-_MAXIMUM_TOOL_ARGUMENT_NODES = 10_000
-_MAXIMUM_TOOL_ARGUMENT_FIELDS = 2_000
+_MAXIMUM_COMPOSE_DEPTH = 100
+_MAXIMUM_COMPOSE_NODES = 10_000
+_MAXIMUM_COMPOSE_FIELDS = 2_000
 
 
 class OutcomeProjectionError(ValueError):
@@ -24,12 +24,29 @@ class OutcomeProjectionError(ValueError):
         self.reason = reason
 
 
-class ToolCallOutcomeProjection(BaseModel):
+class OutcomeSpreadProjection(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
     schema_version: Literal["1.0.0"] = "1.0.0"
-    name: str = Field(max_length=1_000)
-    arguments: str = Field(max_length=1_000)
+    selector: str = Field(max_length=1_000)
+    decode: Literal["none", "json_string"] = "none"
+    flatten: bool = False
+
+
+class ComposedOutcomeProjection(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    schema_version: Literal["1.0.0"] = "1.0.0"
+    fields: dict[str, str] = Field(default_factory=dict, max_length=100)
+    spread: OutcomeSpreadProjection | None = None
+
+    @model_validator(mode="after")
+    def validate_contract(self) -> Self:
+        if not self.fields and self.spread is None:
+            raise ValueError("compose requires fields or spread")
+        if any(not name or len(name) > 1_000 for name in self.fields):
+            raise ValueError("compose field names must contain 1..1000 characters")
+        return self
 
 
 class OutcomeProjection(BaseModel):
@@ -43,25 +60,26 @@ class OutcomeProjection(BaseModel):
     amount: str | None = Field(default=None, max_length=1_000)
     effects: str | None = Field(default=None, max_length=1_000)
     complete_result: str | None = Field(default=None, max_length=1_000)
-    tool_call: ToolCallOutcomeProjection | None = None
+    compose: ComposedOutcomeProjection | None = None
     private_json_pointers: tuple[str, ...] = Field(default=(), max_length=100)
 
     @model_validator(mode="after")
     def validate_contract(self) -> Self:
         selectors = self.field_selectors
         selected_modes = sum(
-            (bool(selectors), self.complete_result is not None, self.tool_call is not None)
+            (bool(selectors), self.complete_result is not None, self.compose is not None)
         )
         if selected_modes != 1:
             raise ValueError(
-                "outcome requires exactly one of field selectors, complete_result, or tool_call"
+                "outcome requires exactly one of field selectors, complete_result, or compose"
             )
         all_selectors = (
             tuple(selectors.values())
             + ((self.complete_result,) if self.complete_result is not None else ())
             + (
-                (self.tool_call.name, self.tool_call.arguments)
-                if self.tool_call is not None
+                tuple(self.compose.fields.values())
+                + ((self.compose.spread.selector,) if self.compose.spread is not None else ())
+                if self.compose is not None
                 else ()
             )
         )
@@ -112,8 +130,9 @@ class OutcomeProjection(BaseModel):
                     "complete_result", self.complete_result, "must resolve to a JSON object"
                 )
             normalized = copy.deepcopy(result)
-        elif self.tool_call is not None:
-            normalized = _project_tool_call(response, self.tool_call)
+        elif self.compose is not None:
+            normalized, common_role_selectors = _compose_outcome(response, self.compose)
+            _validate_common_roles(normalized, common_role_selectors)
         else:
             normalized = {
                 field: copy.deepcopy(_resolve(response, pointer, field=field))
@@ -121,12 +140,17 @@ class OutcomeProjection(BaseModel):
             }
             _validate_common_roles(normalized, self.field_selectors)
         try:
+            _validate_json_structure(normalized)
             encoded = json.dumps(
                 normalized,
                 ensure_ascii=False,
                 separators=(",", ":"),
                 allow_nan=False,
             ).encode("utf-8")
+        except RecursionError:
+            raise OutcomeProjectionError("outcome", "", "exceeds structural limits") from None
+        except UnicodeEncodeError:
+            raise OutcomeProjectionError("outcome", "", "contains invalid Unicode") from None
         except (TypeError, ValueError):
             raise OutcomeProjectionError(
                 "complete_result", self.complete_result or "", "is not JSON"
@@ -139,7 +163,7 @@ class OutcomeProjection(BaseModel):
             )
         for pointer in self.private_json_pointers:
             _resolve(normalized, pointer, field="private_json_pointers")
-        return cast(dict[str, JsonValue], normalized)
+        return copy.deepcopy(cast(dict[str, JsonValue], normalized))
 
     def public_result(self, normalized: dict[str, JsonValue]) -> dict[str, JsonValue]:
         public = copy.deepcopy(normalized)
@@ -203,75 +227,96 @@ def _validate_common_roles(normalized: dict[str, JsonValue], selectors: dict[str
         )
 
 
-def _project_tool_call(
+def _compose_outcome(
     response: JsonValue,
-    projection: ToolCallOutcomeProjection,
+    projection: ComposedOutcomeProjection,
+) -> tuple[dict[str, JsonValue], dict[str, str]]:
+    normalized = {
+        field: _resolve(response, selector, field=f"compose.fields.{field}")
+        for field, selector in projection.fields.items()
+    }
+    spread = projection.spread
+    if spread is not None:
+        spread_value = _resolve(response, spread.selector, field="compose.spread")
+        spread_object = _decode_spread_object(spread_value, spread)
+        if spread.flatten:
+            try:
+                spread_fields = _flatten_fields(spread_object)
+            except ValueError as error:
+                raise OutcomeProjectionError(
+                    "compose.spread",
+                    spread.selector,
+                    str(error),
+                ) from None
+        else:
+            spread_fields = spread_object
+        collisions = normalized.keys() & spread_fields.keys()
+        if collisions:
+            raise OutcomeProjectionError(
+                "compose.spread",
+                spread.selector,
+                "collides with a selected composed field",
+            )
+        normalized.update(spread_fields)
+    common_role_selectors = {
+        field: projection.fields.get(field, spread.selector if spread is not None else "")
+        for field in ("action", "status", "resource_id", "decision", "amount", "effects")
+        if field in normalized
+    }
+    return normalized, common_role_selectors
+
+
+def _decode_spread_object(
+    value: JsonValue,
+    spread: OutcomeSpreadProjection,
 ) -> dict[str, JsonValue]:
-    name = _resolve(response, projection.name, field="tool_call.name")
-    if not isinstance(name, str) or not name:
+    if spread.decode == "none":
+        if isinstance(value, dict):
+            return value
         raise OutcomeProjectionError(
-            "tool_call.name",
-            projection.name,
-            "must resolve to a non-empty string",
+            "compose.spread",
+            spread.selector,
+            "must resolve to a JSON object",
         )
-    encoded_arguments = _resolve(
-        response,
-        projection.arguments,
-        field="tool_call.arguments",
-    )
-    if not isinstance(encoded_arguments, str):
+    if not isinstance(value, str):
         raise OutcomeProjectionError(
-            "tool_call.arguments",
-            projection.arguments,
+            "compose.spread",
+            spread.selector,
             "must resolve to a JSON-encoded object string",
         )
     try:
-        encoded_argument_size = len(encoded_arguments.encode("utf-8"))
+        encoded_size = len(value.encode("utf-8"))
     except UnicodeEncodeError:
         raise OutcomeProjectionError(
-            "tool_call.arguments",
-            projection.arguments,
+            "compose.spread",
+            spread.selector,
             "must resolve to a valid JSON-encoded object string",
         ) from None
-    if encoded_argument_size > _MAXIMUM_NORMALIZED_BYTES:
+    if encoded_size > _MAXIMUM_NORMALIZED_BYTES:
         raise OutcomeProjectionError(
-            "tool_call.arguments",
-            projection.arguments,
-            f"exceeds the {_MAXIMUM_NORMALIZED_BYTES}-byte argument limit",
+            "compose.spread",
+            spread.selector,
+            f"exceeds the {_MAXIMUM_NORMALIZED_BYTES}-byte encoded-object limit",
         )
     try:
-        arguments = json.loads(
-            encoded_arguments,
+        decoded = json.loads(
+            value,
             object_pairs_hook=_unique_object,
             parse_constant=_reject_json_constant,
         )
     except (RecursionError, TypeError, ValueError):
         raise OutcomeProjectionError(
-            "tool_call.arguments",
-            projection.arguments,
+            "compose.spread",
+            spread.selector,
             "must resolve to a valid JSON-encoded object string",
         ) from None
-    if not isinstance(arguments, dict):
+    if not isinstance(decoded, dict):
         raise OutcomeProjectionError(
-            "tool_call.arguments",
-            projection.arguments,
+            "compose.spread",
+            spread.selector,
             "must resolve to a JSON-encoded object string",
         )
-    if "action" in arguments:
-        raise OutcomeProjectionError(
-            "tool_call.arguments",
-            projection.arguments,
-            "must not contain the reserved action field",
-        )
-    try:
-        flattened_arguments = _flatten_argument_fields(cast(dict[str, JsonValue], arguments))
-    except ValueError as error:
-        raise OutcomeProjectionError(
-            "tool_call.arguments",
-            projection.arguments,
-            str(error),
-        ) from None
-    return {"action": name, **flattened_arguments}
+    return cast(dict[str, JsonValue], decoded)
 
 
 def _unique_object(pairs: list[tuple[str, JsonValue]]) -> dict[str, JsonValue]:
@@ -287,7 +332,7 @@ def _reject_json_constant(_: str) -> None:
     raise ValueError("non-finite JSON number")
 
 
-def _flatten_argument_fields(arguments: dict[str, JsonValue]) -> dict[str, JsonValue]:
+def _flatten_fields(arguments: dict[str, JsonValue]) -> dict[str, JsonValue]:
     flattened: dict[str, JsonValue] = {}
     pending: list[tuple[str, JsonValue, int]] = [
         (key, value, 1) for key, value in reversed(tuple(arguments.items()))
@@ -296,7 +341,7 @@ def _flatten_argument_fields(arguments: dict[str, JsonValue]) -> dict[str, JsonV
     while pending:
         prefix, value, depth = pending.pop()
         node_count += 1
-        if depth > _MAXIMUM_TOOL_ARGUMENT_DEPTH or node_count > _MAXIMUM_TOOL_ARGUMENT_NODES:
+        if depth > _MAXIMUM_COMPOSE_DEPTH or node_count > _MAXIMUM_COMPOSE_NODES:
             raise ValueError("exceeds canonical flattening limits")
         if isinstance(value, dict):
             nested_fields = tuple(value.items())
@@ -314,10 +359,24 @@ def _flatten_argument_fields(arguments: dict[str, JsonValue]) -> dict[str, JsonV
             continue
         if prefix in flattened:
             raise ValueError("contains ambiguous field names after canonical flattening")
-        if len(flattened) >= _MAXIMUM_TOOL_ARGUMENT_FIELDS:
+        if len(flattened) >= _MAXIMUM_COMPOSE_FIELDS:
             raise ValueError("exceeds canonical flattening limits")
         flattened[prefix] = value
     return flattened
+
+
+def _validate_json_structure(value: JsonValue) -> None:
+    pending: list[tuple[JsonValue, int]] = [(value, 0)]
+    node_count = 0
+    while pending:
+        current, depth = pending.pop()
+        node_count += 1
+        if depth > _MAXIMUM_COMPOSE_DEPTH or node_count > _MAXIMUM_COMPOSE_NODES:
+            raise RecursionError
+        if isinstance(current, dict):
+            pending.extend((nested, depth + 1) for nested in current.values())
+        elif isinstance(current, list):
+            pending.extend((nested, depth + 1) for nested in current)
 
 
 def _replace_with_private_marker(value: dict[str, JsonValue], pointer: str) -> None:

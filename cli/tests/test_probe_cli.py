@@ -924,9 +924,15 @@ def test_http_smoke_projects_openai_tool_call_without_executable_adapter(
                     "response_json_pointer": "",
                 },
                 "outcome": {
-                    "tool_call": {
-                        "name": "/choices/0/message/tool_calls/0/function/name",
-                        "arguments": "/choices/0/message/tool_calls/0/function/arguments",
+                    "compose": {
+                        "fields": {
+                            "action": "/choices/0/message/tool_calls/0/function/name",
+                        },
+                        "spread": {
+                            "selector": "/choices/0/message/tool_calls/0/function/arguments",
+                            "decode": "json_string",
+                            "flatten": True,
+                        },
                     },
                 },
             }
@@ -1257,7 +1263,7 @@ def test_run_target_receipt_records_projection_definition_and_digest(tmp_path: P
         "amount": None,
         "effects": None,
         "complete_result": None,
-        "tool_call": None,
+        "compose": None,
         "private_json_pointers": [],
     }
     assert receipt["outcome_projection_sha256"] == resolved.config.outcome.digest
