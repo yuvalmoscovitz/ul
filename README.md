@@ -1,17 +1,21 @@
+<div align="center">
+
 # UL
+
+**Discover consequential behavior changes in high-risk AI agents before they reach production.**
 
 [![CI](https://github.com/yuvalmoscovitz/ul/actions/workflows/ci.yml/badge.svg)](https://github.com/yuvalmoscovitz/ul/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Python 3.12+](https://img.shields.io/badge/Python-3.12%2B-blue.svg)](pyproject.toml)
 
-**Discover consequential behavior changes in high-risk AI agents before they reach production.**
+[Quickstart](#quickstart) · [How it works](#how-it-works) · [Documentation](#documentation) ·
+[Community](#community) · [Contributing](CONTRIBUTING.md) · [Security](SECURITY.md)
+
+</div>
 
 UL takes a few observed interactions and a safe entry point to your existing agent. It creates
 controlled variations, calls the current agent, and produces private, reviewable evidence of
 baseline drift, augmentation sensitivity, instability, and inconclusive results.
-
-[Quickstart](#quickstart) · [How it works](#how-it-works) · [Documentation](#documentation) ·
-[Contributing](CONTRIBUTING.md) · [Security](SECURITY.md)
 
 > [!IMPORTANT]
 > UL is early-stage software with no published release yet. APIs and evidence schemas may change.
@@ -164,6 +168,16 @@ UL reports evidence by authority level:
 Missing trajectory or state evidence is reported as unavailable, never passed. A target-reported
 tool call does not prove that a real-world effect committed.
 
+### What a finding looks like
+
+The same comparison and review shape is available without credentials through `ul demo`. This
+preview uses an intentionally defective synthetic agent; it is not evidence about a real system.
+
+![UL finding preview showing a repeatable cancellation-timing change that needs human review](assets/ul-finding-preview.svg)
+
+Real probe evidence keeps the original input, variation, responses, and provenance private. The
+default report exposes a bounded explanation and marks the behavior change for human review.
+
 ## Safety and privacy
 
 - Use only isolated, disposable test targets. Never probe production systems.
@@ -201,6 +215,17 @@ OpenInference traces. These are optional stronger evidence paths, not quickstart
 
 Run `ul --help`, `ul stress --help`, and `ul dataset --help` for the complete CLI surface.
 
+## Community
+
+Ask usage questions in [GitHub Discussions](https://github.com/yuvalmoscovitz/ul/discussions) and
+report reproducible bugs or focused feature proposals through the
+[issue forms](https://github.com/yuvalmoscovitz/ul/issues/new/choose). UL is currently maintained by
+[Yuval Moscovitz](MAINTAINERS.md).
+
+Read [Support](SUPPORT.md) for the correct route, [Contributing](CONTRIBUTING.md) before proposing a
+change, and the [Code of Conduct](CODE_OF_CONDUCT.md) when participating. Report vulnerabilities
+only through the private process in [Security](SECURITY.md).
+
 ## Development
 
 ```bash
@@ -213,5 +238,4 @@ uv run --frozen pyright
 uv run --frozen pytest -q
 ```
 
-See [Contributing](CONTRIBUTING.md) before opening a pull request. Report vulnerabilities through
-the private process in [Security](SECURITY.md). UL is available under the [MIT License](LICENSE).
+UL is available under the [MIT License](LICENSE).
