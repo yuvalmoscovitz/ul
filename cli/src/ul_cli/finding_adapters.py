@@ -17,7 +17,7 @@ from ul.dataset_evaluation import (
     DatasetEvaluationCase,
     DatasetEvaluationFinding,
     DatasetEvaluationTrial,
-    compare_action_outcomes,
+    compare_observed_outcomes,
 )
 from ul.dataset_invariants import (
     DatasetInvariantEvaluation,
@@ -147,6 +147,7 @@ def adapt_dataset_behavior_finding(
             probe_trial,
             result.source.raw_input,
             result.augmentation.source_frames[0],
+            result.comparison_surface,
         )
         repetition_evidence.append(evidence)
         source_receipts.append(
@@ -927,7 +928,13 @@ def _receipt_from_values(
     )
     category_pointer_ids: tuple[str, ...] = ()
     if category is not None and category_value is not None:
-        category_pointer_kind = "rule" if category == "customer_invariant_violation" else "action"
+        category_pointer_kind: EvidencePointerKind = (
+            "rule"
+            if category == "customer_invariant_violation"
+            else "response"
+            if category == "changed_response"
+            else "action"
+        )
         category_pointer_ids = (
             add_pointer(
                 kind=category_pointer_kind,
@@ -1148,12 +1155,12 @@ def _build_behavior_package(
         change: Literal["added", "removed", "changed"] = "added"
     elif category == "missing_effect":
         change = "removed"
-    elif category == "changed_grounded_effect_argument":
+    elif category in {"changed_grounded_effect_argument", "changed_response"}:
         change = "changed"
     else:
         raise ValueError("dataset behavior adapter requires a concrete behavior finding")
     observed_delta = ObservedDelta(
-        kind="action",
+        kind="response" if category == "changed_response" else "action",
         change=change,
         subject_ref=_public_ref(
             context,
@@ -1207,11 +1214,12 @@ def _baseline_drift_signal(
         return "inconclusive"
     historical_frame = result.augmentation.source_frames[0]
     try:
-        drift_deltas = compare_action_outcomes(
+        drift_deltas = compare_observed_outcomes(
             historical_frame,
             current_baseline_frame,
             result.source.raw_input,
             grounding_frame=historical_frame,
+            comparison_surface=result.comparison_surface,
         )
     except ValueError:
         return "inconclusive"
@@ -1235,20 +1243,34 @@ def _cross_examination_availability(
     ]:
         if fact == "response":
             covered = sum(receipt.response_pointer_id is not None for receipt in receipts)
-            pointer_kind = "response"
+            pointer_ids = {
+                receipt.response_pointer_id
+                for receipt in receipts
+                if receipt.response_pointer_id is not None
+            }
         elif fact == "trajectory":
             covered = sum(
                 receipt.receipt.content.trajectory_evidence_status == "complete"
                 for receipt in receipts
             )
-            pointer_kind = "trace"
+            pointer_ids = {
+                pointer.pointer_id
+                for receipt in receipts
+                for pointer in receipt.receipt.content.evidence_pointers
+                if pointer.kind == "trace"
+            }
         else:
             covered = sum(
                 receipt.receipt.content.state_before is not None
                 and receipt.receipt.content.state_after is not None
                 for receipt in receipts
             )
-            pointer_kind = "state"
+            pointer_ids = {
+                pointer.pointer_id
+                for receipt in receipts
+                for pointer in receipt.receipt.content.evidence_pointers
+                if pointer.kind == "state"
+            }
         authorities = cast(
             tuple[EvidenceAuthority, ...],
             tuple(
@@ -1257,8 +1279,7 @@ def _cross_examination_availability(
                         pointer.authority
                         for receipt in receipts
                         for pointer in receipt.receipt.content.evidence_pointers
-                        if pointer.kind == pointer_kind
-                        and not (fact == "response" and pointer.arm == "shared")
+                        if pointer.pointer_id in pointer_ids
                     }
                 )
             ),
@@ -1739,6 +1760,7 @@ def _behavior_repetition_evidence(
     probe_trial: DatasetEvaluationTrial,
     source_input: str,
     grounding_frame: SemanticFrame,
+    comparison_surface: Literal["action", "response"],
 ) -> _BehaviorRepetitionEvidence:
     if source_trial.observed_frame is None or probe_trial.observed_frame is None:
         unavailable_arm = "source" if source_trial.observed_frame is None else "probe"
@@ -1753,34 +1775,43 @@ def _behavior_repetition_evidence(
             else f"{unavailable_arm}_evaluation_unavailable"
         )
         return _BehaviorRepetitionEvidence(
-            source_value=_action_values(source_trial.observed_frame),
-            probe_value=_action_values(probe_trial.observed_frame),
+            source_value=_behavior_values(source_trial.observed_frame, finding.category),
+            probe_value=_behavior_values(probe_trial.observed_frame, finding.category),
             outcome="inconclusive",
             inconclusive_reason=reason,
         )
-    recomputed_findings = compare_action_outcomes(
+    recomputed_findings = compare_observed_outcomes(
         source_trial.observed_frame,
         probe_trial.observed_frame,
         source_input,
         grounding_frame=grounding_frame,
+        comparison_surface=comparison_surface,
     )
     finding_observed = any(
         _behavior_finding_signature(candidate) == _behavior_finding_signature(finding)
         for candidate in recomputed_findings
     )
     return _BehaviorRepetitionEvidence(
-        source_value=_action_values(source_trial.observed_frame),
-        probe_value=_action_values(probe_trial.observed_frame),
+        source_value=_behavior_values(source_trial.observed_frame, finding.category),
+        probe_value=_behavior_values(probe_trial.observed_frame, finding.category),
         outcome="finding_observed" if finding_observed else "finding_not_observed",
     )
 
 
-def _action_values(frame: SemanticFrame | None) -> JsonValue | None:
+def _behavior_values(frame: SemanticFrame | None, category: FindingCategory) -> JsonValue | None:
     if frame is None:
         return None
     return cast(
         JsonValue,
-        [outcome.model_dump(mode="json") for outcome in frame.outcomes if outcome.kind == "action"],
+        [
+            outcome.model_dump(mode="json")
+            for outcome in frame.outcomes
+            if (
+                outcome.kind == "answer"
+                if category == "changed_response"
+                else outcome.kind == "action"
+            )
+        ],
     )
 
 

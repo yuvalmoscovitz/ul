@@ -382,6 +382,17 @@ class CampaignProgressTracker:
             environment="reusable",
         )
 
+    def source_preparation_failed(self, *, case_number: int, failed_units: int) -> None:
+        if failed_units < 1:
+            raise ValueError("source preparation failure must terminate at least one trial unit")
+        self._failed += failed_units
+        self.emit(
+            status="running",
+            stage="augmentation",
+            case_number=case_number,
+            environment="reusable",
+        )
+
     def trial_delivery_uncertain(self, *, case_number: int, unit: DatasetTrialUnit) -> None:
         self._running = 0
         self._failed += 1

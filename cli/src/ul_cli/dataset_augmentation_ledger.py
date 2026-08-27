@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Literal, Self, cast
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
-from ul import DatasetAugmentationResult, InteractionRecord
+from ul import DatasetAugmentationResult, InteractionRecord, SemanticDeconstructorIdentity
 
 if sys.platform == "win32":
     import msvcrt
@@ -38,11 +38,15 @@ class DatasetAugmentationLedgerSemanticSettings(_StrictModel):
     model: str = Field(min_length=1, max_length=200)
     render_model: str = Field(min_length=1, max_length=200)
     equivalence_model: str = Field(min_length=1, max_length=200)
+    deconstruct_reasoning: Literal["required", "omitted"] = "required"
+    render_reasoning: Literal["required", "omitted"] = "required"
+    equivalence_reasoning: Literal["required", "omitted"] = "required"
     max_input_chars: int = Field(ge=1)
     max_output_tokens: int = Field(ge=1)
     max_render_tokens: int = Field(ge=1)
     max_response_bytes: int = Field(ge=1)
     timeout_seconds: float = Field(gt=0, allow_inf_nan=False)
+    deconstructor_identity: SemanticDeconstructorIdentity | None = None
 
 
 class DatasetAugmentationGenerationContext(_StrictModel):
@@ -59,9 +63,12 @@ class DatasetAugmentationGenerationContext(_StrictModel):
         operator_keys = tuple((operator.id, operator.version) for operator in self.operators)
         if len(operator_keys) != len(set(operator_keys)):
             raise ValueError("generation context contains duplicate operators")
-        expected_digest = _canonical_json_sha256(
-            self.model_dump(mode="json", exclude={"context_sha256"})
-        )
+        context_content = self.model_dump(mode="json", exclude={"context_sha256"})
+        if self.semantic_settings.deconstructor_identity is None:
+            cast(dict[str, object], context_content["semantic_settings"]).pop(
+                "deconstructor_identity"
+            )
+        expected_digest = _canonical_json_sha256(context_content)
         if self.context_sha256 != expected_digest:
             raise ValueError("generation context digest must match its canonical content")
         return self
@@ -144,7 +151,12 @@ def create_dataset_augmentation_generation_context(
         "pipeline_version": pipeline_version,
         "selected_dataset_sha256": selected_dataset_sha256,
         "operators": [operator.model_dump(mode="json") for operator in operator_snapshots],
-        "semantic_settings": semantic_settings.model_dump(mode="json"),
+        "semantic_settings": semantic_settings.model_dump(
+            mode="json",
+            exclude={"deconstructor_identity"}
+            if semantic_settings.deconstructor_identity is None
+            else None,
+        ),
         "redaction_policy_sha256": redaction_policy_sha256,
     }
     return DatasetAugmentationGenerationContext(

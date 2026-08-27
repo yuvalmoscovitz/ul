@@ -12,6 +12,7 @@ import pytest
 from typer.testing import CliRunner
 from ul import (
     DatasetAugmentationResult,
+    DatasetSemanticPreparationError,
     EnvironmentLifecycleEvidence,
     EnvironmentTurnEvidence,
     EvaluatorModelPreflight,
@@ -19,6 +20,7 @@ from ul import (
     JsonHttpEnvironmentConfig,
     ObservedAgentOutput,
     OutcomeProjection,
+    semantic_deconstructor_identity,
 )
 from ul.dataset_invariants import (
     DatasetInvariantSuite,
@@ -51,6 +53,31 @@ from ._files import (
 
 runner = CliRunner()
 _ANSI_ESCAPE_PATTERN = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+
+
+def test_evidence_run_context_binds_deconstructor_identity() -> None:
+    records = (_evaluation_result("interaction-1").source,)
+    current_context = cast(dataset_review.DatasetEvidenceRunContext, _run_context(records))
+    legacy_context = dataset_review.create_dataset_evidence_run_context(
+        selected_records=records,
+        operators=(("input.surface.rephrase", "1.0.0"),),
+        repetitions=1,
+        invariant_suite_sha256=None,
+        target_config=current_context.target.config,
+        semantic_settings=current_context.semantic_settings.model_copy(
+            update={"deconstructor_identity": None}
+        ),
+    )
+
+    assert current_context.context_sha256 != legacy_context.context_sha256
+    assert current_context.semantic_settings.deconstructor_identity is not None
+    assert legacy_context.semantic_settings.deconstructor_identity is None
+    legacy_payload = legacy_context.model_dump(mode="json")
+    legacy_payload["semantic_settings"].pop("deconstructor_identity")
+    assert (
+        dataset_review.DatasetEvidenceRunContext.model_validate_json(json.dumps(legacy_payload))
+        == legacy_context
+    )
 
 
 def test_finding_reference_key_is_stable_across_resume(tmp_path: Path) -> None:
@@ -398,6 +425,7 @@ def test_resume_skips_already_processed_interaction_ids(
             max_render_tokens=_settings().max_render_tokens,
             max_response_bytes=_settings().max_response_bytes,
             timeout_seconds=_settings().timeout_seconds,
+            deconstructor_identity=semantic_deconstructor_identity(_settings()),
         ),
     )
     with augmentation_ledger_module.create_private_augmentation_ledger(
@@ -618,6 +646,7 @@ def test_resume_dry_run_rejects_ledger_that_disagrees_with_completed_evidence(
             max_render_tokens=_settings().max_render_tokens,
             max_response_bytes=_settings().max_response_bytes,
             timeout_seconds=_settings().timeout_seconds,
+            deconstructor_identity=semantic_deconstructor_identity(_settings()),
         ),
     )
     mismatched_candidate = evaluation_result.augmentation.candidates[0].model_copy(
@@ -703,6 +732,52 @@ def test_resume_exits_early_when_all_records_already_processed(
     assert "Estimated completion tokens: 0..0" in dry_run.output
     assert result.exit_code == 0, result.output
     assert "Nothing to do" in result.output
+
+
+def test_all_complete_resume_preserves_source_preparation_failure_exit_code(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    dataset = tmp_path / "interactions.jsonl"
+    evidence = tmp_path / "evidence.jsonl"
+    target_config = tmp_path / "target.json"
+    source = _evaluation_result("interaction-1").source
+    _write_dataset(dataset, [_record("interaction-1")])
+    _write_target_config(target_config)
+    run_context = _run_context((source,))
+    failure = customer_module.build_source_preparation_failure_evidence(
+        source,
+        DatasetSemanticPreparationError(),
+        repetitions=1,
+        max_environment_api_calls=2,
+        planned_target_calls=2,
+        run_context=cast(Any, run_context),
+    )
+    evidence.write_text(failure.model_dump_json(exclude_none=True) + "\n", encoding="utf-8")
+    monkeypatch.setattr(command_module, "load_dataset_semantic_settings", _settings)
+
+    result = runner.invoke(
+        root_app,
+        [
+            "dataset",
+            "evaluate",
+            str(dataset),
+            "--environment-config",
+            str(target_config),
+            "--allow-environment-network",
+            "--confirm-test-environment",
+            "--repetitions",
+            "1",
+            "--operator",
+            "input.surface.rephrase",
+            "--resume",
+            str(evidence),
+        ],
+    )
+
+    assert result.exit_code == 2, result.output
+    assert "Nothing to do" in result.output
+    assert "Source preparation failures: 1" in result.output
 
 
 def test_all_complete_resume_preserves_prior_review_finding_exit_code(
@@ -1258,6 +1333,100 @@ def test_resume_rejects_changed_evaluation_plan(tmp_path: Path) -> None:
 
     assert result.exit_code != 0
     assert "incompatible with the current evaluation plan" in result.output
+
+
+def test_resume_rejects_changed_reasoning_mode(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    dataset = tmp_path / "interactions.jsonl"
+    evidence = tmp_path / "evidence.jsonl"
+    target_config = tmp_path / "target.json"
+    _write_dataset(dataset, [_record()])
+    _write_target_config(target_config)
+    evaluation_result = _evaluation_result("interaction-1")
+    run_context = _run_context(
+        (evaluation_result.source,),
+        settings=_settings(deconstruct_reasoning="omitted"),
+    )
+    required_context = _run_context((evaluation_result.source,))
+    assert (
+        command_module._manifest_incompatibility_reason(
+            cast(Any, run_context), cast(Any, required_context)
+        )
+        == "evaluator.reasoning"
+    )
+    evidence.write_text(
+        json.dumps(
+            customer_module.build_customer_evidence_record(
+                evaluation_result,
+                repetitions=1,
+                max_environment_api_calls=2,
+                planned_target_calls=2,
+                run_context=cast(Any, run_context),
+            )
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(command_module, "load_dataset_semantic_settings", _settings)
+
+    result = runner.invoke(
+        root_app,
+        [
+            "dataset",
+            "evaluate",
+            str(dataset),
+            "--environment-config",
+            str(target_config),
+            "--operator",
+            "input.surface.rephrase",
+            "--repetitions",
+            "1",
+            "--resume",
+            str(evidence),
+            "--dry-run",
+        ],
+    )
+
+    assert result.exit_code != 0
+    assert "incompatible with the current evaluation plan" in result.output
+
+
+def test_resume_rejects_pre_response_comparison_context() -> None:
+    evaluation_result = _evaluation_result("interaction-1")
+    current_context = _run_context((evaluation_result.source,))
+    record = cast(
+        dict[str, Any],
+        customer_module.build_customer_evidence_record(
+            evaluation_result,
+            repetitions=1,
+            max_environment_api_calls=2,
+            planned_target_calls=2,
+            run_context=cast(Any, current_context),
+        ),
+    )
+    record["schema_version"] = "1.13.0"
+    legacy_context = cast(dict[str, Any], record["run_context"])
+    legacy_context["schema_version"] = "1.3.0"
+    legacy_context["pipeline_version"] = "1.4.0"
+    legacy_context_content = {
+        key: value
+        for key, value in legacy_context.items()
+        if key not in {"context_sha256", "redaction_policy_sha256", "redaction_coverage"}
+    }
+    legacy_context["context_sha256"] = dataset_review._canonical_json_sha256(legacy_context_content)
+
+    with pytest.raises(
+        ValueError,
+        match="resume evidence is incompatible with the current evaluation plan",
+    ):
+        dataset_review.validate_dataset_resume_evidence(
+            (json.dumps(record) + "\n").encode(),
+            expected_context=cast(Any, current_context),
+            selected_records=(evaluation_result.source,),
+            invariant_suite=None,
+            evidence_projector=customer_module.build_customer_evidence_record,
+        )
 
 
 def test_resume_rejects_evidence_without_terminal_newline(tmp_path: Path) -> None:

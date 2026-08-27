@@ -16,6 +16,8 @@ from ul import (
     DatasetRegressionCase,
     DatasetRegressionResult,
     EvaluationCaseResult,
+    EvaluatorCalibrationExample,
+    EvaluatorCalibrationReport,
     ExecutionResult,
     ExecutionStatus,
     FindingBundle,
@@ -54,6 +56,7 @@ from ul import (
     append_finding_annotations,
     builtin_augmentation_registry,
     builtin_dataset_augmentation_operators,
+    calibrate_evaluator,
     create_dataset_augmentation_projection,
     create_dataset_regression_case,
     create_semantic_model_deconstructor,
@@ -133,6 +136,9 @@ def test_sdk_exposes_dataset_augmentation_api() -> None:
     assert DatasetEvaluationTrial.__name__ == "DatasetEvaluationTrial"
     assert DatasetEvaluationTrialSet.__name__ == "DatasetEvaluationTrialSet"
     assert EvaluationCaseResult.__name__ == "EvaluationCaseResult"
+    assert EvaluatorCalibrationExample.__name__ == "EvaluatorCalibrationExample"
+    assert EvaluatorCalibrationReport.__name__ == "EvaluatorCalibrationReport"
+    assert calibrate_evaluator.__name__ == "calibrate_evaluator"
     assert evaluate_case.__name__ == "evaluate_case"
     assert DatasetInvariantArmEvaluation.__name__ == "DatasetInvariantArmEvaluation"
     assert DatasetInvariantEvaluation.__name__ == "DatasetInvariantEvaluation"

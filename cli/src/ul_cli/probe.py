@@ -25,6 +25,7 @@ import httpx
 import typer
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, ValidationError
 from ul import (
+    DatasetComparisonCompatibilityError,
     DatasetEvaluationResult,
     DatasetSemanticSettings,
     EvaluationCase,
@@ -32,6 +33,7 @@ from ul import (
     ExecutionEvidence,
     InteractionRecord,
     load_dataset_semantic_settings,
+    semantic_deconstructor_identity,
 )
 from ul.environment import validate_execution_evidence
 from ul.http_environment import (
@@ -653,11 +655,15 @@ def _semantic_settings_snapshot(
         model=settings.model,
         render_model=settings.render_model,
         equivalence_model=settings.equivalence_model,
+        deconstruct_reasoning=settings.deconstruct_reasoning,
+        render_reasoning=settings.render_reasoning,
+        equivalence_reasoning=settings.equivalence_reasoning,
         max_input_chars=settings.max_input_chars,
         max_output_tokens=settings.max_output_tokens,
         max_render_tokens=settings.max_render_tokens,
         max_response_bytes=settings.max_response_bytes,
         timeout_seconds=settings.timeout_seconds,
+        deconstructor_identity=semantic_deconstructor_identity(settings),
     )
 
 
@@ -2068,11 +2074,15 @@ def _run_campaign(
             model=settings.model,
             render_model=settings.render_model,
             equivalence_model=settings.equivalence_model,
+            deconstruct_reasoning=settings.deconstruct_reasoning,
+            render_reasoning=settings.render_reasoning,
+            equivalence_reasoning=settings.equivalence_reasoning,
             max_input_chars=settings.max_input_chars,
             max_output_tokens=settings.max_output_tokens,
             max_render_tokens=settings.max_render_tokens,
             max_response_bytes=settings.max_response_bytes,
             timeout_seconds=settings.timeout_seconds,
+            deconstructor_identity=semantic_deconstructor_identity(settings),
         ),
     )
     expected_manifest = create_dataset_run_manifest(
@@ -2266,6 +2276,7 @@ def _run_campaign(
                         progress_runtime=progress_runtime,
                         complete_progress=False,
                         environment_calls_per_target_call=(resolved_target.calls_per_execution),
+                        isolate_source_preparation_failures=False,
                         run_context=run_context,
                         evaluator_preflight=evaluator_preflight,
                         trial_journal=trial_journal,
@@ -2279,6 +2290,14 @@ def _run_campaign(
                     "PROBE_PAUSED_DURING_CAMPAIGN",
                     "The campaign paused at a durable trial boundary.",
                     "Run the opaque resume action to continue only unfinished trials.",
+                    target_safe_to_reuse=True,
+                ) from None
+            except DatasetComparisonCompatibilityError as error:
+                raise ProbeFailure(
+                    "evaluation",
+                    "PROBE_SOURCE_COMPARISON_INCOMPATIBLE",
+                    error.explanation,
+                    error.remediation,
                     target_safe_to_reuse=True,
                 ) from None
             except Exception:

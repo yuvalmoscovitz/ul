@@ -25,6 +25,19 @@ from ul_core.augmentations.authoring import (
     ValidatorBinding,
     builtin_augmentation_library,
 )
+from ul_core.augmentations.bundles import (
+    AugmentationBundle,
+    AugmentationBundleBudget,
+    AugmentationBundleCatalog,
+    AugmentationBundlePlan,
+    BundleBindingReadiness,
+    BundleOperatorPolicy,
+    BundlePlanTotals,
+    BundleProbePlan,
+    BundleSourceCase,
+    builtin_augmentation_bundle_catalog,
+    plan_augmentation_bundle,
+)
 from ul_core.augmentations.definitions import (
     AugmentationBinding,
     AugmentationRef,
@@ -49,6 +62,10 @@ from ul_core.augmentations.registry import (
 
 __all__ = [
     "AugmentationBinding",
+    "AugmentationBundle",
+    "AugmentationBundleBudget",
+    "AugmentationBundleCatalog",
+    "AugmentationBundlePlan",
     "AugmentationChangeSet",
     "AugmentationDefinition",
     "AugmentationLibrary",
@@ -62,6 +79,11 @@ __all__ = [
     "AugmentationValidatorRuntime",
     "BuiltinAugmentationCatalog",
     "BuiltinAugmentationSpec",
+    "BundleBindingReadiness",
+    "BundleOperatorPolicy",
+    "BundlePlanTotals",
+    "BundleProbePlan",
+    "BundleSourceCase",
     "ConversationModifierBinding",
     "ConversationModifierRuntime",
     "DeterministicTransformBinding",
@@ -80,7 +102,9 @@ __all__ = [
     "SemanticRendererRuntime",
     "ValidationResult",
     "ValidatorBinding",
+    "builtin_augmentation_bundle_catalog",
     "builtin_augmentation_catalog",
     "builtin_augmentation_library",
     "builtin_augmentation_registry",
+    "plan_augmentation_bundle",
 ]

@@ -211,6 +211,9 @@ def _settings(**overrides: object) -> SimpleNamespace:
         "model": "test/deconstructor",
         "render_model": "test/renderer",
         "equivalence_model": "test/equivalence",
+        "deconstruct_reasoning": "required",
+        "render_reasoning": "required",
+        "equivalence_reasoning": "required",
         "max_input_chars": 50_000,
         "max_output_tokens": 4_096,
         "max_render_tokens": 512,
@@ -320,6 +323,7 @@ def _run_context(
     *,
     invariant_suite: object | None = None,
     target_config: object | None = None,
+    settings: object | None = None,
 ) -> object:
     return context_module.build_dataset_evidence_run_context(
         selected_records=records,
@@ -361,7 +365,7 @@ def _run_context(
                 },
             }
         ),
-        settings=cast(Any, _settings()),
+        settings=cast(Any, settings if settings is not None else _settings()),
     )
 
 
@@ -383,6 +387,7 @@ def _evaluator_preflight() -> EvaluatorModelPreflight:
     ) -> str:
         options: dict[str, object] = {
             "model": model,
+            "reasoning_mode": "required",
             "max_tokens": max_tokens,
             "temperature": temperature,
             "seed": seed,
@@ -411,6 +416,7 @@ def _evaluator_preflight() -> EvaluatorModelPreflight:
                     "requested_model": "test/deconstructor",
                     "routed_model": "test/deconstructor",
                     "upstream_provider": "test-provider",
+                    "reasoning_mode": "required",
                     "required_parameters": (
                         "response_format",
                         "seed",
@@ -429,6 +435,7 @@ def _evaluator_preflight() -> EvaluatorModelPreflight:
                     "requested_model": "test/renderer",
                     "routed_model": "test/renderer",
                     "upstream_provider": "test-provider",
+                    "reasoning_mode": "required",
                     "required_parameters": (
                         "response_format",
                         "seed",
@@ -453,6 +460,7 @@ def _evaluator_preflight() -> EvaluatorModelPreflight:
                     "requested_model": "test/equivalence",
                     "routed_model": "test/equivalence",
                     "upstream_provider": "test-provider",
+                    "reasoning_mode": "required",
                     "required_parameters": (
                         "response_format",
                         "seed",

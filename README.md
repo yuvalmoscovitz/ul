@@ -142,6 +142,9 @@ ul probe interactions.jsonl \
 
 The file contains environment-variable names and integrity bindings, never credential values.
 
+Named bundles are versioned operator-selection and budget policies. See
+[Plan named augmentation bundles](docs/augmentation-bundles.md).
+
 ## How it works
 
 ```text

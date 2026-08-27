@@ -17,6 +17,7 @@ from ._factories import (
     _evaluation_result,
     _isolated_response_target_config,
     _run_context,
+    _settings,
 )
 
 runner = CliRunner()
@@ -26,12 +27,32 @@ _ANSI_ESCAPE_PATTERN = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 def test_run_context_uses_current_pipeline() -> None:
     record = _evaluation_result("interaction-1").source
     run_context = _run_context((record,))
-    assert run_context.schema_version == "1.3.0"
-    assert run_context.pipeline_version == "1.4.0"
+    assert run_context.schema_version == "1.4.0"
+    assert run_context.pipeline_version == "1.5.0"
     assert run_context.evaluation_mode == "variance"
     assert run_context.target.config.reset.reset_session is True
     assert run_context.target.config.reset.reset_env is True
     assert run_context.fixture.status == "missing"
+
+
+def test_run_context_binds_explicit_reasoning_omission() -> None:
+    record = _evaluation_result("interaction-1").source
+    required = cast(Any, _run_context((record,)))
+    omitted = cast(
+        Any,
+        _run_context(
+            (record,),
+            settings=_settings(
+                deconstruct_reasoning="omitted",
+                render_reasoning="omitted",
+            ),
+        ),
+    )
+
+    assert omitted.semantic_settings.deconstruct_reasoning == "omitted"
+    assert omitted.semantic_settings.render_reasoning == "omitted"
+    assert omitted.semantic_settings.equivalence_reasoning == "required"
+    assert omitted.context_sha256 != required.context_sha256
 
 
 def test_run_context_records_versioned_fixture_identity() -> None:
@@ -44,7 +65,7 @@ def test_run_context_records_versioned_fixture_identity() -> None:
         (record,), target_config=JsonHttpEnvironmentConfig.model_validate(raw_config)
     )
 
-    assert run_context.schema_version == "1.3.0"
+    assert run_context.schema_version == "1.4.0"
     assert run_context.fixture.model_dump(mode="json") == {
         "status": "configured",
         "id": "standard-account",

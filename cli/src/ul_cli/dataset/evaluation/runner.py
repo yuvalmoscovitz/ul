@@ -13,6 +13,7 @@ from ul import (
     DatasetEvaluationRunner,
     DatasetEvaluationTrial,
     DatasetSemanticSettings,
+    DatasetSourcePreparationError,
     DatasetTargetDeliveryUncertain,
     DatasetTrialUnit,
     EvaluatorModelPreflight,
@@ -31,10 +32,16 @@ from ul.local_target import LocalTargetConnection
 
 from ul_cli.dataset_augmentation_ledger import DatasetAugmentationLedger
 from ul_cli.dataset_campaign import DatasetCampaignPlan
-from ul_cli.dataset_review import DatasetEvidenceRunContext
+from ul_cli.dataset_review import (
+    DatasetEvidenceRunContext,
+    DatasetSourcePreparationFailureEvidence,
+)
 from ul_cli.dataset_trial_journal import DatasetTrialJournal
 
-from ..evidence.customer import build_customer_evidence_record
+from ..evidence.customer import (
+    build_customer_evidence_record,
+    build_source_preparation_failure_evidence,
+)
 from ..progress import (
     CampaignControlRequested,
     CampaignNextCommands,
@@ -74,6 +81,8 @@ async def evaluate_interaction_records(
     progress_runtime: CampaignProgressRuntime | None = None,
     complete_progress: bool = True,
     environment_calls_per_target_call: int = 1,
+    isolate_source_preparation_failures: bool = True,
+    source_preparation_failures: list[DatasetSourcePreparationFailureEvidence] | None = None,
 ) -> tuple[DatasetEvaluationResult, ...]:
     if environment_calls_per_target_call < 1:
         raise ValueError("environment calls per target call must be positive")
@@ -105,6 +114,7 @@ async def evaluate_interaction_records(
     initial_target_calls, _, initial_environment_calls, _ = progress_tracker.actual_usage
     actual_target_calls = 0
     active_trial: tuple[int, DatasetTrialUnit] | None = None
+    had_source_preparation_failure = False
 
     def durable_flush() -> None:
         if trial_journal is not None:
@@ -150,6 +160,7 @@ async def evaluate_interaction_records(
                 ),
             )
             for case_number, record in enumerate(records, start=1):
+                plan_outcome_terminal_ids: set[str] = set()
                 precomputed_augmentation = (
                     saved_augmentations.get(record.id) if saved_augmentations is not None else None
                 )
@@ -158,6 +169,7 @@ async def evaluate_interaction_records(
                     augmentation: DatasetAugmentationResult,
                     source: InteractionRecord = record,
                     case_position: int = case_number,
+                    terminal_ids: set[str] = plan_outcome_terminal_ids,
                 ) -> None:
                     candidates = {
                         candidate.operator_id: candidate for candidate in augmentation.candidates
@@ -184,6 +196,7 @@ async def evaluate_interaction_records(
                                 continue
                             if trial_journal is not None:
                                 trial_journal.terminal(unit, state, reason_code)
+                            terminal_ids.add(unit.id)
                             progress_tracker.trial_skipped(
                                 case_number=case_position,
                                 unit=unit,
@@ -247,6 +260,70 @@ async def evaluate_interaction_records(
                         trial_started_callback=trial_started,
                         trial_terminal_callback=trial_terminal,
                     )
+                except DatasetSourcePreparationError as error:
+                    had_source_preparation_failure = True
+                    if not isolate_source_preparation_failures:
+                        raise
+                    if active_trial is not None:
+                        raise AssertionError(
+                            "source preparation failures must precede target delivery"
+                        ) from error
+                    if run_context is None:
+                        raise AssertionError(
+                            "source preparation failure evidence requires a run context"
+                        ) from error
+                    failure_evidence = build_source_preparation_failure_evidence(
+                        record,
+                        error,
+                        repetitions=repetitions,
+                        max_environment_api_calls=max_environment_api_calls,
+                        planned_target_calls=planned_target_calls,
+                        run_context=run_context,
+                    )
+                    output_stream.write(
+                        json.dumps(
+                            failure_evidence.model_dump(mode="json", exclude_none=True),
+                            ensure_ascii=False,
+                        )
+                        + "\n"
+                    )
+                    durable_flush()
+                    if source_preparation_failures is not None:
+                        source_preparation_failures.append(failure_evidence)
+                    failed_units = 0
+                    units = [
+                        DatasetTrialUnit(
+                            interaction_id=record.id,
+                            operator_id="current_baseline",
+                            arm="original",
+                            repetition=repetition,
+                        )
+                        for repetition in range(1, repetitions + 1)
+                    ]
+                    units.extend(
+                        DatasetTrialUnit(
+                            interaction_id=record.id,
+                            operator_id=operator_reference.partition("@")[0],
+                            arm="probe",
+                            repetition=repetition,
+                        )
+                        for operator_reference in operator_ids
+                        for repetition in range(1, repetitions + 1)
+                    )
+                    for unit in units:
+                        if unit.id in plan_outcome_terminal_ids or (
+                            trial_journal is not None and trial_journal.is_terminal(unit)
+                        ):
+                            continue
+                        if trial_journal is not None:
+                            trial_journal.terminal(unit, "errored", error.code)
+                        failed_units += 1
+                    if failed_units:
+                        progress_tracker.source_preparation_failed(
+                            case_number=case_number,
+                            failed_units=failed_units,
+                        )
+                    continue
                 except (DatasetTargetDeliveryUncertain, asyncio.CancelledError):
                     signal_control.target_call_finished()
                     assert active_trial is not None
@@ -307,5 +384,8 @@ async def evaluate_interaction_records(
                 durable_flush()
                 results.append(result)
     if complete_progress:
-        progress_tracker.emit(status="completed", stage="terminal")
+        progress_tracker.emit(
+            status="failed" if had_source_preparation_failure else "completed",
+            stage="terminal",
+        )
     return tuple(results)

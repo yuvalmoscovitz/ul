@@ -7,6 +7,7 @@ from typing import Any, cast, overload
 
 import httpx
 import pytest
+import ul.deconstruction as deconstruction_module
 from pydantic import SecretStr, ValidationError
 from ul.augmentations.dataset import (
     DatasetAugmentationEngine,
@@ -19,10 +20,12 @@ from ul.deconstruction import (
     ProviderDiagnostic,
     ProviderDiagnosticError,
     SemanticCallMetrics,
+    SemanticGroundingError,
     SemanticModelDeconstructor,
     create_semantic_model_deconstructor,
     load_dataset_semantic_settings,
     plan_evaluator_preflight_profiles,
+    semantic_deconstructor_identity,
 )
 from ul_core.dataset import InteractionRecord, SemanticFrame, UserInputRecord
 from ul_core.prompts import prompt_provenance
@@ -217,7 +220,7 @@ async def test_evaluator_preflight_proves_required_capabilities_and_records_poli
     )
     assert sum(profile.max_completion_tokens for profile in planned_profiles) == 1_154
     assert [request["model"] for request in requests[:3]] == [
-        "google/gemini-2.5-flash",
+        "google/gemini-3.5-flash",
         "x-ai/grok-4.3",
         "google/gemini-3.5-flash",
     ]
@@ -296,6 +299,88 @@ async def test_evaluator_preflight_caps_each_sample_at_1024_tokens() -> None:
         await deconstructor.preflight()
 
     assert [request["max_tokens"] for request in requests] == [1_024, 1_024, 1_024]
+    await client.aclose()
+
+
+async def test_explicit_non_reasoning_roles_omit_only_reasoning_and_bind_preflight() -> None:
+    request_bodies: list[dict[str, object]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = cast(dict[str, object], json.loads(request.content))
+        request_bodies.append(body)
+        schema_name = cast(dict[str, Any], body["response_format"])["json_schema"]["name"]
+        if schema_name == "evaluator_preflight":
+            return completion('{"compatible":true}')
+        if schema_name == "semantic_frame":
+            return completion(json.dumps(frame_payload()))
+        if schema_name == "rendered_input":
+            return completion('{"rendered_input":"Please pay invoice INV-104."}')
+        return completion(
+            json.dumps(
+                {
+                    "verdict": "equivalent",
+                    "explanation": "Only the phrasing changed.",
+                    "deltas": [],
+                }
+            )
+        )
+
+    configured_settings = settings().model_copy(
+        update={
+            "model": "qwen/qwen3-30b-a3b-instruct-2507",
+            "render_model": "qwen/qwen3-30b-a3b-instruct-2507",
+            "equivalence_model": "deepseek/deepseek-v4-flash",
+            "deconstruct_reasoning": "omitted",
+            "render_reasoning": "omitted",
+        }
+    )
+    client = mock_client(handler)
+    async with create_semantic_model_deconstructor(
+        configured_settings, client=client
+    ) as deconstructor:
+        preflight = await deconstructor.preflight()
+        await deconstructor.deconstruct(interaction())
+        await deconstructor.render(interaction().raw_input, "Use natural phrasing.")
+        await deconstructor.verify(interaction().raw_input, "Please pay invoice INV-104.")
+
+    qwen_requests = [
+        request for request in request_bodies if request["model"] == configured_settings.model
+    ]
+    deepseek_requests = [
+        request
+        for request in request_bodies
+        if request["model"] == configured_settings.equivalence_model
+    ]
+    assert len(qwen_requests) == 4
+    assert all("reasoning" not in request for request in qwen_requests)
+    assert len(deepseek_requests) == 2
+    assert all(request["reasoning"] == {"effort": "low"} for request in deepseek_requests)
+    assert [profile.reasoning_mode for profile in preflight.profiles] == [
+        "omitted",
+        "omitted",
+        "required",
+    ]
+    assert all("reasoning" not in profile.required_parameters for profile in preflight.profiles[:2])
+    assert "reasoning" in preflight.profiles[2].required_parameters
+
+    changed_plan = plan_evaluator_preflight_profiles(
+        configured_settings.model_copy(update={"deconstruct_reasoning": "required"})
+    )
+    with pytest.raises(ValueError, match="does not match"):
+        deconstructor.reuse_preflight(
+            preflight.model_copy(
+                update={
+                    "profiles": tuple(
+                        profile.model_copy(
+                            update={
+                                "reasoning_mode": changed_plan[index].reasoning_mode,
+                            }
+                        )
+                        for index, profile in enumerate(preflight.profiles)
+                    )
+                }
+            )
+        )
     await client.aclose()
 
 
@@ -496,7 +581,7 @@ async def test_deconstruct_sends_one_bounded_strict_structured_request() -> None
         assert request.headers["authorization"] == "Bearer test-openrouter-key"
         assert request.headers["accept-encoding"] == "identity"
         body = json.loads(request.content)
-        assert body["model"] == "google/gemini-2.5-flash"
+        assert body["model"] == "google/gemini-3.5-flash"
         assert body["reasoning"] == {"effort": "minimal"}
         assert body["seed"] == 0
         assert body["temperature"] == 0
@@ -511,6 +596,21 @@ async def test_deconstruct_sends_one_bounded_strict_structured_request() -> None
         assert body["response_format"]["type"] == "json_schema"
         assert body["response_format"]["json_schema"]["strict"] is True
         assert body["response_format"]["json_schema"]["schema"]["title"] == "SemanticFrame"
+        assert (
+            body["response_format"]["json_schema"]["schema"]["properties"]["outcomes"]["minItems"]
+            == 1
+        )
+        assert "outcomes" in body["response_format"]["json_schema"]["schema"]["required"]
+        for definition_name in (
+            "RequestUnit",
+            "SemanticFactor",
+            "SemanticRelation",
+            "CommunicationAct",
+            "ObservedOutcome",
+        ):
+            definition = body["response_format"]["json_schema"]["schema"]["$defs"][definition_name]
+            assert "evidence" in definition["required"]
+            assert definition["properties"]["evidence"]["minItems"] == 1
         assert [message["role"] for message in body["messages"]] == ["system", "user"]
         assert "fragmented_syntax" in body["messages"][0]["content"]
         assert "frustrated" in body["messages"][0]["content"]
@@ -524,12 +624,19 @@ async def test_deconstruct_sends_one_bounded_strict_structured_request() -> None
         assert "action for a visible executed action or effect" in body["messages"][0]["content"]
         assert "answer for a textual answer" in body["messages"][0]["content"]
         assert "set its status to observed" in body["messages"][0]["content"]
+        assert "empty outcome list is invalid" in body["messages"][0]["content"]
+        assert "sensitive or high risk" in body["messages"][0]["content"]
         assert "A field is also grounded" in body["messages"][0]["content"]
         assert "complete action object is also valid" in body["messages"][0]["content"]
         assert "Other container pointers are invalid" in body["messages"][0]["content"]
         assert "must list the request unit IDs that it fulfills" in body["messages"][0]["content"]
         assert "ground each relation" in body["messages"][0]["content"]
         assert "Never serialize an object" in body["messages"][0]["content"]
+        assert "These are valid grounding shapes" in body["messages"][0]["content"]
+        assert "Nested output text" in body["messages"][0]["content"]
+        assert "Structured output" in body["messages"][0]["content"]
+        assert "Canonical action" in body["messages"][0]["content"]
+        assert "invalid sibling grounding" in body["messages"][0]["content"]
         supplied_record = json.loads(body["messages"][1]["content"])
         assert supplied_record == {
             "raw_input": interaction().raw_input,
@@ -561,6 +668,10 @@ async def test_deconstruct_sends_one_bounded_strict_structured_request() -> None
             "total_tokens": 125,
             "cost": 0.00042,
         },
+        "semantic_deconstructor_identity": semantic_deconstructor_identity(settings()).model_dump(
+            mode="json"
+        ),
+        "semantic_reasoning": {"mode": "required", "effort": "minimal"},
         "prompts": prompt_provenance("semantic.deconstruct"),
     }
     await client.aclose()
@@ -991,6 +1102,7 @@ async def test_render_keeps_caller_instruction_out_of_the_system_prompt() -> Non
             & 0x7FFF_FFFF,
             "max_tokens": 512,
         },
+        "semantic_reasoning": {"mode": "required", "effort": "none"},
     }
     assert not client.is_closed
     await client.aclose()
@@ -1246,6 +1358,13 @@ async def test_deconstruct_supports_input_only_candidate_validation() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         body = json.loads(request.content)
         assert "leave outcomes empty" in body["messages"][0]["content"]
+        assert (
+            "minItems"
+            not in body["response_format"]["json_schema"]["schema"]["properties"]["outcomes"]
+        )
+        assert "outcomes" not in body["response_format"]["json_schema"]["schema"].get(
+            "required", []
+        )
         supplied_record = json.loads(body["messages"][1]["content"])
         assert supplied_record["raw_observed_output"] is None
         assert supplied_record["reference_vocabulary"] == {
@@ -1313,8 +1432,12 @@ async def test_deconstruct_rejects_evidence_pointer_that_does_not_resolve() -> N
 
     client = mock_client(handler)
     async with create_semantic_model_deconstructor(settings(), client=client) as deconstructor:
-        with pytest.raises(ValueError, match="evidence"):
+        with pytest.raises(SemanticGroundingError) as grounding_error:
             await deconstructor.deconstruct(interaction())
+    assert grounding_error.value.diagnostic.reason == "pointer_unresolved"
+    assert grounding_error.value.diagnostic.collection == "factors"
+    assert grounding_error.value.diagnostic.element_index == 0
+    assert grounding_error.value.diagnostic.evidence_index == 0
     await client.aclose()
 
 
@@ -1329,8 +1452,11 @@ async def test_deconstruct_rejects_ungrounded_semantic_elements() -> None:
 
     client = mock_client(handler)
     async with create_semantic_model_deconstructor(settings(), client=client) as deconstructor:
-        with pytest.raises(ValueError, match="source evidence"):
+        with pytest.raises(SemanticGroundingError) as grounding_error:
             await deconstructor.deconstruct(interaction())
+    assert grounding_error.value.diagnostic.reason == "element_evidence_missing"
+    assert grounding_error.value.diagnostic.collection == "factors"
+    assert grounding_error.value.diagnostic.element_index == 0
     await client.aclose()
 
 
@@ -1351,12 +1477,333 @@ async def test_deconstruct_rejects_text_quote_not_found_in_source() -> None:
 
     client = mock_client(handler)
     async with create_semantic_model_deconstructor(settings(), client=client) as deconstructor:
-        with pytest.raises(ValueError, match="text_quote"):
+        with pytest.raises(SemanticGroundingError) as grounding_error:
             await deconstructor.deconstruct(interaction())
+    assert grounding_error.value.diagnostic.reason == "quote_not_exact"
     await client.aclose()
 
 
-async def test_deconstruct_expands_one_unambiguous_ellipsized_quote() -> None:
+async def test_generated_schema_explains_exact_grounding_contract() -> None:
+    schema = SemanticFrame.model_json_schema(mode="validation")
+    evidence_properties = schema["$defs"]["EvidenceReference"]["properties"]
+    outcome_properties = schema["$defs"]["ObservedOutcome"]["properties"]
+
+    assert "resolve exactly" in evidence_properties["json_pointer"]["description"]
+    assert "Exact non-empty substring" in evidence_properties["text_quote"]["description"]
+    assert "Use null" in evidence_properties["text_quote"]["description"]
+    assert "primitive sibling values" in outcome_properties["fields"]["description"]
+    assert "never wrap values" in outcome_properties["fields"]["description"]
+
+
+async def test_deconstructor_identity_binds_extractor_prompt_and_response_schema(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    baseline = semantic_deconstructor_identity(settings())
+    assert baseline.extractor_contract == "semantic-deconstructor/2.0.0"
+    assert baseline.prompt_behavior_sha256 == (
+        deconstruction_module._PROMPTS.get_template_info("semantic.deconstruct").version
+    )
+    assert (
+        len(
+            {
+                baseline.prompt_behavior_sha256,
+                baseline.response_schema_sha256,
+                baseline.identity_sha256,
+            }
+        )
+        == 3
+    )
+
+    changed_extractor = deconstruction_module._semantic_deconstructor_identity(
+        "semantic-deconstructor/changed"
+    )
+    assert changed_extractor.identity_sha256 != baseline.identity_sha256
+
+    original_template_info = deconstruction_module._PROMPTS.get_template_info
+
+    def changed_template_info(name: str):
+        template_info = original_template_info(name)
+        if name == "semantic.deconstruct":
+            return template_info.__class__(
+                name=template_info.name,
+                description=template_info.description,
+                author=template_info.author,
+                variables=template_info.variables,
+                version="a" * 64,
+                source_version=template_info.source_version,
+            )
+        return template_info
+
+    monkeypatch.setattr(deconstruction_module._PROMPTS, "get_template_info", changed_template_info)
+    changed_prompt = semantic_deconstructor_identity(settings())
+    assert changed_prompt.prompt_behavior_sha256 == "a" * 64
+    assert changed_prompt.identity_sha256 != baseline.identity_sha256
+    monkeypatch.undo()
+
+    monkeypatch.setattr(
+        SemanticFrame,
+        "model_json_schema",
+        classmethod(
+            lambda cls, **kwargs: {
+                "type": "object",
+                "title": "ChangedFrame",
+                "properties": {"outcomes": {"type": "array"}},
+                "$defs": {
+                    name: {
+                        "properties": {"evidence": {"type": "array"}},
+                        "required": [],
+                    }
+                    for name in (
+                        "RequestUnit",
+                        "SemanticFactor",
+                        "SemanticRelation",
+                        "CommunicationAct",
+                        "ObservedOutcome",
+                    )
+                },
+            }
+        ),
+    )
+    changed_schema = semantic_deconstructor_identity(settings())
+    assert changed_schema.response_schema_sha256 != baseline.response_schema_sha256
+    assert changed_schema.identity_sha256 != baseline.identity_sha256
+
+    with pytest.raises(ValidationError, match="identity digest"):
+        baseline.model_copy(update={"identity_sha256": "0" * 64}).__class__.model_validate(
+            baseline.model_copy(update={"identity_sha256": "0" * 64}).model_dump()
+        )
+
+
+@pytest.mark.parametrize(
+    "selected_value",
+    [
+        {"status": "done"},
+        ["done"],
+        12,
+        True,
+        None,
+    ],
+)
+async def test_deconstruct_accepts_null_quote_for_structured_non_string_values(
+    selected_value: object,
+) -> None:
+    observed_output = {"result": selected_value}
+    outcome = {
+        **cast(list[dict[str, object]], frame_payload()["outcomes"])[0],
+        "evidence": [
+            {
+                "source": "output",
+                "json_pointer": "/raw_observed_output/result",
+                "text_quote": None,
+            }
+        ],
+    }
+
+    client = mock_client(
+        lambda request: completion(json.dumps({**frame_payload(), "outcomes": [outcome]}))
+    )
+    async with create_semantic_model_deconstructor(settings(), client=client) as deconstructor:
+        frame = await deconstructor.deconstruct(
+            interaction().model_copy(update={"raw_observed_output": observed_output})
+        )
+
+    assert frame.outcomes[0].evidence[0].text_quote is None
+    await client.aclose()
+
+
+async def test_deconstruct_accepts_exact_nested_output_string_quote() -> None:
+    observed_output = {"result": {"message": "Transfer complete"}}
+    outcome = {
+        **cast(list[dict[str, object]], frame_payload()["outcomes"])[0],
+        "evidence": [
+            {
+                "source": "output",
+                "json_pointer": "/raw_observed_output/result/message",
+                "text_quote": "Transfer complete",
+            }
+        ],
+    }
+    client = mock_client(
+        lambda request: completion(json.dumps({**frame_payload(), "outcomes": [outcome]}))
+    )
+    async with create_semantic_model_deconstructor(settings(), client=client) as deconstructor:
+        frame = await deconstructor.deconstruct(
+            interaction().model_copy(update={"raw_observed_output": observed_output})
+        )
+
+    assert frame.outcomes[0].evidence[0].text_quote == "Transfer complete"
+    await client.aclose()
+
+
+@pytest.mark.parametrize(
+    ("selected_text", "unsupported_quote"),
+    [
+        ("A", "B"),
+        ("Café", "Cafe\u0301"),
+        ("Transfer complete", "Transfer completed"),
+        ("Pay invoice INV-104", "Pay ... INV-104"),
+    ],
+)
+async def test_deconstruct_rejects_non_exact_string_grounding(
+    selected_text: str,
+    unsupported_quote: str,
+) -> None:
+    secret_element_id = "MODEL-ELEMENT-ID-MUST-STAY-PRIVATE"
+    secret_provider_body = "PROVIDER-BODY-MUST-STAY-PRIVATE"
+    outcome = {
+        **cast(list[dict[str, object]], frame_payload()["outcomes"])[0],
+        "id": secret_element_id,
+        "evidence": [
+            {
+                "source": "output",
+                "json_pointer": "/raw_observed_output/selected",
+                "text_quote": unsupported_quote,
+            }
+        ],
+    }
+    response = completion(json.dumps({**frame_payload(), "outcomes": [outcome]}))
+    response.headers["x-private-provider-body"] = secret_provider_body
+    client = mock_client(lambda request: response)
+    record = interaction().model_copy(
+        update={"raw_observed_output": {"selected": selected_text, "sibling": unsupported_quote}}
+    )
+
+    async with create_semantic_model_deconstructor(settings(), client=client) as deconstructor:
+        with pytest.raises(SemanticGroundingError) as grounding_error:
+            await deconstructor.deconstruct(record)
+
+    error = grounding_error.value
+    assert error.diagnostic.reason == "quote_not_exact"
+    assert error.diagnostic.collection == "outcomes"
+    assert error.diagnostic.element_index == 0
+    assert error.diagnostic.evidence_index == 0
+    assert error.__cause__ is None
+    assert error.__suppress_context__ is True
+    rendered_error = f"{error!s} {error!r} {error.diagnostic!r}"
+    for private_value in (
+        selected_text,
+        unsupported_quote,
+        secret_element_id,
+        secret_provider_body,
+    ):
+        assert private_value not in rendered_error
+    await client.aclose()
+
+
+async def test_deconstruct_rejects_quote_on_non_string_value() -> None:
+    outcome = {
+        **cast(list[dict[str, object]], frame_payload()["outcomes"])[0],
+        "evidence": [
+            {
+                "source": "output",
+                "json_pointer": "/raw_observed_output/result",
+                "text_quote": "12",
+            }
+        ],
+    }
+    client = mock_client(
+        lambda request: completion(json.dumps({**frame_payload(), "outcomes": [outcome]}))
+    )
+    async with create_semantic_model_deconstructor(settings(), client=client) as deconstructor:
+        with pytest.raises(SemanticGroundingError) as grounding_error:
+            await deconstructor.deconstruct(
+                interaction().model_copy(update={"raw_observed_output": {"result": 12}})
+            )
+
+    assert grounding_error.value.diagnostic.reason == "quote_for_non_string"
+    await client.aclose()
+
+
+async def test_deconstruct_rejects_missing_quote_for_string_value() -> None:
+    outcome = {
+        **cast(list[dict[str, object]], frame_payload()["outcomes"])[0],
+        "evidence": [
+            {
+                "source": "output",
+                "json_pointer": "/raw_observed_output/result",
+                "text_quote": None,
+            }
+        ],
+    }
+    client = mock_client(
+        lambda request: completion(json.dumps({**frame_payload(), "outcomes": [outcome]}))
+    )
+    async with create_semantic_model_deconstructor(settings(), client=client) as deconstructor:
+        with pytest.raises(SemanticGroundingError) as grounding_error:
+            await deconstructor.deconstruct(
+                interaction().model_copy(update={"raw_observed_output": {"result": "done"}})
+            )
+
+    assert grounding_error.value.diagnostic.reason == "quote_missing_for_string"
+    await client.aclose()
+
+
+async def test_deconstruct_rejects_pointer_outside_declared_source() -> None:
+    factor = {
+        **factor_payload(),
+        "evidence": [
+            {
+                "source": "input",
+                "json_pointer": "/raw_observed_output/action",
+                "text_quote": "pay_invoice",
+            }
+        ],
+    }
+    client = mock_client(
+        lambda request: completion(json.dumps({**frame_payload(), "factors": [factor]}))
+    )
+    async with create_semantic_model_deconstructor(settings(), client=client) as deconstructor:
+        with pytest.raises(SemanticGroundingError) as grounding_error:
+            await deconstructor.deconstruct(interaction())
+
+    assert grounding_error.value.diagnostic.reason == "pointer_source_mismatch"
+    await client.aclose()
+
+
+async def test_grounding_diagnostic_hashes_untrusted_pointer_tokens() -> None:
+    private_pointer_token = "patient-S6212774\n\x1b]8;;https://example.test\x07forged"
+    factor = {
+        **factor_payload(),
+        "evidence": [
+            {
+                "source": "input",
+                "json_pointer": f"/raw_input/{private_pointer_token}",
+                "text_quote": None,
+            }
+        ],
+    }
+    client = mock_client(
+        lambda request: completion(json.dumps({**frame_payload(), "factors": [factor]}))
+    )
+
+    async with create_semantic_model_deconstructor(settings(), client=client) as deconstructor:
+        with pytest.raises(SemanticGroundingError) as grounding_error:
+            await deconstructor.deconstruct(interaction())
+
+    error = grounding_error.value
+    assert error.diagnostic.reason == "pointer_unresolved"
+    assert error.diagnostic.json_pointer is not None
+    assert error.diagnostic.json_pointer.startswith("/raw_input/<pointer-sha256:")
+    rendered = " ".join(
+        (
+            str(error),
+            repr(error),
+            repr(error.diagnostic),
+            error.diagnostic.model_dump_json(),
+        )
+    )
+    for private_value in (
+        private_pointer_token,
+        "S6212774",
+        "https://example.test",
+        "\x1b",
+        "\n",
+    ):
+        assert private_value not in rendered
+    await client.aclose()
+
+
+async def test_deconstruct_rejects_ellipsized_quote_without_repair() -> None:
     request_unit = cast(list[dict[str, object]], frame_payload()["request_units"])[0]
     ellipsized_request = {
         **request_unit,
@@ -1374,9 +1821,11 @@ async def test_deconstruct_expands_one_unambiguous_ellipsized_quote() -> None:
 
     client = mock_client(handler)
     async with create_semantic_model_deconstructor(settings(), client=client) as deconstructor:
-        frame = await deconstructor.deconstruct(interaction())
+        with pytest.raises(SemanticGroundingError) as grounding_error:
+            await deconstructor.deconstruct(interaction())
 
-    assert frame.request_units[0].evidence[0].text_quote == "Pay invoice INV-104"
+    assert grounding_error.value.diagnostic.reason == "quote_not_exact"
+    assert deconstructor.semantic_call_metrics == SemanticCallMetrics(actual_calls=1, cache_hits=0)
     await client.aclose()
 
 
@@ -1450,8 +1899,9 @@ async def test_input_only_validation_rejects_output_evidence() -> None:
 
     client = mock_client(handler)
     async with create_semantic_model_deconstructor(settings(), client=client) as deconstructor:
-        with pytest.raises(ValueError, match="output evidence"):
+        with pytest.raises(SemanticGroundingError) as grounding_error:
             await deconstructor.deconstruct(input_only_record)
+    assert grounding_error.value.diagnostic.reason == "output_evidence_without_output"
     await client.aclose()
 
 
@@ -1461,8 +1911,9 @@ async def test_observed_output_requires_a_grounded_outcome() -> None:
 
     client = mock_client(handler)
     async with create_semantic_model_deconstructor(settings(), client=client) as deconstructor:
-        with pytest.raises(ValueError, match="grounded outcome"):
+        with pytest.raises(SemanticGroundingError) as grounding_error:
             await deconstructor.deconstruct(interaction())
+    assert grounding_error.value.diagnostic.reason == "observed_outcome_missing"
     await client.aclose()
 
 
@@ -1495,8 +1946,10 @@ async def test_every_observed_outcome_requires_output_evidence() -> None:
 
     client = mock_client(handler)
     async with create_semantic_model_deconstructor(settings(), client=client) as deconstructor:
-        with pytest.raises(ValueError, match="every observed outcome"):
+        with pytest.raises(SemanticGroundingError) as grounding_error:
             await deconstructor.deconstruct(interaction())
+    assert grounding_error.value.diagnostic.reason == "output_evidence_missing"
+    assert grounding_error.value.diagnostic.element_index == 1
     await client.aclose()
 
 
@@ -1839,6 +2292,11 @@ async def test_openai_compatible_selection_loads_scoped_environment(
             "1",
             "UL_DATASET_MAX_RESPONSE_BYTES must be between 1024 and 5000000",
         ),
+        (
+            "UL_DATASET_DECONSTRUCT_REASONING",
+            "auto",
+            "UL_DATASET_DECONSTRUCT_REASONING must be required or omitted",
+        ),
     ],
 )
 async def test_semantic_settings_loader_reports_safe_field_specific_diagnostics(
@@ -2036,7 +2494,10 @@ async def test_live_augmentation_generates_or_safely_rejects_each_candidate() ->
             operator_ids=tuple(operator.id for operator in operators),
         )
 
-    assert len(result.candidates) == len(operators)
+    assert {
+        *(candidate.operator_id for candidate in result.candidates),
+        *(skip.operator_id for skip in result.skips),
+    } == {operator.id for operator in operators}
     unchanged_candidates = tuple(
         candidate.operator_id
         for candidate in result.candidates
@@ -2044,9 +2505,14 @@ async def test_live_augmentation_generates_or_safely_rejects_each_candidate() ->
     )
     assert not unchanged_candidates, unchanged_candidates
     assert all(candidate.passed or candidate.failure_reasons for candidate in result.candidates)
-    assert [
+    human_review_operators = {
         candidate.operator_id for candidate in result.candidates if candidate.human_review_required
-    ] == ["input.tone.frustrated", "input.intent.self_correction"]
+    }
+    assert "input.tone.frustrated" in human_review_operators
+    assert human_review_operators <= {
+        "input.tone.frustrated",
+        "input.intent.self_correction",
+    }
 
 
 async def test_live_equivalence_qualification_across_ten_domains() -> None:

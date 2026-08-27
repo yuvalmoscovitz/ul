@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Literal
 
 from pydantic import JsonValue
-from ul import DatasetSemanticSettings, InteractionRecord
+from ul import DatasetSemanticSettings, InteractionRecord, semantic_deconstructor_identity
 from ul.dataset_invariants import DatasetInvariantSuite
 from ul.http_environment import JsonHttpTargetConfig
 
@@ -46,11 +46,15 @@ def build_dataset_evidence_run_context(
             model=settings.model,
             render_model=settings.render_model,
             equivalence_model=settings.equivalence_model,
+            deconstruct_reasoning=settings.deconstruct_reasoning,
+            render_reasoning=settings.render_reasoning,
+            equivalence_reasoning=settings.equivalence_reasoning,
             max_input_chars=settings.max_input_chars,
             max_output_tokens=settings.max_output_tokens,
             max_render_tokens=settings.max_render_tokens,
             max_response_bytes=settings.max_response_bytes,
             timeout_seconds=settings.timeout_seconds,
+            deconstructor_identity=semantic_deconstructor_identity(settings),
         ),
         redaction_policy_sha256=redaction_policy_sha256,
         redaction_coverage=redaction_coverage,

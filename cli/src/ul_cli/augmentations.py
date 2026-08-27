@@ -16,6 +16,13 @@ from ul.http_environment import (
     load_json_http_environment_config,
     validate_json_http_environment_configuration,
 )
+from ul_core.augmentations.bundles import (
+    AugmentationBundle,
+    BundleBindingReadiness,
+    BundleSourceCase,
+    builtin_augmentation_bundle_catalog,
+    plan_augmentation_bundle,
+)
 from ul_core.augmentations.definitions import (
     AugmentationBinding,
     AugmentationMode,
@@ -29,6 +36,8 @@ from ul_core.augmentations.projections import ProjectionContract
 from ul_core.evaluation import EnvironmentCapabilities
 
 from ul_cli.dataset import validate_dataset_operator_ids, validate_interaction_dataset
+from ul_cli.dataset.evaluation.records import load_interaction_records
+from ul_cli.dataset.presentation.runtime import print_dataset_plain
 from ul_cli.project import (
     DEFAULT_PROJECT_OPERATORS,
     ProjectConfig,
@@ -38,6 +47,8 @@ from ul_cli.project import (
 )
 
 app = typer.Typer(help="Inspect UL's built-in augmentation library.")
+bundle_app = typer.Typer(help="Inspect and safely preview named business-risk bundles.")
+app.add_typer(bundle_app, name="bundles")
 
 _SCOPES: tuple[AugmentationScope, ...] = ("input", "conversation", "environment")
 _SURFACES: tuple[AugmentationSurface, ...] = (
@@ -56,6 +67,9 @@ _MODES: tuple[AugmentationMode, ...] = (
 )
 _REFERENCE_PATTERN = re.compile(
     r"^[a-z][a-z0-9_]*(?:\.[a-z][a-z0-9_]*)+(?:@(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*))?$"
+)
+_BUNDLE_REFERENCE_PATTERN = re.compile(
+    r"^[a-z][a-z0-9]*(?:-[a-z0-9]+)*(?:@(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*))?$"
 )
 
 _ReadinessStatus = Literal["ready", "blocked", "manual"]
@@ -123,6 +137,196 @@ class _PlannedAugmentation:
             "enabled": self.enabled,
             "projection": self.projection.model_dump(mode="json"),
         }
+
+
+@bundle_app.command("list")
+def list_bundles(
+    json_output: Annotated[
+        bool, typer.Option("--json", help="Emit stable machine-readable JSON.")
+    ] = False,
+) -> None:
+    """List named, versioned bundle selection and budget policies."""
+    bundles = builtin_augmentation_bundle_catalog().list()
+    if json_output:
+        typer.echo(
+            json.dumps(
+                {
+                    "schema_version": "1.0.0",
+                    "bundles": [bundle.model_dump(mode="json") for bundle in bundles],
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+        return
+    typer.echo("Business-risk bundles")
+    for bundle in bundles:
+        typer.echo(f"{bundle.id}@{bundle.version}")
+        typer.echo(f"  {bundle.summary}")
+        typer.echo(f"  independent operators={len(bundle.operators)}")
+
+
+@bundle_app.command("show")
+def show_bundle(
+    reference: Annotated[str, typer.Argument(help="Bundle ID with optional @VERSION.")],
+    json_output: Annotated[
+        bool, typer.Option("--json", help="Emit stable machine-readable JSON.")
+    ] = False,
+) -> None:
+    """Show one bundle's operator selection and hard budget."""
+    bundle = _resolve_bundle(reference)
+    if json_output:
+        typer.echo(
+            json.dumps(
+                {"schema_version": "1.0.0", "bundle": bundle.model_dump(mode="json")},
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+        return
+    typer.echo(f"{bundle.id}@{bundle.version}")
+    typer.echo(f"Summary: {bundle.summary}")
+    typer.echo("Composition: independent probes only; chained composition is unavailable")
+    typer.echo("Operators:")
+    for policy in bundle.operators:
+        typer.echo(f"  {policy.ref.id}@{policy.ref.version} [{policy.mode}]")
+    typer.echo(
+        "Hard budget: "
+        f"cases={bundle.budget.maximum_cases}, "
+        f"fan-out/case={bundle.budget.maximum_fan_out_per_case}, "
+        f"model calls={bundle.budget.maximum_model_calls}, "
+        f"target calls={bundle.budget.maximum_target_calls}, "
+        f"seconds={bundle.budget.maximum_duration_seconds}, "
+        f"cost=${bundle.budget.maximum_cost_usd:.2f}, "
+        f"mutating probes={bundle.budget.maximum_mutating_probes}"
+    )
+
+
+@bundle_app.command("plan")
+def plan_bundle(
+    reference: Annotated[str, typer.Argument(help="Bundle ID with optional @VERSION.")],
+    case: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--case",
+            help="Opaque source case ID; repeat as needed. Defaults to configured project cases.",
+        ),
+    ] = None,
+    source_feature: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--source-feature",
+            help="Available source fact used for applicability; repeat as needed.",
+        ),
+    ] = None,
+    json_output: Annotated[
+        bool, typer.Option("--json", help="Emit stable machine-readable JSON.")
+    ] = False,
+) -> None:
+    """Expand a bundle into bounded independent probes without external calls."""
+    bundle = _resolve_bundle(reference)
+    sources = _bundle_source_cases(case, source_feature)
+    project = _load_project_readiness()
+    try:
+        plan = plan_augmentation_bundle(
+            bundle,
+            sources,
+            binding_readiness=_bundle_binding_readiness(bundle, project),
+        )
+    except ValueError as error:
+        raise typer.BadParameter(str(error), param_hint="REFERENCE") from None
+    if json_output:
+        typer.echo(json.dumps(plan.model_dump(mode="json"), ensure_ascii=False, indent=2))
+        return
+    typer.echo(f"Bundle plan: {plan.bundle_id}@{plan.bundle_version}")
+    typer.echo("Composition: independent probes only; every probe starts from its source case")
+    for probe in plan.probes:
+        print_dataset_plain(
+            f"{probe.status.upper()} {probe.source_case_id} -> "
+            f"{probe.operator.id}@{probe.operator.version} [{probe.mode}]"
+        )
+        typer.echo(f"  Applicability: {probe.applicability} ({'; '.join(probe.reasons)})")
+        typer.echo(f"  Exact controlled change: {', '.join(probe.changed_surfaces)}")
+        typer.echo(f"  Expected relation: {probe.expected_relation}")
+        typer.echo(f"  Evidence: {', '.join(probe.required_evidence)}")
+        typer.echo(
+            f"  Calls: model={probe.model_calls}, target={probe.target_calls}; "
+            f"time<={probe.maximum_duration_seconds}s; cost<=${probe.maximum_cost_usd:.2f}; "
+            f"mutation={probe.mutation_risk}; reset={'yes' if probe.reset_required else 'no'}"
+        )
+    totals = plan.totals
+    typer.echo(
+        "Bounded totals: "
+        f"cases={totals.cases}, planned={totals.planned_probes}, "
+        f"blocked={totals.blocked_probes}, skipped={totals.skipped_probes}, "
+        f"model calls={totals.model_calls}, "
+        f"target calls={totals.target_calls}, time<={totals.maximum_duration_seconds}s, "
+        f"cost<=${totals.maximum_cost_usd:.2f}, mutating probes={totals.mutating_probes}"
+    )
+    typer.echo("Inspection only: 0 model calls, 0 target calls, 0 network requests.")
+
+
+def _bundle_binding_readiness(
+    bundle: AugmentationBundle,
+    project: _ProjectReadiness,
+) -> tuple[BundleBindingReadiness, ...]:
+    catalog = builtin_augmentation_catalog()
+    readiness: list[BundleBindingReadiness] = []
+    for policy in bundle.operators:
+        definition = catalog.get(policy.ref.id, policy.ref.version)
+        binding = next(item for item in definition.bindings if item.mode == policy.mode)
+        reasons = _binding_blocking_reasons(binding, project)
+        readiness.append(
+            BundleBindingReadiness(
+                ref=policy.ref,
+                mode=policy.mode,
+                ready=not reasons,
+                reasons=tuple(reason.message for reason in reasons),
+            )
+        )
+    return tuple(readiness)
+
+
+def _bundle_source_cases(
+    case_ids: list[str] | None,
+    source_features: list[str] | None,
+) -> tuple[BundleSourceCase, ...]:
+    explicit_features = frozenset(source_features or ())
+    if case_ids:
+        return tuple(
+            BundleSourceCase(id=case_id, available_features=explicit_features)
+            for case_id in case_ids
+        )
+    try:
+        project_root, config = load_project()
+        records = load_interaction_records(resolve_project_path(config.dataset, project_root))
+    except (typer.BadParameter, ValueError):
+        raise typer.BadParameter(
+            "provide --case or configure a valid UL project with 'ul init'",
+            param_hint="--case",
+        ) from None
+    project = _load_project_readiness()
+    features = frozenset((*project.available_source_features, *explicit_features))
+    return tuple(
+        BundleSourceCase(id=record.id, available_features=features)
+        for record in records[: config.limit]
+    )
+
+
+def _resolve_bundle(reference: str) -> AugmentationBundle:
+    if not _BUNDLE_REFERENCE_PATTERN.fullmatch(reference):
+        raise typer.BadParameter(
+            "bundle reference must be ID or ID@VERSION",
+            param_hint="REFERENCE",
+        )
+    bundle_id, separator, version = reference.partition("@")
+    try:
+        return builtin_augmentation_bundle_catalog().get(bundle_id, version if separator else None)
+    except KeyError:
+        raise typer.BadParameter(
+            "unknown bundle; use ID or ID@VERSION from 'ul augmentations bundles list'",
+            param_hint="REFERENCE",
+        ) from None
 
 
 @app.command("list")

@@ -4,9 +4,14 @@ from pathlib import Path
 from typing import cast
 
 import pytest
-from ul import DatasetTrialUnit
+from ul import DatasetSemanticPreparationError, DatasetTrialUnit
+from ul_cli.dataset.evaluation.command import (
+    _attempted_target_calls,
+    _reconcile_source_preparation_failures,
+)
 from ul_cli.dataset.evidence.context import build_dataset_evidence_run_context
-from ul_cli.dataset_review import DatasetEvidenceRunContext
+from ul_cli.dataset.evidence.customer import build_source_preparation_failure_evidence
+from ul_cli.dataset_review import DatasetEvidenceRunContext, DatasetResumeEvidence
 from ul_cli.dataset_trial_journal import (
     create_dataset_run_manifest,
     create_dataset_trial_journal,
@@ -90,6 +95,45 @@ def test_terminal_trial_is_recovered_and_cannot_be_recorded_twice(tmp_path: Path
 
     resumed = open_dataset_trial_journal(path, manifest)
     assert resumed.snapshot.recovered_trials == {unit.id: trial}
+    resumed.close()
+
+
+def test_resume_reconciles_an_interrupted_source_failure_without_target_calls(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "trials.jsonl"
+    manifest = _manifest()
+    failure = build_source_preparation_failure_evidence(
+        manifest.selected_records[0],
+        DatasetSemanticPreparationError(),
+        repetitions=1,
+        max_environment_api_calls=10,
+        planned_target_calls=2,
+        run_context=manifest.run_context,
+    )
+    journal = create_dataset_trial_journal(path, manifest)
+    journal.terminal(
+        manifest.work_plan[0],
+        "errored",
+        failure.reason_code,
+    )
+    journal.close()
+    resumed = open_dataset_trial_journal(path, manifest)
+    resume_evidence = DatasetResumeEvidence(
+        processed_ids=frozenset({failure.interaction_id}),
+        source_preparation_failures=(failure,),
+        has_review_findings=False,
+        invariant_evaluations=(),
+        technical_results=(),
+        raw_evidence_sha256="0" * 64,
+    )
+
+    _reconcile_source_preparation_failures(resumed, resume_evidence)
+
+    snapshot = resumed.snapshot
+    assert snapshot.terminal_states == {unit.id: "errored" for unit in manifest.work_plan}
+    assert set(snapshot.terminal_reason_codes.values()) == {failure.reason_code}
+    assert _attempted_target_calls(snapshot) == 0
     resumed.close()
 
 

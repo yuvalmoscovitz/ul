@@ -4,7 +4,6 @@ import asyncio
 import hashlib
 import ipaddress
 import json
-import re
 from collections import OrderedDict
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
@@ -39,6 +38,30 @@ _PROMPTS = PromptManager.instance()
 _SEMANTIC_CACHE_VERSION = "semantic-request-cache/1"
 _MAXIMUM_SEMANTIC_CACHE_ENTRIES = 256
 _MAXIMUM_SEMANTIC_CACHE_BYTES = 16 * 1024 * 1024
+_GROUNDING_REMEDIATION = (
+    "Choose an exact pointer into the declared source and use an exact substring only when that "
+    "pointer selects a string."
+)
+
+type SemanticElementCollection = Literal[
+    "request_units",
+    "factors",
+    "relations",
+    "communication_acts",
+    "outcomes",
+]
+type SemanticGroundingReason = Literal[
+    "outcome_for_input_only_record",
+    "observed_outcome_missing",
+    "output_evidence_missing",
+    "element_evidence_missing",
+    "output_evidence_without_output",
+    "pointer_source_mismatch",
+    "pointer_unresolved",
+    "quote_missing_for_string",
+    "quote_for_non_string",
+    "quote_not_exact",
+]
 
 
 def _sha256_text(value: str) -> str:
@@ -48,6 +71,133 @@ def _sha256_text(value: str) -> str:
 def _render_seed(raw_input: str, instruction: str) -> int:
     digest = hashlib.sha256(f"{raw_input}\0{instruction}".encode()).digest()
     return int.from_bytes(digest[:4], "big") & 0x7FFF_FFFF
+
+
+def _reasoning_option(
+    mode: SemanticReasoningMode,
+    effort: Literal["minimal", "none", "low"],
+) -> dict[str, JsonValue] | None:
+    return {"effort": effort} if mode == "required" else None
+
+
+def _reasoning_metadata(
+    mode: SemanticReasoningMode,
+    effort: Literal["minimal", "none", "low"],
+) -> dict[str, JsonValue]:
+    return {"mode": mode, "effort": effort if mode == "required" else None}
+
+
+class SemanticDeconstructorIdentity(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    extractor_contract: str = Field(min_length=1, max_length=200)
+    prompt_behavior_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    response_schema_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    identity_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+    @model_validator(mode="after")
+    def validate_digest(self) -> Self:
+        expected_identity = _canonical_json_sha256(
+            self.model_dump(mode="json", exclude={"identity_sha256"})
+        )
+        if self.identity_sha256 != expected_identity:
+            raise ValueError("semantic deconstructor identity digest must match its components")
+        return self
+
+
+class SemanticGroundingDiagnostic(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    collection: SemanticElementCollection
+    element_index: int | None = Field(default=None, ge=0)
+    evidence_index: int | None = Field(default=None, ge=0)
+    json_pointer: str | None = Field(default=None, max_length=4_096)
+    reason: SemanticGroundingReason
+    remediation: Literal[
+        "Choose an exact pointer into the declared source and use an exact substring only when "
+        "that pointer selects a string."
+    ] = (
+        "Choose an exact pointer into the declared source and use an exact substring only when "
+        "that pointer selects a string."
+    )
+
+
+class SemanticGroundingError(ValueError):
+    def __init__(self, diagnostic: SemanticGroundingDiagnostic) -> None:
+        self.diagnostic = diagnostic
+        location = diagnostic.collection
+        if diagnostic.element_index is not None:
+            location = f"{location}[{diagnostic.element_index}]"
+        if diagnostic.evidence_index is not None:
+            location = f"{location}.evidence[{diagnostic.evidence_index}]"
+        pointer = f" at {diagnostic.json_pointer}" if diagnostic.json_pointer is not None else ""
+        super().__init__(
+            f"Semantic grounding failed for {location}{pointer} "
+            f"({diagnostic.reason}). Next: {diagnostic.remediation}"
+        )
+
+
+def _canonical_json_sha256(value: object) -> str:
+    serialized = json.dumps(
+        value,
+        ensure_ascii=False,
+        allow_nan=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return _sha256_text(serialized)
+
+
+def _safe_diagnostic_json_pointer(
+    source: Literal["input", "output"],
+    json_pointer: str,
+) -> str:
+    trusted_root = "/raw_input" if source == "input" else "/raw_observed_output"
+    if json_pointer == trusted_root:
+        return trusted_root
+    return f"{trusted_root}/<pointer-sha256:{_sha256_text(json_pointer)[:12]}>"
+
+
+def _semantic_frame_response_schema(*, observed_output_present: bool) -> dict[str, Any]:
+    schema = SemanticFrame.model_json_schema(mode="validation")
+    definitions = cast(dict[str, dict[str, Any]], schema["$defs"])
+    for definition_name in (
+        "RequestUnit",
+        "SemanticFactor",
+        "SemanticRelation",
+        "CommunicationAct",
+        "ObservedOutcome",
+    ):
+        definition = definitions[definition_name]
+        properties = cast(dict[str, dict[str, Any]], definition["properties"])
+        properties["evidence"]["minItems"] = 1
+        required = cast(list[str], definition["required"])
+        if "evidence" not in required:
+            required.append("evidence")
+    if observed_output_present:
+        properties = cast(dict[str, dict[str, Any]], schema["properties"])
+        properties["outcomes"]["minItems"] = 1
+        required = cast(list[str], schema.setdefault("required", []))
+        if "outcomes" not in required:
+            required.append("outcomes")
+    return schema
+
+
+def _semantic_deconstructor_identity(extractor_contract: str) -> SemanticDeconstructorIdentity:
+    content = {
+        "extractor_contract": extractor_contract,
+        "prompt_behavior_sha256": _PROMPTS.get_template_info("semantic.deconstruct").version,
+        "response_schema_sha256": _canonical_json_sha256(
+            {
+                "input_only": _semantic_frame_response_schema(observed_output_present=False),
+                "observed_output": _semantic_frame_response_schema(observed_output_present=True),
+            }
+        ),
+    }
+    return SemanticDeconstructorIdentity(
+        **content,
+        identity_sha256=_canonical_json_sha256(content),
+    )
 
 
 class ProviderDiagnostic(BaseModel):
@@ -79,6 +229,9 @@ class ProviderDiagnosticError(RuntimeError):
             f"({diagnostic.category}; retryable: {'yes' if diagnostic.retryable else 'no'}). "
             f"Next: {diagnostic.suggested_action}"
         )
+
+
+type SemanticReasoningMode = Literal["required", "omitted"]
 
 
 def _provider_diagnostic(
@@ -154,7 +307,7 @@ class OpenRouterDatasetSettings(BaseSettings):
         return self
 
     model: str = Field(
-        default="google/gemini-2.5-flash",
+        default="google/gemini-3.5-flash",
         min_length=1,
         max_length=200,
         validation_alias="UL_DATASET_MODEL",
@@ -170,6 +323,18 @@ class OpenRouterDatasetSettings(BaseSettings):
         min_length=1,
         max_length=200,
         validation_alias="UL_DATASET_EQUIVALENCE_MODEL",
+    )
+    deconstruct_reasoning: SemanticReasoningMode = Field(
+        default="required",
+        validation_alias="UL_DATASET_DECONSTRUCT_REASONING",
+    )
+    render_reasoning: SemanticReasoningMode = Field(
+        default="required",
+        validation_alias="UL_DATASET_RENDER_REASONING",
+    )
+    equivalence_reasoning: SemanticReasoningMode = Field(
+        default="required",
+        validation_alias="UL_DATASET_EQUIVALENCE_REASONING",
     )
     max_input_chars: int = Field(
         default=50_000,
@@ -274,6 +439,18 @@ class OpenAICompatibleDatasetSettings(BaseSettings):
         default="",
         max_length=200,
         validation_alias="UL_DATASET_EQUIVALENCE_MODEL",
+    )
+    deconstruct_reasoning: SemanticReasoningMode = Field(
+        default="required",
+        validation_alias="UL_DATASET_DECONSTRUCT_REASONING",
+    )
+    render_reasoning: SemanticReasoningMode = Field(
+        default="required",
+        validation_alias="UL_DATASET_RENDER_REASONING",
+    )
+    equivalence_reasoning: SemanticReasoningMode = Field(
+        default="required",
+        validation_alias="UL_DATASET_EQUIVALENCE_REASONING",
     )
     max_input_chars: int = Field(
         default=50_000,
@@ -401,6 +578,9 @@ def _semantic_configuration_error(
         "UL_DATASET_MODEL": "model",
         "UL_DATASET_RENDER_MODEL": "render_model",
         "UL_DATASET_EQUIVALENCE_MODEL": "equivalence_model",
+        "UL_DATASET_DECONSTRUCT_REASONING": "deconstruct_reasoning",
+        "UL_DATASET_RENDER_REASONING": "render_reasoning",
+        "UL_DATASET_EQUIVALENCE_REASONING": "equivalence_reasoning",
         "UL_DATASET_MAX_INPUT_CHARS": "max_input_chars",
         "UL_DATASET_MAX_OUTPUT_TOKENS": "max_output_tokens",
         "UL_DATASET_MAX_RENDER_TOKENS": "max_render_tokens",
@@ -421,6 +601,9 @@ def _semantic_configuration_error(
                     "UL_DATASET_RENDER_MODEL": "render_model",
                     "UL_DATASET_EQUIVALENCE_MODEL": "equivalence_model",
                     "UL_DATASET_MODEL": "model",
+                    "UL_DATASET_DECONSTRUCT_REASONING": "deconstruct_reasoning",
+                    "UL_DATASET_RENDER_REASONING": "render_reasoning",
+                    "UL_DATASET_EQUIVALENCE_REASONING": "equivalence_reasoning",
                 }.items()
                 if environment_name in safe_detail
             ),
@@ -443,6 +626,9 @@ def _semantic_configuration_error(
         "equivalence_model": (
             "UL_DATASET_EQUIVALENCE_MODEL must be 1-200 non-whitespace characters when set"
         ),
+        "deconstruct_reasoning": ("UL_DATASET_DECONSTRUCT_REASONING must be required or omitted"),
+        "render_reasoning": "UL_DATASET_RENDER_REASONING must be required or omitted",
+        "equivalence_reasoning": ("UL_DATASET_EQUIVALENCE_REASONING must be required or omitted"),
         "max_input_chars": "UL_DATASET_MAX_INPUT_CHARS must be between 1 and 1000000",
         "max_output_tokens": "UL_DATASET_MAX_OUTPUT_TOKENS must be between 1 and 32768",
         "max_render_tokens": "UL_DATASET_MAX_RENDER_TOKENS must be between 1 and 4096",
@@ -566,6 +752,7 @@ class EvaluatorModelProfilePreflight(BaseModel):
     requested_model: str = Field(min_length=1, max_length=200)
     routed_model: str = Field(min_length=1, max_length=200)
     upstream_provider: str | None = Field(default=None, max_length=200)
+    reasoning_mode: SemanticReasoningMode
     required_parameters: tuple[str, ...]
     request_options_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     parameter_support: Literal["routing_enforced", "endpoint_accepted_unverified"]
@@ -591,6 +778,7 @@ class EvaluatorPreflightProfilePlan(BaseModel):
 
     roles: tuple[Literal["deconstruct", "render", "equivalence"], ...] = Field(min_length=1)
     requested_model: str = Field(min_length=1, max_length=200)
+    reasoning_mode: SemanticReasoningMode
     max_completion_tokens: int = Field(ge=1)
     required_parameters: tuple[str, ...]
 
@@ -612,7 +800,8 @@ class _EvaluatorPreflightHTTPError(ValueError):
 class _EvaluatorPreflightProfile:
     roles: tuple[Literal["deconstruct", "render", "equivalence"], ...]
     model: str
-    reasoning: dict[str, JsonValue]
+    reasoning_mode: SemanticReasoningMode
+    reasoning: dict[str, JsonValue] | None
     max_tokens: int
     temperature: float
     seed: int
@@ -645,7 +834,7 @@ class SemanticCompletionProvider(Protocol):
     def add_request_options(
         self,
         request_body: dict[str, Any],
-        reasoning: dict[str, JsonValue],
+        reasoning: dict[str, JsonValue] | None,
     ) -> None: ...
 
     def generation_metadata(
@@ -676,7 +865,7 @@ class OpenAICompatibleSemanticProvider:
     def add_request_options(
         self,
         request_body: dict[str, Any],
-        reasoning: dict[str, JsonValue],
+        reasoning: dict[str, JsonValue] | None,
     ) -> None:
         return None
 
@@ -721,9 +910,10 @@ class OpenRouterSemanticProvider(OpenAICompatibleSemanticProvider):
     def add_request_options(
         self,
         request_body: dict[str, Any],
-        reasoning: dict[str, JsonValue],
+        reasoning: dict[str, JsonValue] | None,
     ) -> None:
-        request_body["reasoning"] = reasoning
+        if reasoning is not None:
+            request_body["reasoning"] = reasoning
         request_body["provider"] = {
             "require_parameters": True,
             "data_collection": "deny",
@@ -835,6 +1025,7 @@ class SemanticModelDeconstructor:
                     requested_model=profile.model,
                     routed_model=completion.response.model,
                     upstream_provider=completion.response.provider,
+                    reasoning_mode=profile.reasoning_mode,
                     required_parameters=profile.required_parameters,
                     request_options_sha256=self._profile_request_options_sha256(profile),
                     parameter_support=(
@@ -904,13 +1095,15 @@ class SemanticModelDeconstructor:
         completion = await self._request(
             operation="deconstruct",
             model=self.settings.model,
-            reasoning={"effort": "minimal"},
+            reasoning=_reasoning_option(self.settings.deconstruct_reasoning, "minimal"),
             max_tokens=self.settings.max_output_tokens,
             temperature=0,
             seed=0,
             top_p=None,
             schema_name="semantic_frame",
-            schema=SemanticFrame.model_json_schema(mode="validation"),
+            schema=_semantic_frame_response_schema(
+                observed_output_present=observed_output is not None
+            ),
             strict_schema=True,
             system_prompt=_PROMPTS.get_prompt("semantic.deconstruct"),
             untrusted_payload=untrusted_record,
@@ -924,6 +1117,12 @@ class SemanticModelDeconstructor:
                     "extractor_version": self.provider.extractor_version,
                     "metadata": {
                         **self._generation_metadata(completion),
+                        "semantic_deconstructor_identity": _semantic_deconstructor_identity(
+                            self.provider.extractor_version
+                        ).model_dump(mode="json"),
+                        "semantic_reasoning": _reasoning_metadata(
+                            self.settings.deconstruct_reasoning, "minimal"
+                        ),
                         "prompts": prompt_provenance("semantic.deconstruct"),
                     },
                 }
@@ -933,12 +1132,11 @@ class SemanticModelDeconstructor:
             self._discard_cached_completion(completion)
             raise self._invalid_response(error, operation="deconstruct") from None
         try:
-            frame = self._expand_unambiguous_evidence_quotes(record, frame)
             frame = self._ground_self_correction_evidence(record, frame)
             self._validate_evidence(record, frame)
-        except ValueError:
+        except SemanticGroundingError as error:
             self._discard_cached_completion(completion)
-            raise
+            raise error from None
         return frame
 
     async def render(
@@ -963,7 +1161,7 @@ class SemanticModelDeconstructor:
         completion = await self._request(
             operation="render",
             model=self.settings.render_model,
-            reasoning={"effort": "none"},
+            reasoning=_reasoning_option(self.settings.render_reasoning, "none"),
             max_tokens=self.settings.max_render_tokens,
             temperature=0.7,
             seed=render_seed,
@@ -999,6 +1197,7 @@ class SemanticModelDeconstructor:
                     "seed": render_seed,
                     "max_tokens": self.settings.max_render_tokens,
                 },
+                "semantic_reasoning": _reasoning_metadata(self.settings.render_reasoning, "none"),
             },
         )
 
@@ -1013,7 +1212,7 @@ class SemanticModelDeconstructor:
         completion = await self._request(
             operation="verify",
             model=self.settings.equivalence_model,
-            reasoning={"effort": "low"},
+            reasoning=_reasoning_option(self.settings.equivalence_reasoning, "low"),
             max_tokens=min(self.settings.max_output_tokens, 1_024),
             temperature=0,
             seed=0,
@@ -1033,6 +1232,9 @@ class SemanticModelDeconstructor:
                     "metadata": {
                         **self._generation_metadata(completion),
                         "requested_model": self.settings.equivalence_model,
+                        "semantic_reasoning": _reasoning_metadata(
+                            self.settings.equivalence_reasoning, "low"
+                        ),
                         "prompts": prompt_provenance("semantic.verify"),
                     },
                 }
@@ -1097,7 +1299,7 @@ class SemanticModelDeconstructor:
         *,
         operation: Literal["deconstruct", "render", "verify", "preflight"],
         model: str,
-        reasoning: dict[str, JsonValue],
+        reasoning: dict[str, JsonValue] | None,
         max_tokens: int,
         temperature: float,
         seed: int,
@@ -1203,7 +1405,7 @@ class SemanticModelDeconstructor:
         *,
         operation: Literal["deconstruct", "render", "verify", "preflight"],
         model: str,
-        reasoning: dict[str, JsonValue],
+        reasoning: dict[str, JsonValue] | None,
         max_tokens: int,
         temperature: float,
         seed: int,
@@ -1246,7 +1448,7 @@ class SemanticModelDeconstructor:
         *,
         api_key: str | None,
         model: str,
-        reasoning: dict[str, JsonValue],
+        reasoning: dict[str, JsonValue] | None,
         max_tokens: int,
         temperature: float,
         seed: int,
@@ -1391,57 +1593,6 @@ class SemanticModelDeconstructor:
             },
         )
 
-    @classmethod
-    def _expand_unambiguous_evidence_quotes(
-        cls,
-        interaction: InteractionRecord | UserInputRecord,
-        frame: SemanticFrame,
-    ) -> SemanticFrame:
-        observed_output = (
-            interaction.raw_observed_output if isinstance(interaction, InteractionRecord) else None
-        )
-        evidence_payload: JsonValue = {
-            "raw_input": interaction.raw_input,
-            "raw_observed_output": observed_output,
-        }
-
-        def expand_element(element: Any) -> Any:
-            expanded_evidence: list[EvidenceReference] = []
-            for evidence in element.evidence:
-                resolved_value = cls._resolve_json_pointer(evidence_payload, evidence.json_pointer)
-                quote = evidence.text_quote
-                if (
-                    isinstance(resolved_value, str)
-                    and quote is not None
-                    and quote not in resolved_value
-                ):
-                    parts = re.split(r"\s*(?:\.\.\.|…)\s*", quote)
-                    if len(parts) == 2 and all(parts):
-                        prefix_start = resolved_value.find(parts[0])
-                        suffix_start = resolved_value.find(parts[1], prefix_start + len(parts[0]))
-                        if (
-                            prefix_start >= 0
-                            and suffix_start >= 0
-                            and prefix_start == resolved_value.rfind(parts[0])
-                            and suffix_start == resolved_value.rfind(parts[1])
-                        ):
-                            quote = resolved_value[prefix_start : suffix_start + len(parts[1])]
-                            evidence = evidence.model_copy(update={"text_quote": quote})
-                expanded_evidence.append(evidence)
-            return element.model_copy(update={"evidence": tuple(expanded_evidence)})
-
-        return frame.model_copy(
-            update={
-                "request_units": tuple(expand_element(element) for element in frame.request_units),
-                "factors": tuple(expand_element(element) for element in frame.factors),
-                "relations": tuple(expand_element(element) for element in frame.relations),
-                "communication_acts": tuple(
-                    expand_element(element) for element in frame.communication_acts
-                ),
-                "outcomes": tuple(expand_element(element) for element in frame.outcomes),
-            }
-        )
-
     @staticmethod
     def _ground_self_correction_evidence(
         interaction: InteractionRecord | UserInputRecord,
@@ -1542,43 +1693,102 @@ class SemanticModelDeconstructor:
             interaction.raw_observed_output if isinstance(interaction, InteractionRecord) else None
         )
         if observed_output is None and frame.outcomes:
-            raise ValueError("input-only frames must not contain outcomes")
+            raise SemanticGroundingError(
+                SemanticGroundingDiagnostic(
+                    collection="outcomes",
+                    element_index=0,
+                    reason="outcome_for_input_only_record",
+                )
+            )
         if observed_output is not None and not frame.outcomes:
-            raise ValueError("observed outputs must produce at least one grounded outcome")
-        if any(
-            not any(evidence.source == "output" for evidence in outcome.evidence)
-            for outcome in frame.outcomes
-        ):
-            raise ValueError("every observed outcome must include output evidence")
-        elements = (
-            *frame.request_units,
-            *frame.factors,
-            *frame.relations,
-            *frame.communication_acts,
-            *frame.outcomes,
+            raise SemanticGroundingError(
+                SemanticGroundingDiagnostic(
+                    collection="outcomes",
+                    reason="observed_outcome_missing",
+                )
+            )
+        for outcome_index, outcome in enumerate(frame.outcomes):
+            if not any(evidence.source == "output" for evidence in outcome.evidence):
+                raise SemanticGroundingError(
+                    SemanticGroundingDiagnostic(
+                        collection="outcomes",
+                        element_index=outcome_index,
+                        reason="output_evidence_missing",
+                    )
+                )
+        element_collections: tuple[tuple[SemanticElementCollection, tuple[Any, ...]], ...] = (
+            ("request_units", frame.request_units),
+            ("factors", frame.factors),
+            ("relations", frame.relations),
+            ("communication_acts", frame.communication_acts),
+            ("outcomes", frame.outcomes),
         )
         evidence_payload: JsonValue = {
             "raw_input": interaction.raw_input,
             "raw_observed_output": observed_output,
         }
-        for element in elements:
-            if not element.evidence:
-                raise ValueError(f"semantic element {element.id} requires source evidence")
-            for evidence in element.evidence:
-                if evidence.source == "output" and observed_output is None:
-                    raise ValueError("input-only frames must not contain output evidence")
-                expected_prefix = (
-                    "/raw_input" if evidence.source == "input" else "/raw_observed_output"
-                )
-                if (
-                    evidence.json_pointer != expected_prefix
-                    and not evidence.json_pointer.startswith(f"{expected_prefix}/")
-                ):
-                    raise ValueError("evidence json_pointer does not match its source")
-                resolved_value = cls._resolve_json_pointer(evidence_payload, evidence.json_pointer)
-                cls._validate_text_quote(resolved_value, evidence)
-                if isinstance(resolved_value, str) and evidence.text_quote is None:
-                    raise ValueError("evidence on text must include an exact quote")
+        for collection, elements in element_collections:
+            for element_index, element in enumerate(elements):
+                if not element.evidence:
+                    raise SemanticGroundingError(
+                        SemanticGroundingDiagnostic(
+                            collection=collection,
+                            element_index=element_index,
+                            reason="element_evidence_missing",
+                        )
+                    )
+                for evidence_index, evidence in enumerate(element.evidence):
+                    cls._validate_evidence_reference(
+                        evidence_payload,
+                        observed_output,
+                        evidence,
+                        collection=collection,
+                        element_index=element_index,
+                        evidence_index=evidence_index,
+                    )
+
+    @classmethod
+    def _validate_evidence_reference(
+        cls,
+        evidence_payload: JsonValue,
+        observed_output: JsonValue,
+        evidence: EvidenceReference,
+        *,
+        collection: SemanticElementCollection,
+        element_index: int,
+        evidence_index: int,
+    ) -> None:
+        def diagnostic(reason: SemanticGroundingReason) -> SemanticGroundingDiagnostic:
+            return SemanticGroundingDiagnostic(
+                collection=collection,
+                element_index=element_index,
+                evidence_index=evidence_index,
+                json_pointer=_safe_diagnostic_json_pointer(
+                    evidence.source,
+                    evidence.json_pointer,
+                ),
+                reason=reason,
+            )
+
+        if evidence.source == "output" and observed_output is None:
+            raise SemanticGroundingError(diagnostic("output_evidence_without_output"))
+        expected_prefix = "/raw_input" if evidence.source == "input" else "/raw_observed_output"
+        if evidence.json_pointer != expected_prefix and not evidence.json_pointer.startswith(
+            f"{expected_prefix}/"
+        ):
+            raise SemanticGroundingError(diagnostic("pointer_source_mismatch"))
+        try:
+            resolved_value = cls._resolve_json_pointer(evidence_payload, evidence.json_pointer)
+        except ValueError:
+            raise SemanticGroundingError(diagnostic("pointer_unresolved")) from None
+        quote = evidence.text_quote
+        if isinstance(resolved_value, str):
+            if quote is None:
+                raise SemanticGroundingError(diagnostic("quote_missing_for_string"))
+            if quote not in resolved_value:
+                raise SemanticGroundingError(diagnostic("quote_not_exact"))
+        elif quote is not None:
+            raise SemanticGroundingError(diagnostic("quote_for_non_string"))
 
     @staticmethod
     def _resolve_json_pointer(value: JsonValue, pointer: str) -> JsonValue:
@@ -1601,16 +1811,6 @@ class SemanticModelDeconstructor:
                     continue
             raise ValueError("evidence json_pointer does not resolve")
         return cast(JsonValue, current)
-
-    @staticmethod
-    def _validate_text_quote(
-        resolved_value: JsonValue,
-        evidence: EvidenceReference,
-    ) -> None:
-        if evidence.text_quote is None:
-            return
-        if not isinstance(resolved_value, str) or evidence.text_quote not in resolved_value:
-            raise ValueError("evidence text_quote does not occur inside the selected string")
 
     @staticmethod
     def _decode_object(content: str) -> dict[str, Any]:
@@ -1643,6 +1843,13 @@ def create_semantic_model_deconstructor(
     return SemanticModelDeconstructor(settings, provider, client=client)
 
 
+def semantic_deconstructor_identity(
+    settings: DatasetSemanticSettings,
+) -> SemanticDeconstructorIdentity:
+    provider = _semantic_completion_provider(settings)
+    return _semantic_deconstructor_identity(provider.extractor_version)
+
+
 def plan_evaluator_preflight_profiles(
     settings: DatasetSemanticSettings,
 ) -> tuple[EvaluatorPreflightProfilePlan, ...]:
@@ -1651,6 +1858,7 @@ def plan_evaluator_preflight_profiles(
         EvaluatorPreflightProfilePlan(
             roles=profile.roles,
             requested_model=profile.model,
+            reasoning_mode=profile.reasoning_mode,
             max_completion_tokens=profile.max_tokens,
             required_parameters=profile.required_parameters,
         )
@@ -1692,7 +1900,8 @@ def _evaluator_preflight_profiles(
         *,
         role: Literal["deconstruct", "render", "equivalence"],
         model: str,
-        reasoning: dict[str, JsonValue],
+        reasoning_mode: SemanticReasoningMode,
+        reasoning: dict[str, JsonValue] | None,
         max_tokens: int,
         temperature: float,
         seed: int,
@@ -1708,6 +1917,7 @@ def _evaluator_preflight_profiles(
         return _EvaluatorPreflightProfile(
             roles=(role,),
             model=model,
+            reasoning_mode=reasoning_mode,
             reasoning=reasoning,
             max_tokens=max_tokens,
             temperature=temperature,
@@ -1720,7 +1930,8 @@ def _evaluator_preflight_profiles(
         profile(
             role="deconstruct",
             model=settings.model,
-            reasoning={"effort": "minimal"},
+            reasoning_mode=settings.deconstruct_reasoning,
+            reasoning=_reasoning_option(settings.deconstruct_reasoning, "minimal"),
             max_tokens=min(settings.max_output_tokens, _PREFLIGHT_MAX_TOKENS),
             temperature=0,
             seed=0,
@@ -1729,7 +1940,8 @@ def _evaluator_preflight_profiles(
         profile(
             role="render",
             model=settings.render_model,
-            reasoning={"effort": "none"},
+            reasoning_mode=settings.render_reasoning,
+            reasoning=_reasoning_option(settings.render_reasoning, "none"),
             max_tokens=min(settings.max_render_tokens, _PREFLIGHT_MAX_TOKENS),
             temperature=0.7,
             seed=render_seed,
@@ -1738,7 +1950,8 @@ def _evaluator_preflight_profiles(
         profile(
             role="equivalence",
             model=settings.equivalence_model,
-            reasoning={"effort": "low"},
+            reasoning_mode=settings.equivalence_reasoning,
+            reasoning=_reasoning_option(settings.equivalence_reasoning, "low"),
             max_tokens=min(settings.max_output_tokens, _PREFLIGHT_MAX_TOKENS),
             temperature=0,
             seed=0,
@@ -1768,6 +1981,7 @@ def _validate_evaluator_preflight(
         (
             profile.roles,
             profile.model,
+            profile.reasoning_mode,
             profile.required_parameters,
             _profile_request_options_sha256(provider, profile),
         )
@@ -1777,6 +1991,7 @@ def _validate_evaluator_preflight(
         (
             profile.roles,
             profile.requested_model,
+            profile.reasoning_mode,
             profile.required_parameters,
             profile.request_options_sha256,
         )
@@ -1820,6 +2035,7 @@ def _profile_request_options_sha256(
 ) -> str:
     request_options: dict[str, Any] = {
         "model": profile.model,
+        "reasoning_mode": profile.reasoning_mode,
         "max_tokens": profile.max_tokens,
         "temperature": profile.temperature,
         "seed": profile.seed,
