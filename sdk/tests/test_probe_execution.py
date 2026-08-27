@@ -923,9 +923,11 @@ async def test_sync_runner_is_reusable_before_result_callback_runs(
         callback: Callable[..., object],
         *args: object,
     ) -> None:
-        original_schedule_threadsafe(target_loop, callback, *args)
-        if threading.get_ident() == first_worker_ident:
+        is_first_worker = threading.get_ident() == first_worker_ident
+        if is_first_worker:
             first_result_scheduled.set()
+        original_schedule_threadsafe(target_loop, callback, *args)
+        if is_first_worker:
             release_first_worker.wait(timeout=1)
 
     def first_operation(value: str) -> str:
