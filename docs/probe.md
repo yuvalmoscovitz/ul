@@ -223,6 +223,45 @@ pointers address the normalized object and are replaced with `[PRIVATE]` in the 
 preview. The full normalized result remains private evidence. Projections are bounded to 64 KB and
 do not run code or expressions.
 
+For a nested tool-call response, construct the normalized object from declared locations instead
+of writing an adapter. This OpenAI-compatible example selects the function name and spreads the
+decoded argument object:
+
+```json
+{
+  "outcome": {
+    "schema_version": "1.0.0",
+    "compose": {
+      "schema_version": "1.0.0",
+      "fields": {
+        "action": "/choices/0/message/tool_calls/0/function/name"
+      },
+      "spread": {
+        "schema_version": "1.0.0",
+        "selector": "/choices/0/message/tool_calls/0/function/arguments",
+        "decode": "json_string",
+        "flatten": true
+      }
+    }
+  }
+}
+```
+
+`compose.fields` maps normalized field names to selectors. The optional `spread` adds fields from
+one selected object. Use `decode: "json_string"` when that object is encoded inside a string, or
+leave `decode` as `"none"` when the selected value is already an object, as in many Anthropic,
+Gemini, and custom response shapes. `flatten: true` converts nested object and array leaves into
+direct canonical fields such as `body.subject.reference` and `items[0].code`, which gives each
+grounded field one coherent action record. Choose a tool-call index explicitly when a response can
+contain several calls.
+
+Missing values, malformed JSON, duplicate keys, non-object spreads, selected/spread collisions,
+and ambiguous names after flattening fail closed before semantic evaluation. Construction is
+bounded and supports only selection, optional JSON-string decoding, spreading, and flattening. It
+does not execute a tool, infer a response shape, run expressions, or validate model-generated
+arguments against a tool schema; the target remains responsible for validating arguments before
+execution.
+
 ## 3. Inspect the smoke proof
 
 The first result includes a bounded structural summary and digest of the live raw target response,

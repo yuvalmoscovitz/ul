@@ -854,6 +854,126 @@ def test_structured_http_target_runs_real_smoke_and_campaign(
         }
 
 
+def test_http_smoke_projects_openai_tool_call_without_executable_adapter(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    received_requests: list[object] = []
+
+    class TargetHandler(BaseHTTPRequestHandler):
+        def do_POST(self) -> None:
+            content_length = int(self.headers["Content-Length"])
+            received_requests.append(json.loads(self.rfile.read(content_length)))
+            response = json.dumps(
+                {
+                    "choices": [
+                        {
+                            "message": {
+                                "tool_calls": [
+                                    {
+                                        "type": "function",
+                                        "function": {
+                                            "name": "record_observation",
+                                            "arguments": json.dumps(
+                                                {
+                                                    "ticket": 42,
+                                                    "value": "118/77 mmHg",
+                                                    "body": {
+                                                        "subject": {"reference": "Patient/123"}
+                                                    },
+                                                }
+                                            ),
+                                        },
+                                    }
+                                ]
+                            }
+                        }
+                    ]
+                }
+            ).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(response)))
+            self.end_headers()
+            self.wfile.write(response)
+
+        def log_message(self, format: str, *args: object) -> None:
+            del format, args
+
+    try:
+        server = ThreadingHTTPServer(("127.0.0.1", 0), TargetHandler)
+    except PermissionError:
+        pytest.skip("the test environment does not allow binding a loopback server")
+    server_thread = threading.Thread(target=server.serve_forever)
+    server_thread.start()
+    config = tmp_path / "tool-call-target.json"
+    config.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "adapter_tier": "isolated_response",
+                "environment_id": "tool-call-target",
+                "request_isolation_attested": True,
+                "safe_test_target_attested": True,
+                "headers_from_env": {},
+                "execute": {
+                    "url": f"http://127.0.0.1:{server.server_port}/invoke",
+                    "request_json_template": {
+                        "messages": [{"role": "user", "content": "{{input}}"}]
+                    },
+                    "response_json_pointer": "",
+                },
+                "outcome": {
+                    "compose": {
+                        "fields": {
+                            "action": "/choices/0/message/tool_calls/0/function/name",
+                        },
+                        "spread": {
+                            "selector": "/choices/0/message/tool_calls/0/function/arguments",
+                            "decode": "json_string",
+                            "flatten": True,
+                        },
+                    },
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    dataset = _write_dataset(tmp_path)
+    monkeypatch.chdir(tmp_path)
+
+    async def unexpected_preflight(*args: object, **kwargs: object) -> None:
+        raise AssertionError("semantic preflight must not run before paid confirmation")
+
+    monkeypatch.setattr(probe_module, "preflight_evaluator", unexpected_preflight)
+    try:
+        result = runner.invoke(
+            app,
+            [
+                "probe",
+                str(dataset),
+                "--target",
+                str(config),
+                "--allow-insecure-http",
+            ],
+            input="y\nn\n",
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+        server_thread.join()
+
+    assert result.exit_code == 0, result.output
+    assert received_requests == [
+        {"messages": [{"role": "user", "content": "Echo grounded example 1."}]}
+    ]
+    compact_output = "".join(result.output.split())
+    assert '"action":"record_observation"' in compact_output
+    assert '"ticket":42' in compact_output
+    assert '"value":"118/77mmHg"' in compact_output
+    assert '"body.subject.reference":"Patient/123"' in compact_output
+
+
 def test_direct_http_rejects_echoed_nonstandard_header_before_semantic_evaluation(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1143,6 +1263,7 @@ def test_run_target_receipt_records_projection_definition_and_digest(tmp_path: P
         "amount": None,
         "effects": None,
         "complete_result": None,
+        "compose": None,
         "private_json_pointers": [],
     }
     assert receipt["outcome_projection_sha256"] == resolved.config.outcome.digest
