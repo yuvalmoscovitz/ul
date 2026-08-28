@@ -2839,6 +2839,56 @@ def test_public_probe_maps_source_compatibility_before_campaign_target_invocatio
     assert (tmp_path / "target-invocations").read_text().splitlines() == ["called"]
 
 
+def test_public_probe_maps_invalid_recorded_projection_before_campaign_target_invocation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (tmp_path / "agent.py").write_text(
+        "from pathlib import Path\n\n"
+        "def run(value):\n"
+        "    with Path('target-invocations').open('a', encoding='utf-8') as stream:\n"
+        "        stream.write('called\\n')\n"
+        "    return {'result': {'action': 'lookup'}}\n",
+        encoding="utf-8",
+    )
+    dataset = tmp_path / "interactions.jsonl"
+    dataset.write_text(
+        '{"id":"case-1","input":"Look it up.","output":{"missing":true}}\n',
+        encoding="utf-8",
+    )
+    config = _write_projected_callable_config(
+        tmp_path,
+        {"schema_version": "1.0.0", "complete_result": "/result"},
+        target="agent:run",
+    )
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("UL_LIVE", "true")
+    monkeypatch.setenv("OPEN_ROUTER_API_KEY", "test-key")
+
+    async def successful_preflight(settings: object) -> object:
+        del settings
+        return _evaluator_preflight()
+
+    monkeypatch.setattr(probe_module, "preflight_evaluator", successful_preflight)
+    monkeypatch.setattr(
+        campaign_runner_module,
+        "create_semantic_model_deconstructor",
+        lambda _settings: _CleanRoomSemanticModel(),
+    )
+
+    result = runner.invoke(
+        app,
+        ["probe", str(dataset), "--target", str(config), "--limit", "1"],
+        input="y\ny\n",
+    )
+
+    assert result.exit_code == 2, result.output
+    assert "PROBE_SOURCE_OUTCOME_PROJECTION_INVALID" in result.output
+    assert "does not satisfy the target's declared outcome projection" in result.output
+    assert "Target safe to reuse: yes" in result.output
+    assert (tmp_path / "target-invocations").read_text().splitlines() == ["called"]
+
+
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX executable-script test")
 def test_command_config_uses_real_subprocess_target(
     tmp_path: Path,
