@@ -119,8 +119,28 @@ class _CleanRoomSemanticModel:
         reference_frame: SemanticFrame | None = None,
     ) -> SemanticFrame:
         if not isinstance(record, InteractionRecord):
-            assert reference_frame is not None
-            return reference_frame.model_copy(update={"interaction_id": record.id})
+            if reference_frame is not None:
+                return reference_frame.model_copy(update={"interaction_id": record.id})
+            return SemanticFrame(
+                interaction_id=record.id,
+                request_units=(
+                    RequestUnit(
+                        id="lookup-request",
+                        evidence=(
+                            EvidenceReference(
+                                source="input",
+                                json_pointer="/raw_input",
+                                text_quote=None,
+                            ),
+                        ),
+                        confidence=1,
+                        status="explicit",
+                        mode="ask",
+                        predicate="lookup",
+                    ),
+                ),
+                extractor_version="clean-room-test",
+            )
         return SemanticFrame(
             interaction_id=record.id,
             request_units=(
@@ -2456,7 +2476,8 @@ def test_public_documentation_flow_runs_real_callable_campaign_and_report(
     dataset = tmp_path / "interactions.jsonl"
     dataset.write_text(
         '{"id":"case-1","input":"Return the status for ticket 42.",'
-        '"output":{"action":"lookup","ticket":42}}\n',
+        '"output":{"result":{"action":"lookup","ticket":42,'
+        '"customer":{"email":"private@example.test"}}}}\n',
         encoding="utf-8",
     )
     config = _write_projected_callable_config(
@@ -2589,7 +2610,7 @@ def test_campaign_projection_failure_retains_exact_reason_and_partial_work(
     dataset = tmp_path / "interactions.jsonl"
     dataset.write_text(
         '{"id":"case-1","input":"Return the status for ticket 42.",'
-        '"output":{"action":"lookup","ticket":42}}\n',
+        '"output":{"result":{"action":"lookup","ticket":42}}}\n',
         encoding="utf-8",
     )
     config = _write_projected_callable_config(
