@@ -1488,6 +1488,7 @@ def evaluate_dataset(
                 loaded_target_config,
                 test_environment_confirmed=True,
                 allow_insecure_http=allow_insecure_http,
+                timeout_seconds=target_timeout_seconds,
                 max_environment_api_calls=max_environment_api_calls,
             )
     except ValueError as error:
