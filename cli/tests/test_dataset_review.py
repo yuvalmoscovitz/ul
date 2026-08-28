@@ -502,6 +502,91 @@ def test_decide_can_record_non_consequential_variance_without_prompt(tmp_path: P
     assert "Consequence: non-consequential variance" in report.output
 
 
+def test_decide_supersedes_an_existing_advanced_review(tmp_path: Path) -> None:
+    evidence = tmp_path / "evidence.jsonl"
+    _write_evidence(evidence)
+
+    advanced_review = runner.invoke(app, _review_arguments(evidence))
+    assert advanced_review.exit_code == 0, advanced_review.output
+    active_review = _read_reviews(tmp_path / "evidence.reviews.jsonl")[0]
+
+    report = runner.invoke(app, ["dataset", "report", str(evidence)])
+    assert report.exit_code == 0, report.output
+    assert "Consequence: unreviewed" in report.output
+    assert f"--supersedes {active_review['review_id']}" in report.output
+
+    decision = runner.invoke(
+        app,
+        [
+            "dataset",
+            "decide",
+            str(evidence),
+            FINDING_ID,
+            "--not-consequential",
+            "--supersedes",
+            active_review["review_id"],
+        ],
+    )
+
+    assert decision.exit_code == 0, decision.output
+    replacement = _read_reviews(tmp_path / "evidence.reviews.jsonl")[1]
+    assert replacement["consequential"] is False
+    assert replacement["supersedes_review_id"] == active_review["review_id"]
+
+
+def test_decide_can_replace_an_existing_consequence_decision(tmp_path: Path) -> None:
+    evidence = tmp_path / "evidence.jsonl"
+    _write_evidence(evidence)
+    sidecar = tmp_path / "evidence.reviews.jsonl"
+
+    first_decision = runner.invoke(
+        app,
+        ["dataset", "decide", str(evidence), FINDING_ID, "--consequential"],
+    )
+    assert first_decision.exit_code == 0, first_decision.output
+    first_review = _read_reviews(sidecar)[0]
+
+    replacement_decision = runner.invoke(
+        app,
+        [
+            "dataset",
+            "decide",
+            str(evidence),
+            FINDING_ID,
+            "--not-consequential",
+            "--supersedes",
+            first_review["review_id"],
+        ],
+    )
+
+    assert replacement_decision.exit_code == 0, replacement_decision.output
+    reviews = _read_reviews(sidecar)
+    assert reviews[1]["consequential"] is False
+    assert reviews[1]["supersedes_review_id"] == first_review["review_id"]
+
+    restored_decision = runner.invoke(
+        app,
+        [
+            "dataset",
+            "decide",
+            str(evidence),
+            FINDING_ID,
+            "--consequential",
+            "--supersedes",
+            reviews[1]["review_id"],
+        ],
+    )
+
+    assert restored_decision.exit_code == 0, restored_decision.output
+    restored_review = _read_reviews(sidecar)[2]
+    assert restored_review["consequential"] is True
+    assert restored_review["supersedes_review_id"] == reviews[1]["review_id"]
+    report = runner.invoke(app, ["dataset", "report", str(evidence)])
+    assert (
+        "Consequence decisions: unreviewed=0, consequential=1, non_consequential=0" in report.output
+    )
+
+
 def test_decide_does_not_record_an_empty_answer(tmp_path: Path) -> None:
     evidence = tmp_path / "evidence.jsonl"
     _write_evidence(evidence)

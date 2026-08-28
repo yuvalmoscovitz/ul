@@ -1960,10 +1960,15 @@ def report_dataset_evidence(
             )
         _print_plain(f"Consequence: {consequence}")
         if consequence == "unreviewed" and indexed_finding.kind == "semantic_difference":
+            supersedes_argument = (
+                f" --supersedes {shlex.quote(latest_review.review_id)}"
+                if latest_review is not None
+                else ""
+            )
             _print_plain(
                 "Next: "
                 f"ul dataset decide {shlex.quote(str(evidence))} "
-                f"{shlex.quote(indexed_finding.finding_id)}"
+                f"{shlex.quote(indexed_finding.finding_id)}{supersedes_argument}"
             )
         _print_plain(f"Evidence record SHA-256: {loaded_record.sha256}")
 
@@ -2065,6 +2070,10 @@ def decide_dataset_variance(
         Path | None,
         typer.Option(help="Review JSONL; defaults to EVIDENCE with .reviews.jsonl suffix."),
     ] = None,
+    supersedes: Annotated[
+        str | None,
+        typer.Option(help="Active review ID to replace."),
+    ] = None,
 ) -> None:
     """Decide whether one observed baseline-versus-variation difference is consequential."""
     reviews_path = reviews or _default_reviews_path(evidence)
@@ -2101,6 +2110,7 @@ def decide_dataset_variance(
             ),
             reviewed_at=datetime.now(UTC),
             consequential=consequential,
+            supersedes_review_id=supersedes,
         )
         _store_occurrence_review(
             evidence=evidence,
