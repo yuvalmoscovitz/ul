@@ -659,11 +659,14 @@ def _print_human_report(report: UnifiedReport, evidence: Path) -> None:
             typer.echo(f"  Violated repetitions: {finding.violated_repetitions}")
         if finding.next_action == "review_dataset_finding":
             evidence_argument = quoted_evidence or "EVIDENCE"
-            typer.echo(
-                "  Next: "
-                f"ul dataset review {evidence_argument} {finding.finding_id} "
-                "--status STATUS --reviewer REVIEWER --reason REASON"
-            )
+            if finding.kind == "customer_invariant_violation":
+                typer.echo(
+                    "  Next: "
+                    f"ul dataset review {evidence_argument} {finding.finding_id} "
+                    "--status STATUS --reviewer REVIEWER --reason REASON"
+                )
+            else:
+                typer.echo(f"  Next: ul dataset decide {evidence_argument} {finding.finding_id}")
         elif finding.next_action == "inspect_dataset_evidence":
             typer.echo(f"  Next: ul dataset report {quoted_evidence or 'EVIDENCE'}")
         else:

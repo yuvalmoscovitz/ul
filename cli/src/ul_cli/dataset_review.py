@@ -892,7 +892,7 @@ def _canonical_json_sha256(value: object) -> str:
 
 class ReviewRecord(_StrictModel):
     record_type: Literal["occurrence_review"] = Field(default="occurrence_review", exclude=True)
-    schema_version: Literal["1.0.0"] = "1.0.0"
+    schema_version: Literal["1.0.0", "1.1.0"] = "1.0.0"
     review_id: str = Field(pattern=_REVIEW_ID_PATTERN)
     evidence_record_sha256: str = Field(pattern=_SHA256_PATTERN)
     finding_id: str = Field(pattern=_FINDING_ID_PATTERN)
@@ -901,6 +901,7 @@ class ReviewRecord(_StrictModel):
     reviewer: str = Field(min_length=1, max_length=200)
     reason: str = Field(min_length=1, max_length=4000)
     reviewed_at: datetime
+    consequential: bool | None = cast(Any, Field)(default=None, exclude_if=_is_none)
     supersedes_review_id: str | None = Field(default=None, pattern=_REVIEW_ID_PATTERN)
     origin_pattern_review_id: str | None = cast(Any, Field)(
         default=None,
@@ -914,6 +915,14 @@ class ReviewRecord(_StrictModel):
             raise ValueError("reviewer and reason must contain non-whitespace text")
         if self.status != "confirmed" and self.severity != "unrated":
             raise ValueError("only confirmed findings can have a rated severity")
+        if self.consequential is not None:
+            expected_status = "confirmed" if self.consequential else "expected"
+            if self.schema_version != "1.1.0" or self.status != expected_status:
+                raise ValueError("consequence decisions require schema 1.1 and matching status")
+            if self.severity != "unrated":
+                raise ValueError("consequence decisions do not assign severity")
+        elif self.schema_version == "1.1.0":
+            raise ValueError("schema 1.1 reviews require a consequence decision")
         if self.reviewed_at.tzinfo is None or self.reviewed_at.utcoffset() != UTC.utcoffset(None):
             raise ValueError("reviewed_at must use UTC")
         return self
@@ -1818,6 +1827,22 @@ def report_dataset_evidence(
         active_review = active_reviews.get(indexed_finding.finding_id)
         status_counts[active_review.status if active_review else "needs_review"] += 1
 
+    consequence_counts = {
+        "unreviewed": 0,
+        "consequential": 0,
+        "non_consequential": 0,
+    }
+    for indexed_finding in findings.values():
+        if indexed_finding.kind != "semantic_difference":
+            continue
+        active_review = active_reviews.get(indexed_finding.finding_id)
+        if active_review is None or active_review.consequential is None:
+            consequence_counts["unreviewed"] += 1
+        elif active_review.consequential:
+            consequence_counts["consequential"] += 1
+        else:
+            consequence_counts["non_consequential"] += 1
+
     _print_plain(f"Dataset finding report: {len(findings)} finding(s)")
     evaluation_mode = _dataset_evaluation_mode(evidence_records, source_failures)
     if evaluation_mode is not None:
@@ -1827,6 +1852,10 @@ def report_dataset_evidence(
         )
     _print_plain(
         "Reviews: " + ", ".join(f"{status}={count}" for status, count in status_counts.items())
+    )
+    _print_plain(
+        "Consequence decisions: "
+        + ", ".join(f"{status}={count}" for status, count in consequence_counts.items())
     )
     _print_plain(f"Source preparation failures: {len(source_failures)}")
     for source_failure in source_failures:
@@ -1920,6 +1949,22 @@ def report_dataset_evidence(
                 f"(history: {len(matching_reviews)})"
             )
             _print_plain(f"Review reason: {latest_review.reason}")
+        consequence = "not applicable"
+        if indexed_finding.kind == "semantic_difference":
+            consequence = (
+                "unreviewed"
+                if latest_review is None or latest_review.consequential is None
+                else "failure"
+                if latest_review.consequential
+                else "non-consequential variance"
+            )
+        _print_plain(f"Consequence: {consequence}")
+        if consequence == "unreviewed" and indexed_finding.kind == "semantic_difference":
+            _print_plain(
+                "Next: "
+                f"ul dataset decide {shlex.quote(str(evidence))} "
+                f"{shlex.quote(indexed_finding.finding_id)}"
+            )
         _print_plain(f"Evidence record SHA-256: {loaded_record.sha256}")
 
     invariant_evaluations = [
@@ -1949,9 +1994,154 @@ def report_dataset_evidence(
         "unsupported=machine claim not supported; inconclusive=insufficient context."
     )
     _print_plain(
+        "Consequence decision: yes=observed variance is a failure; "
+        "no=observed variance is non-consequential."
+    )
+    _print_plain(
         "Limitation: UL reports observed differences. A human review is a contextual judgment, "
         "not proof of correctness, causation, or production frequency."
     )
+
+
+def _store_occurrence_review(
+    *,
+    evidence: Path,
+    evidence_records: list[_LoadedEvidenceRecord],
+    findings: dict[str, _IndexedFinding],
+    reviews_path: Path,
+    new_review: ReviewRecord,
+) -> None:
+    with _locked_reviews_file(reviews_path) as locked_reviews:
+        review_records = _read_reviews_descriptor(locked_reviews.descriptor)
+        _validate_review_history(
+            review_records,
+            findings,
+            evidence_records,
+            review_history_key=_review_history_key_for_records(evidence, review_records),
+        )
+        active_review = _active_reviews(review_records).get(new_review.finding_id)
+        if active_review is None and new_review.supersedes_review_id is not None:
+            raise _ReviewInputError("--supersedes is only valid when replacing an active review")
+        if active_review is not None and new_review.supersedes_review_id != active_review.review_id:
+            raise _ReviewInputError(
+                f"finding already has an active review; pass --supersedes {active_review.review_id}"
+            )
+        encoded_review = (
+            json.dumps(
+                new_review.model_dump(mode="json"),
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+            + "\n"
+        ).encode()
+        if (
+            os.fstat(locked_reviews.descriptor).st_size + len(encoded_review)
+            > _MAXIMUM_REVIEWS_BYTES
+        ):
+            raise _ReviewInputError("review file exceeds the 10 MB limit")
+        _append_review_atomically(locked_reviews, encoded_review)
+
+
+def decide_dataset_variance(
+    evidence: Annotated[
+        Path,
+        typer.Argument(
+            exists=True, dir_okay=False, readable=True, help="Evaluation evidence JSONL."
+        ),
+    ],
+    finding_id: Annotated[str, typer.Argument(help="Finding ID shown by 'ul dataset report'.")],
+    consequential: Annotated[
+        bool | None,
+        typer.Option(
+            "--consequential/--not-consequential",
+            help="Record the decision without an interactive prompt.",
+        ),
+    ] = None,
+    reviewer: Annotated[
+        str,
+        typer.Option(help="Person or team making the decision."),
+    ] = "local-reviewer",
+    reviews: Annotated[
+        Path | None,
+        typer.Option(help="Review JSONL; defaults to EVIDENCE with .reviews.jsonl suffix."),
+    ] = None,
+) -> None:
+    """Decide whether one observed baseline-versus-variation difference is consequential."""
+    reviews_path = reviews or _default_reviews_path(evidence)
+    try:
+        evidence_records = _load_evidence(evidence)
+        findings = _index_findings(evidence_records)
+        selected = findings.get(finding_id)
+        if selected is None:
+            raise _ReviewInputError("finding ID was not found in the evidence")
+        if selected.kind != "semantic_difference" or selected.semantic_finding is None:
+            raise _ReviewInputError("consequence decisions apply only to observed variances")
+        loaded_record = selected.evidence_record
+        finding = selected.semantic_finding
+        _print_plain(f"Finding {finding_id}")
+        _print_plain(f"Observed difference: {finding.summary}")
+        _print_plain(f"Original: {loaded_record.evidence.original_input}")
+        _print_plain(f"Variation: {selected.case.augmented_input}")
+        _print_plain("Original effects: " + _effects_summary(finding.reference_effects))
+        _print_plain("Variation effects: " + _effects_summary(finding.observed_effects))
+        _print_plain("Question: Would this observed difference matter in your application?")
+        if consequential is None:
+            consequential = _prompt_consequence_decision()
+        new_review = ReviewRecord(
+            schema_version="1.1.0",
+            review_id=f"ulr_{uuid4()}",
+            evidence_record_sha256=loaded_record.sha256,
+            finding_id=finding_id,
+            status="confirmed" if consequential else "expected",
+            reviewer=reviewer,
+            reason=(
+                "Reviewer marked the observed variance consequential."
+                if consequential
+                else "Reviewer marked the observed variance non-consequential."
+            ),
+            reviewed_at=datetime.now(UTC),
+            consequential=consequential,
+        )
+        _store_occurrence_review(
+            evidence=evidence,
+            evidence_records=evidence_records,
+            findings=findings,
+            reviews_path=reviews_path,
+            new_review=new_review,
+        )
+    except (
+        ValidationError,
+        PatternIdentityKeyError,
+        ReviewHistoryKeyError,
+        _ReviewInputError,
+    ) as error:
+        message = (
+            "decision fields are invalid" if isinstance(error, ValidationError) else str(error)
+        )
+        raise typer.BadParameter(message) from None
+    except _ReviewCommitUncertainError:
+        raise typer.BadParameter(
+            "decision was recorded but directory durability could not be confirmed; "
+            "inspect the review history before retrying"
+        ) from None
+    except OSError as error:
+        raise typer.BadParameter(
+            f"cannot safely update review file ({error.__class__.__name__})"
+        ) from None
+
+    decision = "failure" if consequential else "non-consequential variance"
+    _print_plain(f"Recorded decision {new_review.review_id}: {decision}")
+    _print_plain(f"Review history: {reviews_path}")
+
+
+def _prompt_consequence_decision() -> bool:
+    while True:
+        answer = typer.prompt("Is this consequential? [y/n]").strip().lower()
+        if answer in {"y", "yes"}:
+            return True
+        if answer in {"n", "no"}:
+            return False
+        _print_plain("Answer yes or no.")
 
 
 def review_dataset_finding(
@@ -1998,36 +2188,13 @@ def review_dataset_finding(
             reviewed_at=datetime.now(UTC),
             supersedes_review_id=supersedes,
         )
-        with _locked_reviews_file(reviews_path) as locked_reviews:
-            review_records = _read_reviews_descriptor(locked_reviews.descriptor)
-            _validate_review_history(
-                review_records,
-                findings,
-                evidence_records,
-                review_history_key=_review_history_key_for_records(evidence, review_records),
-            )
-            active_review = _active_reviews(review_records).get(finding_id)
-            if active_review is None and supersedes is not None:
-                raise _ReviewInputError(
-                    "--supersedes is only valid when replacing an active review"
-                )
-            if active_review is not None and supersedes != active_review.review_id:
-                raise _ReviewInputError(
-                    "finding already has an active review; pass --supersedes "
-                    f"{active_review.review_id}"
-                )
-            encoded_review = (
-                json.dumps(
-                    new_review.model_dump(mode="json"), ensure_ascii=False, separators=(",", ":")
-                )
-                + "\n"
-            ).encode()
-            if (
-                os.fstat(locked_reviews.descriptor).st_size + len(encoded_review)
-                > _MAXIMUM_REVIEWS_BYTES
-            ):
-                raise _ReviewInputError("review file exceeds the 10 MB limit")
-            _append_review_atomically(locked_reviews, encoded_review)
+        _store_occurrence_review(
+            evidence=evidence,
+            evidence_records=evidence_records,
+            findings=findings,
+            reviews_path=reviews_path,
+            new_review=new_review,
+        )
     except (
         ValidationError,
         PatternIdentityKeyError,

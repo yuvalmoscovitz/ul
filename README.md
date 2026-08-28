@@ -178,6 +178,17 @@ preview uses an intentionally defective synthetic agent; it is not evidence abou
 Real probe evidence keeps the original input, variation, responses, and provenance private. The
 default report exposes a bounded explanation and marks the behavior change for human review.
 
+Review a dataset variance without supplying a correct answer, rubric, or severity:
+
+```console
+ul dataset report evidence.jsonl
+ul dataset decide evidence.jsonl FINDING_ID
+```
+
+UL shows the original and varied behavior, then asks only whether the observed difference is
+consequential. A yes records a failure, a no records a non-consequential variance, and no answer
+leaves the finding unreviewed. Review decisions are stored separately from the original evidence.
+
 ## Safety and privacy
 
 - Use only isolated, disposable test targets. Never probe production systems.

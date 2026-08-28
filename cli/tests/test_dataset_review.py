@@ -421,6 +421,103 @@ def test_report_review_report_journey_preserves_evidence_and_history(tmp_path: P
     assert "history: 2" in final_report.output
 
 
+def test_report_decide_report_journey_records_consequential_failure(tmp_path: Path) -> None:
+    evidence = tmp_path / "evidence.jsonl"
+    original_bytes = _write_evidence(evidence)
+    sidecar = tmp_path / "evidence.reviews.jsonl"
+
+    initial_report = runner.invoke(app, ["dataset", "report", str(evidence)])
+
+    assert initial_report.exit_code == 0, initial_report.output
+    assert (
+        "Consequence decisions: unreviewed=1, consequential=0, non_consequential=0"
+        in initial_report.output
+    )
+    assert "Next: ul dataset decide" in initial_report.output
+    assert FINDING_ID in initial_report.output
+
+    decision = runner.invoke(
+        app,
+        ["dataset", "decide", str(evidence), FINDING_ID],
+        input="y\n",
+    )
+
+    assert decision.exit_code == 0, decision.output
+    assert "Original: Pay AC-100." in decision.output
+    assert "Variation: Pay pay AC-100." in decision.output
+    assert '"invoice_reference": "AC-100"' in decision.output
+    assert '"invoice_reference": "AC-101"' in decision.output
+    assert "Is this consequential? [y/n]: y" in decision.output
+    assert ": failure" in decision.output
+    assert evidence.read_bytes() == original_bytes
+    record = _read_reviews(sidecar)[0]
+    assert record["schema_version"] == "1.1.0"
+    assert record["consequential"] is True
+    assert record["status"] == "confirmed"
+    assert record["severity"] == "unrated"
+    assert record["reviewer"] == "local-reviewer"
+    assert record["reason"] == "Reviewer marked the observed variance consequential."
+
+    reviewed_report = runner.invoke(app, ["dataset", "report", str(evidence)])
+
+    assert reviewed_report.exit_code == 0, reviewed_report.output
+    assert (
+        "Consequence decisions: unreviewed=0, consequential=1, non_consequential=0"
+        in reviewed_report.output
+    )
+    assert "Consequence: failure" in reviewed_report.output
+
+
+def test_decide_can_record_non_consequential_variance_without_prompt(tmp_path: Path) -> None:
+    evidence = tmp_path / "evidence.jsonl"
+    _write_evidence(evidence)
+
+    decision = runner.invoke(
+        app,
+        [
+            "dataset",
+            "decide",
+            str(evidence),
+            FINDING_ID,
+            "--not-consequential",
+            "--reviewer",
+            "risk-team",
+        ],
+    )
+
+    assert decision.exit_code == 0, decision.output
+    assert "Is this consequential?" not in decision.output
+    assert "Recorded decision" in decision.output
+    record = _read_reviews(tmp_path / "evidence.reviews.jsonl")[0]
+    assert record["consequential"] is False
+    assert record["status"] == "expected"
+    assert record["reviewer"] == "risk-team"
+
+    report = runner.invoke(app, ["dataset", "report", str(evidence)])
+
+    assert report.exit_code == 0, report.output
+    assert (
+        "Consequence decisions: unreviewed=0, consequential=0, non_consequential=1" in report.output
+    )
+    assert "Consequence: non-consequential variance" in report.output
+
+
+def test_decide_does_not_record_an_empty_answer(tmp_path: Path) -> None:
+    evidence = tmp_path / "evidence.jsonl"
+    _write_evidence(evidence)
+    sidecar = tmp_path / "evidence.reviews.jsonl"
+
+    decision = runner.invoke(
+        app,
+        ["dataset", "decide", str(evidence), FINDING_ID],
+        input="\n",
+    )
+
+    assert decision.exit_code != 0
+    assert decision.output.count("Is this consequential? [y/n]:") == 2
+    assert not sidecar.exists()
+
+
 def test_root_json_report_is_stable_and_omits_private_dataset_fields(tmp_path: Path) -> None:
     evidence = tmp_path / "evidence.jsonl"
     _write_evidence(evidence)
@@ -1343,7 +1440,7 @@ def test_root_report_uses_a_placeholder_in_windows_commands(
     report = runner.invoke(app, ["report", str(evidence)])
 
     assert report.exit_code == 1, report.output
-    assert f"ul dataset review EVIDENCE {FINDING_ID}" in report.output
+    assert f"ul dataset decide EVIDENCE {FINDING_ID}" in report.output
     assert "ul dataset report EVIDENCE" in report.output
     assert f"ul dataset review {evidence}" not in report.output
 
@@ -1431,6 +1528,11 @@ def test_report_schema_1_4_shows_customer_invariants_separately(tmp_path: Path) 
     assert report.exit_code == 0, report.output
     normalized_output = " ".join(report.output.split())
     assert "Dataset finding report: 2 finding(s)" in normalized_output
+    assert (
+        "Consequence decisions: unreviewed=1, consequential=0, non_consequential=0"
+        in normalized_output
+    )
+    assert "Consequence: not applicable" in normalized_output
     assert "Category: customer_invariant_violation" in normalized_output
     assert "Rule transition: original=satisfied; variation=violated" in normalized_output
     assert "Customer invariant evaluation" in normalized_output
@@ -1441,6 +1543,13 @@ def test_report_schema_1_4_shows_customer_invariants_separately(tmp_path: Path) 
         in normalized_output
     )
     assert "Description: Final amount equals the corrected amount." in normalized_output
+
+    root_report = runner.invoke(app, ["report", str(evidence)])
+
+    assert root_report.exit_code == 1, root_report.output
+    assert "ul dataset decide" in root_report.output
+    assert "ul dataset review" in root_report.output
+    assert "--status STATUS --reviewer REVIEWER --reason REASON" in root_report.output
     assert "reason=one_or_more_trials_violated" in normalized_output
     assert "satisfied=0, violated=3, not_evaluable=0" in normalized_output
     assert "selected_values=" not in normalized_output
