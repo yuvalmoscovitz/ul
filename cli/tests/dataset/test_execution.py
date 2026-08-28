@@ -182,17 +182,29 @@ class _WrappedActionFieldSemanticModel(_LocalEvaluationSemanticModel):
         wrapped_outcomes = tuple(
             outcome.model_copy(
                 update={
+                    "evidence": (
+                        EvidenceReference(
+                            source="output",
+                            json_pointer="/raw_observed_output/actions/0",
+                            text_quote=None,
+                        ),
+                    ),
                     "fields": {
-                        "ticket": {
-                            "value": 42,
+                        name: {
+                            "value": value,
                             "evidence": [
                                 {
                                     "source": "output",
-                                    "json_pointer": "/raw_observed_output/ticket",
+                                    "json_pointer": f"/raw_observed_output/actions/0/{name}",
                                 }
                             ],
                         }
-                    }
+                        for name, value in {
+                            "ticket": 42,
+                            "body.intent": "order",
+                            "body.note.text": "Return status for ticket 42.",
+                        }.items()
+                    },
                 }
             )
             for outcome in frame.outcomes
@@ -324,18 +336,40 @@ def test_full_dataset_evaluation_runs_local_callable_through_worker_boundary(
 ) -> None:
     dataset = tmp_path / "interactions.jsonl"
     output = tmp_path / "results.jsonl"
+    canonical_action = {
+        "action": "lookup",
+        "ticket": 42,
+        "body.intent": "order",
+        "body.note.text": "Return status for ticket 42.",
+    }
+    recorded_output = (
+        {"actions": [canonical_action]}
+        if wrapped_action_fields
+        else {"action": "lookup", "ticket": 42}
+    )
     dataset.write_text(
-        '{"id":"case-1","input":"Return status for ticket 42.",'
-        '"output":{"action":"lookup","ticket":42}}\n',
+        json.dumps(
+            {
+                "id": "case-1",
+                "input": "Return status for ticket 42.",
+                "output": recorded_output,
+            }
+        )
+        + "\n",
         encoding="utf-8",
     )
     function_prefix = "async " if asynchronous else ""
     await_statement = "    await asyncio.sleep(0)\n" if asynchronous else ""
+    returned_output = (
+        repr({"actions": [canonical_action]})
+        if wrapped_action_fields
+        else "{'action': 'lookup', 'ticket': 42, 'received': value}"
+    )
     (tmp_path / "customer_agent.py").write_text(
         "import asyncio\n\n"
         f"{function_prefix}def run(value):\n"
         f"{await_statement}"
-        "    return {'action': 'lookup', 'ticket': 42, 'received': value}\n",
+        f"    return {returned_output}\n",
         encoding="utf-8",
     )
     monkeypatch.chdir(tmp_path)
@@ -390,18 +424,24 @@ def test_full_dataset_evaluation_runs_local_callable_through_worker_boundary(
     assert len(saved["technical_details"]["baseline"]["trial_set"]["trials"]) == 2
     assert saved["technical_details"]["baseline"]["verdict"] == "no_divergence"
     assert saved["technical_details"]["cases"][0]["verdict"] == "no_divergence"
+    observed_fields = saved["technical_details"]["baseline"]["trial_set"]["trials"][0][
+        "observed_frame"
+    ]["outcomes"][0]["fields"]
+    assert observed_fields["ticket"] == 42
+    if wrapped_action_fields:
+        assert observed_fields == {
+            "ticket": 42,
+            "body.intent": "order",
+            "body.note.text": "Return status for ticket 42.",
+        }
+    final_response = saved["technical_details"]["baseline"]["trial_set"]["trials"][0][
+        "execution_evidence"
+    ]["final_response"]
     assert (
-        saved["technical_details"]["baseline"]["trial_set"]["trials"][0]["observed_frame"][
-            "outcomes"
-        ][0]["fields"]["ticket"]
-        == 42
-    )
-    assert (
-        saved["technical_details"]["baseline"]["trial_set"]["trials"][0]["execution_evidence"][
-            "final_response"
-        ]["ticket"]
-        == 42
-    )
+        final_response["actions"][0]["ticket"]
+        if wrapped_action_fields
+        else final_response["ticket"]
+    ) == 42
     if not asynchronous:
         missing_target_resume = runner.invoke(
             root_app,

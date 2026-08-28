@@ -1496,25 +1496,53 @@ async def test_generated_schema_explains_exact_grounding_contract() -> None:
 
 
 @pytest.mark.parametrize(
-    ("evidence_pointer", "text_quote"),
+    ("raw_observed_output", "evidence_pointer", "text_quote", "expected_fields"),
     [
-        ("/raw_observed_output", None),
-        ("/raw_observed_output/action", "pay_invoice"),
+        (
+            {
+                "action": "pay_invoice",
+                "invoice_id": "INV-104",
+                "structured": {"ignored": "not a primitive sibling"},
+            },
+            "/raw_observed_output",
+            None,
+            {"invoice_id": "INV-104"},
+        ),
+        (
+            {"action": "pay_invoice", "invoice_id": "INV-104"},
+            "/raw_observed_output/action",
+            "pay_invoice",
+            {"invoice_id": "INV-104"},
+        ),
+        (
+            {
+                "actions": [
+                    {
+                        "action": "pay_invoice",
+                        "invoice_id": "INV-104",
+                        "body.intent": "order",
+                        "body.note.text": "Pay invoice INV-104",
+                    }
+                ]
+            },
+            "/raw_observed_output/actions/0",
+            None,
+            {
+                "invoice_id": "INV-104",
+                "body.intent": "order",
+                "body.note.text": "Pay invoice INV-104",
+            },
+        ),
     ],
 )
 async def test_deconstruct_derives_action_fields_from_exact_evidenced_record(
+    raw_observed_output: dict[str, object],
     evidence_pointer: str,
     text_quote: str | None,
+    expected_fields: dict[str, object],
 ) -> None:
     observed_interaction = interaction().model_copy(
-        update={
-            "raw_observed_output": {
-                "action": "pay_invoice",
-                "invoice_id": "INV-104",
-                "approved": True,
-                "structured": {"ignored": "not a primitive sibling"},
-            }
-        }
+        update={"raw_observed_output": raw_observed_output}
     )
     wrapped_outcome = {
         **cast(list[dict[str, object]], frame_payload()["outcomes"])[0],
@@ -1526,10 +1554,11 @@ async def test_deconstruct_derives_action_fields_from_exact_evidenced_record(
             }
         ],
         "fields": {
-            "invoice_id": {
-                "value": "INV-104",
-                "evidence": [{"json_pointer": "/raw_observed_output/invoice_id"}],
+            name: {
+                "value": value,
+                "evidence": [{"json_pointer": f"{evidence_pointer}/{name}"}],
             }
+            for name, value in expected_fields.items()
         },
     }
     client = mock_client(
@@ -1539,7 +1568,7 @@ async def test_deconstruct_derives_action_fields_from_exact_evidenced_record(
     async with create_semantic_model_deconstructor(settings(), client=client) as deconstructor:
         frame = await deconstructor.deconstruct(observed_interaction)
 
-    assert frame.outcomes[0].fields == {"invoice_id": "INV-104"}
+    assert frame.outcomes[0].fields == expected_fields
     await client.aclose()
 
 
