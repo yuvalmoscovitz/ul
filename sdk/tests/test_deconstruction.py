@@ -652,7 +652,7 @@ async def test_deconstruct_sends_one_bounded_strict_structured_request() -> None
     assert not client.is_closed
     assert frame.interaction_id == "interaction-1"
     assert frame.schema_version == "1.0.0"
-    assert frame.extractor_version == "semantic-deconstructor/2.0.0"
+    assert frame.extractor_version == "semantic-deconstructor/2.1.0"
     assert frame.metadata == {
         "semantic_provider": "openrouter",
         "semantic_protocol": "openai-chat-completions",
@@ -807,7 +807,7 @@ async def test_openai_compatible_deconstruction_uses_generic_chat_contract() -> 
     ) as deconstructor:
         frame = await deconstructor.deconstruct(interaction())
 
-    assert frame.extractor_version == "semantic-deconstructor/2.0.0"
+    assert frame.extractor_version == "semantic-deconstructor/2.1.0"
     assert frame.metadata["semantic_provider"] == "customer-model-gateway"
     assert frame.metadata["semantic_protocol"] == "openai-chat-completions"
     assert frame.metadata["semantic_endpoint_sha256"] == (
@@ -1495,11 +1495,153 @@ async def test_generated_schema_explains_exact_grounding_contract() -> None:
     assert "never wrap values" in outcome_properties["fields"]["description"]
 
 
+@pytest.mark.parametrize(
+    ("evidence_pointer", "text_quote"),
+    [
+        ("/raw_observed_output", None),
+        ("/raw_observed_output/action", "pay_invoice"),
+    ],
+)
+async def test_deconstruct_derives_action_fields_from_exact_evidenced_record(
+    evidence_pointer: str,
+    text_quote: str | None,
+) -> None:
+    observed_interaction = interaction().model_copy(
+        update={
+            "raw_observed_output": {
+                "action": "pay_invoice",
+                "invoice_id": "INV-104",
+                "approved": True,
+                "structured": {"ignored": "not a primitive sibling"},
+            }
+        }
+    )
+    wrapped_outcome = {
+        **cast(list[dict[str, object]], frame_payload()["outcomes"])[0],
+        "evidence": [
+            {
+                "source": "output",
+                "json_pointer": evidence_pointer,
+                "text_quote": text_quote,
+            }
+        ],
+        "fields": {
+            "invoice_id": {
+                "value": "INV-104",
+                "evidence": [{"json_pointer": "/raw_observed_output/invoice_id"}],
+            }
+        },
+    }
+    client = mock_client(
+        lambda request: completion(json.dumps({**frame_payload(), "outcomes": [wrapped_outcome]}))
+    )
+
+    async with create_semantic_model_deconstructor(settings(), client=client) as deconstructor:
+        frame = await deconstructor.deconstruct(observed_interaction)
+
+    assert frame.outcomes[0].fields == {"invoice_id": "INV-104"}
+    await client.aclose()
+
+
+async def test_deconstruct_does_not_derive_fields_from_ambiguous_action_evidence() -> None:
+    observed_interaction = interaction().model_copy(
+        update={
+            "raw_observed_output": {
+                "actions": [
+                    {"action": "pay_invoice", "invoice_id": "INV-104"},
+                    {"action": "pay_invoice", "invoice_id": "INV-105"},
+                ]
+            }
+        }
+    )
+    wrapped_fields = {"invoice_id": {"value": "INV-104"}}
+    ambiguous_outcome = {
+        **cast(list[dict[str, object]], frame_payload()["outcomes"])[0],
+        "evidence": [
+            {
+                "source": "output",
+                "json_pointer": f"/raw_observed_output/actions/{index}",
+                "text_quote": None,
+            }
+            for index in range(2)
+        ],
+        "fields": wrapped_fields,
+    }
+    client = mock_client(
+        lambda request: completion(json.dumps({**frame_payload(), "outcomes": [ambiguous_outcome]}))
+    )
+
+    async with create_semantic_model_deconstructor(settings(), client=client) as deconstructor:
+        frame = await deconstructor.deconstruct(observed_interaction)
+
+    assert frame.outcomes[0].fields == wrapped_fields
+    await client.aclose()
+
+
+async def test_deconstruct_does_not_infer_raw_tool_call_structure() -> None:
+    observed_interaction = interaction().model_copy(
+        update={
+            "raw_observed_output": {
+                "name": "pay_invoice",
+                "arguments": {"invoice_id": "INV-104"},
+            }
+        }
+    )
+    wrapped_fields = {"invoice_id": {"value": "INV-104"}}
+    raw_tool_outcome = {
+        **cast(list[dict[str, object]], frame_payload()["outcomes"])[0],
+        "evidence": [
+            {
+                "source": "output",
+                "json_pointer": "/raw_observed_output",
+                "text_quote": None,
+            }
+        ],
+        "fields": wrapped_fields,
+    }
+    client = mock_client(
+        lambda request: completion(json.dumps({**frame_payload(), "outcomes": [raw_tool_outcome]}))
+    )
+
+    async with create_semantic_model_deconstructor(settings(), client=client) as deconstructor:
+        frame = await deconstructor.deconstruct(observed_interaction)
+
+    assert frame.outcomes[0].fields == wrapped_fields
+    await client.aclose()
+
+
+async def test_deconstruct_does_not_replace_a_wrapper_with_a_different_value() -> None:
+    observed_interaction = interaction().model_copy(
+        update={
+            "raw_observed_output": {
+                "action": "pay_invoice",
+                "invoice_id": "INV-999",
+            }
+        }
+    )
+    wrapped_fields = {"invoice_id": {"value": "INV-104", "evidence": []}}
+    mismatched_outcome = {
+        **cast(list[dict[str, object]], frame_payload()["outcomes"])[0],
+        "fields": wrapped_fields,
+    }
+    client = mock_client(
+        lambda request: completion(
+            json.dumps({**frame_payload(), "outcomes": [mismatched_outcome]})
+        )
+    )
+
+    async with create_semantic_model_deconstructor(settings(), client=client) as deconstructor:
+        frame = await deconstructor.deconstruct(observed_interaction)
+
+    assert frame.outcomes[0].fields == wrapped_fields
+    await client.aclose()
+
+
 async def test_deconstructor_identity_binds_extractor_prompt_and_response_schema(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     baseline = semantic_deconstructor_identity(settings())
-    assert baseline.extractor_contract == "semantic-deconstructor/2.0.0"
+    assert baseline.extractor_contract == "semantic-deconstructor/2.1.0"
     assert baseline.prompt_behavior_sha256 == (
         deconstruction_module._PROMPTS.get_template_info("semantic.deconstruct").version
     )

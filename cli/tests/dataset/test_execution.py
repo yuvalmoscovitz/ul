@@ -170,6 +170,36 @@ class _LocalEvaluationSemanticModel:
         )
 
 
+class _WrappedActionFieldSemanticModel(_LocalEvaluationSemanticModel):
+    async def deconstruct(
+        self,
+        record: InteractionRecord | UserInputRecord,
+        reference_frame: SemanticFrame | None = None,
+    ) -> SemanticFrame:
+        frame = await super().deconstruct(record, reference_frame)
+        if not isinstance(record, InteractionRecord):
+            return frame
+        wrapped_outcomes = tuple(
+            outcome.model_copy(
+                update={
+                    "fields": {
+                        "ticket": {
+                            "value": 42,
+                            "evidence": [
+                                {
+                                    "source": "output",
+                                    "json_pointer": "/raw_observed_output/ticket",
+                                }
+                            ],
+                        }
+                    }
+                }
+            )
+            for outcome in frame.outcomes
+        )
+        return frame.model_copy(update={"outcomes": wrapped_outcomes})
+
+
 @pytest.fixture(autouse=True)
 def isolate_progress_action_receipts(
     tmp_path: Path,
@@ -285,10 +315,12 @@ def test_execution_requires_config_network_confirmation_environment_and_output(
 
 
 @pytest.mark.parametrize("asynchronous", [False, True])
+@pytest.mark.parametrize("wrapped_action_fields", [False, True])
 def test_full_dataset_evaluation_runs_local_callable_through_worker_boundary(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     asynchronous: bool,
+    wrapped_action_fields: bool,
 ) -> None:
     dataset = tmp_path / "interactions.jsonl"
     output = tmp_path / "results.jsonl"
@@ -309,7 +341,11 @@ def test_full_dataset_evaluation_runs_local_callable_through_worker_boundary(
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("UL_LIVE", "true")
     monkeypatch.setenv("OPEN_ROUTER_API_KEY", "test-key")
-    semantic_model = _LocalEvaluationSemanticModel()
+    semantic_model = (
+        _WrappedActionFieldSemanticModel()
+        if wrapped_action_fields
+        else _LocalEvaluationSemanticModel()
+    )
 
     async def successful_preflight(_settings: object) -> object:
         return _evaluator_preflight()
@@ -352,6 +388,14 @@ def test_full_dataset_evaluation_runs_local_callable_through_worker_boundary(
     manifest = read_dataset_run_manifest(manifest_path(output))
     assert manifest.effective_command.target_timeout_seconds == 90.0
     assert len(saved["technical_details"]["baseline"]["trial_set"]["trials"]) == 2
+    assert saved["technical_details"]["baseline"]["verdict"] == "no_divergence"
+    assert saved["technical_details"]["cases"][0]["verdict"] == "no_divergence"
+    assert (
+        saved["technical_details"]["baseline"]["trial_set"]["trials"][0]["observed_frame"][
+            "outcomes"
+        ][0]["fields"]["ticket"]
+        == 42
+    )
     assert (
         saved["technical_details"]["baseline"]["trial_set"]["trials"][0]["execution_evidence"][
             "final_response"

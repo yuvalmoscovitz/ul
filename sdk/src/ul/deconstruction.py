@@ -26,6 +26,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 from ul_core.dataset import (
     EvidenceReference,
     InteractionRecord,
+    ObservedOutcome,
     RenderedUserInput,
     SemanticEquivalenceAssessment,
     SemanticFactor,
@@ -198,6 +199,102 @@ def _semantic_deconstructor_identity(extractor_contract: str) -> SemanticDeconst
         **content,
         identity_sha256=_canonical_json_sha256(content),
     )
+
+
+def canonicalize_evidenced_action_fields(
+    record: InteractionRecord | UserInputRecord,
+    frame: SemanticFrame,
+) -> SemanticFrame:
+    if not isinstance(record, InteractionRecord):
+        return frame
+    evidence_payload: JsonValue = {
+        "raw_input": record.raw_input,
+        "raw_observed_output": record.raw_observed_output,
+    }
+    normalized_outcomes = tuple(
+        _canonicalize_evidenced_action_outcome(evidence_payload, outcome)
+        for outcome in frame.outcomes
+    )
+    if normalized_outcomes == frame.outcomes:
+        return frame
+    return frame.model_copy(update={"outcomes": normalized_outcomes})
+
+
+def _resolve_json_pointer(value: JsonValue, pointer: str) -> JsonValue:
+    if not pointer:
+        return value
+    current: object = value
+    for encoded_token in pointer[1:].split("/"):
+        token = encoded_token.replace("~1", "/").replace("~0", "~")
+        if isinstance(current, dict):
+            current_mapping = cast(dict[str, object], current)
+            if token in current_mapping:
+                current = current_mapping[token]
+                continue
+        valid_array_index = token == "0" or (token.isdecimal() and not token.startswith("0"))
+        if isinstance(current, list) and valid_array_index:
+            current_sequence = cast(list[object], current)
+            index = int(token)
+            if index < len(current_sequence):
+                current = current_sequence[index]
+                continue
+        raise ValueError("evidence json_pointer does not resolve")
+    return cast(JsonValue, current)
+
+
+def _canonicalize_evidenced_action_outcome(
+    evidence_payload: JsonValue,
+    outcome: ObservedOutcome,
+) -> ObservedOutcome:
+    if outcome.kind != "action":
+        return outcome
+    evidenced_action_objects: dict[int, dict[str, JsonValue]] = {}
+    for evidence in outcome.evidence:
+        if evidence.source != "output":
+            continue
+        try:
+            evidence_value = _resolve_json_pointer(evidence_payload, evidence.json_pointer)
+        except ValueError:
+            continue
+        action_object: dict[str, JsonValue] | None = None
+        if isinstance(evidence_value, dict):
+            action_object = evidence_value
+        elif evidence.json_pointer.rsplit("/", 1)[-1] == "action":
+            parent_pointer = evidence.json_pointer.rsplit("/", 1)[0]
+            try:
+                parent_value = _resolve_json_pointer(evidence_payload, parent_pointer)
+            except ValueError:
+                continue
+            if isinstance(parent_value, dict):
+                action_object = parent_value
+        if (
+            action_object is not None
+            and isinstance(action_object.get("action"), str)
+            and action_object["action"] == outcome.predicate
+        ):
+            evidenced_action_objects[id(action_object)] = action_object
+    if len(evidenced_action_objects) != 1:
+        return outcome
+    action_object = next(iter(evidenced_action_objects.values()))
+    canonical_fields: dict[str, JsonValue] = {}
+    for name, model_value in outcome.fields.items():
+        if name == "action" or name not in action_object:
+            return outcome
+        canonical_value = action_object[name]
+        if isinstance(canonical_value, (dict, list)):
+            return outcome
+        if isinstance(model_value, dict):
+            if "value" not in model_value or not set(model_value) <= {"value", "evidence"}:
+                return outcome
+            model_value = model_value["value"]
+        if (
+            isinstance(model_value, (dict, list))
+            or type(model_value) is not type(canonical_value)
+            or model_value != canonical_value
+        ):
+            return outcome
+        canonical_fields[name] = canonical_value
+    return outcome.model_copy(update={"fields": canonical_fields})
 
 
 class ProviderDiagnostic(BaseModel):
@@ -853,7 +950,7 @@ class OpenAICompatibleSemanticProvider:
     provider_id: str
     base_url: str
     endpoint_sha256: str
-    extractor_version: str = "semantic-deconstructor/2.0.0"
+    extractor_version: str = "semantic-deconstructor/2.1.0"
     equivalence_verifier_version: str = "semantic-equivalence-verifier/2.0.0"
     requires_api_key: bool = False
     trust_environment_transport: bool = False
@@ -1137,7 +1234,7 @@ class SemanticModelDeconstructor:
         except SemanticGroundingError as error:
             self._discard_cached_completion(completion)
             raise error from None
-        return frame
+        return canonicalize_evidenced_action_fields(record, frame)
 
     async def render(
         self,
@@ -1792,25 +1889,7 @@ class SemanticModelDeconstructor:
 
     @staticmethod
     def _resolve_json_pointer(value: JsonValue, pointer: str) -> JsonValue:
-        if not pointer:
-            return value
-        current: object = value
-        for encoded_token in pointer[1:].split("/"):
-            token = encoded_token.replace("~1", "/").replace("~0", "~")
-            if isinstance(current, dict):
-                current_mapping = cast(dict[str, object], current)
-                if token in current_mapping:
-                    current = current_mapping[token]
-                    continue
-            valid_array_index = token == "0" or (token.isdecimal() and not token.startswith("0"))
-            if isinstance(current, list) and valid_array_index:
-                current_sequence = cast(list[object], current)
-                index = int(token)
-                if index < len(current_sequence):
-                    current = current_sequence[index]
-                    continue
-            raise ValueError("evidence json_pointer does not resolve")
-        return cast(JsonValue, current)
+        return _resolve_json_pointer(value, pointer)
 
     @staticmethod
     def _decode_object(content: str) -> dict[str, Any]:
