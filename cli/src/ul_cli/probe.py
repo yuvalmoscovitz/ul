@@ -28,6 +28,7 @@ from ul import (
     DatasetComparisonCompatibilityError,
     DatasetEvaluationResult,
     DatasetSemanticSettings,
+    DatasetSourceOutcomeProjectionError,
     EvaluationCase,
     EvaluatorModelPreflight,
     ExecutionEvidence,
@@ -2296,6 +2297,14 @@ def _run_campaign(
                 raise ProbeFailure(
                     "evaluation",
                     "PROBE_SOURCE_COMPARISON_INCOMPATIBLE",
+                    error.explanation,
+                    error.remediation,
+                    target_safe_to_reuse=True,
+                ) from None
+            except DatasetSourceOutcomeProjectionError as error:
+                raise ProbeFailure(
+                    "evaluation",
+                    "PROBE_SOURCE_OUTCOME_PROJECTION_INVALID",
                     error.explanation,
                     error.remediation,
                     target_safe_to_reuse=True,

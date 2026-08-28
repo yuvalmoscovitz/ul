@@ -143,6 +143,16 @@ _SOURCE_PREPARATION_REASON_CODES = {
 }
 
 
+def _source_outcome_projection_sha256(
+    target_config: JsonHttpTargetConfig | None,
+    local_target: ResolvedLocalTarget | None,
+) -> str | None:
+    projection = local_target.config.outcome if local_target is not None else None
+    if projection is None and target_config is not None:
+        projection = target_config.outcome
+    return projection.digest if projection is not None else None
+
+
 def _reconcile_source_preparation_failures(
     trial_journal: DatasetTrialJournal,
     resume_evidence: DatasetResumeEvidence,
@@ -960,6 +970,10 @@ def evaluate_dataset(
             ),
             redaction_policy_sha256=(
                 redaction_engine.policy.digest if redaction_engine is not None else None
+            ),
+            source_outcome_projection_sha256=_source_outcome_projection_sha256(
+                normalized_target_config,
+                loaded_local_target,
             ),
         )
     except (DatasetInputError, ValidationError, ValueError, RuntimeError) as error:

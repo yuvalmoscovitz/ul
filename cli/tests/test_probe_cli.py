@@ -119,8 +119,28 @@ class _CleanRoomSemanticModel:
         reference_frame: SemanticFrame | None = None,
     ) -> SemanticFrame:
         if not isinstance(record, InteractionRecord):
-            assert reference_frame is not None
-            return reference_frame.model_copy(update={"interaction_id": record.id})
+            if reference_frame is not None:
+                return reference_frame.model_copy(update={"interaction_id": record.id})
+            return SemanticFrame(
+                interaction_id=record.id,
+                request_units=(
+                    RequestUnit(
+                        id="lookup-request",
+                        evidence=(
+                            EvidenceReference(
+                                source="input",
+                                json_pointer="/raw_input",
+                                text_quote=None,
+                            ),
+                        ),
+                        confidence=1,
+                        status="explicit",
+                        mode="ask",
+                        predicate="lookup",
+                    ),
+                ),
+                extractor_version="clean-room-test",
+            )
         return SemanticFrame(
             interaction_id=record.id,
             request_units=(
@@ -2456,7 +2476,8 @@ def test_public_documentation_flow_runs_real_callable_campaign_and_report(
     dataset = tmp_path / "interactions.jsonl"
     dataset.write_text(
         '{"id":"case-1","input":"Return the status for ticket 42.",'
-        '"output":{"action":"lookup","ticket":42}}\n',
+        '"output":{"result":{"action":"lookup","ticket":42,'
+        '"customer":{"email":"private@example.test"}}}}\n',
         encoding="utf-8",
     )
     config = _write_projected_callable_config(
@@ -2589,7 +2610,7 @@ def test_campaign_projection_failure_retains_exact_reason_and_partial_work(
     dataset = tmp_path / "interactions.jsonl"
     dataset.write_text(
         '{"id":"case-1","input":"Return the status for ticket 42.",'
-        '"output":{"action":"lookup","ticket":42}}\n',
+        '"output":{"result":{"action":"lookup","ticket":42}}}\n',
         encoding="utf-8",
     )
     config = _write_projected_callable_config(
@@ -2814,6 +2835,56 @@ def test_public_probe_maps_source_compatibility_before_campaign_target_invocatio
     assert "PROBE_SOURCE_COMPARISON_INCOMPATIBLE" in result.output
     assert "no coherent action or grounded response" in result.output
     assert "Record the agent's returned text or JSON response" in result.output
+    assert "Target safe to reuse: yes" in result.output
+    assert (tmp_path / "target-invocations").read_text().splitlines() == ["called"]
+
+
+def test_public_probe_maps_invalid_recorded_projection_before_campaign_target_invocation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (tmp_path / "agent.py").write_text(
+        "from pathlib import Path\n\n"
+        "def run(value):\n"
+        "    with Path('target-invocations').open('a', encoding='utf-8') as stream:\n"
+        "        stream.write('called\\n')\n"
+        "    return {'result': {'action': 'lookup'}}\n",
+        encoding="utf-8",
+    )
+    dataset = tmp_path / "interactions.jsonl"
+    dataset.write_text(
+        '{"id":"case-1","input":"Look it up.","output":{"missing":true}}\n',
+        encoding="utf-8",
+    )
+    config = _write_projected_callable_config(
+        tmp_path,
+        {"schema_version": "1.0.0", "complete_result": "/result"},
+        target="agent:run",
+    )
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("UL_LIVE", "true")
+    monkeypatch.setenv("OPEN_ROUTER_API_KEY", "test-key")
+
+    async def successful_preflight(settings: object) -> object:
+        del settings
+        return _evaluator_preflight()
+
+    monkeypatch.setattr(probe_module, "preflight_evaluator", successful_preflight)
+    monkeypatch.setattr(
+        campaign_runner_module,
+        "create_semantic_model_deconstructor",
+        lambda _settings: _CleanRoomSemanticModel(),
+    )
+
+    result = runner.invoke(
+        app,
+        ["probe", str(dataset), "--target", str(config), "--limit", "1"],
+        input="y\ny\n",
+    )
+
+    assert result.exit_code == 2, result.output
+    assert "PROBE_SOURCE_OUTCOME_PROJECTION_INVALID" in result.output
+    assert "does not satisfy the target's declared outcome projection" in result.output
     assert "Target safe to reuse: yes" in result.output
     assert (tmp_path / "target-invocations").read_text().splitlines() == ["called"]
 

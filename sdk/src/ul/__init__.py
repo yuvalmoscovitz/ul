@@ -230,10 +230,12 @@ from ul.dataset_evaluation import (
     DatasetEvaluationTrial,
     DatasetEvaluationTrialSet,
     DatasetSemanticPreparationError,
+    DatasetSourceOutcomeProjectionError,
     DatasetSourcePreparationError,
     DatasetTargetDeliveryUncertain,
     DatasetTargetLifecycleFailure,
     DatasetTrialUnit,
+    ProjectedResponseSemanticDeconstructor,
 )
 from ul.dataset_invariants import (
     DatasetInvariantArmEvaluation,
@@ -508,6 +510,7 @@ __all__ = [
     "DatasetRegressionVariation",
     "DatasetSemanticPreparationError",
     "DatasetSemanticSettings",
+    "DatasetSourceOutcomeProjectionError",
     "DatasetSourcePreparationError",
     "DatasetTargetDeliveryUncertain",
     "DatasetTargetLifecycleFailure",
@@ -630,6 +633,7 @@ __all__ = [
     "ProductionObservation",
     "ProductionSource",
     "ProductionSourcePage",
+    "ProjectedResponseSemanticDeconstructor",
     "ProjectionContract",
     "ProjectionTarget",
     "ProjectionTargetOperation",
