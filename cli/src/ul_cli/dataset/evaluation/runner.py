@@ -12,12 +12,15 @@ from ul import (
     DatasetEvaluationResult,
     DatasetEvaluationRunner,
     DatasetEvaluationTrial,
+    DatasetMaterialVarianceJudge,
     DatasetSemanticSettings,
     DatasetSourcePreparationError,
     DatasetTargetDeliveryUncertain,
     DatasetTrialUnit,
     EvaluatorModelPreflight,
     InteractionRecord,
+    OpenAICompatibleEvaluatorJudge,
+    OpenAICompatibleJudgeConfig,
     ProjectedResponseSemanticDeconstructor,
     RedactedSemanticPipeline,
     RedactionEngine,
@@ -135,8 +138,32 @@ async def evaluate_interaction_records(
     progress_tracker.emit(status="running", stage="augmentation")
     deconstructor = create_semantic_model_deconstructor(settings)
     deconstructor.reuse_preflight(evaluator_preflight)
+    if not settings.allow_external_data_processing:
+        raise ValueError("material variance judging requires external data processing approval")
+    materiality_judge = OpenAICompatibleEvaluatorJudge(
+        OpenAICompatibleJudgeConfig(
+            base_url=settings.semantic_base_url,
+            model=settings.materiality_model,
+            api_key=settings.api_key,
+            allow_external_data_processing=settings.allow_external_data_processing,
+            data_policy=(
+                "openrouter_zdr"
+                if settings.semantic_provider_type == "openrouter"
+                else "provider_default"
+            ),
+            timeout_seconds=settings.timeout_seconds,
+            max_output_tokens=512,
+            token_parameter=(
+                "max_tokens"
+                if settings.semantic_provider_type == "openrouter"
+                else "max_completion_tokens"
+            ),
+            max_response_bytes=settings.max_response_bytes,
+        )
+    )
+    material_variance_evaluator = DatasetMaterialVarianceJudge(materiality_judge)
     with signal_control.installed():
-        async with deconstructor, target:
+        async with deconstructor, materiality_judge, target:
             semantic_pipeline = (
                 RedactedSemanticPipeline(deconstructor, redaction_engine)
                 if redaction_engine is not None
@@ -169,6 +196,7 @@ async def evaluate_interaction_records(
                     else "variance"
                 ),
                 source_outcome_projection=source_outcome_projection,
+                material_variance_evaluator=material_variance_evaluator,
             )
             for case_number, record in enumerate(records, start=1):
                 plan_outcome_terminal_ids: set[str] = set()

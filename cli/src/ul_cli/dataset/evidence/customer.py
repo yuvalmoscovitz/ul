@@ -91,8 +91,17 @@ def build_customer_evidence_record(
     evaluation_mode = cast(Literal["variance"], getattr(result, "evaluation_mode", "variance"))
     augmentation_target = getattr(result.source, "augmentation_target", None)
     pattern_facets = _customer_pattern_facets(getattr(result.source, "metadata", {}))
+    evidence_schema_version = (
+        "1.15.0"
+        if all(
+            not case.findings or getattr(case, "material_variance", None) is not None
+            for case in result.cases
+        )
+        else "1.14.0"
+    )
     cases: list[JsonValue] = []
     for case in result.cases:
+        material_variance = getattr(case, "material_variance", None)
         cases.append(
             {
                 "operator_id": case.candidate.operator_id,
@@ -119,6 +128,18 @@ def build_customer_evidence_record(
                     operator_version=case.candidate.operator_version,
                     augmented_input=case.candidate.augmented_input,
                 ),
+                **(
+                    {
+                        "material_variance": cast(
+                            JsonValue,
+                            material_variance.model_dump(mode="json")
+                            if material_variance is not None
+                            else None,
+                        )
+                    }
+                    if evidence_schema_version == "1.15.0"
+                    else {}
+                ),
                 "cross_examination": _customer_cross_examination(result, case),
                 "inconclusive_reasons": list(case.inconclusive_reasons),
             }
@@ -131,7 +152,7 @@ def build_customer_evidence_record(
     if uses_extended_invariants and run_context is None:
         raise ValueError("extended invariant evidence requires a resumable run context")
     evidence: dict[str, JsonValue] = {
-        "schema_version": "1.14.0",
+        "schema_version": evidence_schema_version,
         "evaluation_mode": evaluation_mode,
         "interaction_id": result.source.id,
         **(

@@ -195,7 +195,7 @@ async def test_evaluator_preflight_proves_required_capabilities_and_records_poli
     def handler(request: httpx.Request) -> httpx.Response:
         body = cast(dict[str, object], json.loads(request.content))
         requests.append(body)
-        if len(requests) <= 3:
+        if len(requests) <= 4:
             return completion('{"compatible":true}')
         return completion(json.dumps(frame_payload()))
 
@@ -218,24 +218,26 @@ async def test_evaluator_preflight_proves_required_capabilities_and_records_poli
     assert tuple(profile.roles for profile in planned_profiles) == tuple(
         profile.roles for profile in result.profiles
     )
-    assert sum(profile.max_completion_tokens for profile in planned_profiles) == 1_154
-    assert [request["model"] for request in requests[:3]] == [
+    assert sum(profile.max_completion_tokens for profile in planned_profiles) == 1_666
+    assert [request["model"] for request in requests[:4]] == [
         "google/gemini-3.5-flash",
         "x-ai/grok-4.3",
         "google/gemini-3.5-flash",
+        "qwen/qwen3-30b-a3b-instruct-2507",
     ]
-    assert [request["reasoning"] for request in requests[:3]] == [
+    assert [request.get("reasoning") for request in requests[:4]] == [
         {"effort": "minimal"},
         {"effort": "none"},
         {"effort": "low"},
+        None,
     ]
-    assert [request["temperature"] for request in requests[:3]] == [0, 0.7, 0]
+    assert [request["temperature"] for request in requests[:4]] == [0, 0.7, 0, 0]
     assert requests[0]["seed"] == 0
     assert requests[1]["seed"] == SemanticModelDeconstructor._render_seed(
         "UL evaluator preflight", "Check renderer compatibility."
     )
     assert requests[1]["top_p"] == 0.95
-    assert [request["max_tokens"] for request in requests[:3]] == [321, 512, 321]
+    assert [request["max_tokens"] for request in requests[:4]] == [321, 512, 321, 512]
     assert requests[0]["response_format"] == {
         "type": "json_schema",
         "json_schema": {
@@ -260,6 +262,7 @@ async def test_evaluator_preflight_proves_required_capabilities_and_records_poli
         ("deconstruct",),
         ("render",),
         ("equivalence",),
+        ("materiality",),
     )
     assert result.endpoint_sha256 == settings().semantic_endpoint_sha256
     assert all(profile.routed_model == "provider/resolved-model" for profile in result.profiles)
@@ -298,7 +301,7 @@ async def test_evaluator_preflight_caps_each_sample_at_1024_tokens() -> None:
     ) as deconstructor:
         await deconstructor.preflight()
 
-    assert [request["max_tokens"] for request in requests] == [1_024, 1_024, 1_024]
+    assert [request["max_tokens"] for request in requests] == [1_024, 1_024, 1_024, 512]
     await client.aclose()
 
 
@@ -351,7 +354,7 @@ async def test_explicit_non_reasoning_roles_omit_only_reasoning_and_bind_preflig
         for request in request_bodies
         if request["model"] == configured_settings.equivalence_model
     ]
-    assert len(qwen_requests) == 4
+    assert len(qwen_requests) == 5
     assert all("reasoning" not in request for request in qwen_requests)
     assert len(deepseek_requests) == 2
     assert all(request["reasoning"] == {"effort": "low"} for request in deepseek_requests)
@@ -359,6 +362,7 @@ async def test_explicit_non_reasoning_roles_omit_only_reasoning_and_bind_preflig
         "omitted",
         "omitted",
         "required",
+        "omitted",
     ]
     assert all("reasoning" not in profile.required_parameters for profile in preflight.profiles[:2])
     assert "reasoning" in preflight.profiles[2].required_parameters
@@ -398,14 +402,15 @@ async def test_generic_endpoint_deduplicates_without_claiming_parameter_support(
         result = await deconstructor.preflight()
 
     planned_profiles = plan_evaluator_preflight_profiles(openai_compatible_settings())
-    assert len(request_bodies) == len(planned_profiles) == len(result.profiles) == 2
+    assert len(request_bodies) == len(planned_profiles) == len(result.profiles) == 3
     assert tuple(profile.roles for profile in planned_profiles) == tuple(
         profile.roles for profile in result.profiles
     )
-    assert sum(profile.max_completion_tokens for profile in planned_profiles) == 833
+    assert sum(profile.max_completion_tokens for profile in planned_profiles) == 1_345
     assert tuple(profile.roles for profile in result.profiles) == (
         ("deconstruct", "equivalence"),
         ("render",),
+        ("materiality",),
     )
     assert result.verified_capabilities == ("routing", "structured_output")
     assert result.unverified_options == (

@@ -68,13 +68,198 @@ def test_rich_evidence_builds_parses_and_reports_end_to_end(tmp_path: Path) -> N
     evidence_path.write_text(json.dumps(record) + "\n", encoding="utf-8")
     _create_pattern_identity_key(tmp_path)
 
-    assert record["schema_version"] == "1.14.0"
+    assert record["schema_version"] == "1.15.0"
     assert dataset_review.is_reportable_dataset_evidence(evidence_path) is True
     report = runner.invoke(root_app, ["report", str(evidence_path), "--json"])
     assert report.exit_code == 0, report.output
     parsed_report = json.loads(report.output)
-    assert parsed_report["evidence_schema_versions"] == ["1.14.0"]
+    assert parsed_report["evidence_schema_versions"] == ["1.15.0"]
     assert parsed_report["evaluation_mode"] == "variance"
+
+
+@pytest.mark.parametrize(
+    ("decision", "expected_status", "expected_exit_code"),
+    (
+        ("material_variance", "action_required", 1),
+        ("operationally_equivalent", "resolved", 0),
+        ("insufficient_evidence", "inconclusive", 2),
+    ),
+)
+def test_automatic_materiality_drives_unified_report_actionability(
+    tmp_path: Path,
+    decision: str,
+    expected_status: str,
+    expected_exit_code: int,
+) -> None:
+    result = _evaluation_result(
+        f"automatic-{decision}",
+        has_review_finding=True,
+        material_variance_decision=decision,
+    )
+    record = customer_module.build_customer_evidence_record(
+        result,
+        repetitions=1,
+        max_environment_api_calls=2,
+        planned_target_calls=2,
+        run_context=cast(Any, _run_context((result.source,))),
+    )
+    evidence_path = tmp_path / f"{decision}.jsonl"
+    evidence_path.write_text(json.dumps(record) + "\n", encoding="utf-8")
+    _create_pattern_identity_key(tmp_path)
+
+    command_result = runner.invoke(root_app, ["report", str(evidence_path), "--json"])
+    report = json.loads(command_result.output)
+
+    assert command_result.exit_code == expected_exit_code
+    assert report["review_status"] == expected_status
+    assert report["exit_code"] == expected_exit_code
+
+
+@pytest.mark.parametrize(
+    ("decision", "expected_exit_code", "needs_review"),
+    (
+        ("material_variance", 1, True),
+        ("operationally_equivalent", 0, False),
+        ("insufficient_evidence", 2, False),
+    ),
+)
+def test_automatic_materiality_drives_evaluation_exit_code(
+    decision: str,
+    expected_exit_code: int,
+    needs_review: bool,
+) -> None:
+    result = _evaluation_result(
+        f"automatic-exit-{decision}",
+        has_review_finding=True,
+        material_variance_decision=decision,
+    )
+
+    assert presentation_module.dataset_result_exit_code(result) == expected_exit_code
+    assert presentation_module.result_needs_review(result) is needs_review
+
+
+def test_dataset_report_leads_with_actionable_summary_and_hides_private_values(
+    tmp_path: Path,
+) -> None:
+    clear_result = _evaluation_result("report-clear", has_review_finding=True)
+    clear_result = clear_result.model_copy(
+        update={
+            "cases": (
+                clear_result.cases[0].model_copy(
+                    update={
+                        "verdict": "no_divergence",
+                        "findings": (),
+                        "material_variance": None,
+                    }
+                ),
+            )
+        }
+    )
+    results = (
+        _evaluation_result(
+            "report-material",
+            has_review_finding=True,
+            material_variance_decision="material_variance",
+        ),
+        _evaluation_result(
+            "report-equivalent",
+            has_review_finding=True,
+            material_variance_decision="operationally_equivalent",
+        ),
+        _evaluation_result(
+            "report-inconclusive",
+            has_review_finding=True,
+            material_variance_decision="insufficient_evidence",
+        ),
+        clear_result,
+    )
+    records = [
+        customer_module.build_customer_evidence_record(
+            result,
+            repetitions=1,
+            max_environment_api_calls=2,
+            planned_target_calls=2,
+        )
+        for result in results
+    ]
+    evidence_path = tmp_path / "management-report.jsonl"
+    evidence_path.write_text(
+        "".join(json.dumps(record) + "\n" for record in records),
+        encoding="utf-8",
+    )
+    material_finding_id = cast(dict[str, Any], records[0]["cases"][0])["findings"][0]["finding_id"]
+    equivalent_finding_id = cast(dict[str, Any], records[1]["cases"][0])["findings"][0][
+        "finding_id"
+    ]
+    inconclusive_finding_id = cast(dict[str, Any], records[2]["cases"][0])["findings"][0][
+        "finding_id"
+    ]
+
+    report = runner.invoke(root_app, ["dataset", "report", str(evidence_path)])
+
+    assert report.exit_code == 0, report.output
+    assert "Result: ACTION REQUIRED — 1 consequential behavior change found" in report.output
+    assert "Comparisons: total=4, completed=4, no_observed_difference=1" in report.output
+    assert "Automatic decisions: consequential=1, equivalent=1, inconclusive=1" in report.output
+    assert "Scope: variance; correctness and severity were not assessed" in report.output
+    assert "Consequential behavior changes" in report.output
+    assert "Inconclusive comparisons" in report.output
+    assert "Resolved or equivalent differences" not in report.output
+    assert material_finding_id in report.output
+    assert inconclusive_finding_id in report.output
+    assert equivalent_finding_id not in report.output
+    assert "Transfer 100 to Alice." not in report.output
+    assert "Please transfer 100 to Alice." not in report.output
+
+    all_findings = runner.invoke(
+        root_app,
+        ["dataset", "report", str(evidence_path), "--all-findings"],
+    )
+
+    assert all_findings.exit_code == 0, all_findings.output
+    assert "Resolved or equivalent differences" in all_findings.output
+    assert equivalent_finding_id in all_findings.output
+    assert "Transfer 100 to Alice." not in all_findings.output
+
+    reviewed = runner.invoke(
+        root_app,
+        [
+            "dataset",
+            "review",
+            str(evidence_path),
+            material_finding_id,
+            "--status",
+            "expected",
+            "--reviewer",
+            "risk-team",
+            "--reason",
+            "Approved behavior for this workflow.",
+        ],
+    )
+
+    assert reviewed.exit_code == 0, reviewed.output
+    reviewed_report = runner.invoke(root_app, ["dataset", "report", str(evidence_path)])
+    assert reviewed_report.exit_code == 0, reviewed_report.output
+    assert "Result: INCONCLUSIVE — 1 item(s) need attention" in reviewed_report.output
+    assert "ACTION REQUIRED" not in reviewed_report.output
+    assert "Human review overrides: expected=1" in reviewed_report.output
+
+    private_drilldown = runner.invoke(
+        root_app,
+        [
+            "dataset",
+            "report",
+            str(evidence_path),
+            "--finding",
+            material_finding_id,
+            "--show-sensitive-values",
+        ],
+    )
+
+    assert private_drilldown.exit_code == 0, private_drilldown.output
+    assert "WARNING: showing selected private values" in private_drilldown.output
+    assert "Transfer 100 to Alice." in private_drilldown.output
+    assert "Sensitive value disclosure:" in private_drilldown.output
 
 
 def test_pre_response_schema_action_and_answer_evidence_still_reports(tmp_path: Path) -> None:
@@ -129,6 +314,7 @@ def test_pre_response_schema_action_and_answer_evidence_still_reports(tmp_path: 
         planned_target_calls=1,
     )
     record["schema_version"] = "1.13.0"
+    record["cases"][0].pop("material_variance")
     evidence_path = tmp_path / "legacy-mixed.jsonl"
     evidence_path.write_text(json.dumps(record) + "\n", encoding="utf-8")
     _create_pattern_identity_key(tmp_path)
@@ -495,7 +681,7 @@ def test_rich_customer_evidence_records_source_target_original_and_lineage() -> 
         planned_target_calls=2,
     )
 
-    assert evidence["schema_version"] == "1.14.0"
+    assert evidence["schema_version"] == "1.15.0"
     assert evidence["interaction_id"] == "cancel-order::message"
     assert evidence["source_record_id"] == "cancel-order"
     assert evidence["augmentation_target"] == {
@@ -661,7 +847,7 @@ def test_customer_evidence_keeps_invariants_separate_from_behavioral_findings() 
         invariant_evaluation=invariant_evaluation,
     )
 
-    assert evidence["schema_version"] == "1.14.0"
+    assert evidence["schema_version"] == "1.15.0"
     assert evidence["evaluation_mode"] == "variance"
     assert evidence["cases"] == []
     stored_invariants = cast(dict[str, Any], evidence["invariant_evaluation"])
@@ -967,7 +1153,8 @@ def test_duplicate_semantic_findings_get_stable_unique_reportable_ids(tmp_path: 
     report = runner.invoke(root_app, ["dataset", "report", str(evidence_path)])
 
     assert report.exit_code == 0, report.output
-    assert "Dataset finding report: 2 finding(s)" in report.output
+    assert "Result: ACTION REQUIRED — 1 consequential behavior change found" in report.output
+    assert "Consequential behavior changes" in report.output
 
 
 def test_stored_output_drift_does_not_require_review_or_appear_in_original_replay(

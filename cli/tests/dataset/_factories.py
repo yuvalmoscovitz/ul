@@ -23,6 +23,8 @@ from ul import (
     InteractionRecord,
     JsonHttpEnvironmentConfig,
     JsonHttpIsolatedResponseConfig,
+    MaterialVarianceAssessment,
+    MaterialVarianceEvidence,
     ObservedAgentOutput,
     RichInteractionCase,
     SemanticFrame,
@@ -84,6 +86,7 @@ def _evaluation_result(
     identifier: str,
     *,
     has_review_finding: bool = False,
+    material_variance_decision: str = "material_variance",
 ) -> DatasetEvaluationResult:
     source = InteractionRecord(
         id=identifier,
@@ -150,6 +153,28 @@ def _evaluation_result(
                     message="The variation changed observable behavior.",
                 ),
             ),
+            material_variance=MaterialVarianceAssessment(
+                decision=cast(Any, material_variance_decision),
+                reason_code=(
+                    "action_added"
+                    if material_variance_decision == "material_variance"
+                    else (
+                        "same_real_world_effect"
+                        if material_variance_decision == "operationally_equivalent"
+                        else "missing_comparison_evidence"
+                    )
+                ),
+                explanation="Automatic materiality test decision.",
+                evidence=(
+                    MaterialVarianceEvidence(
+                        json_pointer="/payload/answer/findings/0/baseline_effects/0"
+                    ),
+                    MaterialVarianceEvidence(
+                        json_pointer="/payload/answer/findings/0/variation_effects/0"
+                    ),
+                ),
+                evaluator_version_id=f"ulev_v1_{'a' * 64}",
+            ),
         )
     else:
         evaluation_case = DatasetEvaluationCase(
@@ -211,6 +236,7 @@ def _settings(**overrides: object) -> SimpleNamespace:
         "model": "test/deconstructor",
         "render_model": "test/renderer",
         "equivalence_model": "test/equivalence",
+        "materiality_model": "test/materiality",
         "deconstruct_reasoning": "required",
         "render_reasoning": "required",
         "equivalence_reasoning": "required",
@@ -406,6 +432,17 @@ def _evaluator_preflight() -> EvaluatorModelPreflight:
         )
         & 0x7FFF_FFFF
     )
+    materiality_options = {
+        "model": "test/materiality",
+        "reasoning_mode": "omitted",
+        "max_tokens": 512,
+        "temperature": 0,
+        "seed": 0,
+        "provider": provider_options,
+    }
+    materiality_options_sha256 = hashlib.sha256(
+        json.dumps(materiality_options, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
     return EvaluatorModelPreflight.model_validate(
         {
             "provider": "openrouter",
@@ -471,6 +508,22 @@ def _evaluator_preflight() -> EvaluatorModelPreflight:
                     "request_options_sha256": request_options_sha256(
                         "test/equivalence", "low", 0, 0
                     ),
+                    "parameter_support": "routing_enforced",
+                    "unverified_options": (),
+                },
+                {
+                    "roles": ("materiality",),
+                    "requested_model": "test/materiality",
+                    "routed_model": "test/materiality",
+                    "upstream_provider": "test-provider",
+                    "reasoning_mode": "omitted",
+                    "required_parameters": (
+                        "response_format",
+                        "seed",
+                        "temperature",
+                        "max_tokens",
+                    ),
+                    "request_options_sha256": materiality_options_sha256,
                     "parameter_support": "routing_enforced",
                     "unverified_options": (),
                 },

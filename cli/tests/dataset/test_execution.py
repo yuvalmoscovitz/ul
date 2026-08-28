@@ -16,6 +16,8 @@ import pytest
 from typer.testing import CliRunner
 from ul import (
     DatasetSemanticPreparationError,
+    EvaluatorDecision,
+    EvaluatorEvidence,
     InteractionRecord,
     JsonHttpEnvironmentConfig,
     ProviderDiagnostic,
@@ -211,6 +213,71 @@ class _WrappedActionFieldSemanticModel(_LocalEvaluationSemanticModel):
             for outcome in frame.outcomes
         )
         return frame.model_copy(update={"outcomes": wrapped_outcomes})
+
+
+class _MaterialVarianceSemanticModel(_LocalEvaluationSemanticModel):
+    async def render(
+        self,
+        raw_input: str,
+        instruction: str,
+        *,
+        allow_temporary_value: bool = False,
+    ) -> RenderedUserInput:
+        del raw_input, instruction, allow_temporary_value
+        return RenderedUserInput(text="Please return status for ticket 42.")
+
+    async def deconstruct(
+        self,
+        record: InteractionRecord | UserInputRecord,
+        reference_frame: SemanticFrame | None = None,
+    ) -> SemanticFrame:
+        frame = await super().deconstruct(record, reference_frame)
+        if not isinstance(record, InteractionRecord):
+            return frame
+        raw_output = cast(dict[str, Any], record.raw_observed_output)
+        ticket = cast(int, raw_output["ticket"])
+        return frame.model_copy(
+            update={
+                "outcomes": tuple(
+                    outcome.model_copy(update={"fields": {"ticket": ticket}})
+                    for outcome in frame.outcomes
+                )
+            }
+        )
+
+
+class _MaterialVarianceJudge:
+    label = "material_variance:grounded_argument_changed"
+    score = 1
+
+    def __init__(self, config: object) -> None:
+        self.version = config.evaluator_judge_version()
+
+    async def __aenter__(self) -> _MaterialVarianceJudge:
+        return self
+
+    async def __aexit__(self, *args: object) -> None:
+        pass
+
+    async def evaluate(self, request: object) -> EvaluatorDecision:
+        del request
+        return EvaluatorDecision(
+            score=self.score,
+            label=self.label,
+            explanation="Changed ticket.",
+            evidence=(
+                EvaluatorEvidence(
+                    source="judge_payload",
+                    json_pointer="/payload/answer/findings/0/baseline_effects/0",
+                    description="baseline",
+                ),
+                EvaluatorEvidence(
+                    source="judge_payload",
+                    json_pointer="/payload/answer/findings/0/variation_effects/0",
+                    description="variation",
+                ),
+            ),
+        )
 
 
 @pytest.fixture(autouse=True)
@@ -502,6 +569,125 @@ def test_full_dataset_evaluation_runs_local_callable_through_worker_boundary(
             _ANSI_ESCAPE_PATTERN.sub("", incompatible_resume.output).split()
         )
         assert "incompatible with the current evaluation plan" in normalized_incompatible_error
+
+
+@pytest.mark.parametrize(
+    ("label", "score", "decision", "reason_code", "expected_exit_code"),
+    (
+        (
+            "material_variance:grounded_argument_changed",
+            1,
+            "material_variance",
+            "grounded_argument_changed",
+            1,
+        ),
+        (
+            "operationally_equivalent:same_real_world_effect",
+            0,
+            "operationally_equivalent",
+            "same_real_world_effect",
+            0,
+        ),
+        (
+            "insufficient_evidence:missing_comparison_evidence",
+            0.5,
+            "insufficient_evidence",
+            "missing_comparison_evidence",
+            2,
+        ),
+    ),
+)
+def test_public_cli_persists_and_applies_automatic_materiality(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    label: str,
+    score: float,
+    decision: str,
+    reason_code: str,
+    expected_exit_code: int,
+) -> None:
+    dataset = tmp_path / "interactions.jsonl"
+    output = tmp_path / "results.jsonl"
+    dataset.write_text(
+        '{"id":"case-1","input":"Return status for ticket 42.",'
+        '"output":{"action":"lookup","ticket":42}}\n',
+        encoding="utf-8",
+    )
+    (tmp_path / "customer_agent.py").write_text(
+        "def run(value):\n"
+        "    ticket = 43 if value.startswith('Please') else 42\n"
+        "    return {'action': 'lookup', 'ticket': ticket}\n",
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("UL_LIVE", "true")
+    monkeypatch.setenv("OPEN_ROUTER_API_KEY", "test-key")
+
+    async def successful_preflight(_settings: object) -> object:
+        return _evaluator_preflight()
+
+    monkeypatch.setattr(command_module, "load_dataset_semantic_settings", _settings)
+    monkeypatch.setattr(command_module, "preflight_evaluator", successful_preflight)
+    monkeypatch.setattr(
+        runner_module,
+        "create_semantic_model_deconstructor",
+        lambda _settings: _MaterialVarianceSemanticModel(),
+    )
+    monkeypatch.setattr(
+        runner_module,
+        "OpenAICompatibleEvaluatorJudge",
+        _MaterialVarianceJudge,
+    )
+    monkeypatch.setattr(_MaterialVarianceJudge, "label", label)
+    monkeypatch.setattr(_MaterialVarianceJudge, "score", score)
+    target = resolve_local_target("customer_agent:run")
+
+    evaluated = runner.invoke(
+        root_app,
+        [
+            "dataset",
+            "evaluate",
+            str(dataset),
+            "--operator",
+            "input.surface.rephrase",
+            "--target",
+            "customer_agent:run",
+            "--confirm-target",
+            target.confirmation_sha256,
+            "--confirm-test-environment",
+            "--repetitions",
+            "1",
+            "--output",
+            str(output),
+        ],
+    )
+
+    assert evaluated.exit_code == expected_exit_code, evaluated.output
+    saved = json.loads(output.read_text(encoding="utf-8").splitlines()[1])
+    comparison = saved["cases"][0]
+    assert comparison["material_variance"]["decision"] == decision
+    assert comparison["material_variance"]["reason_code"] == reason_code
+    assert saved["technical_details"]["semantic_calls"]["actual_calls"] == 1
+    normalized_output = " ".join(evaluated.output.split())
+    assert "Next: ul dataset report" in normalized_output
+
+    report = runner.invoke(root_app, ["dataset", "report", str(output), "--all-findings"])
+
+    assert report.exit_code == 0, report.output
+    report_decision = {
+        "material_variance": "consequential",
+        "operationally_equivalent": "equivalent",
+        "insufficient_evidence": "inconclusive",
+    }[decision]
+    assert f"{report_decision}=1" in report.output
+    assert f"Reason: {reason_code.replace('_', ' ')}" in report.output
+    finding_output = output.with_name(f"{output.name}.findings.jsonl")
+    if decision == "material_variance":
+        assert finding_output.stat().st_size > 0
+        assert "Actionable finding export: ul report" in normalized_output
+    else:
+        assert finding_output.stat().st_size == 0
+        assert "Actionable finding export: ul report" not in normalized_output
 
 
 def test_dataset_evaluation_allows_http_target_response_after_thirty_seconds(

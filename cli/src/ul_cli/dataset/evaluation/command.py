@@ -117,6 +117,7 @@ from ..evidence.persistence import (
 )
 from ..presentation.evaluation import (
     dataset_invariant_exit_code,
+    dataset_result_exit_code,
     print_dataset_plan,
     print_dataset_results,
     print_evaluator_preflight,
@@ -1422,6 +1423,8 @@ def evaluate_dataset(
             raise typer.Exit(code=previous_invariant_exit_code)
         if resume_evidence.has_review_findings:
             raise typer.Exit(code=1)
+        if resume_evidence.has_inconclusive_materiality:
+            raise typer.Exit(code=2)
         if source_preparation_failure_count:
             raise typer.Exit(code=2)
         raise typer.Exit(code=0)
@@ -1672,7 +1675,6 @@ def evaluate_dataset(
 
     assert output_stream is not None
     assert finding_reference_context is not None
-    has_review_findings = False
     invariant_evaluations: list[DatasetInvariantEvaluation] = []
     source_preparation_failures: list[DatasetSourcePreparationFailureEvidence] = []
     try:
@@ -1758,7 +1760,7 @@ def evaluate_dataset(
             prior_invariant_evaluations = (
                 resume_evidence.invariant_evaluations if resume_evidence is not None else ()
             )
-            has_review_findings = _write_finding_package_snapshot(
+            _write_finding_package_snapshot(
                 finding_output,
                 (*prior_results, *results),
                 (*prior_invariant_evaluations, *invariant_evaluations),
@@ -1832,8 +1834,19 @@ def evaluate_dataset(
         raise typer.Exit(code=1)
     if evaluation_exit_code == 2:
         raise typer.Exit(code=2)
-    if has_review_findings or (resume_evidence is not None and resume_evidence.has_review_findings):
+    all_semantic_results = (
+        *(resume_evidence.technical_results if resume_evidence is not None else ()),
+        *results,
+    )
+    semantic_exit_code = max(
+        (dataset_result_exit_code(result) for result in all_semantic_results),
+        default=0,
+        key=lambda code: {0: 0, 2: 1, 1: 2}[code],
+    )
+    if semantic_exit_code == 1:
         raise typer.Exit(code=1)
+    if semantic_exit_code == 2:
+        raise typer.Exit(code=2)
     if all_source_preparation_failures:
         raise typer.Exit(code=2)
 
@@ -1951,6 +1964,16 @@ def _manifest_incompatibility_reason(
             requested.semantic_settings.equivalence_model,
         ),
         (
+            "evaluator.materiality_model",
+            recorded.semantic_settings.materiality_model,
+            requested.semantic_settings.materiality_model,
+        ),
+        (
+            "evaluator.materiality_version",
+            recorded.semantic_settings.materiality_evaluator_version_id,
+            requested.semantic_settings.materiality_evaluator_version_id,
+        ),
+        (
             "evaluator.reasoning",
             (
                 recorded.semantic_settings.deconstruct_reasoning,
@@ -1998,6 +2021,7 @@ def _restore_recorded_semantic_settings(
             model=recorded.model,
             render_model=recorded.render_model,
             equivalence_model=recorded.equivalence_model,
+            materiality_model=recorded.materiality_model or recorded.model,
             deconstruct_reasoning=recorded.deconstruct_reasoning,
             render_reasoning=recorded.render_reasoning,
             equivalence_reasoning=recorded.equivalence_reasoning,
@@ -2015,6 +2039,7 @@ def _restore_recorded_semantic_settings(
         model=recorded.model,
         render_model=recorded.render_model,
         equivalence_model=recorded.equivalence_model,
+        materiality_model=recorded.materiality_model or recorded.model,
         deconstruct_reasoning=recorded.deconstruct_reasoning,
         render_reasoning=recorded.render_reasoning,
         equivalence_reasoning=recorded.equivalence_reasoning,

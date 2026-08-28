@@ -3,7 +3,13 @@ from __future__ import annotations
 from typing import Literal
 
 from pydantic import JsonValue
-from ul import DatasetSemanticSettings, InteractionRecord, semantic_deconstructor_identity
+from ul import (
+    DatasetSemanticSettings,
+    InteractionRecord,
+    OpenAICompatibleJudgeConfig,
+    material_variance_evaluator_version_from_config,
+    semantic_deconstructor_identity,
+)
 from ul.dataset_invariants import DatasetInvariantSuite
 from ul.http_environment import JsonHttpTargetConfig
 
@@ -31,6 +37,25 @@ def build_dataset_evidence_run_context(
     redaction_policy_sha256: str | None = None,
     redaction_coverage: tuple[DatasetEvidenceRedactionCoverage, ...] = (),
 ) -> DatasetEvidenceRunContext:
+    materiality_config = OpenAICompatibleJudgeConfig(
+        base_url=settings.semantic_base_url,
+        model=settings.materiality_model,
+        api_key=settings.api_key,
+        allow_external_data_processing=True,
+        data_policy=(
+            "openrouter_zdr"
+            if settings.semantic_provider_type == "openrouter"
+            else "provider_default"
+        ),
+        timeout_seconds=settings.timeout_seconds,
+        max_output_tokens=512,
+        token_parameter=(
+            "max_tokens"
+            if settings.semantic_provider_type == "openrouter"
+            else "max_completion_tokens"
+        ),
+        max_response_bytes=settings.max_response_bytes,
+    )
     return create_dataset_evidence_run_context(
         selected_records=selected_records,
         operators=tuple(
@@ -48,6 +73,7 @@ def build_dataset_evidence_run_context(
             model=settings.model,
             render_model=settings.render_model,
             equivalence_model=settings.equivalence_model,
+            materiality_model=settings.materiality_model,
             deconstruct_reasoning=settings.deconstruct_reasoning,
             render_reasoning=settings.render_reasoning,
             equivalence_reasoning=settings.equivalence_reasoning,
@@ -57,6 +83,9 @@ def build_dataset_evidence_run_context(
             max_response_bytes=settings.max_response_bytes,
             timeout_seconds=settings.timeout_seconds,
             deconstructor_identity=semantic_deconstructor_identity(settings),
+            materiality_evaluator_version_id=(
+                material_variance_evaluator_version_from_config(materiality_config).id
+            ),
         ),
         redaction_policy_sha256=redaction_policy_sha256,
         redaction_coverage=redaction_coverage,

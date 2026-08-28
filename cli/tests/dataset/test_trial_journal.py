@@ -123,6 +123,7 @@ def test_resume_reconciles_an_interrupted_source_failure_without_target_calls(
         processed_ids=frozenset({failure.interaction_id}),
         source_preparation_failures=(failure,),
         has_review_findings=False,
+        has_inconclusive_materiality=False,
         invariant_evaluations=(),
         technical_results=(),
         raw_evidence_sha256="0" * 64,

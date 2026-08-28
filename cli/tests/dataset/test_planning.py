@@ -68,7 +68,7 @@ def test_dry_run_validates_and_makes_no_external_calls(
     assert "Selected interactions: 1" in result.output
     assert "Evaluation mode: variance" in result.output
     assert "Repetitions: 3 per original and accepted variation" in result.output
-    assert "Potential semantic model calls: up to 12" in result.output
+    assert "Potential semantic model calls: up to 14" in result.output
     assert "Potential environment API calls: up to 30" in result.output
     assert "authorized maximum: 100" in result.output
     assert "Semantic models receive historical inputs and outputs" in result.output
@@ -156,7 +156,7 @@ def test_dry_run_json_exposes_per_example_campaign_and_exact_call_plan(
 
     assert result.exit_code == 0, result.output
     payload = json.loads(result.output)
-    assert payload["schema_version"] == "1.2.0"
+    assert payload["schema_version"] == "1.3.0"
     assert payload["evaluation_mode"] == "variance"
     assert payload["fixture"] == {"status": "missing", "id": None, "version": None}
     assert any("no fixture identity" in warning.casefold() for warning in payload["warnings"])
@@ -169,10 +169,11 @@ def test_dry_run_json_exposes_per_example_campaign_and_exact_call_plan(
         "repetitions": 2,
         "repetition_executions": 4,
         "retries": 0,
-        "preflight": 3,
+        "preflight": 4,
         "evaluators": 7,
+        "materiality": 1,
         "variation_generation": 0,
-        "total_semantic_model": 10,
+        "total_semantic_model": 12,
         "total_environment_api": 20,
     }
     assert payload["calls"]["preflight"] == len(payload["preflight_profiles"])
@@ -180,18 +181,20 @@ def test_dry_run_json_exposes_per_example_campaign_and_exact_call_plan(
         ["deconstruct"],
         ["render"],
         ["equivalence"],
+        ["materiality"],
     ]
     assert (
-        sum(profile["max_completion_tokens"] for profile in payload["preflight_profiles"]) == 2_560
+        sum(profile["max_completion_tokens"] for profile in payload["preflight_profiles"]) == 3_072
     )
     assert payload["calls"]["total_semantic_model"] == (
         payload["calls"]["preflight"]
         + payload["calls"]["evaluators"]
+        + payload["calls"]["materiality"]
         + payload["calls"]["variation_generation"]
     )
     assert payload["timing"] == {
         "target_trial_timeout_seconds": 75.0,
-        "maximum_wall_time_seconds": 900.0,
+        "maximum_wall_time_seconds": 1020.0,
     }
     planned_operator = next(
         operator
@@ -203,7 +206,7 @@ def test_dry_run_json_exposes_per_example_campaign_and_exact_call_plan(
     assert "deterministic and free" in planned_operator["reasons"][1]
     assert payload["tokens"] == {
         "minimum": 0,
-        "maximum": 28_160,
+        "maximum": 29_184,
         "scope": "completion_tokens",
     }
     assert payload["money"] is None
@@ -325,7 +328,7 @@ def test_campaign_plan_does_not_count_known_non_executable_variations(
     assert plan.calls.variation == 0
     assert plan.calls.repetition_executions == 3
     assert plan.calls.evaluators == 3
-    assert plan.calls.total_semantic_model == 6
+    assert plan.calls.total_semantic_model == 7
     assert plan.calls.total_environment_api == 15
 
 

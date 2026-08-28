@@ -10,7 +10,7 @@ import stat
 import sys
 import tempfile
 import unicodedata
-from collections.abc import Callable, Generator
+from collections.abc import Callable, Generator, Iterable
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -26,6 +26,7 @@ from ul import (
     DatasetEvaluationResult,
     DatasetSemanticPreparationError,
     InteractionRecord,
+    MaterialVarianceAssessment,
     SemanticDeconstructorIdentity,
 )
 from ul.dataset_invariants import (
@@ -110,7 +111,7 @@ _REVIEW_ID_PATTERN = r"^ulr_[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{
 _PATTERN_REVIEW_ID_PATTERN = (
     r"^ulpr_[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
 )
-_DATASET_EVALUATION_PIPELINE_VERSION = "1.5.0"
+_DATASET_EVALUATION_PIPELINE_VERSION = "1.6.0"
 _MAXIMUM_PATTERN_EFFECTS = 100
 _MAXIMUM_PATTERN_FIELDS = 100
 _MAXIMUM_PATTERN_LABEL_CHARACTERS = 500
@@ -239,6 +240,7 @@ class DatasetEvidenceSemanticSettings(_StrictModel):
     model: str
     render_model: str
     equivalence_model: str
+    materiality_model: str | None = None
     deconstruct_reasoning: Literal["required", "omitted"] = "required"
     render_reasoning: Literal["required", "omitted"] = "required"
     equivalence_reasoning: Literal["required", "omitted"] = "required"
@@ -248,6 +250,10 @@ class DatasetEvidenceSemanticSettings(_StrictModel):
     max_response_bytes: int = Field(ge=1)
     timeout_seconds: float = Field(gt=0)
     deconstructor_identity: SemanticDeconstructorIdentity | None = None
+    materiality_evaluator_version_id: str | None = Field(
+        default=None,
+        pattern=r"^ulev_v1_[0-9a-f]{64}$",
+    )
 
 
 class DatasetEvidenceRedactionCoverage(_StrictModel):
@@ -294,8 +300,8 @@ class DatasetEvidenceFixture(_StrictModel):
 
 
 class DatasetEvidenceRunContext(_StrictModel):
-    schema_version: Literal["1.1.0", "1.2.0", "1.3.0", "1.4.0"] = "1.4.0"
-    pipeline_version: Literal["1.2.0", "1.3.0", "1.4.0", "1.5.0"] = (
+    schema_version: Literal["1.1.0", "1.2.0", "1.3.0", "1.4.0", "1.5.0"] = "1.5.0"
+    pipeline_version: Literal["1.2.0", "1.3.0", "1.4.0", "1.5.0", "1.6.0"] = (
         _DATASET_EVALUATION_PIPELINE_VERSION
     )
     selected_dataset_sha256: str = Field(pattern=_SHA256_PATTERN)
@@ -318,19 +324,26 @@ class DatasetEvidenceRunContext(_StrictModel):
             ("1.2.0", "1.3.0"),
             ("1.3.0", "1.4.0"),
             ("1.4.0", "1.5.0"),
+            ("1.5.0", "1.6.0"),
         }:
             raise ValueError("run context schema and pipeline versions must match")
-        if self.schema_version in {"1.2.0", "1.3.0", "1.4.0"} and self.evaluation_mode is None:
+        if (
+            self.schema_version in {"1.2.0", "1.3.0", "1.4.0", "1.5.0"}
+            and self.evaluation_mode is None
+        ):
             raise ValueError(
                 f"run context schema {self.schema_version} requires an evaluation mode"
             )
         if self.schema_version == "1.1.0" and "evaluation_mode" in self.model_fields_set:
             raise ValueError("run context schema 1.1.0 does not include evaluation mode")
-        if self.schema_version in {"1.3.0", "1.4.0"} and self.fixture is None:
+        if self.schema_version in {"1.3.0", "1.4.0", "1.5.0"} and self.fixture is None:
             raise ValueError(
                 f"run context schema {self.schema_version} requires fixture identity status"
             )
-        if self.schema_version not in {"1.3.0", "1.4.0"} and "fixture" in self.model_fields_set:
+        if (
+            self.schema_version not in {"1.3.0", "1.4.0", "1.5.0"}
+            and "fixture" in self.model_fields_set
+        ):
             raise ValueError(
                 f"run context schema {self.schema_version} does not include fixture identity"
             )
@@ -346,6 +359,12 @@ class DatasetEvidenceRunContext(_StrictModel):
         if self.semantic_settings.deconstructor_identity is None:
             cast(dict[str, object], context_content["semantic_settings"]).pop(
                 "deconstructor_identity"
+            )
+        if self.semantic_settings.materiality_model is None:
+            cast(dict[str, object], context_content["semantic_settings"]).pop("materiality_model")
+        if self.semantic_settings.materiality_evaluator_version_id is None:
+            cast(dict[str, object], context_content["semantic_settings"]).pop(
+                "materiality_evaluator_version_id"
             )
         if "target_timeout_seconds" not in self.model_fields_set:
             context_content.pop("target_timeout_seconds")
@@ -415,6 +434,7 @@ class _Case(_StrictModel):
     variation_rejection_reasons: list[str]
     observations: _Observations | None
     findings: list[_Finding]
+    material_variance: MaterialVarianceAssessment | None = None
     cross_examination: FindingCrossExaminationSummary | None = None
     inconclusive_reasons: list[str]
 
@@ -433,6 +453,7 @@ class _EvidenceRecord(_StrictModel):
         "1.12.0",
         "1.13.0",
         "1.14.0",
+        "1.15.0",
     ]
     evaluation_mode: Literal["variance"] | None = None
     interaction_id: str
@@ -460,6 +481,7 @@ class _EvidenceRecord(_StrictModel):
             "1.12.0",
             "1.13.0",
             "1.14.0",
+            "1.15.0",
         }
         if self.schema_version not in {
             "1.10.0",
@@ -467,9 +489,10 @@ class _EvidenceRecord(_StrictModel):
             "1.12.0",
             "1.13.0",
             "1.14.0",
+            "1.15.0",
         } and "pattern_facets" in (self.model_fields_set):
             raise ValueError("vertical pattern facets require evidence schema 1.10.0")
-        if self.schema_version in {"1.12.0", "1.13.0", "1.14.0"}:
+        if self.schema_version in {"1.12.0", "1.13.0", "1.14.0", "1.15.0"}:
             if any(case.cross_examination is None for case in self.cases):
                 raise ValueError("current evidence schemas require case cross-examination")
         elif any("cross_examination" in case.model_fields_set for case in self.cases):
@@ -503,6 +526,7 @@ class _EvidenceRecord(_StrictModel):
                 "1.12.0",
                 "1.13.0",
                 "1.14.0",
+                "1.15.0",
             }
             and "run_context" in self.model_fields_set
         ):
@@ -525,6 +549,7 @@ class _EvidenceRecord(_StrictModel):
             "1.12.0",
             "1.13.0",
             "1.14.0",
+            "1.15.0",
         }:
             raise ValueError("extended invariant results require evidence schema 1.6.0")
         if (
@@ -543,13 +568,18 @@ class _EvidenceRecord(_StrictModel):
             if isinstance(self.technical_details, dict)
             else None
         )
-        if self.schema_version != "1.14.0" and (
+        if self.schema_version not in {"1.14.0", "1.15.0"} and (
             has_response_findings or technical_comparison_surface == "response"
         ):
             raise ValueError("response comparison evidence requires schema 1.14.0")
         if has_response_findings and technical_comparison_surface != "response":
             raise ValueError("response findings require response comparison technical evidence")
-        if self.schema_version in {"1.13.0", "1.14.0"}:
+        if self.schema_version == "1.15.0":
+            if any((case.material_variance is None) != (not case.findings) for case in self.cases):
+                raise ValueError("schema 1.15.0 requires materiality for every semantic finding")
+        elif any("material_variance" in case.model_fields_set for case in self.cases):
+            raise ValueError("legacy evidence cannot contain material variance assessments")
+        if self.schema_version in {"1.13.0", "1.14.0", "1.15.0"}:
             from ul_cli.dataset.evidence.customer import build_customer_evidence_record
 
             technical_result = DatasetEvaluationResult.model_validate(
@@ -567,6 +597,15 @@ class _EvidenceRecord(_StrictModel):
                 case.cross_examination is None
                 or case.cross_examination.model_dump(mode="json")
                 != expected_case["cross_examination"]
+                or (
+                    self.schema_version == "1.15.0"
+                    and (
+                        case.material_variance.model_dump(mode="json")
+                        if case.material_variance is not None
+                        else None
+                    )
+                    != expected_case.get("material_variance")
+                )
                 for case, expected_case in zip(self.cases, expected_cases, strict=True)
             ):
                 raise ValueError(
@@ -585,6 +624,7 @@ class DatasetResumeEvidence:
     processed_ids: frozenset[str]
     source_preparation_failures: tuple[DatasetSourcePreparationFailureEvidence, ...]
     has_review_findings: bool
+    has_inconclusive_materiality: bool
     invariant_evaluations: tuple[DatasetInvariantEvaluation, ...]
     technical_results: tuple[DatasetEvaluationResult, ...]
     raw_evidence_sha256: str
@@ -632,7 +672,7 @@ def create_dataset_evidence_run_context(
         else DatasetEvidenceFixture(status="not_required")
     )
     content = {
-        "schema_version": "1.4.0",
+        "schema_version": "1.5.0",
         "pipeline_version": _DATASET_EVALUATION_PIPELINE_VERSION,
         "selected_dataset_sha256": selected_dataset_sha256,
         "operators": [operator.model_dump(mode="json") for operator in operator_snapshots],
@@ -642,12 +682,7 @@ def create_dataset_evidence_run_context(
         "invariant_suite_sha256": invariant_suite_sha256,
         "target": target.model_dump(mode="json"),
         "fixture": fixture.model_dump(mode="json"),
-        "semantic_settings": semantic_settings.model_dump(
-            mode="json",
-            exclude={"deconstructor_identity"}
-            if semantic_settings.deconstructor_identity is None
-            else None,
-        ),
+        "semantic_settings": semantic_settings.model_dump(mode="json", exclude_none=True),
     }
     if redaction_policy_sha256 is not None:
         content["redaction_policy_sha256"] = redaction_policy_sha256
@@ -704,6 +739,7 @@ def validate_dataset_resume_evidence(
             processed_ids=frozenset(),
             source_preparation_failures=(),
             has_review_findings=False,
+            has_inconclusive_materiality=False,
             invariant_evaluations=(),
             technical_results=(),
             raw_evidence_sha256=hashlib.sha256(raw_evidence).hexdigest(),
@@ -715,6 +751,7 @@ def validate_dataset_resume_evidence(
     selected_records_by_id = {record.id: record for record in selected_records}
     processed_ids: set[str] = set()
     has_review_findings = False
+    has_inconclusive_materiality = False
     invariant_evaluations: list[DatasetInvariantEvaluation] = []
     technical_results: list[DatasetEvaluationResult] = []
     source_preparation_failures: list[DatasetSourcePreparationFailureEvidence] = []
@@ -772,6 +809,7 @@ def validate_dataset_resume_evidence(
                 "1.12.0",
                 "1.13.0",
                 "1.14.0",
+                "1.15.0",
             }
             or evidence.run_context is None
         ):
@@ -836,9 +874,16 @@ def validate_dataset_resume_evidence(
         )
         if evidence.model_dump(mode="json") != projected_evidence:
             raise ValueError("resume evidence public summary does not match its technical details")
-        has_review_findings |= any(
-            case.verdict == "divergence_needs_review" for case in technical_result.cases
-        )
+        for case in technical_result.cases:
+            if case.verdict != "divergence_needs_review":
+                continue
+            if (
+                case.material_variance is None
+                or case.material_variance.decision == "material_variance"
+            ):
+                has_review_findings = True
+            elif case.material_variance.decision == "insufficient_evidence":
+                has_inconclusive_materiality = True
         if expected_invariant_evaluation is not None:
             invariant_evaluations.append(expected_invariant_evaluation)
         processed_ids.add(evidence.interaction_id)
@@ -846,6 +891,7 @@ def validate_dataset_resume_evidence(
         processed_ids=frozenset(processed_ids),
         source_preparation_failures=tuple(source_preparation_failures),
         has_review_findings=has_review_findings,
+        has_inconclusive_materiality=has_inconclusive_materiality,
         invariant_evaluations=tuple(invariant_evaluations),
         technical_results=tuple(technical_results),
         raw_evidence_sha256=hashlib.sha256(raw_evidence).hexdigest(),
@@ -1060,6 +1106,20 @@ class _IndexedFinding:
     variation_rule: DatasetInvariantRuleResult | None = None
 
 
+def _effective_finding_status(
+    indexed_finding: _IndexedFinding,
+    active_review: ReviewRecord | None,
+) -> FindingReviewStatus:
+    if active_review is not None:
+        return active_review.status
+    automatic_materiality = indexed_finding.case.material_variance
+    if automatic_materiality is None or automatic_materiality.decision == "material_variance":
+        return "needs_review"
+    if automatic_materiality.decision == "operationally_equivalent":
+        return "expected"
+    return "inconclusive"
+
+
 class ConfirmedDatasetFinding(BaseModel):
     model_config = ConfigDict(arbitrary_types_allowed=True, frozen=True)
 
@@ -1154,9 +1214,7 @@ def _summarize_dataset_evidence(
     indexed_invariant_keys: set[tuple[str, str, str, str]] = set()
     for indexed_finding in indexed_findings.values():
         active_review = active_reviews.get(indexed_finding.finding_id)
-        review_status: FindingReviewStatus = (
-            active_review.status if active_review is not None else "needs_review"
-        )
+        review_status = _effective_finding_status(indexed_finding, active_review)
         review_severity: FindingSeverity = (
             active_review.severity if active_review is not None else "unrated"
         )
@@ -1747,6 +1805,35 @@ def _dataset_evidence_is_inconclusive(records: list[_LoadedEvidenceRecord]) -> b
     return False
 
 
+def _dataset_case_report_bucket(
+    case: _Case,
+) -> Literal[
+    "consequential",
+    "equivalent",
+    "inconclusive",
+    "unclassified",
+    "no_difference",
+    "not_evaluated",
+]:
+    if not case.variation_accepted:
+        return "not_evaluated"
+    if case.material_variance is not None:
+        if case.material_variance.decision == "material_variance":
+            return "consequential"
+        if case.material_variance.decision == "operationally_equivalent":
+            return "equivalent"
+        return "inconclusive"
+    if (
+        case.inconclusive_reasons
+        or case.observations is None
+        or case.observations.stability != "stable"
+    ):
+        return "inconclusive"
+    if case.findings:
+        return "unclassified"
+    return "no_difference"
+
+
 def report_dataset_evidence(
     evidence: Annotated[
         Path,
@@ -1762,7 +1849,7 @@ def report_dataset_evidence(
         bool,
         typer.Option(
             help=(
-                "Show capped values for one reviewable invariant finding. Values may contain "
+                "Show capped private values for one finding. Values may contain "
                 "secrets or PII and may enter terminal scrollback, CI output, or logs."
             )
         ),
@@ -1774,6 +1861,13 @@ def report_dataset_evidence(
             help="Finding ID whose invariant values may be disclosed.",
         ),
     ] = None,
+    all_findings: Annotated[
+        bool,
+        typer.Option(
+            "--all-findings",
+            help="Also list automatically equivalent or human-resolved findings.",
+        ),
+    ] = False,
 ) -> None:
     """Show findings and their human review state without model or network calls."""
     reviews_path = reviews or _default_reviews_path(evidence)
@@ -1796,13 +1890,13 @@ def report_dataset_evidence(
             sensitive_finding = findings.get(sensitive_finding_id)
             if sensitive_finding is None:
                 raise _ReviewInputError("sensitive-value finding ID was not found in the evidence")
-            if sensitive_finding.baseline_rule is None or sensitive_finding.variation_rule is None:
-                raise _ReviewInputError(
-                    "sensitive values are available only for a reviewable invariant finding"
+            sensitive_lines = (
+                _bounded_sensitive_semantic_lines(sensitive_finding)
+                if sensitive_finding.semantic_finding is not None
+                else _bounded_sensitive_invariant_lines(
+                    cast(DatasetInvariantRuleResult, sensitive_finding.baseline_rule),
+                    cast(DatasetInvariantRuleResult, sensitive_finding.variation_rule),
                 )
-            sensitive_lines = _bounded_sensitive_invariant_lines(
-                sensitive_finding.baseline_rule,
-                sensitive_finding.variation_rule,
             )
         elif sensitive_finding_id is not None:
             raise _ReviewInputError("--finding is valid only with --show-sensitive-values")
@@ -1811,23 +1905,84 @@ def report_dataset_evidence(
 
     active_reviews = _active_reviews(review_records)
     status_counts = {
-        status: 0
+        status: sum(review.status == status for review in active_reviews.values())
         for status in ("needs_review", "confirmed", "expected", "unsupported", "inconclusive")
     }
-    for indexed_finding in findings.values():
-        active_review = active_reviews.get(indexed_finding.finding_id)
-        status_counts[active_review.status if active_review else "needs_review"] += 1
 
-    _print_plain(f"Dataset finding report: {len(findings)} finding(s)")
+    cases = [case for loaded_record in evidence_records for case in loaded_record.evidence.cases]
+    comparison_counts = {
+        bucket: sum(_dataset_case_report_bucket(case) == bucket for case in cases)
+        for bucket in (
+            "consequential",
+            "equivalent",
+            "inconclusive",
+            "unclassified",
+            "no_difference",
+            "not_evaluated",
+        )
+    }
+    findings_by_case: dict[int, list[_IndexedFinding]] = {}
+    for indexed_finding in findings.values():
+        findings_by_case.setdefault(id(indexed_finding.case), []).append(indexed_finding)
+    consequential_count = 0
+    unresolved_count = len(source_failures)
+    for case in cases:
+        case_bucket = _dataset_case_report_bucket(case)
+        case_findings = findings_by_case.get(id(case), [])
+        if not case_findings:
+            consequential_count += case_bucket == "consequential"
+            unresolved_count += case_bucket in {"inconclusive", "unclassified"}
+            continue
+        effective_statuses = {
+            _effective_finding_status(
+                indexed_finding,
+                active_reviews.get(indexed_finding.finding_id),
+            )
+            for indexed_finding in case_findings
+        }
+        if "confirmed" in effective_statuses or (
+            case_bucket == "consequential" and "needs_review" in effective_statuses
+        ):
+            consequential_count += 1
+        elif effective_statuses & {"needs_review", "inconclusive"}:
+            unresolved_count += 1
+    if consequential_count:
+        result_summary = (
+            f"ACTION REQUIRED — {consequential_count} consequential behavior "
+            f"change{'s' if consequential_count != 1 else ''} found"
+        )
+    elif unresolved_count:
+        result_summary = f"INCONCLUSIVE — {unresolved_count} item(s) need attention"
+    else:
+        result_summary = "CLEAR — no consequential behavior changes found"
+
+    _print_plain("UL dataset report")
+    _print_plain(f"Result: {result_summary}")
+    _print_plain(
+        f"Comparisons: total={len(cases)}, completed="
+        f"{len(cases) - comparison_counts['not_evaluated']}, "
+        f"no_observed_difference={comparison_counts['no_difference']}"
+    )
+    _print_plain(
+        "Automatic decisions: "
+        f"consequential={comparison_counts['consequential']}, "
+        f"equivalent={comparison_counts['equivalent']}, "
+        f"inconclusive={comparison_counts['inconclusive']}"
+    )
+    if comparison_counts["unclassified"] or comparison_counts["not_evaluated"]:
+        _print_plain(
+            "Other: "
+            f"unclassified={comparison_counts['unclassified']}, "
+            f"not_evaluated={comparison_counts['not_evaluated']}"
+        )
     evaluation_mode = _dataset_evaluation_mode(evidence_records, source_failures)
     if evaluation_mode is not None:
+        _print_plain(f"Scope: {evaluation_mode}; correctness and severity were not assessed")
+    if active_reviews:
         _print_plain(
-            f"Evaluation mode: {evaluation_mode} (historical output is not an expected answer; "
-            "correctness not assessed)"
+            "Human review overrides: "
+            + ", ".join(f"{status}={count}" for status, count in status_counts.items() if count)
         )
-    _print_plain(
-        "Reviews: " + ", ".join(f"{status}={count}" for status, count in status_counts.items())
-    )
     _print_plain(f"Source preparation failures: {len(source_failures)}")
     for source_failure in source_failures:
         _print_plain("")
@@ -1838,10 +1993,59 @@ def report_dataset_evidence(
         _print_plain(f"Next: {source_failure.remediation}")
     if show_sensitive_values:
         _print_plain(
-            "WARNING: showing selected invariant values; they may contain secrets or PII and "
+            "WARNING: showing selected private values; they may contain secrets or PII and "
             "may be retained in terminal scrollback, CI output, or logs."
         )
-    for indexed_finding in findings.values():
+    visible_findings = [
+        indexed_finding
+        for indexed_finding in findings.values()
+        if all_findings
+        or indexed_finding.finding_id == sensitive_finding_id
+        or _effective_finding_status(
+            indexed_finding,
+            active_reviews.get(indexed_finding.finding_id),
+        )
+        in {"needs_review", "confirmed", "inconclusive"}
+    ]
+
+    def finding_section(indexed_finding: _IndexedFinding) -> str:
+        status = _effective_finding_status(
+            indexed_finding,
+            active_reviews.get(indexed_finding.finding_id),
+        )
+        if status == "inconclusive":
+            return "Inconclusive comparisons"
+        if status in {"expected", "unsupported"}:
+            return "Resolved or equivalent differences"
+        if (
+            indexed_finding.case.material_variance is not None
+            and indexed_finding.case.material_variance.decision == "material_variance"
+        ):
+            return "Consequential behavior changes"
+        return "Findings needing review"
+
+    section_order = {
+        "Consequential behavior changes": 0,
+        "Findings needing review": 1,
+        "Inconclusive comparisons": 2,
+        "Resolved or equivalent differences": 3,
+    }
+    visible_findings.sort(
+        key=lambda indexed_finding: (
+            section_order[finding_section(indexed_finding)],
+            indexed_finding.finding_id,
+        )
+    )
+    current_section: str | None = None
+    section_item_number = 0
+    for indexed_finding in visible_findings:
+        section = finding_section(indexed_finding)
+        if section != current_section:
+            _print_plain("")
+            _print_plain(section)
+            current_section = section
+            section_item_number = 0
+        section_item_number += 1
         loaded_record = indexed_finding.evidence_record
         case = indexed_finding.case
         matching_reviews = [
@@ -1851,50 +2055,34 @@ def report_dataset_evidence(
         ]
         latest_review = active_reviews.get(indexed_finding.finding_id)
         _print_plain("")
-        _print_plain(f"Finding {indexed_finding.finding_id}")
         if indexed_finding.semantic_finding is not None:
             finding = indexed_finding.semantic_finding
-            _print_plain(f"Machine status: {case.status}")
-            _print_plain(f"Category: {finding.category}")
-            _print_plain(f"Summary: {finding.summary}")
+            _print_plain(f"{section_item_number}. {finding.summary}")
+            if case.material_variance is not None:
+                _print_plain("Reason: " + case.material_variance.reason_code.replace("_", " "))
         else:
             baseline_rule = indexed_finding.baseline_rule
             variation_rule = indexed_finding.variation_rule
             if baseline_rule is None or variation_rule is None:
                 raise AssertionError("invariant finding requires both rule results")
-            _print_plain(f"Semantic comparison status: {case.status}")
+            _print_plain(f"{section_item_number}. Customer-defined rule changed state.")
             _print_plain(
                 f"Invariant finding status: original={baseline_rule.status}; "
                 f"variation={variation_rule.status}"
-            )
-            _print_plain("Category: customer_invariant_violation")
-            _print_plain(
-                f"Summary: Customer rule {variation_rule.rule_id} was satisfied by the original "
-                "and violated by the variation."
             )
             _print_plain(
                 f"Rule: {variation_rule.rule_id} ({variation_rule.rule_version}); "
                 f"type={variation_rule.rule_type}; declared_severity={variation_rule.severity}"
             )
             _print_plain(f"Description: {variation_rule.description}")
-        _print_plain(f"Original: {loaded_record.evidence.original_input}")
-        _print_plain(f"Variation: {case.augmented_input}")
-        _print_plain(f"Operator: {case.operator_id} ({case.operator_version})")
+        _print_plain("Test variation: " + case.operator_id.replace(".", " / ").replace("_", " "))
         _print_plain(
-            "Original trials: "
+            "Evidence stability: original="
             + _observations_summary(loaded_record.evidence.current_baseline.observations)
+            + "; variation="
+            + _observations_summary(case.observations)
         )
-        _print_plain("Variation trials: " + _observations_summary(case.observations))
-        if indexed_finding.semantic_finding is not None:
-            _print_plain(
-                "Reference effects: "
-                + _effects_summary(indexed_finding.semantic_finding.reference_effects)
-            )
-            _print_plain(
-                "Observed effects: "
-                + _effects_summary(indexed_finding.semantic_finding.observed_effects)
-            )
-        else:
+        if indexed_finding.semantic_finding is None:
             baseline_rule = indexed_finding.baseline_rule
             variation_rule = indexed_finding.variation_rule
             if baseline_rule is None or variation_rule is None:
@@ -1908,11 +2096,12 @@ def report_dataset_evidence(
                     f"Variation rule trial {trial.repetition}: {trial.status}; "
                     f"{_invariant_trial_location(trial)}; reason={trial.reason_code}"
                 )
-            if show_sensitive_values and indexed_finding.finding_id == sensitive_finding_id:
-                for sensitive_line in sensitive_lines:
-                    _print_sensitive_plain(sensitive_line)
+        if show_sensitive_values and indexed_finding.finding_id == sensitive_finding_id:
+            for sensitive_line in sensitive_lines:
+                _print_sensitive_plain(sensitive_line)
         if latest_review is None:
-            _print_plain(f"Latest review: needs_review (history: {len(matching_reviews)})")
+            if case.material_variance is None:
+                _print_plain(f"Decision: needs review (history: {len(matching_reviews)})")
         else:
             _print_plain(
                 f"Latest review: {latest_review.status}, severity={latest_review.severity}, "
@@ -1920,7 +2109,13 @@ def report_dataset_evidence(
                 f"(history: {len(matching_reviews)})"
             )
             _print_plain(f"Review reason: {latest_review.reason}")
-        _print_plain(f"Evidence record SHA-256: {loaded_record.sha256}")
+        _print_plain(f"Finding ID: {indexed_finding.finding_id}")
+        if not show_sensitive_values:
+            _print_plain(
+                "Inspect private values: ul dataset report "
+                f"{shlex.quote(str(evidence))} --finding "
+                f"{shlex.quote(indexed_finding.finding_id)} --show-sensitive-values"
+            )
 
     invariant_evaluations = [
         loaded_record.evidence.invariant_evaluation
@@ -1943,11 +2138,13 @@ def report_dataset_evidence(
 
     _print_plain("")
     _print_plain(f"Complete technical evidence: {evidence}")
-    _print_plain(f"Review history: {reviews_path}")
-    _print_plain(
-        "Review meanings: confirmed=problem in context; expected=supported acceptable difference; "
-        "unsupported=machine claim not supported; inconclusive=insufficient context."
-    )
+    if review_records:
+        _print_plain(f"Review history: {reviews_path}")
+        _print_plain(
+            "Review meanings: confirmed=problem in context; expected=supported acceptable "
+            "difference; unsupported=machine claim not supported; "
+            "inconclusive=insufficient context."
+        )
     _print_plain(
         "Limitation: UL reports observed differences. A human review is a contextual judgment, "
         "not proof of correctness, causation, or production frequency."
@@ -2346,7 +2543,7 @@ def _load_evidence_document(path: Path) -> _LoadedEvidenceDocument:
     except (UnicodeDecodeError, json.JSONDecodeError, ValidationError, ValueError):
         raise _ReviewInputError(
             "evidence is not valid UL dataset evidence JSONL; expected success schema through "
-            "1.14.0 or source-preparation-failure/1.0.0"
+            "1.15.0 or source-preparation-failure/1.0.0"
         ) from None
     return _LoadedEvidenceDocument(
         records=records,
@@ -3130,22 +3327,30 @@ def _observations_summary(observations: _Observations | None) -> str:
     )
 
 
-def _effects_summary(effects: list[_Effect]) -> str:
-    if not effects:
-        return "none"
-    return "; ".join(
-        json.dumps(
-            {
-                "kind": effect.kind,
-                "predicate": effect.predicate,
-                "fields": effect.fields,
-                "propositions": effect.propositions,
-                "status": effect.status,
-            },
-            ensure_ascii=False,
-            sort_keys=True,
+def _bounded_sensitive_semantic_lines(
+    indexed_finding: _IndexedFinding,
+) -> tuple[str, ...]:
+    finding = indexed_finding.semantic_finding
+    if finding is None:
+        raise AssertionError("semantic disclosure requires a semantic finding")
+    return _bounded_sensitive_lines(
+        (
+            _sensitive_json_line(
+                "Original input",
+                {"value": indexed_finding.evidence_record.evidence.original_input},
+            ),
+            _sensitive_json_line(
+                "Variation input", {"value": indexed_finding.case.augmented_input}
+            ),
+            _sensitive_json_line(
+                "Reference effects",
+                {"value": [effect.model_dump(mode="json") for effect in finding.reference_effects]},
+            ),
+            _sensitive_json_line(
+                "Observed effects",
+                {"value": [effect.model_dump(mode="json") for effect in finding.observed_effects]},
+            ),
         )
-        for effect in effects
     )
 
 
@@ -3196,9 +3401,13 @@ def _bounded_sensitive_invariant_lines(
     baseline_rule: DatasetInvariantRuleResult,
     variation_rule: DatasetInvariantRuleResult,
 ) -> tuple[str, ...]:
+    return _bounded_sensitive_lines(_sensitive_invariant_lines(baseline_rule, variation_rule))
+
+
+def _bounded_sensitive_lines(lines_to_check: Iterable[str]) -> tuple[str, ...]:
     lines: list[str] = []
     encoded_bytes = 0
-    for line in _sensitive_invariant_lines(baseline_rule, variation_rule):
+    for line in lines_to_check:
         encoded_bytes += len((_sanitize_plain_text(line) + "\n").encode("utf-8"))
         lines.append(line)
         if (

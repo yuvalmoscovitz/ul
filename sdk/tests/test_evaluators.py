@@ -740,6 +740,7 @@ async def test_openai_compatible_judge_uses_structured_output_and_explicit_data_
                 api_key="test-secret",
                 allow_external_data_processing=True,
                 data_policy="openrouter_zdr",
+                token_parameter="max_tokens",
             ),
             client=client,
         )
@@ -762,6 +763,8 @@ async def test_openai_compatible_judge_uses_structured_output_and_explicit_data_
         "require_parameters": True,
         "zdr": True,
     }
+    assert request_body["max_tokens"] == 1_024
+    assert "max_completion_tokens" not in request_body
     assert captured_request.headers["authorization"] == "Bearer test-secret"
 
 

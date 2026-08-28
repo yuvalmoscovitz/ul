@@ -99,7 +99,8 @@ def print_dataset_plan(
         f"repetition_rounds={campaign_plan.calls.repetitions}, "
         f"retries={campaign_plan.calls.retries}, "
         f"preflight={campaign_plan.calls.preflight}, "
-        f"evaluators={campaign_plan.calls.evaluators}"
+        f"evaluators={campaign_plan.calls.evaluators}, "
+        f"materiality={campaign_plan.calls.materiality}"
     )
     for profile in campaign_plan.preflight_profiles:
         print_dataset_plain(
@@ -333,15 +334,26 @@ def print_dataset_results(
     if augmentations_output is not None:
         print_dataset_plain(f"Saved augmentations: {augmentations_output}")
     if show_report_guidance:
+        console.print(f"Next: ul dataset report {output}")
         if has_decision_ready_findings:
-            console.print(f"Next: ul report {finding_output}")
-            console.print(f"Private dataset details: ul dataset report {output}")
-        else:
-            console.print(f"Next: ul dataset report {output}")
+            console.print(f"Actionable finding export: ul report {finding_output}")
 
 
 def result_needs_review(result: DatasetEvaluationResult) -> bool:
-    return any(case.verdict == "divergence_needs_review" for case in result.cases)
+    return dataset_result_exit_code(result) == 1
+
+
+def dataset_result_exit_code(result: DatasetEvaluationResult) -> int:
+    has_inconclusive_materiality = False
+    for case in result.cases:
+        if case.verdict != "divergence_needs_review":
+            continue
+        material_variance = getattr(case, "material_variance", None)
+        if material_variance is None or material_variance.decision == "material_variance":
+            return 1
+        if material_variance.decision == "insufficient_evidence":
+            has_inconclusive_materiality = True
+    return 2 if has_inconclusive_materiality else 0
 
 
 def dataset_invariant_exit_code(
