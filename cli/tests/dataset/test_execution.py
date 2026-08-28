@@ -7,6 +7,7 @@ import re
 import stat
 import sys
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, cast
@@ -407,6 +408,108 @@ def test_full_dataset_evaluation_runs_local_callable_through_worker_boundary(
             _ANSI_ESCAPE_PATTERN.sub("", incompatible_resume.output).split()
         )
         assert "incompatible with the current evaluation plan" in normalized_incompatible_error
+
+
+def test_dataset_evaluation_allows_http_target_response_after_thirty_seconds(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request_count = 0
+
+    class SlowTargetHandler(BaseHTTPRequestHandler):
+        def do_POST(self) -> None:
+            nonlocal request_count
+            content_length = int(self.headers["Content-Length"])
+            json.loads(self.rfile.read(content_length))
+            request_count += 1
+            if request_count == 1:
+                time.sleep(31)
+            response = json.dumps({"result": {"action": "lookup", "ticket": 42}}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(response)))
+            self.end_headers()
+            self.wfile.write(response)
+
+        def log_message(self, format: str, *args: object) -> None:
+            pass
+
+    try:
+        server = ThreadingHTTPServer(("127.0.0.1", 0), SlowTargetHandler)
+    except PermissionError:
+        pytest.skip("the test environment does not allow binding a loopback server")
+    server_thread = threading.Thread(target=server.serve_forever)
+    server_thread.start()
+    dataset = tmp_path / "interactions.jsonl"
+    output = tmp_path / "results.jsonl"
+    dataset.write_text(
+        '{"id":"case-1","input":"Return status for ticket 42.",'
+        '"output":{"action":"lookup","ticket":42}}\n',
+        encoding="utf-8",
+    )
+    url = f"http://127.0.0.1:{server.server_port}/invoke"
+    direct_options = {
+        "allow_insecure_http": True,
+        "request_json_template": '{"input":"{{input}}"}',
+        "response_json_pointer": "/result",
+        "request_isolation_attested": True,
+        "safe_test_target_attested": True,
+    }
+    resolved_target = resolve_http_target(url, **direct_options)
+    semantic_model = _LocalEvaluationSemanticModel()
+
+    async def successful_preflight(_settings: object) -> object:
+        return _evaluator_preflight()
+
+    monkeypatch.setenv("UL_LIVE", "true")
+    monkeypatch.setenv("OPEN_ROUTER_API_KEY", "test-key")
+    monkeypatch.setattr(command_module, "load_dataset_semantic_settings", _settings)
+    monkeypatch.setattr(command_module, "preflight_evaluator", successful_preflight)
+    monkeypatch.setattr(
+        runner_module,
+        "create_semantic_model_deconstructor",
+        lambda _settings: semantic_model,
+    )
+    try:
+        result = runner.invoke(
+            root_app,
+            [
+                "dataset",
+                "evaluate",
+                str(dataset),
+                "--target",
+                url,
+                "--request-json-template",
+                cast(str, direct_options["request_json_template"]),
+                "--response-json-pointer",
+                "/result",
+                "--confirm-request-isolation",
+                "--confirm-safe-test-target",
+                "--confirm-target",
+                resolved_target.confirmation_sha256,
+                "--allow-insecure-http",
+                "--allow-environment-network",
+                "--confirm-test-environment",
+                "--repetitions",
+                "1",
+                "--target-timeout-seconds",
+                "35",
+                "--output",
+                str(output),
+            ],
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+        server_thread.join()
+
+    assert result.exit_code == 0, result.output
+    assert request_count == 2
+    saved = json.loads(output.read_text(encoding="utf-8").splitlines()[1])
+    baseline_trial = saved["technical_details"]["baseline"]["trial_set"]["trials"][0]
+    variation_trial = saved["technical_details"]["cases"][0]["trial_set"]["trials"][0]
+    assert baseline_trial["execution_evidence"]["final_response"]["ticket"] == 42
+    assert variation_trial["execution_evidence"]["final_response"]["ticket"] == 42
 
 
 def test_declared_projection_compares_raw_recorded_tool_calls_through_public_cli(
@@ -889,6 +992,7 @@ def test_execution_creates_private_explicit_output(
         def from_config(cls, config: JsonHttpEnvironmentConfig, **options: object) -> FakeTarget:
             assert config.execute_turn.url == "http://127.0.0.1:8765/execute"
             assert options["test_environment_confirmed"] is True
+            assert options["timeout_seconds"] == 75.0
             return cls()
 
     async def fake_evaluate(
