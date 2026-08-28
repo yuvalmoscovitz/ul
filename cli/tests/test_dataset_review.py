@@ -36,7 +36,7 @@ from ul_cli import report as report_module
 from ul_cli.dataset.evaluation import command as dataset_command
 from ul_cli.dataset.evaluation import runner as dataset_runner
 from ul_cli.main import app
-from ul_cli.pattern_identity import pattern_evidence_reference, pattern_mechanism_pseudonym
+from ul_cli.pattern_identity import pattern_mechanism_pseudonym
 from ul_cli.report_contract import (
     FindingSummary,
     UnifiedReport,
@@ -363,12 +363,12 @@ def test_report_review_report_journey_preserves_evidence_and_history(tmp_path: P
     initial_report = runner.invoke(app, ["dataset", "report", str(evidence)])
 
     assert initial_report.exit_code == 0, initial_report.output
-    assert "Dataset finding report: 1 finding(s)" in initial_report.output
-    assert "needs_review=1" in initial_report.output
-    assert "Original: Pay AC-100." in initial_report.output
-    assert "Variation: Pay pay AC-100." in initial_report.output
-    assert '"invoice_reference": "AC-100"' in initial_report.output
-    assert '"invoice_reference": "AC-101"' in initial_report.output
+    assert "UL dataset report" in initial_report.output
+    assert "Findings needing review" in initial_report.output
+    assert "Original: Pay AC-100." not in initial_report.output
+    assert "Variation: Pay pay AC-100." not in initial_report.output
+    assert '"invoice_reference": "AC-100"' not in initial_report.output
+    assert '"invoice_reference": "AC-101"' not in initial_report.output
     assert "stable; 3/3 observed; groups=1+2+3" in initial_report.output
     assert "not proof of correctness, causation, or production frequency" in initial_report.output
     assert not sidecar.exists()
@@ -414,7 +414,7 @@ def test_report_review_report_journey_preserves_evidence_and_history(tmp_path: P
     assert review_history[1]["supersedes_review_id"] == first_record["review_id"]
     assert evidence.read_bytes() == original_bytes
 
-    final_report = runner.invoke(app, ["dataset", "report", str(evidence)])
+    final_report = runner.invoke(app, ["dataset", "report", str(evidence), "--all-findings"])
     assert final_report.exit_code == 0, final_report.output
     assert "expected=1" in final_report.output
     assert "Latest review: expected, severity=unrated" in final_report.output
@@ -455,7 +455,7 @@ def test_root_json_report_is_stable_and_omits_private_dataset_fields(tmp_path: P
                     "ulpf_v1_b5dd705fb4db534431680decfe8b221fbebfd049d7b7aba99c2b59af966a2ca3"
                 ),
                 "pattern_snapshot_id": (
-                    "ulps_v1_9edd3015baa3dc15bcf658ae32a83ce8f838ac74fd8ac46c00c0ae1a8a3af720"
+                    "ulps_v1_ebcde01bff883fa43fcfa740b674d2ad614afbd8d67a5147b701809a1b136ba6"
                 ),
                 "kind": "behavior_difference",
                 "category": "changed_grounded_effect_argument",
@@ -492,9 +492,8 @@ def test_root_json_report_is_stable_and_omits_private_dataset_fields(tmp_path: P
                 "members": [
                     {
                         "finding_id": FINDING_ID,
-                        "evidence_record_ref": pattern_evidence_reference(
-                            _PATTERN_IDENTITY_KEY,
-                            "58747e142523f31429e1fff3b9712d4bdee4b29062a7806869bf9b7c0c1016f8",
+                        "evidence_record_ref": (
+                            "ulpe_v1_717751ec28be57ec84779be550f7280d7e0c5a4377c2a092300cb3a13fe1aff5"
                         ),
                         "membership_reasons": [
                             "same_action_shape",
@@ -1430,7 +1429,7 @@ def test_report_schema_1_4_shows_customer_invariants_separately(tmp_path: Path) 
 
     assert report.exit_code == 0, report.output
     normalized_output = " ".join(report.output.split())
-    assert "Dataset finding report: 2 finding(s)" in normalized_output
+    assert "UL dataset report" in normalized_output
     assert "Category: customer_invariant_violation" in normalized_output
     assert "Rule transition: original=satisfied; variation=violated" in normalized_output
     assert "Customer invariant evaluation" in normalized_output
@@ -1821,10 +1820,11 @@ def test_sensitive_value_disclosure_requires_one_invariant_finding(tmp_path: Pat
     assert missing_finding.exit_code != 0
     missing_output = " ".join(_ANSI_ESCAPE_PATTERN.sub("", missing_finding.output).split())
     assert "requires --finding FINDING_ID" in missing_output
-    assert semantic_finding.exit_code != 0
+    assert semantic_finding.exit_code == 0, semantic_finding.output
     semantic_output = " ".join(_ANSI_ESCAPE_PATTERN.sub("", semantic_finding.output).split())
-    assert "only for a reviewable" in semantic_output
-    assert "invariant finding" in semantic_output
+    assert "WARNING: showing selected private values" in semantic_output
+    assert 'Original input: {"value":"Pay AC-100."}' in semantic_output
+    assert 'Variation input: {"value":"Pay pay AC-100."}' in semantic_output
 
 
 def test_sensitive_value_printer_does_not_wrap_beyond_counted_line(
@@ -2014,7 +2014,7 @@ def test_invalid_evidence_diagnostic_lists_current_schema(tmp_path: Path) -> Non
     result = runner.invoke(app, ["dataset", "report", str(evidence)])
 
     assert result.exit_code != 0
-    assert "1.14.0" in result.output
+    assert "1.15.0" in result.output
 
 
 def test_malformed_extra_field_and_digest_mismatch_reviews_are_rejected(tmp_path: Path) -> None:

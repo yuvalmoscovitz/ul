@@ -20,6 +20,8 @@ from dataset._factories import _evaluator_preflight
 from typer.testing import CliRunner
 from ul import (
     DatasetEvaluationResult,
+    EvaluatorDecision,
+    EvaluatorEvidence,
     InteractionRecord,
     load_json_http_environment_config,
     load_local_target_config,
@@ -370,6 +372,45 @@ class _UnknownOutcomeSemanticModel(_ResponseOnlySemanticModel):
             ),
             extractor_version="unknown-outcome-test",
         )
+
+
+class _MaterialResponseJudge:
+    def __init__(self, config: object) -> None:
+        self.version = config.evaluator_judge_version()
+
+    async def __aenter__(self) -> _MaterialResponseJudge:
+        return self
+
+    async def __aexit__(self, *args: object) -> None:
+        pass
+
+    async def evaluate(self, request: object) -> EvaluatorDecision:
+        del request
+        return EvaluatorDecision(
+            score=1,
+            label="material_variance:response_meaning_changed",
+            explanation="The response recommendation changed.",
+            evidence=(
+                EvaluatorEvidence(
+                    source="judge_payload",
+                    json_pointer="/payload/answer/findings/0/baseline_effects/0",
+                    description="baseline",
+                ),
+                EvaluatorEvidence(
+                    source="judge_payload",
+                    json_pointer="/payload/answer/findings/0/variation_effects/0",
+                    description="variation",
+                ),
+            ),
+        )
+
+
+def _use_material_response_judge(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        campaign_runner_module,
+        "OpenAICompatibleEvaluatorJudge",
+        _MaterialResponseJudge,
+    )
 
 
 def test_declining_target_confirmation_imports_nothing_and_calls_nothing(
@@ -2663,6 +2704,7 @@ def test_public_probe_runs_answer_only_callable_through_real_worker_and_reports_
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    _use_material_response_judge(monkeypatch)
     (tmp_path / "agent.py").write_text(
         "import json\n"
         "from pathlib import Path\n\n"
@@ -2737,6 +2779,7 @@ def test_public_probe_runs_raw_text_callable_through_real_worker_without_leaking
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    _use_material_response_judge(monkeypatch)
     (tmp_path / "agent.py").write_text(
         "from pathlib import Path\n\n"
         "def run(value):\n"
@@ -3108,6 +3151,7 @@ def test_real_callable_probe_review_save_and_replay_without_bridge(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    _use_material_response_judge(monkeypatch)
     (tmp_path / "customer_agent.py").write_text(
         "def run(value):\n"
         "    changed = '[accepted variation]' in value\n"
@@ -3162,6 +3206,7 @@ def test_real_authenticated_http_probe_review_save_and_replay_without_bridge(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    _use_material_response_judge(monkeypatch)
     received_authorization: list[str | None] = []
 
     class RegressionTargetHandler(BaseHTTPRequestHandler):

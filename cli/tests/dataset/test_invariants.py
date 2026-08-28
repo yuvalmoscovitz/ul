@@ -13,6 +13,7 @@ from typer.testing import CliRunner
 from ul import (
     DatasetEvaluationResult,
     ObservedAgentOutput,
+    OpenAICompatibleDatasetSettings,
 )
 from ul.dataset_invariants import (
     DatasetInvariantEvaluation,
@@ -75,7 +76,7 @@ def test_invariant_dry_run_reports_rules_authority_and_no_extra_calls(
     assert "Declared observation authority: committed_state_snapshot" in result.output
     assert "Additional model calls for customer invariants: 0" in result.output
     assert "Additional environment API calls for customer invariants: 0" in result.output
-    assert "Potential semantic model calls: up to 12" in result.output
+    assert "Potential semantic model calls: up to 14" in result.output
     assert "Potential environment API calls: up to 6" in result.output
 
 
@@ -181,7 +182,7 @@ def test_extended_invariants_use_new_evidence_schema_and_hide_values_from_termin
     presentation_module._print_invariant_results((invariant_evaluation,))
     terminal_output = capsys.readouterr().out
 
-    assert parsed.schema_version == "1.14.0"
+    assert parsed.schema_version == "1.15.0"
     assert parsed.evaluation_mode == "variance"
     assert parsed.run_context is not None
     assert parsed.run_context.evaluation_mode == "variance"
@@ -394,7 +395,11 @@ def test_invariant_evaluation_reuses_results_without_extra_runner_calls(
             runner_module.evaluate_interaction_records(
                 (cast(Any, SimpleNamespace()),),
                 ("input.surface.rephrase",),
-                cast(Any, SimpleNamespace()),
+                OpenAICompatibleDatasetSettings(
+                    allow_external_data_processing=True,
+                    base_url="https://evaluator.example/v1",
+                    model="test-model",
+                ),
                 cast(Any, AsyncContext()),
                 output_stream,
                 repetitions=1,

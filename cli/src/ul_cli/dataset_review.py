@@ -2017,6 +2017,8 @@ def report_dataset_evidence(
             return "Inconclusive comparisons"
         if status in {"expected", "unsupported"}:
             return "Resolved or equivalent differences"
+        if status == "confirmed":
+            return "Consequential behavior changes"
         if (
             indexed_finding.case.material_variance is not None
             and indexed_finding.case.material_variance.decision == "material_variance"
@@ -2058,6 +2060,7 @@ def report_dataset_evidence(
         if indexed_finding.semantic_finding is not None:
             finding = indexed_finding.semantic_finding
             _print_plain(f"{section_item_number}. {finding.summary}")
+            _print_plain(f"Category: {finding.category}")
             if case.material_variance is not None:
                 _print_plain("Reason: " + case.material_variance.reason_code.replace("_", " "))
         else:
@@ -2066,6 +2069,8 @@ def report_dataset_evidence(
             if baseline_rule is None or variation_rule is None:
                 raise AssertionError("invariant finding requires both rule results")
             _print_plain(f"{section_item_number}. Customer-defined rule changed state.")
+            _print_plain("Category: customer_invariant_violation")
+            _print_plain(f"Semantic comparison status: {case.status}")
             _print_plain(
                 f"Invariant finding status: original={baseline_rule.status}; "
                 f"variation={variation_rule.status}"
@@ -2109,7 +2114,7 @@ def report_dataset_evidence(
                 f"(history: {len(matching_reviews)})"
             )
             _print_plain(f"Review reason: {latest_review.reason}")
-        _print_plain(f"Finding ID: {indexed_finding.finding_id}")
+        _print_plain(f"Finding {indexed_finding.finding_id}")
         if not show_sensitive_values:
             _print_plain(
                 "Inspect private values: ul dataset report "
