@@ -68,6 +68,7 @@ class _StrictModel(BaseModel):
 
 class DatasetRunEffectiveCommand(_StrictModel):
     repetitions: int = Field(ge=1, le=_MAXIMUM_REPETITIONS)
+    target_timeout_seconds: float = Field(default=30.0, gt=0, le=3_600)
     max_environment_api_calls: int = Field(ge=1)
     allow_environment_network: bool
     confirm_test_environment: bool
@@ -218,6 +219,7 @@ def create_dataset_run_manifest(
     selected_records: tuple[InteractionRecord, ...],
     selected_operator_ids: tuple[str, ...],
     repetitions: int,
+    target_timeout_seconds: float = 30.0,
     max_environment_api_calls: int,
     allow_environment_network: bool,
     confirm_test_environment: bool,
@@ -241,6 +243,7 @@ def create_dataset_run_manifest(
         raise ValueError(f"repetitions cannot exceed {_MAXIMUM_REPETITIONS}")
     effective_command = DatasetRunEffectiveCommand(
         repetitions=repetitions,
+        target_timeout_seconds=target_timeout_seconds,
         max_environment_api_calls=max_environment_api_calls,
         allow_environment_network=allow_environment_network,
         confirm_test_environment=confirm_test_environment,

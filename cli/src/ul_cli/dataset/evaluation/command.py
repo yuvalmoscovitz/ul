@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
+import math
 import os
 import shlex
 import sys
@@ -136,11 +137,31 @@ from .runner import evaluate_interaction_records, preflight_evaluator
 _MAXIMUM_DATASET_RECORDS = 100
 _MAXIMUM_REPETITIONS = 100
 _DEFAULT_MAXIMUM_ENVIRONMENT_API_CALLS = 100
+_DEFAULT_TARGET_TIMEOUT_SECONDS = 30.0
+_MAXIMUM_TARGET_TIMEOUT_SECONDS = 3_600.0
 _MAXIMUM_FINDING_SNAPSHOT_BYTES = 128_000_000
 _SOURCE_PREPARATION_REASON_CODES = {
     "source_semantic_preparation_failed",
     "source_comparison_surface_incompatible",
 }
+
+
+def _resolve_target_timeout_seconds(
+    requested: float | None,
+    recorded_manifest: DatasetRunManifest | None,
+) -> float:
+    recorded = (
+        recorded_manifest.effective_command.target_timeout_seconds
+        if recorded_manifest is not None
+        else _DEFAULT_TARGET_TIMEOUT_SECONDS
+    )
+    resolved = recorded if requested is None else requested
+    if not math.isfinite(resolved) or resolved <= 0:
+        raise typer.BadParameter(
+            "target timeout must be positive and finite",
+            param_hint="--target-timeout-seconds",
+        )
+    return resolved
 
 
 def _source_outcome_projection_sha256(
@@ -408,6 +429,15 @@ def evaluate_dataset(
             help="Fresh-state environment executions per original input and accepted variation.",
         ),
     ] = None,
+    target_timeout_seconds: Annotated[
+        float | None,
+        typer.Option(
+            "--target-timeout-seconds",
+            min=0,
+            max=_MAXIMUM_TARGET_TIMEOUT_SECONDS,
+            help="Maximum seconds allowed for each target trial.",
+        ),
+    ] = None,
     max_environment_api_calls: Annotated[
         int | None,
         typer.Option(
@@ -611,6 +641,10 @@ def evaluate_dataset(
         if redaction_state is None and recorded_command.redaction_state_path is not None:
             redaction_state = Path(recorded_command.redaction_state_path)
     repetitions = repetitions or 3
+    target_timeout_seconds = _resolve_target_timeout_seconds(
+        target_timeout_seconds,
+        recorded_manifest_for_resume,
+    )
     direct_http_options_used = (
         http_preset is not None
         or request_json_template is not None
@@ -928,6 +962,7 @@ def evaluate_dataset(
                 selected_operator_ids=selected_operators,
                 evaluation_mode=evaluation_mode,
                 repetitions=repetitions,
+                target_timeout_seconds=target_timeout_seconds,
                 invariant_suite=invariant_suite,
                 target_config=(
                     None if direct_http_target_receipt is not None else normalized_target_config
@@ -1050,6 +1085,7 @@ def evaluate_dataset(
             selected_records=all_selected_records,
             selected_operator_ids=selected_operators,
             repetitions=repetitions,
+            target_timeout_seconds=target_timeout_seconds,
             max_environment_api_calls=max_environment_api_calls,
             allow_environment_network=allow_environment_network,
             confirm_test_environment=confirm_test_environment,
@@ -1227,6 +1263,7 @@ def evaluate_dataset(
         selected_operator_ids=selected_operators,
         repetitions=repetitions,
         target_calls_per_execution=target_calls_per_execution,
+        target_timeout_seconds=target_timeout_seconds,
         settings=settings,
         saved_augmentations=saved_augmentations,
         show_sensitive_values=show_sensitive_values,
@@ -1278,6 +1315,7 @@ def evaluate_dataset(
                 loaded_target_config.headers_from_env if loaded_target_config is not None else {}
             ),
             repetitions=repetitions,
+            target_timeout_seconds=target_timeout_seconds,
             max_environment_api_calls=max_environment_api_calls,
             target_calls_per_execution=target_calls_per_execution,
             target_supports_state_observation=(
@@ -1493,14 +1531,7 @@ def evaluate_dataset(
         semantic_call_budget=campaign_plan.calls.total_semantic_model,
         environment_call_budget=max_environment_api_calls,
         token_budget=campaign_plan.tokens.maximum,
-        maximum_wall_time_seconds=(
-            max(
-                1,
-                campaign_plan.calls.total_environment_api
-                + campaign_plan.calls.total_semantic_model,
-            )
-            * settings.timeout_seconds
-        ),
+        maximum_wall_time_seconds=campaign_plan.timing.maximum_wall_time_seconds,
         next_commands=create_campaign_next_commands(output, resume_argv=resume_argv),
         json_output=progress_json,
     )
@@ -1672,6 +1703,8 @@ def evaluate_dataset(
                 durable_arguments["progress_json"] = True
             if "source_preparation_failures" in evaluation_parameters or accepts_extra_arguments:
                 durable_arguments["source_preparation_failures"] = source_preparation_failures
+            if "target_timeout_seconds" in evaluation_parameters or accepts_extra_arguments:
+                durable_arguments["target_timeout_seconds"] = target_timeout_seconds
             evaluation_runner = cast(Any, evaluate_interaction_records)
             if invariant_suite is not None:
                 evaluation_coroutine = evaluation_runner(
@@ -1891,6 +1924,11 @@ def _manifest_incompatibility_reason(
         ("projection", recorded.invariant_suite_sha256, requested.invariant_suite_sha256),
         ("operators", recorded.operators, requested.operators),
         (
+            "target_timeout_seconds",
+            recorded.target_timeout_seconds,
+            requested.target_timeout_seconds,
+        ),
+        (
             "evaluator.provider",
             recorded.semantic_settings.provider,
             requested.semantic_settings.provider,
@@ -2008,6 +2046,11 @@ def _effective_command_incompatibility_reason(
             right.augmentations_output_path,
         ),
         ("repetitions", left.repetitions, right.repetitions),
+        (
+            "target_timeout_seconds",
+            left.target_timeout_seconds,
+            right.target_timeout_seconds,
+        ),
         (
             "max_environment_api_calls",
             left.max_environment_api_calls,

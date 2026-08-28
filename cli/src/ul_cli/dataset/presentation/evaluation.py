@@ -43,6 +43,7 @@ def print_dataset_plan(
     target_endpoint: str | None,
     target_header_environment_variables: dict[str, str],
     repetitions: int,
+    target_timeout_seconds: float,
     max_environment_api_calls: int,
     target_calls_per_execution: int,
     target_supports_state_observation: bool | None,
@@ -78,6 +79,10 @@ def print_dataset_plan(
         "correctness not assessed)"
     )
     console.print(f"Repetitions: {repetitions} per original and accepted variation")
+    console.print(f"Target trial timeout: {target_timeout_seconds:g} seconds")
+    console.print(
+        f"Maximum planned wall time: {campaign_plan.timing.maximum_wall_time_seconds:g} seconds"
+    )
     if invariant_suite is None:
         console.print("Customer invariants: none")
     else:
