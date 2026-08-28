@@ -22,6 +22,7 @@ from ul_core.dataset import (
     ObservedAgentOutput,
     ObservedOutcome,
     SemanticFrame,
+    UserInputRecord,
 )
 from ul_core.evaluation import EvaluationCase, ExecutionEvidence
 from ul_core.models import ConversationRole, ConversationTurn, ULModel
@@ -38,7 +39,7 @@ from ul.environment import (
     observed_outputs_from_evidence,
     validate_execution_evidence,
 )
-from ul.outcome_projection import OutcomeProjectionError
+from ul.outcome_projection import OutcomeProjection, OutcomeProjectionError
 from ul.probe_execution import OutcomeProjectionExecutionError
 
 FindingCategory = Literal[
@@ -85,6 +86,15 @@ class DatasetSemanticPreparationError(DatasetSourcePreparationError):
         super().__init__(self.explanation)
 
 
+class DatasetSourceOutcomeProjectionError(DatasetSourcePreparationError):
+    code = "source_outcome_projection_failed"
+    explanation = "The recorded output does not satisfy the target's declared outcome projection."
+    remediation = "Correct the recorded output or the target outcome projection, then rerun."
+
+    def __init__(self) -> None:
+        super().__init__(self.explanation)
+
+
 class DatasetComparisonCompatibilityError(DatasetSourcePreparationError):
     code = "source_comparison_surface_incompatible"
     explanation = "The recorded output has no coherent action or grounded response to compare."
@@ -95,6 +105,35 @@ class DatasetComparisonCompatibilityError(DatasetSourcePreparationError):
 
     def __init__(self) -> None:
         super().__init__(self.explanation)
+
+
+class ProjectedResponseSemanticDeconstructor:
+    def __init__(self, deconstructor: SemanticDeconstructor) -> None:
+        self._deconstructor = deconstructor
+
+    @property
+    def semantic_call_metrics(self) -> object | None:
+        return getattr(self._deconstructor, "semantic_call_metrics", None)
+
+    async def deconstruct(
+        self,
+        record: InteractionRecord | UserInputRecord,
+        reference_frame: SemanticFrame | None = None,
+    ) -> SemanticFrame:
+        if not isinstance(record, InteractionRecord):
+            return await self._deconstructor.deconstruct(record, reference_frame)
+        input_reference = (
+            reference_frame.model_copy(update={"outcomes": ()})
+            if reference_frame is not None
+            else None
+        )
+        input_frame = await self._deconstructor.deconstruct(
+            UserInputRecord(id=record.id, raw_input=record.raw_input, metadata=record.metadata),
+            input_reference,
+        )
+        if input_frame.interaction_id != record.id:
+            raise ValueError("deconstructed frame must reference its source interaction")
+        return _response_frame(input_frame, record.raw_observed_output)
 
 
 class DatasetEvaluationFinding(_StrictULModel):
@@ -370,6 +409,7 @@ class DatasetEvaluationRunner:
         target_timeout_seconds: float = 30,
         allow_network_egress: bool = False,
         evaluation_mode: DatasetEvaluationMode = "variance",
+        source_outcome_projection: OutcomeProjection | None = None,
     ) -> None:
         if evaluation_mode != "variance":
             raise ValueError(
@@ -388,6 +428,7 @@ class DatasetEvaluationRunner:
         self._environment = environment
         self._target_timeout_seconds = target_timeout_seconds
         self._evaluation_mode: Literal["variance"] = evaluation_mode
+        self._source_outcome_projection = source_outcome_projection
         self._target_state_uncertain = False
 
     async def run(
@@ -407,11 +448,26 @@ class DatasetEvaluationRunner:
         if type(repetitions) is not int or repetitions < 1:
             raise ValueError("repetitions must be a positive integer")
         starting_actual_calls, starting_cache_hits = self._semantic_call_metrics()
+        projected_source = source
+        if self._source_outcome_projection is not None:
+            try:
+                normalized_source_output = self._source_outcome_projection.project(
+                    source.raw_observed_output
+                )
+                public_source_output = self._source_outcome_projection.public_result(
+                    normalized_source_output
+                )
+            except OutcomeProjectionError:
+                raise DatasetSourceOutcomeProjectionError from None
+            projected_source = source.model_copy(
+                update={"raw_observed_output": public_source_output}
+            )
         if precomputed_augmentation is None:
             try:
                 augmentation = await self._augmentation_engine.augment(
-                    (source,), operator_ids=operator_ids
+                    (projected_source,), operator_ids=operator_ids
                 )
+                augmentation = augmentation.model_copy(update={"source_records": (source,)})
                 _validate_precomputed_augmentation(source, augmentation, operator_ids=None)
             except ValueError:
                 raise DatasetSemanticPreparationError from None
@@ -421,9 +477,9 @@ class DatasetEvaluationRunner:
             augmentation = precomputed_augmentation
             _validate_precomputed_augmentation(source, augmentation, operator_ids=operator_ids)
         source_frame = augmentation.source_frames[0]
-        comparison_surface = _source_comparison_surface(source, source_frame)
+        comparison_surface = _source_comparison_surface(projected_source, source_frame)
         if comparison_surface == "response":
-            source_frame = _response_frame(source_frame, source.raw_observed_output)
+            source_frame = _response_frame(source_frame, projected_source.raw_observed_output)
             augmentation = augmentation.model_copy(update={"source_frames": (source_frame,)})
         accepted_candidates = tuple(
             candidate for candidate in augmentation.candidates if candidate.passed

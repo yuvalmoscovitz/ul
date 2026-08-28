@@ -18,6 +18,7 @@ from ul import (
     DatasetTrialUnit,
     EvaluatorModelPreflight,
     InteractionRecord,
+    ProjectedResponseSemanticDeconstructor,
     RedactedSemanticPipeline,
     RedactionEngine,
     create_semantic_model_deconstructor,
@@ -144,13 +145,19 @@ async def evaluate_interaction_records(
                 if isinstance(semantic_pipeline, RedactedSemanticPipeline)
                 else target
             )
+            source_outcome_projection = getattr(target, "outcome_projection", None)
+            evaluation_deconstructor = (
+                ProjectedResponseSemanticDeconstructor(semantic_pipeline)
+                if source_outcome_projection is not None
+                else semantic_pipeline
+            )
             runner = DatasetEvaluationRunner(
                 DatasetAugmentationEngine(
-                    semantic_pipeline,
+                    evaluation_deconstructor,
                     semantic_pipeline,
                     semantic_pipeline,
                 ),
-                semantic_pipeline,
+                evaluation_deconstructor,
                 evaluation_target,
                 allow_network_egress=allow_network_egress,
                 evaluation_mode=(
@@ -158,6 +165,7 @@ async def evaluate_interaction_records(
                     if run_context is not None and run_context.evaluation_mode is not None
                     else "variance"
                 ),
+                source_outcome_projection=source_outcome_projection,
             )
             for case_number, record in enumerate(records, start=1):
                 plan_outcome_terminal_ids: set[str] = set()

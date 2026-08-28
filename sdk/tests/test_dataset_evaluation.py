@@ -20,12 +20,14 @@ from ul.dataset_evaluation import (
     DatasetEvaluationTrial,
     DatasetEvaluationTrialSet,
     DatasetSemanticPreparationError,
+    DatasetSourceOutcomeProjectionError,
     DatasetTargetDeliveryUncertain,
     DatasetTrialUnit,
+    ProjectedResponseSemanticDeconstructor,
 )
 from ul.dataset_evaluation import DatasetEvaluationRunner as _DatasetEvaluationRunner
 from ul.deconstruction import OpenRouterDatasetSettings, create_semantic_model_deconstructor
-from ul.outcome_projection import OutcomeProjectionError
+from ul.outcome_projection import OutcomeProjection, OutcomeProjectionError
 from ul.probe_execution import OutcomeProjectionExecutionError
 from ul.redaction import (
     LocalPseudonymStore,
@@ -70,6 +72,7 @@ class DatasetEvaluationRunner(_DatasetEvaluationRunner):
         *,
         target_timeout_seconds: float = 30,
         allow_network_egress: bool = True,
+        source_outcome_projection: OutcomeProjection | None = None,
     ) -> None:
         super().__init__(
             augmentation_engine,
@@ -77,6 +80,7 @@ class DatasetEvaluationRunner(_DatasetEvaluationRunner):
             environment,
             target_timeout_seconds=target_timeout_seconds,
             allow_network_egress=allow_network_egress,
+            source_outcome_projection=source_outcome_projection,
         )
 
     async def run(
@@ -1146,6 +1150,78 @@ async def test_source_preparation_validation_failure_is_sanitized_before_deliver
 
     assert raised.value.code == "source_semantic_preparation_failed"
     assert "untrusted provider validation detail" not in str(raised.value)
+    assert target.raw_inputs == []
+
+
+async def test_declared_projection_compares_recorded_and_fresh_responses() -> None:
+    projection = OutcomeProjection.model_validate(
+        {
+            "compose": {
+                "fields": {"action": "/tool_calls/0/name"},
+                "spread": {
+                    "selector": "/tool_calls/0/arguments",
+                    "decode": "json_string",
+                },
+            }
+        }
+    )
+    source = _source().model_copy(
+        update={
+            "raw_observed_output": {
+                "tool_calls": [
+                    {
+                        "name": "record_observation",
+                        "arguments": '{"patient":"123"}',
+                    }
+                ]
+            }
+        }
+    )
+    semantic_pipeline = DeterministicSemanticPipeline(())
+    projected_deconstructor = ProjectedResponseSemanticDeconstructor(semantic_pipeline)
+    target = DeterministicEnvironment(
+        raw_output={"action": "record_observation", "patient": "123"},
+        baseline_raw_output={"action": "record_observation", "patient": "123"},
+    )
+    runner = DatasetEvaluationRunner(
+        DatasetAugmentationEngine(
+            projected_deconstructor,
+            semantic_pipeline,
+            semantic_pipeline,
+        ),
+        projected_deconstructor,
+        target,
+        source_outcome_projection=projection,
+    )
+
+    result = await runner.run(source)
+
+    assert result.comparison_surface == "response"
+    assert result.baseline.verdict == "no_divergence"
+    assert result.cases[0].verdict == "no_divergence"
+    assert len(target.raw_inputs) == 2
+    assert semantic_pipeline.observed_records == []
+    assert result.source == source
+    assert result.augmentation.source_records == (source,)
+
+
+async def test_invalid_recorded_projection_fails_before_target_delivery() -> None:
+    projection = OutcomeProjection(complete_result="/missing")
+    semantic_pipeline = DeterministicSemanticPipeline(())
+    projected_deconstructor = ProjectedResponseSemanticDeconstructor(semantic_pipeline)
+    target = DeterministicEnvironment()
+    runner = DatasetEvaluationRunner(
+        DatasetAugmentationEngine(projected_deconstructor, semantic_pipeline),
+        projected_deconstructor,
+        target,
+        source_outcome_projection=projection,
+    )
+
+    with pytest.raises(DatasetSourceOutcomeProjectionError) as raised:
+        await runner.run(_source())
+
+    assert raised.value.code == "source_outcome_projection_failed"
+    assert "/missing" not in str(raised.value)
     assert target.raw_inputs == []
 
 

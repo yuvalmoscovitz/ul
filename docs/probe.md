@@ -255,6 +255,13 @@ direct canonical fields such as `body.subject.reference` and `items[0].code`, wh
 grounded field one coherent action record. Choose a tool-call index explicitly when a response can
 contain several calls.
 
+During dataset evaluation, UL applies this same declared projection to each historical `output`
+and every fresh target response. The historical result establishes the response comparison
+surface, and UL compares fresh baseline and variation objects directly. The semantic model
+receives the input for augmentation but does not have to infer the tool-call envelope. A
+historical output that does not satisfy the projection is recorded as a source preparation failure
+before any target call for that case.
+
 Missing values, malformed JSON, duplicate keys, non-object spreads, selected/spread collisions,
 and ambiguous names after flattening fail closed before semantic evaluation. Construction is
 bounded and supports only selection, optional JSON-string decoding, spreading, and flattening. It

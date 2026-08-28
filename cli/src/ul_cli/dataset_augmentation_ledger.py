@@ -56,6 +56,7 @@ class DatasetAugmentationGenerationContext(_StrictModel):
     operators: tuple[DatasetAugmentationLedgerOperator, ...] = Field(min_length=1)
     semantic_settings: DatasetAugmentationLedgerSemanticSettings
     redaction_policy_sha256: str | None = Field(default=None, pattern=_SHA256_PATTERN)
+    source_outcome_projection_sha256: str | None = Field(default=None, pattern=_SHA256_PATTERN)
     context_sha256: str = Field(pattern=_SHA256_PATTERN)
 
     @model_validator(mode="after")
@@ -68,6 +69,8 @@ class DatasetAugmentationGenerationContext(_StrictModel):
             cast(dict[str, object], context_content["semantic_settings"]).pop(
                 "deconstructor_identity"
             )
+        if self.source_outcome_projection_sha256 is None:
+            context_content.pop("source_outcome_projection_sha256")
         expected_digest = _canonical_json_sha256(context_content)
         if self.context_sha256 != expected_digest:
             raise ValueError("generation context digest must match its canonical content")
@@ -139,6 +142,7 @@ def create_dataset_augmentation_generation_context(
     semantic_settings: DatasetAugmentationLedgerSemanticSettings,
     pipeline_version: str = "1.0.0",
     redaction_policy_sha256: str | None = None,
+    source_outcome_projection_sha256: str | None = None,
 ) -> DatasetAugmentationGenerationContext:
     _validate_unique_source_ids(selected_records)
     operator_snapshots = tuple(
@@ -158,6 +162,11 @@ def create_dataset_augmentation_generation_context(
             else None,
         ),
         "redaction_policy_sha256": redaction_policy_sha256,
+        **(
+            {"source_outcome_projection_sha256": source_outcome_projection_sha256}
+            if source_outcome_projection_sha256 is not None
+            else {}
+        ),
     }
     return DatasetAugmentationGenerationContext(
         pipeline_version=pipeline_version,
@@ -165,6 +174,7 @@ def create_dataset_augmentation_generation_context(
         operators=operator_snapshots,
         semantic_settings=semantic_settings,
         redaction_policy_sha256=redaction_policy_sha256,
+        source_outcome_projection_sha256=source_outcome_projection_sha256,
         context_sha256=_canonical_json_sha256(content),
     )
 

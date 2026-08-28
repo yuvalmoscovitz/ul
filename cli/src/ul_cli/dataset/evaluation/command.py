@@ -961,6 +961,15 @@ def evaluate_dataset(
             redaction_policy_sha256=(
                 redaction_engine.policy.digest if redaction_engine is not None else None
             ),
+            source_outcome_projection_sha256=(
+                loaded_local_target.config.outcome.digest
+                if loaded_local_target is not None
+                and loaded_local_target.config.outcome is not None
+                else normalized_target_config.outcome.digest
+                if normalized_target_config is not None
+                and normalized_target_config.outcome is not None
+                else None
+            ),
         )
     except (DatasetInputError, ValidationError, ValueError, RuntimeError) as error:
         raise typer.BadParameter(str(error)) from None

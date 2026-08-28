@@ -79,8 +79,28 @@ class _LocalEvaluationSemanticModel:
         reference_frame: SemanticFrame | None = None,
     ) -> SemanticFrame:
         if not isinstance(record, InteractionRecord):
-            assert reference_frame is not None
-            return reference_frame.model_copy(update={"interaction_id": record.id})
+            if reference_frame is not None:
+                return reference_frame.model_copy(update={"interaction_id": record.id})
+            return SemanticFrame(
+                interaction_id=record.id,
+                request_units=(
+                    RequestUnit(
+                        id="lookup-request",
+                        evidence=(
+                            EvidenceReference(
+                                source="input",
+                                json_pointer="/raw_input",
+                                text_quote=None,
+                            ),
+                        ),
+                        confidence=1,
+                        status="explicit",
+                        mode="ask",
+                        predicate="lookup",
+                    ),
+                ),
+                extractor_version="local-evaluation-test",
+            )
         return SemanticFrame(
             interaction_id=record.id,
             request_units=(
@@ -360,6 +380,107 @@ def test_full_dataset_evaluation_runs_local_callable_through_worker_boundary(
         assert "Resume compatible: 1 complete interaction(s) skipped; 0 remaining" in (
             resumed.output
         )
+
+
+def test_declared_projection_compares_raw_recorded_tool_calls_through_public_cli(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    dataset = tmp_path / "interactions.jsonl"
+    output = tmp_path / "results.jsonl"
+    dataset.write_text(
+        '{"id":"case-1","input":"Return status for ticket 42.",'
+        '"output":{"tool_calls":[{"name":"lookup",'
+        '"arguments":"{\\"ticket\\":42}"}]}}\n',
+        encoding="utf-8",
+    )
+    (tmp_path / "customer_agent.py").write_text(
+        "import json\n\n"
+        "def run(value):\n"
+        "    return {'tool_calls': [{'name': 'lookup', "
+        "'arguments': json.dumps({'ticket': 42})}]}\n",
+        encoding="utf-8",
+    )
+    target_config = tmp_path / "target.json"
+    target_config.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "kind": "python_callable",
+                "target_id": "projected-tool-agent",
+                "working_directory": str(tmp_path),
+                "interpreter": str(Path(sys.executable).resolve()),
+                "target": "customer_agent:run",
+                "outcome": {
+                    "compose": {
+                        "fields": {"action": "/tool_calls/0/name"},
+                        "spread": {
+                            "selector": "/tool_calls/0/arguments",
+                            "decode": "json_string",
+                        },
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("UL_LIVE", "true")
+    monkeypatch.setenv("OPEN_ROUTER_API_KEY", "test-key")
+
+    class ProjectedResponseSemanticModel(_LocalEvaluationSemanticModel):
+        async def render(
+            self,
+            raw_input: str,
+            instruction: str,
+            *,
+            allow_temporary_value: bool = False,
+        ) -> RenderedUserInput:
+            del raw_input, instruction, allow_temporary_value
+            return RenderedUserInput(text="Please return status for ticket 42.")
+
+    semantic_model = ProjectedResponseSemanticModel()
+
+    async def successful_preflight(_settings: object) -> object:
+        return _evaluator_preflight()
+
+    monkeypatch.setattr(command_module, "load_dataset_semantic_settings", _settings)
+    monkeypatch.setattr(command_module, "preflight_evaluator", successful_preflight)
+    monkeypatch.setattr(
+        runner_module,
+        "create_semantic_model_deconstructor",
+        lambda _settings: semantic_model,
+    )
+    target = resolve_local_target(str(target_config))
+
+    result = runner.invoke(
+        root_app,
+        [
+            "dataset",
+            "evaluate",
+            str(dataset),
+            "--target",
+            str(target_config),
+            "--confirm-target",
+            target.confirmation_sha256,
+            "--confirm-test-environment",
+            "--repetitions",
+            "1",
+            "--output",
+            str(output),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    evidence = json.loads(output.read_text(encoding="utf-8").splitlines()[1])
+    details = evidence["technical_details"]
+    assert details["comparison_surface"] == "response"
+    assert details["baseline"]["verdict"] == "no_divergence"
+    assert details["cases"][0]["verdict"] == "no_divergence"
+    assert details["baseline"]["trial_set"]["trials"][0]["target_output"]["raw_output"] == {
+        "action": "lookup",
+        "ticket": 42,
+    }
 
 
 def test_local_target_pause_action_preserves_binding_and_resumes(

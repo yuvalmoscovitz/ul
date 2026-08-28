@@ -91,6 +91,7 @@ def _context(
     *,
     model: str = "test/model",
     include_deconstructor_identity: bool = True,
+    source_outcome_projection_sha256: str | None = None,
 ):
     return create_dataset_augmentation_generation_context(
         selected_records=selected_records,
@@ -112,6 +113,7 @@ def _context(
                 else None
             ),
         ),
+        source_outcome_projection_sha256=source_outcome_projection_sha256,
     )
 
 
@@ -195,6 +197,19 @@ def test_generation_context_hash_binds_deconstructor_identity() -> None:
     legacy_payload = legacy_context.model_dump(mode="json")
     legacy_payload["semantic_settings"].pop("deconstructor_identity")
     assert type(legacy_context).model_validate_json(json.dumps(legacy_payload)) == legacy_context
+
+
+def test_generation_context_hash_binds_source_outcome_projection() -> None:
+    source = _source()
+    first = _context((source,), source_outcome_projection_sha256="2" * 64)
+    second = _context((source,), source_outcome_projection_sha256="3" * 64)
+    legacy = _context((source,))
+
+    assert first.context_sha256 != second.context_sha256
+    assert first.context_sha256 != legacy.context_sha256
+    legacy_payload = legacy.model_dump(mode="json")
+    legacy_payload.pop("source_outcome_projection_sha256")
+    assert type(legacy).model_validate_json(json.dumps(legacy_payload)) == legacy
 
 
 def test_resume_rejects_truncated_record(tmp_path: Path) -> None:
