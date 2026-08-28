@@ -26,9 +26,11 @@ from ul import (
     MaterialVarianceAssessment,
     MaterialVarianceEvidence,
     ObservedAgentOutput,
+    OpenAICompatibleJudgeConfig,
     RichInteractionCase,
     SemanticFrame,
     create_dataset_augmentation_projection,
+    material_variance_evaluator_version_from_config,
     project_rich_interaction_case,
 )
 from ul.augmentations.dataset import DatasetAugmentationCandidate
@@ -41,6 +43,19 @@ from ul_cli.dataset.evidence import context as context_module
 
 runner = CliRunner()
 _ANSI_ESCAPE_PATTERN = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+_TEST_MATERIALITY_EVALUATOR_VERSION_ID = material_variance_evaluator_version_from_config(
+    OpenAICompatibleJudgeConfig(
+        base_url="https://openrouter.ai/api/v1",
+        model="test/materiality",
+        api_key=SecretStr("test-key"),
+        allow_external_data_processing=True,
+        data_policy="openrouter_zdr",
+        timeout_seconds=60.0,
+        max_output_tokens=512,
+        token_parameter="max_tokens",
+        max_response_bytes=1_000_000,
+    )
+).id
 
 
 def _trial_set(
@@ -173,7 +188,7 @@ def _evaluation_result(
                         json_pointer="/payload/answer/findings/0/variation_effects/0"
                     ),
                 ),
-                evaluator_version_id=f"ulev_v1_{'a' * 64}",
+                evaluator_version_id=_TEST_MATERIALITY_EVALUATOR_VERSION_ID,
             ),
         )
     else:

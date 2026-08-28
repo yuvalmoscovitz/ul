@@ -249,8 +249,10 @@ class _MaterialVarianceSemanticModel(_LocalEvaluationSemanticModel):
 class _MaterialVarianceJudge:
     label = "material_variance:grounded_argument_changed"
     score = 1
+    expected_token_parameter = "max_tokens"
 
     def __init__(self, config: object) -> None:
+        assert config.token_parameter == self.expected_token_parameter
         self.version = config.evaluator_judge_version()
 
     async def __aenter__(self) -> _MaterialVarianceJudge:
@@ -572,7 +574,14 @@ def test_full_dataset_evaluation_runs_local_callable_through_worker_boundary(
 
 
 @pytest.mark.parametrize(
-    ("label", "score", "decision", "reason_code", "expected_exit_code"),
+    (
+        "label",
+        "score",
+        "decision",
+        "reason_code",
+        "expected_exit_code",
+        "settings_overrides",
+    ),
     (
         (
             "material_variance:grounded_argument_changed",
@@ -580,6 +589,7 @@ def test_full_dataset_evaluation_runs_local_callable_through_worker_boundary(
             "material_variance",
             "grounded_argument_changed",
             1,
+            {},
         ),
         (
             "operationally_equivalent:same_real_world_effect",
@@ -587,6 +597,7 @@ def test_full_dataset_evaluation_runs_local_callable_through_worker_boundary(
             "operationally_equivalent",
             "same_real_world_effect",
             0,
+            {},
         ),
         (
             "insufficient_evidence:missing_comparison_evidence",
@@ -594,6 +605,22 @@ def test_full_dataset_evaluation_runs_local_callable_through_worker_boundary(
             "insufficient_evidence",
             "missing_comparison_evidence",
             2,
+            {},
+        ),
+        (
+            "material_variance:grounded_argument_changed",
+            1,
+            "material_variance",
+            "grounded_argument_changed",
+            1,
+            {
+                "semantic_provider_id": "generic-test",
+                "semantic_provider_type": "openai-compatible",
+                "semantic_base_url": "https://evaluator.example/v1",
+                "semantic_endpoint_sha256": "f" * 64,
+                "api_key_required": False,
+                "api_key_environment_variable": "UL_DATASET_OPENAI_API_KEY",
+            },
         ),
     ),
 )
@@ -605,6 +632,7 @@ def test_public_cli_persists_and_applies_automatic_materiality(
     decision: str,
     reason_code: str,
     expected_exit_code: int,
+    settings_overrides: dict[str, object],
 ) -> None:
     dataset = tmp_path / "interactions.jsonl"
     output = tmp_path / "results.jsonl"
@@ -626,7 +654,11 @@ def test_public_cli_persists_and_applies_automatic_materiality(
     async def successful_preflight(_settings: object) -> object:
         return _evaluator_preflight()
 
-    monkeypatch.setattr(command_module, "load_dataset_semantic_settings", _settings)
+    monkeypatch.setattr(
+        command_module,
+        "load_dataset_semantic_settings",
+        lambda: _settings(**settings_overrides),
+    )
     monkeypatch.setattr(command_module, "preflight_evaluator", successful_preflight)
     monkeypatch.setattr(
         runner_module,

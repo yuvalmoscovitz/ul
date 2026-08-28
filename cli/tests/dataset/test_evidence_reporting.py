@@ -7,6 +7,7 @@ from types import SimpleNamespace
 from typing import Any, cast
 
 import pytest
+from pydantic import ValidationError
 from typer.testing import CliRunner
 from ul import (
     AugmentationTarget,
@@ -21,6 +22,9 @@ from ul import (
 )
 from ul.dataset_invariants import (
     DatasetInvariantEvaluation,
+    DatasetInvariantSuite,
+    JsonValuesEqualInvariant,
+    evaluate_dataset_invariants,
 )
 from ul_cli import dataset_review
 from ul_cli.dataset.evidence import customer as customer_module
@@ -199,7 +203,7 @@ def test_dataset_report_leads_with_actionable_summary_and_hides_private_values(
 
     assert report.exit_code == 0, report.output
     assert "Result: ACTION REQUIRED — 1 consequential behavior change found" in report.output
-    assert "Comparisons: total=4, completed=4, no_observed_difference=1" in report.output
+    assert "Semantic comparisons: total=4, completed=4, no_observed_difference=1" in report.output
     assert "Automatic decisions: consequential=1, equivalent=1, inconclusive=1" in report.output
     assert "Scope: variance; correctness and severity were not assessed" in report.output
     assert "Consequential behavior changes" in report.output
@@ -260,6 +264,235 @@ def test_dataset_report_leads_with_actionable_summary_and_hides_private_values(
     assert "WARNING: showing selected private values" in private_drilldown.output
     assert "Transfer 100 to Alice." in private_drilldown.output
     assert "Sensitive value disclosure:" in private_drilldown.output
+
+
+def test_equivalent_semantic_difference_does_not_suppress_invariant_violation(
+    tmp_path: Path,
+) -> None:
+    result = _evaluation_result(
+        "equivalent-with-invariant",
+        has_review_finding=True,
+        material_variance_decision="operationally_equivalent",
+    )
+    baseline_trial = result.baseline.trial_set.trials[0]
+    variation_trial = result.cases[0].trial_set.trials[0]
+    assert baseline_trial.target_output is not None
+    assert variation_trial.target_output is not None
+    baseline_output = baseline_trial.target_output.model_copy(
+        update={"raw_output": {"actual": 100, "expected": 100}}
+    )
+    variation_output = variation_trial.target_output.model_copy(
+        update={"raw_output": {"actual": 200, "expected": 100}}
+    )
+    result = result.model_copy(
+        update={
+            "baseline": result.baseline.model_copy(
+                update={
+                    "trial_set": result.baseline.trial_set.model_copy(
+                        update={
+                            "trials": (
+                                baseline_trial.model_copy(
+                                    update={"target_output": baseline_output}
+                                ),
+                            )
+                        }
+                    )
+                }
+            ),
+            "cases": (
+                result.cases[0].model_copy(
+                    update={
+                        "trial_set": result.cases[0].trial_set.model_copy(
+                            update={
+                                "trials": (
+                                    variation_trial.model_copy(
+                                        update={"target_output": variation_output}
+                                    ),
+                                )
+                            }
+                        )
+                    }
+                ),
+            ),
+        }
+    )
+    invariant_suite = DatasetInvariantSuite(
+        schema_version="1.0.0",
+        observation_source="target_output",
+        observation_authority="agent_response",
+        rules=(
+            JsonValuesEqualInvariant(
+                type="json_values_equal",
+                id="values-remain-equal",
+                version="1.0.0",
+                description="The committed values must remain equal.",
+                severity="high",
+                left_pointer="/actual",
+                right_pointer="/expected",
+            ),
+        ),
+    )
+    invariant_evaluation = evaluate_dataset_invariants(result, invariant_suite)
+    record = customer_module.build_customer_evidence_record(
+        result,
+        repetitions=1,
+        max_environment_api_calls=2,
+        planned_target_calls=2,
+        invariant_evaluation=invariant_evaluation,
+    )
+    evidence_path = tmp_path / "equivalent-with-invariant.jsonl"
+    evidence_path.write_text(json.dumps(record) + "\n", encoding="utf-8")
+    indexed_findings = dataset_review._index_findings(dataset_review._load_evidence(evidence_path))
+    semantic_finding_id = next(
+        finding_id
+        for finding_id, indexed in indexed_findings.items()
+        if indexed.kind == "semantic_difference"
+    )
+    invariant_finding_id = next(
+        finding_id
+        for finding_id, indexed in indexed_findings.items()
+        if indexed.kind == "customer_invariant_violation"
+    )
+
+    management_report = runner.invoke(root_app, ["dataset", "report", str(evidence_path)])
+
+    assert management_report.exit_code == 0, management_report.output
+    assert "Result: ACTION REQUIRED" in management_report.output
+    assert "Customer invariant violations: total=1, require_attention=1" in (
+        management_report.output
+    )
+    assert invariant_finding_id in management_report.output
+    assert semantic_finding_id not in management_report.output
+
+    _create_pattern_identity_key(tmp_path)
+    unified_report = runner.invoke(root_app, ["report", str(evidence_path), "--json"])
+
+    assert unified_report.exit_code == 1, unified_report.output
+    finding_statuses = {
+        finding["finding_id"]: finding["review_status"]
+        for finding in json.loads(unified_report.output)["findings"]
+    }
+    assert finding_statuses == {
+        semantic_finding_id: "expected",
+        invariant_finding_id: "needs_review",
+    }
+
+
+def test_dataset_report_treats_unstable_behavior_as_actionable(tmp_path: Path) -> None:
+    result = _evaluation_result("unstable-report", has_review_finding=True)
+    baseline_trial = result.baseline.trial_set.trials[0]
+    stable_baseline_trial_set = DatasetEvaluationTrialSet(
+        requested_repetitions=2,
+        stability="stable",
+        trials=(
+            baseline_trial,
+            baseline_trial.model_copy(
+                update={
+                    "repetition": 2,
+                    "observed_frame": baseline_trial.observed_frame.model_copy(
+                        update={"interaction_id": "unstable-report:current_baseline:round-2"}
+                    ),
+                }
+            ),
+        ),
+        outcome_groups=(
+            DatasetEvaluationOutcomeGroup(repetitions=(1, 2), representative_effects=()),
+        ),
+    )
+    stable_trial = result.cases[0].trial_set.trials[0]
+    unstable_trial_set = DatasetEvaluationTrialSet(
+        requested_repetitions=2,
+        stability="unstable",
+        trials=(
+            stable_trial,
+            stable_trial.model_copy(
+                update={
+                    "repetition": 2,
+                    "observed_frame": stable_trial.observed_frame.model_copy(
+                        update={
+                            "interaction_id": ("unstable-report:input.surface.rephrase:round-2")
+                        }
+                    ),
+                }
+            ),
+        ),
+        outcome_groups=(
+            DatasetEvaluationOutcomeGroup(repetitions=(1,), representative_effects=()),
+            DatasetEvaluationOutcomeGroup(repetitions=(2,), representative_effects=()),
+        ),
+    )
+    unstable_case = result.cases[0].model_copy(
+        update={
+            "trial_set": unstable_trial_set,
+            "findings": (),
+            "material_variance": None,
+        }
+    )
+    result = result.model_copy(
+        update={
+            "baseline": result.baseline.model_copy(update={"trial_set": stable_baseline_trial_set}),
+            "cases": (unstable_case,),
+        }
+    )
+    result = DatasetEvaluationResult.model_validate(result.model_dump())
+    record = customer_module.build_customer_evidence_record(
+        result,
+        repetitions=2,
+        max_environment_api_calls=2,
+        planned_target_calls=4,
+    )
+    evidence_path = tmp_path / "unstable.jsonl"
+    evidence_path.write_text(json.dumps(record) + "\n", encoding="utf-8")
+
+    report = runner.invoke(root_app, ["dataset", "report", str(evidence_path)])
+
+    assert report.exit_code == 0, report.output
+    assert "Result: ACTION REQUIRED" in report.output
+    assert "Other: unstable=1" in report.output
+    assert "Behavior changed inconsistently across repeated trials." in report.output
+
+
+def test_dataset_report_lists_inconclusive_case_without_finding(tmp_path: Path) -> None:
+    result = _evaluation_result("technical-inconclusive", has_review_finding=True)
+    trial = (
+        result.cases[0]
+        .trial_set.trials[0]
+        .model_copy(
+            update={"observed_frame": None, "inconclusive_reasons": ("target_execution_failed",)}
+        )
+    )
+    inconclusive_trial_set = DatasetEvaluationTrialSet(
+        requested_repetitions=1,
+        stability="inconclusive",
+        trials=(trial,),
+    )
+    inconclusive_case = result.cases[0].model_copy(
+        update={
+            "verdict": "inconclusive",
+            "trial_set": inconclusive_trial_set,
+            "findings": (),
+            "material_variance": None,
+            "inconclusive_reasons": ("target_execution_failed",),
+        }
+    )
+    result = result.model_copy(update={"cases": (inconclusive_case,)})
+    record = customer_module.build_customer_evidence_record(
+        result,
+        repetitions=1,
+        max_environment_api_calls=2,
+        planned_target_calls=2,
+    )
+    evidence_path = tmp_path / "inconclusive.jsonl"
+    evidence_path.write_text(json.dumps(record) + "\n", encoding="utf-8")
+
+    report = runner.invoke(root_app, ["dataset", "report", str(evidence_path)])
+
+    assert report.exit_code == 0, report.output
+    assert "Result: INCONCLUSIVE" in report.output
+    assert "Comparison could not be classified." in report.output
+    assert "Case: technical-inconclusive" in report.output
+    assert "Reasons: target_execution_failed" in report.output
+    assert "Transfer 100 to Alice." not in report.output
 
 
 def test_pre_response_schema_action_and_answer_evidence_still_reports(tmp_path: Path) -> None:
@@ -341,6 +574,29 @@ def test_response_evidence_cannot_be_downgraded_to_pre_response_schema() -> None
         ValueError,
         match=r"response comparison evidence requires schema 1\.14\.0",
     ):
+        dataset_review._EvidenceRecord.model_validate_json(json.dumps(record))
+
+
+def test_materiality_version_must_match_run_context() -> None:
+    result = _evaluation_result(
+        "materiality-version-tamper",
+        has_review_finding=True,
+        material_variance_decision="operationally_equivalent",
+    )
+    record = customer_module.build_customer_evidence_record(
+        result,
+        repetitions=1,
+        max_environment_api_calls=2,
+        planned_target_calls=2,
+        run_context=cast(Any, _run_context((result.source,))),
+    )
+    mismatched_version = "ulev_v1_" + "f" * 64
+    record["cases"][0]["material_variance"]["evaluator_version_id"] = mismatched_version
+    record["technical_details"]["cases"][0]["material_variance"]["evaluator_version_id"] = (
+        mismatched_version
+    )
+
+    with pytest.raises(ValidationError, match="must match the evidence run context"):
         dataset_review._EvidenceRecord.model_validate_json(json.dumps(record))
 
 

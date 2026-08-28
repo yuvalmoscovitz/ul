@@ -85,7 +85,7 @@ def _finding(*, expected_amount: int = 100, observed_amount: int = 200) -> Datas
 
 async def test_material_variance_judge_persists_closed_local_decision() -> None:
     judge = RecordingJudge(_decision("material_variance:grounded_argument_changed", 1))
-    evaluator = DatasetMaterialVarianceJudge(judge)
+    evaluator = DatasetMaterialVarianceJudge(judge, max_input_chars=50_000)
 
     assessment = await evaluator.evaluate("action", (_finding(),))
 
@@ -117,7 +117,9 @@ async def test_material_variance_judge_persists_closed_local_decision() -> None:
 async def test_material_variance_judge_accepts_operational_equivalence() -> None:
     judge = RecordingJudge(_decision("operationally_equivalent:alias_or_representation", 0))
 
-    assessment = await DatasetMaterialVarianceJudge(judge).evaluate("action", (_finding(),))
+    assessment = await DatasetMaterialVarianceJudge(judge, max_input_chars=50_000).evaluate(
+        "action", (_finding(),)
+    )
 
     assert assessment.decision == "operationally_equivalent"
     assert assessment.reason_code == "alias_or_representation"
@@ -127,10 +129,12 @@ async def test_material_variance_judge_fails_closed_on_invalid_or_failed_judgmen
     invalid_score = RecordingJudge(_decision("operationally_equivalent:same_real_world_effect", 1))
     failed = RecordingJudge(RuntimeError("private-provider-body"))
 
-    invalid_assessment = await DatasetMaterialVarianceJudge(invalid_score).evaluate(
+    invalid_assessment = await DatasetMaterialVarianceJudge(
+        invalid_score, max_input_chars=50_000
+    ).evaluate("action", (_finding(),))
+    failed_assessment = await DatasetMaterialVarianceJudge(failed, max_input_chars=50_000).evaluate(
         "action", (_finding(),)
     )
-    failed_assessment = await DatasetMaterialVarianceJudge(failed).evaluate("action", (_finding(),))
 
     assert invalid_assessment.decision == "insufficient_evidence"
     assert invalid_assessment.reason_code == "judge_error"
@@ -140,7 +144,7 @@ async def test_material_variance_judge_fails_closed_on_invalid_or_failed_judgmen
 
 async def test_material_variance_judge_skips_empty_or_oversized_payloads() -> None:
     judge = RecordingJudge(_decision("material_variance:response_meaning_changed", 1))
-    evaluator = DatasetMaterialVarianceJudge(judge)
+    evaluator = DatasetMaterialVarianceJudge(judge, max_input_chars=100_000)
     oversized = DatasetEvaluationFinding(
         category="changed_response",
         message="changed",
@@ -164,6 +168,17 @@ async def test_material_variance_judge_skips_empty_or_oversized_payloads() -> No
     assert oversized_assessment.reason_code == "missing_comparison_evidence"
     assert evaluator.actual_calls == 0
     assert not judge.requests
+
+    configured_limit_judge = RecordingJudge(
+        _decision("material_variance:grounded_argument_changed", 1)
+    )
+    configured_limit_assessment = await DatasetMaterialVarianceJudge(
+        configured_limit_judge,
+        max_input_chars=100,
+    ).evaluate("action", (_finding(),))
+
+    assert configured_limit_assessment.reason_code == "missing_comparison_evidence"
+    assert not configured_limit_judge.requests
 
 
 async def test_material_variance_assessment_rejects_incoherent_or_unsafe_evidence() -> None:

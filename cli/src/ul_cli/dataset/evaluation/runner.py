@@ -153,15 +153,14 @@ async def evaluate_interaction_records(
             ),
             timeout_seconds=settings.timeout_seconds,
             max_output_tokens=512,
-            token_parameter=(
-                "max_tokens"
-                if settings.semantic_provider_type == "openrouter"
-                else "max_completion_tokens"
-            ),
+            token_parameter="max_tokens",
             max_response_bytes=settings.max_response_bytes,
         )
     )
-    material_variance_evaluator = DatasetMaterialVarianceJudge(materiality_judge)
+    material_variance_evaluator = DatasetMaterialVarianceJudge(
+        materiality_judge,
+        max_input_chars=settings.max_input_chars,
+    )
     with signal_control.installed():
         async with deconstructor, materiality_judge, target:
             semantic_pipeline = (

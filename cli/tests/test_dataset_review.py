@@ -1461,6 +1461,8 @@ def test_invariant_violation_without_semantic_difference_can_be_reviewed(
     report = runner.invoke(app, ["dataset", "report", str(evidence)])
 
     assert report.exit_code == 0, report.output
+    assert "Result: ACTION REQUIRED" in report.output
+    assert "Customer invariant violations: total=1, require_attention=1" in report.output
     indexed_findings = dataset_review._index_findings(dataset_review._load_evidence(evidence))
     assert len(indexed_findings) == 1
     invariant_finding_id = next(iter(indexed_findings))

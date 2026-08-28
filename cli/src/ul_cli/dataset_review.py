@@ -577,6 +577,18 @@ class _EvidenceRecord(_StrictModel):
         if self.schema_version == "1.15.0":
             if any((case.material_variance is None) != (not case.findings) for case in self.cases):
                 raise ValueError("schema 1.15.0 requires materiality for every semantic finding")
+            if self.run_context is not None:
+                expected_materiality_version = (
+                    self.run_context.semantic_settings.materiality_evaluator_version_id
+                )
+                if expected_materiality_version is None or any(
+                    case.material_variance is not None
+                    and case.material_variance.evaluator_version_id != expected_materiality_version
+                    for case in self.cases
+                ):
+                    raise ValueError(
+                        "materiality assessment version must match the evidence run context"
+                    )
         elif any("material_variance" in case.model_fields_set for case in self.cases):
             raise ValueError("legacy evidence cannot contain material variance assessments")
         if self.schema_version in {"1.13.0", "1.14.0", "1.15.0"}:
@@ -1112,6 +1124,8 @@ def _effective_finding_status(
 ) -> FindingReviewStatus:
     if active_review is not None:
         return active_review.status
+    if indexed_finding.kind == "customer_invariant_violation":
+        return "needs_review"
     automatic_materiality = indexed_finding.case.material_variance
     if automatic_materiality is None or automatic_materiality.decision == "material_variance":
         return "needs_review"
@@ -1811,6 +1825,7 @@ def _dataset_case_report_bucket(
     "consequential",
     "equivalent",
     "inconclusive",
+    "unstable",
     "unclassified",
     "no_difference",
     "not_evaluated",
@@ -1823,11 +1838,9 @@ def _dataset_case_report_bucket(
         if case.material_variance.decision == "operationally_equivalent":
             return "equivalent"
         return "inconclusive"
-    if (
-        case.inconclusive_reasons
-        or case.observations is None
-        or case.observations.stability != "stable"
-    ):
+    if case.observations is not None and case.observations.stability == "unstable":
+        return "unstable"
+    if case.inconclusive_reasons or case.observations is None:
         return "inconclusive"
     if case.findings:
         return "unclassified"
@@ -1916,6 +1929,7 @@ def report_dataset_evidence(
             "consequential",
             "equivalent",
             "inconclusive",
+            "unstable",
             "unclassified",
             "no_difference",
             "not_evaluated",
@@ -1930,7 +1944,7 @@ def report_dataset_evidence(
         case_bucket = _dataset_case_report_bucket(case)
         case_findings = findings_by_case.get(id(case), [])
         if not case_findings:
-            consequential_count += case_bucket == "consequential"
+            consequential_count += case_bucket in {"consequential", "unstable"}
             unresolved_count += case_bucket in {"inconclusive", "unclassified"}
             continue
         effective_statuses = {
@@ -1940,11 +1954,9 @@ def report_dataset_evidence(
             )
             for indexed_finding in case_findings
         }
-        if "confirmed" in effective_statuses or (
-            case_bucket == "consequential" and "needs_review" in effective_statuses
-        ):
+        if effective_statuses & {"confirmed", "needs_review"}:
             consequential_count += 1
-        elif effective_statuses & {"needs_review", "inconclusive"}:
+        elif "inconclusive" in effective_statuses:
             unresolved_count += 1
     if consequential_count:
         result_summary = (
@@ -1959,7 +1971,7 @@ def report_dataset_evidence(
     _print_plain("UL dataset report")
     _print_plain(f"Result: {result_summary}")
     _print_plain(
-        f"Comparisons: total={len(cases)}, completed="
+        f"Semantic comparisons: total={len(cases)}, completed="
         f"{len(cases) - comparison_counts['not_evaluated']}, "
         f"no_observed_difference={comparison_counts['no_difference']}"
     )
@@ -1969,11 +1981,34 @@ def report_dataset_evidence(
         f"equivalent={comparison_counts['equivalent']}, "
         f"inconclusive={comparison_counts['inconclusive']}"
     )
-    if comparison_counts["unclassified"] or comparison_counts["not_evaluated"]:
+    if (
+        comparison_counts["unstable"]
+        or comparison_counts["unclassified"]
+        or comparison_counts["not_evaluated"]
+    ):
         _print_plain(
             "Other: "
+            f"unstable={comparison_counts['unstable']}, "
             f"unclassified={comparison_counts['unclassified']}, "
             f"not_evaluated={comparison_counts['not_evaluated']}"
+        )
+    invariant_findings = [
+        indexed_finding
+        for indexed_finding in findings.values()
+        if indexed_finding.kind == "customer_invariant_violation"
+    ]
+    if invariant_findings:
+        invariant_attention_count = sum(
+            _effective_finding_status(
+                indexed_finding,
+                active_reviews.get(indexed_finding.finding_id),
+            )
+            in {"needs_review", "confirmed"}
+            for indexed_finding in invariant_findings
+        )
+        _print_plain(
+            "Customer invariant violations: "
+            f"total={len(invariant_findings)}, require_attention={invariant_attention_count}"
         )
     evaluation_mode = _dataset_evaluation_mode(evidence_records, source_failures)
     if evaluation_mode is not None:
@@ -2040,6 +2075,35 @@ def report_dataset_evidence(
     )
     current_section: str | None = None
     section_item_number = 0
+    semantic_finding_case_ids = {
+        id(indexed_finding.case)
+        for indexed_finding in findings.values()
+        if indexed_finding.kind == "semantic_difference"
+    }
+    unrepresented_unstable_cases = [
+        (loaded_record, case)
+        for loaded_record in evidence_records
+        for case in loaded_record.evidence.cases
+        if _dataset_case_report_bucket(case) == "unstable"
+        and id(case) not in semantic_finding_case_ids
+    ]
+    if unrepresented_unstable_cases:
+        _print_plain("")
+        _print_plain("Consequential behavior changes")
+        current_section = "Consequential behavior changes"
+        for loaded_record, case in unrepresented_unstable_cases:
+            section_item_number += 1
+            _print_plain("")
+            _print_plain(
+                f"{section_item_number}. Behavior changed inconsistently across repeated trials."
+            )
+            _print_plain(
+                "Case: " + (case.source_record_id or loaded_record.evidence.interaction_id)
+            )
+            _print_plain(
+                "Test variation: " + case.operator_id.replace(".", " / ").replace("_", " ")
+            )
+            _print_plain("Evidence stability: " + _observations_summary(case.observations))
     for indexed_finding in visible_findings:
         section = finding_section(indexed_finding)
         if section != current_section:
@@ -2121,6 +2185,38 @@ def report_dataset_evidence(
                 f"{shlex.quote(str(evidence))} --finding "
                 f"{shlex.quote(indexed_finding.finding_id)} --show-sensitive-values"
             )
+
+    unrepresented_inconclusive_cases = [
+        (loaded_record, case)
+        for loaded_record in evidence_records
+        for case in loaded_record.evidence.cases
+        if _dataset_case_report_bucket(case) == "inconclusive"
+        and id(case) not in semantic_finding_case_ids
+    ]
+    if unrepresented_inconclusive_cases:
+        if current_section != "Inconclusive comparisons":
+            _print_plain("")
+            _print_plain("Inconclusive comparisons")
+            section_item_number = 0
+        for loaded_record, case in unrepresented_inconclusive_cases:
+            section_item_number += 1
+            reasons = tuple(case.inconclusive_reasons)
+            if not reasons:
+                reason = (
+                    "variation observations unavailable"
+                    if case.observations is None
+                    else "variation behavior was not stable"
+                )
+                reasons = (reason,)
+            _print_plain("")
+            _print_plain(f"{section_item_number}. Comparison could not be classified.")
+            _print_plain(
+                "Case: " + (case.source_record_id or loaded_record.evidence.interaction_id)
+            )
+            _print_plain(
+                "Test variation: " + case.operator_id.replace(".", " / ").replace("_", " ")
+            )
+            _print_plain("Reasons: " + ", ".join(reasons))
 
     invariant_evaluations = [
         loaded_record.evidence.invariant_evaluation

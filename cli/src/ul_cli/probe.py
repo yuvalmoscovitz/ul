@@ -33,7 +33,9 @@ from ul import (
     EvaluatorModelPreflight,
     ExecutionEvidence,
     InteractionRecord,
+    OpenAICompatibleJudgeConfig,
     load_dataset_semantic_settings,
+    material_variance_evaluator_version_from_config,
     semantic_deconstructor_identity,
 )
 from ul.environment import validate_execution_evidence
@@ -650,12 +652,28 @@ def _persist_probe_quarantine(
 def _semantic_settings_snapshot(
     settings: DatasetSemanticSettings,
 ) -> DatasetEvidenceSemanticSettings:
+    materiality_config = OpenAICompatibleJudgeConfig(
+        base_url=settings.semantic_base_url,
+        model=settings.materiality_model,
+        api_key=settings.api_key,
+        allow_external_data_processing=True,
+        data_policy=(
+            "openrouter_zdr"
+            if settings.semantic_provider_type == "openrouter"
+            else "provider_default"
+        ),
+        timeout_seconds=settings.timeout_seconds,
+        max_output_tokens=512,
+        token_parameter="max_tokens",
+        max_response_bytes=settings.max_response_bytes,
+    )
     return DatasetEvidenceSemanticSettings(
         provider=settings.semantic_provider_id,
         endpoint_sha256=settings.semantic_endpoint_sha256,
         model=settings.model,
         render_model=settings.render_model,
         equivalence_model=settings.equivalence_model,
+        materiality_model=settings.materiality_model,
         deconstruct_reasoning=settings.deconstruct_reasoning,
         render_reasoning=settings.render_reasoning,
         equivalence_reasoning=settings.equivalence_reasoning,
@@ -665,6 +683,9 @@ def _semantic_settings_snapshot(
         max_response_bytes=settings.max_response_bytes,
         timeout_seconds=settings.timeout_seconds,
         deconstructor_identity=semantic_deconstructor_identity(settings),
+        materiality_evaluator_version_id=(
+            material_variance_evaluator_version_from_config(materiality_config).id
+        ),
     )
 
 

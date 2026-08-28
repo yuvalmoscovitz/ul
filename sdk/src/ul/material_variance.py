@@ -95,8 +95,11 @@ _EXPLANATIONS = {
 
 
 class DatasetMaterialVarianceJudge:
-    def __init__(self, judge: EvaluatorJudge) -> None:
+    def __init__(self, judge: EvaluatorJudge, *, max_input_chars: int) -> None:
+        if max_input_chars < 1:
+            raise ValueError("material variance input limit must be positive")
         self._judge = judge
+        self._max_input_chars = max_input_chars
         judge_version = getattr(judge, "version", None)
         if judge_version is None:
             raise ValueError("material variance judge requires a versioned configuration")
@@ -120,8 +123,11 @@ class DatasetMaterialVarianceJudge:
         findings: tuple[DatasetEvaluationFinding, ...],
     ) -> MaterialVarianceAssessment:
         answer = _comparison_payload(comparison_surface, findings)
-        if not findings or len(json.dumps(answer, ensure_ascii=True).encode()) > (
-            _MAXIMUM_PAYLOAD_BYTES
+        encoded_answer = json.dumps(answer, ensure_ascii=False, separators=(",", ":"))
+        if (
+            not findings
+            or len(encoded_answer) > self._max_input_chars
+            or len(encoded_answer.encode("utf-8")) > _MAXIMUM_PAYLOAD_BYTES
         ):
             return self._insufficient("missing_comparison_evidence")
         self._actual_calls += 1
