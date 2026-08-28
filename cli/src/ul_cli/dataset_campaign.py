@@ -69,8 +69,13 @@ class CampaignFixturePlan(_StrictModel):
     version: str | None = None
 
 
+class CampaignTimingPlan(_StrictModel):
+    target_trial_timeout_seconds: float = Field(gt=0, le=3_600)
+    maximum_wall_time_seconds: float = Field(gt=0)
+
+
 class DatasetCampaignPlan(_StrictModel):
-    schema_version: Literal["1.1.0"] = "1.1.0"
+    schema_version: Literal["1.2.0"] = "1.2.0"
     evaluation_mode: Literal["variance"] = "variance"
     fixture: CampaignFixturePlan | None = None
     examples: tuple[CampaignExamplePlan, ...]
@@ -78,6 +83,7 @@ class DatasetCampaignPlan(_StrictModel):
     preflight_profiles: tuple[EvaluatorPreflightProfilePlan, ...]
     tokens: CampaignTokenRange
     money: CampaignMoneyRange | None = None
+    timing: CampaignTimingPlan
     warnings: tuple[str, ...] = ()
     inspection_model_calls: Literal[0] = 0
     inspection_environment_calls: Literal[0] = 0
@@ -99,6 +105,7 @@ def create_dataset_campaign_plan(
     selected_operator_ids: tuple[str, ...],
     repetitions: int,
     target_calls_per_execution: int,
+    target_timeout_seconds: float = 30.0,
     settings: DatasetSemanticSettings,
     saved_augmentations: dict[str, DatasetAugmentationResult] | None = None,
     show_sensitive_values: bool = False,
@@ -161,6 +168,10 @@ def create_dataset_campaign_plan(
     preflight_profiles = plan_evaluator_preflight_profiles(settings) if requires_preflight else ()
     preflight_calls = len(preflight_profiles)
     total_semantic_calls = evaluator_calls + generation_calls + preflight_calls
+    maximum_wall_time_seconds = (
+        max(1, execution_calls) * target_timeout_seconds
+        + total_semantic_calls * settings.timeout_seconds
+    )
 
     deconstruction_calls = (
         source_deconstruction_calls + candidate_deconstruction_calls + trial_evaluator_calls
@@ -231,6 +242,10 @@ def create_dataset_campaign_plan(
         ),
         preflight_profiles=preflight_profiles,
         tokens=CampaignTokenRange(minimum=0, maximum=maximum_completion_tokens),
+        timing=CampaignTimingPlan(
+            target_trial_timeout_seconds=target_timeout_seconds,
+            maximum_wall_time_seconds=maximum_wall_time_seconds,
+        ),
         warnings=tuple(warnings),
     )
 

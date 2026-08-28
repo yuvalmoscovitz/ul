@@ -98,6 +98,11 @@ displayed `--confirm-target` digest, and `--output`. Pause/resume uses the priva
 snapshot. Header secret values never enter a resume command or run artifact; their hashes are bound
 to the confirmation, and resume stops if a credential value changes.
 
+Each dataset target trial has a 30-second outer deadline by default. Use
+`--target-timeout-seconds SECONDS` for a slower test agent, up to 3600 seconds. The selected value
+appears in the dry-run plan and is bound into evidence and resume compatibility. A target adapter
+may enforce a shorter internal deadline; raise that adapter limit separately when needed.
+
 UL binds the resolved executable, the direct Python module and UL worker, allowlisted environment
 value digests, and command arguments that resolve to files. Repeat `--target-artifact PATH` for
 every transitive Python helper, command script, bundle, or other executable dependency that is not

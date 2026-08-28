@@ -302,6 +302,7 @@ class DatasetEvidenceRunContext(_StrictModel):
     operators: tuple[DatasetEvidenceOperator, ...] = Field(min_length=1)
     evaluation_mode: Literal["variance"] | None = None
     repetitions: int = Field(ge=1)
+    target_timeout_seconds: float = Field(default=30.0, gt=0, le=3_600)
     invariant_suite_sha256: str | None = Field(default=None, pattern=_SHA256_PATTERN)
     target: DatasetEvidenceTarget
     fixture: DatasetEvidenceFixture | None = None
@@ -346,6 +347,8 @@ class DatasetEvidenceRunContext(_StrictModel):
             cast(dict[str, object], context_content["semantic_settings"]).pop(
                 "deconstructor_identity"
             )
+        if "target_timeout_seconds" not in self.model_fields_set:
+            context_content.pop("target_timeout_seconds")
         expected_context_sha256 = _canonical_json_sha256(context_content)
         if self.context_sha256 != expected_context_sha256:
             raise ValueError("run context digest must match its canonical content")
@@ -593,6 +596,7 @@ def create_dataset_evidence_run_context(
     operators: tuple[tuple[str, str], ...],
     evaluation_mode: Literal["variance"] = "variance",
     repetitions: int,
+    target_timeout_seconds: float = 30.0,
     invariant_suite_sha256: str | None,
     target_config: JsonHttpTargetConfig | None = None,
     target_receipt: dict[str, JsonValue] | None = None,
@@ -634,6 +638,7 @@ def create_dataset_evidence_run_context(
         "operators": [operator.model_dump(mode="json") for operator in operator_snapshots],
         "evaluation_mode": evaluation_mode,
         "repetitions": repetitions,
+        "target_timeout_seconds": target_timeout_seconds,
         "invariant_suite_sha256": invariant_suite_sha256,
         "target": target.model_dump(mode="json"),
         "fixture": fixture.model_dump(mode="json"),
@@ -655,6 +660,7 @@ def create_dataset_evidence_run_context(
         operators=operator_snapshots,
         evaluation_mode=evaluation_mode,
         repetitions=repetitions,
+        target_timeout_seconds=target_timeout_seconds,
         invariant_suite_sha256=invariant_suite_sha256,
         target=target,
         fixture=fixture,

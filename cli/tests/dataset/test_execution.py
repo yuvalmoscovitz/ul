@@ -335,6 +335,8 @@ def test_full_dataset_evaluation_runs_local_callable_through_worker_boundary(
             "--confirm-test-environment",
             "--repetitions",
             "2",
+            "--target-timeout-seconds",
+            "90",
             "--output",
             str(output),
         ],
@@ -345,6 +347,9 @@ def test_full_dataset_evaluation_runs_local_callable_through_worker_boundary(
     assert saved["run_context"]["target"]["kind"] == "probe_target"
     assert saved["run_context"]["fixture"]["status"] == "not_required"
     assert saved["run_context"]["target"]["receipt"]["supports_state_observation"] is False
+    assert saved["run_context"]["target_timeout_seconds"] == 90.0
+    manifest = read_dataset_run_manifest(manifest_path(output))
+    assert manifest.effective_command.target_timeout_seconds == 90.0
     assert len(saved["technical_details"]["baseline"]["trial_set"]["trials"]) == 2
     assert (
         saved["technical_details"]["baseline"]["trial_set"]["trials"][0]["execution_evidence"][
@@ -380,6 +385,28 @@ def test_full_dataset_evaluation_runs_local_callable_through_worker_boundary(
         assert "Resume compatible: 1 complete interaction(s) skipped; 0 remaining" in (
             resumed.output
         )
+        assert "Target trial timeout: 90 seconds" in resumed.output
+        incompatible_resume = runner.invoke(
+            root_app,
+            [
+                "dataset",
+                "evaluate",
+                "--resume",
+                str(output),
+                "--target",
+                "customer_agent:run",
+                "--confirm-target",
+                target.confirmation_sha256,
+                "--target-timeout-seconds",
+                "91",
+                "--dry-run",
+            ],
+        )
+        assert incompatible_resume.exit_code == 2
+        normalized_incompatible_error = " ".join(
+            _ANSI_ESCAPE_PATTERN.sub("", incompatible_resume.output).split()
+        )
+        assert "incompatible with the current evaluation plan" in normalized_incompatible_error
 
 
 def test_declared_projection_compares_raw_recorded_tool_calls_through_public_cli(
@@ -874,6 +901,7 @@ def test_execution_creates_private_explicit_output(
         repetitions: int,
         max_environment_api_calls: int,
         planned_target_calls: int,
+        target_timeout_seconds: float,
         run_context: object,
         augmentation_ledger: object,
         saved_augmentations: object,
@@ -891,6 +919,7 @@ def test_execution_creates_private_explicit_output(
         assert repetitions == 3
         assert max_environment_api_calls == 100
         assert planned_target_calls == 30
+        assert target_timeout_seconds == 75.0
         assert progress_plan.calls.total_environment_api == 30
         if has_source_preparation_failure:
             failure = customer_module.build_source_preparation_failure_evidence(
@@ -928,6 +957,8 @@ def test_execution_creates_private_explicit_output(
             "--allow-insecure-http",
             "--allow-environment-network",
             "--confirm-test-environment",
+            "--target-timeout-seconds",
+            "75",
             "--output",
             str(output),
         ],
@@ -973,6 +1004,8 @@ def test_execution_creates_private_explicit_output(
             "--allow-insecure-http",
             "--allow-environment-network",
             "--confirm-test-environment",
+            "--target-timeout-seconds",
+            "75",
             "--output",
             str(failed_output),
         ],

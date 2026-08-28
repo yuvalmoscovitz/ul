@@ -67,6 +67,7 @@ async def evaluate_interaction_records(
     repetitions: int,
     max_environment_api_calls: int,
     planned_target_calls: int,
+    target_timeout_seconds: float = 30.0,
     run_context: DatasetEvidenceRunContext | None = None,
     augmentation_ledger: DatasetAugmentationLedger | None = None,
     saved_augmentations: dict[str, DatasetAugmentationResult] | None = None,
@@ -91,7 +92,7 @@ async def evaluate_interaction_records(
     work_upper_bound = len(records) * repetitions * (1 + len(operator_ids))
     semantic_call_budget = progress_plan.calls.total_semantic_model if progress_plan else 0
     token_budget = progress_plan.tokens.maximum if progress_plan else 0
-    timeout_seconds = settings.timeout_seconds if progress_plan else 1
+    semantic_timeout_seconds = settings.timeout_seconds if progress_plan else 1
     if progress_next_commands is None:
         output_name = str(getattr(output_stream, "name", "dataset-evidence.jsonl"))
         progress_next_commands = create_campaign_next_commands(Path(output_name))
@@ -104,7 +105,8 @@ async def evaluate_interaction_records(
             environment_call_budget=max_environment_api_calls,
             token_budget=token_budget,
             maximum_wall_time_seconds=(
-                max(1, planned_target_calls + semantic_call_budget) * timeout_seconds
+                max(1, work_upper_bound) * target_timeout_seconds
+                + semantic_call_budget * semantic_timeout_seconds
             ),
             next_commands=progress_next_commands,
             json_output=progress_json,
@@ -159,6 +161,7 @@ async def evaluate_interaction_records(
                 ),
                 evaluation_deconstructor,
                 evaluation_target,
+                target_timeout_seconds=target_timeout_seconds,
                 allow_network_egress=allow_network_egress,
                 evaluation_mode=(
                     run_context.evaluation_mode

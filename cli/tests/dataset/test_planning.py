@@ -86,6 +86,35 @@ def test_dry_run_validates_and_makes_no_external_calls(
     assert "Transfer 100" not in result.output
 
 
+@pytest.mark.parametrize("timeout", ("0", "nan", "3601"))
+def test_dry_run_rejects_unbounded_target_timeout(
+    tmp_path: Path,
+    timeout: str,
+) -> None:
+    dataset = tmp_path / "interactions.jsonl"
+    target_config = tmp_path / "target.json"
+    _write_dataset(dataset, [_record()])
+    _write_target_config(target_config)
+
+    result = runner.invoke(
+        root_app,
+        [
+            "dataset",
+            "evaluate",
+            str(dataset),
+            "--environment-config",
+            str(target_config),
+            "--target-timeout-seconds",
+            timeout,
+            "--dry-run",
+        ],
+    )
+
+    assert result.exit_code == 2
+    normalized_output = " ".join(_ANSI_ESCAPE_PATTERN.sub("", result.output).split())
+    assert "target-timeout-seconds" in normalized_output
+
+
 def test_dry_run_json_exposes_per_example_campaign_and_exact_call_plan(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -118,6 +147,8 @@ def test_dry_run_json_exposes_per_example_campaign_and_exact_call_plan(
             str(target_config),
             "--repetitions",
             "2",
+            "--target-timeout-seconds",
+            "75",
             "--dry-run",
             "--json",
         ],
@@ -125,7 +156,7 @@ def test_dry_run_json_exposes_per_example_campaign_and_exact_call_plan(
 
     assert result.exit_code == 0, result.output
     payload = json.loads(result.output)
-    assert payload["schema_version"] == "1.1.0"
+    assert payload["schema_version"] == "1.2.0"
     assert payload["evaluation_mode"] == "variance"
     assert payload["fixture"] == {"status": "missing", "id": None, "version": None}
     assert any("no fixture identity" in warning.casefold() for warning in payload["warnings"])
@@ -158,6 +189,10 @@ def test_dry_run_json_exposes_per_example_campaign_and_exact_call_plan(
         + payload["calls"]["evaluators"]
         + payload["calls"]["variation_generation"]
     )
+    assert payload["timing"] == {
+        "target_trial_timeout_seconds": 75.0,
+        "maximum_wall_time_seconds": 900.0,
+    }
     planned_operator = next(
         operator
         for operator in payload["examples"][0]["operators"]
