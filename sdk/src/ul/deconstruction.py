@@ -278,21 +278,23 @@ def _canonicalize_evidenced_action_outcome(
     action_object = next(iter(evidenced_action_objects.values()))
     canonical_fields = dict(outcome.fields)
     for name, model_value in outcome.fields.items():
-        if name == "action" or name not in action_object:
+        if name not in action_object:
             continue
+        if name == "action":
+            return outcome
         canonical_value = action_object[name]
         if isinstance(canonical_value, (dict, list)):
-            continue
+            return outcome
         if isinstance(model_value, dict):
             if "value" not in model_value or not set(model_value) <= {"value", "evidence"}:
-                continue
+                return outcome
             model_value = model_value["value"]
         if (
             isinstance(model_value, (dict, list))
             or type(model_value) is not type(canonical_value)
             or model_value != canonical_value
         ):
-            continue
+            return outcome
         canonical_fields[name] = canonical_value
     return outcome.model_copy(update={"fields": canonical_fields})
 

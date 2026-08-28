@@ -2218,6 +2218,27 @@ async def test_runner_rejects_inconclusive_source_actions_before_execution(
     assert target.raw_inputs == []
 
 
+async def test_runner_rejects_a_mismatched_existing_wrapper_before_execution() -> None:
+    source_outcome = _outcome(
+        "partially_matching_wrappers",
+        0,
+        fields={
+            "amount": {"value": 999, "evidence": []},
+            "recipient": {"value": "Alice", "evidence": []},
+        },
+    )
+    runner, semantic_pipeline, target = _runner((_source_outcomes()[0],))
+    semantic_pipeline.source_frame = _frame("source", (source_outcome,))
+
+    with pytest.raises(
+        DatasetComparisonCompatibilityError,
+        match="no coherent action or grounded response",
+    ):
+        await runner.run(_source())
+
+    assert target.raw_inputs == []
+
+
 async def test_runner_rejects_empty_source_action_values_before_execution() -> None:
     source_outcome = _outcome("empty_recipient", 0, fields={"recipient": ""})
     runner, semantic_pipeline, target = _runner((_source_outcomes()[0],))
