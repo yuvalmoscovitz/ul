@@ -33,6 +33,7 @@ from ul.augmentations.dataset import (
     DatasetAugmentationResult,
     builtin_dataset_augmentation_operators,
 )
+from ul.deconstruction import canonicalize_evidenced_action_fields
 from ul.environment import (
     environment_timeout_requires_quarantine,
     execution_evidence_requires_quarantine,
@@ -471,12 +472,14 @@ class DatasetEvaluationRunner:
                 _validate_precomputed_augmentation(source, augmentation, operator_ids=None)
             except ValueError:
                 raise DatasetSemanticPreparationError from None
-            if augmentation_checkpoint_callback is not None:
-                augmentation_checkpoint_callback(augmentation)
         else:
             augmentation = precomputed_augmentation
             _validate_precomputed_augmentation(source, augmentation, operator_ids=operator_ids)
         source_frame = augmentation.source_frames[0]
+        source_frame = canonicalize_evidenced_action_fields(projected_source, source_frame)
+        augmentation = augmentation.model_copy(update={"source_frames": (source_frame,)})
+        if precomputed_augmentation is None and augmentation_checkpoint_callback is not None:
+            augmentation_checkpoint_callback(augmentation)
         comparison_surface = _source_comparison_surface(projected_source, source_frame)
         if comparison_surface == "response":
             source_frame = _response_frame(source_frame, projected_source.raw_observed_output)
@@ -806,6 +809,7 @@ class DatasetEvaluationRunner:
             )
         if observed_frame.interaction_id != record.id:
             raise ValueError(f"observed frame must reference its {subject} interaction")
+        observed_frame = canonicalize_evidenced_action_fields(record, observed_frame)
         if comparison_surface == "response":
             if not _frame_supports_response_projection(record, observed_frame):
                 return DatasetEvaluationTrial(
