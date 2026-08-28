@@ -203,6 +203,7 @@ class _WrappedActionFieldSemanticModel(_LocalEvaluationSemanticModel):
                             "ticket": 42,
                             "body.intent": "order",
                             "body.note.text": "Return status for ticket 42.",
+                            "authoredOn": "stale-reference-only-value",
                         }.items()
                     },
                 }
@@ -433,6 +434,15 @@ def test_full_dataset_evaluation_runs_local_callable_through_worker_boundary(
             "ticket": 42,
             "body.intent": "order",
             "body.note.text": "Return status for ticket 42.",
+            "authoredOn": {
+                "value": "stale-reference-only-value",
+                "evidence": [
+                    {
+                        "source": "output",
+                        "json_pointer": "/raw_observed_output/actions/0/authoredOn",
+                    }
+                ],
+            },
         }
     final_response = saved["technical_details"]["baseline"]["trial_set"]["trials"][0][
         "execution_evidence"
