@@ -276,9 +276,11 @@ def _canonicalize_evidenced_action_outcome(
     if len(evidenced_action_objects) != 1:
         return outcome
     action_object = next(iter(evidenced_action_objects.values()))
-    canonical_fields: dict[str, JsonValue] = {}
+    canonical_fields = dict(outcome.fields)
     for name, model_value in outcome.fields.items():
-        if name == "action" or name not in action_object:
+        if name not in action_object:
+            continue
+        if name == "action":
             return outcome
         canonical_value = action_object[name]
         if isinstance(canonical_value, (dict, list)):
@@ -950,7 +952,7 @@ class OpenAICompatibleSemanticProvider:
     provider_id: str
     base_url: str
     endpoint_sha256: str
-    extractor_version: str = "semantic-deconstructor/2.1.0"
+    extractor_version: str = "semantic-deconstructor/2.2.0"
     equivalence_verifier_version: str = "semantic-equivalence-verifier/2.0.0"
     requires_api_key: bool = False
     trust_environment_transport: bool = False

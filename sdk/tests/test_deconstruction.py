@@ -652,7 +652,7 @@ async def test_deconstruct_sends_one_bounded_strict_structured_request() -> None
     assert not client.is_closed
     assert frame.interaction_id == "interaction-1"
     assert frame.schema_version == "1.0.0"
-    assert frame.extractor_version == "semantic-deconstructor/2.1.0"
+    assert frame.extractor_version == "semantic-deconstructor/2.2.0"
     assert frame.metadata == {
         "semantic_provider": "openrouter",
         "semantic_protocol": "openai-chat-completions",
@@ -807,7 +807,7 @@ async def test_openai_compatible_deconstruction_uses_generic_chat_contract() -> 
     ) as deconstructor:
         frame = await deconstructor.deconstruct(interaction())
 
-    assert frame.extractor_version == "semantic-deconstructor/2.1.0"
+    assert frame.extractor_version == "semantic-deconstructor/2.2.0"
     assert frame.metadata["semantic_provider"] == "customer-model-gateway"
     assert frame.metadata["semantic_protocol"] == "openai-chat-completions"
     assert frame.metadata["semantic_endpoint_sha256"] == (
@@ -1666,11 +1666,35 @@ async def test_deconstruct_does_not_replace_a_wrapper_with_a_different_value() -
     await client.aclose()
 
 
+async def test_deconstruct_normalizes_exact_fields_independently() -> None:
+    exact_wrapper = {"value": "INV-104", "evidence": []}
+    missing_wrapper = {"value": "2026-08-28", "evidence": []}
+    mixed_outcome = {
+        **cast(list[dict[str, object]], frame_payload()["outcomes"])[0],
+        "fields": {
+            "invoice_id": exact_wrapper,
+            "authoredOn": missing_wrapper,
+        },
+    }
+    client = mock_client(
+        lambda request: completion(json.dumps({**frame_payload(), "outcomes": [mixed_outcome]}))
+    )
+
+    async with create_semantic_model_deconstructor(settings(), client=client) as deconstructor:
+        frame = await deconstructor.deconstruct(interaction())
+
+    assert frame.outcomes[0].fields == {
+        "invoice_id": "INV-104",
+        "authoredOn": missing_wrapper,
+    }
+    await client.aclose()
+
+
 async def test_deconstructor_identity_binds_extractor_prompt_and_response_schema(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     baseline = semantic_deconstructor_identity(settings())
-    assert baseline.extractor_contract == "semantic-deconstructor/2.1.0"
+    assert baseline.extractor_contract == "semantic-deconstructor/2.2.0"
     assert baseline.prompt_behavior_sha256 == (
         deconstruction_module._PROMPTS.get_template_info("semantic.deconstruct").version
     )
