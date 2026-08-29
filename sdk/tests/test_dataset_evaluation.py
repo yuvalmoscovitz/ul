@@ -1285,7 +1285,7 @@ async def test_repeated_action_business_identifier_substitution_is_reported() ->
             fields={
                 "target": "unread emails",
                 "id": "message-C",
-                "evidence_pointer": "/proof/C",
+                "evidence_pointer": "/proof/B",
             },
         ),
     )
