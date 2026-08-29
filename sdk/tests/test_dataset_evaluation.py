@@ -1249,7 +1249,7 @@ async def test_repeated_actions_with_a_substituted_effect_are_inconclusive() -> 
     assert result.cases[0].verdict == "inconclusive"
 
 
-async def test_repeated_actions_require_all_evidenced_fields() -> None:
+async def test_repeated_actions_include_fields_omitted_by_the_deconstructor() -> None:
     source_outcomes = (
         _outcome(
             "first",
@@ -1283,8 +1283,22 @@ async def test_repeated_actions_require_all_evidenced_fields() -> None:
         baseline_outcomes=incomplete_live_outcomes,
     )
     semantic_pipeline.source_frame = _frame("source", incomplete_live_outcomes)
+    changed_recipient_outcomes = (
+        _outcome(
+            "changed_first",
+            0,
+            predicate="send_email",
+            fields={"target": "unread emails", "recipient": "Mallory"},
+        ),
+        _outcome(
+            "changed_second",
+            1,
+            predicate="send_email",
+            fields={"target": "unread emails", "recipient": "Eve"},
+        ),
+    )
     target = DeterministicEnvironment(
-        raw_output=_raw_output_for_actions(source_outcomes),
+        raw_output=_raw_output_for_actions(changed_recipient_outcomes),
         baseline_raw_output=_raw_output_for_actions(source_outcomes),
     )
     runner = DatasetEvaluationRunner(
@@ -1296,6 +1310,64 @@ async def test_repeated_actions_require_all_evidenced_fields() -> None:
         id="source",
         raw_input="Process unread emails.",
         raw_observed_output=_raw_output_for_actions(source_outcomes),
+    )
+
+    result = await runner.run(source)
+
+    assert result.baseline.verdict == "no_divergence"
+    assert result.cases[0].verdict == "inconclusive"
+    for trial in result.baseline.trial_set.trials:
+        assert trial.observed_frame is not None
+        assert all("recipient" in outcome.fields for outcome in trial.observed_frame.outcomes)
+
+
+async def test_repeated_actions_with_structured_evidence_are_inconclusive() -> None:
+    incomplete_outcomes = (
+        _outcome(
+            "first",
+            0,
+            predicate="send_email",
+            fields={"target": "unread emails"},
+        ),
+        _outcome(
+            "second",
+            1,
+            predicate="send_email",
+            fields={"target": "unread emails"},
+        ),
+    )
+    structured_output: JsonValue = {
+        "outcomes": {
+            "0": {
+                "action": "send_email",
+                "target": "unread emails",
+                "arguments": {"recipient": "Alice"},
+            },
+            "1": {
+                "action": "send_email",
+                "target": "unread emails",
+                "arguments": {"recipient": "Bob"},
+            },
+        }
+    }
+    semantic_pipeline = DeterministicSemanticPipeline(
+        incomplete_outcomes,
+        baseline_outcomes=incomplete_outcomes,
+    )
+    semantic_pipeline.source_frame = _frame("source", incomplete_outcomes)
+    target = DeterministicEnvironment(
+        raw_output=structured_output,
+        baseline_raw_output=structured_output,
+    )
+    runner = DatasetEvaluationRunner(
+        DatasetAugmentationEngine(semantic_pipeline, semantic_pipeline),
+        semantic_pipeline,
+        target,
+    )
+    source = InteractionRecord(
+        id="source",
+        raw_input="Process unread emails.",
+        raw_observed_output=structured_output,
     )
 
     with pytest.raises(DatasetComparisonCompatibilityError):

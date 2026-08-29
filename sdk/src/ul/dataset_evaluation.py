@@ -1228,12 +1228,22 @@ def _action_outcome_reliability_issues(
         if not evidenced_action_objects:
             issues.append(f"action outcome {outcome.id} predicate lacks coherent action evidence")
         elif outcome.predicate in repeated_predicates and not any(
-            set(outcome.fields) == set(action_object) - {"action"}
+            not any(
+                isinstance(value, (dict, list))
+                for name, value in action_object.items()
+                if name != "action"
+            )
+            and set(outcome.fields)
+            == {
+                name
+                for name, value in action_object.items()
+                if name != "action" and not isinstance(value, (dict, list))
+            }
             and all(
                 _observable_field_key(name, outcome.fields[name])
                 == _observable_field_key(name, value)
                 for name, value in action_object.items()
-                if name != "action"
+                if name != "action" and not isinstance(value, (dict, list))
             )
             for action_object in evidenced_action_objects
         ):

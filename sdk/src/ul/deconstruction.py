@@ -211,8 +211,18 @@ def canonicalize_evidenced_action_fields(
         "raw_input": record.raw_input,
         "raw_observed_output": record.raw_observed_output,
     }
+    action_predicate_counts: dict[str, int] = {}
+    for outcome in frame.outcomes:
+        if outcome.kind == "action":
+            action_predicate_counts[outcome.predicate] = (
+                action_predicate_counts.get(outcome.predicate, 0) + 1
+            )
     normalized_outcomes = tuple(
-        _canonicalize_evidenced_action_outcome(evidence_payload, outcome)
+        _canonicalize_evidenced_action_outcome(
+            evidence_payload,
+            outcome,
+            include_missing_fields=action_predicate_counts.get(outcome.predicate, 0) > 1,
+        )
         for outcome in frame.outcomes
     )
     if normalized_outcomes == frame.outcomes:
@@ -245,6 +255,8 @@ def _resolve_json_pointer(value: JsonValue, pointer: str) -> JsonValue:
 def _canonicalize_evidenced_action_outcome(
     evidence_payload: JsonValue,
     outcome: ObservedOutcome,
+    *,
+    include_missing_fields: bool = False,
 ) -> ObservedOutcome:
     if outcome.kind != "action":
         return outcome
@@ -296,6 +308,14 @@ def _canonicalize_evidenced_action_outcome(
         ):
             return outcome
         canonical_fields[name] = canonical_value
+    if include_missing_fields:
+        canonical_fields.update(
+            (name, value)
+            for name, value in action_object.items()
+            if name != "action"
+            and name not in canonical_fields
+            and not isinstance(value, (dict, list))
+        )
     return outcome.model_copy(update={"fields": canonical_fields})
 
 
