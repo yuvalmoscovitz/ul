@@ -342,6 +342,7 @@ Configure the existing UL semantic provider only when you are ready for the disp
 
 ```bash
 export OPEN_ROUTER_API_KEY=YOUR_SECRET_FROM_A_SECRET_MANAGER
+export UL_DATASET_MODEL=your-provider/model
 export UL_LIVE=true
 
 ul probe interactions.jsonl \

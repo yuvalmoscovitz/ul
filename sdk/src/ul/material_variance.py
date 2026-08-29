@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from typing import cast
 
 from pydantic import JsonValue
@@ -25,6 +26,10 @@ from ul.evaluators import (
 
 _PROMPTS = PromptManager.instance()
 _MAXIMUM_PAYLOAD_BYTES = 64 * 1024
+_READ_ONLY_ACTION_TOKENS = frozenset(
+    {"FETCH", "FIND", "GET", "LIST", "LOOKUP", "QUERY", "READ", "SEARCH"}
+)
+_RESPONSE_ENVELOPE_FIELDS = frozenset({"answer", "actions", "reward", "status", "steps", "task_id"})
 _EVALUATOR = RubricEvaluator(
     id="dataset.material_variance",
     rubric=_PROMPTS.get_prompt("evaluation.material_variance"),
@@ -217,7 +222,7 @@ def _effect_payload(
     selected_fields = (
         {name: fields[name] for name in finding.grounded_field_names if name in fields}
         if kind == "action"
-        else fields
+        else _normalized_response_fields(fields)
     )
     return cast(
         JsonValue,
@@ -227,6 +232,45 @@ def _effect_payload(
             "fields": selected_fields,
         },
     )
+
+
+def _normalized_response_fields(fields: dict[str, JsonValue]) -> dict[str, JsonValue]:
+    value = fields.get("value")
+    if not isinstance(value, dict) or not {"answer", "actions"} <= value.keys():
+        return fields
+    answer = value.get("answer")
+    actions = value.get("actions")
+    substantive_answer = None if answer is None or answer == [] else answer
+    normalized: dict[str, JsonValue] = {
+        "substantive_answer_state": "empty" if substantive_answer is None else "present",
+        "substantive_answer": substantive_answer,
+    }
+    if isinstance(actions, list):
+        committed_actions = [action for action in actions if not _is_read_only_action(action)]
+        normalized["committed_action_count"] = len(committed_actions)
+        normalized["committed_actions"] = committed_actions
+    else:
+        normalized["committed_action_count"] = None
+        normalized["committed_actions"] = actions
+    other_fields = {
+        key: nested_value
+        for key, nested_value in value.items()
+        if key not in _RESPONSE_ENVELOPE_FIELDS
+    }
+    if other_fields:
+        normalized["other_fields"] = other_fields
+    return normalized
+
+
+def _is_read_only_action(action: JsonValue) -> bool:
+    if not isinstance(action, dict):
+        return False
+    action_name = action.get("action", action.get("name"))
+    if not isinstance(action_name, str):
+        return False
+    separated_name = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", action_name)
+    tokens = set(re.findall(r"[A-Za-z]+", separated_name.upper()))
+    return bool(tokens & _READ_ONLY_ACTION_TOKENS)
 
 
 def _has_required_citations(decision: str, pointers: tuple[str, ...]) -> bool:

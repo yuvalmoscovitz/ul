@@ -4,6 +4,7 @@ import re
 from typing import Protocol
 
 import pytest
+from pydantic import ValidationError
 from ul.augmentations.dataset import DatasetAugmentationEngine
 from ul.dataset_evaluation import DatasetEvaluationRunner
 from ul.deconstruction import OpenRouterDatasetSettings, create_semantic_model_deconstructor
@@ -41,7 +42,10 @@ from examples.accounts_payable.dataset_target import (
     SeededIntentFanOutDefectAccountsPayableDatasetTarget,
 )
 
-_LIVE_SETTINGS = OpenRouterDatasetSettings()
+try:
+    _LIVE_SETTINGS = OpenRouterDatasetSettings()
+except ValidationError:
+    _LIVE_SETTINGS = None
 _LIVE_TRANSFER_INPUT = "transfer 120$ to alice"
 
 
@@ -529,7 +533,8 @@ async def test_repetition_e2e_reports_seeded_variation_instability() -> None:
 
 @pytest.mark.asyncio
 @pytest.mark.skipif(
-    not (
+    _LIVE_SETTINGS is None
+    or not (
         _LIVE_SETTINGS.live_calls
         and _LIVE_SETTINGS.allow_external_data_processing
         and _LIVE_SETTINGS.api_key is not None
@@ -537,6 +542,7 @@ async def test_repetition_e2e_reports_seeded_variation_instability() -> None:
     reason="requires explicit live dataset call and external processing opt-ins",
 )
 async def test_live_deconstructor_discovers_seeded_duplicate_payment() -> None:
+    assert _LIVE_SETTINGS is not None
     source_output = await AccountsPayableDatasetTarget().execute(SOURCE_INPUT)
     source = InteractionRecord(
         id="ap-single-approved-payment",
@@ -563,7 +569,8 @@ async def test_live_deconstructor_discovers_seeded_duplicate_payment() -> None:
 
 @pytest.mark.asyncio
 @pytest.mark.skipif(
-    not (
+    _LIVE_SETTINGS is None
+    or not (
         _LIVE_SETTINGS.live_calls
         and _LIVE_SETTINGS.allow_external_data_processing
         and _LIVE_SETTINGS.api_key is not None
@@ -571,6 +578,7 @@ async def test_live_deconstructor_discovers_seeded_duplicate_payment() -> None:
     reason="requires explicit live dataset call and external processing opt-ins",
 )
 async def test_live_pipeline_discovers_seeded_first_value_wins_defect() -> None:
+    assert _LIVE_SETTINGS is not None
     source = InteractionRecord(
         id="live-transfer-self-correction",
         raw_input=_LIVE_TRANSFER_INPUT,

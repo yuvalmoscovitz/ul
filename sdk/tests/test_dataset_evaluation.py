@@ -795,6 +795,7 @@ async def test_repetition_benchmark_reduces_semantic_calls_without_changing_find
 
     client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
     semantic_settings = OpenRouterDatasetSettings(
+        model="test/default-model",
         live_calls=True,
         allow_external_data_processing=True,
         api_key=SecretStr("test-openrouter-key"),

@@ -108,7 +108,9 @@ def _context(
             max_response_bytes=1_000_000,
             timeout_seconds=60.0,
             deconstructor_identity=(
-                semantic_deconstructor_identity(OpenRouterDatasetSettings())
+                semantic_deconstructor_identity(
+                    OpenRouterDatasetSettings(model="test/default-model")
+                )
                 if include_deconstructor_identity
                 else None
             ),

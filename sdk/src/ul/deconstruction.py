@@ -397,35 +397,46 @@ class OpenRouterDatasetSettings(BaseSettings):
     ul_live: bool = Field(default=False, validation_alias="UL_LIVE", exclude=True, repr=False)
 
     @model_validator(mode="after")
-    def apply_ul_live_shorthand(self) -> Self:
+    def validate_and_normalize(self) -> Self:
         if self.ul_live:
             if "live_calls" not in self.model_fields_set:
                 self.live_calls = True
             if "allow_external_data_processing" not in self.model_fields_set:
                 self.allow_external_data_processing = True
+        if not self.model.strip():
+            raise ValueError("UL_DATASET_MODEL must contain non-whitespace text")
+        if not self.render_model:
+            self.render_model = self.model
+        elif not self.render_model.strip():
+            raise ValueError("UL_DATASET_RENDER_MODEL must contain non-whitespace text")
+        if not self.equivalence_model:
+            self.equivalence_model = self.model
+        elif not self.equivalence_model.strip():
+            raise ValueError("UL_DATASET_EQUIVALENCE_MODEL must contain non-whitespace text")
+        if not self.materiality_model:
+            self.materiality_model = self.model
+        elif not self.materiality_model.strip():
+            raise ValueError("UL_DATASET_MATERIALITY_MODEL must contain non-whitespace text")
         return self
 
     model: str = Field(
-        default="google/gemini-3.5-flash",
+        default=...,
         min_length=1,
         max_length=200,
         validation_alias="UL_DATASET_MODEL",
     )
     render_model: str = Field(
-        default="x-ai/grok-4.3",
-        min_length=1,
+        default="",
         max_length=200,
         validation_alias="UL_DATASET_RENDER_MODEL",
     )
     equivalence_model: str = Field(
-        default="google/gemini-3.5-flash",
-        min_length=1,
+        default="",
         max_length=200,
         validation_alias="UL_DATASET_EQUIVALENCE_MODEL",
     )
     materiality_model: str = Field(
-        default="qwen/qwen3-30b-a3b-instruct-2507",
-        min_length=1,
+        default="",
         max_length=200,
         validation_alias="UL_DATASET_MATERIALITY_MODEL",
     )

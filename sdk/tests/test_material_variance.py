@@ -125,6 +125,126 @@ async def test_material_variance_judge_accepts_operational_equivalence() -> None
     assert assessment.reason_code == "alias_or_representation"
 
 
+async def test_material_variance_judge_normalizes_response_envelopes() -> None:
+    judge = RecordingJudge(_decision("material_variance:action_added", 1))
+    finding = DatasetEvaluationFinding(
+        category="changed_response",
+        message="changed",
+        expected_effects=(
+            ObservedOutcome(
+                id="baseline-response",
+                kind="answer",
+                predicate="returned_response",
+                status="observed",
+                confidence=1,
+                position=0,
+                fields={
+                    "value": {
+                        "task_id": "private-task",
+                        "status": "completed",
+                        "answer": [],
+                        "actions": [
+                            {"action": "FHIR_GET", "url": "private-read-target"},
+                        ],
+                        "reward": 0,
+                        "steps": 1,
+                    }
+                },
+            ),
+        ),
+        observed_effects=(
+            ObservedOutcome(
+                id="variation-response",
+                kind="answer",
+                predicate="returned_response",
+                status="observed",
+                confidence=1,
+                position=0,
+                fields={
+                    "value": {
+                        "task_id": "other-private-task",
+                        "status": "completed",
+                        "answer": None,
+                        "actions": [
+                            {"action": "findPatient", "url": "private-read-target"},
+                            {"action": "FHIR_POST", "body": {"value": 118}},
+                        ],
+                        "reward": 1,
+                        "steps": 3,
+                    }
+                },
+            ),
+        ),
+    )
+
+    assessment = await DatasetMaterialVarianceJudge(judge, max_input_chars=50_000).evaluate(
+        "response", (finding,)
+    )
+
+    assert assessment.decision == "material_variance"
+    answer = judge.requests[0].payload["answer"]
+    assert answer["findings"][0]["baseline_effects"][0]["fields"] == {
+        "substantive_answer_state": "empty",
+        "substantive_answer": None,
+        "committed_action_count": 0,
+        "committed_actions": [],
+    }
+    assert answer["findings"][0]["variation_effects"][0]["fields"] == {
+        "substantive_answer_state": "empty",
+        "substantive_answer": None,
+        "committed_action_count": 1,
+        "committed_actions": [{"action": "FHIR_POST", "body": {"value": 118}}],
+    }
+    assert "private" not in repr(answer)
+
+
+async def test_material_variance_judge_keeps_unknown_actions_and_business_fields() -> None:
+    judge = RecordingJudge(_decision("operationally_equivalent:same_real_world_effect", 0))
+    outcome = ObservedOutcome(
+        id="response",
+        kind="answer",
+        predicate="returned_response",
+        status="observed",
+        confidence=1,
+        position=0,
+        fields={
+            "value": {
+                "answer": ["A substantive answer."],
+                "actions": [
+                    {"action": "BUDGET_UPDATE"},
+                    {"payload": 1},
+                    "opaque-action",
+                ],
+                "business_result": {"approved": True},
+                "status": "completed",
+            }
+        },
+    )
+    finding = DatasetEvaluationFinding(
+        category="changed_response",
+        message="changed",
+        expected_effects=(outcome,),
+        observed_effects=(outcome,),
+    )
+
+    await DatasetMaterialVarianceJudge(judge, max_input_chars=50_000).evaluate(
+        "response", (finding,)
+    )
+
+    fields = judge.requests[0].payload["answer"]["findings"][0]["baseline_effects"][0]["fields"]
+    assert fields == {
+        "substantive_answer_state": "present",
+        "substantive_answer": ["A substantive answer."],
+        "committed_action_count": 3,
+        "committed_actions": [
+            {"action": "BUDGET_UPDATE"},
+            {"payload": 1},
+            "opaque-action",
+        ],
+        "other_fields": {"business_result": {"approved": True}},
+    }
+
+
 async def test_material_variance_judge_fails_closed_on_invalid_or_failed_judgment() -> None:
     invalid_score = RecordingJudge(_decision("operationally_equivalent:same_real_world_effect", 1))
     failed = RecordingJudge(RuntimeError("private-provider-body"))

@@ -47,6 +47,7 @@ def settings(
     timeout_seconds: float = 12,
 ) -> OpenRouterDatasetSettings:
     return OpenRouterDatasetSettings(
+        model="test/default-model",
         live_calls=live_calls,
         allow_external_data_processing=allow_external_data_processing,
         api_key=api_key,
@@ -77,6 +78,13 @@ def openai_compatible_settings(
         max_output_tokens=321,
         timeout_seconds=12,
     )
+
+
+def openrouter_live_settings() -> OpenRouterDatasetSettings:
+    try:
+        return OpenRouterDatasetSettings()
+    except ValidationError:
+        pytest.skip("requires an explicit OpenRouter model configuration")
 
 
 def interaction() -> InteractionRecord:
@@ -220,10 +228,10 @@ async def test_evaluator_preflight_proves_required_capabilities_and_records_poli
     )
     assert sum(profile.max_completion_tokens for profile in planned_profiles) == 1_666
     assert [request["model"] for request in requests[:4]] == [
-        "google/gemini-3.5-flash",
-        "x-ai/grok-4.3",
-        "google/gemini-3.5-flash",
-        "qwen/qwen3-30b-a3b-instruct-2507",
+        "test/default-model",
+        "test/default-model",
+        "test/default-model",
+        "test/default-model",
     ]
     assert [request.get("reasoning") for request in requests[:4]] == [
         {"effort": "minimal"},
@@ -333,6 +341,7 @@ async def test_explicit_non_reasoning_roles_omit_only_reasoning_and_bind_preflig
             "model": "qwen/qwen3-30b-a3b-instruct-2507",
             "render_model": "qwen/qwen3-30b-a3b-instruct-2507",
             "equivalence_model": "deepseek/deepseek-v4-flash",
+            "materiality_model": "qwen/qwen3-30b-a3b-instruct-2507",
             "deconstruct_reasoning": "omitted",
             "render_reasoning": "omitted",
         }
@@ -586,7 +595,7 @@ async def test_deconstruct_sends_one_bounded_strict_structured_request() -> None
         assert request.headers["authorization"] == "Bearer test-openrouter-key"
         assert request.headers["accept-encoding"] == "identity"
         body = json.loads(request.content)
-        assert body["model"] == "google/gemini-3.5-flash"
+        assert body["model"] == "test/default-model"
         assert body["reasoning"] == {"effort": "minimal"}
         assert body["seed"] == 0
         assert body["temperature"] == 0
@@ -1038,7 +1047,7 @@ async def test_render_keeps_caller_instruction_out_of_the_system_prompt() -> Non
 
     def handler(request: httpx.Request) -> httpx.Response:
         body = json.loads(request.content)
-        assert body["model"] == "x-ai/grok-4.3"
+        assert body["model"] == "test/default-model"
         assert body["reasoning"] == {"effort": "none"}
         assert body["max_tokens"] == 512
         assert body["temperature"] == 0.7
@@ -1092,7 +1101,7 @@ async def test_render_keeps_caller_instruction_out_of_the_system_prompt() -> Non
             "total_tokens": 125,
             "cost": 0.00042,
         },
-        "requested_model": "x-ai/grok-4.3",
+        "requested_model": "test/default-model",
         "prompts": prompt_provenance(
             "semantic.render",
             "semantic.render.temporary_value_forbidden",
@@ -1251,10 +1260,10 @@ async def test_self_correction_evidence_is_grounded_to_the_exact_visible_repair(
     assert grounded.communication_acts[0].evidence[0].text_quote == "13500$, sorry 12500$"
 
 
-async def test_verify_equivalence_compares_raw_inputs_with_a_stronger_model() -> None:
+async def test_verify_equivalence_compares_raw_inputs_with_the_configured_model() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         body = json.loads(request.content)
-        assert body["model"] == "google/gemini-3.5-flash"
+        assert body["model"] == "test/default-model"
         assert body["reasoning"] == {"effort": "low"}
         assert body["temperature"] == 0
         assert body["seed"] == 0
@@ -2569,6 +2578,7 @@ async def test_ul_live_enables_both_permissions(
         monkeypatch.delenv(variable_name, raising=False)
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("UL_LIVE", "true")
+    monkeypatch.setenv("UL_DATASET_MODEL", "test/default-model")
 
     configured_settings = OpenRouterDatasetSettings()
 
@@ -2601,6 +2611,7 @@ async def test_granular_false_overrides_ul_live(
         monkeypatch.delenv(variable_name, raising=False)
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("UL_LIVE", "true")
+    monkeypatch.setenv("UL_DATASET_MODEL", "test/default-model")
     monkeypatch.setenv(override_name, "false")
 
     configured_settings = OpenRouterDatasetSettings()
@@ -2620,7 +2631,9 @@ async def test_dotenv_ul_live_respects_process_granular_override(
         "UL_DATASET_ALLOW_EXTERNAL_DATA_PROCESSING",
     ):
         monkeypatch.delenv(variable_name, raising=False)
-    (tmp_path / ".env").write_text("UL_LIVE=true\n", encoding="utf-8")
+    (tmp_path / ".env").write_text(
+        "UL_LIVE=true\nUL_DATASET_MODEL=test/default-model\n", encoding="utf-8"
+    )
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("UL_DATASET_LIVE_CALLS", "false")
 
@@ -2634,7 +2647,17 @@ async def test_settings_reject_unbounded_values() -> None:
     configured_settings = settings()
 
     assert "test-openrouter-key" not in repr(configured_settings)
-    assert configured_settings.equivalence_model == "google/gemini-3.5-flash"
+    assert configured_settings.render_model == configured_settings.model
+    assert configured_settings.equivalence_model == configured_settings.model
+    assert configured_settings.materiality_model == configured_settings.model
+    assert (
+        OpenRouterDatasetSettings(
+            model="customer/default-model", materiality_model="customer/materiality-model"
+        ).materiality_model
+        == "customer/materiality-model"
+    )
+    with pytest.raises(ValidationError, match="UL_DATASET_MATERIALITY_MODEL"):
+        OpenRouterDatasetSettings(model="customer/default-model", materiality_model="   ")
     with pytest.raises(ValidationError):
         settings(max_input_chars=1_000_001)
     with pytest.raises(ValidationError):
@@ -2647,8 +2670,19 @@ async def test_settings_reject_unbounded_values() -> None:
         settings(timeout_seconds=301)
 
 
+async def test_openrouter_requires_one_default_model(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("UL_DATASET_MODEL", raising=False)
+
+    with pytest.raises(ValidationError):
+        OpenRouterDatasetSettings()
+
+
 async def test_live_deconstruction_with_synthetic_interaction() -> None:
-    configured_settings = OpenRouterDatasetSettings()
+    configured_settings = openrouter_live_settings()
     if not configured_settings.live_calls or configured_settings.api_key is None:
         pytest.skip("requires explicit OpenRouter live opt-in and API key")
     configured_settings = configured_settings.model_copy(
@@ -2677,7 +2711,7 @@ async def test_live_deconstruction_with_synthetic_interaction() -> None:
 
 
 async def test_live_augmentation_generates_or_safely_rejects_each_candidate() -> None:
-    configured_settings = OpenRouterDatasetSettings()
+    configured_settings = openrouter_live_settings()
     if not configured_settings.live_calls or configured_settings.api_key is None:
         pytest.skip("requires explicit OpenRouter live opt-in and API key")
     configured_settings = configured_settings.model_copy(
@@ -2716,7 +2750,7 @@ async def test_live_augmentation_generates_or_safely_rejects_each_candidate() ->
 
 
 async def test_live_equivalence_qualification_across_ten_domains() -> None:
-    configured_settings = OpenRouterDatasetSettings()
+    configured_settings = openrouter_live_settings()
     if not configured_settings.live_calls or configured_settings.api_key is None:
         pytest.skip("requires explicit OpenRouter live opt-in and API key")
     configured_settings = configured_settings.model_copy(
