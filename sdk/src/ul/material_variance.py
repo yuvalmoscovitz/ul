@@ -246,7 +246,7 @@ def _normalized_response_fields(fields: dict[str, JsonValue]) -> dict[str, JsonV
         return fields
     answer = value.get("answer")
     actions = value.get("actions")
-    substantive_answer = None if answer is None or answer == [] else answer
+    substantive_answer = None if _is_empty_answer(answer) else answer
     normalized: dict[str, JsonValue] = {
         "substantive_answer_state": "empty" if substantive_answer is None else "present",
         "substantive_answer": substantive_answer,
@@ -266,6 +266,16 @@ def _normalized_response_fields(fields: dict[str, JsonValue]) -> dict[str, JsonV
     if other_fields:
         normalized["other_fields"] = other_fields
     return normalized
+
+
+def _is_empty_answer(answer: JsonValue) -> bool:
+    if answer is None:
+        return True
+    if isinstance(answer, str):
+        return not answer.strip()
+    if isinstance(answer, (list, dict)):
+        return not answer
+    return False
 
 
 def _is_read_only_action(action: JsonValue) -> bool:

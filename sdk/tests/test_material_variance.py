@@ -194,6 +194,27 @@ async def test_material_variance_safety_floor_catches_removed_substantive_respon
     assert not judge.requests
 
 
+@pytest.mark.parametrize("baseline_answer", ["", "  \n", [], {}])
+async def test_material_variance_safety_floor_canonicalizes_empty_answers(
+    baseline_answer: JsonValue,
+) -> None:
+    judge = RecordingJudge(_decision("operationally_equivalent:presentation_only", 0))
+    finding = _response_finding(
+        baseline_answer=baseline_answer,
+        baseline_actions=[],
+        variation_answer=None,
+        variation_actions=[],
+    )
+
+    assessment = await DatasetMaterialVarianceJudge(judge, max_input_chars=50_000).evaluate(
+        "response", (finding,)
+    )
+
+    assert assessment.decision == "operationally_equivalent"
+    assert assessment.reason_code == "presentation_only"
+    assert len(judge.requests) == 1
+
+
 async def test_material_variance_safety_floor_catches_removed_committed_action() -> None:
     judge = RecordingJudge(_decision("operationally_equivalent:same_real_world_effect", 0))
     finding = _response_finding(
