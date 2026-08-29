@@ -2425,7 +2425,9 @@ async def test_openai_compatible_settings_hide_rejected_url_credentials_and_quer
     assert rejected_url not in rendered_error
 
 
-async def test_openai_compatible_settings_allow_loopback_http_and_inherit_models() -> None:
+async def test_openai_compatible_settings_allow_loopback_http_and_inherit_models(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     configured_settings = openai_compatible_settings(
         base_url="http://127.0.0.1:8000/v1/",
         model="local-model",
@@ -2436,6 +2438,7 @@ async def test_openai_compatible_settings_allow_loopback_http_and_inherit_models
     assert configured_settings.render_model == "local-model"
     assert configured_settings.equivalence_model == "local-model"
 
+    monkeypatch.delenv("UL_DATASET_MODEL")
     with pytest.raises(ValidationError):
         OpenAICompatibleDatasetSettings(base_url="https://models.example.test/v1")
     with pytest.raises(ValidationError):
