@@ -1367,7 +1367,18 @@ def _input_grounded_action_field_names_by_outcome(
                 == first_grounded_key
                 for reference in reference_outcomes[1:]
             )
-            if references_share_grounding:
+            outcomes_share_grounding = all(
+                shared_grounded_names <= set(outcome.fields)
+                and _json_key(
+                    {
+                        name: _observable_field_key(name, outcome.fields[name])
+                        for name in shared_grounded_names
+                    }
+                )
+                == first_grounded_key
+                for outcome in outcomes
+            )
+            if references_share_grounding and outcomes_share_grounding:
                 grounded_names_by_outcome.update(
                     (outcome.id, shared_grounded_names) for outcome in outcomes
                 )
@@ -1898,15 +1909,8 @@ def _action_outcomes_by_key(
 
 
 def _action_record_key(outcome: ObservedOutcome) -> str:
-    evidence_envelope_fields = {"evidence_pointer"}
-    if "evidence_pointer" in outcome.fields:
-        evidence_envelope_fields.add("id")
     return _json_key(
-        {
-            name: _observable_field_key(name, value)
-            for name, value in outcome.fields.items()
-            if name not in evidence_envelope_fields
-        }
+        {name: _observable_field_key(name, value) for name, value in outcome.fields.items()}
     )
 
 

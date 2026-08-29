@@ -1253,6 +1253,72 @@ async def test_repeated_actions_with_a_substituted_effect_are_reported() -> None
     ]
 
 
+async def test_repeated_action_business_identifier_substitution_is_reported() -> None:
+    source_outcomes = (
+        _outcome(
+            "first",
+            0,
+            predicate="send_email",
+            fields={
+                "target": "unread emails",
+                "id": "message-A",
+                "evidence_pointer": "/proof/A",
+            },
+        ),
+        _outcome(
+            "second",
+            1,
+            predicate="send_email",
+            fields={
+                "target": "unread emails",
+                "id": "message-B",
+                "evidence_pointer": "/proof/B",
+            },
+        ),
+    )
+    live_outcomes = (
+        source_outcomes[0],
+        _outcome(
+            "live_second",
+            1,
+            predicate="send_email",
+            fields={
+                "target": "unread emails",
+                "id": "message-C",
+                "evidence_pointer": "/proof/C",
+            },
+        ),
+    )
+    semantic_pipeline = DeterministicSemanticPipeline(
+        live_outcomes,
+        baseline_outcomes=source_outcomes,
+    )
+    semantic_pipeline.source_frame = _frame("source", source_outcomes)
+    target = DeterministicEnvironment(
+        raw_output=_raw_output_for_actions(live_outcomes),
+        baseline_raw_output=_raw_output_for_actions(source_outcomes),
+    )
+    runner = DatasetEvaluationRunner(
+        DatasetAugmentationEngine(semantic_pipeline, semantic_pipeline),
+        semantic_pipeline,
+        target,
+    )
+    source = InteractionRecord(
+        id="source",
+        raw_input="Process unread emails.",
+        raw_observed_output=_raw_output_for_actions(source_outcomes),
+    )
+
+    result = await runner.run(source)
+
+    assert result.baseline.verdict == "no_divergence"
+    assert result.cases[0].verdict == "divergence_needs_review"
+    assert [finding.category for finding in result.cases[0].findings] == [
+        "missing_effect",
+        "unexpected_effect",
+    ]
+
+
 async def test_repeated_actions_use_exact_fields_omitted_by_the_deconstructor() -> None:
     source_outcomes = (
         _outcome(
@@ -1456,6 +1522,44 @@ async def test_ambiguous_repeated_action_grounding_is_inconclusive() -> None:
         "action",
     )
     assert result.cases[0].verdict == "inconclusive"
+
+
+async def test_repeated_actions_cannot_replace_a_shared_grounded_identity() -> None:
+    source_outcomes = (
+        _outcome("first", 0, fields={"account_id": "acct-1", "amount": 100}),
+        _outcome("second", 1, fields={"account_id": "acct-1", "amount": 200}),
+    )
+    live_outcomes = (
+        _outcome("live_first", 0, fields={"account_id": "attacker", "amount": 100}),
+        _outcome("live_second", 1, fields={"account_id": "attacker", "amount": 200}),
+    )
+    semantic_pipeline = DeterministicSemanticPipeline(
+        live_outcomes,
+        baseline_outcomes=live_outcomes,
+    )
+    semantic_pipeline.source_frame = _frame("source", source_outcomes)
+    target = DeterministicEnvironment(
+        raw_output=_raw_output_for_actions(live_outcomes),
+        baseline_raw_output=_raw_output_for_actions(live_outcomes),
+    )
+    runner = DatasetEvaluationRunner(
+        DatasetAugmentationEngine(semantic_pipeline, semantic_pipeline),
+        semantic_pipeline,
+        target,
+    )
+    source = InteractionRecord(
+        id="source",
+        raw_input="Process account acct-1.",
+        raw_observed_output=_raw_output_for_actions(source_outcomes),
+    )
+
+    result = await runner.run(source)
+
+    assert result.baseline.verdict == "inconclusive"
+    assert result.cases[0].verdict == "inconclusive"
+    assert any(
+        "cannot be safely associated" in reason for reason in result.baseline.inconclusive_reasons
+    )
     assert target.raw_inputs == [source.raw_input]
 
 
@@ -2006,44 +2110,6 @@ async def test_repetitions_are_interleaved_and_group_equivalent_observations() -
     assert result.cases[0].trial_set.stability == "stable"
     assert result.cases[0].trial_set.outcome_groups[0].repetitions == (1, 2, 3)
     assert result.cases[0].verdict == "no_divergence"
-
-
-async def test_repeated_action_groups_ignore_execution_evidence_envelope_ids() -> None:
-    def repeated_actions(sequence: int) -> JsonValue:
-        return _raw_output_for_actions(
-            (
-                _outcome(
-                    f"first-{sequence}",
-                    0,
-                    fields={
-                        "amount": 100,
-                        "recipient": "Alice",
-                        "id": f"state-change-{sequence}",
-                        "evidence_pointer": f"/changes/{sequence}",
-                    },
-                ),
-                _outcome(
-                    f"second-{sequence}",
-                    1,
-                    fields={
-                        "amount": 100,
-                        "recipient": "Alice",
-                        "id": f"state-change-{sequence + 1}",
-                        "evidence_pointer": f"/changes/{sequence + 1}",
-                    },
-                ),
-            )
-        )
-
-    runner, _, _ = _sequence_runner([repeated_actions(sequence) for sequence in range(1, 7)])
-
-    result = await runner.run(_source(), repetitions=3)
-
-    assert result.baseline.trial_set.stability == "stable"
-    case = result.cases[0]
-    assert case.trial_set is not None
-    assert case.trial_set.stability == "stable"
-    assert case.verdict == "no_divergence"
 
 
 async def test_stable_repeated_difference_keeps_findings() -> None:
