@@ -42,10 +42,15 @@ from examples.accounts_payable.dataset_target import (
     SeededIntentFanOutDefectAccountsPayableDatasetTarget,
 )
 
-try:
-    _LIVE_SETTINGS = OpenRouterDatasetSettings()
-except ValidationError:
-    _LIVE_SETTINGS = None
+
+def _load_live_settings() -> OpenRouterDatasetSettings | None:
+    try:
+        return OpenRouterDatasetSettings()
+    except ValidationError:
+        return None
+
+
+_LIVE_SETTINGS = _load_live_settings()
 _LIVE_TRANSFER_INPUT = "transfer 120$ to alice"
 
 
