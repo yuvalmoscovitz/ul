@@ -5,8 +5,8 @@ import json
 import math
 import re
 import secrets
-from collections import Counter, defaultdict
-from collections.abc import Callable, Iterable
+from collections import defaultdict
+from collections.abc import Callable, Iterable, Mapping, Set
 from decimal import Decimal, InvalidOperation
 from itertools import islice
 from typing import Literal, Protocol, Self
@@ -1103,13 +1103,23 @@ def _group_evaluation_trials(
         if association_issues:
             raise AssertionError("reliable trials require unambiguous action grounding")
         action_keys: list[str] = []
-        for effect in action_effects:
-            grounded_fields: dict[str, JsonValue] = {
-                name: _observable_field_key(name, value)
-                for name, value in effect.fields.items()
-                if name in grounded_names_by_outcome.get(effect.id, set())
-            }
-            action_keys.append(_json_key([effect.predicate, grounded_fields]))
+        for effects in _action_outcomes_by_key(observed_frame).values():
+            shared_identity = _shared_grounded_action_identity(
+                effects,
+                grounded_names_by_outcome,
+            )
+            for effect in effects:
+                if len(effects) > 1 and shared_identity is not None:
+                    action_keys.append(
+                        _json_key([effect.predicate, "complete", _action_record_key(effect)])
+                    )
+                    continue
+                grounded_fields: dict[str, JsonValue] = {
+                    name: _observable_field_key(name, value)
+                    for name, value in effect.fields.items()
+                    if name in grounded_names_by_outcome.get(effect.id, set())
+                }
+                action_keys.append(_json_key([effect.predicate, grounded_fields]))
         answer_effects = _answer_outcomes(observed_frame)
         answer_keys = tuple(
             _json_key(["answer", *_response_outcome_semantics(outcome)])
@@ -1357,28 +1367,18 @@ def _input_grounded_action_field_names_by_outcome(
                 == first_grounded_key
                 for reference in reference_outcomes[1:]
             )
-            reference_action_keys = Counter(
-                _json_key(
+            outcomes_share_grounding = all(
+                shared_grounded_names <= set(outcome.fields)
+                and _json_key(
                     {
-                        name: _observable_field_key(name, value)
-                        for name, value in reference.fields.items()
+                        name: _observable_field_key(name, outcome.fields[name])
+                        for name in shared_grounded_names
                     }
                 )
-                for reference in reference_outcomes
-            )
-            outcome_action_keys = Counter(
-                _json_key(
-                    {
-                        name: _observable_field_key(name, value)
-                        for name, value in outcome.fields.items()
-                    }
-                )
+                == first_grounded_key
                 for outcome in outcomes
             )
-            if references_share_grounding and (
-                outcome_action_keys <= reference_action_keys
-                or reference_action_keys <= outcome_action_keys
-            ):
+            if references_share_grounding and outcomes_share_grounding:
                 grounded_names_by_outcome.update(
                     (outcome.id, shared_grounded_names) for outcome in outcomes
                 )
@@ -1525,6 +1525,78 @@ def _compare_action_outcomes(
                     observed_effects=observed,
                 )
             )
+            continue
+
+        expected_shared_identity = _shared_grounded_action_identity(
+            expected,
+            input_grounded_field_names_by_outcome,
+        )
+        expected_shared_names = (
+            expected_shared_identity[0]
+            if expected_shared_identity is not None
+            else frozenset[str]()
+        )
+        observed_shared_identity = _shared_grounded_action_identity(
+            observed,
+            {outcome.id: expected_shared_names for outcome in observed},
+        )
+        compare_complete_records = (
+            len(expected) > 1
+            and expected_shared_identity is not None
+            and (not observed or observed_shared_identity == expected_shared_identity)
+        )
+        if compare_complete_records:
+            unmatched_expected, unmatched_observed = _remove_action_record_matches(
+                expected,
+                observed,
+            )
+            if unmatched_expected:
+                findings.append(
+                    DatasetEvaluationFinding(
+                        category="missing_effect",
+                        message=(
+                            f"Needs review: the {subject} omitted {len(unmatched_expected)} "
+                            f"complete {key[1]} action effect records."
+                        ),
+                        expected_effects=unmatched_expected,
+                        observed_effects=observed,
+                    )
+                )
+            expected_action_keys = {_action_record_key(effect) for effect in expected}
+            duplicate = tuple(
+                effect
+                for effect in unmatched_observed
+                if _action_record_key(effect) in expected_action_keys
+            )
+            if duplicate:
+                findings.append(
+                    DatasetEvaluationFinding(
+                        category="duplicate_effect",
+                        message=(
+                            f"Needs review: the {subject} repeated a complete {key[1]} "
+                            "action effect record."
+                        ),
+                        expected_effects=expected,
+                        observed_effects=duplicate,
+                    )
+                )
+            unexpected = tuple(
+                effect
+                for effect in unmatched_observed
+                if _action_record_key(effect) not in expected_action_keys
+            )
+            if unexpected:
+                findings.append(
+                    DatasetEvaluationFinding(
+                        category="unexpected_effect",
+                        message=(
+                            f"Needs review: the {subject} produced an unexpected complete "
+                            f"{key[1]} action effect record."
+                        ),
+                        expected_effects=expected,
+                        observed_effects=unexpected,
+                    )
+                )
             continue
 
         unmatched_expected, unmatched_observed = _remove_grounded_matches(
@@ -1834,6 +1906,61 @@ def _action_outcomes_by_key(
         if outcome.kind == "action":
             grouped[(outcome.kind, outcome.predicate)].append(outcome)
     return {key: tuple(outcomes) for key, outcomes in grouped.items()}
+
+
+def _action_record_key(outcome: ObservedOutcome) -> str:
+    return _json_key(
+        {name: _observable_field_key(name, value) for name, value in outcome.fields.items()}
+    )
+
+
+def _shared_grounded_action_identity(
+    outcomes: tuple[ObservedOutcome, ...],
+    grounded_names_by_outcome: Mapping[str, Set[str]],
+) -> tuple[frozenset[str], str] | None:
+    if not outcomes:
+        return None
+    first_outcome = outcomes[0]
+    shared_names = frozenset(grounded_names_by_outcome.get(first_outcome.id, set()))
+    if not shared_names or not shared_names <= set(first_outcome.fields):
+        return None
+    first_key = _json_key(
+        {name: _observable_field_key(name, first_outcome.fields[name]) for name in shared_names}
+    )
+    if any(
+        frozenset(grounded_names_by_outcome.get(outcome.id, set())) != shared_names
+        or not shared_names <= set(outcome.fields)
+        or _json_key(
+            {name: _observable_field_key(name, outcome.fields[name]) for name in shared_names}
+        )
+        != first_key
+        for outcome in outcomes[1:]
+    ):
+        return None
+    return shared_names, first_key
+
+
+def _remove_action_record_matches(
+    expected: tuple[ObservedOutcome, ...],
+    observed: tuple[ObservedOutcome, ...],
+) -> tuple[tuple[ObservedOutcome, ...], tuple[ObservedOutcome, ...]]:
+    remaining_observed = list(observed)
+    unmatched_expected: list[ObservedOutcome] = []
+    for expected_effect in expected:
+        expected_key = _action_record_key(expected_effect)
+        matching_index = next(
+            (
+                index
+                for index, observed_effect in enumerate(remaining_observed)
+                if _action_record_key(observed_effect) == expected_key
+            ),
+            None,
+        )
+        if matching_index is None:
+            unmatched_expected.append(expected_effect)
+            continue
+        remaining_observed.pop(matching_index)
+    return tuple(unmatched_expected), tuple(remaining_observed)
 
 
 def _remove_grounded_matches(

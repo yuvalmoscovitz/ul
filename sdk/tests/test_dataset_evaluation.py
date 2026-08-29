@@ -1199,7 +1199,7 @@ async def test_repeated_actions_with_the_same_grounded_identity_are_compared() -
     assert result.cases[0].verdict == "no_divergence"
 
 
-async def test_repeated_actions_with_a_substituted_effect_are_inconclusive() -> None:
+async def test_repeated_actions_with_a_substituted_effect_are_reported() -> None:
     source_outcomes = (
         _outcome(
             "first",
@@ -1225,12 +1225,12 @@ async def test_repeated_actions_with_a_substituted_effect_are_inconclusive() -> 
     )
     semantic_pipeline = DeterministicSemanticPipeline(
         live_outcomes,
-        baseline_outcomes=live_outcomes,
+        baseline_outcomes=source_outcomes,
     )
     semantic_pipeline.source_frame = _frame("source", source_outcomes)
     target = DeterministicEnvironment(
         raw_output=_raw_output_for_actions(live_outcomes),
-        baseline_raw_output=_raw_output_for_actions(live_outcomes),
+        baseline_raw_output=_raw_output_for_actions(source_outcomes),
     )
     runner = DatasetEvaluationRunner(
         DatasetAugmentationEngine(semantic_pipeline, semantic_pipeline),
@@ -1245,11 +1245,81 @@ async def test_repeated_actions_with_a_substituted_effect_are_inconclusive() -> 
 
     result = await runner.run(source)
 
-    assert result.baseline.verdict == "inconclusive"
-    assert result.cases[0].verdict == "inconclusive"
+    assert result.baseline.verdict == "no_divergence"
+    assert result.cases[0].verdict == "divergence_needs_review"
+    assert [finding.category for finding in result.cases[0].findings] == [
+        "missing_effect",
+        "unexpected_effect",
+    ]
 
 
-async def test_repeated_actions_include_fields_omitted_by_the_deconstructor() -> None:
+async def test_repeated_action_business_identifier_substitution_is_reported() -> None:
+    source_outcomes = (
+        _outcome(
+            "first",
+            0,
+            predicate="send_email",
+            fields={
+                "target": "unread emails",
+                "id": "message-A",
+                "evidence_pointer": "/proof/A",
+            },
+        ),
+        _outcome(
+            "second",
+            1,
+            predicate="send_email",
+            fields={
+                "target": "unread emails",
+                "id": "message-B",
+                "evidence_pointer": "/proof/B",
+            },
+        ),
+    )
+    live_outcomes = (
+        source_outcomes[0],
+        _outcome(
+            "live_second",
+            1,
+            predicate="send_email",
+            fields={
+                "target": "unread emails",
+                "id": "message-C",
+                "evidence_pointer": "/proof/B",
+            },
+        ),
+    )
+    semantic_pipeline = DeterministicSemanticPipeline(
+        live_outcomes,
+        baseline_outcomes=source_outcomes,
+    )
+    semantic_pipeline.source_frame = _frame("source", source_outcomes)
+    target = DeterministicEnvironment(
+        raw_output=_raw_output_for_actions(live_outcomes),
+        baseline_raw_output=_raw_output_for_actions(source_outcomes),
+    )
+    runner = DatasetEvaluationRunner(
+        DatasetAugmentationEngine(semantic_pipeline, semantic_pipeline),
+        semantic_pipeline,
+        target,
+    )
+    source = InteractionRecord(
+        id="source",
+        raw_input="Process unread emails.",
+        raw_observed_output=_raw_output_for_actions(source_outcomes),
+    )
+
+    result = await runner.run(source)
+
+    assert result.baseline.verdict == "no_divergence"
+    assert result.cases[0].verdict == "divergence_needs_review"
+    assert [finding.category for finding in result.cases[0].findings] == [
+        "missing_effect",
+        "unexpected_effect",
+    ]
+
+
+async def test_repeated_actions_use_exact_fields_omitted_by_the_deconstructor() -> None:
     source_outcomes = (
         _outcome(
             "first",
@@ -1315,7 +1385,11 @@ async def test_repeated_actions_include_fields_omitted_by_the_deconstructor() ->
     result = await runner.run(source)
 
     assert result.baseline.verdict == "no_divergence"
-    assert result.cases[0].verdict == "inconclusive"
+    assert result.cases[0].verdict == "divergence_needs_review"
+    assert [finding.category for finding in result.cases[0].findings] == [
+        "missing_effect",
+        "unexpected_effect",
+    ]
     for trial in result.baseline.trial_set.trials:
         assert trial.observed_frame is not None
         assert all("recipient" in outcome.fields for outcome in trial.observed_frame.outcomes)
@@ -1448,6 +1522,44 @@ async def test_ambiguous_repeated_action_grounding_is_inconclusive() -> None:
         "action",
     )
     assert result.cases[0].verdict == "inconclusive"
+
+
+async def test_repeated_actions_cannot_replace_a_shared_grounded_identity() -> None:
+    source_outcomes = (
+        _outcome("first", 0, fields={"account_id": "acct-1", "amount": 100}),
+        _outcome("second", 1, fields={"account_id": "acct-1", "amount": 200}),
+    )
+    live_outcomes = (
+        _outcome("live_first", 0, fields={"account_id": "attacker", "amount": 100}),
+        _outcome("live_second", 1, fields={"account_id": "attacker", "amount": 200}),
+    )
+    semantic_pipeline = DeterministicSemanticPipeline(
+        live_outcomes,
+        baseline_outcomes=live_outcomes,
+    )
+    semantic_pipeline.source_frame = _frame("source", source_outcomes)
+    target = DeterministicEnvironment(
+        raw_output=_raw_output_for_actions(live_outcomes),
+        baseline_raw_output=_raw_output_for_actions(live_outcomes),
+    )
+    runner = DatasetEvaluationRunner(
+        DatasetAugmentationEngine(semantic_pipeline, semantic_pipeline),
+        semantic_pipeline,
+        target,
+    )
+    source = InteractionRecord(
+        id="source",
+        raw_input="Process account acct-1.",
+        raw_observed_output=_raw_output_for_actions(source_outcomes),
+    )
+
+    result = await runner.run(source)
+
+    assert result.baseline.verdict == "inconclusive"
+    assert result.cases[0].verdict == "inconclusive"
+    assert any(
+        "cannot be safely associated" in reason for reason in result.baseline.inconclusive_reasons
+    )
     assert target.raw_inputs == [source.raw_input]
 
 
