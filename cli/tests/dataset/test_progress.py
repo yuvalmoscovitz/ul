@@ -17,6 +17,7 @@ from ul import (
     DatasetTargetDeliveryUncertain,
     DatasetTrialUnit,
     InteractionRecord,
+    OpenAICompatibleDatasetSettings,
 )
 from ul_cli import dataset_review
 from ul_cli import progress_action as progress_action_module
@@ -409,7 +410,11 @@ def test_source_preparation_failures_do_not_abort_a_ten_source_campaign(
             return await runner_module.evaluate_interaction_records(
                 records,
                 ("input.surface.rephrase",),
-                cast(Any, SimpleNamespace()),
+                OpenAICompatibleDatasetSettings(
+                    allow_external_data_processing=True,
+                    base_url="https://evaluator.example/v1",
+                    model="test-model",
+                ),
                 cast(Any, AsyncContext()),
                 output_stream,
                 repetitions=1,
@@ -567,7 +572,11 @@ def test_cancellation_after_delivery_before_semantic_completion_is_quarantined(
                         ),
                     ),
                     (),
-                    cast(Any, SimpleNamespace()),
+                    OpenAICompatibleDatasetSettings(
+                        allow_external_data_processing=True,
+                        base_url="https://evaluator.example/v1",
+                        model="test-model",
+                    ),
                     cast(Any, AsyncContext()),
                     output_stream,
                     repetitions=1,

@@ -369,7 +369,7 @@ def _confirmed_evidence() -> dict[str, Any]:
     }
 
 
-def test_runner_uses_safe_argv_minimal_environment_private_artifacts_and_cleans_server(
+def test_runner_uses_configured_models_safe_argv_and_private_artifacts(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(quickstart, "_PROJECT_DIRECTORY", tmp_path)
@@ -401,9 +401,10 @@ def test_runner_uses_safe_argv_minimal_environment_private_artifacts_and_cleans_
             "OPEN_ROUTER_API_KEY": "test-only-secret",
             "UL_DATASET_LIVE_CALLS": "true",
             "UL_DATASET_ALLOW_EXTERNAL_DATA_PROCESSING": "true",
-            "UL_DATASET_MODEL": "google/gemini-3.5-flash",
-            "UL_DATASET_RENDER_MODEL": "google/gemini-2.5-flash",
-            "UL_DATASET_EQUIVALENCE_MODEL": "google/gemini-3.5-flash",
+            "UL_DATASET_MODEL": "untrusted/model-override",
+            "UL_DATASET_RENDER_MODEL": "untrusted/render-override",
+            "UL_DATASET_EQUIVALENCE_MODEL": "untrusted/checker-override",
+            "UL_DATASET_MATERIALITY_MODEL": "untrusted/model-override",
         }
         target_config_path = Path(command[command.index("--environment-config") + 1])
         assert Path(command[command.index("--invariants") + 1]) == (
@@ -448,6 +449,7 @@ def test_live_environment_accepts_ul_live_and_forwards_granular_permissions(
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("OPEN_ROUTER_API_KEY", "test-only-secret")
     monkeypatch.setenv("UL_LIVE", "true")
+    monkeypatch.setenv("UL_DATASET_MODEL", "customer/default-model")
 
     subprocess_environment = cast(
         Callable[..., dict[str, str]], quickstart.__dict__["_subprocess_environment"]
@@ -467,6 +469,7 @@ def test_live_environment_respects_granular_false_override(
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("OPEN_ROUTER_API_KEY", "test-only-secret")
     monkeypatch.setenv("UL_LIVE", "true")
+    monkeypatch.setenv("UL_DATASET_MODEL", "customer/default-model")
     monkeypatch.setenv("UL_DATASET_ALLOW_EXTERNAL_DATA_PROCESSING", "false")
 
     subprocess_environment = cast(
@@ -500,6 +503,7 @@ def test_live_environment_supports_keyless_loopback_openai_provider(
         "UL_DATASET_MODEL": "local-model",
         "UL_DATASET_RENDER_MODEL": "local-model",
         "UL_DATASET_EQUIVALENCE_MODEL": "local-model",
+        "UL_DATASET_MATERIALITY_MODEL": "local-model",
         "UL_DATASET_LIVE_CALLS": "true",
         "UL_DATASET_ALLOW_EXTERNAL_DATA_PROCESSING": "true",
     }
@@ -575,6 +579,7 @@ def test_runner_propagates_nonconfirmation_and_execution_error(
     monkeypatch.setenv("OPEN_ROUTER_API_KEY", "test-only-secret")
     monkeypatch.setenv("UL_DATASET_LIVE_CALLS", "true")
     monkeypatch.setenv("UL_DATASET_ALLOW_EXTERNAL_DATA_PROCESSING", "true")
+    monkeypatch.setenv("UL_DATASET_MODEL", "customer/default-model")
 
     def no_finding(command: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
         evidence_path = Path(command[command.index("--output") + 1])
@@ -599,6 +604,7 @@ def test_dry_run_does_not_construct_the_target_server(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(quickstart, "_PROJECT_DIRECTORY", tmp_path)
+    monkeypatch.setenv("UL_DATASET_MODEL", "customer/default-model")
 
     def unexpected_server() -> object:
         raise AssertionError("dry-run constructed the target server")
@@ -618,6 +624,7 @@ def test_dry_run_is_a_real_subprocess_and_needs_no_api_key(tmp_path: Path) -> No
             ]
         ),
         "HOME": str(tmp_path),
+        "UL_DATASET_MODEL": "customer/default-model",
     }
 
     completed = subprocess.run(
@@ -633,9 +640,9 @@ def test_dry_run_is_a_real_subprocess_and_needs_no_api_key(tmp_path: Path) -> No
 
     assert completed.returncode == 0, completed.stdout + completed.stderr
     assert "No model or target requests sent." in completed.stdout
-    assert "Potential semantic model calls: up to 12" in completed.stdout
-    assert "preflight=3" in completed.stdout
-    assert "Estimated completion tokens: 0..36352" in completed.stdout
+    assert "Potential semantic model calls: up to 14" in completed.stdout
+    assert "preflight=4" in completed.stdout
+    assert "Estimated completion tokens: 0..37376" in completed.stdout
     assert "OPEN_ROUTER_API_KEY" not in environment
 
 

@@ -46,6 +46,7 @@ class CampaignCallCounts(_StrictModel):
     retries: int = Field(ge=0)
     preflight: int = Field(ge=0)
     evaluators: int = Field(ge=0)
+    materiality: int = Field(ge=0)
     variation_generation: int = Field(ge=0)
     total_semantic_model: int = Field(ge=0)
     total_environment_api: int = Field(ge=0)
@@ -75,7 +76,7 @@ class CampaignTimingPlan(_StrictModel):
 
 
 class DatasetCampaignPlan(_StrictModel):
-    schema_version: Literal["1.2.0"] = "1.2.0"
+    schema_version: Literal["1.3.0"] = "1.3.0"
     evaluation_mode: Literal["variance"] = "variance"
     fixture: CampaignFixturePlan | None = None
     examples: tuple[CampaignExamplePlan, ...]
@@ -159,6 +160,7 @@ def create_dataset_campaign_plan(
     candidate_deconstruction_calls = materialization_record_count * operator_count
     equivalence_calls = materialization_record_count * operator_count
     trial_evaluator_calls = execution_calls
+    materiality_calls = variation_candidate_count
     evaluator_calls = (
         source_deconstruction_calls
         + candidate_deconstruction_calls
@@ -167,7 +169,7 @@ def create_dataset_campaign_plan(
     )
     preflight_profiles = plan_evaluator_preflight_profiles(settings) if requires_preflight else ()
     preflight_calls = len(preflight_profiles)
-    total_semantic_calls = evaluator_calls + generation_calls + preflight_calls
+    total_semantic_calls = evaluator_calls + materiality_calls + generation_calls + preflight_calls
     maximum_wall_time_seconds = (
         max(1, execution_calls) * target_timeout_seconds
         + total_semantic_calls * settings.timeout_seconds
@@ -181,6 +183,7 @@ def create_dataset_campaign_plan(
         + deconstruction_calls * settings.max_output_tokens
         + generation_calls * settings.max_render_tokens
         + equivalence_calls * min(settings.max_output_tokens, 1_024)
+        + materiality_calls * 512
     )
     warnings = list(_model_parameter_warnings(settings))
     candidate_inputs_available = any(
@@ -236,6 +239,7 @@ def create_dataset_campaign_plan(
             retries=0,
             preflight=preflight_calls,
             evaluators=evaluator_calls,
+            materiality=materiality_calls,
             variation_generation=generation_calls,
             total_semantic_model=total_semantic_calls,
             total_environment_api=execution_calls * target_calls_per_execution,

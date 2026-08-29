@@ -1406,6 +1406,7 @@ def test_resume_rejects_pre_response_comparison_context() -> None:
         ),
     )
     record["schema_version"] = "1.13.0"
+    record["cases"][0].pop("material_variance")
     legacy_context = cast(dict[str, Any], record["run_context"])
     legacy_context["schema_version"] = "1.3.0"
     legacy_context["pipeline_version"] = "1.4.0"

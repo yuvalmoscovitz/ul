@@ -235,6 +235,10 @@ from ul.dataset_evaluation import (
     DatasetTargetDeliveryUncertain,
     DatasetTargetLifecycleFailure,
     DatasetTrialUnit,
+    MaterialVarianceAssessment,
+    MaterialVarianceDecision,
+    MaterialVarianceEvidence,
+    MaterialVarianceReasonCode,
     ProjectedResponseSemanticDeconstructor,
 )
 from ul.dataset_invariants import (
@@ -359,6 +363,11 @@ from ul.local_target import (
     load_local_target_config,
     local_target_config_sha256,
     validate_local_target_config,
+)
+from ul.material_variance import (
+    DatasetMaterialVarianceJudge,
+    material_variance_evaluator_version,
+    material_variance_evaluator_version_from_config,
 )
 from ul.otlp_ingest import OtlpIngestResult, OtlpInteractionRecord, parse_otlp_traces
 from ul.otlp_observation import (
@@ -498,6 +507,7 @@ __all__ = [
     "DatasetInvariantValueEqualsTrialEvaluation",
     "DatasetInvariantValueInSetRuleEvaluation",
     "DatasetInvariantValueInSetTrialEvaluation",
+    "DatasetMaterialVarianceJudge",
     "DatasetRegressionCase",
     "DatasetRegressionExecution",
     "DatasetRegressionInvariantSuite",
@@ -599,6 +609,10 @@ __all__ = [
     "LocalTargetConnection",
     "LocalTargetDryRunPlan",
     "LocalTargetLimits",
+    "MaterialVarianceAssessment",
+    "MaterialVarianceDecision",
+    "MaterialVarianceEvidence",
+    "MaterialVarianceReasonCode",
     "MaterializedScenario",
     "MultiTurnRegressionCase",
     "NoNewEffectInvariant",
@@ -767,6 +781,8 @@ __all__ = [
     "load_trace_replay_result",
     "load_trace_replay_results",
     "local_target_config_sha256",
+    "material_variance_evaluator_version",
+    "material_variance_evaluator_version_from_config",
     "materialize_trace_replay_bundle",
     "normalize_json_state",
     "parse_finding_annotations_jsonl",

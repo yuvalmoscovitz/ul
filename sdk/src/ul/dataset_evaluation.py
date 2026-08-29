@@ -9,9 +9,9 @@ from collections import defaultdict
 from collections.abc import Callable, Iterable
 from decimal import Decimal, InvalidOperation
 from itertools import islice
-from typing import Literal, Self
+from typing import Literal, Protocol, Self
 
-from pydantic import ConfigDict, Field, JsonValue, model_validator
+from pydantic import ConfigDict, Field, JsonValue, field_validator, model_validator
 from ul_core.contracts import (
     EnvironmentExecutor,
     SemanticDeconstructor,
@@ -62,6 +62,26 @@ TrialSetStability = Literal["stable", "unstable", "inconclusive"]
 DatasetEvaluationMode = Literal["variance", "correctness", "preference"]
 TrialArm = Literal["original", "probe"]
 ComparisonSurface = Literal["action", "response"]
+MaterialVarianceDecision = Literal[
+    "material_variance",
+    "operationally_equivalent",
+    "insufficient_evidence",
+]
+MaterialVarianceReasonCode = Literal[
+    "action_added",
+    "action_removed",
+    "action_count_changed",
+    "action_target_changed",
+    "grounded_argument_changed",
+    "committed_state_changed",
+    "response_meaning_changed",
+    "alias_or_representation",
+    "presentation_only",
+    "lookup_path_only",
+    "same_real_world_effect",
+    "missing_comparison_evidence",
+    "judge_error",
+]
 
 
 class _StrictULModel(ULModel):
@@ -145,6 +165,70 @@ class DatasetEvaluationFinding(_StrictULModel):
     expected_effects: tuple[ObservedOutcome, ...] = ()
     observed_effects: tuple[ObservedOutcome, ...] = ()
     grounded_field_names: tuple[str, ...] = ()
+
+
+class MaterialVarianceEvidence(_StrictULModel):
+    json_pointer: str = Field(min_length=1, max_length=2_000)
+
+    @field_validator("json_pointer")
+    @classmethod
+    def validate_json_pointer(cls, value: str) -> str:
+        if not value.startswith("/payload/answer/findings/") or any(
+            ord(character) < 32 or ord(character) == 127 for character in value
+        ):
+            raise ValueError("material variance evidence requires a safe finding pointer")
+        return value
+
+
+class MaterialVarianceAssessment(_StrictULModel):
+    decision: MaterialVarianceDecision
+    reason_code: MaterialVarianceReasonCode
+    explanation: str = Field(min_length=1, max_length=500)
+    evidence: tuple[MaterialVarianceEvidence, ...] = Field(default=(), max_length=20)
+    evaluator_version_id: str = Field(pattern=r"^ulev_v1_[0-9a-f]{64}$")
+
+    @model_validator(mode="after")
+    def validate_decision(self) -> Self:
+        material_reasons = {
+            "action_added",
+            "action_removed",
+            "action_count_changed",
+            "action_target_changed",
+            "grounded_argument_changed",
+            "committed_state_changed",
+            "response_meaning_changed",
+        }
+        equivalent_reasons = {
+            "alias_or_representation",
+            "presentation_only",
+            "lookup_path_only",
+            "same_real_world_effect",
+        }
+        insufficient_reasons = {"missing_comparison_evidence", "judge_error"}
+        expected_reasons = {
+            "material_variance": material_reasons,
+            "operationally_equivalent": equivalent_reasons,
+            "insufficient_evidence": insufficient_reasons,
+        }[self.decision]
+        if self.reason_code not in expected_reasons:
+            raise ValueError("material variance reason must match its decision")
+        if self.decision != "insufficient_evidence" and len(self.evidence) < 2:
+            raise ValueError("conclusive materiality requires cited comparison evidence")
+        return self
+
+
+class DatasetMaterialVarianceEvaluator(Protocol):
+    @property
+    def evaluator_version_id(self) -> str: ...
+
+    @property
+    def actual_calls(self) -> int: ...
+
+    async def evaluate(
+        self,
+        comparison_surface: ComparisonSurface,
+        findings: tuple[DatasetEvaluationFinding, ...],
+    ) -> MaterialVarianceAssessment: ...
 
 
 class DatasetTargetLifecycleFailure(_StrictULModel):
@@ -272,6 +356,7 @@ class DatasetEvaluationCase(_StrictULModel):
     verdict: CaseVerdict
     trial_set: DatasetEvaluationTrialSet | None = None
     findings: tuple[DatasetEvaluationFinding, ...] = ()
+    material_variance: MaterialVarianceAssessment | None = None
     inconclusive_reasons: tuple[str, ...] = ()
 
     @model_validator(mode="after")
@@ -286,6 +371,8 @@ class DatasetEvaluationCase(_StrictULModel):
             raise ValueError("findings require stable observed trials")
         if self.findings and self.inconclusive_reasons:
             raise ValueError("inconclusive cases cannot have findings")
+        if self.material_variance is not None and not self.findings:
+            raise ValueError("material variance assessment requires findings")
         if (
             self.trial_set is not None
             and self.trial_set.stability == "inconclusive"
@@ -411,6 +498,7 @@ class DatasetEvaluationRunner:
         allow_network_egress: bool = False,
         evaluation_mode: DatasetEvaluationMode = "variance",
         source_outcome_projection: OutcomeProjection | None = None,
+        material_variance_evaluator: DatasetMaterialVarianceEvaluator | None = None,
     ) -> None:
         if evaluation_mode != "variance":
             raise ValueError(
@@ -430,6 +518,7 @@ class DatasetEvaluationRunner:
         self._target_timeout_seconds = target_timeout_seconds
         self._evaluation_mode: Literal["variance"] = evaluation_mode
         self._source_outcome_projection = source_outcome_projection
+        self._material_variance_evaluator = material_variance_evaluator
         self._target_state_uncertain = False
 
     async def run(
@@ -449,6 +538,11 @@ class DatasetEvaluationRunner:
         if type(repetitions) is not int or repetitions < 1:
             raise ValueError("repetitions must be a positive integer")
         starting_actual_calls, starting_cache_hits = self._semantic_call_metrics()
+        starting_material_variance_calls = (
+            self._material_variance_evaluator.actual_calls
+            if self._material_variance_evaluator is not None
+            else 0
+        )
         projected_source = source
         if self._source_outcome_projection is not None:
             try:
@@ -641,15 +735,26 @@ class DatasetEvaluationRunner:
                 if comparison_surface == "action"
                 else _compare_response_outcomes(baseline_frame, observed_frame)
             )
+            material_variance = (
+                await self._material_variance_evaluator.evaluate(comparison_surface, findings)
+                if findings and self._material_variance_evaluator is not None
+                else None
+            )
             cases.append(
                 DatasetEvaluationCase(
                     candidate=candidate,
                     verdict=("divergence_needs_review" if findings else "no_divergence"),
                     trial_set=trial_set,
                     findings=findings,
+                    material_variance=material_variance,
                 )
             )
         ending_actual_calls, ending_cache_hits = self._semantic_call_metrics()
+        material_variance_calls = (
+            self._material_variance_evaluator.actual_calls - starting_material_variance_calls
+            if self._material_variance_evaluator is not None
+            else 0
+        )
         return DatasetEvaluationResult(
             evaluation_mode=self._evaluation_mode,
             comparison_surface=comparison_surface,
@@ -658,7 +763,7 @@ class DatasetEvaluationRunner:
             baseline=baseline,
             cases=tuple(cases),
             semantic_calls=DatasetSemanticCallCounts(
-                actual_calls=ending_actual_calls - starting_actual_calls,
+                actual_calls=ending_actual_calls - starting_actual_calls + material_variance_calls,
                 cache_hits=ending_cache_hits - starting_cache_hits,
             ),
         )

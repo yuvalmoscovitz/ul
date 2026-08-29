@@ -397,31 +397,48 @@ class OpenRouterDatasetSettings(BaseSettings):
     ul_live: bool = Field(default=False, validation_alias="UL_LIVE", exclude=True, repr=False)
 
     @model_validator(mode="after")
-    def apply_ul_live_shorthand(self) -> Self:
+    def validate_and_normalize(self) -> Self:
         if self.ul_live:
             if "live_calls" not in self.model_fields_set:
                 self.live_calls = True
             if "allow_external_data_processing" not in self.model_fields_set:
                 self.allow_external_data_processing = True
+        if not self.model.strip():
+            raise ValueError("UL_DATASET_MODEL must contain non-whitespace text")
+        if not self.render_model:
+            self.render_model = self.model
+        elif not self.render_model.strip():
+            raise ValueError("UL_DATASET_RENDER_MODEL must contain non-whitespace text")
+        if not self.equivalence_model:
+            self.equivalence_model = self.model
+        elif not self.equivalence_model.strip():
+            raise ValueError("UL_DATASET_EQUIVALENCE_MODEL must contain non-whitespace text")
+        if not self.materiality_model:
+            self.materiality_model = self.model
+        elif not self.materiality_model.strip():
+            raise ValueError("UL_DATASET_MATERIALITY_MODEL must contain non-whitespace text")
         return self
 
     model: str = Field(
-        default="google/gemini-3.5-flash",
+        default=...,
         min_length=1,
         max_length=200,
         validation_alias="UL_DATASET_MODEL",
     )
     render_model: str = Field(
-        default="x-ai/grok-4.3",
-        min_length=1,
+        default="",
         max_length=200,
         validation_alias="UL_DATASET_RENDER_MODEL",
     )
     equivalence_model: str = Field(
-        default="google/gemini-3.5-flash",
-        min_length=1,
+        default="",
         max_length=200,
         validation_alias="UL_DATASET_EQUIVALENCE_MODEL",
+    )
+    materiality_model: str = Field(
+        default="",
+        max_length=200,
+        validation_alias="UL_DATASET_MATERIALITY_MODEL",
     )
     deconstruct_reasoning: SemanticReasoningMode = Field(
         default="required",
@@ -539,6 +556,11 @@ class OpenAICompatibleDatasetSettings(BaseSettings):
         max_length=200,
         validation_alias="UL_DATASET_EQUIVALENCE_MODEL",
     )
+    materiality_model: str = Field(
+        default="",
+        max_length=200,
+        validation_alias="UL_DATASET_MATERIALITY_MODEL",
+    )
     deconstruct_reasoning: SemanticReasoningMode = Field(
         default="required",
         validation_alias="UL_DATASET_DECONSTRUCT_REASONING",
@@ -602,6 +624,10 @@ class OpenAICompatibleDatasetSettings(BaseSettings):
             self.equivalence_model = self.model
         elif not self.equivalence_model.strip():
             raise ValueError("UL_DATASET_EQUIVALENCE_MODEL must contain non-whitespace text")
+        if not self.materiality_model:
+            self.materiality_model = self.model
+        elif not self.materiality_model.strip():
+            raise ValueError("UL_DATASET_MATERIALITY_MODEL must contain non-whitespace text")
         return self
 
     @property
@@ -677,6 +703,7 @@ def _semantic_configuration_error(
         "UL_DATASET_MODEL": "model",
         "UL_DATASET_RENDER_MODEL": "render_model",
         "UL_DATASET_EQUIVALENCE_MODEL": "equivalence_model",
+        "UL_DATASET_MATERIALITY_MODEL": "materiality_model",
         "UL_DATASET_DECONSTRUCT_REASONING": "deconstruct_reasoning",
         "UL_DATASET_RENDER_REASONING": "render_reasoning",
         "UL_DATASET_EQUIVALENCE_REASONING": "equivalence_reasoning",
@@ -699,6 +726,7 @@ def _semantic_configuration_error(
                     "UL_DATASET_OPENAI_PROVIDER_ID": "provider_id",
                     "UL_DATASET_RENDER_MODEL": "render_model",
                     "UL_DATASET_EQUIVALENCE_MODEL": "equivalence_model",
+                    "UL_DATASET_MATERIALITY_MODEL": "materiality_model",
                     "UL_DATASET_MODEL": "model",
                     "UL_DATASET_DECONSTRUCT_REASONING": "deconstruct_reasoning",
                     "UL_DATASET_RENDER_REASONING": "render_reasoning",
@@ -724,6 +752,9 @@ def _semantic_configuration_error(
         ),
         "equivalence_model": (
             "UL_DATASET_EQUIVALENCE_MODEL must be 1-200 non-whitespace characters when set"
+        ),
+        "materiality_model": (
+            "UL_DATASET_MATERIALITY_MODEL must be 1-200 non-whitespace characters when set"
         ),
         "deconstruct_reasoning": ("UL_DATASET_DECONSTRUCT_REASONING must be required or omitted"),
         "render_reasoning": "UL_DATASET_RENDER_REASONING must be required or omitted",
@@ -847,7 +878,9 @@ class _EvaluatorPreflightSample(BaseModel):
 class EvaluatorModelProfilePreflight(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
-    roles: tuple[Literal["deconstruct", "render", "equivalence"], ...] = Field(min_length=1)
+    roles: tuple[Literal["deconstruct", "render", "equivalence", "materiality"], ...] = Field(
+        min_length=1
+    )
     requested_model: str = Field(min_length=1, max_length=200)
     routed_model: str = Field(min_length=1, max_length=200)
     upstream_provider: str | None = Field(default=None, max_length=200)
@@ -875,7 +908,9 @@ class EvaluatorModelPreflight(BaseModel):
 class EvaluatorPreflightProfilePlan(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
-    roles: tuple[Literal["deconstruct", "render", "equivalence"], ...] = Field(min_length=1)
+    roles: tuple[Literal["deconstruct", "render", "equivalence", "materiality"], ...] = Field(
+        min_length=1
+    )
     requested_model: str = Field(min_length=1, max_length=200)
     reasoning_mode: SemanticReasoningMode
     max_completion_tokens: int = Field(ge=1)
@@ -897,7 +932,7 @@ class _EvaluatorPreflightHTTPError(ValueError):
 
 @dataclass(frozen=True)
 class _EvaluatorPreflightProfile:
-    roles: tuple[Literal["deconstruct", "render", "equivalence"], ...]
+    roles: tuple[Literal["deconstruct", "render", "equivalence", "materiality"], ...]
     model: str
     reasoning_mode: SemanticReasoningMode
     reasoning: dict[str, JsonValue] | None
@@ -1979,7 +2014,7 @@ def _evaluator_preflight_profiles(
 
     def profile(
         *,
-        role: Literal["deconstruct", "render", "equivalence"],
+        role: Literal["deconstruct", "render", "equivalence", "materiality"],
         model: str,
         reasoning_mode: SemanticReasoningMode,
         reasoning: dict[str, JsonValue] | None,
@@ -2034,6 +2069,16 @@ def _evaluator_preflight_profiles(
             reasoning_mode=settings.equivalence_reasoning,
             reasoning=_reasoning_option(settings.equivalence_reasoning, "low"),
             max_tokens=min(settings.max_output_tokens, _PREFLIGHT_MAX_TOKENS),
+            temperature=0,
+            seed=0,
+            top_p=None,
+        ),
+        profile(
+            role="materiality",
+            model=settings.materiality_model,
+            reasoning_mode="omitted",
+            reasoning=None,
+            max_tokens=min(512, _PREFLIGHT_MAX_TOKENS),
             temperature=0,
             seed=0,
             top_p=None,

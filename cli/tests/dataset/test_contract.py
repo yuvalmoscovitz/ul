@@ -106,7 +106,7 @@ def test_legacy_operator_list_delegates_to_catalog_and_keeps_existing_call_accou
 
     assert dry_run.exit_code == 0, dry_run.output
     assert "Operators: input.intent.self_correction@1.0.0" in dry_run.output
-    assert "Potential semantic model calls: up to 13" in dry_run.output
+    assert "Potential semantic model calls: up to 15" in dry_run.output
     assert "Potential environment API calls: up to 6" in dry_run.output
 
     wrong_version = runner.invoke(

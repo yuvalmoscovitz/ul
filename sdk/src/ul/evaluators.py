@@ -94,6 +94,7 @@ class OpenAICompatibleJudgeConfig(ULModel):
     data_policy: Literal["provider_default", "openrouter_zdr"] = "provider_default"
     timeout_seconds: float = Field(default=60, gt=0, le=300)
     max_output_tokens: int = Field(default=1_024, ge=64, le=8_192)
+    token_parameter: Literal["max_tokens", "max_completion_tokens"] = "max_completion_tokens"
     max_response_bytes: int = Field(default=1_000_000, ge=1_024, le=5_000_000)
 
     @model_validator(mode="after")
@@ -227,7 +228,7 @@ class OpenAICompatibleEvaluatorJudge:
                     "schema": _JudgeOutput.model_json_schema(mode="validation"),
                 },
             },
-            "max_completion_tokens": self.config.max_output_tokens,
+            self.config.token_parameter: self.config.max_output_tokens,
             "temperature": 0,
         }
         if self.config.data_policy == "openrouter_zdr":

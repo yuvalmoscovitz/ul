@@ -23,10 +23,14 @@ from ul import (
     InteractionRecord,
     JsonHttpEnvironmentConfig,
     JsonHttpIsolatedResponseConfig,
+    MaterialVarianceAssessment,
+    MaterialVarianceEvidence,
     ObservedAgentOutput,
+    OpenAICompatibleJudgeConfig,
     RichInteractionCase,
     SemanticFrame,
     create_dataset_augmentation_projection,
+    material_variance_evaluator_version_from_config,
     project_rich_interaction_case,
 )
 from ul.augmentations.dataset import DatasetAugmentationCandidate
@@ -39,6 +43,19 @@ from ul_cli.dataset.evidence import context as context_module
 
 runner = CliRunner()
 _ANSI_ESCAPE_PATTERN = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+_TEST_MATERIALITY_EVALUATOR_VERSION_ID = material_variance_evaluator_version_from_config(
+    OpenAICompatibleJudgeConfig(
+        base_url="https://openrouter.ai/api/v1",
+        model="test/materiality",
+        api_key=SecretStr("test-key"),
+        allow_external_data_processing=True,
+        data_policy="openrouter_zdr",
+        timeout_seconds=60.0,
+        max_output_tokens=512,
+        token_parameter="max_tokens",
+        max_response_bytes=1_000_000,
+    )
+).id
 
 
 def _trial_set(
@@ -84,6 +101,7 @@ def _evaluation_result(
     identifier: str,
     *,
     has_review_finding: bool = False,
+    material_variance_decision: str = "material_variance",
 ) -> DatasetEvaluationResult:
     source = InteractionRecord(
         id=identifier,
@@ -150,6 +168,28 @@ def _evaluation_result(
                     message="The variation changed observable behavior.",
                 ),
             ),
+            material_variance=MaterialVarianceAssessment(
+                decision=cast(Any, material_variance_decision),
+                reason_code=(
+                    "action_added"
+                    if material_variance_decision == "material_variance"
+                    else (
+                        "same_real_world_effect"
+                        if material_variance_decision == "operationally_equivalent"
+                        else "missing_comparison_evidence"
+                    )
+                ),
+                explanation="Automatic materiality test decision.",
+                evidence=(
+                    MaterialVarianceEvidence(
+                        json_pointer="/payload/answer/findings/0/baseline_effects/0"
+                    ),
+                    MaterialVarianceEvidence(
+                        json_pointer="/payload/answer/findings/0/variation_effects/0"
+                    ),
+                ),
+                evaluator_version_id=_TEST_MATERIALITY_EVALUATOR_VERSION_ID,
+            ),
         )
     else:
         evaluation_case = DatasetEvaluationCase(
@@ -211,6 +251,7 @@ def _settings(**overrides: object) -> SimpleNamespace:
         "model": "test/deconstructor",
         "render_model": "test/renderer",
         "equivalence_model": "test/equivalence",
+        "materiality_model": "test/materiality",
         "deconstruct_reasoning": "required",
         "render_reasoning": "required",
         "equivalence_reasoning": "required",
@@ -406,6 +447,17 @@ def _evaluator_preflight() -> EvaluatorModelPreflight:
         )
         & 0x7FFF_FFFF
     )
+    materiality_options = {
+        "model": "test/materiality",
+        "reasoning_mode": "omitted",
+        "max_tokens": 512,
+        "temperature": 0,
+        "seed": 0,
+        "provider": provider_options,
+    }
+    materiality_options_sha256 = hashlib.sha256(
+        json.dumps(materiality_options, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
     return EvaluatorModelPreflight.model_validate(
         {
             "provider": "openrouter",
@@ -471,6 +523,22 @@ def _evaluator_preflight() -> EvaluatorModelPreflight:
                     "request_options_sha256": request_options_sha256(
                         "test/equivalence", "low", 0, 0
                     ),
+                    "parameter_support": "routing_enforced",
+                    "unverified_options": (),
+                },
+                {
+                    "roles": ("materiality",),
+                    "requested_model": "test/materiality",
+                    "routed_model": "test/materiality",
+                    "upstream_provider": "test-provider",
+                    "reasoning_mode": "omitted",
+                    "required_parameters": (
+                        "response_format",
+                        "seed",
+                        "temperature",
+                        "max_tokens",
+                    ),
+                    "request_options_sha256": materiality_options_sha256,
                     "parameter_support": "routing_enforced",
                     "unverified_options": (),
                 },

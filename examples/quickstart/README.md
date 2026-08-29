@@ -19,8 +19,13 @@ Run from the repository root after installing dependencies and configuring eithe
 an OpenAI-compatible provider as shown in the [main README](../../README.md):
 
 ```bash
+export UL_DATASET_MODEL=your-provider/model
 uv run python -m examples.quickstart.run
 ```
+
+That one model is used for every semantic task by default. Set `UL_DATASET_RENDER_MODEL`,
+`UL_DATASET_EQUIVALENCE_MODEL`, or `UL_DATASET_MATERIALITY_MODEL` only when you want a task-specific
+override.
 
 Validate the complete local environment lifecycle first, without an API key or UL semantic-model calls:
 
@@ -151,11 +156,9 @@ case; it is not proof that the implementation is correct or that every related f
 
 ## Limitations
 
-The example is intentionally small and deterministic on the target side. With OpenRouter,
-semantic analysis and behavioral comparison explicitly request `google/gemini-3.5-flash`, while
-seeded variation rendering requests `google/gemini-2.5-flash`;
-an OpenAI-compatible provider uses its configured models. Model behavior may still vary, so the
-finding is not guaranteed. The invariant result applies only to configured fields returned by the
+The example is intentionally small and deterministic on the target side. It uses the customer-
+configured default model and any task-specific model overrides. Model behavior may still vary, so
+the finding is not guaranteed. The invariant result applies only to configured fields returned by the
 environment's separate committed-state snapshot endpoint. UL validates the reset acknowledgement
 contract but cannot independently prove that the environment erased every state store. Satisfying the
 rule does not establish overall correctness or safety.

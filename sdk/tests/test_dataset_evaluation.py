@@ -19,10 +19,13 @@ from ul.dataset_evaluation import (
     DatasetEvaluationResult,
     DatasetEvaluationTrial,
     DatasetEvaluationTrialSet,
+    DatasetMaterialVarianceEvaluator,
     DatasetSemanticPreparationError,
     DatasetSourceOutcomeProjectionError,
     DatasetTargetDeliveryUncertain,
     DatasetTrialUnit,
+    MaterialVarianceAssessment,
+    MaterialVarianceEvidence,
     ProjectedResponseSemanticDeconstructor,
 )
 from ul.dataset_evaluation import DatasetEvaluationRunner as _DatasetEvaluationRunner
@@ -63,6 +66,37 @@ from ul_core.evaluation import (
 pytestmark = pytest.mark.asyncio
 
 
+class RecordingMaterialVarianceEvaluator:
+    evaluator_version_id = f"ulev_v1_{'a' * 64}"
+
+    def __init__(self) -> None:
+        self.actual_calls = 0
+        self.findings: tuple[DatasetEvaluationFinding, ...] = ()
+
+    async def evaluate(
+        self,
+        comparison_surface: Literal["action", "response"],
+        findings: tuple[DatasetEvaluationFinding, ...],
+    ) -> MaterialVarianceAssessment:
+        assert comparison_surface == "action"
+        self.actual_calls += 1
+        self.findings = findings
+        return MaterialVarianceAssessment(
+            decision="material_variance",
+            reason_code="grounded_argument_changed",
+            explanation="The variation changed the observed real-world action or outcome.",
+            evidence=(
+                MaterialVarianceEvidence(
+                    json_pointer="/payload/answer/findings/0/baseline_effects/0"
+                ),
+                MaterialVarianceEvidence(
+                    json_pointer="/payload/answer/findings/0/variation_effects/0"
+                ),
+            ),
+            evaluator_version_id=self.evaluator_version_id,
+        )
+
+
 class DatasetEvaluationRunner(_DatasetEvaluationRunner):
     def __init__(
         self,
@@ -73,6 +107,7 @@ class DatasetEvaluationRunner(_DatasetEvaluationRunner):
         target_timeout_seconds: float = 30,
         allow_network_egress: bool = True,
         source_outcome_projection: OutcomeProjection | None = None,
+        material_variance_evaluator: DatasetMaterialVarianceEvaluator | None = None,
     ) -> None:
         super().__init__(
             augmentation_engine,
@@ -81,6 +116,7 @@ class DatasetEvaluationRunner(_DatasetEvaluationRunner):
             target_timeout_seconds=target_timeout_seconds,
             allow_network_egress=allow_network_egress,
             source_outcome_projection=source_outcome_projection,
+            material_variance_evaluator=material_variance_evaluator,
         )
 
     async def run(
@@ -759,6 +795,7 @@ async def test_repetition_benchmark_reduces_semantic_calls_without_changing_find
 
     client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
     semantic_settings = OpenRouterDatasetSettings(
+        model="test/default-model",
         live_calls=True,
         allow_external_data_processing=True,
         api_key=SecretStr("test-openrouter-key"),
@@ -974,6 +1011,41 @@ async def test_candidate_is_compared_with_changed_current_baseline() -> None:
     assert result.baseline.verdict == "no_divergence"
     assert result.cases[0].verdict == "divergence_needs_review"
     assert result.cases[0].findings[0].grounded_field_names == ("amount",)
+
+
+async def test_flagged_candidate_receives_one_persisted_materiality_assessment() -> None:
+    baseline_outcome = _outcome(
+        "baseline_transfer",
+        0,
+        fields={"amount": 120, "recipient": "Alice"},
+    )
+    candidate_outcome = _outcome(
+        "candidate_transfer",
+        0,
+        fields={"amount": 130, "recipient": "Alice"},
+    )
+    semantic_pipeline = DeterministicSemanticPipeline(
+        (candidate_outcome,),
+        baseline_outcomes=(baseline_outcome,),
+    )
+    materiality = RecordingMaterialVarianceEvaluator()
+    runner = DatasetEvaluationRunner(
+        DatasetAugmentationEngine(semantic_pipeline, semantic_pipeline),
+        semantic_pipeline,
+        DeterministicEnvironment(
+            raw_output=_raw_output_for_actions((candidate_outcome,)),
+            baseline_raw_output=_raw_output_for_actions((baseline_outcome,)),
+        ),
+        material_variance_evaluator=materiality,
+    )
+
+    result = await runner.run(_source())
+
+    assert materiality.actual_calls == 1
+    assert materiality.findings == result.cases[0].findings
+    assert result.cases[0].material_variance is not None
+    assert result.cases[0].material_variance.decision == "material_variance"
+    assert result.semantic_calls.actual_calls == 1
 
 
 async def test_candidate_change_to_new_baseline_action_is_detected() -> None:
