@@ -5,7 +5,7 @@ import json
 import math
 import re
 import secrets
-from collections import defaultdict
+from collections import Counter, defaultdict
 from collections.abc import Callable, Iterable
 from decimal import Decimal, InvalidOperation
 from itertools import islice
@@ -1161,6 +1161,17 @@ def _action_outcome_reliability_issues(
     require_input_grounded_fields: bool = False,
 ) -> tuple[str, ...]:
     issues: list[str] = []
+    repeated_predicates = {
+        predicate
+        for (_, predicate), outcomes in _action_outcomes_by_key(frame).items()
+        if len(outcomes) > 1
+    }
+    if reference_frame is not None:
+        repeated_predicates.update(
+            predicate
+            for (_, predicate), outcomes in _action_outcomes_by_key(reference_frame).items()
+            if len(outcomes) > 1
+        )
     input_grounded_field_names_by_outcome, association_issues = (
         _input_grounded_action_field_names_by_outcome(
             frame,
@@ -1216,6 +1227,29 @@ def _action_outcome_reliability_issues(
         }
         if not evidenced_action_objects:
             issues.append(f"action outcome {outcome.id} predicate lacks coherent action evidence")
+        elif outcome.predicate in repeated_predicates and not any(
+            not any(
+                isinstance(value, (dict, list))
+                for name, value in action_object.items()
+                if name != "action"
+            )
+            and set(outcome.fields)
+            == {
+                name
+                for name, value in action_object.items()
+                if name != "action" and not isinstance(value, (dict, list))
+            }
+            and all(
+                _observable_field_key(name, outcome.fields[name])
+                == _observable_field_key(name, value)
+                for name, value in action_object.items()
+                if name != "action" and not isinstance(value, (dict, list))
+            )
+            for action_object in evidenced_action_objects
+        ):
+            issues.append(
+                f"action outcome {outcome.id} does not fully represent its evidenced action"
+            )
         elif grounded_fields and not any(
             all(
                 name in action_object and _observable_values_equal(action_object[name], value)
@@ -1303,6 +1337,52 @@ def _input_grounded_action_field_names_by_outcome(
                 for outcome in outcomes
             )
             continue
+        first_reference = reference_outcomes[0]
+        shared_grounded_names = grounded_names_by_reference_id[first_reference.id]
+        if shared_grounded_names:
+            first_grounded_key = _json_key(
+                {
+                    name: _observable_field_key(name, first_reference.fields[name])
+                    for name in shared_grounded_names
+                }
+            )
+            references_share_grounding = all(
+                grounded_names_by_reference_id[reference.id] == shared_grounded_names
+                and _json_key(
+                    {
+                        name: _observable_field_key(name, reference.fields[name])
+                        for name in shared_grounded_names
+                    }
+                )
+                == first_grounded_key
+                for reference in reference_outcomes[1:]
+            )
+            reference_action_keys = Counter(
+                _json_key(
+                    {
+                        name: _observable_field_key(name, value)
+                        for name, value in reference.fields.items()
+                    }
+                )
+                for reference in reference_outcomes
+            )
+            outcome_action_keys = Counter(
+                _json_key(
+                    {
+                        name: _observable_field_key(name, value)
+                        for name, value in outcome.fields.items()
+                    }
+                )
+                for outcome in outcomes
+            )
+            if references_share_grounding and (
+                outcome_action_keys <= reference_action_keys
+                or reference_action_keys <= outcome_action_keys
+            ):
+                grounded_names_by_outcome.update(
+                    (outcome.id, shared_grounded_names) for outcome in outcomes
+                )
+                continue
         remaining_outcomes = list(outcomes)
         remaining_references = list(reference_outcomes)
         while remaining_outcomes and remaining_references:
