@@ -1157,7 +1157,7 @@ async def test_repeated_actions_with_the_same_grounded_identity_are_compared() -
             fields={
                 "target": "unread emails",
                 "procedure": "SOP-FIN-AP-004",
-                "message_id": "live-1",
+                "message_id": "source-1",
             },
         ),
         _outcome(
@@ -1167,7 +1167,7 @@ async def test_repeated_actions_with_the_same_grounded_identity_are_compared() -
             fields={
                 "target": "unread emails",
                 "procedure": "SOP-FIN-AP-004",
-                "message_id": "live-2",
+                "message_id": "source-2",
             },
         ),
     )
@@ -1197,6 +1197,144 @@ async def test_repeated_actions_with_the_same_grounded_identity_are_compared() -
     assert result.baseline.trial_set.stability == "stable"
     assert len(result.baseline.trial_set.outcome_groups[0].representative_effects) == 2
     assert result.cases[0].verdict == "no_divergence"
+
+
+async def test_repeated_actions_with_a_substituted_effect_are_inconclusive() -> None:
+    source_outcomes = (
+        _outcome(
+            "first",
+            0,
+            predicate="send_email",
+            fields={"target": "unread emails", "recipient": "Alice"},
+        ),
+        _outcome(
+            "second",
+            1,
+            predicate="send_email",
+            fields={"target": "unread emails", "recipient": "Bob"},
+        ),
+    )
+    live_outcomes = (
+        source_outcomes[0],
+        _outcome(
+            "live_second",
+            1,
+            predicate="send_email",
+            fields={"target": "unread emails", "recipient": "Mallory"},
+        ),
+    )
+    semantic_pipeline = DeterministicSemanticPipeline(
+        live_outcomes,
+        baseline_outcomes=live_outcomes,
+    )
+    semantic_pipeline.source_frame = _frame("source", source_outcomes)
+    target = DeterministicEnvironment(
+        raw_output=_raw_output_for_actions(live_outcomes),
+        baseline_raw_output=_raw_output_for_actions(live_outcomes),
+    )
+    runner = DatasetEvaluationRunner(
+        DatasetAugmentationEngine(semantic_pipeline, semantic_pipeline),
+        semantic_pipeline,
+        target,
+    )
+    source = InteractionRecord(
+        id="source",
+        raw_input="Process unread emails.",
+        raw_observed_output=_raw_output_for_actions(source_outcomes),
+    )
+
+    result = await runner.run(source)
+
+    assert result.baseline.verdict == "inconclusive"
+    assert result.cases[0].verdict == "inconclusive"
+
+
+async def test_repeated_actions_require_all_evidenced_fields() -> None:
+    source_outcomes = (
+        _outcome(
+            "first",
+            0,
+            predicate="send_email",
+            fields={"target": "unread emails", "recipient": "Alice"},
+        ),
+        _outcome(
+            "second",
+            1,
+            predicate="send_email",
+            fields={"target": "unread emails", "recipient": "Bob"},
+        ),
+    )
+    incomplete_live_outcomes = (
+        _outcome(
+            "live_first",
+            0,
+            predicate="send_email",
+            fields={"target": "unread emails"},
+        ),
+        _outcome(
+            "live_second",
+            1,
+            predicate="send_email",
+            fields={"target": "unread emails"},
+        ),
+    )
+    semantic_pipeline = DeterministicSemanticPipeline(
+        incomplete_live_outcomes,
+        baseline_outcomes=incomplete_live_outcomes,
+    )
+    semantic_pipeline.source_frame = _frame("source", incomplete_live_outcomes)
+    target = DeterministicEnvironment(
+        raw_output=_raw_output_for_actions(source_outcomes),
+        baseline_raw_output=_raw_output_for_actions(source_outcomes),
+    )
+    runner = DatasetEvaluationRunner(
+        DatasetAugmentationEngine(semantic_pipeline, semantic_pipeline),
+        semantic_pipeline,
+        target,
+    )
+    source = InteractionRecord(
+        id="source",
+        raw_input="Process unread emails.",
+        raw_observed_output=_raw_output_for_actions(source_outcomes),
+    )
+
+    with pytest.raises(DatasetComparisonCompatibilityError):
+        await runner.run(source)
+
+
+async def test_numeric_identifier_representations_are_distinct_grounded_identities() -> None:
+    source_outcomes = (
+        _outcome("first", 0, fields={"message_id": 1}),
+        _outcome("second", 1, fields={"message_id": "1.0"}),
+    )
+    live_outcomes = (
+        _outcome("live_first", 0, fields={"message_id": 1}),
+        _outcome("live_second", 1, fields={"message_id": "1.0"}),
+    )
+    semantic_pipeline = DeterministicSemanticPipeline(
+        live_outcomes,
+        baseline_outcomes=live_outcomes,
+    )
+    semantic_pipeline.source_frame = _frame("source", source_outcomes)
+    target = DeterministicEnvironment(
+        raw_output=_raw_output_for_actions(live_outcomes),
+        baseline_raw_output=_raw_output_for_actions(live_outcomes),
+    )
+    runner = DatasetEvaluationRunner(
+        DatasetAugmentationEngine(semantic_pipeline, semantic_pipeline),
+        semantic_pipeline,
+        target,
+    )
+    source = InteractionRecord(
+        id="source",
+        raw_input="Process messages 1 and 1.0.",
+        raw_observed_output=_raw_output_for_actions(source_outcomes),
+    )
+
+    result = await runner.run(source)
+
+    assert result.baseline.verdict == "inconclusive"
+    assert result.cases[0].verdict == "inconclusive"
 
 
 async def test_ambiguous_repeated_action_grounding_is_inconclusive() -> None:
