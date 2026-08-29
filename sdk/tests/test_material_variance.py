@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import pytest
-from pydantic import ValidationError
+from pydantic import JsonValue, ValidationError
 from ul.dataset_evaluation import (
     DatasetEvaluationFinding,
     MaterialVarianceAssessment,
@@ -83,6 +83,32 @@ def _finding(*, expected_amount: int = 100, observed_amount: int = 200) -> Datas
     )
 
 
+def _response_finding(
+    *,
+    baseline_answer: JsonValue,
+    baseline_actions: list[JsonValue],
+    variation_answer: JsonValue,
+    variation_actions: list[JsonValue],
+) -> DatasetEvaluationFinding:
+    def outcome(identifier: str, answer: JsonValue, actions: list[JsonValue]) -> ObservedOutcome:
+        return ObservedOutcome(
+            id=identifier,
+            kind="answer",
+            predicate="returned_response",
+            status="observed",
+            confidence=1,
+            position=0,
+            fields={"value": {"answer": answer, "actions": actions}},
+        )
+
+    return DatasetEvaluationFinding(
+        category="changed_response",
+        message="changed",
+        expected_effects=(outcome("baseline-response", baseline_answer, baseline_actions),),
+        observed_effects=(outcome("variation-response", variation_answer, variation_actions),),
+    )
+
+
 async def test_material_variance_judge_persists_closed_local_decision() -> None:
     judge = RecordingJudge(_decision("material_variance:grounded_argument_changed", 1))
     evaluator = DatasetMaterialVarianceJudge(judge, max_input_chars=50_000)
@@ -127,54 +153,14 @@ async def test_material_variance_judge_accepts_operational_equivalence() -> None
 
 async def test_material_variance_judge_normalizes_response_envelopes() -> None:
     judge = RecordingJudge(_decision("material_variance:action_added", 1))
-    finding = DatasetEvaluationFinding(
-        category="changed_response",
-        message="changed",
-        expected_effects=(
-            ObservedOutcome(
-                id="baseline-response",
-                kind="answer",
-                predicate="returned_response",
-                status="observed",
-                confidence=1,
-                position=0,
-                fields={
-                    "value": {
-                        "task_id": "private-task",
-                        "status": "completed",
-                        "answer": [],
-                        "actions": [
-                            {"action": "FHIR_GET", "url": "private-read-target"},
-                        ],
-                        "reward": 0,
-                        "steps": 1,
-                    }
-                },
-            ),
-        ),
-        observed_effects=(
-            ObservedOutcome(
-                id="variation-response",
-                kind="answer",
-                predicate="returned_response",
-                status="observed",
-                confidence=1,
-                position=0,
-                fields={
-                    "value": {
-                        "task_id": "other-private-task",
-                        "status": "completed",
-                        "answer": None,
-                        "actions": [
-                            {"action": "findPatient", "url": "private-read-target"},
-                            {"action": "FHIR_POST", "body": {"value": 118}},
-                        ],
-                        "reward": 1,
-                        "steps": 3,
-                    }
-                },
-            ),
-        ),
+    finding = _response_finding(
+        baseline_answer=[],
+        baseline_actions=[{"action": "FHIR_GET", "url": "private-read-target"}],
+        variation_answer=None,
+        variation_actions=[
+            {"action": "findPatient", "url": "private-read-target"},
+            {"action": "FHIR_POST", "body": {"value": 118}},
+        ],
     )
 
     assessment = await DatasetMaterialVarianceJudge(judge, max_input_chars=50_000).evaluate(
@@ -182,20 +168,65 @@ async def test_material_variance_judge_normalizes_response_envelopes() -> None:
     )
 
     assert assessment.decision == "material_variance"
-    answer = judge.requests[0].payload["answer"]
-    assert answer["findings"][0]["baseline_effects"][0]["fields"] == {
-        "substantive_answer_state": "empty",
-        "substantive_answer": None,
-        "committed_action_count": 0,
-        "committed_actions": [],
-    }
-    assert answer["findings"][0]["variation_effects"][0]["fields"] == {
-        "substantive_answer_state": "empty",
-        "substantive_answer": None,
-        "committed_action_count": 1,
-        "committed_actions": [{"action": "FHIR_POST", "body": {"value": 118}}],
-    }
-    assert "private" not in repr(answer)
+    assert assessment.reason_code == "action_added"
+    assert tuple(evidence.json_pointer for evidence in assessment.evidence) == (
+        "/payload/answer/findings/0/baseline_effects/0",
+        "/payload/answer/findings/0/variation_effects/0",
+    )
+    assert not judge.requests
+
+
+async def test_material_variance_safety_floor_catches_removed_substantive_response() -> None:
+    judge = RecordingJudge(_decision("operationally_equivalent:same_real_world_effect", 0))
+    finding = _response_finding(
+        baseline_answer=[42],
+        baseline_actions=[],
+        variation_answer=[],
+        variation_actions=[],
+    )
+
+    assessment = await DatasetMaterialVarianceJudge(judge, max_input_chars=50_000).evaluate(
+        "response", (finding,)
+    )
+
+    assert assessment.decision == "material_variance"
+    assert assessment.reason_code == "response_meaning_changed"
+    assert not judge.requests
+
+
+async def test_material_variance_safety_floor_catches_removed_committed_action() -> None:
+    judge = RecordingJudge(_decision("operationally_equivalent:same_real_world_effect", 0))
+    finding = _response_finding(
+        baseline_answer=[],
+        baseline_actions=[{"action": "CREATE_RECORD", "value": 42}],
+        variation_answer=[],
+        variation_actions=[{"action": "FHIR_GET", "value": 42}],
+    )
+
+    assessment = await DatasetMaterialVarianceJudge(judge, max_input_chars=50_000).evaluate(
+        "response", (finding,)
+    )
+
+    assert assessment.decision == "material_variance"
+    assert assessment.reason_code == "action_removed"
+    assert not judge.requests
+
+
+async def test_material_variance_safety_floor_leaves_response_meaning_to_judge() -> None:
+    judge = RecordingJudge(_decision("material_variance:response_meaning_changed", 1))
+    finding = _response_finding(
+        baseline_answer=["Monday"],
+        baseline_actions=[],
+        variation_answer=["Tuesday"],
+        variation_actions=[],
+    )
+
+    assessment = await DatasetMaterialVarianceJudge(judge, max_input_chars=50_000).evaluate(
+        "response", (finding,)
+    )
+
+    assert assessment.reason_code == "response_meaning_changed"
+    assert len(judge.requests) == 1
 
 
 async def test_material_variance_judge_keeps_unknown_actions_and_business_fields() -> None:
@@ -217,6 +248,7 @@ async def test_material_variance_judge_keeps_unknown_actions_and_business_fields
                 ],
                 "business_result": {"approved": True},
                 "status": "completed",
+                "task_id": "private-task",
             }
         },
     )
@@ -243,6 +275,7 @@ async def test_material_variance_judge_keeps_unknown_actions_and_business_fields
         ],
         "other_fields": {"business_result": {"approved": True}},
     }
+    assert "private-task" not in repr(fields)
 
 
 async def test_material_variance_judge_fails_closed_on_invalid_or_failed_judgment() -> None:

@@ -31,7 +31,7 @@ _READ_ONLY_ACTION_TOKENS = frozenset(
 )
 _RESPONSE_ENVELOPE_FIELDS = frozenset({"answer", "actions", "reward", "status", "steps", "task_id"})
 _EVALUATOR = RubricEvaluator(
-    id="dataset.material_variance",
+    id="dataset.material_variance.v2",
     rubric=_PROMPTS.get_prompt("evaluation.material_variance"),
     minimum_score=0,
     include_sources=("answer",),
@@ -135,6 +135,12 @@ class DatasetMaterialVarianceJudge:
             or len(encoded_answer.encode("utf-8")) > _MAXIMUM_PAYLOAD_BYTES
         ):
             return self._insufficient("missing_comparison_evidence")
+        deterministic_assessment = _deterministic_response_material_variance(
+            answer,
+            evaluator_version_id=self.evaluator_version_id,
+        )
+        if deterministic_assessment is not None:
+            return deterministic_assessment
         self._actual_calls += 1
         results = await evaluate(
             EvaluationSubject(agent_status="succeeded", answer=answer),
@@ -271,6 +277,86 @@ def _is_read_only_action(action: JsonValue) -> bool:
     separated_name = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", action_name)
     tokens = set(re.findall(r"[A-Za-z]+", separated_name.upper()))
     return bool(tokens & _READ_ONLY_ACTION_TOKENS)
+
+
+def _deterministic_response_material_variance(
+    answer: dict[str, JsonValue],
+    *,
+    evaluator_version_id: str,
+) -> MaterialVarianceAssessment | None:
+    findings = answer.get("findings")
+    if not isinstance(findings, list):
+        return None
+    for finding_index, finding in enumerate(findings):
+        if not isinstance(finding, dict):
+            continue
+        baseline_effects = finding.get("baseline_effects")
+        variation_effects = finding.get("variation_effects")
+        baseline_facts = _response_safety_facts(baseline_effects)
+        variation_facts = _response_safety_facts(variation_effects)
+        if baseline_facts is None or variation_facts is None:
+            continue
+        baseline_action_count, baseline_has_answer = baseline_facts
+        variation_action_count, variation_has_answer = variation_facts
+        if baseline_action_count != variation_action_count:
+            reason_code: MaterialVarianceReasonCode
+            if baseline_action_count == 0:
+                reason_code = "action_added"
+            elif variation_action_count == 0:
+                reason_code = "action_removed"
+            else:
+                reason_code = "action_count_changed"
+            return _deterministic_material_assessment(
+                finding_index,
+                reason_code,
+                evaluator_version_id=evaluator_version_id,
+            )
+        if baseline_has_answer != variation_has_answer:
+            return _deterministic_material_assessment(
+                finding_index,
+                "response_meaning_changed",
+                evaluator_version_id=evaluator_version_id,
+            )
+    return None
+
+
+def _response_safety_facts(effects: JsonValue) -> tuple[int, bool] | None:
+    if not isinstance(effects, list) or len(effects) != 1:
+        return None
+    effect = effects[0]
+    if not isinstance(effect, dict) or effect.get("kind") != "answer":
+        return None
+    fields = effect.get("fields")
+    if not isinstance(fields, dict):
+        return None
+    committed_action_count = fields.get("committed_action_count")
+    answer_state = fields.get("substantive_answer_state")
+    if (
+        type(committed_action_count) is not int
+        or committed_action_count < 0
+        or answer_state not in {"empty", "present"}
+    ):
+        return None
+    return committed_action_count, answer_state == "present"
+
+
+def _deterministic_material_assessment(
+    finding_index: int,
+    reason_code: MaterialVarianceReasonCode,
+    *,
+    evaluator_version_id: str,
+) -> MaterialVarianceAssessment:
+    finding_pointer = f"/payload/answer/findings/{finding_index}"
+    return MaterialVarianceAssessment(
+        decision="material_variance",
+        reason_code=reason_code,
+        explanation=_EXPLANATIONS["material_variance"],
+        evidence=(
+            MaterialVarianceEvidence(json_pointer=f"{finding_pointer}/baseline_effects/0"),
+            MaterialVarianceEvidence(json_pointer=f"{finding_pointer}/variation_effects/0"),
+        ),
+        evaluator_version_id=evaluator_version_id,
+    )
 
 
 def _has_required_citations(decision: str, pointers: tuple[str, ...]) -> bool:

@@ -246,6 +246,39 @@ class _MaterialVarianceSemanticModel(_LocalEvaluationSemanticModel):
         )
 
 
+class _ResponseMaterialVarianceSemanticModel(_MaterialVarianceSemanticModel):
+    async def deconstruct(
+        self,
+        record: InteractionRecord | UserInputRecord,
+        reference_frame: SemanticFrame | None = None,
+    ) -> SemanticFrame:
+        frame = await _LocalEvaluationSemanticModel.deconstruct(self, record, reference_frame)
+        if not isinstance(record, InteractionRecord):
+            return frame
+        return frame.model_copy(
+            update={
+                "outcomes": (
+                    ObservedOutcome(
+                        id="returned-response",
+                        evidence=(
+                            EvidenceReference(
+                                source="output",
+                                json_pointer="/raw_observed_output",
+                                text_quote=None,
+                            ),
+                        ),
+                        confidence=1,
+                        status="observed",
+                        position=0,
+                        kind="answer",
+                        predicate="returned_response",
+                        fields={"value": record.raw_observed_output},
+                    ),
+                )
+            }
+        )
+
+
 class _MaterialVarianceJudge:
     label = "material_variance:grounded_argument_changed"
     score = 1
@@ -720,6 +753,81 @@ def test_public_cli_persists_and_applies_automatic_materiality(
     else:
         assert finding_output.stat().st_size == 0
         assert "Actionable finding export: ul report" not in normalized_output
+
+
+def test_public_cli_does_not_let_judge_suppress_removed_committed_action(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    dataset = tmp_path / "interactions.jsonl"
+    output = tmp_path / "results.jsonl"
+    dataset.write_text(
+        '{"id":"case-1","input":"Create record 42.",'
+        '"output":{"answer":[],"actions":[{"action":"CREATE_RECORD","id":42}]}}\n',
+        encoding="utf-8",
+    )
+    (tmp_path / "customer_agent.py").write_text(
+        "def run(value):\n"
+        "    actions = [] if value.startswith('Please') else "
+        "[{'action': 'CREATE_RECORD', 'id': 42}]\n"
+        "    return {'answer': [], 'actions': actions}\n",
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("UL_LIVE", "true")
+    monkeypatch.setenv("OPEN_ROUTER_API_KEY", "test-key")
+
+    async def successful_preflight(_settings: object) -> object:
+        return _evaluator_preflight()
+
+    monkeypatch.setattr(command_module, "load_dataset_semantic_settings", _settings)
+    monkeypatch.setattr(command_module, "preflight_evaluator", successful_preflight)
+    monkeypatch.setattr(
+        runner_module,
+        "create_semantic_model_deconstructor",
+        lambda _settings: _ResponseMaterialVarianceSemanticModel(),
+    )
+    monkeypatch.setattr(runner_module, "OpenAICompatibleEvaluatorJudge", _MaterialVarianceJudge)
+    monkeypatch.setattr(
+        _MaterialVarianceJudge,
+        "label",
+        "operationally_equivalent:same_real_world_effect",
+    )
+    monkeypatch.setattr(_MaterialVarianceJudge, "score", 0)
+    target = resolve_local_target("customer_agent:run")
+
+    evaluated = runner.invoke(
+        root_app,
+        [
+            "dataset",
+            "evaluate",
+            str(dataset),
+            "--operator",
+            "input.surface.rephrase",
+            "--target",
+            "customer_agent:run",
+            "--confirm-target",
+            target.confirmation_sha256,
+            "--confirm-test-environment",
+            "--repetitions",
+            "1",
+            "--output",
+            str(output),
+        ],
+    )
+
+    assert evaluated.exit_code == 1, evaluated.output
+    saved = json.loads(output.read_text(encoding="utf-8").splitlines()[1])
+    comparison = saved["cases"][0]
+    assert comparison["material_variance"]["decision"] == "material_variance"
+    assert comparison["material_variance"]["reason_code"] == "action_removed"
+    assert saved["technical_details"]["semantic_calls"]["actual_calls"] == 0
+
+    report = runner.invoke(root_app, ["dataset", "report", str(output)])
+
+    assert report.exit_code == 0, report.output
+    assert "ACTION REQUIRED" in report.output
+    assert "consequential=1" in report.output
 
 
 def test_dataset_evaluation_allows_http_target_response_after_thirty_seconds(
