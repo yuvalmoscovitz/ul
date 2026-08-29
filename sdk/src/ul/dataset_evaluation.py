@@ -1303,6 +1303,23 @@ def _input_grounded_action_field_names_by_outcome(
                 for outcome in outcomes
             )
             continue
+        first_reference = reference_outcomes[0]
+        shared_grounded_names = grounded_names_by_reference_id[first_reference.id]
+        if shared_grounded_names and all(
+            grounded_names_by_reference_id[reference.id] == shared_grounded_names
+            and all(
+                _observable_values_equal(
+                    reference.fields[name],
+                    first_reference.fields[name],
+                )
+                for name in shared_grounded_names
+            )
+            for reference in reference_outcomes[1:]
+        ):
+            grounded_names_by_outcome.update(
+                (outcome.id, shared_grounded_names) for outcome in outcomes
+            )
+            continue
         remaining_outcomes = list(outcomes)
         remaining_references = list(reference_outcomes)
         while remaining_outcomes and remaining_references:
