@@ -1199,7 +1199,7 @@ async def test_repeated_actions_with_the_same_grounded_identity_are_compared() -
     assert result.cases[0].verdict == "no_divergence"
 
 
-async def test_repeated_actions_with_a_substituted_effect_are_inconclusive() -> None:
+async def test_repeated_actions_with_a_substituted_effect_are_reported() -> None:
     source_outcomes = (
         _outcome(
             "first",
@@ -1225,12 +1225,12 @@ async def test_repeated_actions_with_a_substituted_effect_are_inconclusive() -> 
     )
     semantic_pipeline = DeterministicSemanticPipeline(
         live_outcomes,
-        baseline_outcomes=live_outcomes,
+        baseline_outcomes=source_outcomes,
     )
     semantic_pipeline.source_frame = _frame("source", source_outcomes)
     target = DeterministicEnvironment(
         raw_output=_raw_output_for_actions(live_outcomes),
-        baseline_raw_output=_raw_output_for_actions(live_outcomes),
+        baseline_raw_output=_raw_output_for_actions(source_outcomes),
     )
     runner = DatasetEvaluationRunner(
         DatasetAugmentationEngine(semantic_pipeline, semantic_pipeline),
@@ -1245,11 +1245,15 @@ async def test_repeated_actions_with_a_substituted_effect_are_inconclusive() -> 
 
     result = await runner.run(source)
 
-    assert result.baseline.verdict == "inconclusive"
-    assert result.cases[0].verdict == "inconclusive"
+    assert result.baseline.verdict == "no_divergence"
+    assert result.cases[0].verdict == "divergence_needs_review"
+    assert [finding.category for finding in result.cases[0].findings] == [
+        "missing_effect",
+        "unexpected_effect",
+    ]
 
 
-async def test_repeated_actions_include_fields_omitted_by_the_deconstructor() -> None:
+async def test_repeated_actions_use_exact_fields_omitted_by_the_deconstructor() -> None:
     source_outcomes = (
         _outcome(
             "first",
@@ -1315,7 +1319,11 @@ async def test_repeated_actions_include_fields_omitted_by_the_deconstructor() ->
     result = await runner.run(source)
 
     assert result.baseline.verdict == "no_divergence"
-    assert result.cases[0].verdict == "inconclusive"
+    assert result.cases[0].verdict == "divergence_needs_review"
+    assert [finding.category for finding in result.cases[0].findings] == [
+        "missing_effect",
+        "unexpected_effect",
+    ]
     for trial in result.baseline.trial_set.trials:
         assert trial.observed_frame is not None
         assert all("recipient" in outcome.fields for outcome in trial.observed_frame.outcomes)
@@ -1998,6 +2006,44 @@ async def test_repetitions_are_interleaved_and_group_equivalent_observations() -
     assert result.cases[0].trial_set.stability == "stable"
     assert result.cases[0].trial_set.outcome_groups[0].repetitions == (1, 2, 3)
     assert result.cases[0].verdict == "no_divergence"
+
+
+async def test_repeated_action_groups_ignore_execution_evidence_envelope_ids() -> None:
+    def repeated_actions(sequence: int) -> JsonValue:
+        return _raw_output_for_actions(
+            (
+                _outcome(
+                    f"first-{sequence}",
+                    0,
+                    fields={
+                        "amount": 100,
+                        "recipient": "Alice",
+                        "id": f"state-change-{sequence}",
+                        "evidence_pointer": f"/changes/{sequence}",
+                    },
+                ),
+                _outcome(
+                    f"second-{sequence}",
+                    1,
+                    fields={
+                        "amount": 100,
+                        "recipient": "Alice",
+                        "id": f"state-change-{sequence + 1}",
+                        "evidence_pointer": f"/changes/{sequence + 1}",
+                    },
+                ),
+            )
+        )
+
+    runner, _, _ = _sequence_runner([repeated_actions(sequence) for sequence in range(1, 7)])
+
+    result = await runner.run(_source(), repetitions=3)
+
+    assert result.baseline.trial_set.stability == "stable"
+    case = result.cases[0]
+    assert case.trial_set is not None
+    assert case.trial_set.stability == "stable"
+    assert case.verdict == "no_divergence"
 
 
 async def test_stable_repeated_difference_keeps_findings() -> None:
