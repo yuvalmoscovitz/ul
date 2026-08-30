@@ -400,10 +400,16 @@ def _flatten_fields(arguments: dict[str, JsonValue]) -> dict[str, JsonValue]:
 
 
 def _validate_json_structure(value: JsonValue) -> None:
-    pending: list[tuple[JsonValue, int]] = [(value, 0)]
+    pending: list[tuple[Iterator[tuple[JsonValue, int]], int]] = [(iter(((value, 0),)), 0)]
     node_count = 0
+    character_count = 0
     while pending:
-        current, depth = pending.pop()
+        children, depth = pending[-1]
+        try:
+            current, key_characters = next(children)
+        except StopIteration:
+            pending.pop()
+            continue
         node_count += 1
         if depth > _MAXIMUM_COMPOSE_DEPTH:
             raise _JsonStructureLimitError(
@@ -415,10 +421,22 @@ def _validate_json_structure(value: JsonValue) -> None:
                 f"has {node_count} nodes, exceeding the "
                 f"{_MAXIMUM_COMPOSE_NODES}-node normalized-result limit"
             )
+        character_count += key_characters
+        if isinstance(current, str):
+            character_count += len(current)
+        if character_count > _MAXIMUM_NORMALIZED_BYTES:
+            raise _JsonStructureLimitError(
+                f"exceeds the {_MAXIMUM_NORMALIZED_BYTES}-byte normalized-result limit"
+            )
         if isinstance(current, dict):
-            pending.extend((nested, depth + 1) for nested in reversed(current.values()))
+            pending.append(
+                (
+                    ((nested, len(key)) for key, nested in current.items()),
+                    depth + 1,
+                )
+            )
         elif isinstance(current, list):
-            pending.extend((nested, depth + 1) for nested in reversed(current))
+            pending.append((((nested, 0) for nested in current), depth + 1))
 
 
 def _encoded_json_size(value: JsonValue) -> int:

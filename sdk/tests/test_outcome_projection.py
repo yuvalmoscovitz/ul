@@ -4,6 +4,7 @@ import json
 from typing import cast
 
 import pytest
+import ul.outcome_projection as outcome_projection
 from pydantic import ValidationError
 from ul.outcome_projection import OutcomeProjection, OutcomeProjectionError
 
@@ -349,6 +350,38 @@ def test_projection_reports_exact_node_limit() -> None:
         match="has 10001 nodes, exceeding the 10000-node normalized-result limit",
     ):
         projection.project({"result": {str(index): index for index in range(10_000)}})
+
+
+def test_projection_checks_wide_arrays_incrementally() -> None:
+    class CountingList(list[object]):
+        yielded = 0
+
+        def __iter__(self):  # type: ignore[no-untyped-def]
+            for value in super().__iter__():
+                self.yielded += 1
+                yield value
+
+    projection = OutcomeProjection.model_validate({"compose": {"fields": {"actions": "/actions"}}})
+    actions = CountingList(range(20_000))
+
+    with pytest.raises(OutcomeProjectionError, match="10000-node normalized-result limit"):
+        projection.project({"actions": actions})  # type: ignore[arg-type]
+
+    assert actions.yielded < len(actions)
+
+
+def test_projection_rejects_character_lower_bound_before_json_encoding(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    projection = OutcomeProjection.model_validate({"compose": {"fields": {"value": "/value"}}})
+
+    def unexpected_encoding(_: object) -> int:
+        raise AssertionError("oversized strings must fail before JSON encoding")
+
+    monkeypatch.setattr(outcome_projection, "_encoded_json_size", unexpected_encoding)
+
+    with pytest.raises(OutcomeProjectionError, match="64000-byte normalized-result limit"):
+        projection.project({"value": "\u0000" * 64_001})
 
 
 def test_projection_rejects_overlapping_private_pointers() -> None:
