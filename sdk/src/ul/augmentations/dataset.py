@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from decimal import Decimal
 from itertools import islice, pairwise
 from typing import Any, Literal, Self, cast
@@ -30,6 +30,7 @@ from ul_core.models import ULModel
 from ul_core.prompts import PromptManager, prompt_provenance
 
 _PROMPTS = PromptManager.instance()
+_MAX_DECOMPOSED_RELATION_PARTS = 10_000
 
 
 def _is_none(value: object) -> bool:
@@ -1410,48 +1411,162 @@ def _unresolved_node_reason(frame: SemanticFrame) -> str | None:
 
 
 def _canonical_semantics(frame: SemanticFrame) -> tuple[object, ...]:
-    factor_semantics = {
-        factor.id: (factor.kind, factor.role, _json_key(factor.value)) for factor in frame.factors
-    }
+    factor_semantics: dict[str, tuple[tuple[str, ...], ...]] = {}
+    list_offsets: dict[tuple[str, str], int] = {}
+    for factor in frame.factors:
+        list_key = (factor.kind, factor.role)
+        list_offset = list_offsets.get(list_key, 0)
+        parts = _factor_semantic_parts(factor, list_offset=list_offset)
+        factor_semantics[factor.id] = parts
+        if isinstance(factor.value, list):
+            list_offsets[list_key] = list_offset + len(parts)
     request_semantics = {
         request.id: (
             request.mode,
             request.predicate,
-            tuple(sorted(factor_semantics[factor_id] for factor_id in request.factor_ids)),
+            tuple(
+                sorted(
+                    part for factor_id in request.factor_ids for part in factor_semantics[factor_id]
+                )
+            ),
         )
         for request in frame.request_units
     }
     communication_semantics = {
         act.id: (
             act.kind,
-            tuple(sorted(factor_semantics[factor_id] for factor_id in act.factor_ids)),
+            tuple(
+                sorted(part for factor_id in act.factor_ids for part in factor_semantics[factor_id])
+            ),
             _json_key(act.attributes),
         )
         for act in frame.communication_acts
     }
     endpoint_semantics = {
-        **{identifier: ("factor", value) for identifier, value in factor_semantics.items()},
-        **{identifier: ("request", value) for identifier, value in request_semantics.items()},
         **{
-            identifier: ("communication", value)
+            identifier: tuple(("factor", part) for part in parts)
+            for identifier, parts in factor_semantics.items()
+        },
+        **{identifier: (("request", value),) for identifier, value in request_semantics.items()},
+        **{
+            identifier: (("communication", value),)
             for identifier, value in communication_semantics.items()
         },
     }
-    relation_semantics = tuple(
-        sorted(
-            (
-                relation.kind,
-                tuple(sorted(endpoint_semantics[item] for item in relation.source_ids)),
-                tuple(sorted(endpoint_semantics[item] for item in relation.target_ids)),
-            )
-            for relation in frame.relations
+    list_factor_ids = {factor.id for factor in frame.factors if isinstance(factor.value, list)}
+    canonical_relations: list[tuple[object, ...]] = []
+    decomposed_relation_parts = 0
+    for relation in frame.relations:
+        expanded_relations = _expanded_relation_semantics(
+            relation.kind,
+            relation.source_ids,
+            relation.target_ids,
+            endpoint_semantics,
+            list_factor_ids,
         )
-    )
+        if decomposed_relation_parts + len(expanded_relations) > _MAX_DECOMPOSED_RELATION_PARTS:
+            canonical_relations.append(
+                _unexpanded_relation_semantics(
+                    relation.kind,
+                    relation.source_ids,
+                    relation.target_ids,
+                    endpoint_semantics,
+                )
+            )
+        else:
+            canonical_relations.extend(expanded_relations)
+            decomposed_relation_parts += len(expanded_relations)
+    relation_semantics = tuple(sorted(canonical_relations))
     return (
-        tuple(sorted(factor_semantics.values())),
+        tuple(sorted(part for parts in factor_semantics.values() for part in parts)),
         tuple(request_semantics[request.id] for request in frame.request_units),
         relation_semantics,
         tuple(communication_semantics[act.id] for act in frame.communication_acts),
+    )
+
+
+def _factor_semantic_parts(
+    factor: SemanticFactor, *, list_offset: int
+) -> tuple[tuple[str, ...], ...]:
+    if isinstance(factor.value, list):
+        if not factor.value:
+            return ((factor.kind, factor.role, "list", "[]"),)
+        return tuple(
+            (
+                factor.kind,
+                factor.role,
+                "list_item",
+                str(list_offset + index),
+                _json_key(item),
+            )
+            for index, item in enumerate(factor.value)
+        )
+    return ((factor.kind, factor.role, "value", _json_key(factor.value)),)
+
+
+def _expanded_relation_semantics(
+    kind: str,
+    source_ids: tuple[str, ...],
+    target_ids: tuple[str, ...],
+    endpoint_semantics: Mapping[str, tuple[tuple[object, ...], ...]],
+    list_factor_ids: set[str],
+) -> tuple[tuple[object, ...], ...]:
+    decomposed_endpoint_ids = tuple(
+        item for item in (*source_ids, *target_ids) if item in list_factor_ids
+    )
+    if len(decomposed_endpoint_ids) != 1:
+        return (_unexpanded_relation_semantics(kind, source_ids, target_ids, endpoint_semantics),)
+    decomposed_endpoint_id = decomposed_endpoint_ids[0]
+    return tuple(
+        (
+            kind,
+            _relation_endpoint_group(
+                source_ids,
+                endpoint_semantics,
+                decomposed_endpoint_id=decomposed_endpoint_id,
+                decomposed_part=part,
+            ),
+            _relation_endpoint_group(
+                target_ids,
+                endpoint_semantics,
+                decomposed_endpoint_id=decomposed_endpoint_id,
+                decomposed_part=part,
+            ),
+        )
+        for part in endpoint_semantics[decomposed_endpoint_id]
+    )
+
+
+def _unexpanded_relation_semantics(
+    kind: str,
+    source_ids: tuple[str, ...],
+    target_ids: tuple[str, ...],
+    endpoint_semantics: Mapping[str, tuple[tuple[object, ...], ...]],
+) -> tuple[object, ...]:
+    return (
+        kind,
+        _relation_endpoint_group(source_ids, endpoint_semantics),
+        _relation_endpoint_group(target_ids, endpoint_semantics),
+    )
+
+
+def _relation_endpoint_group(
+    endpoint_ids: tuple[str, ...],
+    endpoint_semantics: Mapping[str, tuple[tuple[object, ...], ...]],
+    *,
+    decomposed_endpoint_id: str | None = None,
+    decomposed_part: tuple[object, ...] | None = None,
+) -> tuple[tuple[object, ...], ...]:
+    return tuple(
+        sorted(
+            part
+            for endpoint_id in endpoint_ids
+            for part in (
+                (decomposed_part,)
+                if endpoint_id == decomposed_endpoint_id and decomposed_part is not None
+                else endpoint_semantics[endpoint_id]
+            )
+        )
     )
 
 

@@ -252,6 +252,80 @@ def _frame(
     )
 
 
+def _list_decomposition_frames() -> tuple[SemanticFrame, SemanticFrame]:
+    operations: tuple[dict[str, JsonValue], ...] = (
+        {"project": "API Gateway Upgrade", "status": "Completed"},
+        {"project": "Mobile App Redesign", "status": "In Progress"},
+    )
+    source_factor = SemanticFactor(
+        id="source_operations",
+        evidence=_evidence("input"),
+        confidence=1,
+        status="explicit",
+        kind="list",
+        role="update_operations",
+        value=list(operations),
+    )
+    source_count = SemanticFactor(
+        id="source_operation_count",
+        evidence=(EvidenceReference(source="input", json_pointer="/raw_input", text_quote="2"),),
+        confidence=1,
+        status="explicit",
+        kind="number",
+        role="operation_count",
+        value=2,
+    )
+    source_request = RequestUnit(
+        id="request",
+        evidence=_evidence("input"),
+        confidence=1,
+        status="explicit",
+        mode="act",
+        predicate="update_spreadsheet",
+        factor_ids=(source_factor.id, source_count.id),
+    )
+    source_outcome = _outcome(
+        "source_update",
+        0,
+        predicate="update_spreadsheet",
+        fields={"operation_count": 2},
+    )
+    source = _frame("source", (source_outcome,)).model_copy(
+        update={
+            "request_units": (source_request,),
+            "factors": (source_factor, source_count),
+            "communication_acts": (),
+        }
+    )
+    candidate_factors = tuple(
+        source_factor.model_copy(
+            update={"id": f"candidate_operation_{index}", "value": [operation]}
+        )
+        for index, operation in enumerate(operations)
+    )
+    candidate = source.model_copy(
+        update={
+            "interaction_id": "source:input.surface.punctuation_noise",
+            "request_units": (
+                source_request.model_copy(
+                    update={
+                        "factor_ids": (
+                            *(factor.id for factor in candidate_factors),
+                            "candidate_operation_count",
+                        )
+                    }
+                ),
+            ),
+            "factors": (
+                *candidate_factors,
+                source_count.model_copy(update={"id": "candidate_operation_count"}),
+            ),
+            "outcomes": (),
+        }
+    )
+    return source, candidate
+
+
 def _source() -> InteractionRecord:
     return InteractionRecord(
         id="source",
@@ -909,6 +983,58 @@ async def test_runner_executes_only_accepted_candidates_and_keeps_rejected_candi
         == accepted.target_output.raw_output
     )
     assert DatasetEvaluationResult.model_validate_json(result.model_dump_json()) == result
+
+
+async def test_runner_executes_punctuation_candidate_with_equivalent_list_decomposition() -> None:
+    source = _source().model_copy(
+        update={
+            "raw_input": (
+                "In the Status Report Google Sheet, update API Gateway Upgrade to Completed "
+                "and Mobile App Redesign to In Progress. These are 2 row updates."
+            ),
+            "raw_observed_output": None,
+        }
+    )
+    source_frame, candidate_frame = _list_decomposition_frames()
+    source = source.model_copy(
+        update={"raw_observed_output": _raw_output_for_actions(source_frame.outcomes)}
+    )
+
+    class ListDecompositionPipeline(DeterministicSemanticPipeline):
+        async def deconstruct(
+            self,
+            record: InteractionRecord | UserInputRecord,
+            reference_frame: SemanticFrame | None = None,
+        ) -> SemanticFrame:
+            if record.id == source.id:
+                return source_frame
+            if not isinstance(record, InteractionRecord):
+                return candidate_frame.model_copy(update={"interaction_id": record.id})
+            return source_frame.model_copy(update={"interaction_id": record.id})
+
+    pipeline = ListDecompositionPipeline(source_frame.outcomes)
+    pipeline.source_frame = source_frame
+    environment = DeterministicEnvironment(
+        raw_output=_raw_output_for_actions(source_frame.outcomes),
+        baseline_raw_output=_raw_output_for_actions(source_frame.outcomes),
+    )
+    runner = DatasetEvaluationRunner(
+        DatasetAugmentationEngine(pipeline, pipeline), pipeline, environment
+    )
+
+    result = await runner.run(source, operator_ids=("input.surface.punctuation_noise",))
+
+    case = result.cases[0]
+    assert case.candidate.passed
+    assert case.target_output is not None
+    assert case.verdict == "no_divergence"
+    assert environment.raw_inputs == [
+        source.raw_input,
+        (
+            "In the Status Report Google Sheet,, update API Gateway Upgrade to Completed "
+            "and Mobile App Redesign to In Progress. These are 2 row updates."
+        ),
+    ]
 
 
 async def test_redacted_runner_evidence_never_persists_environment_secrets(tmp_path: Path) -> None:
