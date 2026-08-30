@@ -1184,6 +1184,30 @@ async def test_deterministic_frustrated_tone_does_not_require_model_added_label(
     assert candidate.renderer_metadata["algorithm"] == "frustration_interjection_prefix"
 
 
+async def test_deterministic_frustrated_tone_without_label_rejects_semantic_drift() -> None:
+    record = source_record()
+    original_frame = source_frame(record)
+    candidate_frame = source_frame(record, identifier_prefix="candidate").model_copy(
+        update={
+            "factors": (
+                original_frame.factors[0].model_copy(
+                    update={"id": "candidate:amount", "value": 999}
+                ),
+                original_frame.factors[1].model_copy(update={"id": "candidate:recipient"}),
+            ),
+            "outcomes": (),
+        }
+    )
+    model = DeterministicSemanticModel({record.id: original_frame}, candidate_frame)
+
+    result = await DatasetAugmentationEngine(model, model).augment(
+        (record,), operator_ids=("input.tone.frustrated",)
+    )
+
+    assert not result.candidates[0].passed
+    assert "factors differ from the expected frame" in result.candidates[0].failure_reasons
+
+
 async def test_behavior_operator_rejects_relations_touching_its_marker() -> None:
     record = source_record()
     original_frame = source_frame(record)
