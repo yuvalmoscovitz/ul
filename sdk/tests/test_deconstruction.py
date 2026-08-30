@@ -1251,13 +1251,38 @@ async def test_self_correction_evidence_is_grounded_to_the_exact_visible_repair(
         )
     )
 
+    aliased = frame.model_copy(
+        update={"relations": (frame.relations[0].model_copy(update={"kind": "self_correction"}),)}
+    )
+    normalized = SemanticModelDeconstructor._normalize_self_correction_relation_kind(aliased)
     grounded = SemanticModelDeconstructor._ground_self_correction_evidence(
         UserInputRecord(id="candidate", raw_input=candidate_input),
-        frame,
+        normalized,
     )
 
+    assert normalized.relations[0].kind == "superseded_by"
     assert grounded.relations[0].evidence[0].text_quote == "13500$, sorry 12500$"
     assert grounded.communication_acts[0].evidence[0].text_quote == "13500$, sorry 12500$"
+
+    relationless = frame.model_copy(
+        update={
+            "relations": (),
+            "communication_acts": (
+                frame.communication_acts[0].model_copy(update={"factor_ids": ()}),
+            ),
+        }
+    )
+    normalized_relationless = SemanticModelDeconstructor._normalize_self_correction_relation_kind(
+        relationless
+    )
+
+    assert normalized_relationless.relations[0].kind == "superseded_by"
+    assert normalized_relationless.relations[0].source_ids == ("provisional",)
+    assert normalized_relationless.relations[0].target_ids == ("final",)
+    assert normalized_relationless.communication_acts[0].factor_ids == (
+        "provisional",
+        "final",
+    )
 
 
 async def test_verify_equivalence_compares_raw_inputs_with_the_configured_model() -> None:

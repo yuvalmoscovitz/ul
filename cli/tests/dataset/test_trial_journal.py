@@ -4,7 +4,11 @@ from pathlib import Path
 from typing import cast
 
 import pytest
-from ul import DatasetSemanticPreparationError, DatasetTrialUnit
+from ul import (
+    DatasetSemanticPreparationError,
+    DatasetSourceOutcomeProjectionError,
+    DatasetTrialUnit,
+)
 from ul_cli.dataset.evaluation.command import (
     _attempted_target_calls,
     _reconcile_source_preparation_failures,
@@ -136,6 +140,22 @@ def test_resume_reconciles_an_interrupted_source_failure_without_target_calls(
     assert set(snapshot.terminal_reason_codes.values()) == {failure.reason_code}
     assert _attempted_target_calls(snapshot) == 0
     resumed.close()
+
+
+def test_source_outcome_projection_failure_builds_durable_evidence() -> None:
+    manifest = _manifest()
+
+    failure = build_source_preparation_failure_evidence(
+        manifest.selected_records[0],
+        DatasetSourceOutcomeProjectionError(),
+        repetitions=1,
+        max_environment_api_calls=10,
+        planned_target_calls=2,
+        run_context=manifest.run_context,
+    )
+
+    assert failure.reason_code == "source_outcome_projection_failed"
+    assert "declared outcome projection" in failure.summary
 
 
 def test_skipped_trial_is_recovered_without_duplicate_terminal_transition(tmp_path: Path) -> None:

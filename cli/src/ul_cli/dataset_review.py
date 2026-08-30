@@ -25,6 +25,7 @@ from ul import (
     DatasetComparisonCompatibilityError,
     DatasetEvaluationResult,
     DatasetSemanticPreparationError,
+    DatasetSourceOutcomeProjectionError,
     InteractionRecord,
     MaterialVarianceAssessment,
     SemanticDeconstructorIdentity,
@@ -388,6 +389,7 @@ class DatasetSourcePreparationFailureEvidence(_StrictModel):
     failure_stage: Literal["semantic_preparation"] = "semantic_preparation"
     reason_code: Literal[
         "source_semantic_preparation_failed",
+        "source_outcome_projection_failed",
         "source_comparison_surface_incompatible",
     ]
     summary: str = Field(min_length=1, max_length=500)
@@ -405,6 +407,10 @@ class DatasetSourcePreparationFailureEvidence(_StrictModel):
             "source_semantic_preparation_failed": (
                 DatasetSemanticPreparationError.explanation,
                 DatasetSemanticPreparationError.remediation,
+            ),
+            "source_outcome_projection_failed": (
+                DatasetSourceOutcomeProjectionError.explanation,
+                DatasetSourceOutcomeProjectionError.remediation,
             ),
             "source_comparison_surface_incompatible": (
                 DatasetComparisonCompatibilityError.explanation,

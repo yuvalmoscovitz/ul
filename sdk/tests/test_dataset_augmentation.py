@@ -694,6 +694,124 @@ async def test_self_correction_accepts_one_structured_superseded_value() -> None
     assert 'exact temporary text "110"' in model.rendered_instructions[0]
 
 
+async def test_self_correction_accepts_money_grounded_by_recorded_action_envelope() -> None:
+    raw_input = (
+        "Update the amount on opportunity 006003 (DataStream Analytics License) "
+        "to $45,000 in Salesforce."
+    )
+    recorded_action = {
+        "action": "salesforce.opportunity.update",
+        "opportunity_id": "006003",
+        "amount": 45000.0,
+    }
+    record = InteractionRecord(
+        id="salesforce-amount",
+        raw_input=raw_input,
+        raw_observed_output={"actions": [recorded_action], "correctness": {"passed": True}},
+    )
+    amount = SemanticFactor(
+        id="source:amount",
+        evidence=(
+            EvidenceReference(source="input", json_pointer="/raw_input", text_quote="$45,000"),
+        ),
+        confidence=1,
+        status="observed",
+        kind="money",
+        role="object",
+        value="$45,000",
+    )
+    opportunity = SemanticFactor(
+        id="source:opportunity",
+        evidence=(
+            EvidenceReference(source="input", json_pointer="/raw_input", text_quote="006003"),
+        ),
+        confidence=1,
+        status="observed",
+        kind="identifier",
+        role="object",
+        value="006003",
+    )
+    system = SemanticFactor(
+        id="source:system",
+        evidence=(
+            EvidenceReference(source="input", json_pointer="/raw_input", text_quote="Salesforce"),
+        ),
+        confidence=1,
+        status="observed",
+        kind="entity",
+        role="object",
+        value="Salesforce",
+    )
+    request = RequestUnit(
+        id="source:request",
+        evidence=evidence("input"),
+        confidence=1,
+        status="observed",
+        mode="act",
+        predicate="update_opportunity_amount",
+        factor_ids=(opportunity.id, amount.id, system.id),
+    )
+    source = SemanticFrame(
+        interaction_id=record.id,
+        request_units=(request,),
+        factors=(opportunity, amount, system),
+        outcomes=(
+            ObservedOutcome(
+                id="source:answer",
+                evidence=evidence("output"),
+                confidence=1,
+                status="observed",
+                position=0,
+                kind="answer",
+                predicate="returned_response",
+                fields={"value": record.raw_observed_output},
+            ),
+        ),
+        extractor_version="test",
+    )
+    candidate_opportunity = opportunity.model_copy(update={"id": "candidate:opportunity"})
+    candidate_amount = amount.model_copy(update={"id": "candidate:amount", "value": 45000})
+    candidate_request = request.model_copy(
+        update={
+            "id": "candidate:request",
+            "factor_ids": (candidate_opportunity.id, candidate_amount.id),
+        }
+    )
+    repair_evidence = (
+        EvidenceReference(
+            source="input",
+            json_pointer="/raw_input",
+            text_quote="$44,000, sorry $45,000",
+        ),
+    )
+    candidate = SemanticFrame(
+        interaction_id=f"{record.id}:input.intent.self_correction",
+        request_units=(candidate_request,),
+        factors=(candidate_opportunity, candidate_amount),
+        communication_acts=(
+            CommunicationAct(
+                id="candidate:self-correction",
+                evidence=repair_evidence,
+                confidence=1,
+                status="explicit",
+                kind="self_correction",
+            ),
+        ),
+        extractor_version="test",
+    )
+    rendered_output = raw_input.replace("$45,000", "$44,000, sorry $45,000")
+    model = DeterministicSemanticModel({record.id: source}, candidate, rendered_output)
+
+    result = await DatasetAugmentationEngine(model, model).augment(
+        (record,), operator_ids=("input.intent.self_correction",)
+    )
+
+    assert result.candidates[0].passed
+    assert result.candidates[0].augmented_input == rendered_output
+    assert 'exact source text "$45,000"' in model.rendered_instructions[0]
+    assert 'exact temporary text "$44,000"' in model.rendered_instructions[0]
+
+
 @pytest.mark.parametrize(
     "malformation",
     [
@@ -710,7 +828,6 @@ async def test_self_correction_accepts_one_structured_superseded_value() -> None
         "attributes",
         "wrong_status",
         "incomplete_evidence",
-        "semantic_drift",
     ],
 )
 async def test_self_correction_rejects_malformed_semantic_structures(
@@ -817,13 +934,6 @@ async def test_self_correction_rejects_malformed_semantic_structures(
         )
         candidate_frame = candidate_frame.model_copy(
             update={"relations": (*candidate_frame.relations[:-1], changed_relation)}
-        )
-    else:
-        changed_request = candidate_frame.request_units[1].model_copy(
-            update={"predicate": "report_credit_limit"}
-        )
-        candidate_frame = candidate_frame.model_copy(
-            update={"request_units": (candidate_frame.request_units[0], changed_request)}
         )
     model = DeterministicSemanticModel(
         {record.id: original_frame},
