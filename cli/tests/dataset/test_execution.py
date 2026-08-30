@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import stat
@@ -22,8 +23,10 @@ from ul import (
     JsonHttpEnvironmentConfig,
     ProviderDiagnostic,
     ProviderDiagnosticError,
+    semantic_deconstructor_identity,
 )
 from ul.environment import evaluation_case_from_inputs
+from ul_cli import dataset_augmentation_ledger as augmentation_ledger_module
 from ul_cli import progress_action as progress_action_module
 from ul_cli.dataset.evaluation import command as command_module
 from ul_cli.dataset.evaluation import runner as runner_module
@@ -53,6 +56,7 @@ from ul_core.dataset import (
 )
 
 from ._factories import (
+    _evaluation_result,
     _evaluator_preflight,
     _settings,
 )
@@ -64,6 +68,109 @@ from ._files import (
 
 runner = CliRunner()
 _ANSI_ESCAPE_PATTERN = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+
+
+def test_execution_reuses_complete_augmentation_input_without_regeneration(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    evaluation_result = _evaluation_result("interaction-1", has_review_finding=True)
+    dataset = tmp_path / "interactions.jsonl"
+    augmentation_input = tmp_path / "accepted.augmentations.jsonl"
+    output = tmp_path / "fresh-target-results.jsonl"
+    target_config = tmp_path / "fresh-target.json"
+    _write_dataset(dataset, [_record()])
+    _write_target_config(target_config, url="http://127.0.0.1:8765/execute")
+    settings = _settings()
+    generation_context = augmentation_ledger_module.create_dataset_augmentation_generation_context(
+        selected_records=(evaluation_result.source,),
+        operators=(("input.surface.rephrase", "1.0.0"),),
+        semantic_settings=augmentation_ledger_module.DatasetAugmentationLedgerSemanticSettings(
+            provider=settings.semantic_provider_id,
+            endpoint_sha256=settings.semantic_endpoint_sha256,
+            model=settings.model,
+            render_model=settings.render_model,
+            equivalence_model=settings.equivalence_model,
+            deconstruct_reasoning=settings.deconstruct_reasoning,
+            render_reasoning=settings.render_reasoning,
+            equivalence_reasoning=settings.equivalence_reasoning,
+            max_input_chars=settings.max_input_chars,
+            max_output_tokens=settings.max_output_tokens,
+            max_render_tokens=settings.max_render_tokens,
+            max_response_bytes=settings.max_response_bytes,
+            timeout_seconds=settings.timeout_seconds,
+            deconstructor_identity=semantic_deconstructor_identity(settings),
+        ),
+    )
+    with augmentation_ledger_module.create_private_augmentation_ledger(
+        augmentation_input,
+        generation_context=generation_context,
+        selected_records=(evaluation_result.source,),
+    ) as ledger:
+        ledger.append(
+            source=evaluation_result.source,
+            augmentation=evaluation_result.augmentation,
+        )
+    accepted_bytes = augmentation_input.read_bytes()
+    captured_saved_augmentations: dict[str, object] = {}
+
+    class FakeTarget:
+        @classmethod
+        def from_config(cls, *_args: object, **_kwargs: object) -> FakeTarget:
+            return cls()
+
+    async def fake_evaluate(
+        records: tuple[InteractionRecord, ...],
+        _operator_ids: tuple[str, ...],
+        _settings: object,
+        _target: object,
+        output_stream: Any,
+        **arguments: object,
+    ) -> tuple[object, ...]:
+        assert records == (evaluation_result.source,)
+        assert arguments["augmentation_ledger"] is None
+        captured_saved_augmentations.update(
+            cast(dict[str, object], arguments["saved_augmentations"])
+        )
+        output_stream.write('{"saved":true}\n')
+        output_stream.flush()
+        return ()
+
+    monkeypatch.setattr(command_module, "load_dataset_semantic_settings", lambda: settings)
+    monkeypatch.setattr(command_module, "JsonHttpEnvironmentConnection", FakeTarget)
+    monkeypatch.setattr(command_module, "evaluate_interaction_records", fake_evaluate)
+
+    result = runner.invoke(
+        root_app,
+        [
+            "dataset",
+            "evaluate",
+            str(dataset),
+            "--operator",
+            "input.surface.rephrase",
+            "--environment-config",
+            str(target_config),
+            "--allow-insecure-http",
+            "--allow-environment-network",
+            "--confirm-test-environment",
+            "--repetitions",
+            "1",
+            "--augmentations-input",
+            str(augmentation_input),
+            "--output",
+            str(output),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert captured_saved_augmentations == {"interaction-1": evaluation_result.augmentation}
+    assert augmentation_input.read_bytes() == accepted_bytes
+    assert not (tmp_path / "fresh-target-results.augmentations.jsonl").exists()
+    manifest = read_dataset_run_manifest(manifest_path(output))
+    assert manifest.effective_command.augmentations_input_path == str(augmentation_input.resolve())
+    assert (
+        manifest.effective_command.augmentations_input_sha256
+        == hashlib.sha256(accepted_bytes).hexdigest()
+    )
 
 
 class _LocalEvaluationSemanticModel:

@@ -491,6 +491,7 @@ def test_augmentation_persistence_options_are_discoverable_at_80_columns(
 
     assert result.exit_code == 0, result.output
     normalized_output = " ".join(_ANSI_ESCAPE_PATTERN.sub("", result.output).split())
+    assert "--augmentations-input" in normalized_output
     assert "--augmentations-output" in normalized_output
     assert "--no-save-augmentations" in normalized_output
 
@@ -599,6 +600,70 @@ def test_custom_augmentations_output_conflicts_with_no_save(tmp_path: Path) -> N
     assert "used with --no-save-augmentations" in normalized_output
     assert not evidence.exists()
     assert not augmentations.exists()
+
+
+def test_augmentation_input_conflicts_with_augmentation_output(tmp_path: Path) -> None:
+    dataset = tmp_path / "interactions.jsonl"
+    evidence = tmp_path / "results.jsonl"
+    augmentation_input = tmp_path / "accepted.jsonl"
+    augmentation_output = tmp_path / "new.jsonl"
+    _write_dataset(dataset, [_record()])
+    augmentation_input.touch(mode=0o600)
+
+    result = runner.invoke(
+        root_app,
+        [
+            "dataset",
+            "evaluate",
+            str(dataset),
+            "--output",
+            str(evidence),
+            "--augmentations-input",
+            str(augmentation_input),
+            "--augmentations-output",
+            str(augmentation_output),
+            "--dry-run",
+        ],
+    )
+
+    assert result.exit_code == 2
+    normalized_output = " ".join(
+        _ANSI_ESCAPE_PATTERN.sub("", result.output).replace("│", " ").split()
+    )
+    assert "cannot be combined" in normalized_output
+    assert not evidence.exists()
+    assert not augmentation_output.exists()
+
+
+def test_augmentation_input_requires_complete_selected_dataset(tmp_path: Path) -> None:
+    dataset = tmp_path / "interactions.jsonl"
+    evidence = tmp_path / "results.jsonl"
+    augmentation_input = tmp_path / "accepted.jsonl"
+    _write_dataset(dataset, [_record()])
+    augmentation_input.touch(mode=0o600)
+
+    result = runner.invoke(
+        root_app,
+        [
+            "dataset",
+            "evaluate",
+            str(dataset),
+            "--output",
+            str(evidence),
+            "--augmentations-input",
+            str(augmentation_input),
+            "--dry-run",
+        ],
+    )
+
+    assert result.exit_code == 2
+    normalized_output = " ".join(
+        _ANSI_ESCAPE_PATTERN.sub("", result.output).replace("│", " ").split()
+    )
+    assert "augmentation input must contain every selected interaction exactly once" in (
+        normalized_output
+    )
+    assert not evidence.exists()
 
 
 def test_redaction_dry_run_reports_value_free_coverage_without_key_or_state(

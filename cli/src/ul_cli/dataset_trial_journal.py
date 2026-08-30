@@ -84,6 +84,8 @@ class DatasetRunEffectiveCommand(_StrictModel):
     redaction_policy_source: str | None = None
     redaction_state_path: str | None = None
     redaction_state_sha256: str | None = Field(default=None, pattern=_SHA256_PATTERN)
+    augmentations_input_path: str | None = None
+    augmentations_input_sha256: str | None = Field(default=None, pattern=_SHA256_PATTERN)
     augmentations_output_path: str | None = None
     http_target_confirmation: HttpTargetConfirmation | None = None
     http_target_config: JsonHttpTargetConfig | None = None
@@ -235,6 +237,8 @@ def create_dataset_run_manifest(
     redaction_policy_source: str | None = None,
     redaction_state_path: str | None = None,
     redaction_state_sha256: str | None = None,
+    augmentations_input_path: str | None = None,
+    augmentations_input_sha256: str | None = None,
     augmentations_output_path: str | None = None,
     http_target_confirmation: HttpTargetConfirmation | None = None,
     http_target_config: JsonHttpTargetConfig | None = None,
@@ -259,6 +263,8 @@ def create_dataset_run_manifest(
         redaction_policy_source=redaction_policy_source,
         redaction_state_path=redaction_state_path,
         redaction_state_sha256=redaction_state_sha256,
+        augmentations_input_path=augmentations_input_path,
+        augmentations_input_sha256=augmentations_input_sha256,
         augmentations_output_path=augmentations_output_path,
         http_target_confirmation=http_target_confirmation,
         http_target_config=http_target_config,
