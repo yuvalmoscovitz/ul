@@ -4,6 +4,7 @@ from collections.abc import Iterator
 from typing import Literal
 
 import pytest
+import ul.augmentations.dataset as dataset_augmentations
 from pydantic import JsonValue
 from ul.augmentations.dataset import (
     DatasetAugmentationEngine,
@@ -152,6 +153,22 @@ def spreadsheet_list_frames(record: InteractionRecord) -> tuple[SemanticFrame, S
         role="update_operations",
         value=list(operations),
     )
+    source_spreadsheet = source_operations.model_copy(
+        update={
+            "id": "source:spreadsheet",
+            "kind": "identifier",
+            "role": "target_spreadsheet",
+            "value": "ss_status",
+        }
+    )
+    source_worksheet = source_operations.model_copy(
+        update={
+            "id": "source:worksheet",
+            "kind": "identifier",
+            "role": "target_worksheet",
+            "value": "ws_report",
+        }
+    )
     source_request = RequestUnit(
         id="source:request",
         evidence=evidence("input"),
@@ -159,7 +176,7 @@ def spreadsheet_list_frames(record: InteractionRecord) -> tuple[SemanticFrame, S
         status="explicit",
         mode="act",
         predicate="update_spreadsheet",
-        factor_ids=(source_operations.id,),
+        factor_ids=(source_spreadsheet.id, source_worksheet.id, source_operations.id),
     )
     source_relation = SemanticRelation(
         id="source:fulfills",
@@ -173,8 +190,22 @@ def spreadsheet_list_frames(record: InteractionRecord) -> tuple[SemanticFrame, S
     source = SemanticFrame(
         interaction_id=record.id,
         request_units=(source_request,),
-        factors=(source_operations,),
-        relations=(source_relation,),
+        factors=(source_spreadsheet, source_worksheet, source_operations),
+        relations=(
+            source_relation,
+            *(
+                SemanticRelation(
+                    id=f"source:fulfills:{factor.id}",
+                    evidence=evidence("input"),
+                    confidence=1,
+                    status="explicit",
+                    kind="fulfills",
+                    source_ids=(source_request.id,),
+                    target_ids=(factor.id,),
+                )
+                for factor in (source_spreadsheet, source_worksheet)
+            ),
+        ),
         outcomes=(
             ObservedOutcome(
                 id="source:outcome",
@@ -205,13 +236,21 @@ def spreadsheet_list_frames(record: InteractionRecord) -> tuple[SemanticFrame, S
     candidate_request = source_request.model_copy(
         update={
             "id": "candidate:request",
-            "factor_ids": tuple(factor.id for factor in candidate_operations),
+            "factor_ids": (
+                "candidate:spreadsheet",
+                "candidate:worksheet",
+                *(factor.id for factor in candidate_operations),
+            ),
         }
     )
     candidate = SemanticFrame(
         interaction_id=f"{record.id}:input.surface.punctuation_noise",
         request_units=(candidate_request,),
-        factors=candidate_operations,
+        factors=(
+            source_spreadsheet.model_copy(update={"id": "candidate:spreadsheet"}),
+            source_worksheet.model_copy(update={"id": "candidate:worksheet"}),
+            *candidate_operations,
+        ),
         relations=tuple(
             SemanticRelation(
                 id=f"candidate:fulfills:{index}",
@@ -1341,13 +1380,25 @@ async def test_punctuation_noise_accepts_equivalent_list_factor_decomposition() 
     assert candidate.passed
     assert candidate.failure_reasons == ()
     assert candidate.semantic_equivalence_assessment is None
+    assert candidate.semantic_normalization is not None
+    assert candidate.semantic_normalization.model_dump() == {
+        "normalizer_version": "semantic-frame/1.0.0",
+        "applied_rules": (
+            "ordered_list_factor_decomposition",
+            "redundant_scalar_fulfills_elision",
+        ),
+        "verdict": "equivalent",
+    }
     assert candidate.augmented_input == (
         "In the Status Report Google Sheet,, update API Gateway Upgrade to Completed "
         "and Mobile App Redesign to In Progress."
     )
 
 
-@pytest.mark.parametrize("drift", ["changed_operation", "reordered_operations", "missing_relation"])
+@pytest.mark.parametrize(
+    "drift",
+    ["changed_operation", "reordered_operations", "missing_relation", "reversed_relation"],
+)
 async def test_list_factor_decomposition_still_rejects_semantic_drift(drift: str) -> None:
     record = source_record().model_copy(
         update={
@@ -1359,19 +1410,29 @@ async def test_list_factor_decomposition_still_rejects_semantic_drift(drift: str
     )
     original_frame, candidate_frame = spreadsheet_list_frames(record)
     if drift == "changed_operation":
-        changed_factor = candidate_frame.factors[1].model_copy(
+        changed_factor = candidate_frame.factors[3].model_copy(
             update={"value": [{"project": "Mobile App Redesign", "status": "Blocked"}]}
         )
         candidate_frame = candidate_frame.model_copy(
-            update={"factors": (candidate_frame.factors[0], changed_factor)}
+            update={"factors": (*candidate_frame.factors[:3], changed_factor)}
         )
     elif drift == "reordered_operations":
         candidate_frame = candidate_frame.model_copy(
             update={"factors": tuple(reversed(candidate_frame.factors))}
         )
-    else:
+    elif drift == "missing_relation":
         candidate_frame = candidate_frame.model_copy(
             update={"relations": candidate_frame.relations[:1]}
+        )
+    else:
+        reversed_relation = candidate_frame.relations[0].model_copy(
+            update={
+                "source_ids": candidate_frame.relations[0].target_ids,
+                "target_ids": candidate_frame.relations[0].source_ids,
+            }
+        )
+        candidate_frame = candidate_frame.model_copy(
+            update={"relations": (reversed_relation, *candidate_frame.relations[1:])}
         )
     model = DeterministicSemanticModel({record.id: original_frame}, candidate_frame)
 
@@ -1382,6 +1443,56 @@ async def test_list_factor_decomposition_still_rejects_semantic_drift(drift: str
     candidate = result.candidates[0]
     assert not candidate.passed
     assert candidate.failure_reasons
+
+
+async def test_relation_decomposition_fails_closed_before_oversized_expansion(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    list_factor = SemanticFactor(
+        id="items",
+        evidence=evidence("input"),
+        confidence=1,
+        status="explicit",
+        kind="list",
+        role="items",
+        value=list(range(101)),
+    )
+    scalar_factors = tuple(
+        list_factor.model_copy(
+            update={"id": f"scalar:{index}", "kind": "identifier", "value": index}
+        )
+        for index in range(100)
+    )
+    wide_relation = SemanticRelation(
+        id="wide",
+        evidence=evidence("input"),
+        confidence=1,
+        status="explicit",
+        kind="associated_with",
+        source_ids=(list_factor.id,),
+        target_ids=tuple(factor.id for factor in scalar_factors),
+    )
+    narrow_relation = wide_relation.model_copy(
+        update={"id": "narrow", "target_ids": (scalar_factors[0].id,)}
+    )
+    frame = SemanticFrame(
+        interaction_id="wide",
+        factors=(list_factor, *scalar_factors),
+        relations=(wide_relation, narrow_relation),
+        extractor_version="test",
+    )
+
+    def reject_expansion(*args: object, **kwargs: object) -> tuple[object, ...]:
+        raise AssertionError("oversized relation expansion must not be materialized")
+
+    monkeypatch.setattr(dataset_augmentations, "_expanded_relation_semantics", reject_expansion)
+
+    assert (
+        dataset_augmentations._semantic_difference_reasons(
+            frame, frame.model_copy(update={"relations": tuple(reversed(frame.relations))})
+        )
+        == ()
+    )
 
 
 async def test_punctuation_noise_skips_when_every_insertion_point_is_protected() -> None:

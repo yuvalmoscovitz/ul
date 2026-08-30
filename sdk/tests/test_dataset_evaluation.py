@@ -51,6 +51,7 @@ from ul_core.dataset import (
     RequestUnit,
     SemanticFactor,
     SemanticFrame,
+    SemanticRelation,
     UserInputRecord,
 )
 from ul_core.evaluation import (
@@ -266,14 +267,29 @@ def _list_decomposition_frames() -> tuple[SemanticFrame, SemanticFrame]:
         role="update_operations",
         value=list(operations),
     )
-    source_count = SemanticFactor(
-        id="source_operation_count",
-        evidence=(EvidenceReference(source="input", json_pointer="/raw_input", text_quote="2"),),
+    source_spreadsheet = SemanticFactor(
+        id="source_spreadsheet",
+        evidence=_evidence("input"),
         confidence=1,
         status="explicit",
-        kind="number",
-        role="operation_count",
-        value=2,
+        kind="identifier",
+        role="target_spreadsheet",
+        value="ss_status",
+    )
+    source_worksheet = source_spreadsheet.model_copy(
+        update={
+            "id": "source_worksheet",
+            "role": "target_worksheet",
+            "value": "ws_report",
+        }
+    )
+    source_count = source_spreadsheet.model_copy(
+        update={
+            "id": "source_operation_count",
+            "kind": "number",
+            "role": "operation_count",
+            "value": 2,
+        }
     )
     source_request = RequestUnit(
         id="request",
@@ -282,7 +298,12 @@ def _list_decomposition_frames() -> tuple[SemanticFrame, SemanticFrame]:
         status="explicit",
         mode="act",
         predicate="update_spreadsheet",
-        factor_ids=(source_factor.id, source_count.id),
+        factor_ids=(
+            source_spreadsheet.id,
+            source_worksheet.id,
+            source_factor.id,
+            source_count.id,
+        ),
     )
     source_outcome = _outcome(
         "source_update",
@@ -293,7 +314,19 @@ def _list_decomposition_frames() -> tuple[SemanticFrame, SemanticFrame]:
     source = _frame("source", (source_outcome,)).model_copy(
         update={
             "request_units": (source_request,),
-            "factors": (source_factor, source_count),
+            "factors": (source_spreadsheet, source_worksheet, source_factor, source_count),
+            "relations": tuple(
+                SemanticRelation(
+                    id=f"source_fulfills_{factor.id}",
+                    evidence=_evidence("input"),
+                    confidence=1,
+                    status="explicit",
+                    kind="fulfills",
+                    source_ids=(source_request.id,),
+                    target_ids=(factor.id,),
+                )
+                for factor in (source_factor, source_spreadsheet, source_worksheet, source_count)
+            ),
             "communication_acts": (),
         }
     )
@@ -310,6 +343,8 @@ def _list_decomposition_frames() -> tuple[SemanticFrame, SemanticFrame]:
                 source_request.model_copy(
                     update={
                         "factor_ids": (
+                            "candidate_spreadsheet",
+                            "candidate_worksheet",
                             *(factor.id for factor in candidate_factors),
                             "candidate_operation_count",
                         )
@@ -317,8 +352,22 @@ def _list_decomposition_frames() -> tuple[SemanticFrame, SemanticFrame]:
                 ),
             ),
             "factors": (
+                source_spreadsheet.model_copy(update={"id": "candidate_spreadsheet"}),
+                source_worksheet.model_copy(update={"id": "candidate_worksheet"}),
                 *candidate_factors,
                 source_count.model_copy(update={"id": "candidate_operation_count"}),
+            ),
+            "relations": tuple(
+                SemanticRelation(
+                    id=f"candidate_fulfills_{factor.id}",
+                    evidence=_evidence("input"),
+                    confidence=1,
+                    status="explicit",
+                    kind="fulfills",
+                    source_ids=(source_request.id,),
+                    target_ids=(factor.id,),
+                )
+                for factor in candidate_factors
             ),
             "outcomes": (),
         }
@@ -989,8 +1038,10 @@ async def test_runner_executes_punctuation_candidate_with_equivalent_list_decomp
     source = _source().model_copy(
         update={
             "raw_input": (
-                "In the Status Report Google Sheet, update API Gateway Upgrade to Completed "
-                "and Mobile App Redesign to In Progress. These are 2 row updates."
+                "In the Status Report Google Sheet, update the following: 1) Find the row for "
+                "'API Gateway Upgrade' and change Status to 'Completed'. 2) Find the row for "
+                "'Mobile App Redesign' and change Status to 'In Progress'. Use spreadsheet "
+                "ss_status, worksheet ws_report."
             ),
             "raw_observed_output": None,
         }
@@ -1026,13 +1077,17 @@ async def test_runner_executes_punctuation_candidate_with_equivalent_list_decomp
 
     case = result.cases[0]
     assert case.candidate.passed
+    assert case.candidate.semantic_normalization is not None
+    assert case.candidate.semantic_normalization.verdict == "equivalent"
     assert case.target_output is not None
     assert case.verdict == "no_divergence"
     assert environment.raw_inputs == [
         source.raw_input,
         (
-            "In the Status Report Google Sheet,, update API Gateway Upgrade to Completed "
-            "and Mobile App Redesign to In Progress. These are 2 row updates."
+            "In the Status Report Google Sheet,, update the following: 1) Find the row for "
+            "'API Gateway Upgrade' and change Status to 'Completed'. 2) Find the row for "
+            "'Mobile App Redesign' and change Status to 'In Progress'. Use spreadsheet "
+            "ss_status, worksheet ws_report."
         ),
     ]
 

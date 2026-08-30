@@ -24,13 +24,14 @@ from ul_core.dataset import (
     SemanticEquivalenceAssessment,
     SemanticFactor,
     SemanticFrame,
+    SemanticRelation,
     UserInputRecord,
 )
 from ul_core.models import ULModel
 from ul_core.prompts import PromptManager, prompt_provenance
 
 _PROMPTS = PromptManager.instance()
-_MAX_DECOMPOSED_RELATION_PARTS = 10_000
+_MAX_DECOMPOSED_RELATION_ENDPOINTS = 10_000
 
 
 def _is_none(value: object) -> bool:
@@ -206,6 +207,14 @@ def resolve_dataset_augmentation_operator(reference: str) -> DatasetAugmentation
     return max(matching, key=lambda operator: _version_tuple(operator.version))
 
 
+class SemanticNormalizationAssessment(ULModel):
+    normalizer_version: Literal["semantic-frame/1.0.0"] = "semantic-frame/1.0.0"
+    applied_rules: tuple[
+        Literal["ordered_list_factor_decomposition", "redundant_scalar_fulfills_elision"], ...
+    ]
+    verdict: Literal["equivalent", "different"]
+
+
 class DatasetAugmentationCandidate(ULModel):
     source_interaction_id: str = Field(min_length=1)
     source_record_id: str | None = cast(Any, Field)(default=None, min_length=1, exclude_if=_is_none)
@@ -227,6 +236,9 @@ class DatasetAugmentationCandidate(ULModel):
     expected_input_frame: SemanticFrame
     reparsed_input_frame: SemanticFrame | None
     semantic_equivalence_assessment: SemanticEquivalenceAssessment | None = None
+    semantic_normalization: SemanticNormalizationAssessment | None = cast(Any, Field)(
+        default=None, exclude_if=_is_none
+    )
     passed: bool
     failure_reasons: tuple[str, ...] = ()
 
@@ -615,6 +627,11 @@ class DatasetAugmentationEngine:
                         expected_input_frame=expected_input_frame,
                         reparsed_input_frame=reparsed_frame,
                         semantic_equivalence_assessment=equivalence_assessment,
+                        semantic_normalization=(
+                            _semantic_normalization_assessment(expected_input_frame, reparsed_frame)
+                            if reparsed_frame is not None
+                            else None
+                        ),
                         passed=not failure_reasons,
                         failure_reasons=tuple(failure_reasons),
                     )
@@ -736,6 +753,32 @@ def _semantic_difference_reasons(
             labels, expected_semantics, reparsed_semantics, strict=True
         )
         if expected_part != reparsed_part
+    )
+
+
+def _semantic_normalization_assessment(
+    expected: SemanticFrame, reparsed: SemanticFrame
+) -> SemanticNormalizationAssessment | None:
+    applied_rules: list[
+        Literal["ordered_list_factor_decomposition", "redundant_scalar_fulfills_elision"]
+    ] = []
+    if any(
+        isinstance(factor.value, list) for frame in (expected, reparsed) for factor in frame.factors
+    ):
+        applied_rules.append("ordered_list_factor_decomposition")
+    if any(
+        _is_redundant_scalar_fulfills(relation, frame)
+        for frame in (expected, reparsed)
+        for relation in frame.relations
+    ):
+        applied_rules.append("redundant_scalar_fulfills_elision")
+    if not applied_rules:
+        return None
+    return SemanticNormalizationAssessment(
+        applied_rules=tuple(applied_rules),
+        verdict=(
+            "equivalent" if not _semantic_difference_reasons(expected, reparsed) else "different"
+        ),
     )
 
 
@@ -1454,17 +1497,35 @@ def _canonical_semantics(frame: SemanticFrame) -> tuple[object, ...]:
         },
     }
     list_factor_ids = {factor.id for factor in frame.factors if isinstance(factor.value, list)}
-    canonical_relations: list[tuple[object, ...]] = []
-    decomposed_relation_parts = 0
-    for relation in frame.relations:
-        expanded_relations = _expanded_relation_semantics(
-            relation.kind,
+    retained_relations = tuple(
+        relation
+        for relation in frame.relations
+        if not _is_redundant_scalar_fulfills(relation, frame)
+    )
+    decomposed_relation_endpoints = 0
+    for relation in retained_relations:
+        decomposed_relation_endpoints += _relation_expansion_endpoint_count(
             relation.source_ids,
             relation.target_ids,
             endpoint_semantics,
             list_factor_ids,
         )
-        if decomposed_relation_parts + len(expanded_relations) > _MAX_DECOMPOSED_RELATION_PARTS:
+        if decomposed_relation_endpoints > _MAX_DECOMPOSED_RELATION_ENDPOINTS:
+            break
+    expand_relations = decomposed_relation_endpoints <= _MAX_DECOMPOSED_RELATION_ENDPOINTS
+    canonical_relations: list[tuple[object, ...]] = []
+    for relation in retained_relations:
+        if expand_relations:
+            canonical_relations.extend(
+                _expanded_relation_semantics(
+                    relation.kind,
+                    relation.source_ids,
+                    relation.target_ids,
+                    endpoint_semantics,
+                    list_factor_ids,
+                )
+            )
+        else:
             canonical_relations.append(
                 _unexpanded_relation_semantics(
                     relation.kind,
@@ -1473,15 +1534,26 @@ def _canonical_semantics(frame: SemanticFrame) -> tuple[object, ...]:
                     endpoint_semantics,
                 )
             )
-        else:
-            canonical_relations.extend(expanded_relations)
-            decomposed_relation_parts += len(expanded_relations)
     relation_semantics = tuple(sorted(canonical_relations))
     return (
         tuple(sorted(part for parts in factor_semantics.values() for part in parts)),
         tuple(request_semantics[request.id] for request in frame.request_units),
         relation_semantics,
         tuple(communication_semantics[act.id] for act in frame.communication_acts),
+    )
+
+
+def _is_redundant_scalar_fulfills(relation: SemanticRelation, frame: SemanticFrame) -> bool:
+    if relation.kind != "fulfills" or len(relation.source_ids) != 1:
+        return False
+    request_factor_ids = {request.id: set(request.factor_ids) for request in frame.request_units}
+    referenced_factor_ids = request_factor_ids.get(relation.source_ids[0])
+    if referenced_factor_ids is None or not set(relation.target_ids) <= referenced_factor_ids:
+        return False
+    factors_by_id = {factor.id: factor for factor in frame.factors}
+    return bool(relation.target_ids) and all(
+        target_id in factors_by_id and not isinstance(factors_by_id[target_id].value, list)
+        for target_id in relation.target_ids
     )
 
 
@@ -1535,6 +1607,26 @@ def _expanded_relation_semantics(
         )
         for part in endpoint_semantics[decomposed_endpoint_id]
     )
+
+
+def _relation_expansion_endpoint_count(
+    source_ids: tuple[str, ...],
+    target_ids: tuple[str, ...],
+    endpoint_semantics: Mapping[str, tuple[tuple[object, ...], ...]],
+    list_factor_ids: set[str],
+) -> int:
+    decomposed_endpoint_ids = tuple(
+        item for item in (*source_ids, *target_ids) if item in list_factor_ids
+    )
+    if len(decomposed_endpoint_ids) != 1:
+        return 0
+    decomposed_endpoint_id = decomposed_endpoint_ids[0]
+    expansion_count = len(endpoint_semantics[decomposed_endpoint_id])
+    endpoints_per_expansion = sum(
+        1 if endpoint_id == decomposed_endpoint_id else len(endpoint_semantics[endpoint_id])
+        for endpoint_id in (*source_ids, *target_ids)
+    )
+    return expansion_count * endpoints_per_expansion
 
 
 def _unexpanded_relation_semantics(
