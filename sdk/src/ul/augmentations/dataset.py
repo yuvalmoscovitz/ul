@@ -840,6 +840,26 @@ def _declared_communication_form_difference_reasons(
 
 
 _SELF_CORRECTION_FACTOR_KINDS = ("money", "number", "date_time", "duration")
+_ACTION_OPERATION_WORDS = frozenset(
+    {
+        "add",
+        "approve",
+        "cancel",
+        "create",
+        "delete",
+        "modify",
+        "pay",
+        "post",
+        "reject",
+        "remove",
+        "schedule",
+        "send",
+        "set",
+        "transfer",
+        "update",
+        "write",
+    }
+)
 
 
 def _select_self_correction_factor(
@@ -934,7 +954,8 @@ def _recorded_action_contains_unique_factor_value(
     associated_actions = tuple(
         action
         for action in action_records
-        if all(
+        if _action_matches_request_operation(str(action["action"]), request.predicate)
+        and all(
             sum(
                 type(identifier_value) is type(value) and identifier_value == value
                 for field_name, value in action.items()
@@ -956,6 +977,20 @@ def _recorded_action_contains_unique_factor_value(
         and _self_correction_values_equal(value, factor.value, factor_kind=factor.kind)
     )
     return len(matching_fields) == 1
+
+
+def _action_matches_request_operation(action_name: str, request_predicate: str) -> bool:
+    action_operations = {
+        token
+        for token in re.findall(r"[a-z0-9]+", action_name.casefold())
+        if token in _ACTION_OPERATION_WORDS
+    }
+    request_operations = {
+        token
+        for token in re.findall(r"[a-z0-9]+", request_predicate.casefold())
+        if token in _ACTION_OPERATION_WORDS
+    }
+    return len(action_operations) == 1 and action_operations <= request_operations
 
 
 def _self_correction_values_equal(first: JsonValue, second: JsonValue, *, factor_kind: str) -> bool:
@@ -1151,14 +1186,15 @@ def _structured_self_correction_difference_reasons(
             final_quote
         )
     ]
-    correction_words = tuple(re.findall(r"[A-Za-z]+", between_values.casefold()))
-    if correction_words not in {
-        ("actually",),
-        ("correction",),
-        ("i", "mean"),
-        ("rather",),
-        ("sorry",),
-    }:
+    if (
+        re.fullmatch(
+            r"\s*[,;:.\u2013\u2014-]*\s*(?:actually|correction|i\s+mean|rather|sorry)"
+            r"\s*[,;:.\u2013\u2014-]*\s*",
+            between_values,
+            flags=re.IGNORECASE,
+        )
+        is None
+    ):
         return ("correction language must contain only a recognized correction cue",)
     if not all(
         _element_evidence_spans_values(element, provisional_quote, final_quote)

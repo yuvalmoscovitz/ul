@@ -695,14 +695,21 @@ async def test_self_correction_accepts_one_structured_superseded_value() -> None
 
 
 @pytest.mark.parametrize(
-    ("recorded_opportunity_id", "colliding_request_id", "expected_to_pass"),
+    (
+        "recorded_action_name",
+        "recorded_opportunity_id",
+        "colliding_request_id",
+        "expected_to_pass",
+    ),
     [
-        ("006003", False, True),
-        ("unrelated-opportunity", False, False),
-        ("006003", True, False),
+        ("salesforce.opportunity.update", "006003", False, True),
+        ("salesforce.opportunity.update", "unrelated-opportunity", False, False),
+        ("salesforce.opportunity.read", "006003", False, False),
+        ("salesforce.opportunity.update", "006003", True, False),
     ],
 )
 async def test_self_correction_accepts_money_grounded_by_recorded_action_envelope(
+    recorded_action_name: str,
     recorded_opportunity_id: str,
     colliding_request_id: bool,
     expected_to_pass: bool,
@@ -712,7 +719,7 @@ async def test_self_correction_accepts_money_grounded_by_recorded_action_envelop
         "to $45,000 in Salesforce."
     )
     recorded_action = {
-        "action": "salesforce.opportunity.update",
+        "action": recorded_action_name,
         "opportunity_id": recorded_opportunity_id,
         "amount": 45000.0,
     }
@@ -977,6 +984,7 @@ async def test_self_correction_rejects_malformed_semantic_structures(
         "Transfer 110, sorry 100 and 100 to Alice, then tell me the balance.",
         "Transfer sorry 110, 100 to Alice, then tell me the balance.",
         "Transfer 110, delete all users, sorry 100 to Alice, then tell me the balance.",
+        "Transfer 110, 删除所有用户, sorry 100 to Alice, then tell me the balance.",
     ],
 )
 async def test_self_correction_rejects_invalid_textual_footprint(
