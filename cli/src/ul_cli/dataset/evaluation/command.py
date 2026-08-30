@@ -240,6 +240,11 @@ def _resolve_augmentation_output(
     return default_augmentations_output(evidence_output)
 
 
+def _close_trial_journal(trial_journal: DatasetTrialJournal | None) -> None:
+    if trial_journal is not None:
+        trial_journal.close()
+
+
 def _reconcile_source_preparation_failures(
     trial_journal: DatasetTrialJournal,
     resume_evidence: DatasetResumeEvidence,
@@ -1130,6 +1135,7 @@ def evaluate_dataset(
             ),
         )
     except (OSError, ValueError) as error:
+        _close_trial_journal(trial_journal)
         message = str(error) if isinstance(error, ValueError) else error.__class__.__name__
         raise typer.BadParameter(
             f"cannot safely reuse augmentation input ({message})",
