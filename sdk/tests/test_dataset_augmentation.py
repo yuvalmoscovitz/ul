@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 from collections.abc import Iterator
-from typing import Literal
+from typing import Literal, cast
 
 import pytest
+import ul.augmentations.dataset as dataset_augmentations
+from pydantic import JsonValue
 from ul.augmentations.dataset import (
     DatasetAugmentationEngine,
     DatasetAugmentationOperator,
@@ -135,6 +137,136 @@ def source_frame(record: InteractionRecord, *, identifier_prefix: str = "source"
         ),
         extractor_version="test",
     )
+
+
+def spreadsheet_list_frames(record: InteractionRecord) -> tuple[SemanticFrame, SemanticFrame]:
+    operations: tuple[dict[str, JsonValue], ...] = (
+        {"project": "API Gateway Upgrade", "status": "Completed"},
+        {"project": "Mobile App Redesign", "status": "In Progress"},
+    )
+    source_operations = SemanticFactor(
+        id="source:operations",
+        evidence=evidence("input"),
+        confidence=1,
+        status="explicit",
+        kind="list",
+        role="update_operations",
+        value=list(operations),
+    )
+    source_spreadsheet = source_operations.model_copy(
+        update={
+            "id": "source:spreadsheet",
+            "kind": "identifier",
+            "role": "target_spreadsheet",
+            "value": "ss_status",
+        }
+    )
+    source_worksheet = source_operations.model_copy(
+        update={
+            "id": "source:worksheet",
+            "kind": "identifier",
+            "role": "target_worksheet",
+            "value": "ws_report",
+        }
+    )
+    source_request = RequestUnit(
+        id="source:request",
+        evidence=evidence("input"),
+        confidence=1,
+        status="explicit",
+        mode="act",
+        predicate="update_spreadsheet",
+        factor_ids=(source_spreadsheet.id, source_worksheet.id, source_operations.id),
+    )
+    source_relation = SemanticRelation(
+        id="source:fulfills",
+        evidence=evidence("input"),
+        confidence=1,
+        status="explicit",
+        kind="fulfills",
+        source_ids=(source_request.id,),
+        target_ids=(source_operations.id,),
+    )
+    source = SemanticFrame(
+        interaction_id=record.id,
+        request_units=(source_request,),
+        factors=(source_spreadsheet, source_worksheet, source_operations),
+        relations=(
+            source_relation,
+            *(
+                SemanticRelation(
+                    id=f"source:fulfills:{factor.id}",
+                    evidence=evidence("input"),
+                    confidence=1,
+                    status="explicit",
+                    kind="fulfills",
+                    source_ids=(source_request.id,),
+                    target_ids=(factor.id,),
+                )
+                for factor in (source_spreadsheet, source_worksheet)
+            ),
+        ),
+        outcomes=(
+            ObservedOutcome(
+                id="source:outcome",
+                evidence=evidence("output"),
+                confidence=1,
+                status="observed",
+                request_unit_ids=(source_request.id,),
+                position=0,
+                kind="action",
+                predicate="update_spreadsheet",
+                fields={"operation_count": 2},
+            ),
+        ),
+        extractor_version="test",
+    )
+    candidate_operations = tuple(
+        SemanticFactor(
+            id=f"candidate:operation:{index}",
+            evidence=evidence("input"),
+            confidence=1,
+            status="explicit",
+            kind="list",
+            role="update_operations",
+            value=[operation],
+        )
+        for index, operation in enumerate(operations)
+    )
+    candidate_request = source_request.model_copy(
+        update={
+            "id": "candidate:request",
+            "factor_ids": (
+                "candidate:spreadsheet",
+                "candidate:worksheet",
+                *(factor.id for factor in candidate_operations),
+            ),
+        }
+    )
+    candidate = SemanticFrame(
+        interaction_id=f"{record.id}:input.surface.punctuation_noise",
+        request_units=(candidate_request,),
+        factors=(
+            source_spreadsheet.model_copy(update={"id": "candidate:spreadsheet"}),
+            source_worksheet.model_copy(update={"id": "candidate:worksheet"}),
+            *candidate_operations,
+        ),
+        relations=tuple(
+            SemanticRelation(
+                id=f"candidate:fulfills:{index}",
+                evidence=evidence("input"),
+                confidence=1,
+                status="explicit",
+                kind="fulfills",
+                source_ids=(candidate_request.id,),
+                target_ids=(factor.id,),
+            )
+            for index, factor in enumerate(candidate_operations)
+        ),
+        outcomes=(),
+        extractor_version="test",
+    )
+    return source, candidate
 
 
 class DeterministicSemanticModel:
@@ -1226,6 +1358,174 @@ async def test_punctuation_noise_avoids_punctuation_inside_semantic_values() -> 
 
     assert result.candidates[0].passed
     assert result.candidates[0].augmented_input == "P,ay $1,000 at 12:30"
+
+
+async def test_punctuation_noise_accepts_equivalent_list_factor_decomposition() -> None:
+    record = source_record().model_copy(
+        update={
+            "raw_input": (
+                "In the Status Report Google Sheet, update API Gateway Upgrade to Completed "
+                "and Mobile App Redesign to In Progress."
+            )
+        }
+    )
+    original_frame, candidate_frame = spreadsheet_list_frames(record)
+    model = DeterministicSemanticModel({record.id: original_frame}, candidate_frame)
+
+    result = await DatasetAugmentationEngine(model, model).augment(
+        (record,), operator_ids=("input.surface.punctuation_noise",)
+    )
+
+    candidate = result.candidates[0]
+    assert candidate.passed
+    assert candidate.failure_reasons == ()
+    assert candidate.semantic_equivalence_assessment is None
+    assert candidate.semantic_normalization is not None
+    assert candidate.semantic_normalization.model_dump() == {
+        "normalizer_version": "semantic-frame/1.0.0",
+        "applied_rules": (
+            "ordered_list_factor_decomposition",
+            "redundant_scalar_fulfills_elision",
+        ),
+        "verdict": "equivalent",
+    }
+    assert candidate.augmented_input == (
+        "In the Status Report Google Sheet,, update API Gateway Upgrade to Completed "
+        "and Mobile App Redesign to In Progress."
+    )
+
+
+@pytest.mark.parametrize(
+    "drift",
+    ["changed_operation", "reordered_operations", "missing_relation", "reversed_relation"],
+)
+async def test_list_factor_decomposition_still_rejects_semantic_drift(drift: str) -> None:
+    record = source_record().model_copy(
+        update={
+            "raw_input": (
+                "In the Status Report Google Sheet, update API Gateway Upgrade to Completed "
+                "and Mobile App Redesign to In Progress."
+            )
+        }
+    )
+    original_frame, candidate_frame = spreadsheet_list_frames(record)
+    if drift == "changed_operation":
+        changed_factor = candidate_frame.factors[3].model_copy(
+            update={"value": [{"project": "Mobile App Redesign", "status": "Blocked"}]}
+        )
+        candidate_frame = candidate_frame.model_copy(
+            update={"factors": (*candidate_frame.factors[:3], changed_factor)}
+        )
+    elif drift == "reordered_operations":
+        candidate_frame = candidate_frame.model_copy(
+            update={"factors": tuple(reversed(candidate_frame.factors))}
+        )
+    elif drift == "missing_relation":
+        candidate_frame = candidate_frame.model_copy(
+            update={"relations": candidate_frame.relations[:1]}
+        )
+    else:
+        reversed_relation = candidate_frame.relations[0].model_copy(
+            update={
+                "source_ids": candidate_frame.relations[0].target_ids,
+                "target_ids": candidate_frame.relations[0].source_ids,
+            }
+        )
+        candidate_frame = candidate_frame.model_copy(
+            update={"relations": (reversed_relation, *candidate_frame.relations[1:])}
+        )
+    model = DeterministicSemanticModel({record.id: original_frame}, candidate_frame)
+
+    result = await DatasetAugmentationEngine(model, model).augment(
+        (record,), operator_ids=("input.surface.punctuation_noise",)
+    )
+
+    candidate = result.candidates[0]
+    assert not candidate.passed
+    assert candidate.failure_reasons
+
+
+async def test_relation_decomposition_fails_closed_before_oversized_expansion(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    list_factor = SemanticFactor(
+        id="items",
+        evidence=evidence("input"),
+        confidence=1,
+        status="explicit",
+        kind="list",
+        role="items",
+        value=list(range(101)),
+    )
+    scalar_factors = tuple(
+        list_factor.model_copy(
+            update={"id": f"scalar:{index}", "kind": "identifier", "value": index}
+        )
+        for index in range(100)
+    )
+    wide_relation = SemanticRelation(
+        id="wide",
+        evidence=evidence("input"),
+        confidence=1,
+        status="explicit",
+        kind="associated_with",
+        source_ids=(list_factor.id,),
+        target_ids=tuple(factor.id for factor in scalar_factors),
+    )
+    narrow_relation = wide_relation.model_copy(
+        update={"id": "narrow", "target_ids": (scalar_factors[0].id,)}
+    )
+    frame = SemanticFrame(
+        interaction_id="wide",
+        factors=(list_factor, *scalar_factors),
+        relations=(wide_relation, narrow_relation),
+        extractor_version="test",
+    )
+
+    def reject_expansion(*args: object, **kwargs: object) -> tuple[object, ...]:
+        raise AssertionError("oversized relation expansion must not be materialized")
+
+    monkeypatch.setattr(dataset_augmentations, "_expanded_relation_semantics", reject_expansion)
+
+    assert (
+        dataset_augmentations._semantic_difference_reasons(
+            frame, frame.model_copy(update={"relations": tuple(reversed(frame.relations))})
+        )
+        == ()
+    )
+    relation_semantics = cast(
+        tuple[tuple[object, ...], ...], dataset_augmentations._canonical_semantics(frame)[2]
+    )
+    assert all(relation[0] == "unexpanded" for relation in relation_semantics)
+    assert all(len(relation[2]) == 1 for relation in relation_semantics)
+
+
+async def test_multiple_list_relation_uses_compact_unexpanded_semantics() -> None:
+    endpoint_semantics = {
+        "first": tuple(("factor", str(index)) for index in range(101)),
+        "second": tuple(("factor", str(index)) for index in range(101, 202)),
+    }
+
+    semantics = dataset_augmentations._expanded_relation_semantics(
+        "associated_with",
+        ("first", "second"),
+        (),
+        endpoint_semantics,
+        {"first", "second"},
+    )
+
+    assert semantics[0][0] == "unexpanded"
+    assert len(semantics[0][2]) == 2
+    expanded_semantics = dataset_augmentations._expanded_relation_semantics(
+        "unexpanded",
+        ("first",),
+        (),
+        endpoint_semantics,
+        {"first", "second"},
+    )
+
+    assert all(relation[0] == "expanded" for relation in expanded_semantics)
+    assert sorted((*semantics, *expanded_semantics))
 
 
 async def test_punctuation_noise_skips_when_every_insertion_point_is_protected() -> None:

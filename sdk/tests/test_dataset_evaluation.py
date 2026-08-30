@@ -51,6 +51,7 @@ from ul_core.dataset import (
     RequestUnit,
     SemanticFactor,
     SemanticFrame,
+    SemanticRelation,
     UserInputRecord,
 )
 from ul_core.evaluation import (
@@ -250,6 +251,128 @@ def _frame(
         outcomes=outcomes,
         extractor_version="test",
     )
+
+
+def _list_decomposition_frames() -> tuple[SemanticFrame, SemanticFrame]:
+    operations: tuple[dict[str, JsonValue], ...] = (
+        {"project": "API Gateway Upgrade", "status": "Completed"},
+        {"project": "Mobile App Redesign", "status": "In Progress"},
+    )
+    source_factor = SemanticFactor(
+        id="source_operations",
+        evidence=_evidence("input"),
+        confidence=1,
+        status="explicit",
+        kind="list",
+        role="update_operations",
+        value=list(operations),
+    )
+    source_spreadsheet = SemanticFactor(
+        id="source_spreadsheet",
+        evidence=_evidence("input"),
+        confidence=1,
+        status="explicit",
+        kind="identifier",
+        role="target_spreadsheet",
+        value="ss_status",
+    )
+    source_worksheet = source_spreadsheet.model_copy(
+        update={
+            "id": "source_worksheet",
+            "role": "target_worksheet",
+            "value": "ws_report",
+        }
+    )
+    source_count = source_spreadsheet.model_copy(
+        update={
+            "id": "source_operation_count",
+            "kind": "number",
+            "role": "operation_count",
+            "value": 2,
+        }
+    )
+    source_request = RequestUnit(
+        id="request",
+        evidence=_evidence("input"),
+        confidence=1,
+        status="explicit",
+        mode="act",
+        predicate="update_spreadsheet",
+        factor_ids=(
+            source_spreadsheet.id,
+            source_worksheet.id,
+            source_factor.id,
+            source_count.id,
+        ),
+    )
+    source_outcome = _outcome(
+        "source_update",
+        0,
+        predicate="update_spreadsheet",
+        fields={"operation_count": 2},
+    )
+    source = _frame("source", (source_outcome,)).model_copy(
+        update={
+            "request_units": (source_request,),
+            "factors": (source_spreadsheet, source_worksheet, source_factor, source_count),
+            "relations": tuple(
+                SemanticRelation(
+                    id=f"source_fulfills_{factor.id}",
+                    evidence=_evidence("input"),
+                    confidence=1,
+                    status="explicit",
+                    kind="fulfills",
+                    source_ids=(source_request.id,),
+                    target_ids=(factor.id,),
+                )
+                for factor in (source_factor, source_spreadsheet, source_worksheet, source_count)
+            ),
+            "communication_acts": (),
+        }
+    )
+    candidate_factors = tuple(
+        source_factor.model_copy(
+            update={"id": f"candidate_operation_{index}", "value": [operation]}
+        )
+        for index, operation in enumerate(operations)
+    )
+    candidate = source.model_copy(
+        update={
+            "interaction_id": "source:input.surface.punctuation_noise",
+            "request_units": (
+                source_request.model_copy(
+                    update={
+                        "factor_ids": (
+                            "candidate_spreadsheet",
+                            "candidate_worksheet",
+                            *(factor.id for factor in candidate_factors),
+                            "candidate_operation_count",
+                        )
+                    }
+                ),
+            ),
+            "factors": (
+                source_spreadsheet.model_copy(update={"id": "candidate_spreadsheet"}),
+                source_worksheet.model_copy(update={"id": "candidate_worksheet"}),
+                *candidate_factors,
+                source_count.model_copy(update={"id": "candidate_operation_count"}),
+            ),
+            "relations": tuple(
+                SemanticRelation(
+                    id=f"candidate_fulfills_{factor.id}",
+                    evidence=_evidence("input"),
+                    confidence=1,
+                    status="explicit",
+                    kind="fulfills",
+                    source_ids=(source_request.id,),
+                    target_ids=(factor.id,),
+                )
+                for factor in candidate_factors
+            ),
+            "outcomes": (),
+        }
+    )
+    return source, candidate
 
 
 def _source() -> InteractionRecord:
@@ -909,6 +1032,64 @@ async def test_runner_executes_only_accepted_candidates_and_keeps_rejected_candi
         == accepted.target_output.raw_output
     )
     assert DatasetEvaluationResult.model_validate_json(result.model_dump_json()) == result
+
+
+async def test_runner_executes_punctuation_candidate_with_equivalent_list_decomposition() -> None:
+    source = _source().model_copy(
+        update={
+            "raw_input": (
+                "In the Status Report Google Sheet, update the following: 1) Find the row for "
+                "'API Gateway Upgrade' and change Status to 'Completed'. 2) Find the row for "
+                "'Mobile App Redesign' and change Status to 'In Progress'. Use spreadsheet "
+                "ss_status, worksheet ws_report."
+            ),
+            "raw_observed_output": None,
+        }
+    )
+    source_frame, candidate_frame = _list_decomposition_frames()
+    source = source.model_copy(
+        update={"raw_observed_output": _raw_output_for_actions(source_frame.outcomes)}
+    )
+
+    class ListDecompositionPipeline(DeterministicSemanticPipeline):
+        async def deconstruct(
+            self,
+            record: InteractionRecord | UserInputRecord,
+            reference_frame: SemanticFrame | None = None,
+        ) -> SemanticFrame:
+            if record.id == source.id:
+                return source_frame
+            if not isinstance(record, InteractionRecord):
+                return candidate_frame.model_copy(update={"interaction_id": record.id})
+            return source_frame.model_copy(update={"interaction_id": record.id})
+
+    pipeline = ListDecompositionPipeline(source_frame.outcomes)
+    pipeline.source_frame = source_frame
+    environment = DeterministicEnvironment(
+        raw_output=_raw_output_for_actions(source_frame.outcomes),
+        baseline_raw_output=_raw_output_for_actions(source_frame.outcomes),
+    )
+    runner = DatasetEvaluationRunner(
+        DatasetAugmentationEngine(pipeline, pipeline), pipeline, environment
+    )
+
+    result = await runner.run(source, operator_ids=("input.surface.punctuation_noise",))
+
+    case = result.cases[0]
+    assert case.candidate.passed
+    assert case.candidate.semantic_normalization is not None
+    assert case.candidate.semantic_normalization.verdict == "equivalent"
+    assert case.target_output is not None
+    assert case.verdict == "no_divergence"
+    assert environment.raw_inputs == [
+        source.raw_input,
+        (
+            "In the Status Report Google Sheet,, update the following: 1) Find the row for "
+            "'API Gateway Upgrade' and change Status to 'Completed'. 2) Find the row for "
+            "'Mobile App Redesign' and change Status to 'In Progress'. Use spreadsheet "
+            "ss_status, worksheet ws_report."
+        ),
+    ]
 
 
 async def test_redacted_runner_evidence_never_persists_environment_secrets(tmp_path: Path) -> None:
