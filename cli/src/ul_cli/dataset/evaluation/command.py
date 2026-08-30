@@ -143,6 +143,7 @@ _MAXIMUM_TARGET_TIMEOUT_SECONDS = 3_600.0
 _MAXIMUM_FINDING_SNAPSHOT_BYTES = 128_000_000
 _SOURCE_PREPARATION_REASON_CODES = {
     "source_semantic_preparation_failed",
+    "source_outcome_projection_failed",
     "source_comparison_surface_incompatible",
 }
 

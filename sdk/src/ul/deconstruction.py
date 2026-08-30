@@ -32,6 +32,7 @@ from ul_core.dataset import (
     SemanticEquivalenceAssessment,
     SemanticFactor,
     SemanticFrame,
+    SemanticRelation,
     UserInputRecord,
 )
 from ul_core.prompts import PromptManager, prompt_provenance
@@ -1300,6 +1301,7 @@ class SemanticModelDeconstructor:
             self._discard_cached_completion(completion)
             raise self._invalid_response(error, operation="deconstruct") from None
         try:
+            frame = self._normalize_self_correction_relation_kind(frame)
             frame = self._ground_self_correction_evidence(record, frame)
             self._validate_evidence(record, frame)
         except SemanticGroundingError as error:
@@ -1767,6 +1769,90 @@ class SemanticModelDeconstructor:
                     {field_name for outcome in frame.outcomes for field_name in outcome.fields}
                 ),
             },
+        )
+
+    @staticmethod
+    def _normalize_self_correction_relation_kind(frame: SemanticFrame) -> SemanticFrame:
+        correction_acts = tuple(
+            act for act in frame.communication_acts if act.kind == "self_correction"
+        )
+        canonical_relations = tuple(
+            relation for relation in frame.relations if relation.kind == "superseded_by"
+        )
+        aliased_relations = tuple(
+            relation for relation in frame.relations if relation.kind == "self_correction"
+        )
+        if len(correction_acts) != 1 or canonical_relations or len(aliased_relations) > 1:
+            return frame
+        correction_act = correction_acts[0]
+        if correction_act.attributes:
+            return frame
+        provisional_factors = tuple(
+            factor
+            for factor in frame.factors
+            if factor.status == "superseded"
+            and not any(factor.id in request.factor_ids for request in frame.request_units)
+        )
+        if len(provisional_factors) != 1:
+            return frame
+        provisional_factor = provisional_factors[0]
+        final_factors = tuple(
+            factor
+            for factor in frame.factors
+            if factor.status != "superseded"
+            and (factor.kind, factor.role) == (provisional_factor.kind, provisional_factor.role)
+            and sum(factor.id in request.factor_ids for request in frame.request_units) == 1
+        )
+        if len(final_factors) != 1:
+            return frame
+        final_factor = final_factors[0]
+        expected_factor_ids = (provisional_factor.id, final_factor.id)
+        if correction_act.factor_ids not in ((), expected_factor_ids):
+            return frame
+        correction_relation = aliased_relations[0] if aliased_relations else None
+        if correction_relation is not None and (
+            correction_relation.source_ids != (provisional_factor.id,)
+            or correction_relation.target_ids != (final_factor.id,)
+        ):
+            return frame
+        if correction_relation is None:
+            relation_id = f"{correction_act.id}:superseded-by"
+            existing_ids = {
+                *(request.id for request in frame.request_units),
+                *(factor.id for factor in frame.factors),
+                *(relation.id for relation in frame.relations),
+                *(act.id for act in frame.communication_acts),
+                *(outcome.id for outcome in frame.outcomes),
+            }
+            if relation_id in existing_ids:
+                return frame
+            correction_relation = SemanticRelation(
+                id=relation_id,
+                evidence=correction_act.evidence,
+                confidence=correction_act.confidence,
+                status=correction_act.status,
+                kind="superseded_by",
+                source_ids=(provisional_factor.id,),
+                target_ids=(final_factor.id,),
+            )
+            normalized_relations = (*frame.relations, correction_relation)
+        else:
+            normalized_relations = tuple(
+                relation.model_copy(update={"kind": "superseded_by"})
+                if relation.id == correction_relation.id
+                else relation
+                for relation in frame.relations
+            )
+        return frame.model_copy(
+            update={
+                "relations": normalized_relations,
+                "communication_acts": tuple(
+                    act.model_copy(update={"factor_ids": expected_factor_ids})
+                    if act.id == correction_act.id
+                    else act
+                    for act in frame.communication_acts
+                ),
+            }
         )
 
     @staticmethod

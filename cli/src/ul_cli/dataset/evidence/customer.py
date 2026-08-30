@@ -60,6 +60,7 @@ def build_source_preparation_failure_evidence(
         reason_code=cast(
             Literal[
                 "source_semantic_preparation_failed",
+                "source_outcome_projection_failed",
                 "source_comparison_surface_incompatible",
             ],
             error.code,
