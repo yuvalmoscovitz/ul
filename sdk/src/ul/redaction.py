@@ -25,6 +25,7 @@ from ul_core.contracts import (
 from ul_core.dataset import (
     InteractionRecord,
     RenderedUserInput,
+    SemanticAllowedSurfaceChange,
     SemanticEquivalenceAssessment,
     SemanticFrame,
     UserInputRecord,
@@ -591,14 +592,22 @@ class RedactedSemanticPipeline:
             raise RedactionBoundaryError() from None
 
     async def verify(
-        self, source_input: str, candidate_input: str
+        self,
+        source_input: str,
+        candidate_input: str,
+        *,
+        allowed_surface_change: SemanticAllowedSurfaceChange = "none",
     ) -> SemanticEquivalenceAssessment:
         try:
             protected_source = self.engine.transform(source_input, location="input").value
             protected_candidate = self.engine.transform(candidate_input, location="input").value
             if not isinstance(protected_source, str) or not isinstance(protected_candidate, str):
                 raise RedactionBoundaryError()
-            assessment = await self._pipeline.verify(protected_source, protected_candidate)
+            assessment = await self._pipeline.verify(
+                protected_source,
+                protected_candidate,
+                allowed_surface_change=allowed_surface_change,
+            )
             return assessment.model_copy(update={"metadata": self._metadata(assessment.metadata)})
         except RedactionBoundaryError:
             raise

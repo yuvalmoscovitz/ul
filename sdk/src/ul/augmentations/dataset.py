@@ -21,6 +21,7 @@ from ul_core.contracts import (
 from ul_core.dataset import (
     InteractionRecord,
     RenderedUserInput,
+    SemanticAllowedSurfaceChange,
     SemanticEquivalenceAssessment,
     SemanticFactor,
     SemanticFrame,
@@ -500,6 +501,9 @@ class DatasetAugmentationEngine:
                     "transformation_prompts": prompt_provenance(*transformation_prompt_names),
                 }
                 augmented_input = rendered_input.text
+                surface_footprint_reasons = _surface_footprint_reasons(
+                    operator.id, record.raw_input, augmented_input
+                )
                 candidate_record = UserInputRecord(
                     id=f"{record.id}:{operator.id}",
                     raw_input=augmented_input,
@@ -551,6 +555,7 @@ class DatasetAugmentationEngine:
                     if (
                         self._equivalence_verifier is not None
                         and operator.allowed_change != "structured_self_correction"
+                        and not surface_footprint_reasons
                         and failure_reasons
                         and all(
                             reason.endswith("differ from the expected frame")
@@ -561,6 +566,7 @@ class DatasetAugmentationEngine:
                             equivalence_assessment = await self._equivalence_verifier.verify(
                                 record.raw_input,
                                 augmented_input,
+                                allowed_surface_change=_allowed_surface_change(operator.id),
                             )
                         except ValueError:
                             failure_reasons = ["semantic equivalence validation failed"]
@@ -573,9 +579,7 @@ class DatasetAugmentationEngine:
                                 ]
                             else:
                                 failure_reasons = ["semantic equivalence check was uncertain"]
-                failure_reasons.extend(
-                    _surface_footprint_reasons(operator.id, record.raw_input, augmented_input)
-                )
+                failure_reasons.extend(surface_footprint_reasons)
                 if augmented_input == record.raw_input:
                     failure_reasons.append("renderer did not change the source input")
                 generated_input_key = _text_key(augmented_input)
@@ -1118,6 +1122,14 @@ def _surface_footprint_reasons(
         if augmented_repetition_count != source_repetition_count + 1:
             return ("rendered input must contain exactly one immediate word repetition",)
     return ()
+
+
+def _allowed_surface_change(operator_id: OperatorId) -> SemanticAllowedSurfaceChange:
+    if operator_id == "input.surface.case_variation":
+        return "single_unprotected_case_change"
+    if operator_id == "input.surface.punctuation_noise":
+        return "single_unprotected_punctuation_insertion"
+    return "none"
 
 
 def _add_typing_noise(

@@ -1269,6 +1269,7 @@ async def test_verify_equivalence_compares_raw_inputs_with_the_configured_model(
         assert body["seed"] == 0
         assert body["response_format"]["json_schema"]["name"] == ("semantic_equivalence_assessment")
         assert "same complete task meaning" in body["messages"][0]["content"]
+        assert "No caller-verified surface edit is declared." in body["messages"][0]["content"]
         assert json.loads(body["messages"][1]["content"]) == {
             "source_input": "Pay invoice AC-100 for $125 USD.",
             "candidate_input": "Can you pay invoice AC-100 for $125 USD?",
@@ -1295,6 +1296,38 @@ async def test_verify_equivalence_compares_raw_inputs_with_the_configured_model(
     assert assessment.verdict == "equivalent"
     assert assessment.verifier_version == "semantic-equivalence-verifier/2.0.0"
     assert assessment.metadata["semantic_generation_id"] == "generation-1"
+    assert assessment.metadata["semantic_equivalence_policy"] == {"allowed_surface_change": "none"}
+    await client.aclose()
+
+
+async def test_verify_equivalence_receives_trusted_case_change_policy() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        system_prompt = body["messages"][0]["content"]
+        assert "exactly one Unicode letter changed case" in system_prompt
+        assert "outside all evidence-grounded semantic value spans" in system_prompt
+        return completion(
+            json.dumps(
+                {
+                    "verdict": "equivalent",
+                    "explanation": "Only caller-verified capitalization changed.",
+                    "deltas": [],
+                }
+            )
+        )
+
+    client = mock_client(handler)
+    async with create_semantic_model_deconstructor(settings(), client=client) as deconstructor:
+        assessment = await deconstructor.verify(
+            "Great news - mark opportunity 006001 Closed Won.",
+            "great news - mark opportunity 006001 Closed Won.",
+            allowed_surface_change="single_unprotected_case_change",
+        )
+
+    assert assessment.verdict == "equivalent"
+    assert assessment.metadata["semantic_equivalence_policy"] == {
+        "allowed_surface_change": "single_unprotected_case_change"
+    }
     await client.aclose()
 
 

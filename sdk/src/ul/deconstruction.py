@@ -28,6 +28,7 @@ from ul_core.dataset import (
     InteractionRecord,
     ObservedOutcome,
     RenderedUserInput,
+    SemanticAllowedSurfaceChange,
     SemanticEquivalenceAssessment,
     SemanticFactor,
     SemanticFrame,
@@ -36,6 +37,19 @@ from ul_core.dataset import (
 from ul_core.prompts import PromptManager, prompt_provenance
 
 _PROMPTS = PromptManager.instance()
+_ALLOWED_SURFACE_CHANGE_RULES: dict[SemanticAllowedSurfaceChange, str] = {
+    "none": "No caller-verified surface edit is declared.",
+    "single_unprotected_case_change": (
+        "The caller deterministically verified exactly one Unicode letter changed case outside "
+        "all evidence-grounded semantic value spans. You must treat that casing edit itself as "
+        "harmless."
+    ),
+    "single_unprotected_punctuation_insertion": (
+        "The caller deterministically verified exactly one punctuation character was inserted "
+        "outside all evidence-grounded semantic value spans. Treat that insertion itself as "
+        "harmless and do not report it as a delta."
+    ),
+}
 _SEMANTIC_CACHE_VERSION = "semantic-request-cache/1"
 _MAXIMUM_SEMANTIC_CACHE_ENTRIES = 256
 _MAXIMUM_SEMANTIC_CACHE_BYTES = 16 * 1024 * 1024
@@ -1359,6 +1373,8 @@ class SemanticModelDeconstructor:
         self,
         source_input: str,
         candidate_input: str,
+        *,
+        allowed_surface_change: SemanticAllowedSurfaceChange = "none",
     ) -> SemanticEquivalenceAssessment:
         untrusted_payload = self._bounded_json(
             {"source_input": source_input, "candidate_input": candidate_input}
@@ -1374,7 +1390,10 @@ class SemanticModelDeconstructor:
             schema_name="semantic_equivalence_assessment",
             schema=SemanticEquivalenceAssessment.model_json_schema(mode="validation"),
             strict_schema=True,
-            system_prompt=_PROMPTS.get_prompt("semantic.verify"),
+            system_prompt=_PROMPTS.get_prompt(
+                "semantic.verify",
+                allowed_surface_change_rule=_ALLOWED_SURFACE_CHANGE_RULES[allowed_surface_change],
+            ),
             untrusted_payload=untrusted_payload,
         )
         try:
@@ -1386,6 +1405,9 @@ class SemanticModelDeconstructor:
                     "metadata": {
                         **self._generation_metadata(completion),
                         "requested_model": self.settings.equivalence_model,
+                        "semantic_equivalence_policy": {
+                            "allowed_surface_change": allowed_surface_change
+                        },
                         "semantic_reasoning": _reasoning_metadata(
                             self.settings.equivalence_reasoning, "low"
                         ),
