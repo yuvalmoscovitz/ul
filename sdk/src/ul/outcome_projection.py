@@ -27,6 +27,10 @@ class OutcomeProjectionError(ValueError):
         self.reason = reason
 
 
+class _JsonStructureLimitError(ValueError):
+    pass
+
+
 class OutcomeSpreadProjection(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
@@ -152,14 +156,8 @@ class OutcomeProjection(BaseModel):
         try:
             _validate_json_structure(normalized)
             encoded_size = _encoded_json_size(normalized)
-        except RecursionError:
-            raise OutcomeProjectionError("outcome", "", "exceeds structural limits") from None
-        except OverflowError:
-            raise OutcomeProjectionError(
-                "outcome",
-                "",
-                f"exceeds the {_MAXIMUM_NORMALIZED_BYTES}-byte normalized-result limit",
-            ) from None
+        except _JsonStructureLimitError as error:
+            raise OutcomeProjectionError("outcome", "", str(error)) from None
         except UnicodeEncodeError:
             raise OutcomeProjectionError("outcome", "", "contains invalid Unicode") from None
         except (TypeError, ValueError):
@@ -262,17 +260,11 @@ def _compose_outcome(
         else:
             try:
                 _validate_json_structure(spread_object)
-            except RecursionError:
+            except _JsonStructureLimitError as error:
                 raise OutcomeProjectionError(
                     "compose.spread",
                     spread.selector,
-                    "exceeds structural limits",
-                ) from None
-            except OverflowError:
-                raise OutcomeProjectionError(
-                    "compose.spread",
-                    spread.selector,
-                    f"exceeds the {_MAXIMUM_NORMALIZED_BYTES}-byte normalized-result limit",
+                    str(error),
                 ) from None
             spread_fields = spread_object
         collisions = normalized.keys() & spread_fields.keys()
@@ -408,27 +400,43 @@ def _flatten_fields(arguments: dict[str, JsonValue]) -> dict[str, JsonValue]:
 
 
 def _validate_json_structure(value: JsonValue) -> None:
-    pending: list[Iterator[tuple[JsonValue, int, int]]] = [iter(((value, 0, 0),))]
+    pending: list[tuple[Iterator[tuple[JsonValue, int]], int]] = [(iter(((value, 0),)), 0)]
     node_count = 0
     character_count = 0
     while pending:
+        children, depth = pending[-1]
         try:
-            current, depth, key_characters = next(pending[-1])
+            current, key_characters = next(children)
         except StopIteration:
             pending.pop()
             continue
         node_count += 1
-        if depth > _MAXIMUM_COMPOSE_DEPTH or node_count > _MAXIMUM_COMPOSE_NODES:
-            raise RecursionError
+        if depth > _MAXIMUM_COMPOSE_DEPTH:
+            raise _JsonStructureLimitError(
+                f"has depth {depth}, exceeding the "
+                f"{_MAXIMUM_COMPOSE_DEPTH}-level normalized-result limit"
+            )
+        if node_count > _MAXIMUM_COMPOSE_NODES:
+            raise _JsonStructureLimitError(
+                f"has {node_count} nodes, exceeding the "
+                f"{_MAXIMUM_COMPOSE_NODES}-node normalized-result limit"
+            )
         character_count += key_characters
         if isinstance(current, str):
             character_count += len(current)
         if character_count > _MAXIMUM_NORMALIZED_BYTES:
-            raise OverflowError
+            raise _JsonStructureLimitError(
+                f"exceeds the {_MAXIMUM_NORMALIZED_BYTES}-byte normalized-result limit"
+            )
         if isinstance(current, dict):
-            pending.append(((nested, depth + 1, len(key)) for key, nested in current.items()))
+            pending.append(
+                (
+                    ((nested, len(key)) for key, nested in current.items()),
+                    depth + 1,
+                )
+            )
         elif isinstance(current, list):
-            pending.append((nested, depth + 1, 0) for nested in current)
+            pending.append((((nested, 0) for nested in current), depth + 1))
 
 
 def _encoded_json_size(value: JsonValue) -> int:
