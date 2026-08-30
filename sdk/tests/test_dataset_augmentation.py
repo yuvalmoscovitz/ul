@@ -19,6 +19,7 @@ from ul_core.dataset import (
     ObservedOutcome,
     RenderedUserInput,
     RequestUnit,
+    SemanticAllowedSurfaceChange,
     SemanticDelta,
     SemanticEquivalenceAssessment,
     SemanticFactor,
@@ -323,11 +324,17 @@ class DeterministicEquivalenceVerifier:
     def __init__(self, assessment: SemanticEquivalenceAssessment | None) -> None:
         self.assessment = assessment
         self.calls: list[tuple[str, str]] = []
+        self.allowed_surface_changes: list[SemanticAllowedSurfaceChange] = []
 
     async def verify(
-        self, source_input: str, candidate_input: str
+        self,
+        source_input: str,
+        candidate_input: str,
+        *,
+        allowed_surface_change: SemanticAllowedSurfaceChange = "none",
     ) -> SemanticEquivalenceAssessment:
         self.calls.append((source_input, candidate_input))
+        self.allowed_surface_changes.append(allowed_surface_change)
         if self.assessment is None:
             raise ValueError("invalid model evidence")
         return self.assessment
@@ -1320,6 +1327,79 @@ async def test_case_variation_avoids_protected_values_and_expanding_case_mapping
     assert result.candidates[0].augmented_input == "TEST-ID ßAuftrag ausführen."
 
 
+@pytest.mark.parametrize(
+    ("operator_id", "allowed_surface_change", "frame_drift"),
+    [
+        (
+            "input.surface.case_variation",
+            "single_unprotected_case_change",
+            "reversed_relation",
+        ),
+        (
+            "input.surface.punctuation_noise",
+            "single_unprotected_punctuation_insertion",
+            "extra_style_label",
+        ),
+    ],
+)
+async def test_surface_operator_passes_trusted_change_policy_to_equivalence_fallback(
+    operator_id: str,
+    allowed_surface_change: SemanticAllowedSurfaceChange,
+    frame_drift: str,
+) -> None:
+    record = source_record()
+    original_frame = source_frame(record)
+    candidate_frame = source_frame(record, identifier_prefix="candidate").model_copy(
+        update={"outcomes": ()}
+    )
+    if frame_drift == "reversed_relation":
+        relation = candidate_frame.relations[0]
+        candidate_frame = candidate_frame.model_copy(
+            update={
+                "relations": (
+                    relation.model_copy(
+                        update={
+                            "source_ids": relation.target_ids,
+                            "target_ids": relation.source_ids,
+                        }
+                    ),
+                )
+            }
+        )
+    else:
+        candidate_frame = candidate_frame.model_copy(
+            update={
+                "communication_acts": (
+                    *candidate_frame.communication_acts,
+                    CommunicationAct(
+                        id="candidate:verbose",
+                        evidence=evidence("input"),
+                        confidence=1,
+                        status="explicit",
+                        kind="verbose",
+                    ),
+                )
+            }
+        )
+    model = DeterministicSemanticModel({record.id: original_frame}, candidate_frame)
+    assessment = SemanticEquivalenceAssessment(
+        verdict="equivalent",
+        explanation="Only the caller-verified surface edit changed.",
+        verifier_version="test/1",
+        metadata={"model": "test/equivalence"},
+    )
+    verifier = DeterministicEquivalenceVerifier(assessment)
+
+    result = await DatasetAugmentationEngine(model, model, verifier).augment(
+        (record,), operator_ids=(operator_id,)
+    )
+
+    candidate = result.candidates[0]
+    assert candidate.passed
+    assert candidate.semantic_equivalence_assessment == assessment
+    assert verifier.allowed_surface_changes == [allowed_surface_change]
+
+
 async def test_punctuation_noise_avoids_punctuation_inside_semantic_values() -> None:
     record = source_record().model_copy(update={"raw_input": "Pay $1,000 at 12:30"})
     original_frame = source_frame(record)
@@ -1938,6 +2018,7 @@ async def test_engine_uses_equivalence_only_after_strict_frame_mismatch(
     assert candidate.passed is expected_passed
     assert candidate.semantic_equivalence_assessment == assessment
     assert verifier.calls == [(record.raw_input, candidate.augmented_input)]
+    assert verifier.allowed_surface_changes == ["none"]
     if expected_reason is not None:
         assert expected_reason in candidate.failure_reasons
 

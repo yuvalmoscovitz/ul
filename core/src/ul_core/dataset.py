@@ -504,6 +504,13 @@ class SemanticDelta(_StrictULModel):
         return self
 
 
+SemanticAllowedSurfaceChange = Literal[
+    "none",
+    "single_unprotected_case_change",
+    "single_unprotected_punctuation_insertion",
+]
+
+
 class SemanticEquivalenceAssessment(_StrictULModel):
     schema_version: Literal["1.0.0"] = "1.0.0"
     verdict: Literal["equivalent", "different", "uncertain"]

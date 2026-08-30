@@ -6,6 +6,7 @@ from typing import Protocol, runtime_checkable
 from ul_core.dataset import (
     InteractionRecord,
     RenderedUserInput,
+    SemanticAllowedSurfaceChange,
     SemanticEquivalenceAssessment,
     SemanticFrame,
     UserInputRecord,
@@ -70,6 +71,8 @@ class SemanticEquivalenceVerifier(Protocol):
         self,
         source_input: str,
         candidate_input: str,
+        *,
+        allowed_surface_change: SemanticAllowedSurfaceChange = "none",
     ) -> Awaitable[SemanticEquivalenceAssessment]: ...
 
 
