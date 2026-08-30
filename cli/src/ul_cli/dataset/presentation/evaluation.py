@@ -52,6 +52,7 @@ def print_dataset_plan(
     fixture_version: str | None,
     invariant_suite: DatasetInvariantSuite | None,
     output: Path | None,
+    augmentations_input: Path | None,
     augmentations_output: Path | None,
     semantic_provider_id: str,
     semantic_endpoint_sha256: str,
@@ -184,7 +185,9 @@ def print_dataset_plan(
         )
     if output is not None:
         console.print(f"Evidence destination: {output}")
-    if augmentations_output is None:
+    if augmentations_input is not None:
+        print_dataset_plain(f"Reusing accepted augmentations: {augmentations_input}")
+    elif augmentations_output is None:
         console.print(
             "Augmentations will not be saved. Interrupted generation may repeat model calls."
         )

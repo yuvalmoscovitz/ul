@@ -23,6 +23,7 @@ from ul import (
     DatasetSemanticSettings,
     EvaluatorModelCompatibilityError,
     EvaluatorModelPreflight,
+    InteractionRecord,
     OpenAICompatibleDatasetSettings,
     OpenRouterDatasetSettings,
     ProviderDiagnosticError,
@@ -52,6 +53,7 @@ from ul_cli.dataset.progress import (
     create_campaign_progress_runtime,
 )
 from ul_cli.dataset_augmentation_ledger import (
+    DatasetAugmentationGenerationContext,
     DatasetAugmentationLedger,
     DatasetAugmentationLedgerSemanticSettings,
     create_dataset_augmentation_generation_context,
@@ -174,6 +176,68 @@ def _source_outcome_projection_sha256(
     if projection is None and target_config is not None:
         projection = target_config.outcome
     return projection.digest if projection is not None else None
+
+
+def _load_complete_augmentation_input(
+    path: Path | None,
+    *,
+    expected_context: DatasetAugmentationGenerationContext,
+    selected_records: tuple[InteractionRecord, ...],
+    recorded_sha256: str | None,
+) -> tuple[dict[str, DatasetAugmentationResult], str | None]:
+    if path is None:
+        return {}, None
+    snapshot = read_augmentation_ledger(
+        path,
+        expected_context=expected_context,
+        selected_records=selected_records,
+    )
+    expected_source_ids = frozenset(record.id for record in selected_records)
+    if snapshot.processed_source_ids != expected_source_ids:
+        raise ValueError("augmentation input must contain every selected interaction exactly once")
+    if recorded_sha256 is not None and recorded_sha256 != snapshot.raw_ledger_sha256:
+        raise ValueError("augmentation input digest does not match the recorded campaign")
+    return (
+        {record.source.id: record.augmentation for record in snapshot.records},
+        snapshot.raw_ledger_sha256,
+    )
+
+
+def _restore_recorded_augmentation_input(
+    requested: Path | None,
+    recorded_manifest: DatasetRunManifest | None,
+) -> Path | None:
+    if requested is not None or recorded_manifest is None:
+        return requested
+    recorded_path = recorded_manifest.effective_command.augmentations_input_path
+    return Path(recorded_path) if recorded_path is not None else None
+
+
+def _resolve_augmentation_output(
+    *,
+    augmentations_input: Path | None,
+    augmentations_output: Path | None,
+    no_save_augmentations: bool,
+    evidence_output: Path | None,
+) -> Path | None:
+    if augmentations_output is not None and no_save_augmentations:
+        raise typer.BadParameter(
+            "--augmentations-output cannot be used with --no-save-augmentations",
+            param_hint="--augmentations-output",
+        )
+    if augmentations_input is not None and augmentations_output is not None:
+        raise typer.BadParameter(
+            "--augmentations-input cannot be combined with --augmentations-output",
+            param_hint="--augmentations-input",
+        )
+    if (
+        augmentations_output is not None
+        or no_save_augmentations
+        or augmentations_input is not None
+        or evidence_output is None
+    ):
+        return augmentations_output
+    return default_augmentations_output(evidence_output)
 
 
 def _reconcile_source_preparation_failures(
@@ -374,6 +438,21 @@ def evaluate_dataset(
         Path | None,
         typer.Option(help="New JSONL file for complete local evidence."),
     ] = None,
+    augmentations_input: Annotated[
+        Path | None,
+        typer.Option(
+            "--augmentations-input",
+            exists=True,
+            file_okay=True,
+            dir_okay=False,
+            readable=True,
+            resolve_path=True,
+            help=(
+                "Reuse a complete private augmentation JSONL from an earlier UL campaign "
+                "without regenerating candidates."
+            ),
+        ),
+    ] = None,
     augmentations_output: Annotated[
         Path | None,
         typer.Option(
@@ -570,8 +649,10 @@ def evaluate_dataset(
     --confirm-request-isolation --confirm-safe-test-target --dry-run
 
     Discover operators: ul augmentations list --mode dataset_variation
+    Augmentation reuse: --augmentations-input PATH
     Augmentation retention: --augmentations-output PATH or --no-save-augmentations
     """
+    augmentations_input_was_explicit = augmentations_input is not None
     augmentations_output_was_explicit = augmentations_output is not None
     redaction_state_was_explicit = redaction_state is not None
     recorded_manifest_for_resume = None
@@ -693,11 +774,9 @@ def evaluate_dataset(
             "Historical dataset output is grounding evidence, not an expected answer.",
             param_hint="--evaluation-mode",
         )
-    if augmentations_output is not None and no_save_augmentations:
-        raise typer.BadParameter(
-            "--augmentations-output cannot be used with --no-save-augmentations",
-            param_hint="--augmentations-output",
-        )
+    augmentations_input = _restore_recorded_augmentation_input(
+        augmentations_input, recorded_manifest_for_resume
+    )
     if resume is not None:
         if output is not None and output.resolve() != resume.resolve():
             raise typer.BadParameter(
@@ -706,8 +785,12 @@ def evaluate_dataset(
             )
         if output is None:
             output = resume
-    if not no_save_augmentations and augmentations_output is None and output is not None:
-        augmentations_output = default_augmentations_output(output)
+    augmentations_output = _resolve_augmentation_output(
+        augmentations_input=augmentations_input,
+        augmentations_output=augmentations_output,
+        no_save_augmentations=no_save_augmentations,
+        evidence_output=output,
+    )
     if (
         output is not None
         and augmentations_output is not None
@@ -1033,7 +1116,25 @@ def evaluate_dataset(
 
     resume_evidence: DatasetResumeEvidence | None = None
     saved_augmentations: dict[str, DatasetAugmentationResult] = {}
+    augmentations_input_sha256: str | None = None
     skipped_count = 0
+    try:
+        saved_augmentations, augmentations_input_sha256 = _load_complete_augmentation_input(
+            augmentations_input,
+            expected_context=augmentation_generation_context,
+            selected_records=all_selected_records,
+            recorded_sha256=(
+                recorded_manifest_for_resume.effective_command.augmentations_input_sha256
+                if recorded_manifest_for_resume is not None
+                else None
+            ),
+        )
+    except (OSError, ValueError) as error:
+        message = str(error) if isinstance(error, ValueError) else error.__class__.__name__
+        raise typer.BadParameter(
+            f"cannot safely reuse augmentation input ({message})",
+            param_hint="--augmentations-input",
+        ) from None
     if resume is not None:
         assert output is not None
         assert run_context is not None
@@ -1092,7 +1193,7 @@ def evaluate_dataset(
             allow_environment_network=allow_environment_network,
             confirm_test_environment=confirm_test_environment,
             allow_insecure_http=allow_insecure_http,
-            save_augmentations=not no_save_augmentations,
+            save_augmentations=augmentations_output is not None,
             semantic_provider_type=settings.semantic_provider_type,
             semantic_base_url=settings.semantic_base_url,
             semantic_live_calls=settings.live_calls,
@@ -1148,6 +1249,17 @@ def evaluate_dataset(
                     else None
                 )
             ),
+            augmentations_input_path=(
+                str(augmentations_input.resolve())
+                if augmentations_input is not None
+                and (recorded_manifest_for_resume is None or augmentations_input_was_explicit)
+                else (
+                    recorded_manifest_for_resume.effective_command.augmentations_input_path
+                    if recorded_manifest_for_resume is not None
+                    else None
+                )
+            ),
+            augmentations_input_sha256=augmentations_input_sha256,
             http_target_confirmation=_recorded_or_resolved_http_confirmation(
                 resolved_http_target, recorded_manifest_for_resume
             ),
@@ -1342,6 +1454,7 @@ def evaluate_dataset(
             ),
             invariant_suite=invariant_suite,
             output=output,
+            augmentations_input=augmentations_input,
             augmentations_output=augmentations_output,
             semantic_provider_id=settings.semantic_provider_id,
             semantic_endpoint_sha256=settings.semantic_endpoint_sha256,
@@ -2066,6 +2179,16 @@ def _effective_command_incompatibility_reason(
             "redaction_state_sha256",
             left.redaction_state_sha256,
             right.redaction_state_sha256,
+        ),
+        (
+            "augmentations_input_path",
+            left.augmentations_input_path,
+            right.augmentations_input_path,
+        ),
+        (
+            "augmentations_input_sha256",
+            left.augmentations_input_sha256,
+            right.augmentations_input_sha256,
         ),
         (
             "augmentations_output_path",
