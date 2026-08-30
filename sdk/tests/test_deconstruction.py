@@ -1284,6 +1284,19 @@ async def test_self_correction_evidence_is_grounded_to_the_exact_visible_repair(
         "final",
     )
 
+    synthesized_relation_id = f"{relationless.communication_acts[0].id}:superseded-by"
+    colliding_request = relationless.request_units[0].model_copy(
+        update={"id": synthesized_relation_id}
+    )
+    colliding_frame = relationless.model_copy(update={"request_units": (colliding_request,)})
+
+    collision_rejected = SemanticModelDeconstructor._normalize_self_correction_relation_kind(
+        colliding_frame
+    )
+
+    assert collision_rejected.relations == ()
+    assert collision_rejected.communication_acts[0].factor_ids == ()
+
 
 async def test_verify_equivalence_compares_raw_inputs_with_the_configured_model() -> None:
     def handler(request: httpx.Request) -> httpx.Response:

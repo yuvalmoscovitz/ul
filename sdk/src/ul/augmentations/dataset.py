@@ -22,6 +22,7 @@ from ul_core.dataset import (
     EvidenceReference,
     InteractionRecord,
     RenderedUserInput,
+    RequestUnit,
     SemanticAllowedSurfaceChange,
     SemanticEquivalenceAssessment,
     SemanticFactor,
@@ -880,7 +881,12 @@ def _select_self_correction_factor(
                     act_requests_by_factor_id[factor.id][0].id
                 ]
             )
-            or _recorded_action_contains_unique_factor_value(record, factor)
+            or _recorded_action_contains_unique_factor_value(
+                record,
+                frame,
+                act_requests_by_factor_id[factor.id][0],
+                factor,
+            )
         )
         and (quote := _unique_input_quote(factor)) is not None
         and record.raw_input.count(quote) == 1
@@ -897,7 +903,10 @@ def _select_self_correction_factor(
 
 
 def _recorded_action_contains_unique_factor_value(
-    record: InteractionRecord, factor: SemanticFactor
+    record: InteractionRecord,
+    frame: SemanticFrame,
+    request: RequestUnit,
+    factor: SemanticFactor,
 ) -> bool:
     observed_output = record.raw_observed_output
     action_records: tuple[Mapping[str, JsonValue], ...] = ()
@@ -912,10 +921,34 @@ def _recorded_action_contains_unique_factor_value(
                     for action in raw_actions
                     if isinstance(action, dict) and isinstance(action.get("action"), str)
                 )
+    request_identifier_values = tuple(
+        identifier_factor.value
+        for identifier_factor in frame.factors
+        if identifier_factor.id in request.factor_ids
+        and identifier_factor.kind == "identifier"
+        and isinstance(identifier_factor.value, (str, int, float))
+        and not isinstance(identifier_factor.value, bool)
+    )
+    if not request_identifier_values:
+        return False
+    associated_actions = tuple(
+        action
+        for action in action_records
+        if all(
+            sum(
+                type(identifier_value) is type(value) and identifier_value == value
+                for field_name, value in action.items()
+                if field_name == "id" or field_name.endswith("_id")
+            )
+            == 1
+            for identifier_value in request_identifier_values
+        )
+    )
+    if len(associated_actions) != 1:
+        return False
     matching_fields = tuple(
-        (action_index, field_name)
-        for action_index, action in enumerate(action_records)
-        for field_name, value in action.items()
+        field_name
+        for field_name, value in associated_actions[0].items()
         if field_name != "action"
         and field_name != "id"
         and not field_name.endswith("_id")
@@ -1118,8 +1151,15 @@ def _structured_self_correction_difference_reasons(
             final_quote
         )
     ]
-    if not any(character.isalpha() for character in between_values):
-        return ("correction language must appear between provisional and final values",)
+    correction_words = tuple(re.findall(r"[A-Za-z]+", between_values.casefold()))
+    if correction_words not in {
+        ("actually",),
+        ("correction",),
+        ("i", "mean"),
+        ("rather",),
+        ("sorry",),
+    }:
+        return ("correction language must contain only a recognized correction cue",)
     if not all(
         _element_evidence_spans_values(element, provisional_quote, final_quote)
         for element in (correction_act, correction_relation)
@@ -1182,9 +1222,11 @@ def _normalize_planned_self_correction_frame(
     provisional_id = f"{correction_act.id}:provisional"
     relation_id = f"{correction_act.id}:superseded-by"
     existing_ids = {
+        *(request.id for request in frame.request_units),
         *(factor.id for factor in frame.factors),
         *(relation.id for relation in frame.relations),
         *(act.id for act in frame.communication_acts),
+        *(outcome.id for outcome in frame.outcomes),
     }
     if provisional_id in existing_ids or relation_id in existing_ids:
         return frame

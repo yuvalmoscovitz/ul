@@ -1817,7 +1817,14 @@ class SemanticModelDeconstructor:
             return frame
         if correction_relation is None:
             relation_id = f"{correction_act.id}:superseded-by"
-            if any(relation.id == relation_id for relation in frame.relations):
+            existing_ids = {
+                *(request.id for request in frame.request_units),
+                *(factor.id for factor in frame.factors),
+                *(relation.id for relation in frame.relations),
+                *(act.id for act in frame.communication_acts),
+                *(outcome.id for outcome in frame.outcomes),
+            }
+            if relation_id in existing_ids:
                 return frame
             correction_relation = SemanticRelation(
                 id=relation_id,

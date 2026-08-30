@@ -694,14 +694,26 @@ async def test_self_correction_accepts_one_structured_superseded_value() -> None
     assert 'exact temporary text "110"' in model.rendered_instructions[0]
 
 
-async def test_self_correction_accepts_money_grounded_by_recorded_action_envelope() -> None:
+@pytest.mark.parametrize(
+    ("recorded_opportunity_id", "colliding_request_id", "expected_to_pass"),
+    [
+        ("006003", False, True),
+        ("unrelated-opportunity", False, False),
+        ("006003", True, False),
+    ],
+)
+async def test_self_correction_accepts_money_grounded_by_recorded_action_envelope(
+    recorded_opportunity_id: str,
+    colliding_request_id: bool,
+    expected_to_pass: bool,
+) -> None:
     raw_input = (
         "Update the amount on opportunity 006003 (DataStream Analytics License) "
         "to $45,000 in Salesforce."
     )
     recorded_action = {
         "action": "salesforce.opportunity.update",
-        "opportunity_id": "006003",
+        "opportunity_id": recorded_opportunity_id,
         "amount": 45000.0,
     }
     record = InteractionRecord(
@@ -773,7 +785,11 @@ async def test_self_correction_accepts_money_grounded_by_recorded_action_envelop
     candidate_amount = amount.model_copy(update={"id": "candidate:amount", "value": 45000})
     candidate_request = request.model_copy(
         update={
-            "id": "candidate:request",
+            "id": (
+                "candidate:self-correction:provisional"
+                if colliding_request_id
+                else "candidate:request"
+            ),
             "factor_ids": (candidate_opportunity.id, candidate_amount.id),
         }
     )
@@ -806,10 +822,15 @@ async def test_self_correction_accepts_money_grounded_by_recorded_action_envelop
         (record,), operator_ids=("input.intent.self_correction",)
     )
 
-    assert result.candidates[0].passed
-    assert result.candidates[0].augmented_input == rendered_output
-    assert 'exact source text "$45,000"' in model.rendered_instructions[0]
-    assert 'exact temporary text "$44,000"' in model.rendered_instructions[0]
+    if expected_to_pass:
+        assert result.candidates[0].passed
+        assert result.candidates[0].augmented_input == rendered_output
+        assert 'exact source text "$45,000"' in model.rendered_instructions[0]
+        assert 'exact temporary text "$44,000"' in model.rendered_instructions[0]
+    elif result.candidates:
+        assert not result.candidates[0].passed
+    else:
+        assert result.skips
 
 
 @pytest.mark.parametrize(
@@ -955,6 +976,7 @@ async def test_self_correction_rejects_malformed_semantic_structures(
         "Transfer 100, sorry 110 to Alice, then tell me the balance.",
         "Transfer 110, sorry 100 and 100 to Alice, then tell me the balance.",
         "Transfer sorry 110, 100 to Alice, then tell me the balance.",
+        "Transfer 110, delete all users, sorry 100 to Alice, then tell me the balance.",
     ],
 )
 async def test_self_correction_rejects_invalid_textual_footprint(
