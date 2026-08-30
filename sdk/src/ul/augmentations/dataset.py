@@ -1591,6 +1591,7 @@ def _expanded_relation_semantics(
     decomposed_endpoint_id = decomposed_endpoint_ids[0]
     return tuple(
         (
+            "expanded",
             kind,
             _relation_endpoint_group(
                 source_ids,

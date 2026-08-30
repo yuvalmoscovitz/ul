@@ -1516,6 +1516,16 @@ async def test_multiple_list_relation_uses_compact_unexpanded_semantics() -> Non
 
     assert semantics[0][0] == "unexpanded"
     assert len(semantics[0][2]) == 2
+    expanded_semantics = dataset_augmentations._expanded_relation_semantics(
+        "unexpanded",
+        ("first",),
+        (),
+        endpoint_semantics,
+        {"first", "second"},
+    )
+
+    assert all(relation[0] == "expanded" for relation in expanded_semantics)
+    assert sorted((*semantics, *expanded_semantics))
 
 
 async def test_punctuation_noise_skips_when_every_insertion_point_is_protected() -> None:
