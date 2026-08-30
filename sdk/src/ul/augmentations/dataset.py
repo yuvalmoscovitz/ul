@@ -1636,9 +1636,10 @@ def _unexpanded_relation_semantics(
     endpoint_semantics: Mapping[str, tuple[tuple[object, ...], ...]],
 ) -> tuple[object, ...]:
     return (
+        "unexpanded",
         kind,
-        _relation_endpoint_group(source_ids, endpoint_semantics),
-        _relation_endpoint_group(target_ids, endpoint_semantics),
+        tuple(sorted(endpoint_semantics[endpoint_id] for endpoint_id in source_ids)),
+        tuple(sorted(endpoint_semantics[endpoint_id] for endpoint_id in target_ids)),
     )
 
 

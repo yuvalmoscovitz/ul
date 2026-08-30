@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterator
-from typing import Literal
+from typing import Literal, cast
 
 import pytest
 import ul.augmentations.dataset as dataset_augmentations
@@ -1493,6 +1493,29 @@ async def test_relation_decomposition_fails_closed_before_oversized_expansion(
         )
         == ()
     )
+    relation_semantics = cast(
+        tuple[tuple[object, ...], ...], dataset_augmentations._canonical_semantics(frame)[2]
+    )
+    assert all(relation[0] == "unexpanded" for relation in relation_semantics)
+    assert all(len(relation[2]) == 1 for relation in relation_semantics)
+
+
+async def test_multiple_list_relation_uses_compact_unexpanded_semantics() -> None:
+    endpoint_semantics = {
+        "first": tuple(("factor", str(index)) for index in range(101)),
+        "second": tuple(("factor", str(index)) for index in range(101, 202)),
+    }
+
+    semantics = dataset_augmentations._expanded_relation_semantics(
+        "associated_with",
+        ("first", "second"),
+        (),
+        endpoint_semantics,
+        {"first", "second"},
+    )
+
+    assert semantics[0][0] == "unexpanded"
+    assert len(semantics[0][2]) == 2
 
 
 async def test_punctuation_noise_skips_when_every_insertion_point_is_protected() -> None:
