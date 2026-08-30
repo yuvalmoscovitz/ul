@@ -1672,6 +1672,54 @@ async def test_declared_projection_compares_recorded_and_fresh_responses() -> No
     assert result.augmentation.source_records == (source,)
 
 
+@pytest.mark.parametrize("action_count", [12, 14])
+async def test_declared_projection_accepts_bounded_action_arrays_from_source_and_environment(
+    action_count: int,
+) -> None:
+    projection = OutcomeProjection.model_validate({"compose": {"fields": {"actions": "/actions"}}})
+    actions = [
+        {
+            "action": "slack.message",
+            "path": "data/slack/slack.json",
+            "pointer": f"/messages/C006/{index}",
+            "text": f"Message {index}: " + "x" * 60,
+            "channel_pointer": f"/messages/C006/{index}",
+            "target": "unread emails",
+            "procedure": "SOP-FIN-AP-004",
+        }
+        for index in range(action_count)
+    ]
+    projected_response = {"actions": actions}
+    source = _source().model_copy(update={"raw_observed_output": projected_response})
+    semantic_pipeline = DeterministicSemanticPipeline(())
+    projected_deconstructor = ProjectedResponseSemanticDeconstructor(semantic_pipeline)
+    target = DeterministicEnvironment(
+        raw_output=projected_response,
+        baseline_raw_output=projected_response,
+    )
+    runner = DatasetEvaluationRunner(
+        DatasetAugmentationEngine(
+            projected_deconstructor,
+            semantic_pipeline,
+            semantic_pipeline,
+        ),
+        projected_deconstructor,
+        target,
+        source_outcome_projection=projection,
+    )
+
+    result = await runner.run(source)
+
+    assert result.baseline.verdict == "no_divergence"
+    assert result.cases[0].verdict == "no_divergence"
+    baseline_output = result.baseline.trial_set.trials[0].target_output
+    variation_output = result.cases[0].trial_set.trials[0].target_output
+    assert baseline_output is not None
+    assert variation_output is not None
+    assert baseline_output.raw_output == projected_response
+    assert variation_output.raw_output == projected_response
+
+
 async def test_invalid_recorded_projection_fails_before_target_delivery() -> None:
     projection = OutcomeProjection(complete_result="/missing")
     semantic_pipeline = DeterministicSemanticPipeline(())
