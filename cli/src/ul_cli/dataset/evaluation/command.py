@@ -245,6 +245,32 @@ def _close_trial_journal(trial_journal: DatasetTrialJournal | None) -> None:
         trial_journal.close()
 
 
+def _validate_resume_augmentation_durability(
+    manifest: DatasetRunManifest,
+    trial_journal: DatasetTrialJournal,
+    resume_evidence: DatasetResumeEvidence | None,
+) -> None:
+    command = manifest.effective_command
+    if command.save_augmentations or command.augmentations_input_path is not None:
+        return
+    source_failure_ids = {
+        failure.interaction_id
+        for failure in (
+            resume_evidence.source_preparation_failures if resume_evidence is not None else ()
+        )
+    }
+    terminal_interaction_ids = {
+        unit.interaction_id
+        for unit in manifest.work_plan
+        if unit.id in trial_journal.snapshot.terminal_states
+    }
+    if terminal_interaction_ids - source_failure_ids:
+        raise ValueError(
+            "resume_incompatible:augmentation_not_durable; start a new output with "
+            "augmentation retention enabled"
+        )
+
+
 def _reconcile_source_preparation_failures(
     trial_journal: DatasetTrialJournal,
     resume_evidence: DatasetResumeEvidence,
@@ -1328,27 +1354,9 @@ def evaluate_dataset(
                         )
                 elif resolve_quarantine_after is not None:
                     raise ValueError("resume_incompatible:no_quarantined_trials_to_resolve")
-                source_failure_ids: set[str] = (
-                    {
-                        failure.interaction_id
-                        for failure in resume_evidence.source_preparation_failures
-                    }
-                    if resume_evidence is not None
-                    else set()
+                _validate_resume_augmentation_durability(
+                    recorded_manifest, trial_journal, resume_evidence
                 )
-                terminal_interaction_ids = {
-                    unit.interaction_id
-                    for unit in recorded_manifest.work_plan
-                    if unit.id in trial_journal.snapshot.terminal_states
-                }
-                if (
-                    not recorded_manifest.effective_command.save_augmentations
-                    and terminal_interaction_ids - source_failure_ids
-                ):
-                    raise ValueError(
-                        "resume_incompatible:augmentation_not_durable; start a new output with "
-                        "augmentation retention enabled"
-                    )
         except (OSError, ValueError) as error:
             if trial_journal is not None:
                 trial_journal.close()

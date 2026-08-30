@@ -336,6 +336,78 @@ def test_resume_fails_closed_when_completed_trials_have_no_durable_augmentation(
     assert "resume_incompatible:augmentation_not_durable" in result.output
 
 
+def test_resume_accepts_completed_trials_with_durable_augmentation_input(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    evidence = tmp_path / "evidence.jsonl"
+    augmentations_input = tmp_path / "accepted.augmentations.jsonl"
+    evaluation = _evaluation_result("interaction-1")
+    settings = _settings()
+    generation_context = augmentation_ledger_module.create_dataset_augmentation_generation_context(
+        selected_records=(evaluation.source,),
+        operators=(("input.surface.rephrase", "1.0.0"),),
+        semantic_settings=augmentation_ledger_module.DatasetAugmentationLedgerSemanticSettings(
+            provider=settings.semantic_provider_id,
+            endpoint_sha256=settings.semantic_endpoint_sha256,
+            model=settings.model,
+            render_model=settings.render_model,
+            equivalence_model=settings.equivalence_model,
+            deconstruct_reasoning=settings.deconstruct_reasoning,
+            render_reasoning=settings.render_reasoning,
+            equivalence_reasoning=settings.equivalence_reasoning,
+            max_input_chars=settings.max_input_chars,
+            max_output_tokens=settings.max_output_tokens,
+            max_render_tokens=settings.max_render_tokens,
+            max_response_bytes=settings.max_response_bytes,
+            timeout_seconds=settings.timeout_seconds,
+            deconstructor_identity=semantic_deconstructor_identity(settings),
+        ),
+    )
+    with augmentation_ledger_module.create_private_augmentation_ledger(
+        augmentations_input,
+        generation_context=generation_context,
+        selected_records=(evaluation.source,),
+    ) as ledger:
+        ledger.append(source=evaluation.source, augmentation=evaluation.augmentation)
+    augmentation_sha256 = hashlib.sha256(augmentations_input.read_bytes()).hexdigest()
+    run_context = _run_context((evaluation.source,))
+    manifest = dataset_trial_journal.create_dataset_run_manifest(
+        run_context=run_context,
+        selected_records=(evaluation.source,),
+        selected_operator_ids=("input.surface.rephrase",),
+        repetitions=1,
+        max_environment_api_calls=10,
+        allow_environment_network=True,
+        confirm_test_environment=True,
+        allow_insecure_http=False,
+        save_augmentations=False,
+        augmentations_input_path=str(augmentations_input.resolve()),
+        augmentations_input_sha256=augmentation_sha256,
+    )
+    evidence.write_bytes(b"")
+    dataset_trial_journal.persist_dataset_run_manifest(
+        dataset_trial_journal.manifest_path(evidence), manifest
+    )
+    journal = dataset_trial_journal.create_dataset_trial_journal(
+        dataset_trial_journal.journal_path(evidence), manifest
+    )
+    journal.start(manifest.work_plan[0])
+    journal.finish(manifest.work_plan[0], evaluation.baseline.trial_set.trials[0])
+    journal.close()
+    persistence_module.persist_evaluator_preflight(evidence, _evaluator_preflight())
+    monkeypatch.setattr(command_module, "load_dataset_semantic_settings", lambda: settings)
+
+    result = runner.invoke(
+        root_app,
+        ["dataset", "evaluate", "--resume", str(evidence), "--dry-run"],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert f"Reusing accepted augmentations: {augmentations_input}" in " ".join(
+        _ANSI_ESCAPE_PATTERN.sub("", result.output).split()
+    )
+
+
 def test_quarantined_trial_requires_bound_operator_cleanup_attestation(
     tmp_path: Path,
 ) -> None:
