@@ -14,6 +14,7 @@ from ul_cli.main import app as root_app
 
 from ._factories import (
     _evaluation_result,
+    _run_config,
     _settings,
 )
 from ._files import (
@@ -243,8 +244,7 @@ def test_campaign_plan_json_preserves_fixture_contract(
     plan = campaign_module.create_dataset_campaign_plan(
         records=(_evaluation_result("interaction-1").source,),
         selected_operator_ids=("input.surface.rephrase",),
-        repetitions=1,
-        target_calls_per_execution=1,
+        run_config=_run_config(),
         settings=cast(Any, _settings()),
         fixture_status=cast(Any, status),
         fixture_id=fixture_id,
@@ -268,8 +268,7 @@ def test_campaign_plan_exposes_precomputed_candidate_without_new_generation() ->
     plan = campaign_module.create_dataset_campaign_plan(
         records=(evaluation_result.source,),
         selected_operator_ids=("input.surface.rephrase",),
-        repetitions=1,
-        target_calls_per_execution=1,
+        run_config=_run_config(),
         settings=command_module.load_dataset_semantic_settings(),
         saved_augmentations={evaluation_result.source.id: evaluation_result.augmentation},
     )
@@ -288,8 +287,7 @@ def test_campaign_plan_exposes_precomputed_candidate_without_new_generation() ->
     sensitive_plan = campaign_module.create_dataset_campaign_plan(
         records=(evaluation_result.source,),
         selected_operator_ids=("input.surface.rephrase",),
-        repetitions=1,
-        target_calls_per_execution=1,
+        run_config=_run_config(),
         settings=command_module.load_dataset_semantic_settings(),
         saved_augmentations={evaluation_result.source.id: evaluation_result.augmentation},
         show_sensitive_values=True,
@@ -306,6 +304,30 @@ def test_campaign_plan_exposes_precomputed_candidate_without_new_generation() ->
     assert any("sensitive data" in warning for warning in sensitive_plan.warnings)
 
 
+def test_campaign_plan_derives_execution_totals_and_timeout_from_run_config() -> None:
+    run_config = _run_config(
+        repetitions=2,
+        environment_api_calls_per_trial=3,
+        planned_environment_api_calls=12,
+        max_environment_api_calls=12,
+        trial_timeout_seconds=47,
+    )
+
+    plan = campaign_module.create_dataset_campaign_plan(
+        records=(_evaluation_result("interaction-1").source,),
+        selected_operator_ids=("input.surface.rephrase",),
+        run_config=run_config,
+        settings=command_module.load_dataset_semantic_settings(),
+    )
+
+    assert plan.calls.baseline == 2
+    assert plan.calls.variation == 2
+    assert plan.calls.total_environment_api == 12
+    assert plan.timing.target_trial_timeout_seconds == 47
+    with pytest.raises(ValueError, match="frozen"):
+        run_config.repetitions = 3  # type: ignore[misc]
+
+
 @pytest.mark.parametrize("candidate_state", ["rejected", "missing"])
 def test_campaign_plan_does_not_count_known_non_executable_variations(
     candidate_state: str,
@@ -318,8 +340,11 @@ def test_campaign_plan_does_not_count_known_non_executable_variations(
     plan = campaign_module.create_dataset_campaign_plan(
         records=(evaluation_result.source,),
         selected_operator_ids=("input.surface.rephrase",),
-        repetitions=3,
-        target_calls_per_execution=5,
+        run_config=_run_config(
+            repetitions=3,
+            environment_api_calls_per_trial=5,
+            planned_environment_api_calls=30,
+        ),
         settings=command_module.load_dataset_semantic_settings(),
         saved_augmentations={evaluation_result.source.id: saved_augmentation},
     )
@@ -339,8 +364,7 @@ def test_campaign_plan_keeps_unattempted_operators_conditional() -> None:
     plan = campaign_module.create_dataset_campaign_plan(
         records=(evaluation_result.source,),
         selected_operator_ids=("input.surface.rephrase",),
-        repetitions=1,
-        target_calls_per_execution=1,
+        run_config=_run_config(),
         settings=command_module.load_dataset_semantic_settings(),
         saved_augmentations={evaluation_result.source.id: saved_augmentation},
     )
@@ -400,8 +424,7 @@ def test_campaign_plan_warns_about_missing_review_and_provider_parameters() -> N
     plan = campaign_module.create_dataset_campaign_plan(
         records=(source,),
         selected_operator_ids=("input.tone.frustrated",),
-        repetitions=1,
-        target_calls_per_execution=1,
+        run_config=_run_config(),
         settings=cast(
             Any,
             _settings(

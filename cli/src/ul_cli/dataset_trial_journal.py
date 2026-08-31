@@ -23,6 +23,7 @@ from ul.http_environment import JsonHttpTargetConfig
 
 from ul_cli.dataset.storage.private_files import open_resume_descriptor
 from ul_cli.dataset_review import DatasetEvidenceRunContext
+from ul_cli.dataset_run_config import DatasetRunConfig
 from ul_cli.http_target_resolution import HttpTargetConfirmation
 
 if sys.platform == "win32":
@@ -34,8 +35,6 @@ _SHA256_PATTERN = r"^[0-9a-f]{64}$"
 _MAXIMUM_MANIFEST_BYTES = 32_000_000
 _MAXIMUM_JOURNAL_BYTES = 256_000_000
 _MAXIMUM_JOURNAL_RECORD_BYTES = 8_000_000
-_MAXIMUM_REPETITIONS = 100
-
 TrialState = Literal[
     "planned",
     "running",
@@ -67,12 +66,7 @@ class _StrictModel(BaseModel):
 
 
 class DatasetRunEffectiveCommand(_StrictModel):
-    repetitions: int = Field(ge=1, le=_MAXIMUM_REPETITIONS)
-    target_timeout_seconds: float = Field(default=30.0, gt=0, le=3_600)
-    max_environment_api_calls: int = Field(ge=1)
-    allow_environment_network: bool
-    confirm_test_environment: bool
-    allow_insecure_http: bool
+    run_config: DatasetRunConfig
     save_augmentations: bool
     semantic_provider_type: Literal["openrouter", "openai-compatible"] = "openrouter"
     semantic_base_url: str = Field(default="https://openrouter.ai/api/v1", min_length=1)
@@ -92,7 +86,7 @@ class DatasetRunEffectiveCommand(_StrictModel):
 
 
 class DatasetRunManifest(_StrictModel):
-    schema_version: Literal["1.0.0"] = "1.0.0"
+    schema_version: Literal["1.1.0"] = "1.1.0"
     run_context: DatasetEvidenceRunContext
     selected_records: tuple[InteractionRecord, ...] = Field(min_length=1)
     selected_operator_ids: tuple[str, ...] = Field(min_length=1)
@@ -112,15 +106,22 @@ class DatasetRunManifest(_StrictModel):
         )
         if selected_operator_ids != recorded_operator_ids:
             raise ValueError("manifest operators do not match its run context")
-        if self.effective_command.repetitions != self.run_context.repetitions:
+        if self.effective_command.run_config.repetitions != self.run_context.repetitions:
             raise ValueError("manifest repetitions do not match its run context")
+        if self.effective_command.run_config.evaluation_mode != self.run_context.evaluation_mode:
+            raise ValueError("manifest evaluation mode does not match its run context")
+        if (
+            self.effective_command.run_config.target.trial_timeout_seconds
+            != self.run_context.target_timeout_seconds
+        ):
+            raise ValueError("manifest target timeout does not match its run context")
         unit_ids = tuple(unit.id for unit in self.work_plan)
         if len(set(unit_ids)) != len(unit_ids):
             raise ValueError("manifest contains duplicate trial units")
         expected_units = _materialize_work_plan(
             self.selected_records,
             self.selected_operator_ids,
-            self.effective_command.repetitions,
+            self.effective_command.run_config.repetitions,
         )
         if self.work_plan != expected_units:
             raise ValueError("manifest work plan does not match its effective command")
@@ -220,12 +221,7 @@ def create_dataset_run_manifest(
     run_context: DatasetEvidenceRunContext,
     selected_records: tuple[InteractionRecord, ...],
     selected_operator_ids: tuple[str, ...],
-    repetitions: int,
-    target_timeout_seconds: float = 30.0,
-    max_environment_api_calls: int,
-    allow_environment_network: bool,
-    confirm_test_environment: bool,
-    allow_insecure_http: bool,
+    run_config: DatasetRunConfig,
     save_augmentations: bool,
     semantic_provider_type: Literal["openrouter", "openai-compatible"] = "openrouter",
     semantic_base_url: str = "https://openrouter.ai/api/v1",
@@ -243,15 +239,8 @@ def create_dataset_run_manifest(
     http_target_confirmation: HttpTargetConfirmation | None = None,
     http_target_config: JsonHttpTargetConfig | None = None,
 ) -> DatasetRunManifest:
-    if repetitions > _MAXIMUM_REPETITIONS:
-        raise ValueError(f"repetitions cannot exceed {_MAXIMUM_REPETITIONS}")
     effective_command = DatasetRunEffectiveCommand(
-        repetitions=repetitions,
-        target_timeout_seconds=target_timeout_seconds,
-        max_environment_api_calls=max_environment_api_calls,
-        allow_environment_network=allow_environment_network,
-        confirm_test_environment=confirm_test_environment,
-        allow_insecure_http=allow_insecure_http,
+        run_config=run_config,
         save_augmentations=save_augmentations,
         semantic_provider_type=semantic_provider_type,
         semantic_base_url=semantic_base_url,
@@ -270,14 +259,18 @@ def create_dataset_run_manifest(
         http_target_config=http_target_config,
     )
     content = {
-        "schema_version": "1.0.0",
+        "schema_version": "1.1.0",
         "run_context": run_context.model_dump(mode="json"),
         "selected_records": [record.model_dump(mode="json") for record in selected_records],
         "selected_operator_ids": list(selected_operator_ids),
         "effective_command": effective_command.model_dump(mode="json"),
         "work_plan": [
             unit.model_dump(mode="json")
-            for unit in _materialize_work_plan(selected_records, selected_operator_ids, repetitions)
+            for unit in _materialize_work_plan(
+                selected_records,
+                selected_operator_ids,
+                run_config.repetitions,
+            )
         ],
     }
     return DatasetRunManifest(

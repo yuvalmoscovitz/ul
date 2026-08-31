@@ -40,6 +40,7 @@ from ._factories import (
     _evaluation_result,
     _evaluator_preflight,
     _invariant_evaluation,
+    _run_config,
     _run_context,
 )
 from ._files import (
@@ -411,9 +412,10 @@ def test_invariant_evaluation_reuses_results_without_extra_runner_calls(
                 ),
                 cast(Any, AsyncContext()),
                 output_stream,
-                repetitions=1,
-                max_environment_api_calls=2,
-                planned_target_calls=2,
+                run_config=_run_config(
+                    planned_environment_api_calls=2,
+                    max_environment_api_calls=2,
+                ),
                 invariant_suite=suite,
                 invariant_evaluations=stored_evaluations,
                 evaluator_preflight=_evaluator_preflight(),

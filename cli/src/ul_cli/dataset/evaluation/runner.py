@@ -39,6 +39,7 @@ from ul_cli.dataset_review import (
     DatasetEvidenceRunContext,
     DatasetSourcePreparationFailureEvidence,
 )
+from ul_cli.dataset_run_config import DatasetRunConfig
 from ul_cli.dataset_trial_journal import DatasetTrialJournal
 
 from ..evidence.customer import (
@@ -66,17 +67,13 @@ async def evaluate_interaction_records(
     target: JsonHttpEnvironmentConnection | LocalTargetConnection,
     output_stream: TextIO,
     *,
-    repetitions: int,
-    max_environment_api_calls: int,
-    planned_target_calls: int,
-    target_timeout_seconds: float = 30.0,
+    run_config: DatasetRunConfig,
     run_context: DatasetEvidenceRunContext | None = None,
     augmentation_ledger: DatasetAugmentationLedger | None = None,
     saved_augmentations: dict[str, DatasetAugmentationResult] | None = None,
     invariant_suite: DatasetInvariantSuite | None = None,
     invariant_evaluations: list[DatasetInvariantEvaluation] | None = None,
     redaction_engine: RedactionEngine | None = None,
-    allow_network_egress: bool = True,
     evaluator_preflight: EvaluatorModelPreflight,
     trial_journal: DatasetTrialJournal | None = None,
     progress_json: bool = False,
@@ -84,12 +81,11 @@ async def evaluate_interaction_records(
     progress_next_commands: CampaignNextCommands | None = None,
     progress_runtime: CampaignProgressRuntime | None = None,
     complete_progress: bool = True,
-    environment_calls_per_target_call: int = 1,
     isolate_source_preparation_failures: bool = True,
     source_preparation_failures: list[DatasetSourcePreparationFailureEvidence] | None = None,
 ) -> tuple[DatasetEvaluationResult, ...]:
-    if environment_calls_per_target_call < 1:
-        raise ValueError("environment calls per target call must be positive")
+    repetitions = run_config.repetitions
+    target_config = run_config.target
     results: list[DatasetEvaluationResult] = []
     work_upper_bound = len(records) * repetitions * (1 + len(operator_ids))
     semantic_call_budget = progress_plan.calls.total_semantic_model if progress_plan else 0
@@ -102,12 +98,12 @@ async def evaluate_interaction_records(
         progress_runtime = create_campaign_progress_runtime(
             case_count=len(records),
             work_upper_bound=work_upper_bound,
-            target_call_budget=planned_target_calls,
+            target_call_budget=target_config.planned_environment_api_calls,
             semantic_call_budget=semantic_call_budget,
-            environment_call_budget=max_environment_api_calls,
+            environment_call_budget=target_config.max_environment_api_calls,
             token_budget=token_budget,
             maximum_wall_time_seconds=(
-                max(1, work_upper_bound) * target_timeout_seconds
+                max(1, work_upper_bound) * target_config.trial_timeout_seconds
                 + semantic_call_budget * semantic_timeout_seconds
             ),
             next_commands=progress_next_commands,
@@ -170,13 +166,9 @@ async def evaluate_interaction_records(
                 ),
                 evaluation_deconstructor,
                 evaluation_target,
-                target_timeout_seconds=target_timeout_seconds,
-                allow_network_egress=allow_network_egress,
-                evaluation_mode=(
-                    run_context.evaluation_mode
-                    if run_context is not None and run_context.evaluation_mode is not None
-                    else "variance"
-                ),
+                target_timeout_seconds=target_config.trial_timeout_seconds,
+                allow_network_egress=target_config.allow_network_egress,
+                evaluation_mode=run_config.evaluation_mode,
                 source_outcome_projection=source_outcome_projection,
                 material_variance_evaluator=material_variance_evaluator,
             )
@@ -297,8 +289,8 @@ async def evaluate_interaction_records(
                         record,
                         error,
                         repetitions=repetitions,
-                        max_environment_api_calls=max_environment_api_calls,
-                        planned_target_calls=planned_target_calls,
+                        max_environment_api_calls=target_config.max_environment_api_calls,
+                        planned_target_calls=target_config.planned_environment_api_calls,
                         run_context=run_context,
                     )
                     output_stream.write(
@@ -379,7 +371,7 @@ async def evaluate_interaction_records(
                         None
                         if initial_environment_calls is None
                         else initial_environment_calls
-                        + actual_target_calls * environment_calls_per_target_call
+                        + actual_target_calls * target_config.environment_api_calls_per_trial
                     ),
                     tokens=None,
                 )
@@ -393,8 +385,8 @@ async def evaluate_interaction_records(
                         build_customer_evidence_record(
                             result,
                             repetitions=repetitions,
-                            max_environment_api_calls=max_environment_api_calls,
-                            planned_target_calls=planned_target_calls,
+                            max_environment_api_calls=target_config.max_environment_api_calls,
+                            planned_target_calls=target_config.planned_environment_api_calls,
                             run_context=run_context,
                             invariant_evaluation=invariant_evaluation,
                         ),

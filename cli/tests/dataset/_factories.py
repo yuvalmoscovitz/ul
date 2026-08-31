@@ -40,6 +40,7 @@ from ul.dataset_invariants import (
     DatasetInvariantRuleEvaluation,
 )
 from ul_cli.dataset.evidence import context as context_module
+from ul_cli.dataset_run_config import DatasetRunConfig, TargetExecutionConfig
 
 runner = CliRunner()
 _ANSI_ESCAPE_PATTERN = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
@@ -371,7 +372,7 @@ def _run_context(
     return context_module.build_dataset_evidence_run_context(
         selected_records=records,
         selected_operator_ids=("input.surface.rephrase",),
-        repetitions=1,
+        run_config=_run_config(),
         invariant_suite=cast(Any, invariant_suite),
         target_config=cast(Any, target_config)
         if target_config is not None
@@ -409,6 +410,31 @@ def _run_context(
             }
         ),
         settings=cast(Any, settings if settings is not None else _settings()),
+    )
+
+
+def _run_config(
+    *,
+    repetitions: int = 1,
+    environment_api_calls_per_trial: int = 1,
+    planned_environment_api_calls: int | None = None,
+    max_environment_api_calls: int = 100,
+    trial_timeout_seconds: float = 30.0,
+) -> DatasetRunConfig:
+    planned_calls = planned_environment_api_calls or (
+        repetitions * 2 * environment_api_calls_per_trial
+    )
+    return DatasetRunConfig(
+        repetitions=repetitions,
+        target=TargetExecutionConfig(
+            trial_timeout_seconds=trial_timeout_seconds,
+            max_environment_api_calls=max_environment_api_calls,
+            environment_api_calls_per_trial=environment_api_calls_per_trial,
+            planned_environment_api_calls=planned_calls,
+            allow_network_egress=True,
+            test_environment_confirmed=True,
+            allow_insecure_http=False,
+        ),
     )
 
 

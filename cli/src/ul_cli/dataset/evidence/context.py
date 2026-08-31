@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from typing import Literal
-
 from pydantic import JsonValue
 from ul import (
     DatasetSemanticSettings,
@@ -19,6 +17,7 @@ from ul_cli.dataset_review import (
     DatasetEvidenceSemanticSettings,
     create_dataset_evidence_run_context,
 )
+from ul_cli.dataset_run_config import DatasetRunConfig
 
 from ..evaluation.operators import dataset_operator_identity
 
@@ -27,9 +26,7 @@ def build_dataset_evidence_run_context(
     *,
     selected_records: tuple[InteractionRecord, ...],
     selected_operator_ids: tuple[str, ...],
-    evaluation_mode: Literal["variance"] = "variance",
-    repetitions: int,
-    target_timeout_seconds: float = 30.0,
+    run_config: DatasetRunConfig,
     invariant_suite: DatasetInvariantSuite | None,
     target_config: JsonHttpTargetConfig | None,
     target_receipt: dict[str, JsonValue] | None = None,
@@ -43,9 +40,7 @@ def build_dataset_evidence_run_context(
         operators=tuple(
             dataset_operator_identity(reference) for reference in selected_operator_ids
         ),
-        evaluation_mode=evaluation_mode,
-        repetitions=repetitions,
-        target_timeout_seconds=target_timeout_seconds,
+        run_config=run_config,
         invariant_suite_sha256=(invariant_suite.sha256 if invariant_suite is not None else None),
         target_config=target_config,
         target_receipt=target_receipt,
