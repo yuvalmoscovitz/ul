@@ -1603,12 +1603,12 @@ def evaluate_dataset(
                 raise ValueError(
                     "HTTP execution requires --confirm-target with the exact displayed digest"
                 )
-            if not allow_environment_network:
+            if not run_config.target.allow_network_egress:
                 raise ValueError("environment execution requires --allow-environment-network")
             execution_target = JsonHttpEnvironmentConnection.from_config(
                 loaded_target_config,
-                test_environment_confirmed=True,
-                allow_insecure_http=allow_insecure_http,
+                test_environment_confirmed=run_config.target.test_environment_confirmed,
+                allow_insecure_http=run_config.target.allow_insecure_http,
                 timeout_seconds=run_config.target.trial_timeout_seconds,
                 max_environment_api_calls=run_config.target.max_environment_api_calls,
             )

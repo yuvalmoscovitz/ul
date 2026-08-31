@@ -1145,13 +1145,11 @@ def probe(
             plan=plan,
             run_config=run_config,
             output=output,
-            repetitions=repetitions,
             remaining_target_seconds=remaining_target_seconds,
             run_context=run_context,
             progress_runtime=progress_runtime,
             evaluator_preflight=evaluator_preflight,
             resume_campaign=resume_checkpoint is not None,
-            allow_insecure_http=allow_insecure_http,
             resolve_quarantine_after=resolve_quarantine_after,
         )
         projection_failure = _campaign_projection_failure(results, output)
@@ -2026,13 +2024,11 @@ def _run_campaign(
     plan: DatasetCampaignPlan,
     run_config: DatasetRunConfig,
     output: Path,
-    repetitions: int,
     remaining_target_seconds: float | None,
     run_context: DatasetEvidenceRunContext,
     progress_runtime: CampaignProgressRuntime,
     evaluator_preflight: EvaluatorModelPreflight | None,
     resume_campaign: bool,
-    allow_insecure_http: bool,
     resolve_quarantine_after: Literal["environment-reset", "environment-replacement"] | None,
 ) -> tuple[DatasetEvaluationResult, ...]:
     resolved_target.revalidate_identity()
