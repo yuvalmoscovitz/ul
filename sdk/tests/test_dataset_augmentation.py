@@ -847,17 +847,20 @@ async def test_self_correction_accepts_money_grounded_by_recorded_action_envelop
 
 
 def grounded_enum_self_correction_frames(
-    *, prior_actions: list[dict[str, JsonValue]]
+    *,
+    prior_actions: list[dict[str, JsonValue]],
+    final_action: dict[str, JsonValue] | None = None,
 ) -> tuple[InteractionRecord, SemanticFrame, SemanticFrame, str]:
     raw_input = (
         "Opportunity 006001 is currently Negotiation/Review. Great news - it just closed! "
         "Please mark it as Closed Won in Salesforce."
     )
-    final_action: dict[str, JsonValue] = {
-        "action": "salesforce.opportunity.update",
-        "opportunity_id": "006001",
-        "stage_name": "Closed Won",
-    }
+    if final_action is None:
+        final_action = {
+            "action": "salesforce.opportunity.update",
+            "opportunity_id": "006001",
+            "stage_name": "Closed Won",
+        }
     record = InteractionRecord(
         id="salesforce-stage",
         raw_input=raw_input,
@@ -1071,6 +1074,75 @@ async def test_self_correction_skips_unsafe_or_ambiguous_prior_enum_actions(
 ) -> None:
     record, source, candidate_frame, rendered_output = grounded_enum_self_correction_frames(
         prior_actions=prior_actions
+    )
+    model = DeterministicSemanticModel({record.id: source}, candidate_frame, rendered_output)
+
+    result = await DatasetAugmentationEngine(model, model).augment(
+        (record,), operator_ids=("input.intent.self_correction",)
+    )
+
+    assert not result.candidates
+    assert result.skips
+
+
+@pytest.mark.parametrize(
+    ("prior_action", "final_action"),
+    [
+        (
+            {
+                "action": "salesforce.opportunity.read",
+                "opportunity_id": "006001",
+                "account_status": "Negotiation/Review",
+            },
+            {
+                "action": "salesforce.opportunity.update",
+                "opportunity_id": "006001",
+                "account_status": "Closed Won",
+            },
+        ),
+        (
+            {
+                "action": "salesforce.opportunity.update.read",
+                "opportunity_id": "006001",
+                "stage_name": "Negotiation/Review",
+            },
+            {
+                "action": "salesforce.opportunity.update",
+                "opportunity_id": "006001",
+                "stage_name": "Closed Won",
+            },
+        ),
+        (
+            {
+                "action": "salesforce.opportunity.read",
+                "account_id": "006001",
+                "stage_name": "Negotiation/Review",
+            },
+            {
+                "action": "salesforce.opportunity.update",
+                "account_id": "006001",
+                "stage_name": "Closed Won",
+            },
+        ),
+        (
+            {
+                "action": "salesforce.account.read",
+                "account_id": "006001",
+                "stage_name": "Negotiation/Review",
+            },
+            {
+                "action": "salesforce.account.update",
+                "account_id": "006001",
+                "stage_name": "Closed Won",
+            },
+        ),
+    ],
+)
+async def test_self_correction_skips_enum_grounding_from_wrong_action_binding(
+    prior_action: dict[str, JsonValue], final_action: dict[str, JsonValue]
+) -> None:
+    record, source, candidate_frame, rendered_output = grounded_enum_self_correction_frames(
+        prior_actions=[prior_action], final_action=final_action
     )
     model = DeterministicSemanticModel({record.id: source}, candidate_frame, rendered_output)
 

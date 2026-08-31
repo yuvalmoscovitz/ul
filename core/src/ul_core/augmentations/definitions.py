@@ -347,7 +347,7 @@ _BUILTIN_AUGMENTATION_SPECS = (
         applicability_rule=(
             "Applies only when one explicit numeric, monetary, date, or duration value can be "
             "temporarily misstated, or one enum value has one exact prior observed value for "
-            "the same field and object."
+            "the same field and object and both values appear exactly once in the input."
         ),
     ),
     _scenario_spec(

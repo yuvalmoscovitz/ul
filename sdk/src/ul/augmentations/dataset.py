@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-from collections.abc import Iterable, Mapping
+from collections.abc import Collection, Iterable, Mapping
 from dataclasses import dataclass
 from decimal import Decimal
 from itertools import islice, pairwise
@@ -931,20 +931,25 @@ def _recorded_action_factor_match(
     factor: SemanticFactor,
 ) -> tuple[int, Mapping[str, JsonValue], str] | None:
     action_records = _recorded_action_records(record)
-    request_identifier_values = _request_identifier_values(frame, request)
-    if not request_identifier_values:
+    request_identifier_factors = _request_identifier_factors(frame, request)
+    if not request_identifier_factors:
         return None
     matches: list[tuple[int, Mapping[str, JsonValue], str]] = []
     for action_index, action in enumerate(action_records):
         if not _action_matches_request_operation(str(action["action"]), request.predicate):
             continue
-        if not _action_contains_exact_identifier_values(action, request_identifier_values):
+        if not _action_matches_request_resource(str(action["action"]), request.predicate):
+            continue
+        if not _action_contains_exact_identifiers(
+            action, request_identifier_factors, request.predicate
+        ):
             continue
         matching_fields = tuple(
             field_name
             for field_name, value in action.items()
             if not _is_action_identifier_field(field_name)
             and field_name != "action"
+            and _semantic_role_matches_action_field(factor.role, field_name, request.predicate)
             and not isinstance(value, (dict, list, bool))
             and _self_correction_values_equal(value, factor.value, factor_kind=factor.kind)
         )
@@ -970,11 +975,11 @@ def _recorded_action_records(
     return ()
 
 
-def _request_identifier_values(
+def _request_identifier_factors(
     frame: SemanticFrame, request: RequestUnit
-) -> tuple[str | int | float, ...]:
+) -> tuple[SemanticFactor, ...]:
     return tuple(
-        identifier_factor.value
+        identifier_factor
         for identifier_factor in frame.factors
         if _factor_is_associated_with_request(identifier_factor, request)
         and identifier_factor.kind == "identifier"
@@ -1001,26 +1006,98 @@ def _is_action_identifier_field(field_name: str) -> bool:
     return field_name == "id" or field_name.endswith("_id")
 
 
-def _action_contains_exact_identifier_values(
+def _action_contains_exact_identifiers(
     action: Mapping[str, JsonValue],
-    request_identifier_values: tuple[str | int | float, ...],
+    request_identifier_factors: tuple[SemanticFactor, ...],
+    request_predicate: str,
 ) -> bool:
-    action_identifier_values = tuple(
-        value
+    action_identifiers = tuple(
+        (field_name, value)
         for field_name, value in action.items()
         if _is_action_identifier_field(field_name)
         and isinstance(value, (str, int, float))
         and not isinstance(value, bool)
     )
-    return len(action_identifier_values) == len(request_identifier_values) and all(
+    if len(action_identifiers) != len(request_identifier_factors):
+        return False
+    factors_match_once = all(
         sum(
-            type(identifier_value) is type(value) and identifier_value == value
-            for field_name, value in action.items()
-            if _is_action_identifier_field(field_name)
+            _identifier_factor_matches_action_field(
+                factor, field_name, str(action["action"]), request_predicate
+            )
+            and type(factor.value) is type(value)
+            and factor.value == value
+            for field_name, value in action_identifiers
         )
         == 1
-        for identifier_value in request_identifier_values
+        for factor in request_identifier_factors
     )
+    fields_match_once = all(
+        sum(
+            _identifier_factor_matches_action_field(
+                factor, field_name, str(action["action"]), request_predicate
+            )
+            and type(factor.value) is type(value)
+            and factor.value == value
+            for factor in request_identifier_factors
+        )
+        == 1
+        for field_name, value in action_identifiers
+    )
+    return factors_match_once and fields_match_once
+
+
+def _identifier_factor_matches_action_field(
+    factor: SemanticFactor,
+    field_name: str,
+    action_name: str,
+    request_predicate: str,
+) -> bool:
+    field_tokens = _semantic_name_tokens(field_name, ignored={"id", "identifier"})
+    if not field_tokens:
+        return field_name == "id" and factor.role in {"id", "identifier"}
+    role_tokens = _semantic_name_tokens(factor.role, ignored={"id", "identifier", "object"})
+    if role_tokens:
+        return role_tokens == field_tokens
+    request_tokens = set(_semantic_name_tokens(request_predicate, ignored=_ACTION_OPERATION_WORDS))
+    action_resource_tokens = set(_action_resource_key(action_name))
+    return set(field_tokens) <= request_tokens and set(field_tokens) <= action_resource_tokens
+
+
+def _semantic_role_matches_action_field(role: str, field_name: str, request_predicate: str) -> bool:
+    ignored = {
+        "current",
+        "desired",
+        "final",
+        "from",
+        "object",
+        "name",
+        "new",
+        "requested",
+        "target",
+        "to",
+        "value",
+    }
+    role_tokens = _semantic_name_tokens(role, ignored=ignored)
+    field_tokens = _semantic_name_tokens(field_name, ignored=ignored)
+    if not field_tokens:
+        return False
+    if role_tokens:
+        return role_tokens == field_tokens
+    request_tokens = set(_semantic_name_tokens(request_predicate, ignored=_ACTION_OPERATION_WORDS))
+    return set(field_tokens) <= request_tokens
+
+
+def _semantic_name_tokens(name: str, *, ignored: Collection[str]) -> tuple[str, ...]:
+    return tuple(
+        token for token in re.findall(r"[a-z0-9]+", name.casefold()) if token not in ignored
+    )
+
+
+def _action_matches_request_resource(action_name: str, request_predicate: str) -> bool:
+    request_tokens = set(_semantic_name_tokens(request_predicate, ignored=_ACTION_OPERATION_WORDS))
+    action_resource = _action_resource_key(action_name)
+    return bool(action_resource) and action_resource[-1] in request_tokens
 
 
 def _grounded_prior_enum_plan(
@@ -1106,12 +1183,9 @@ def _action_resource_key(action_name: str) -> tuple[str, ...]:
 
 
 def _is_observation_action(action_name: str) -> bool:
-    operations = {
-        token
-        for token in re.findall(r"[a-z0-9]+", action_name.casefold())
-        if token in _OBSERVATION_OPERATION_WORDS
-    }
-    return len(operations) == 1
+    tokens = set(re.findall(r"[a-z0-9]+", action_name.casefold()))
+    observation_operations = {token for token in tokens if token in _OBSERVATION_OPERATION_WORDS}
+    return len(observation_operations) == 1 and not tokens.intersection(_ACTION_OPERATION_WORDS)
 
 
 def _safe_enum_provisional_quote(value: str) -> bool:
