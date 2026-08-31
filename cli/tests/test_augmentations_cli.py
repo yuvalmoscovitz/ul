@@ -190,8 +190,7 @@ def test_guide_and_surface_filter_make_the_library_navigable() -> None:
     assert "World and business state" in guide.output
     assert "Tool and execution" in guide.output
     assert "Trust, policy, and authorization" in guide.output
-    assert guide.output.count("@1.0.0 [implemented; not_qualified]") == 20
-    assert "input.tone.frustrated@1.1.0 [implemented; not_qualified]" in guide.output
+    assert guide.output.count("@1.0.0 [implemented; not_qualified]") == 21
 
     filtered = runner.invoke(
         app,
@@ -273,7 +272,7 @@ def test_show_reports_dataset_execution_requirements_without_requiring_invariant
     result = CliRunner().invoke(app, ["augmentations", "show", "input.tone.frustrated"])
 
     assert result.exit_code == 0
-    assert "ul dataset evaluate --operator input.tone.frustrated@1.1.0" in result.output
+    assert "ul dataset evaluate --operator input.tone.frustrated@1.0.0" in result.output
     assert "test environment" in result.output
     assert "committed-state observation" in result.output
     assert "semantic model" in result.output
@@ -378,7 +377,7 @@ def test_plan_json_is_stable_complete_and_project_aware(
 
     frustrated = _planned_augmentation(payload, "input.tone.frustrated")
     assert frustrated["status"] == "manual"
-    assert frustrated["command"] == "ul run --operator input.tone.frustrated@1.1.0"
+    assert frustrated["command"] == "ul run --operator input.tone.frustrated@1.0.0"
     assert "human_review_required" in _reason_codes(frustrated)
 
     ambiguity = _planned_augmentation(payload, "conversation.ambiguity")
@@ -496,7 +495,7 @@ def test_plan_human_output_is_actionable_and_attests_zero_calls(
     assert "Augmentation readiness: 9 ready, 3 blocked, 9 manual" in result.output
     assert "READY input.surface.rephrase@1.0.0" in result.output
     assert "Command: ul run --operator input.surface.rephrase@1.0.0" in result.output
-    assert "MANUAL input.tone.frustrated@1.1.0" in result.output
+    assert "MANUAL input.tone.frustrated@1.0.0" in result.output
     assert "BLOCKED environment.tool.timeout_after_commit@1.0.0" in result.output
     assert (
         "Inspection only: 0 model calls, 0 environment calls, 0 network requests." in result.output

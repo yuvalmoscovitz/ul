@@ -993,7 +993,7 @@ async def test_runner_executes_only_accepted_candidates_and_keeps_rejected_candi
     runner, semantic_pipeline, target = _runner(observed_outcomes)
 
     result = await runner.run(
-        _source(), operator_ids=("input.surface.rephrase", "input.surface.fragmented_syntax")
+        _source(), operator_ids=("input.surface.rephrase", "input.tone.frustrated")
     )
 
     assert len(result.cases) == 2
@@ -1163,40 +1163,6 @@ async def test_runner_executes_case_variation_with_trusted_equivalence_policy() 
     assert case.verdict == "no_divergence"
     assert pipeline.allowed_surface_changes == ["single_unprotected_case_change"]
     assert environment.raw_inputs == [source.raw_input, "transfer 100 to Alice."]
-
-
-async def test_runner_executes_deterministic_frustrated_request_without_tone_label() -> None:
-    source = _source()
-    raw_input = source.raw_input
-    source_frame = _frame(source.id, _source_outcomes())
-    candidate_frame = _frame(f"{source.id}:input.tone.frustrated", ())
-
-    class FrustratedTonePipeline(DeterministicSemanticPipeline):
-        async def deconstruct(
-            self,
-            record: InteractionRecord | UserInputRecord,
-            reference_frame: SemanticFrame | None = None,
-        ) -> SemanticFrame:
-            if record.id == source.id:
-                return source_frame
-            if not isinstance(record, InteractionRecord):
-                return candidate_frame.model_copy(update={"interaction_id": record.id})
-            return await super().deconstruct(record, reference_frame)
-
-    pipeline = FrustratedTonePipeline(source_frame.outcomes)
-    environment = DeterministicEnvironment()
-    runner = DatasetEvaluationRunner(
-        DatasetAugmentationEngine(pipeline, pipeline, pipeline), pipeline, environment
-    )
-
-    result = await runner.run(source, operator_ids=("input.tone.frustrated",))
-
-    case = result.cases[0]
-    assert case.candidate.passed
-    assert case.candidate.renderer_metadata["algorithm"] == "frustration_interjection_prefix"
-    assert case.target_output is not None
-    assert case.verdict == "no_divergence"
-    assert environment.raw_inputs == [raw_input, f"Ugh, {raw_input}"]
 
 
 async def test_redacted_runner_evidence_never_persists_environment_secrets(tmp_path: Path) -> None:
@@ -2273,7 +2239,7 @@ async def test_runner_classifies_extra_effect_with_new_arguments_as_unexpected()
 async def test_case_model_rejects_inconsistent_execution_and_verdicts() -> None:
     runner, _, _ = _runner(_source_outcomes())
     result = await runner.run(
-        _source(), operator_ids=("input.surface.rephrase", "input.surface.fragmented_syntax")
+        _source(), operator_ids=("input.surface.rephrase", "input.tone.frustrated")
     )
     with pytest.raises(ValidationError, match="one explicit comparison surface"):
         DatasetEvaluationOutcomeGroup(

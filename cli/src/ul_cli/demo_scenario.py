@@ -9,7 +9,6 @@ from ul.augmentations.dataset import (
     DatasetAugmentationOperatorReference,
     DatasetAugmentationResult,
     create_dataset_augmentation_projection,
-    resolve_dataset_augmentation_operator,
 )
 from ul.dataset_evaluation import DatasetEvaluationResult, DatasetEvaluationRunner
 from ul_core.dataset import (
@@ -187,12 +186,11 @@ def _candidate(
     operator_id: str,
     augmented_input: str,
 ) -> DatasetAugmentationCandidate:
-    operator = resolve_dataset_augmentation_operator(operator_id)
     return DatasetAugmentationCandidate.model_validate(
         {
             "source_interaction_id": source.id,
             "operator_id": operator_id,
-            "operator_version": operator.version,
+            "operator_version": "1.0.0",
             "allowed_change": "declared_communication_form",
             "human_review_required": operator_id == "input.tone.frustrated",
             "projection": create_dataset_augmentation_projection(source),
@@ -220,10 +218,7 @@ def _precomputed_augmentation(
     )
     return DatasetAugmentationResult(
         operator_references=tuple(
-            DatasetAugmentationOperatorReference(
-                id=candidate.operator_id,
-                version=candidate.operator_version,
-            )
+            DatasetAugmentationOperatorReference(id=candidate.operator_id)
             for candidate in candidates
         ),
         source_records=(source,),

@@ -219,7 +219,6 @@ def _dataset_spec(
     augmentation_id: str,
     summary: str,
     *,
-    version: str = "1.0.0",
     expected_relation: str = (
         "The wording may change. Task meaning, authorization, consequential actions, and "
         "business state must stay the same."
@@ -228,6 +227,7 @@ def _dataset_spec(
     applicability_profile: AugmentationApplicabilityProfile = "broad",
     applicability_rule: str = "Applies to any nonempty user input with recorded source semantics.",
 ) -> BuiltinAugmentationSpec:
+    version = "1.0.0"
     return BuiltinAugmentationSpec(
         ref=AugmentationRef(id=augmentation_id, version=version),
         surface="human_behavior",
@@ -331,7 +331,6 @@ _BUILTIN_AUGMENTATION_SPECS = (
     _dataset_spec(
         "input.tone.frustrated",
         "Express the same request with frustration.",
-        version="1.1.0",
         expected_relation=(
             "Tone may change. Service quality, authorization, consequential actions, and business "
             "state must not degrade."

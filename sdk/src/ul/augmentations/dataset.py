@@ -177,6 +177,7 @@ _BUILTIN_OPERATORS = (
         operator_id="input.tone.frustrated",
         allowed_change="declared_communication_form",
         target_communication_kind="frustrated",
+        target_marker_required=True,
     ),
     _builtin_operator(
         operator_id="input.intent.self_correction",
@@ -1382,8 +1383,6 @@ def _surface_footprint_reasons(
         and augmented_word_count <= source_word_count * 2
     ):
         return ("rendered input is not between 1.5 and 2 times the source length",)
-    if operator_id == "input.tone.frustrated" and augmented_input != f"Ugh, {source_input}":
-        return ("rendered input must add exactly the deterministic frustration prefix",)
     if operator_id == "input.surface.disfluency_repeat":
         source_repetition_count = sum(
             first.casefold() == second.casefold()
