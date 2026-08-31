@@ -351,6 +351,7 @@ def _enforce_budget(budget: AugmentationBundleBudget, totals: BundlePlanTotals) 
 def _policy(
     augmentation_id: str,
     *,
+    version: str = "1.0.0",
     mode: AugmentationMode,
     model_calls: int,
     target_calls: int = 1,
@@ -360,7 +361,7 @@ def _policy(
     reset_required: bool = False,
 ) -> BundleOperatorPolicy:
     return BundleOperatorPolicy(
-        ref=AugmentationRef(id=augmentation_id, version="1.0.0"),
+        ref=AugmentationRef(id=augmentation_id, version=version),
         mode=mode,
         model_calls=model_calls,
         target_calls=target_calls,
@@ -418,6 +419,7 @@ _BUILTIN_BUNDLES = (
         operators=(
             _policy(
                 "input.intent.self_correction",
+                version="1.1.0",
                 mode="dataset_variation",
                 model_calls=4,
                 mutation_risk="state",
