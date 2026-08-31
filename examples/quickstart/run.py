@@ -55,6 +55,8 @@ def _subprocess_environment(*, dry_run: bool) -> dict[str, str]:
         "UL_DATASET_EQUIVALENCE_MODEL": settings.equivalence_model,
         "UL_DATASET_MATERIALITY_MODEL": settings.materiality_model,
     }
+    if settings.semantic_provider_type == "openrouter":
+        environment["UL_DATASET_OPENROUTER_PROVIDER"] = settings.upstream_provider
     if settings.semantic_provider_type != "openrouter":
         environment.update(
             {

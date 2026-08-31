@@ -377,6 +377,7 @@ def test_runner_uses_configured_models_safe_argv_and_private_artifacts(
     monkeypatch.setenv("UL_DATASET_LIVE_CALLS", "true")
     monkeypatch.setenv("UL_DATASET_ALLOW_EXTERNAL_DATA_PROCESSING", "true")
     monkeypatch.setenv("UL_DATASET_MODEL", "untrusted/model-override")
+    monkeypatch.setenv("UL_DATASET_OPENROUTER_PROVIDER", "test-provider")
     monkeypatch.setenv("UL_DATASET_RENDER_MODEL", "untrusted/render-override")
     monkeypatch.setenv("UL_DATASET_EQUIVALENCE_MODEL", "untrusted/checker-override")
     monkeypatch.setenv("UNRELATED_SECRET", "must-not-be-forwarded")
@@ -405,6 +406,7 @@ def test_runner_uses_configured_models_safe_argv_and_private_artifacts(
             "UL_DATASET_RENDER_MODEL": "untrusted/render-override",
             "UL_DATASET_EQUIVALENCE_MODEL": "untrusted/checker-override",
             "UL_DATASET_MATERIALITY_MODEL": "untrusted/model-override",
+            "UL_DATASET_OPENROUTER_PROVIDER": "test-provider",
         }
         target_config_path = Path(command[command.index("--environment-config") + 1])
         assert Path(command[command.index("--invariants") + 1]) == (
@@ -450,6 +452,7 @@ def test_live_environment_accepts_ul_live_and_forwards_granular_permissions(
     monkeypatch.setenv("OPEN_ROUTER_API_KEY", "test-only-secret")
     monkeypatch.setenv("UL_LIVE", "true")
     monkeypatch.setenv("UL_DATASET_MODEL", "customer/default-model")
+    monkeypatch.setenv("UL_DATASET_OPENROUTER_PROVIDER", "test-provider")
 
     subprocess_environment = cast(
         Callable[..., dict[str, str]], quickstart.__dict__["_subprocess_environment"]
@@ -459,6 +462,7 @@ def test_live_environment_accepts_ul_live_and_forwards_granular_permissions(
     assert environment["OPEN_ROUTER_API_KEY"] == "test-only-secret"
     assert environment["UL_DATASET_LIVE_CALLS"] == "true"
     assert environment["UL_DATASET_ALLOW_EXTERNAL_DATA_PROCESSING"] == "true"
+    assert environment["UL_DATASET_OPENROUTER_PROVIDER"] == "test-provider"
     assert "UL_LIVE" not in environment
 
 
@@ -470,6 +474,7 @@ def test_live_environment_respects_granular_false_override(
     monkeypatch.setenv("OPEN_ROUTER_API_KEY", "test-only-secret")
     monkeypatch.setenv("UL_LIVE", "true")
     monkeypatch.setenv("UL_DATASET_MODEL", "customer/default-model")
+    monkeypatch.setenv("UL_DATASET_OPENROUTER_PROVIDER", "test-provider")
     monkeypatch.setenv("UL_DATASET_ALLOW_EXTERNAL_DATA_PROCESSING", "false")
 
     subprocess_environment = cast(
@@ -580,6 +585,7 @@ def test_runner_propagates_nonconfirmation_and_execution_error(
     monkeypatch.setenv("UL_DATASET_LIVE_CALLS", "true")
     monkeypatch.setenv("UL_DATASET_ALLOW_EXTERNAL_DATA_PROCESSING", "true")
     monkeypatch.setenv("UL_DATASET_MODEL", "customer/default-model")
+    monkeypatch.setenv("UL_DATASET_OPENROUTER_PROVIDER", "test-provider")
 
     def no_finding(command: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
         evidence_path = Path(command[command.index("--output") + 1])
@@ -605,6 +611,7 @@ def test_dry_run_does_not_construct_the_target_server(
 ) -> None:
     monkeypatch.setattr(quickstart, "_PROJECT_DIRECTORY", tmp_path)
     monkeypatch.setenv("UL_DATASET_MODEL", "customer/default-model")
+    monkeypatch.setenv("UL_DATASET_OPENROUTER_PROVIDER", "test-provider")
 
     def unexpected_server() -> object:
         raise AssertionError("dry-run constructed the target server")
@@ -625,6 +632,7 @@ def test_dry_run_is_a_real_subprocess_and_needs_no_api_key(tmp_path: Path) -> No
         ),
         "HOME": str(tmp_path),
         "UL_DATASET_MODEL": "customer/default-model",
+        "UL_DATASET_OPENROUTER_PROVIDER": "test-provider",
     }
 
     completed = subprocess.run(
