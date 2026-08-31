@@ -219,6 +219,7 @@ def _dataset_spec(
     augmentation_id: str,
     summary: str,
     *,
+    version: str = "1.0.0",
     expected_relation: str = (
         "The wording may change. Task meaning, authorization, consequential actions, and "
         "business state must stay the same."
@@ -227,7 +228,6 @@ def _dataset_spec(
     applicability_profile: AugmentationApplicabilityProfile = "broad",
     applicability_rule: str = "Applies to any nonempty user input with recorded source semantics.",
 ) -> BuiltinAugmentationSpec:
-    version = "1.0.0"
     return BuiltinAugmentationSpec(
         ref=AugmentationRef(id=augmentation_id, version=version),
         surface="human_behavior",
@@ -340,12 +340,14 @@ _BUILTIN_AUGMENTATION_SPECS = (
     _dataset_spec(
         "input.intent.self_correction",
         "Correct one request value within the same input.",
+        version="1.1.0",
         expected_relation="The corrected value must control the response and business outcome.",
         human_review=True,
         applicability_profile="conditional",
         applicability_rule=(
             "Applies only when one explicit numeric, monetary, date, or duration value can be "
-            "temporarily misstated and immediately corrected without ambiguity."
+            "temporarily misstated, or one enum value has one exact prior observed value for "
+            "the same field and object."
         ),
     ),
     _scenario_spec(

@@ -1264,6 +1264,17 @@ async def test_self_correction_evidence_is_grounded_to_the_exact_visible_repair(
     assert grounded.relations[0].evidence[0].text_quote == "13500$, sorry 12500$"
     assert grounded.communication_acts[0].evidence[0].text_quote == "13500$, sorry 12500$"
 
+    repeated_prior_input = "The previous amount was 13500$. Pay 13500$, sorry 12500$."
+    repeated_prior_grounded = SemanticModelDeconstructor._ground_self_correction_evidence(
+        UserInputRecord(id="candidate", raw_input=repeated_prior_input),
+        normalized,
+    )
+    assert repeated_prior_grounded.relations[0].evidence[0].text_quote == "13500$, sorry 12500$"
+    assert (
+        repeated_prior_grounded.communication_acts[0].evidence[0].text_quote
+        == "13500$, sorry 12500$"
+    )
+
     relationless = frame.model_copy(
         update={
             "relations": (),

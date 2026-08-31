@@ -74,7 +74,7 @@ def test_bundle_plan_fans_out_independently_and_exposes_bounded_work() -> None:
 
 def test_bundle_plan_reports_skips_and_deduplicates_canonical_probes() -> None:
     policy = BundleOperatorPolicy(
-        ref=AugmentationRef(id="input.intent.self_correction", version="1.0.0"),
+        ref=AugmentationRef(id="input.intent.self_correction", version="1.1.0"),
         mode="dataset_variation",
         model_calls=4,
         target_calls=1,
