@@ -28,7 +28,6 @@ from ul import (
     OpenRouterDatasetSettings,
     ProviderDiagnosticError,
     load_dataset_semantic_settings,
-    semantic_deconstructor_identity,
 )
 from ul.dataset_invariants import (
     DatasetInvariantEvaluation,
@@ -55,9 +54,9 @@ from ul_cli.dataset.progress import (
 from ul_cli.dataset_augmentation_ledger import (
     DatasetAugmentationGenerationContext,
     DatasetAugmentationLedger,
-    DatasetAugmentationLedgerSemanticSettings,
     create_dataset_augmentation_generation_context,
     create_private_augmentation_ledger,
+    dataset_augmentation_ledger_semantic_settings,
     open_augmentation_ledger_for_resume,
     read_augmentation_ledger,
 )
@@ -1103,22 +1102,7 @@ def evaluate_dataset(
                 dataset_operator_identity(operator_reference)
                 for operator_reference in selected_operators
             ),
-            semantic_settings=DatasetAugmentationLedgerSemanticSettings(
-                provider=settings.semantic_provider_id,
-                endpoint_sha256=settings.semantic_endpoint_sha256,
-                model=settings.model,
-                render_model=settings.render_model,
-                equivalence_model=settings.equivalence_model,
-                deconstruct_reasoning=settings.deconstruct_reasoning,
-                render_reasoning=settings.render_reasoning,
-                equivalence_reasoning=settings.equivalence_reasoning,
-                max_input_chars=settings.max_input_chars,
-                max_output_tokens=settings.max_output_tokens,
-                max_render_tokens=settings.max_render_tokens,
-                max_response_bytes=settings.max_response_bytes,
-                timeout_seconds=settings.timeout_seconds,
-                deconstructor_identity=semantic_deconstructor_identity(settings),
-            ),
+            semantic_settings=dataset_augmentation_ledger_semantic_settings(settings),
             redaction_policy_sha256=(
                 redaction_engine.policy.digest if redaction_engine is not None else None
             ),
@@ -2071,30 +2055,9 @@ def _manifest_incompatibility_reason(
             requested.target_timeout_seconds,
         ),
         (
-            "evaluator.provider",
-            recorded.semantic_settings.provider,
-            requested.semantic_settings.provider,
-        ),
-        (
-            "evaluator.endpoint_sha256",
-            recorded.semantic_settings.endpoint_sha256,
-            requested.semantic_settings.endpoint_sha256,
-        ),
-        ("evaluator.model", recorded.semantic_settings.model, requested.semantic_settings.model),
-        (
-            "evaluator.render_model",
-            recorded.semantic_settings.render_model,
-            requested.semantic_settings.render_model,
-        ),
-        (
-            "evaluator.equivalence_model",
-            recorded.semantic_settings.equivalence_model,
-            requested.semantic_settings.equivalence_model,
-        ),
-        (
-            "evaluator.materiality_model",
-            recorded.semantic_settings.materiality_model,
-            requested.semantic_settings.materiality_model,
+            "evaluator.llm_client",
+            recorded.semantic_settings.llm_client,
+            requested.semantic_settings.llm_client,
         ),
         (
             "evaluator.materiality_version",
@@ -2102,34 +2065,9 @@ def _manifest_incompatibility_reason(
             requested.semantic_settings.materiality_evaluator_version_id,
         ),
         (
-            "evaluator.reasoning",
-            (
-                recorded.semantic_settings.deconstruct_reasoning,
-                recorded.semantic_settings.render_reasoning,
-                recorded.semantic_settings.equivalence_reasoning,
-            ),
-            (
-                requested.semantic_settings.deconstruct_reasoning,
-                requested.semantic_settings.render_reasoning,
-                requested.semantic_settings.equivalence_reasoning,
-            ),
-        ),
-        (
-            "evaluator.limits",
-            (
-                recorded.semantic_settings.max_input_chars,
-                recorded.semantic_settings.max_output_tokens,
-                recorded.semantic_settings.max_render_tokens,
-                recorded.semantic_settings.max_response_bytes,
-                recorded.semantic_settings.timeout_seconds,
-            ),
-            (
-                requested.semantic_settings.max_input_chars,
-                requested.semantic_settings.max_output_tokens,
-                requested.semantic_settings.max_render_tokens,
-                requested.semantic_settings.max_response_bytes,
-                requested.semantic_settings.timeout_seconds,
-            ),
+            "evaluator.max_input_chars",
+            recorded.semantic_settings.max_input_chars,
+            requested.semantic_settings.max_input_chars,
         ),
         ("dataset", recorded.selected_dataset_sha256, requested.selected_dataset_sha256),
         ("redaction", recorded.redaction_policy_sha256, requested.redaction_policy_sha256),
@@ -2141,41 +2079,48 @@ def _restore_recorded_semantic_settings(
     manifest: DatasetRunManifest,
 ) -> DatasetSemanticSettings:
     recorded = manifest.run_context.semantic_settings
+    llm_client = recorded.llm_client
+    deconstruct = llm_client.role_config("deconstruct")
+    render = llm_client.role_config("render")
+    equivalence = llm_client.role_config("equivalence")
+    materiality = llm_client.role_config("materiality")
     command = manifest.effective_command
     if command.semantic_provider_type == "openai-compatible":
         return OpenAICompatibleDatasetSettings(
             live_calls=command.semantic_live_calls,
             allow_external_data_processing=command.semantic_allow_external_data_processing,
-            model=recorded.model,
-            render_model=recorded.render_model,
-            equivalence_model=recorded.equivalence_model,
-            materiality_model=recorded.materiality_model or recorded.model,
-            deconstruct_reasoning=recorded.deconstruct_reasoning,
-            render_reasoning=recorded.render_reasoning,
-            equivalence_reasoning=recorded.equivalence_reasoning,
+            model=deconstruct.model,
+            render_model=render.model,
+            equivalence_model=equivalence.model,
+            materiality_model=materiality.model,
+            deconstruct_reasoning=deconstruct.reasoning_mode,
+            render_reasoning=render.reasoning_mode,
+            equivalence_reasoning=equivalence.reasoning_mode,
             max_input_chars=recorded.max_input_chars,
-            max_output_tokens=recorded.max_output_tokens,
-            max_render_tokens=recorded.max_render_tokens,
-            max_response_bytes=recorded.max_response_bytes,
-            timeout_seconds=recorded.timeout_seconds,
-            provider_id=recorded.provider,
+            max_output_tokens=deconstruct.max_output_tokens,
+            max_render_tokens=render.max_output_tokens,
+            max_response_bytes=llm_client.max_response_bytes,
+            timeout_seconds=llm_client.timeout_seconds,
+            provider_id=llm_client.provider_id,
             base_url=command.semantic_base_url,
         )
+    assert llm_client.upstream_provider is not None
     return OpenRouterDatasetSettings(
         live_calls=command.semantic_live_calls,
         allow_external_data_processing=command.semantic_allow_external_data_processing,
-        model=recorded.model,
-        render_model=recorded.render_model,
-        equivalence_model=recorded.equivalence_model,
-        materiality_model=recorded.materiality_model or recorded.model,
-        deconstruct_reasoning=recorded.deconstruct_reasoning,
-        render_reasoning=recorded.render_reasoning,
-        equivalence_reasoning=recorded.equivalence_reasoning,
+        model=deconstruct.model,
+        render_model=render.model,
+        equivalence_model=equivalence.model,
+        materiality_model=materiality.model,
+        deconstruct_reasoning=deconstruct.reasoning_mode,
+        render_reasoning=render.reasoning_mode,
+        equivalence_reasoning=equivalence.reasoning_mode,
         max_input_chars=recorded.max_input_chars,
-        max_output_tokens=recorded.max_output_tokens,
-        max_render_tokens=recorded.max_render_tokens,
-        max_response_bytes=recorded.max_response_bytes,
-        timeout_seconds=recorded.timeout_seconds,
+        max_output_tokens=deconstruct.max_output_tokens,
+        max_render_tokens=render.max_output_tokens,
+        max_response_bytes=llm_client.max_response_bytes,
+        timeout_seconds=llm_client.timeout_seconds,
+        upstream_provider=llm_client.upstream_provider,
     )
 
 

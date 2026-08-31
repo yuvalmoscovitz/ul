@@ -19,6 +19,7 @@ from ul import (
     InteractionRecord,
     OpenAICompatibleDatasetSettings,
 )
+from ul.llm import LLMClient, llm_client_config_from_dataset_settings
 from ul_cli import dataset_review
 from ul_cli import progress_action as progress_action_module
 from ul_cli.dataset.evaluation import runner as runner_module
@@ -331,11 +332,19 @@ def test_source_preparation_failures_do_not_abort_a_ten_source_campaign(
     collected_source_failures: list[Any] = []
 
     class AsyncContext:
+        def __init__(self, semantic_settings: Any | None = None) -> None:
+            self.llm_client = (
+                LLMClient(llm_client_config_from_dataset_settings(semantic_settings))
+                if semantic_settings is not None
+                else None
+            )
+
         async def __aenter__(self) -> object:
             return self
 
         async def __aexit__(self, *args: object) -> None:
-            pass
+            if self.llm_client is not None:
+                await self.llm_client.aclose()
 
         def reuse_preflight(self, _result: object) -> None:
             pass
@@ -398,7 +407,7 @@ def test_source_preparation_failures_do_not_abort_a_ten_source_campaign(
     monkeypatch.setattr(
         runner_module,
         "create_semantic_model_deconstructor",
-        lambda settings: AsyncContext(),
+        lambda settings: AsyncContext(settings),
     )
     monkeypatch.setattr(runner_module, "DatasetAugmentationEngine", lambda *args: object())
     monkeypatch.setattr(runner_module, "DatasetEvaluationRunner", FakeRunner)
@@ -522,11 +531,19 @@ def test_cancellation_after_delivery_before_semantic_completion_is_quarantined(
             pass
 
     class AsyncContext:
+        def __init__(self, semantic_settings: Any | None = None) -> None:
+            self.llm_client = (
+                LLMClient(llm_client_config_from_dataset_settings(semantic_settings))
+                if semantic_settings is not None
+                else None
+            )
+
         async def __aenter__(self) -> object:
             return self
 
         async def __aexit__(self, *args: object) -> None:
-            pass
+            if self.llm_client is not None:
+                await self.llm_client.aclose()
 
         def reuse_preflight(self, _result: object) -> None:
             pass
@@ -552,7 +569,7 @@ def test_cancellation_after_delivery_before_semantic_completion_is_quarantined(
     monkeypatch.setattr(
         runner_module,
         "create_semantic_model_deconstructor",
-        lambda settings: AsyncContext(),
+        lambda settings: AsyncContext(settings),
     )
     monkeypatch.setattr(runner_module, "DatasetAugmentationEngine", lambda *args: object())
     monkeypatch.setattr(runner_module, "DatasetEvaluationRunner", FakeRunner)

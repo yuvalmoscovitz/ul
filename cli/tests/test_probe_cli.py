@@ -16,7 +16,7 @@ from typing import Any, cast
 
 import pytest
 import typer
-from dataset._factories import _evaluator_preflight
+from dataset._factories import _evaluator_preflight, _settings
 from typer.testing import CliRunner
 from ul import (
     DatasetEvaluationResult,
@@ -26,6 +26,8 @@ from ul import (
     load_json_http_environment_config,
     load_local_target_config,
 )
+from ul.evaluators import evaluator_judge_version_from_llm_config
+from ul.llm import LLMClient, llm_client_config_from_dataset_settings
 from ul_cli import dataset_review
 from ul_cli import probe as probe_module
 from ul_cli import progress_action as progress_action_module
@@ -106,11 +108,16 @@ def _write_callable(path: Path, *, failing: bool = False) -> None:
 
 
 class _CleanRoomSemanticModel:
+    def __init__(self, semantic_settings: Any | None = None) -> None:
+        self.llm_client = LLMClient(
+            llm_client_config_from_dataset_settings(semantic_settings or _settings())
+        )
+
     async def __aenter__(self) -> _CleanRoomSemanticModel:
         return self
 
     async def __aexit__(self, *args: object) -> None:
-        return None
+        await self.llm_client.aclose()
 
     def reuse_preflight(self, result: object) -> None:
         del result
@@ -375,8 +382,8 @@ class _UnknownOutcomeSemanticModel(_ResponseOnlySemanticModel):
 
 
 class _MaterialResponseJudge:
-    def __init__(self, config: object) -> None:
-        self.version = config.evaluator_judge_version()
+    def __init__(self, *, llm_client: LLMClient) -> None:
+        self.version = evaluator_judge_version_from_llm_config(llm_client.config)
 
     async def __aenter__(self) -> _MaterialResponseJudge:
         return self
@@ -869,7 +876,7 @@ def test_structured_http_target_runs_real_smoke_and_campaign(
     monkeypatch.setattr(
         campaign_runner_module,
         "create_semantic_model_deconstructor",
-        lambda _settings: _CleanRoomSemanticModel(),
+        lambda semantic_settings: _CleanRoomSemanticModel(semantic_settings),
     )
     arguments = [
         "probe",
@@ -1913,7 +1920,7 @@ def test_authenticated_direct_http_pause_resume_preserves_mapping_options(
     monkeypatch.setattr(
         campaign_runner_module,
         "create_semantic_model_deconstructor",
-        lambda _settings: _CleanRoomSemanticModel(),
+        lambda semantic_settings: _CleanRoomSemanticModel(semantic_settings),
     )
     endpoint = f"http://127.0.0.1:{server.server_port}/invoke"
     try:
@@ -2216,7 +2223,7 @@ def test_paused_probe_action_resumes_after_terminal_trial_without_replay(
     monkeypatch.setattr(
         campaign_runner_module,
         "create_semantic_model_deconstructor",
-        lambda _settings: _CleanRoomSemanticModel(),
+        lambda semantic_settings: _CleanRoomSemanticModel(semantic_settings),
     )
     result = runner.invoke(
         app,
@@ -2618,8 +2625,11 @@ def test_public_documentation_flow_runs_real_callable_campaign_and_report(
     evidence = evidence_lines[1]
     assert evidence["execution_plan"]["repetitions"] == 2
     assert evidence["execution_plan"]["dataset_planned_target_calls"] == 4
-    assert evidence["run_context"]["semantic_settings"]["provider"] == "openrouter"
-    assert evidence["run_context"]["semantic_settings"]["model"]
+    assert evidence["run_context"]["semantic_settings"]["llm_client"]["provider_id"] == (
+        "openrouter"
+    )
+    llm_roles = evidence["run_context"]["semantic_settings"]["llm_client"]["roles"]
+    assert next(role["model"] for role in llm_roles if role["role"] == "deconstruct")
     assert evidence["run_context"]["target"]["kind"] == "probe_target"
     assert evidence["run_context"]["target"]["receipt"]["confirmation_sha256"]
     assert (
@@ -2741,12 +2751,11 @@ def test_public_probe_runs_answer_only_callable_through_real_worker_and_reports_
         del settings
         return _evaluator_preflight()
 
-    semantic_model = _ResponseOnlySemanticModel()
     monkeypatch.setattr(probe_module, "preflight_evaluator", successful_preflight)
     monkeypatch.setattr(
         campaign_runner_module,
         "create_semantic_model_deconstructor",
-        lambda _settings: semantic_model,
+        lambda semantic_settings: _ResponseOnlySemanticModel(semantic_settings),
     )
 
     result = runner.invoke(
@@ -2818,7 +2827,7 @@ def test_public_probe_runs_raw_text_callable_through_real_worker_without_leaking
     monkeypatch.setattr(
         campaign_runner_module,
         "create_semantic_model_deconstructor",
-        lambda _settings: _ResponseOnlySemanticModel(),
+        lambda semantic_settings: _ResponseOnlySemanticModel(semantic_settings),
     )
 
     result = runner.invoke(
@@ -2925,7 +2934,7 @@ def test_public_probe_maps_invalid_recorded_projection_before_campaign_target_in
     monkeypatch.setattr(
         campaign_runner_module,
         "create_semantic_model_deconstructor",
-        lambda _settings: _CleanRoomSemanticModel(),
+        lambda semantic_settings: _CleanRoomSemanticModel(semantic_settings),
     )
 
     result = runner.invoke(
@@ -3059,8 +3068,7 @@ def _probe_review_and_save_response_regression(
         return _evaluator_preflight()
 
     def clean_room_model(settings: object) -> _RegressionSemanticModel:
-        del settings
-        return _RegressionSemanticModel()
+        return _RegressionSemanticModel(settings)
 
     monkeypatch.setattr(probe_module, "preflight_evaluator", clean_room_preflight)
     monkeypatch.setattr(

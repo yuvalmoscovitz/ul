@@ -57,6 +57,7 @@ from ul.dataset_invariants import (
 from ul.dataset_regression import dataset_regression_target_config_sha256
 from ul.environment import validate_outcome_projection_evidence
 from ul.http_environment import JsonHttpIsolatedResponseConfig, JsonHttpTargetConfig
+from ul.llm import LLMClientIdentity
 from ul.outcome_projection import OutcomeProjection
 from ul_core.augmentations.definitions import builtin_augmentation_catalog
 
@@ -236,26 +237,8 @@ class DatasetEvidenceOperator(_StrictModel):
 
 
 class DatasetEvidenceSemanticSettings(_StrictModel):
-    provider: str = Field(min_length=1, max_length=100)
-    upstream_provider: str | None = Field(
-        default=None,
-        min_length=1,
-        max_length=100,
-        pattern=r"^[A-Za-z0-9][A-Za-z0-9._/-]*$",
-    )
-    endpoint_sha256: str = Field(pattern=_SHA256_PATTERN)
-    model: str
-    render_model: str
-    equivalence_model: str
-    materiality_model: str | None = None
-    deconstruct_reasoning: Literal["required", "omitted"] = "required"
-    render_reasoning: Literal["required", "omitted"] = "required"
-    equivalence_reasoning: Literal["required", "omitted"] = "required"
+    llm_client: LLMClientIdentity
     max_input_chars: int = Field(ge=1)
-    max_output_tokens: int = Field(ge=1)
-    max_render_tokens: int = Field(ge=1)
-    max_response_bytes: int = Field(ge=1)
-    timeout_seconds: float = Field(gt=0)
     deconstructor_identity: SemanticDeconstructorIdentity | None = None
     materiality_evaluator_version_id: str | None = Field(
         default=None,
@@ -363,18 +346,6 @@ class DatasetEvidenceRunContext(_StrictModel):
             context_content.pop("redaction_policy_sha256")
         if not self.redaction_coverage:
             context_content.pop("redaction_coverage")
-        if self.semantic_settings.deconstructor_identity is None:
-            cast(dict[str, object], context_content["semantic_settings"]).pop(
-                "deconstructor_identity"
-            )
-        if self.semantic_settings.materiality_model is None:
-            cast(dict[str, object], context_content["semantic_settings"]).pop("materiality_model")
-        if self.semantic_settings.upstream_provider is None:
-            cast(dict[str, object], context_content["semantic_settings"]).pop("upstream_provider")
-        if self.semantic_settings.materiality_evaluator_version_id is None:
-            cast(dict[str, object], context_content["semantic_settings"]).pop(
-                "materiality_evaluator_version_id"
-            )
         if "target_timeout_seconds" not in self.model_fields_set:
             context_content.pop("target_timeout_seconds")
         expected_context_sha256 = _canonical_json_sha256(context_content)
@@ -708,7 +679,7 @@ def create_dataset_evidence_run_context(
         "invariant_suite_sha256": invariant_suite_sha256,
         "target": target.model_dump(mode="json"),
         "fixture": fixture.model_dump(mode="json"),
-        "semantic_settings": semantic_settings.model_dump(mode="json", exclude_none=True),
+        "semantic_settings": semantic_settings.model_dump(mode="json"),
     }
     if redaction_policy_sha256 is not None:
         content["redaction_policy_sha256"] = redaction_policy_sha256

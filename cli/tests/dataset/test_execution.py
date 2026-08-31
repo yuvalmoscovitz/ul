@@ -23,9 +23,10 @@ from ul import (
     JsonHttpEnvironmentConfig,
     ProviderDiagnostic,
     ProviderDiagnosticError,
-    semantic_deconstructor_identity,
 )
 from ul.environment import evaluation_case_from_inputs
+from ul.evaluators import evaluator_judge_version_from_llm_config
+from ul.llm import LLMClient, llm_client_config_from_dataset_settings
 from ul_cli import dataset_augmentation_ledger as augmentation_ledger_module
 from ul_cli import progress_action as progress_action_module
 from ul_cli.dataset.evaluation import command as command_module
@@ -84,21 +85,8 @@ def test_execution_reuses_complete_augmentation_input_without_regeneration(
     generation_context = augmentation_ledger_module.create_dataset_augmentation_generation_context(
         selected_records=(evaluation_result.source,),
         operators=(("input.surface.rephrase", "1.0.0"),),
-        semantic_settings=augmentation_ledger_module.DatasetAugmentationLedgerSemanticSettings(
-            provider=settings.semantic_provider_id,
-            endpoint_sha256=settings.semantic_endpoint_sha256,
-            model=settings.model,
-            render_model=settings.render_model,
-            equivalence_model=settings.equivalence_model,
-            deconstruct_reasoning=settings.deconstruct_reasoning,
-            render_reasoning=settings.render_reasoning,
-            equivalence_reasoning=settings.equivalence_reasoning,
-            max_input_chars=settings.max_input_chars,
-            max_output_tokens=settings.max_output_tokens,
-            max_render_tokens=settings.max_render_tokens,
-            max_response_bytes=settings.max_response_bytes,
-            timeout_seconds=settings.timeout_seconds,
-            deconstructor_identity=semantic_deconstructor_identity(settings),
+        semantic_settings=(
+            augmentation_ledger_module.dataset_augmentation_ledger_semantic_settings(settings)
         ),
     )
     with augmentation_ledger_module.create_private_augmentation_ledger(
@@ -174,11 +162,16 @@ def test_execution_reuses_complete_augmentation_input_without_regeneration(
 
 
 class _LocalEvaluationSemanticModel:
+    def __init__(self, semantic_settings: Any | None = None) -> None:
+        self.llm_client = LLMClient(
+            llm_client_config_from_dataset_settings(semantic_settings or _settings())
+        )
+
     async def __aenter__(self) -> _LocalEvaluationSemanticModel:
         return self
 
     async def __aexit__(self, *args: object) -> None:
-        return None
+        await self.llm_client.aclose()
 
     def reuse_preflight(self, result: object) -> None:
         del result
@@ -391,13 +384,14 @@ class _MaterialVarianceJudge:
     score = 1
     expected_token_parameter = "max_tokens"
 
-    def __init__(self, config: object) -> None:
-        assert config.token_parameter == self.expected_token_parameter
-        if config.data_policy == "openrouter_zdr":
+    def __init__(self, *, llm_client: LLMClient) -> None:
+        config = llm_client.config
+        assert config.role_config("materiality").token_parameter == self.expected_token_parameter
+        if config.provider_type == "openrouter":
             assert config.upstream_provider == "test-provider"
         else:
             assert config.upstream_provider is None
-        self.version = config.evaluator_judge_version()
+        self.version = evaluator_judge_version_from_llm_config(config)
 
     async def __aenter__(self) -> _MaterialVarianceJudge:
         return self
@@ -807,7 +801,7 @@ def test_public_cli_persists_and_applies_automatic_materiality(
     monkeypatch.setattr(
         runner_module,
         "create_semantic_model_deconstructor",
-        lambda _settings: _MaterialVarianceSemanticModel(),
+        lambda semantic_settings: _MaterialVarianceSemanticModel(semantic_settings),
     )
     monkeypatch.setattr(
         runner_module,

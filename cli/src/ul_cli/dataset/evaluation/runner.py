@@ -20,7 +20,6 @@ from ul import (
     EvaluatorModelPreflight,
     InteractionRecord,
     OpenAICompatibleEvaluatorJudge,
-    OpenAICompatibleJudgeConfig,
     ProjectedResponseSemanticDeconstructor,
     RedactedSemanticPipeline,
     RedactionEngine,
@@ -140,28 +139,7 @@ async def evaluate_interaction_records(
     deconstructor.reuse_preflight(evaluator_preflight)
     if not settings.allow_external_data_processing:
         raise ValueError("material variance judging requires external data processing approval")
-    materiality_judge = OpenAICompatibleEvaluatorJudge(
-        OpenAICompatibleJudgeConfig(
-            base_url=settings.semantic_base_url,
-            model=settings.materiality_model,
-            api_key=settings.api_key,
-            allow_external_data_processing=settings.allow_external_data_processing,
-            data_policy=(
-                "openrouter_zdr"
-                if settings.semantic_provider_type == "openrouter"
-                else "provider_default"
-            ),
-            upstream_provider=(
-                getattr(settings, "upstream_provider", None)
-                if settings.semantic_provider_type == "openrouter"
-                else None
-            ),
-            timeout_seconds=settings.timeout_seconds,
-            max_output_tokens=512,
-            token_parameter="max_tokens",
-            max_response_bytes=settings.max_response_bytes,
-        )
-    )
+    materiality_judge = OpenAICompatibleEvaluatorJudge(llm_client=deconstructor.llm_client)
     material_variance_evaluator = DatasetMaterialVarianceJudge(
         materiality_judge,
         max_input_chars=settings.max_input_chars,

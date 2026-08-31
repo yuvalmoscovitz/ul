@@ -20,7 +20,6 @@ from ul import (
     JsonHttpEnvironmentConfig,
     ObservedAgentOutput,
     OutcomeProjection,
-    semantic_deconstructor_identity,
 )
 from ul.dataset_invariants import (
     DatasetInvariantSuite,
@@ -346,21 +345,8 @@ def test_resume_accepts_completed_trials_with_durable_augmentation_input(
     generation_context = augmentation_ledger_module.create_dataset_augmentation_generation_context(
         selected_records=(evaluation.source,),
         operators=(("input.surface.rephrase", "1.0.0"),),
-        semantic_settings=augmentation_ledger_module.DatasetAugmentationLedgerSemanticSettings(
-            provider=settings.semantic_provider_id,
-            endpoint_sha256=settings.semantic_endpoint_sha256,
-            model=settings.model,
-            render_model=settings.render_model,
-            equivalence_model=settings.equivalence_model,
-            deconstruct_reasoning=settings.deconstruct_reasoning,
-            render_reasoning=settings.render_reasoning,
-            equivalence_reasoning=settings.equivalence_reasoning,
-            max_input_chars=settings.max_input_chars,
-            max_output_tokens=settings.max_output_tokens,
-            max_render_tokens=settings.max_render_tokens,
-            max_response_bytes=settings.max_response_bytes,
-            timeout_seconds=settings.timeout_seconds,
-            deconstructor_identity=semantic_deconstructor_identity(settings),
+        semantic_settings=(
+            augmentation_ledger_module.dataset_augmentation_ledger_semantic_settings(settings)
         ),
     )
     with augmentation_ledger_module.create_private_augmentation_ledger(
@@ -486,18 +472,8 @@ def test_resume_skips_already_processed_interaction_ids(
     generation_context = augmentation_ledger_module.create_dataset_augmentation_generation_context(
         selected_records=selected_records,
         operators=(("input.surface.rephrase", "1.0.0"),),
-        semantic_settings=augmentation_ledger_module.DatasetAugmentationLedgerSemanticSettings(
-            provider="openrouter",
-            endpoint_sha256=_settings().semantic_endpoint_sha256,
-            model=_settings().model,
-            render_model=_settings().render_model,
-            equivalence_model=_settings().equivalence_model,
-            max_input_chars=_settings().max_input_chars,
-            max_output_tokens=_settings().max_output_tokens,
-            max_render_tokens=_settings().max_render_tokens,
-            max_response_bytes=_settings().max_response_bytes,
-            timeout_seconds=_settings().timeout_seconds,
-            deconstructor_identity=semantic_deconstructor_identity(_settings()),
+        semantic_settings=(
+            augmentation_ledger_module.dataset_augmentation_ledger_semantic_settings(_settings())
         ),
     )
     with augmentation_ledger_module.create_private_augmentation_ledger(
@@ -707,18 +683,8 @@ def test_resume_dry_run_rejects_ledger_that_disagrees_with_completed_evidence(
     generation_context = augmentation_ledger_module.create_dataset_augmentation_generation_context(
         selected_records=selected_records,
         operators=(("input.surface.rephrase", "1.0.0"),),
-        semantic_settings=augmentation_ledger_module.DatasetAugmentationLedgerSemanticSettings(
-            provider="openrouter",
-            endpoint_sha256=_settings().semantic_endpoint_sha256,
-            model=_settings().model,
-            render_model=_settings().render_model,
-            equivalence_model=_settings().equivalence_model,
-            max_input_chars=_settings().max_input_chars,
-            max_output_tokens=_settings().max_output_tokens,
-            max_render_tokens=_settings().max_render_tokens,
-            max_response_bytes=_settings().max_response_bytes,
-            timeout_seconds=_settings().timeout_seconds,
-            deconstructor_identity=semantic_deconstructor_identity(_settings()),
+        semantic_settings=(
+            augmentation_ledger_module.dataset_augmentation_ledger_semantic_settings(_settings())
         ),
     )
     mismatched_candidate = evaluation_result.augmentation.candidates[0].model_copy(
@@ -1425,7 +1391,7 @@ def test_resume_rejects_changed_reasoning_mode(
         command_module._manifest_incompatibility_reason(
             cast(Any, run_context), cast(Any, required_context)
         )
-        == "evaluator.reasoning"
+        == "evaluator.llm_client"
     )
     evidence.write_text(
         json.dumps(
