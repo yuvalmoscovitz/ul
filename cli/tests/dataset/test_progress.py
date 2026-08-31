@@ -329,7 +329,7 @@ def test_source_preparation_failures_do_not_abort_a_ten_source_campaign(
     failed_ids = {"source-2", "source-7"}
     target_started_ids: list[str] = []
     journal_states: dict[str, str] = {}
-    collected_source_failures: list[Any] = []
+    collected_source_events: list[Any] = []
 
     class AsyncContext:
         def __init__(self, semantic_settings: Any | None = None) -> None:
@@ -433,7 +433,7 @@ def test_source_preparation_failures_do_not_abort_a_ten_source_campaign(
                 run_context=run_context,
                 evaluator_preflight=cast(Any, object()),
                 trial_journal=cast(Any, FakeJournal()),
-                source_preparation_failures=collected_source_failures,
+                source_preparation_events=collected_source_events,
             )
 
     results = asyncio.run(run())
@@ -449,10 +449,16 @@ def test_source_preparation_failures_do_not_abort_a_ten_source_campaign(
     assert len(evidence_lines) == 10
     failures = [line for line in evidence_lines if line.get("record_type")]
     assert [failure["interaction_id"] for failure in failures] == ["source-2", "source-7"]
-    assert [failure.interaction_id for failure in collected_source_failures] == [
+    assert [event.interaction_id for event in collected_source_events] == [
         "source-2",
         "source-7",
     ]
+    assert all(event.durability_state == "persisted" for event in collected_source_events)
+    assert all(
+        event.retry_disposition == "do_not_retry_in_campaign"
+        and event.review_disposition == "inspect_source"
+        for event in collected_source_events
+    )
     assert all("raw_input" not in failure for failure in failures)
     for field_name in ("interaction_id", "source_record_id"):
         oversized_failure = {**failures[0], field_name: "x" * 501}
