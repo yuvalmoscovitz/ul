@@ -1621,6 +1621,16 @@ def test_dataset_invariant_adapter_preserves_exact_mixed_repetitions() -> None:
         mixed_evaluation.model_dump_json()
     )
 
+    assert all(
+        package.occurrence.kind != "customer_invariant_violation"
+        for package in adapt_dataset_finding_packages(
+            mixed_result,
+            invariant_evaluation=mixed_evaluation,
+            invariant_rules=(_rule(),),
+            context=_context(),
+        )
+    )
+
     package = adapt_dataset_invariant_finding(
         mixed_result,
         mixed_evaluation,
@@ -1930,9 +1940,15 @@ def test_dataset_mixed_missing_probe_repetition_remains_persistable() -> None:
         context=_context(),
     )
 
-    assert len(packages) == 1
-    package = packages[0]
-    assert package.occurrence.kind == "customer_invariant_violation"
+    assert packages == ()
+
+    package = adapt_dataset_invariant_finding(
+        mixed_result,
+        mixed_evaluation,
+        _rule(),
+        case_index=0,
+        context=_context(),
+    )
     assert package.occurrence.repetition_summary.inconclusive == 1
     assert package.occurrence.repetitions[1].outcome == "inconclusive"
     assert package.occurrence.repetitions[1].inconclusive_reason == "target_output_missing"

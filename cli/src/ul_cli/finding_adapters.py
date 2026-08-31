@@ -35,6 +35,7 @@ from ul_core.evaluation import (
 )
 
 from ul_cli.finding_reference import finding_public_reference
+from ul_cli.invariant_findings import is_reproduced_invariant_difference
 from ul_cli.report_contract import (
     CapturedJson,
     CrossExaminationArm,
@@ -211,6 +212,11 @@ def adapt_dataset_finding_packages(
         if invariant_evaluation is not None
         else {}
     )
+    baseline_rules_by_id = (
+        {rule.rule_id: rule for rule in invariant_evaluation.baseline.rules}
+        if invariant_evaluation is not None
+        else {}
+    )
     for case_index, case in enumerate(result.cases):
         if case.material_variance is None or case.material_variance.decision == "material_variance":
             packages.extend(
@@ -223,7 +229,10 @@ def adapt_dataset_finding_packages(
                 for finding_index in range(len(case.findings))
             )
         for rule_evaluation in variation_rules_by_operator.get(case.candidate.operator_id, ()):
-            if rule_evaluation.status != "violated":
+            baseline_rule = baseline_rules_by_id.get(rule_evaluation.rule_id)
+            if baseline_rule is None or not is_reproduced_invariant_difference(
+                baseline_rule, rule_evaluation
+            ):
                 continue
             rule_definition = rules_by_id.get(rule_evaluation.rule_id)
             if rule_definition is None or invariant_evaluation is None:
