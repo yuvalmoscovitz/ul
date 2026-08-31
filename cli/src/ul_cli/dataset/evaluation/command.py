@@ -51,6 +51,7 @@ from ul_cli.dataset.progress import (
     create_campaign_next_commands,
     create_campaign_progress_runtime,
 )
+from ul_cli.dataset.source_preparation import DatasetSourcePreparationFailureEvent
 from ul_cli.dataset_augmentation_ledger import (
     DatasetAugmentationGenerationContext,
     DatasetAugmentationLedger,
@@ -64,7 +65,6 @@ from ul_cli.dataset_campaign import create_dataset_campaign_plan
 from ul_cli.dataset_review import (
     DatasetEvidenceRunContext,
     DatasetResumeEvidence,
-    DatasetSourcePreparationFailureEvidence,
 )
 from ul_cli.dataset_run_config import DatasetRunConfig, TargetExecutionConfig
 from ul_cli.dataset_trial_journal import (
@@ -1794,7 +1794,7 @@ def evaluate_dataset(
     assert output_stream is not None
     assert finding_reference_context is not None
     invariant_evaluations: list[DatasetInvariantEvaluation] = []
-    source_preparation_failures: list[DatasetSourcePreparationFailureEvidence] = []
+    source_preparation_events: list[DatasetSourcePreparationFailureEvent] = []
     try:
         with output_stream:
             evaluation_parameters = inspect.signature(evaluate_interaction_records).parameters
@@ -1817,8 +1817,8 @@ def evaluate_dataset(
                 "progress_json" in evaluation_parameters or accepts_extra_arguments
             ):
                 durable_arguments["progress_json"] = True
-            if "source_preparation_failures" in evaluation_parameters or accepts_extra_arguments:
-                durable_arguments["source_preparation_failures"] = source_preparation_failures
+            if "source_preparation_events" in evaluation_parameters or accepts_extra_arguments:
+                durable_arguments["source_preparation_events"] = source_preparation_events
             evaluation_runner = cast(Any, evaluate_interaction_records)
             if invariant_suite is not None:
                 evaluation_coroutine = evaluation_runner(
@@ -1904,7 +1904,7 @@ def evaluate_dataset(
     progress_runtime.tracker.emit(status="running", stage="report")
     all_source_preparation_failures = (
         resume_evidence.source_preparation_failures if resume_evidence is not None else ()
-    ) + tuple(source_preparation_failures)
+    ) + tuple(event.evidence for event in source_preparation_events)
     try:
         print_dataset_results(
             results,
