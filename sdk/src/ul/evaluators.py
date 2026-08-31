@@ -153,6 +153,7 @@ class OpenAICompatibleJudgeConfig(ULModel):
                     model=self.model,
                     max_output_tokens=self.max_output_tokens,
                     token_parameter=self.token_parameter,
+                    reasoning_mode="omitted",
                 )
                 for role in ("deconstruct", "render", "equivalence", "materiality")
             ),
@@ -273,7 +274,6 @@ class OpenAICompatibleEvaluatorJudge:
     async def evaluate(self, request: JudgeRequest) -> EvaluatorDecision:
         completion = await self.llm_client.complete(
             role="materiality",
-            reasoning=None,
             seed=0,
             top_p=None,
             schema_name="ul_evaluator_decision",

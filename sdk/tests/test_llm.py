@@ -23,10 +23,33 @@ def _config() -> LLMClientConfig:
         allow_external_data_processing=True,
         upstream_provider="pinned-provider",
         roles=(
-            LLMRoleConfig(role="deconstruct", model="test/deconstruct", max_output_tokens=100),
-            LLMRoleConfig(role="render", model="test/render", max_output_tokens=101),
-            LLMRoleConfig(role="equivalence", model="test/equivalence", max_output_tokens=102),
-            LLMRoleConfig(role="materiality", model="test/materiality", max_output_tokens=103),
+            LLMRoleConfig(
+                role="deconstruct",
+                model="test/deconstruct",
+                max_output_tokens=100,
+                reasoning_mode="required",
+                reasoning_effort="minimal",
+            ),
+            LLMRoleConfig(
+                role="render",
+                model="test/render",
+                max_output_tokens=101,
+                reasoning_mode="required",
+                reasoning_effort="none",
+            ),
+            LLMRoleConfig(
+                role="equivalence",
+                model="test/equivalence",
+                max_output_tokens=102,
+                reasoning_mode="required",
+                reasoning_effort="low",
+            ),
+            LLMRoleConfig(
+                role="materiality",
+                model="test/materiality",
+                max_output_tokens=103,
+                reasoning_mode="omitted",
+            ),
         ),
         timeout_seconds=60.0,
         max_response_bytes=1_000_000,
@@ -55,7 +78,6 @@ async def test_one_client_applies_the_same_deterministic_route_to_every_semantic
         for role in ("deconstruct", "render", "equivalence", "materiality"):
             await client.complete(
                 role=role,
-                reasoning={"effort": "low"},
                 seed=0,
                 top_p=None,
                 schema_name="test_response",
@@ -70,6 +92,12 @@ async def test_one_client_applies_the_same_deterministic_route_to_every_semantic
         "test/render",
         "test/equivalence",
         "test/materiality",
+    ]
+    assert [request.get("reasoning") for request in requests] == [
+        {"effort": "minimal"},
+        {"effort": "none"},
+        {"effort": "low"},
+        None,
     ]
     for request in requests:
         assert request["temperature"] == 0
@@ -88,4 +116,4 @@ async def test_llm_configuration_is_frozen_and_secret_free_in_evidence() -> None
     with pytest.raises(ValidationError):
         config.__setattr__("temperature", 1)
 
-    assert "private-api-key" not in json.dumps(config.evidence_identity())
+    assert "private-api-key" not in config.evidence_identity().model_dump_json()

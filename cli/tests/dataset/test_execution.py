@@ -23,7 +23,6 @@ from ul import (
     JsonHttpEnvironmentConfig,
     ProviderDiagnostic,
     ProviderDiagnosticError,
-    semantic_deconstructor_identity,
 )
 from ul.environment import evaluation_case_from_inputs
 from ul_cli import dataset_augmentation_ledger as augmentation_ledger_module
@@ -84,21 +83,8 @@ def test_execution_reuses_complete_augmentation_input_without_regeneration(
     generation_context = augmentation_ledger_module.create_dataset_augmentation_generation_context(
         selected_records=(evaluation_result.source,),
         operators=(("input.surface.rephrase", "1.0.0"),),
-        semantic_settings=augmentation_ledger_module.DatasetAugmentationLedgerSemanticSettings(
-            provider=settings.semantic_provider_id,
-            endpoint_sha256=settings.semantic_endpoint_sha256,
-            model=settings.model,
-            render_model=settings.render_model,
-            equivalence_model=settings.equivalence_model,
-            deconstruct_reasoning=settings.deconstruct_reasoning,
-            render_reasoning=settings.render_reasoning,
-            equivalence_reasoning=settings.equivalence_reasoning,
-            max_input_chars=settings.max_input_chars,
-            max_output_tokens=settings.max_output_tokens,
-            max_render_tokens=settings.max_render_tokens,
-            max_response_bytes=settings.max_response_bytes,
-            timeout_seconds=settings.timeout_seconds,
-            deconstructor_identity=semantic_deconstructor_identity(settings),
+        semantic_settings=(
+            augmentation_ledger_module.dataset_augmentation_ledger_semantic_settings(settings)
         ),
     )
     with augmentation_ledger_module.create_private_augmentation_ledger(

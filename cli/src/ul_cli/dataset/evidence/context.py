@@ -60,21 +60,8 @@ def dataset_evidence_semantic_settings(
 ) -> DatasetEvidenceSemanticSettings:
     llm_config = llm_client_config_from_dataset_settings(settings)
     return DatasetEvidenceSemanticSettings(
-        provider=llm_config.provider_id,
-        upstream_provider=llm_config.upstream_provider,
-        endpoint_sha256=llm_config.endpoint_sha256,
-        model=llm_config.role_config("deconstruct").model,
-        render_model=llm_config.role_config("render").model,
-        equivalence_model=llm_config.role_config("equivalence").model,
-        materiality_model=llm_config.role_config("materiality").model,
-        deconstruct_reasoning=settings.deconstruct_reasoning,
-        render_reasoning=settings.render_reasoning,
-        equivalence_reasoning=settings.equivalence_reasoning,
+        llm_client=llm_config.evidence_identity(),
         max_input_chars=settings.max_input_chars,
-        max_output_tokens=llm_config.role_config("deconstruct").max_output_tokens,
-        max_render_tokens=llm_config.role_config("render").max_output_tokens,
-        max_response_bytes=llm_config.max_response_bytes,
-        timeout_seconds=llm_config.timeout_seconds,
         deconstructor_identity=semantic_deconstructor_identity(settings),
         materiality_evaluator_version_id=(
             material_variance_evaluator_version_from_llm_config(llm_config).id

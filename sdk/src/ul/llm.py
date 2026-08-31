@@ -14,6 +14,8 @@ from ul_core.models import ULModel
 
 type LLMRole = Literal["deconstruct", "render", "equivalence", "materiality"]
 type LLMProviderType = Literal["openrouter", "openai-compatible"]
+type LLMReasoningMode = Literal["required", "omitted"]
+type LLMReasoningEffort = Literal["minimal", "none", "low"]
 
 
 class DatasetLLMSettings(Protocol):
@@ -57,6 +59,15 @@ class DatasetLLMSettings(Protocol):
     def materiality_model(self) -> str: ...
 
     @property
+    def deconstruct_reasoning(self) -> LLMReasoningMode: ...
+
+    @property
+    def render_reasoning(self) -> LLMReasoningMode: ...
+
+    @property
+    def equivalence_reasoning(self) -> LLMReasoningMode: ...
+
+    @property
     def max_output_tokens(self) -> int: ...
 
     @property
@@ -76,6 +87,61 @@ class LLMRoleConfig(ULModel):
     model: str = Field(min_length=1, max_length=200)
     max_output_tokens: int = Field(ge=1, le=32_768)
     token_parameter: Literal["max_tokens", "max_completion_tokens"] = "max_tokens"
+    reasoning_mode: LLMReasoningMode
+    reasoning_effort: LLMReasoningEffort | None = None
+
+    @model_validator(mode="after")
+    def validate_reasoning(self) -> Self:
+        if (self.reasoning_mode == "required") != (self.reasoning_effort is not None):
+            raise ValueError("required reasoning needs an effort and omitted reasoning forbids it")
+        return self
+
+    def reasoning_option(self) -> dict[str, JsonValue] | None:
+        if self.reasoning_effort is None:
+            return None
+        return {"effort": self.reasoning_effort}
+
+    def reasoning_metadata(self) -> dict[str, JsonValue]:
+        return {"mode": self.reasoning_mode, "effort": self.reasoning_effort}
+
+
+class LLMClientIdentity(ULModel):
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    provider_id: str = Field(min_length=1, max_length=100)
+    provider_type: LLMProviderType
+    upstream_provider: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=100,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9._/-]*$",
+    )
+    endpoint_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    roles: tuple[LLMRoleConfig, ...] = Field(min_length=4, max_length=4)
+    temperature: Literal[0] = 0
+    timeout_seconds: float = Field(gt=0, le=300)
+    max_response_bytes: int = Field(ge=1_024, le=5_000_000)
+    data_policy: dict[str, JsonValue]
+
+    @model_validator(mode="after")
+    def validate_configuration(self) -> Self:
+        configured_roles = tuple(role.role for role in self.roles)
+        required_roles: tuple[LLMRole, ...] = (
+            "deconstruct",
+            "render",
+            "equivalence",
+            "materiality",
+        )
+        if len(set(configured_roles)) != len(configured_roles) or set(configured_roles) != set(
+            required_roles
+        ):
+            raise ValueError("LLM client identity requires each semantic role exactly once")
+        if (self.provider_type == "openrouter") != (self.upstream_provider is not None):
+            raise ValueError("only an OpenRouter LLM identity requires an upstream provider")
+        return self
+
+    def role_config(self, role: LLMRole) -> LLMRoleConfig:
+        return next(configuration for configuration in self.roles if configuration.role == role)
 
 
 class LLMClientConfig(ULModel):
@@ -163,25 +229,18 @@ class LLMClientConfig(ULModel):
             ),
         }
 
-    def evidence_identity(self) -> dict[str, JsonValue]:
-        return {
-            "provider": self.provider_id,
-            "provider_type": self.provider_type,
-            "upstream_provider": self.upstream_provider,
-            "endpoint_sha256": self.endpoint_sha256,
-            "roles": {
-                role.role: {
-                    "model": role.model,
-                    "max_output_tokens": role.max_output_tokens,
-                    "token_parameter": role.token_parameter,
-                }
-                for role in self.roles
-            },
-            "temperature": self.temperature,
-            "timeout_seconds": self.timeout_seconds,
-            "max_response_bytes": self.max_response_bytes,
-            "data_policy": self.data_policy(),
-        }
+    def evidence_identity(self) -> LLMClientIdentity:
+        return LLMClientIdentity(
+            provider_id=self.provider_id,
+            provider_type=self.provider_type,
+            upstream_provider=self.upstream_provider,
+            endpoint_sha256=self.endpoint_sha256,
+            roles=self.roles,
+            temperature=self.temperature,
+            timeout_seconds=self.timeout_seconds,
+            max_response_bytes=self.max_response_bytes,
+            data_policy=self.data_policy(),
+        )
 
     def evaluator_judge_configuration(self, role: LLMRole) -> dict[str, JsonValue]:
         role_config = self.role_config(role)
@@ -202,7 +261,6 @@ class LLMClientConfig(ULModel):
         self,
         *,
         role: LLMRole,
-        reasoning: dict[str, JsonValue] | None,
         seed: int,
         top_p: float | None,
         max_output_tokens: int | None = None,
@@ -218,6 +276,7 @@ class LLMClientConfig(ULModel):
             role_config.token_parameter: requested_tokens,
         }
         if self.provider_type == "openrouter":
+            reasoning = role_config.reasoning_option()
             if reasoning is not None:
                 options["reasoning"] = reasoning
             options["provider"] = {
@@ -251,21 +310,30 @@ def llm_client_config_from_dataset_settings(settings: DatasetLLMSettings) -> LLM
                 role="deconstruct",
                 model=settings.model,
                 max_output_tokens=settings.max_output_tokens,
+                reasoning_mode=settings.deconstruct_reasoning,
+                reasoning_effort=(
+                    "minimal" if settings.deconstruct_reasoning == "required" else None
+                ),
             ),
             LLMRoleConfig(
                 role="render",
                 model=settings.render_model,
                 max_output_tokens=settings.max_render_tokens,
+                reasoning_mode=settings.render_reasoning,
+                reasoning_effort="none" if settings.render_reasoning == "required" else None,
             ),
             LLMRoleConfig(
                 role="equivalence",
                 model=settings.equivalence_model,
                 max_output_tokens=min(settings.max_output_tokens, 1_024),
+                reasoning_mode=settings.equivalence_reasoning,
+                reasoning_effort=("low" if settings.equivalence_reasoning == "required" else None),
             ),
             LLMRoleConfig(
                 role="materiality",
                 model=settings.materiality_model,
                 max_output_tokens=512,
+                reasoning_mode="omitted",
             ),
         ),
         timeout_seconds=settings.timeout_seconds,
@@ -352,14 +420,12 @@ class LLMClient:
         self,
         *,
         role: LLMRole,
-        reasoning: dict[str, JsonValue] | None,
         seed: int,
         top_p: float | None,
         max_output_tokens: int | None = None,
     ) -> dict[str, Any]:
         return self.config.request_options(
             role=role,
-            reasoning=reasoning,
             seed=seed,
             top_p=top_p,
             max_output_tokens=max_output_tokens,
@@ -369,7 +435,6 @@ class LLMClient:
         self,
         *,
         role: LLMRole,
-        reasoning: dict[str, JsonValue] | None,
         seed: int,
         top_p: float | None,
         schema_name: str,
@@ -384,7 +449,6 @@ class LLMClient:
         request_body = {
             **self.request_options(
                 role=role,
-                reasoning=reasoning,
                 seed=seed,
                 top_p=top_p,
                 max_output_tokens=max_output_tokens,

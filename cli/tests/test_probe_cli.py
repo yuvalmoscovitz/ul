@@ -2618,8 +2618,11 @@ def test_public_documentation_flow_runs_real_callable_campaign_and_report(
     evidence = evidence_lines[1]
     assert evidence["execution_plan"]["repetitions"] == 2
     assert evidence["execution_plan"]["dataset_planned_target_calls"] == 4
-    assert evidence["run_context"]["semantic_settings"]["provider"] == "openrouter"
-    assert evidence["run_context"]["semantic_settings"]["model"]
+    assert evidence["run_context"]["semantic_settings"]["llm_client"]["provider_id"] == (
+        "openrouter"
+    )
+    llm_roles = evidence["run_context"]["semantic_settings"]["llm_client"]["roles"]
+    assert next(role["model"] for role in llm_roles if role["role"] == "deconstruct")
     assert evidence["run_context"]["target"]["kind"] == "probe_target"
     assert evidence["run_context"]["target"]["receipt"]["confirmation_sha256"]
     assert (

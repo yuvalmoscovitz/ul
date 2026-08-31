@@ -99,20 +99,6 @@ def _render_seed(raw_input: str, instruction: str) -> int:
     return int.from_bytes(digest[:4], "big") & 0x7FFF_FFFF
 
 
-def _reasoning_option(
-    mode: SemanticReasoningMode,
-    effort: Literal["minimal", "none", "low"],
-) -> dict[str, JsonValue] | None:
-    return {"effort": effort} if mode == "required" else None
-
-
-def _reasoning_metadata(
-    mode: SemanticReasoningMode,
-    effort: Literal["minimal", "none", "low"],
-) -> dict[str, JsonValue]:
-    return {"mode": mode, "effort": effort if mode == "required" else None}
-
-
 class SemanticDeconstructorIdentity(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
@@ -952,7 +938,6 @@ class _EvaluatorPreflightProfile:
     roles: tuple[Literal["deconstruct", "render", "equivalence", "materiality"], ...]
     model: str
     reasoning_mode: SemanticReasoningMode
-    reasoning: dict[str, JsonValue] | None
     max_tokens: int
     temperature: float
     seed: int
@@ -1011,7 +996,6 @@ class SemanticModelDeconstructor:
                 completion = await self._request(
                     operation="preflight",
                     role=profile.roles[0],
-                    reasoning=profile.reasoning,
                     max_tokens=profile.max_tokens,
                     seed=profile.seed,
                     top_p=profile.top_p,
@@ -1090,7 +1074,7 @@ class SemanticModelDeconstructor:
         self._preflight_result = result
 
     def _preflight_profiles(self) -> tuple[_EvaluatorPreflightProfile, ...]:
-        return _evaluator_preflight_profiles(self.settings, self.llm_client.config)
+        return _evaluator_preflight_profiles(self.llm_client.config)
 
     def _profile_request_options_sha256(self, profile: _EvaluatorPreflightProfile) -> str:
         return _profile_request_options_sha256(self.llm_client.config, profile)
@@ -1125,7 +1109,6 @@ class SemanticModelDeconstructor:
         completion = await self._request(
             operation="deconstruct",
             role="deconstruct",
-            reasoning=_reasoning_option(self.settings.deconstruct_reasoning, "minimal"),
             max_tokens=self.settings.max_output_tokens,
             seed=0,
             top_p=None,
@@ -1149,9 +1132,9 @@ class SemanticModelDeconstructor:
                         "semantic_deconstructor_identity": _semantic_deconstructor_identity(
                             _EXTRACTOR_VERSION
                         ).model_dump(mode="json"),
-                        "semantic_reasoning": _reasoning_metadata(
-                            self.settings.deconstruct_reasoning, "minimal"
-                        ),
+                        "semantic_reasoning": self.llm_client.config.role_config(
+                            "deconstruct"
+                        ).reasoning_metadata(),
                         "prompts": prompt_provenance("semantic.deconstruct"),
                     },
                 }
@@ -1191,7 +1174,6 @@ class SemanticModelDeconstructor:
         completion = await self._request(
             operation="render",
             role="render",
-            reasoning=_reasoning_option(self.settings.render_reasoning, "none"),
             max_tokens=self.settings.max_render_tokens,
             seed=render_seed,
             top_p=None,
@@ -1225,7 +1207,9 @@ class SemanticModelDeconstructor:
                     "seed": render_seed,
                     "max_tokens": self.settings.max_render_tokens,
                 },
-                "semantic_reasoning": _reasoning_metadata(self.settings.render_reasoning, "none"),
+                "semantic_reasoning": self.llm_client.config.role_config(
+                    "render"
+                ).reasoning_metadata(),
             },
         )
 
@@ -1242,7 +1226,6 @@ class SemanticModelDeconstructor:
         completion = await self._request(
             operation="verify",
             role="equivalence",
-            reasoning=_reasoning_option(self.settings.equivalence_reasoning, "low"),
             max_tokens=min(self.settings.max_output_tokens, 1_024),
             seed=0,
             top_p=None,
@@ -1267,9 +1250,9 @@ class SemanticModelDeconstructor:
                         "semantic_equivalence_policy": {
                             "allowed_surface_change": allowed_surface_change
                         },
-                        "semantic_reasoning": _reasoning_metadata(
-                            self.settings.equivalence_reasoning, "low"
-                        ),
+                        "semantic_reasoning": self.llm_client.config.role_config(
+                            "equivalence"
+                        ).reasoning_metadata(),
                         "prompts": prompt_provenance("semantic.verify"),
                     },
                 }
@@ -1334,7 +1317,6 @@ class SemanticModelDeconstructor:
         *,
         operation: Literal["deconstruct", "render", "verify", "preflight"],
         role: LLMRole,
-        reasoning: dict[str, JsonValue] | None,
         max_tokens: int,
         seed: int,
         top_p: float | None,
@@ -1349,7 +1331,6 @@ class SemanticModelDeconstructor:
         cache_key = self._semantic_cache_key(
             operation=operation,
             model=role_config.model,
-            reasoning=reasoning,
             max_tokens=max_tokens,
             temperature=self.llm_client.config.temperature,
             seed=seed,
@@ -1373,7 +1354,6 @@ class SemanticModelDeconstructor:
         try:
             response = await self.llm_client.complete(
                 role=role,
-                reasoning=reasoning,
                 seed=seed,
                 top_p=top_p,
                 schema_name=schema_name,
@@ -1448,7 +1428,6 @@ class SemanticModelDeconstructor:
         *,
         operation: Literal["deconstruct", "render", "verify", "preflight"],
         model: str,
-        reasoning: dict[str, JsonValue] | None,
         max_tokens: int,
         temperature: float,
         seed: int,
@@ -1461,7 +1440,7 @@ class SemanticModelDeconstructor:
     ) -> str:
         identity = {
             "cache_version": _SEMANTIC_CACHE_VERSION,
-            "llm_client": self.llm_client.config.evidence_identity(),
+            "llm_client": self.llm_client.config.evidence_identity().model_dump(mode="json"),
             "extractor_version": _EXTRACTOR_VERSION,
             "equivalence_verifier_version": _EQUIVALENCE_VERIFIER_VERSION,
             "evaluator_preflight": (
@@ -1471,7 +1450,6 @@ class SemanticModelDeconstructor:
             ),
             "operation": operation,
             "model": model,
-            "reasoning": reasoning,
             "max_tokens": max_tokens,
             "temperature": temperature,
             "seed": seed,
@@ -1867,7 +1845,7 @@ def plan_evaluator_preflight_profiles(
             max_completion_tokens=profile.max_tokens,
             required_parameters=profile.required_parameters,
         )
-        for profile in _evaluator_preflight_profiles(settings, llm_config)
+        for profile in _evaluator_preflight_profiles(llm_config)
     )
 
 
@@ -1878,13 +1856,12 @@ def validate_evaluator_preflight(
     llm_config = llm_client_config_from_dataset_settings(settings)
     _validate_evaluator_preflight(
         llm_config,
-        _evaluator_preflight_profiles(settings, llm_config),
+        _evaluator_preflight_profiles(llm_config),
         result,
     )
 
 
 def _evaluator_preflight_profiles(
-    settings: DatasetSemanticSettings,
     llm_config: LLMClientConfig,
 ) -> tuple[_EvaluatorPreflightProfile, ...]:
     render_seed = _render_seed("UL evaluator preflight", "Check renderer compatibility.")
@@ -1892,17 +1869,13 @@ def _evaluator_preflight_profiles(
     def profile(
         *,
         role: Literal["deconstruct", "render", "equivalence", "materiality"],
-        model: str,
-        reasoning_mode: SemanticReasoningMode,
-        reasoning: dict[str, JsonValue] | None,
         max_tokens: int,
-        temperature: float,
         seed: int,
         top_p: float | None,
     ) -> _EvaluatorPreflightProfile:
+        role_config = llm_config.role_config(role)
         request_options = llm_config.request_options(
             role=role,
-            reasoning=reasoning,
             seed=seed,
             top_p=top_p,
             max_output_tokens=max_tokens,
@@ -1914,11 +1887,10 @@ def _evaluator_preflight_profiles(
             required_parameters.append("top_p")
         return _EvaluatorPreflightProfile(
             roles=(role,),
-            model=model,
-            reasoning_mode=reasoning_mode,
-            reasoning=reasoning,
+            model=role_config.model,
+            reasoning_mode=role_config.reasoning_mode,
             max_tokens=max_tokens,
-            temperature=temperature,
+            temperature=llm_config.temperature,
             seed=seed,
             top_p=top_p,
             required_parameters=tuple(required_parameters),
@@ -1927,41 +1899,37 @@ def _evaluator_preflight_profiles(
     candidates = (
         profile(
             role="deconstruct",
-            model=settings.model,
-            reasoning_mode=settings.deconstruct_reasoning,
-            reasoning=_reasoning_option(settings.deconstruct_reasoning, "minimal"),
-            max_tokens=min(settings.max_output_tokens, _PREFLIGHT_MAX_TOKENS),
-            temperature=0,
+            max_tokens=min(
+                llm_config.role_config("deconstruct").max_output_tokens,
+                _PREFLIGHT_MAX_TOKENS,
+            ),
             seed=0,
             top_p=None,
         ),
         profile(
             role="render",
-            model=settings.render_model,
-            reasoning_mode=settings.render_reasoning,
-            reasoning=_reasoning_option(settings.render_reasoning, "none"),
-            max_tokens=min(settings.max_render_tokens, _PREFLIGHT_MAX_TOKENS),
-            temperature=0,
+            max_tokens=min(
+                llm_config.role_config("render").max_output_tokens,
+                _PREFLIGHT_MAX_TOKENS,
+            ),
             seed=render_seed,
             top_p=None,
         ),
         profile(
             role="equivalence",
-            model=settings.equivalence_model,
-            reasoning_mode=settings.equivalence_reasoning,
-            reasoning=_reasoning_option(settings.equivalence_reasoning, "low"),
-            max_tokens=min(settings.max_output_tokens, _PREFLIGHT_MAX_TOKENS),
-            temperature=0,
+            max_tokens=min(
+                llm_config.role_config("equivalence").max_output_tokens,
+                _PREFLIGHT_MAX_TOKENS,
+            ),
             seed=0,
             top_p=None,
         ),
         profile(
             role="materiality",
-            model=settings.materiality_model,
-            reasoning_mode="omitted",
-            reasoning=None,
-            max_tokens=min(512, _PREFLIGHT_MAX_TOKENS),
-            temperature=0,
+            max_tokens=min(
+                llm_config.role_config("materiality").max_output_tokens,
+                _PREFLIGHT_MAX_TOKENS,
+            ),
             seed=0,
             top_p=None,
         ),
@@ -2047,7 +2015,6 @@ def _profile_request_options_sha256(
         "reasoning_mode": profile.reasoning_mode,
         **llm_config.request_options(
             role=profile.roles[0],
-            reasoning=profile.reasoning,
             seed=profile.seed,
             top_p=profile.top_p,
             max_output_tokens=profile.max_tokens,
