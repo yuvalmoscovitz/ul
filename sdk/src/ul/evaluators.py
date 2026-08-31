@@ -44,11 +44,9 @@ from ul_core.prompts import PromptManager
 
 from ul.environment import validate_execution_evidence
 from ul.llm import (
-    DatasetLLMSettings,
     LLMClient,
     LLMClientConfig,
     LLMRoleConfig,
-    llm_client_config_from_dataset_settings,
 )
 
 _PROMPTS = PromptManager.instance()
@@ -143,7 +141,7 @@ class OpenAICompatibleJudgeConfig(ULModel):
                 if provider_type == "openrouter"
                 else "UL_DATASET_OPENAI_API_KEY"
             ),
-            api_key_required=False,
+            api_key_required=provider_type == "openrouter",
             live_calls=True,
             allow_external_data_processing=self.allow_external_data_processing,
             upstream_provider=self.upstream_provider,
@@ -159,34 +157,6 @@ class OpenAICompatibleJudgeConfig(ULModel):
             ),
             timeout_seconds=self.timeout_seconds,
             max_response_bytes=self.max_response_bytes,
-        )
-
-    @classmethod
-    def from_dataset_settings(
-        cls,
-        settings: DatasetLLMSettings,
-    ) -> OpenAICompatibleJudgeConfig:
-        return cls.from_llm_client_config(llm_client_config_from_dataset_settings(settings))
-
-    @classmethod
-    def from_llm_client_config(
-        cls,
-        config: LLMClientConfig,
-    ) -> OpenAICompatibleJudgeConfig:
-        materiality = config.role_config("materiality")
-        return cls(
-            base_url=config.base_url,
-            model=materiality.model,
-            api_key=config.api_key,
-            allow_external_data_processing=True,
-            data_policy=(
-                "openrouter_zdr" if config.provider_type == "openrouter" else "provider_default"
-            ),
-            upstream_provider=config.upstream_provider,
-            timeout_seconds=config.timeout_seconds,
-            max_output_tokens=materiality.max_output_tokens,
-            token_parameter=materiality.token_parameter,
-            max_response_bytes=config.max_response_bytes,
         )
 
 

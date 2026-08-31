@@ -295,6 +295,7 @@ def llm_client_config_from_dataset_settings(settings: DatasetLLMSettings) -> LLM
     upstream_provider = (
         settings.upstream_provider if settings.semantic_provider_type == "openrouter" else None
     )
+    supports_reasoning_options = settings.semantic_provider_type == "openrouter"
     return LLMClientConfig(
         provider_id=settings.semantic_provider_id,
         provider_type=settings.semantic_provider_type,
@@ -310,24 +311,40 @@ def llm_client_config_from_dataset_settings(settings: DatasetLLMSettings) -> LLM
                 role="deconstruct",
                 model=settings.model,
                 max_output_tokens=settings.max_output_tokens,
-                reasoning_mode=settings.deconstruct_reasoning,
+                reasoning_mode=(
+                    settings.deconstruct_reasoning if supports_reasoning_options else "omitted"
+                ),
                 reasoning_effort=(
-                    "minimal" if settings.deconstruct_reasoning == "required" else None
+                    "minimal"
+                    if supports_reasoning_options and settings.deconstruct_reasoning == "required"
+                    else None
                 ),
             ),
             LLMRoleConfig(
                 role="render",
                 model=settings.render_model,
                 max_output_tokens=settings.max_render_tokens,
-                reasoning_mode=settings.render_reasoning,
-                reasoning_effort="none" if settings.render_reasoning == "required" else None,
+                reasoning_mode=(
+                    settings.render_reasoning if supports_reasoning_options else "omitted"
+                ),
+                reasoning_effort=(
+                    "none"
+                    if supports_reasoning_options and settings.render_reasoning == "required"
+                    else None
+                ),
             ),
             LLMRoleConfig(
                 role="equivalence",
                 model=settings.equivalence_model,
                 max_output_tokens=min(settings.max_output_tokens, 1_024),
-                reasoning_mode=settings.equivalence_reasoning,
-                reasoning_effort=("low" if settings.equivalence_reasoning == "required" else None),
+                reasoning_mode=(
+                    settings.equivalence_reasoning if supports_reasoning_options else "omitted"
+                ),
+                reasoning_effort=(
+                    "low"
+                    if supports_reasoning_options and settings.equivalence_reasoning == "required"
+                    else None
+                ),
             ),
             LLMRoleConfig(
                 role="materiality",

@@ -6,7 +6,13 @@ from typing import cast
 import httpx
 import pytest
 from pydantic import SecretStr, ValidationError
-from ul.llm import LLMClient, LLMClientConfig, LLMRoleConfig
+from ul.deconstruction import OpenAICompatibleDatasetSettings
+from ul.llm import (
+    LLMClient,
+    LLMClientConfig,
+    LLMRoleConfig,
+    llm_client_config_from_dataset_settings,
+)
 
 pytestmark = pytest.mark.asyncio
 
@@ -117,3 +123,63 @@ async def test_llm_configuration_is_frozen_and_secret_free_in_evidence() -> None
         config.__setattr__("temperature", 1)
 
     assert "private-api-key" not in config.evidence_identity().model_dump_json()
+
+
+async def test_openai_compatible_identity_records_reasoning_as_omitted() -> None:
+    config = llm_client_config_from_dataset_settings(
+        OpenAICompatibleDatasetSettings(
+            live_calls=True,
+            allow_external_data_processing=True,
+            api_key=SecretStr("customer-key"),
+            provider_id="customer-gateway",
+            base_url="https://models.example.test/v1",
+            model="customer/model",
+            deconstruct_reasoning="required",
+            render_reasoning="required",
+            equivalence_reasoning="required",
+        )
+    )
+
+    for role in ("deconstruct", "render", "equivalence"):
+        assert config.role_config(role).reasoning_metadata() == {
+            "mode": "omitted",
+            "effort": None,
+        }
+        assert "reasoning" not in config.request_options(role=role, seed=0, top_p=None)
+
+
+@pytest.mark.parametrize(
+    ("config_update", "expected_error"),
+    [
+        ({"live_calls": False}, "require UL_LIVE=true"),
+        ({"allow_external_data_processing": False}, "process raw inputs and outputs"),
+        ({"api_key": None}, "require OPEN_ROUTER_API_KEY"),
+    ],
+)
+async def test_llm_access_controls_fail_before_any_request(
+    config_update: dict[str, object],
+    expected_error: str,
+) -> None:
+    request_count = 0
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        nonlocal request_count
+        request_count += 1
+        return httpx.Response(500)
+
+    config = _config().model_copy(update=config_update)
+    async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as transport:
+        client = LLMClient(config, client=transport)
+        with pytest.raises(RuntimeError, match=expected_error):
+            await client.complete(
+                role="materiality",
+                seed=0,
+                top_p=None,
+                schema_name="test_response",
+                schema={"type": "object"},
+                strict_schema=True,
+                system_prompt="Return JSON.",
+                user_payload="{}",
+            )
+
+    assert request_count == 0

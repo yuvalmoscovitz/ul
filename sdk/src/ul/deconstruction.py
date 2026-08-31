@@ -1106,10 +1106,11 @@ class SemanticModelDeconstructor:
         if reference_frame is not None:
             request_payload["reference_vocabulary"] = self._reference_vocabulary(reference_frame)
         untrusted_record = self._bounded_json(request_payload)
+        role_config = self.llm_client.config.role_config("deconstruct")
         completion = await self._request(
             operation="deconstruct",
             role="deconstruct",
-            max_tokens=self.settings.max_output_tokens,
+            max_tokens=role_config.max_output_tokens,
             seed=0,
             top_p=None,
             schema_name="semantic_frame",
@@ -1132,9 +1133,7 @@ class SemanticModelDeconstructor:
                         "semantic_deconstructor_identity": _semantic_deconstructor_identity(
                             _EXTRACTOR_VERSION
                         ).model_dump(mode="json"),
-                        "semantic_reasoning": self.llm_client.config.role_config(
-                            "deconstruct"
-                        ).reasoning_metadata(),
+                        "semantic_reasoning": role_config.reasoning_metadata(),
                         "prompts": prompt_provenance("semantic.deconstruct"),
                     },
                 }
@@ -1171,10 +1170,11 @@ class SemanticModelDeconstructor:
             else "semantic.render.temporary_value_forbidden"
         )
         temporary_value_rule = _PROMPTS.get_prompt(temporary_value_prompt)
+        role_config = self.llm_client.config.role_config("render")
         completion = await self._request(
             operation="render",
             role="render",
-            max_tokens=self.settings.max_render_tokens,
+            max_tokens=role_config.max_output_tokens,
             seed=render_seed,
             top_p=None,
             schema_name="rendered_input",
@@ -1200,16 +1200,14 @@ class SemanticModelDeconstructor:
             text=rendered,
             metadata={
                 **self._generation_metadata(completion),
-                "requested_model": self.settings.render_model,
+                "requested_model": role_config.model,
                 "prompts": prompt_provenance("semantic.render", temporary_value_prompt),
                 "sampling": {
                     "temperature": 0,
                     "seed": render_seed,
-                    "max_tokens": self.settings.max_render_tokens,
+                    "max_tokens": role_config.max_output_tokens,
                 },
-                "semantic_reasoning": self.llm_client.config.role_config(
-                    "render"
-                ).reasoning_metadata(),
+                "semantic_reasoning": role_config.reasoning_metadata(),
             },
         )
 
@@ -1223,10 +1221,11 @@ class SemanticModelDeconstructor:
         untrusted_payload = self._bounded_json(
             {"source_input": source_input, "candidate_input": candidate_input}
         )
+        role_config = self.llm_client.config.role_config("equivalence")
         completion = await self._request(
             operation="verify",
             role="equivalence",
-            max_tokens=min(self.settings.max_output_tokens, 1_024),
+            max_tokens=role_config.max_output_tokens,
             seed=0,
             top_p=None,
             schema_name="semantic_equivalence_assessment",
@@ -1246,13 +1245,11 @@ class SemanticModelDeconstructor:
                     "verifier_version": _EQUIVALENCE_VERIFIER_VERSION,
                     "metadata": {
                         **self._generation_metadata(completion),
-                        "requested_model": self.settings.equivalence_model,
+                        "requested_model": role_config.model,
                         "semantic_equivalence_policy": {
                             "allowed_surface_change": allowed_surface_change
                         },
-                        "semantic_reasoning": self.llm_client.config.role_config(
-                            "equivalence"
-                        ).reasoning_metadata(),
+                        "semantic_reasoning": role_config.reasoning_metadata(),
                         "prompts": prompt_provenance("semantic.verify"),
                     },
                 }

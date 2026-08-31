@@ -797,6 +797,7 @@ async def test_openrouter_judge_rejects_a_response_from_an_unpinned_provider() -
             OpenAICompatibleJudgeConfig(
                 base_url="https://models.example.test/v1",
                 model="customer/judge",
+                api_key="test-key",
                 allow_external_data_processing=True,
                 data_policy="openrouter_zdr",
                 upstream_provider="test-provider",

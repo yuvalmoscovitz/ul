@@ -27,6 +27,7 @@ from ul.deconstruction import (
     plan_evaluator_preflight_profiles,
     semantic_deconstructor_identity,
 )
+from ul.llm import LLMClient, llm_client_config_from_dataset_settings
 from ul_core.dataset import InteractionRecord, SemanticFrame, UserInputRecord
 from ul_core.prompts import prompt_provenance
 
@@ -1177,6 +1178,39 @@ async def test_render_keeps_caller_instruction_out_of_the_system_prompt() -> Non
     }
     assert not client.is_closed
     await client.aclose()
+
+
+async def test_injected_llm_client_is_the_authority_for_render_configuration() -> None:
+    requests: list[dict[str, object]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(cast(dict[str, object], json.loads(request.content)))
+        return completion('{"rendered_input":"Please pay INV-104."}')
+
+    configured_settings = settings(max_render_tokens=512)
+    base_config = llm_client_config_from_dataset_settings(configured_settings)
+    roles = tuple(
+        role.model_copy(update={"model": "injected/render-model", "max_output_tokens": 777})
+        if role.role == "render"
+        else role
+        for role in base_config.roles
+    )
+    injected_config = base_config.model_copy(update={"roles": roles})
+    transport = mock_client(handler)
+    llm_client = LLMClient(injected_config, client=transport)
+
+    async with create_semantic_model_deconstructor(
+        configured_settings,
+        llm_client=llm_client,
+    ) as deconstructor:
+        rendered = await deconstructor.render("Pay INV-104.", "Use natural phrasing.")
+
+    assert requests[0]["model"] == "injected/render-model"
+    assert requests[0]["max_tokens"] == 777
+    assert rendered.metadata["requested_model"] == "injected/render-model"
+    assert rendered.metadata["sampling"]["max_tokens"] == 777
+    assert not transport.is_closed
+    await transport.aclose()
 
 
 async def test_render_trusted_self_correction_mode_is_caller_controlled() -> None:
