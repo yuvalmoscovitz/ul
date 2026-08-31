@@ -47,6 +47,11 @@ def build_dataset_evidence_run_context(
             if settings.semantic_provider_type == "openrouter"
             else "provider_default"
         ),
+        upstream_provider=(
+            getattr(settings, "upstream_provider", None)
+            if settings.semantic_provider_type == "openrouter"
+            else None
+        ),
         timeout_seconds=settings.timeout_seconds,
         max_output_tokens=512,
         token_parameter="max_tokens",
@@ -65,6 +70,11 @@ def build_dataset_evidence_run_context(
         target_receipt=target_receipt,
         semantic_settings=DatasetEvidenceSemanticSettings(
             provider=settings.semantic_provider_id,
+            upstream_provider=(
+                getattr(settings, "upstream_provider", None)
+                if settings.semantic_provider_type == "openrouter"
+                else None
+            ),
             endpoint_sha256=settings.semantic_endpoint_sha256,
             model=settings.model,
             render_model=settings.render_model,

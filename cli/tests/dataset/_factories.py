@@ -50,6 +50,7 @@ _TEST_MATERIALITY_EVALUATOR_VERSION_ID = material_variance_evaluator_version_fro
         api_key=SecretStr("test-key"),
         allow_external_data_processing=True,
         data_policy="openrouter_zdr",
+        upstream_provider="test-provider",
         timeout_seconds=60.0,
         max_output_tokens=512,
         token_parameter="max_tokens",

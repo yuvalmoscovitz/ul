@@ -85,7 +85,7 @@ def _sha256_text(value: str) -> str:
 
 
 def _normalized_openrouter_provider_name(value: str) -> str:
-    return "".join(character for character in value.casefold() if character.isalnum())
+    return value.strip().casefold().replace(" ", "-")
 
 
 def _render_seed(raw_input: str, instruction: str) -> int:

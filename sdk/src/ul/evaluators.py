@@ -92,6 +92,12 @@ class OpenAICompatibleJudgeConfig(ULModel):
     api_key: SecretStr | None = Field(default=None, repr=False)
     allow_external_data_processing: Literal[True]
     data_policy: Literal["provider_default", "openrouter_zdr"] = "provider_default"
+    upstream_provider: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=100,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9._/-]*$",
+    )
     timeout_seconds: float = Field(default=60, gt=0, le=300)
     max_output_tokens: int = Field(default=1_024, ge=64, le=8_192)
     token_parameter: Literal["max_tokens", "max_completion_tokens"] = "max_completion_tokens"
@@ -100,6 +106,8 @@ class OpenAICompatibleJudgeConfig(ULModel):
     @model_validator(mode="after")
     def validate_and_normalize_base_url(self) -> Self:
         object.__setattr__(self, "base_url", _validated_judge_base_url(self.base_url))
+        if self.data_policy == "openrouter_zdr" and self.upstream_provider is None:
+            raise ValueError("openrouter_zdr requires upstream_provider")
         return self
 
     def evaluator_judge_version(self) -> EvaluatorJudgeVersion:
@@ -162,6 +170,7 @@ class _JudgeResponse(BaseModel):
     model_config = ConfigDict(extra="ignore", hide_input_in_errors=True)
 
     choices: tuple[_JudgeChoice, ...] = Field(min_length=1)
+    provider: str | None = Field(default=None, max_length=200)
 
 
 class _JudgeOutput(BaseModel):
@@ -236,6 +245,8 @@ class OpenAICompatibleEvaluatorJudge:
                 "data_collection": "deny",
                 "require_parameters": True,
                 "zdr": True,
+                "only": [self.config.upstream_provider],
+                "allow_fallbacks": False,
             }
         headers = {"Content-Type": "application/json"}
         if self.config.api_key is not None:
@@ -264,6 +275,12 @@ class OpenAICompatibleEvaluatorJudge:
                     maximum_bytes=self.config.max_response_bytes,
                 )
         parsed_response = _JudgeResponse.model_validate_json(response_body)
+        if self.config.upstream_provider is not None and (
+            parsed_response.provider is None
+            or _normalized_openrouter_provider_name(parsed_response.provider)
+            != _normalized_openrouter_provider_name(self.config.upstream_provider)
+        ):
+            raise ValueError("judge response did not honor the configured OpenRouter provider")
         parsed_value = parsed_response.model_dump(mode="json")
         if _contains_secret(parsed_value, self.config.base_url):
             raise ValueError("judge response contains the configured endpoint URL")
@@ -278,6 +295,10 @@ class OpenAICompatibleEvaluatorJudge:
             explanation=output.explanation,
             evidence=_judge_evidence(request, output.citations),
         )
+
+
+def _normalized_openrouter_provider_name(value: str) -> str:
+    return value.strip().casefold().replace(" ", "-")
 
 
 async def evaluate_case(

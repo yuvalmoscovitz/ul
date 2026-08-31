@@ -1559,6 +1559,15 @@ def test_campaign_receipt_binds_models_bounds_and_command_wide_smoke_wall(
 
     assert original.semantic_settings_sha256 != changed.semantic_settings_sha256
     assert probe_module._model_sha256(original) != probe_module._model_sha256(changed)
+    changed_provider = probe_module._campaign_confirmation(
+        plan,
+        settings.model_copy(update={"upstream_provider": "different-provider"}),
+        resolved,
+        case_limit=10,
+    )
+    assert original.semantic_settings_sha256 != changed_provider.semantic_settings_sha256
+    assert original.data_policy["upstream_provider"] == settings.upstream_provider
+    assert changed_provider.data_policy["upstream_provider"] == "different-provider"
     different_operator_plan = probe_module.create_dataset_campaign_plan(
         records=records,
         selected_operator_ids=probe_module.validate_operator_ids(["input.surface.case_variation"]),

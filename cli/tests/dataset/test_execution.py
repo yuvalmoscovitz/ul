@@ -393,6 +393,10 @@ class _MaterialVarianceJudge:
 
     def __init__(self, config: object) -> None:
         assert config.token_parameter == self.expected_token_parameter
+        if config.data_policy == "openrouter_zdr":
+            assert config.upstream_provider == "test-provider"
+        else:
+            assert config.upstream_provider is None
         self.version = config.evaluator_judge_version()
 
     async def __aenter__(self) -> _MaterialVarianceJudge:

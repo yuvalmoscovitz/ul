@@ -237,6 +237,12 @@ class DatasetEvidenceOperator(_StrictModel):
 
 class DatasetEvidenceSemanticSettings(_StrictModel):
     provider: str = Field(min_length=1, max_length=100)
+    upstream_provider: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=100,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9._/-]*$",
+    )
     endpoint_sha256: str = Field(pattern=_SHA256_PATTERN)
     model: str
     render_model: str
@@ -363,6 +369,8 @@ class DatasetEvidenceRunContext(_StrictModel):
             )
         if self.semantic_settings.materiality_model is None:
             cast(dict[str, object], context_content["semantic_settings"]).pop("materiality_model")
+        if self.semantic_settings.upstream_provider is None:
+            cast(dict[str, object], context_content["semantic_settings"]).pop("upstream_provider")
         if self.semantic_settings.materiality_evaluator_version_id is None:
             cast(dict[str, object], context_content["semantic_settings"]).pop(
                 "materiality_evaluator_version_id"

@@ -151,6 +151,11 @@ async def evaluate_interaction_records(
                 if settings.semantic_provider_type == "openrouter"
                 else "provider_default"
             ),
+            upstream_provider=(
+                getattr(settings, "upstream_provider", None)
+                if settings.semantic_provider_type == "openrouter"
+                else None
+            ),
             timeout_seconds=settings.timeout_seconds,
             max_output_tokens=512,
             token_parameter="max_tokens",

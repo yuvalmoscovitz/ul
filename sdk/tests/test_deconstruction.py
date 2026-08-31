@@ -315,13 +315,16 @@ async def test_evaluator_preflight_caps_each_sample_at_1024_tokens() -> None:
     await client.aclose()
 
 
-async def test_evaluator_preflight_rejects_an_unpinned_upstream_provider() -> None:
+@pytest.mark.parametrize("returned_provider", ("different-provider", "provider/name"))
+async def test_evaluator_preflight_rejects_an_unpinned_upstream_provider(
+    returned_provider: str,
+) -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         body = json.loads(request.content)
         assert body["provider"]["only"] == ["provider-name"]
         assert body["provider"]["allow_fallbacks"] is False
         response = completion('{"compatible":true}').json()
-        response["provider"] = "different-provider"
+        response["provider"] = returned_provider
         return httpx.Response(200, json=response)
 
     client = mock_client(handler)
