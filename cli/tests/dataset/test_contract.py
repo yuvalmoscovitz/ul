@@ -87,7 +87,7 @@ def test_legacy_operator_list_delegates_to_catalog_and_keeps_existing_call_accou
         "input.surface.punctuation_noise@1.0.0:",
         "input.surface.rephrase@1.0.0:",
         "input.surface.typing_noise@1.0.0:",
-        "input.tone.frustrated@1.0.0:",
+        "input.tone.frustrated@1.1.0:",
     )
 
     dataset = tmp_path / "interactions.jsonl"
