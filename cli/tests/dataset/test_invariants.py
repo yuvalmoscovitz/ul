@@ -21,6 +21,7 @@ from ul.dataset_invariants import (
     JsonValueEqualsLiteralInvariant,
     NoNewEffectInvariant,
 )
+from ul.llm import LLMClient, llm_client_config_from_dataset_settings
 from ul_cli import dataset_review
 from ul_cli.dataset.evaluation import command as command_module
 from ul_cli.dataset.evaluation import runner as runner_module
@@ -348,11 +349,19 @@ def test_invariant_evaluation_reuses_results_without_extra_runner_calls(
     stored_evaluations: list[DatasetInvariantEvaluation] = []
 
     class AsyncContext:
+        def __init__(self, semantic_settings: Any | None = None) -> None:
+            self.llm_client = (
+                LLMClient(llm_client_config_from_dataset_settings(semantic_settings))
+                if semantic_settings is not None
+                else None
+            )
+
         async def __aenter__(self) -> object:
             return self
 
         async def __aexit__(self, *args: object) -> None:
-            pass
+            if self.llm_client is not None:
+                await self.llm_client.aclose()
 
         def reuse_preflight(self, result: object) -> None:
             assert result == _evaluator_preflight()
@@ -376,7 +385,7 @@ def test_invariant_evaluation_reuses_results_without_extra_runner_calls(
     monkeypatch.setattr(
         runner_module,
         "create_semantic_model_deconstructor",
-        lambda settings: AsyncContext(),
+        lambda settings: AsyncContext(settings),
     )
     monkeypatch.setattr(runner_module, "DatasetAugmentationEngine", lambda *args: object())
     monkeypatch.setattr(runner_module, "DatasetEvaluationRunner", FakeRunner)
