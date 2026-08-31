@@ -1392,9 +1392,7 @@ def _summarize_dataset_evidence(
                     if len(conclusive_statuses) > 1
                     else "inconclusive"
                 )
-                non_promoted_inconclusive = (
-                    operator_id is not None or rule_stability != "stable"
-                )
+                non_promoted_inconclusive = operator_id is not None or rule_stability != "stable"
                 finding_summaries.append(
                     FindingSummary(
                         kind="customer_invariant_violation",

@@ -307,9 +307,7 @@ def print_dataset_results(
         )
         for case in result.cases:
             case_number += 1
-            finding_labels = [
-                _FINDING_LABELS[finding.category] for finding in case.findings
-            ]
+            finding_labels = [_FINDING_LABELS[finding.category] for finding in case.findings]
             invariant_evaluation = invariant_evaluations_by_interaction.get(result.source.id)
             if invariant_evaluation is not None:
                 finding_labels.extend(

@@ -23,13 +23,9 @@ def _repeated_evaluation(
         update={"repetition": 2, "status": variation_second_status}
     )
     if baseline_second_status == "violated":
-        baseline_second = baseline_second.model_copy(
-            update={"reason_code": "values_differ"}
-        )
+        baseline_second = baseline_second.model_copy(update={"reason_code": "values_differ"})
     if variation_second_status == "satisfied":
-        variation_second = variation_second.model_copy(
-            update={"reason_code": "values_equal"}
-        )
+        variation_second = variation_second.model_copy(update={"reason_code": "values_equal"})
     return evaluation.model_copy(
         update={
             "baseline": evaluation.baseline.model_copy(
@@ -65,7 +61,5 @@ def test_reproduced_invariant_requires_every_aligned_trial_to_flip() -> None:
         reproduced.baseline.rules[0], reproduced.variations[0].rules[0]
     )
     assert reproduced_invariant_rule_pairs(reproduced, "input.surface.rephrase")
-    assert not reproduced_invariant_rule_pairs(
-        intermittent_probe, "input.surface.rephrase"
-    )
+    assert not reproduced_invariant_rule_pairs(intermittent_probe, "input.surface.rephrase")
     assert not reproduced_invariant_rule_pairs(unstable_source, "input.surface.rephrase")

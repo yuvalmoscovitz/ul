@@ -462,7 +462,7 @@ def test_reproduced_invariant_surfaces_despite_full_response_instability(
                                 for repetition in (1, 2)
                             ),
                         }
-                    )
+                    ),
                 }
             ),
             "cases": (
@@ -483,7 +483,7 @@ def test_reproduced_invariant_surfaces_despite_full_response_instability(
                                     for repetition in (1, 2)
                                 ),
                             }
-                        )
+                        ),
                     }
                 ),
             ),
@@ -506,12 +506,14 @@ def test_reproduced_invariant_surfaces_despite_full_response_instability(
         ),
     )
     invariant_evaluation = evaluate_dataset_invariants(result, invariant_suite)
-    assert tuple(
-        trial.status for trial in invariant_evaluation.baseline.rules[0].trials
-    ) == ("satisfied", "satisfied")
-    assert tuple(
-        trial.status for trial in invariant_evaluation.variations[0].rules[0].trials
-    ) == ("violated", "violated")
+    assert tuple(trial.status for trial in invariant_evaluation.baseline.rules[0].trials) == (
+        "satisfied",
+        "satisfied",
+    )
+    assert tuple(trial.status for trial in invariant_evaluation.variations[0].rules[0].trials) == (
+        "violated",
+        "violated",
+    )
     assert reproduced_invariant_rule_pairs(
         invariant_evaluation, result.cases[0].candidate.operator_id
     )
@@ -553,8 +555,7 @@ def test_reproduced_invariant_surfaces_despite_full_response_instability(
     invariant_summary = next(
         finding
         for finding in json.loads(unified_report.output)["findings"]
-        if finding["kind"] == "customer_invariant_violation"
-        and finding["finding_id"] is not None
+        if finding["kind"] == "customer_invariant_violation" and finding["finding_id"] is not None
     )
     assert invariant_summary["requested_repetitions"] == 2
     assert invariant_summary["violated_repetitions"] == 2
