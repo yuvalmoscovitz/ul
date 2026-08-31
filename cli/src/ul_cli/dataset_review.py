@@ -62,6 +62,7 @@ from ul.outcome_projection import OutcomeProjection
 from ul_core.augmentations.definitions import builtin_augmentation_catalog
 
 from ul_cli.dataset_run_config import DatasetRunConfig
+from ul_cli.invariant_findings import is_reproduced_invariant_difference
 from ul_cli.pattern_identity import (
     PatternIdentityKeyError,
     ReviewHistoryKeyError,
@@ -1285,10 +1286,10 @@ def _summarize_dataset_evidence(
                 declared_severity=variation_rule.severity,
                 review_status=review_status,
                 review_severity=review_severity,
-                requested_repetitions=observations.requested_repetitions,
-                conclusive_repetitions=observations.observed_repetitions,
-                inconclusive_repetitions=observations.inconclusive_repetitions,
-                stability=observations.stability,
+                requested_repetitions=len(variation_rule.trials),
+                conclusive_repetitions=len(variation_rule.trials),
+                inconclusive_repetitions=0,
+                stability="stable",
                 evidence_authorities=(
                     "customer_declared",
                     "deterministic_evaluator",
@@ -1377,6 +1378,23 @@ def _summarize_dataset_evidence(
                 )
                 if observations is None:
                     raise AssertionError("violated invariant rules require observations")
+                conclusive_repetitions = sum(
+                    trial.status != "not_evaluable" for trial in rule.trials
+                )
+                inconclusive_repetitions = len(rule.trials) - conclusive_repetitions
+                conclusive_statuses = {
+                    trial.status for trial in rule.trials if trial.status != "not_evaluable"
+                }
+                rule_stability = (
+                    "stable"
+                    if not inconclusive_repetitions and len(conclusive_statuses) == 1
+                    else "unstable"
+                    if len(conclusive_statuses) > 1
+                    else "inconclusive"
+                )
+                non_promoted_inconclusive = (
+                    operator_id is not None or rule_stability != "stable"
+                )
                 finding_summaries.append(
                     FindingSummary(
                         kind="customer_invariant_violation",
@@ -1386,10 +1404,12 @@ def _summarize_dataset_evidence(
                         rule_id=rule.rule_id,
                         rule_version=rule.rule_version,
                         declared_severity=rule.severity,
-                        requested_repetitions=observations.requested_repetitions,
-                        conclusive_repetitions=observations.observed_repetitions,
-                        inconclusive_repetitions=observations.inconclusive_repetitions,
-                        stability=observations.stability,
+                        review_status=("inconclusive" if non_promoted_inconclusive else None),
+                        review_severity=("unrated" if non_promoted_inconclusive else None),
+                        requested_repetitions=len(rule.trials),
+                        conclusive_repetitions=conclusive_repetitions,
+                        inconclusive_repetitions=inconclusive_repetitions,
+                        stability=rule_stability,
                         violated_repetitions=sum(
                             trial.status == "violated" for trial in rule.trials
                         ),
@@ -2129,8 +2149,13 @@ def report_dataset_evidence(
             )
             _print_plain(f"Description: {variation_rule.description}")
         _print_plain("Test variation: " + case.operator_id.replace(".", " / ").replace("_", " "))
+        stability_label = (
+            "Evidence stability"
+            if indexed_finding.semantic_finding is not None
+            else "Full-response stability"
+        )
         _print_plain(
-            "Evidence stability: original="
+            f"{stability_label}: original="
             + _observations_summary(loaded_record.evidence.current_baseline.observations)
             + "; variation="
             + _observations_summary(case.observations)
@@ -2141,6 +2166,11 @@ def report_dataset_evidence(
             if baseline_rule is None or variation_rule is None:
                 raise AssertionError("invariant finding requires both rule results")
             _print_plain(
+                f"Invariant repetitions: original satisfied={len(baseline_rule.trials)}/"
+                f"{len(baseline_rule.trials)}; variation violated="
+                f"{len(variation_rule.trials)}/{len(variation_rule.trials)}"
+            )
+            _print_plain(
                 f"Rule transition: original={baseline_rule.status}; "
                 f"variation={variation_rule.status}"
             )
@@ -2149,6 +2179,10 @@ def report_dataset_evidence(
                     f"Variation rule trial {trial.repetition}: {trial.status}; "
                     f"{_invariant_trial_location(trial)}; reason={trial.reason_code}"
                 )
+            _print_plain(
+                "Finding limitations: causality not established; production prevalence not "
+                "measured; whole-task correctness not established."
+            )
         if show_sensitive_values and indexed_finding.finding_id == sensitive_finding_id:
             for sensitive_line in sensitive_lines:
                 _print_sensitive_plain(sensitive_line)
@@ -2965,7 +2999,7 @@ def _index_findings(
                 baseline_rule = baseline_rules.get(variation_rule.rule_id)
                 if baseline_rule is None:
                     raise _ReviewInputError("invariant variation rule is missing from the baseline")
-                if baseline_rule.status != "satisfied" or variation_rule.status != "violated":
+                if not is_reproduced_invariant_difference(baseline_rule, variation_rule):
                     continue
                 finding_id = _invariant_finding_id(
                     finding_id_prefix,
