@@ -40,6 +40,7 @@ from ._factories import (
     _evaluator_preflight,
     _invariant_evaluation,
     _rich_evaluation_result,
+    _run_config,
     _run_context,
     _settings,
 )
@@ -60,7 +61,7 @@ def test_evidence_run_context_binds_deconstructor_identity() -> None:
     legacy_context = dataset_review.create_dataset_evidence_run_context(
         selected_records=records,
         operators=(("input.surface.rephrase", "1.0.0"),),
-        repetitions=1,
+        run_config=_run_config(),
         invariant_suite_sha256=None,
         target_config=current_context.target.config,
         semantic_settings=current_context.semantic_settings.model_copy(
@@ -185,11 +186,11 @@ def test_resume_rejects_deleted_durable_sidecars_instead_of_replaying_as_legacy(
         run_context=_run_context((source,)),
         selected_records=(source,),
         selected_operator_ids=("input.surface.rephrase",),
-        repetitions=1,
-        max_environment_api_calls=10,
-        allow_environment_network=True,
-        confirm_test_environment=True,
-        allow_insecure_http=False,
+        run_config=_run_config(
+            environment_api_calls_per_trial=5,
+            planned_environment_api_calls=10,
+            max_environment_api_calls=10,
+        ),
         save_augmentations=True,
     )
     dataset_trial_journal.persist_dataset_run_manifest(
@@ -245,11 +246,11 @@ def test_resume_reuses_manifest_without_original_data_config_or_overrides(
         run_context=run_context,
         selected_records=(source,),
         selected_operator_ids=("input.surface.rephrase",),
-        repetitions=1,
-        max_environment_api_calls=10,
-        allow_environment_network=True,
-        confirm_test_environment=True,
-        allow_insecure_http=False,
+        run_config=_run_config(
+            environment_api_calls_per_trial=5,
+            planned_environment_api_calls=10,
+            max_environment_api_calls=10,
+        ),
         save_augmentations=True,
         invariant_suite_snapshot=invariant_suite,
         invariant_suite_source=str(invariant_path.resolve()),
@@ -306,11 +307,11 @@ def test_resume_fails_closed_when_completed_trials_have_no_durable_augmentation(
         run_context=run_context,
         selected_records=(evaluation.source,),
         selected_operator_ids=("input.surface.rephrase",),
-        repetitions=1,
-        max_environment_api_calls=10,
-        allow_environment_network=True,
-        confirm_test_environment=True,
-        allow_insecure_http=False,
+        run_config=_run_config(
+            environment_api_calls_per_trial=5,
+            planned_environment_api_calls=10,
+            max_environment_api_calls=10,
+        ),
         save_augmentations=False,
     )
     evidence.write_bytes(b"")
@@ -361,11 +362,11 @@ def test_resume_accepts_completed_trials_with_durable_augmentation_input(
         run_context=run_context,
         selected_records=(evaluation.source,),
         selected_operator_ids=("input.surface.rephrase",),
-        repetitions=1,
-        max_environment_api_calls=10,
-        allow_environment_network=True,
-        confirm_test_environment=True,
-        allow_insecure_http=False,
+        run_config=_run_config(
+            environment_api_calls_per_trial=5,
+            planned_environment_api_calls=10,
+            max_environment_api_calls=10,
+        ),
         save_augmentations=False,
         augmentations_input_path=str(augmentations_input.resolve()),
         augmentations_input_sha256=augmentation_sha256,
@@ -403,11 +404,11 @@ def test_quarantined_trial_requires_bound_operator_cleanup_attestation(
         run_context=_run_context((source,)),
         selected_records=(source,),
         selected_operator_ids=("input.surface.rephrase",),
-        repetitions=1,
-        max_environment_api_calls=10,
-        allow_environment_network=True,
-        confirm_test_environment=True,
-        allow_insecure_http=False,
+        run_config=_run_config(
+            environment_api_calls_per_trial=5,
+            planned_environment_api_calls=10,
+            max_environment_api_calls=10,
+        ),
         save_augmentations=True,
     )
     evidence.write_bytes(b"")
@@ -514,9 +515,7 @@ def test_resume_skips_already_processed_interaction_ids(
         target: object,
         output_stream: Any,
         *,
-        repetitions: int,
-        max_environment_api_calls: int,
-        planned_target_calls: int,
+        run_config: object,
         run_context: object,
         augmentation_ledger: object,
         saved_augmentations: object,
@@ -528,8 +527,6 @@ def test_resume_skips_already_processed_interaction_ids(
             operator_ids,
             settings,
             target,
-            max_environment_api_calls,
-            planned_target_calls,
             augmentation_ledger,
             progress_plan,
         )
@@ -539,7 +536,7 @@ def test_resume_skips_already_processed_interaction_ids(
         )
         assert redaction_engine is None
         assert evaluator_preflight == _evaluator_preflight()
-        assert repetitions == 1
+        assert cast(Any, run_config).repetitions == 1
         for record in records:
             evaluated_ids.append(record.id)
         output_stream.write(

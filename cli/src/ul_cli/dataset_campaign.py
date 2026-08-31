@@ -15,6 +15,8 @@ from ul_core.augmentations.definitions import (
     builtin_augmentation_catalog,
 )
 
+from ul_cli.dataset_run_config import DatasetRunConfig
+
 
 class _StrictModel(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
@@ -104,18 +106,17 @@ def create_dataset_campaign_plan(
     *,
     records: tuple[InteractionRecord, ...],
     selected_operator_ids: tuple[str, ...],
-    repetitions: int,
-    target_calls_per_execution: int,
-    target_timeout_seconds: float = 30.0,
+    run_config: DatasetRunConfig,
     settings: DatasetSemanticSettings,
     saved_augmentations: dict[str, DatasetAugmentationResult] | None = None,
     show_sensitive_values: bool = False,
     requires_preflight: bool = True,
-    evaluation_mode: Literal["variance"] = "variance",
     fixture_status: Literal["configured", "missing", "not_required"] | None = None,
     fixture_id: str | None = None,
     fixture_version: str | None = None,
 ) -> DatasetCampaignPlan:
+    repetitions = run_config.repetitions
+    target_config = run_config.target
     saved = saved_augmentations or {}
     selected_ids = {reference.partition("@")[0] for reference in selected_operator_ids}
     catalog = builtin_augmentation_catalog().list()
@@ -171,7 +172,7 @@ def create_dataset_campaign_plan(
     preflight_calls = len(preflight_profiles)
     total_semantic_calls = evaluator_calls + materiality_calls + generation_calls + preflight_calls
     maximum_wall_time_seconds = (
-        max(1, execution_calls) * target_timeout_seconds
+        max(1, execution_calls) * target_config.trial_timeout_seconds
         + total_semantic_calls * settings.timeout_seconds
     )
 
@@ -220,7 +221,7 @@ def create_dataset_campaign_plan(
             "findings can be reproduced."
         )
     return DatasetCampaignPlan(
-        evaluation_mode=evaluation_mode,
+        evaluation_mode=run_config.evaluation_mode,
         fixture=(
             CampaignFixturePlan(
                 status=fixture_status,
@@ -242,12 +243,12 @@ def create_dataset_campaign_plan(
             materiality=materiality_calls,
             variation_generation=generation_calls,
             total_semantic_model=total_semantic_calls,
-            total_environment_api=execution_calls * target_calls_per_execution,
+            total_environment_api=(execution_calls * target_config.environment_api_calls_per_trial),
         ),
         preflight_profiles=preflight_profiles,
         tokens=CampaignTokenRange(minimum=0, maximum=maximum_completion_tokens),
         timing=CampaignTimingPlan(
-            target_trial_timeout_seconds=target_timeout_seconds,
+            target_trial_timeout_seconds=target_config.trial_timeout_seconds,
             maximum_wall_time_seconds=maximum_wall_time_seconds,
         ),
         warnings=tuple(warnings),

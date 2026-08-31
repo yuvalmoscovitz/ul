@@ -16,7 +16,7 @@ from typing import Any, cast
 
 import pytest
 import typer
-from dataset._factories import _evaluator_preflight, _settings
+from dataset._factories import _evaluator_preflight, _run_config, _settings
 from typer.testing import CliRunner
 from ul import (
     DatasetEvaluationResult,
@@ -1552,8 +1552,7 @@ def test_campaign_receipt_binds_models_bounds_and_command_wide_smoke_wall(
     plan = probe_module.create_dataset_campaign_plan(
         records=records,
         selected_operator_ids=operator_ids,
-        repetitions=1,
-        target_calls_per_execution=1,
+        run_config=_run_config(),
         settings=settings,
     )
     original = probe_module._campaign_confirmation(plan, settings, resolved, case_limit=10)
@@ -1578,8 +1577,7 @@ def test_campaign_receipt_binds_models_bounds_and_command_wide_smoke_wall(
     different_operator_plan = probe_module.create_dataset_campaign_plan(
         records=records,
         selected_operator_ids=probe_module.validate_operator_ids(["input.surface.case_variation"]),
-        repetitions=1,
-        target_calls_per_execution=1,
+        run_config=_run_config(),
         settings=settings,
     )
     different_operator_confirmation = probe_module._campaign_confirmation(

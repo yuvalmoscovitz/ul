@@ -61,6 +61,7 @@ from ul.llm import LLMClientIdentity
 from ul.outcome_projection import OutcomeProjection
 from ul_core.augmentations.definitions import builtin_augmentation_catalog
 
+from ul_cli.dataset_run_config import DatasetRunConfig
 from ul_cli.pattern_identity import (
     PatternIdentityKeyError,
     ReviewHistoryKeyError,
@@ -631,9 +632,7 @@ def create_dataset_evidence_run_context(
     *,
     selected_records: tuple[InteractionRecord, ...],
     operators: tuple[tuple[str, str], ...],
-    evaluation_mode: Literal["variance"] = "variance",
-    repetitions: int,
-    target_timeout_seconds: float = 30.0,
+    run_config: DatasetRunConfig,
     invariant_suite_sha256: str | None,
     target_config: JsonHttpTargetConfig | None = None,
     target_receipt: dict[str, JsonValue] | None = None,
@@ -673,9 +672,9 @@ def create_dataset_evidence_run_context(
         "pipeline_version": _DATASET_EVALUATION_PIPELINE_VERSION,
         "selected_dataset_sha256": selected_dataset_sha256,
         "operators": [operator.model_dump(mode="json") for operator in operator_snapshots],
-        "evaluation_mode": evaluation_mode,
-        "repetitions": repetitions,
-        "target_timeout_seconds": target_timeout_seconds,
+        "evaluation_mode": run_config.evaluation_mode,
+        "repetitions": run_config.repetitions,
+        "target_timeout_seconds": run_config.target.trial_timeout_seconds,
         "invariant_suite_sha256": invariant_suite_sha256,
         "target": target.model_dump(mode="json"),
         "fixture": fixture.model_dump(mode="json"),
@@ -690,9 +689,9 @@ def create_dataset_evidence_run_context(
     return DatasetEvidenceRunContext(
         selected_dataset_sha256=selected_dataset_sha256,
         operators=operator_snapshots,
-        evaluation_mode=evaluation_mode,
-        repetitions=repetitions,
-        target_timeout_seconds=target_timeout_seconds,
+        evaluation_mode=run_config.evaluation_mode,
+        repetitions=run_config.repetitions,
+        target_timeout_seconds=run_config.target.trial_timeout_seconds,
         invariant_suite_sha256=invariant_suite_sha256,
         target=target,
         fixture=fixture,

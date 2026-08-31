@@ -628,7 +628,7 @@ def test_full_dataset_evaluation_runs_local_callable_through_worker_boundary(
     assert saved["run_context"]["target"]["receipt"]["supports_state_observation"] is False
     assert saved["run_context"]["target_timeout_seconds"] == 90.0
     manifest = read_dataset_run_manifest(manifest_path(output))
-    assert manifest.effective_command.target_timeout_seconds == 90.0
+    assert manifest.effective_command.run_config.target.trial_timeout_seconds == 90.0
     assert len(saved["technical_details"]["baseline"]["trial_set"]["trials"]) == 2
     assert saved["technical_details"]["baseline"]["verdict"] == "no_divergence"
     assert saved["technical_details"]["cases"][0]["verdict"] == "no_divergence"
@@ -1527,10 +1527,7 @@ def test_execution_creates_private_explicit_output(
         target: object,
         output_stream: Any,
         *,
-        repetitions: int,
-        max_environment_api_calls: int,
-        planned_target_calls: int,
-        target_timeout_seconds: float,
+        run_config: Any,
         run_context: object,
         augmentation_ledger: object,
         saved_augmentations: object,
@@ -1545,18 +1542,18 @@ def test_execution_creates_private_explicit_output(
         assert redaction_engine is None
         captured_records.extend(record.id for record in records)
         assert operator_ids == ("input.surface.disfluency_repeat",)
-        assert repetitions == 3
-        assert max_environment_api_calls == 100
-        assert planned_target_calls == 30
-        assert target_timeout_seconds == 75.0
+        assert run_config.repetitions == 3
+        assert run_config.target.max_environment_api_calls == 100
+        assert run_config.target.planned_environment_api_calls == 30
+        assert run_config.target.trial_timeout_seconds == 75.0
         assert progress_plan.calls.total_environment_api == 30
         if has_source_preparation_failure:
             failure = customer_module.build_source_preparation_failure_evidence(
                 records[0],
                 DatasetSemanticPreparationError(),
-                repetitions=repetitions,
-                max_environment_api_calls=max_environment_api_calls,
-                planned_target_calls=planned_target_calls,
+                repetitions=run_config.repetitions,
+                max_environment_api_calls=run_config.target.max_environment_api_calls,
+                planned_target_calls=run_config.target.planned_environment_api_calls,
                 run_context=cast(Any, run_context),
             )
             source_preparation_failures.append(failure)
@@ -1840,9 +1837,7 @@ def test_execution_wires_redaction_into_records_pipeline_and_run_context(
         _target: object,
         output_stream: Any,
         *,
-        repetitions: int,
-        max_environment_api_calls: int,
-        planned_target_calls: int,
+        run_config: object,
         run_context: object,
         augmentation_ledger: object,
         saved_augmentations: object,
@@ -1852,9 +1847,7 @@ def test_execution_wires_redaction_into_records_pipeline_and_run_context(
         progress_plan: object,
     ) -> tuple[object, ...]:
         del (
-            repetitions,
-            max_environment_api_calls,
-            planned_target_calls,
+            run_config,
             augmentation_ledger,
             saved_augmentations,
             progress_plan,
@@ -1997,9 +1990,7 @@ def test_target_config_runs_nested_request_and_response_against_loopback(
             target: Any,
             output_stream: Any,
             *,
-            repetitions: int,
-            max_environment_api_calls: int,
-            planned_target_calls: int,
+            run_config: object,
             run_context: object,
             augmentation_ledger: object,
             saved_augmentations: object,
@@ -2011,9 +2002,7 @@ def test_target_config_runs_nested_request_and_response_against_loopback(
             del (
                 operator_ids,
                 settings,
-                repetitions,
-                max_environment_api_calls,
-                planned_target_calls,
+                run_config,
                 run_context,
                 augmentation_ledger,
                 saved_augmentations,

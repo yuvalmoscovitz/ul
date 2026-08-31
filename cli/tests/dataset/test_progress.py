@@ -35,7 +35,7 @@ from ul_cli.dataset.progress import (
 )
 from ul_cli.main import app as root_app
 
-from ._factories import _evaluation_result, _run_context
+from ._factories import _evaluation_result, _run_config, _run_context
 
 
 def _tracker(publish: object, clock: object) -> CampaignProgressTracker:
@@ -426,9 +426,10 @@ def test_source_preparation_failures_do_not_abort_a_ten_source_campaign(
                 ),
                 cast(Any, AsyncContext()),
                 output_stream,
-                repetitions=1,
-                max_environment_api_calls=20,
-                planned_target_calls=20,
+                run_config=_run_config(
+                    planned_environment_api_calls=20,
+                    max_environment_api_calls=20,
+                ),
                 run_context=run_context,
                 evaluator_preflight=cast(Any, object()),
                 trial_journal=cast(Any, FakeJournal()),
@@ -596,9 +597,10 @@ def test_cancellation_after_delivery_before_semantic_completion_is_quarantined(
                     ),
                     cast(Any, AsyncContext()),
                     output_stream,
-                    repetitions=1,
-                    max_environment_api_calls=1,
-                    planned_target_calls=1,
+                    run_config=_run_config(
+                        planned_environment_api_calls=1,
+                        max_environment_api_calls=1,
+                    ),
                     evaluator_preflight=cast(Any, object()),
                     trial_journal=cast(Any, FakeJournal()),
                 )

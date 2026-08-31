@@ -96,6 +96,7 @@ from ul_cli.dataset_review import (
     DatasetEvidenceSemanticSettings,
     create_dataset_evidence_run_context,
 )
+from ul_cli.dataset_run_config import DatasetRunConfig, TargetExecutionConfig
 from ul_cli.dataset_trial_journal import (
     DatasetTrialJournal,
     create_dataset_run_manifest,
@@ -906,11 +907,32 @@ def probe(
         try:
             settings = load_dataset_semantic_settings()
             validate_model_input_bounds(records, settings.max_input_chars)
+            run_config = DatasetRunConfig(
+                repetitions=repetitions,
+                target=TargetExecutionConfig(
+                    trial_timeout_seconds=_TARGET_TIMEOUT_SECONDS,
+                    max_environment_api_calls=(
+                        len(records)
+                        * repetitions
+                        * (1 + len(selected_operator_ids))
+                        * resolved_target.calls_per_execution
+                    ),
+                    environment_api_calls_per_trial=resolved_target.calls_per_execution,
+                    planned_environment_api_calls=(
+                        len(records)
+                        * repetitions
+                        * (1 + len(selected_operator_ids))
+                        * resolved_target.calls_per_execution
+                    ),
+                    allow_network_egress=True,
+                    test_environment_confirmed=True,
+                    allow_insecure_http=allow_insecure_http,
+                ),
+            )
             plan = create_dataset_campaign_plan(
                 records=records,
                 selected_operator_ids=selected_operator_ids,
-                repetitions=repetitions,
-                target_calls_per_execution=resolved_target.calls_per_execution,
+                run_config=run_config,
                 settings=settings,
             )
             campaign_confirmation = _campaign_confirmation(
@@ -970,7 +992,7 @@ def probe(
                 operators=tuple(
                     dataset_operator_identity(reference) for reference in selected_operator_ids
                 ),
-                repetitions=repetitions,
+                run_config=run_config,
                 invariant_suite_sha256=None,
                 target_receipt=_target_evidence_receipt(resolved_target),
                 semantic_settings=_semantic_settings_snapshot(settings),
@@ -1121,14 +1143,13 @@ def probe(
             resolved_target=resolved_target,
             settings=settings,
             plan=plan,
+            run_config=run_config,
             output=output,
-            repetitions=repetitions,
             remaining_target_seconds=remaining_target_seconds,
             run_context=run_context,
             progress_runtime=progress_runtime,
             evaluator_preflight=evaluator_preflight,
             resume_campaign=resume_checkpoint is not None,
-            allow_insecure_http=allow_insecure_http,
             resolve_quarantine_after=resolve_quarantine_after,
         )
         projection_failure = _campaign_projection_failure(results, output)
@@ -2001,14 +2022,13 @@ def _run_campaign(
     resolved_target: _ResolvedTarget,
     settings: DatasetSemanticSettings,
     plan: DatasetCampaignPlan,
+    run_config: DatasetRunConfig,
     output: Path,
-    repetitions: int,
     remaining_target_seconds: float | None,
     run_context: DatasetEvidenceRunContext,
     progress_runtime: CampaignProgressRuntime,
     evaluator_preflight: EvaluatorModelPreflight | None,
     resume_campaign: bool,
-    allow_insecure_http: bool,
     resolve_quarantine_after: Literal["environment-reset", "environment-replacement"] | None,
 ) -> tuple[DatasetEvaluationResult, ...]:
     resolved_target.revalidate_identity()
@@ -2043,11 +2063,7 @@ def _run_campaign(
         run_context=run_context,
         selected_records=records,
         selected_operator_ids=selected_operator_ids,
-        repetitions=repetitions,
-        max_environment_api_calls=plan.calls.total_environment_api,
-        allow_environment_network=True,
-        confirm_test_environment=True,
-        allow_insecure_http=allow_insecure_http,
+        run_config=run_config,
         save_augmentations=True,
         semantic_provider_type=settings.semantic_provider_type,
         semantic_base_url=settings.semantic_base_url,
@@ -2223,13 +2239,10 @@ def _run_campaign(
                         settings,
                         connection,
                         output_stream,
-                        repetitions=repetitions,
-                        max_environment_api_calls=plan.calls.total_environment_api,
-                        planned_target_calls=plan.calls.total_environment_api,
+                        run_config=run_config,
                         progress_plan=plan,
                         progress_runtime=progress_runtime,
                         complete_progress=False,
-                        environment_calls_per_target_call=(resolved_target.calls_per_execution),
                         isolate_source_preparation_failures=False,
                         run_context=run_context,
                         evaluator_preflight=evaluator_preflight,
