@@ -729,7 +729,7 @@ async def test_openai_compatible_judge_uses_structured_output_and_explicit_data_
                             )
                         }
                     }
-                ]
+                ],
             },
         )
 
