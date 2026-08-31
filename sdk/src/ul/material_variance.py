@@ -22,7 +22,9 @@ from ul.evaluators import (
     OpenAICompatibleJudgeConfig,
     create_evaluator_version,
     evaluate,
+    evaluator_judge_version_from_llm_config,
 )
+from ul.llm import LLMClientConfig
 
 _PROMPTS = PromptManager.instance()
 _MAXIMUM_PAYLOAD_BYTES = 64 * 1024
@@ -194,6 +196,15 @@ def material_variance_evaluator_version_from_config(
     return create_evaluator_version(
         _EVALUATOR,
         judge_version=config.evaluator_judge_version(),
+    )
+
+
+def material_variance_evaluator_version_from_llm_config(
+    config: LLMClientConfig,
+) -> EvaluatorVersion:
+    return create_evaluator_version(
+        _EVALUATOR,
+        judge_version=evaluator_judge_version_from_llm_config(config),
     )
 
 

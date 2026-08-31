@@ -33,10 +33,7 @@ from ul import (
     EvaluatorModelPreflight,
     ExecutionEvidence,
     InteractionRecord,
-    OpenAICompatibleJudgeConfig,
     load_dataset_semantic_settings,
-    material_variance_evaluator_version_from_config,
-    semantic_deconstructor_identity,
 )
 from ul.environment import validate_execution_evidence
 from ul.http_environment import (
@@ -46,6 +43,7 @@ from ul.http_environment import (
     json_http_environment_capabilities,
     json_http_environment_config_urls,
 )
+from ul.llm import llm_client_config_from_dataset_settings
 from ul.local_target import (
     LocalTargetConfig,
     LocalTargetConnection,
@@ -66,6 +64,7 @@ from ul_cli.dataset.evaluation.records import (
     validate_model_input_bounds,
 )
 from ul_cli.dataset.evaluation.runner import evaluate_interaction_records
+from ul_cli.dataset.evidence.context import dataset_evidence_semantic_settings
 from ul_cli.dataset.evidence.persistence import (
     create_durable_evidence_output,
     default_augmentations_output,
@@ -86,9 +85,9 @@ from ul_cli.dataset.progress import (
 from ul_cli.dataset.storage.private_files import create_private_output, open_resume_descriptor
 from ul_cli.dataset_augmentation_ledger import (
     DatasetAugmentationLedger,
-    DatasetAugmentationLedgerSemanticSettings,
     create_dataset_augmentation_generation_context,
     create_private_augmentation_ledger,
+    dataset_augmentation_ledger_semantic_settings,
     open_augmentation_ledger_for_resume,
 )
 from ul_cli.dataset_campaign import DatasetCampaignPlan, create_dataset_campaign_plan
@@ -652,51 +651,7 @@ def _persist_probe_quarantine(
 def _semantic_settings_snapshot(
     settings: DatasetSemanticSettings,
 ) -> DatasetEvidenceSemanticSettings:
-    materiality_config = OpenAICompatibleJudgeConfig(
-        base_url=settings.semantic_base_url,
-        model=settings.materiality_model,
-        api_key=settings.api_key,
-        allow_external_data_processing=True,
-        data_policy=(
-            "openrouter_zdr"
-            if settings.semantic_provider_type == "openrouter"
-            else "provider_default"
-        ),
-        upstream_provider=(
-            getattr(settings, "upstream_provider", None)
-            if settings.semantic_provider_type == "openrouter"
-            else None
-        ),
-        timeout_seconds=settings.timeout_seconds,
-        max_output_tokens=512,
-        token_parameter="max_tokens",
-        max_response_bytes=settings.max_response_bytes,
-    )
-    return DatasetEvidenceSemanticSettings(
-        provider=settings.semantic_provider_id,
-        upstream_provider=(
-            getattr(settings, "upstream_provider", None)
-            if settings.semantic_provider_type == "openrouter"
-            else None
-        ),
-        endpoint_sha256=settings.semantic_endpoint_sha256,
-        model=settings.model,
-        render_model=settings.render_model,
-        equivalence_model=settings.equivalence_model,
-        materiality_model=settings.materiality_model,
-        deconstruct_reasoning=settings.deconstruct_reasoning,
-        render_reasoning=settings.render_reasoning,
-        equivalence_reasoning=settings.equivalence_reasoning,
-        max_input_chars=settings.max_input_chars,
-        max_output_tokens=settings.max_output_tokens,
-        max_render_tokens=settings.max_render_tokens,
-        max_response_bytes=settings.max_response_bytes,
-        timeout_seconds=settings.timeout_seconds,
-        deconstructor_identity=semantic_deconstructor_identity(settings),
-        materiality_evaluator_version_id=(
-            material_variance_evaluator_version_from_config(materiality_config).id
-        ),
-    )
+    return dataset_evidence_semantic_settings(settings)
 
 
 def _target_evidence_receipt(resolved_target: _ResolvedTarget) -> dict[str, JsonValue]:
@@ -1969,6 +1924,7 @@ def _campaign_confirmation(
     *,
     case_limit: int,
 ) -> _CampaignConfirmation:
+    llm_config = llm_client_config_from_dataset_settings(settings)
     planned_target_seconds = (
         resolved_target.calls_per_execution + plan.calls.repetition_executions
     ) * _TARGET_TIMEOUT_SECONDS
@@ -1977,40 +1933,16 @@ def _campaign_confirmation(
         if resolved_target.maximum_active_target_seconds is not None
         else planned_target_seconds
     )
-    if settings.semantic_provider_type == "openrouter":
-        data_policy: dict[str, object] = {
-            "external_processing": True,
-            "provider_policy_declared": True,
-            "data_collection": "deny",
-            "zero_data_retention_required": True,
-            "upstream_provider": (
-                getattr(settings, "upstream_provider", None)
-                if settings.semantic_provider_type == "openrouter"
-                else None
-            ),
-            "implication": (
-                "The configured route requires data collection to be denied and zero data "
-                "retention; the evaluator request is still processed externally."
-            ),
-        }
-    else:
-        data_policy = {
-            "external_processing": True,
-            "provider_policy_declared": False,
-            "implication": (
-                "The configured endpoint receives evaluator prompts and sample data; UL cannot "
-                "verify its retention or training policy."
-            ),
-        }
+    data_policy = llm_config.data_policy()
     return _CampaignConfirmation(
         target_confirmation_sha256=resolved_target.confirmation_sha256,
-        semantic_provider_id=settings.semantic_provider_id,
-        semantic_provider_type=settings.semantic_provider_type,
-        semantic_endpoint_sha256=settings.semantic_endpoint_sha256,
+        semantic_provider_id=llm_config.provider_id,
+        semantic_provider_type=llm_config.provider_type,
+        semantic_endpoint_sha256=llm_config.endpoint_sha256,
         semantic_settings_sha256=_model_sha256(_semantic_settings_snapshot(settings)),
         campaign_plan_sha256=_model_sha256(plan),
         case_limit=case_limit,
-        data_policy=data_policy,
+        data_policy=cast(dict[str, object], data_policy),
         command_environment_api_requests=(
             resolved_target.calls_per_execution + plan.calls.total_environment_api
         ),
@@ -2105,22 +2037,7 @@ def _run_campaign(
             dataset_operator_identity(operator_reference)
             for operator_reference in selected_operator_ids
         ),
-        semantic_settings=DatasetAugmentationLedgerSemanticSettings(
-            provider=settings.semantic_provider_id,
-            endpoint_sha256=settings.semantic_endpoint_sha256,
-            model=settings.model,
-            render_model=settings.render_model,
-            equivalence_model=settings.equivalence_model,
-            deconstruct_reasoning=settings.deconstruct_reasoning,
-            render_reasoning=settings.render_reasoning,
-            equivalence_reasoning=settings.equivalence_reasoning,
-            max_input_chars=settings.max_input_chars,
-            max_output_tokens=settings.max_output_tokens,
-            max_render_tokens=settings.max_render_tokens,
-            max_response_bytes=settings.max_response_bytes,
-            timeout_seconds=settings.timeout_seconds,
-            deconstructor_identity=semantic_deconstructor_identity(settings),
-        ),
+        semantic_settings=dataset_augmentation_ledger_semantic_settings(settings),
     )
     expected_manifest = create_dataset_run_manifest(
         run_context=run_context,

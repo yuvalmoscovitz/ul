@@ -32,6 +32,7 @@ from ul.dataset_invariants import (
     evaluate_dataset_invariants,
 )
 from ul.http_environment import JsonHttpEnvironmentConnection
+from ul.llm import LLMClient
 from ul.local_target import LocalTargetConnection
 
 from ul_cli.dataset_augmentation_ledger import DatasetAugmentationLedger
@@ -140,26 +141,12 @@ async def evaluate_interaction_records(
     deconstructor.reuse_preflight(evaluator_preflight)
     if not settings.allow_external_data_processing:
         raise ValueError("material variance judging requires external data processing approval")
-    materiality_judge = OpenAICompatibleEvaluatorJudge(
-        OpenAICompatibleJudgeConfig(
-            base_url=settings.semantic_base_url,
-            model=settings.materiality_model,
-            api_key=settings.api_key,
-            allow_external_data_processing=settings.allow_external_data_processing,
-            data_policy=(
-                "openrouter_zdr"
-                if settings.semantic_provider_type == "openrouter"
-                else "provider_default"
-            ),
-            upstream_provider=(
-                getattr(settings, "upstream_provider", None)
-                if settings.semantic_provider_type == "openrouter"
-                else None
-            ),
-            timeout_seconds=settings.timeout_seconds,
-            max_output_tokens=512,
-            token_parameter="max_tokens",
-            max_response_bytes=settings.max_response_bytes,
+    shared_llm_client = getattr(deconstructor, "llm_client", None)
+    materiality_judge = (
+        OpenAICompatibleEvaluatorJudge(llm_client=shared_llm_client)
+        if isinstance(shared_llm_client, LLMClient)
+        else OpenAICompatibleEvaluatorJudge(
+            OpenAICompatibleJudgeConfig.from_dataset_settings(settings)
         )
     )
     material_variance_evaluator = DatasetMaterialVarianceJudge(

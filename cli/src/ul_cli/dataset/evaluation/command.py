@@ -28,7 +28,6 @@ from ul import (
     OpenRouterDatasetSettings,
     ProviderDiagnosticError,
     load_dataset_semantic_settings,
-    semantic_deconstructor_identity,
 )
 from ul.dataset_invariants import (
     DatasetInvariantEvaluation,
@@ -55,9 +54,9 @@ from ul_cli.dataset.progress import (
 from ul_cli.dataset_augmentation_ledger import (
     DatasetAugmentationGenerationContext,
     DatasetAugmentationLedger,
-    DatasetAugmentationLedgerSemanticSettings,
     create_dataset_augmentation_generation_context,
     create_private_augmentation_ledger,
+    dataset_augmentation_ledger_semantic_settings,
     open_augmentation_ledger_for_resume,
     read_augmentation_ledger,
 )
@@ -1103,22 +1102,7 @@ def evaluate_dataset(
                 dataset_operator_identity(operator_reference)
                 for operator_reference in selected_operators
             ),
-            semantic_settings=DatasetAugmentationLedgerSemanticSettings(
-                provider=settings.semantic_provider_id,
-                endpoint_sha256=settings.semantic_endpoint_sha256,
-                model=settings.model,
-                render_model=settings.render_model,
-                equivalence_model=settings.equivalence_model,
-                deconstruct_reasoning=settings.deconstruct_reasoning,
-                render_reasoning=settings.render_reasoning,
-                equivalence_reasoning=settings.equivalence_reasoning,
-                max_input_chars=settings.max_input_chars,
-                max_output_tokens=settings.max_output_tokens,
-                max_render_tokens=settings.max_render_tokens,
-                max_response_bytes=settings.max_response_bytes,
-                timeout_seconds=settings.timeout_seconds,
-                deconstructor_identity=semantic_deconstructor_identity(settings),
-            ),
+            semantic_settings=dataset_augmentation_ledger_semantic_settings(settings),
             redaction_policy_sha256=(
                 redaction_engine.policy.digest if redaction_engine is not None else None
             ),

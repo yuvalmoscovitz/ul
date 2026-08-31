@@ -10,7 +10,14 @@ from pathlib import Path
 from typing import Literal, Self, cast
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
-from ul import DatasetAugmentationResult, InteractionRecord, SemanticDeconstructorIdentity
+from ul import (
+    DatasetAugmentationResult,
+    DatasetSemanticSettings,
+    InteractionRecord,
+    SemanticDeconstructorIdentity,
+    semantic_deconstructor_identity,
+)
+from ul.llm import llm_client_config_from_dataset_settings
 
 if sys.platform == "win32":
     import msvcrt
@@ -47,6 +54,28 @@ class DatasetAugmentationLedgerSemanticSettings(_StrictModel):
     max_response_bytes: int = Field(ge=1)
     timeout_seconds: float = Field(gt=0, allow_inf_nan=False)
     deconstructor_identity: SemanticDeconstructorIdentity | None = None
+
+
+def dataset_augmentation_ledger_semantic_settings(
+    settings: DatasetSemanticSettings,
+) -> DatasetAugmentationLedgerSemanticSettings:
+    llm_config = llm_client_config_from_dataset_settings(settings)
+    return DatasetAugmentationLedgerSemanticSettings(
+        provider=llm_config.provider_id,
+        endpoint_sha256=llm_config.endpoint_sha256,
+        model=llm_config.role_config("deconstruct").model,
+        render_model=llm_config.role_config("render").model,
+        equivalence_model=llm_config.role_config("equivalence").model,
+        deconstruct_reasoning=settings.deconstruct_reasoning,
+        render_reasoning=settings.render_reasoning,
+        equivalence_reasoning=settings.equivalence_reasoning,
+        max_input_chars=settings.max_input_chars,
+        max_output_tokens=llm_config.role_config("deconstruct").max_output_tokens,
+        max_render_tokens=llm_config.role_config("render").max_output_tokens,
+        max_response_bytes=llm_config.max_response_bytes,
+        timeout_seconds=llm_config.timeout_seconds,
+        deconstructor_identity=semantic_deconstructor_identity(settings),
+    )
 
 
 class DatasetAugmentationGenerationContext(_StrictModel):
