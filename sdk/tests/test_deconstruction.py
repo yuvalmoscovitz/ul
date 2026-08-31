@@ -48,6 +48,7 @@ def settings(
 ) -> OpenRouterDatasetSettings:
     return OpenRouterDatasetSettings(
         model="test/default-model",
+        upstream_provider="provider-name",
         live_calls=live_calls,
         allow_external_data_processing=allow_external_data_processing,
         api_key=api_key,
@@ -239,12 +240,12 @@ async def test_evaluator_preflight_proves_required_capabilities_and_records_poli
         {"effort": "low"},
         None,
     ]
-    assert [request["temperature"] for request in requests[:4]] == [0, 0.7, 0, 0]
+    assert [request["temperature"] for request in requests[:4]] == [0, 0, 0, 0]
     assert requests[0]["seed"] == 0
     assert requests[1]["seed"] == SemanticModelDeconstructor._render_seed(
         "UL evaluator preflight", "Check renderer compatibility."
     )
-    assert requests[1]["top_p"] == 0.95
+    assert "top_p" not in requests[1]
     assert [request["max_tokens"] for request in requests[:4]] == [321, 512, 321, 512]
     assert requests[0]["response_format"] == {
         "type": "json_schema",
@@ -287,6 +288,7 @@ async def test_evaluator_preflight_proves_required_capabilities_and_records_poli
         "provider_policy_declared": True,
         "data_collection": "deny",
         "zero_data_retention_required": True,
+        "upstream_provider": "provider-name",
         "implication": (
             "The configured route requires data collection to be denied and zero data retention; "
             "the evaluator request is still processed externally."
@@ -310,6 +312,61 @@ async def test_evaluator_preflight_caps_each_sample_at_1024_tokens() -> None:
         await deconstructor.preflight()
 
     assert [request["max_tokens"] for request in requests] == [1_024, 1_024, 1_024, 512]
+    await client.aclose()
+
+
+@pytest.mark.parametrize("returned_provider", ("different-provider", "provider/name"))
+async def test_evaluator_preflight_rejects_an_unpinned_upstream_provider(
+    returned_provider: str,
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        assert body["provider"]["only"] == ["provider-name"]
+        assert body["provider"]["allow_fallbacks"] is False
+        response = completion('{"compatible":true}').json()
+        response["provider"] = returned_provider
+        return httpx.Response(200, json=response)
+
+    client = mock_client(handler)
+    async with create_semantic_model_deconstructor(settings(), client=client) as deconstructor:
+        with pytest.raises(EvaluatorModelCompatibilityError, match="provider pin"):
+            await deconstructor.preflight()
+
+    await client.aclose()
+
+
+async def test_evaluator_preflight_accepts_a_normalized_upstream_provider_name() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        response = completion('{"compatible":true}').json()
+        response["provider"] = "Provider Name"
+        return httpx.Response(200, json=response)
+
+    client = mock_client(handler)
+    configured_settings = settings().model_copy(update={"upstream_provider": "provider-name"})
+    async with create_semantic_model_deconstructor(
+        configured_settings, client=client
+    ) as deconstructor:
+        result = await deconstructor.preflight()
+
+    assert all(profile.upstream_provider == "Provider Name" for profile in result.profiles)
+    assert all(
+        profile.configured_upstream_provider == "provider-name" for profile in result.profiles
+    )
+    await client.aclose()
+
+
+async def test_deconstruction_rejects_a_response_from_an_unpinned_provider() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        response = completion(json.dumps(frame_payload())).json()
+        response["provider"] = "different-provider"
+        return httpx.Response(200, json=response)
+
+    client = mock_client(handler)
+    async with create_semantic_model_deconstructor(settings(), client=client) as deconstructor:
+        with pytest.raises(ProviderDiagnosticError) as error:
+            await deconstructor.deconstruct(interaction())
+
+    assert error.value.diagnostic.category == "invalid_response"
     await client.aclose()
 
 
@@ -427,7 +484,6 @@ async def test_generic_endpoint_deduplicates_without_claiming_parameter_support(
         "seed",
         "temperature",
         "max_tokens",
-        "top_p",
     )
     assert all(
         profile.parameter_support == "endpoint_accepted_unverified" for profile in result.profiles
@@ -606,6 +662,8 @@ async def test_deconstruct_sends_one_bounded_strict_structured_request() -> None
             "require_parameters": True,
             "data_collection": "deny",
             "zdr": True,
+            "only": ["provider-name"],
+            "allow_fallbacks": False,
         }
         assert body["response_format"]["type"] == "json_schema"
         assert body["response_format"]["json_schema"]["strict"] is True
@@ -1050,8 +1108,8 @@ async def test_render_keeps_caller_instruction_out_of_the_system_prompt() -> Non
         assert body["model"] == "test/default-model"
         assert body["reasoning"] == {"effort": "none"}
         assert body["max_tokens"] == 512
-        assert body["temperature"] == 0.7
-        assert body["top_p"] == 0.95
+        assert body["temperature"] == 0
+        assert "top_p" not in body
         assert (
             body["seed"]
             == int.from_bytes(
@@ -1107,8 +1165,7 @@ async def test_render_keeps_caller_instruction_out_of_the_system_prompt() -> Non
             "semantic.render.temporary_value_forbidden",
         ),
         "sampling": {
-            "temperature": 0.7,
-            "top_p": 0.95,
+            "temperature": 0,
             "seed": int.from_bytes(
                 hashlib.sha256(f"{raw_input}\0{instruction}".encode()).digest()[:4],
                 "big",
@@ -2611,6 +2668,7 @@ async def test_settings_load_dotenv_and_hide_secrets(
         "UL_DATASET_LIVE_CALLS",
         "UL_DATASET_ALLOW_EXTERNAL_DATA_PROCESSING",
         "UL_DATASET_MODEL",
+        "UL_DATASET_OPENROUTER_PROVIDER",
         "UL_DATASET_RENDER_MODEL",
         "UL_DATASET_EQUIVALENCE_MODEL",
         "UL_DATASET_MAX_RENDER_TOKENS",
@@ -2621,6 +2679,7 @@ async def test_settings_load_dotenv_and_hide_secrets(
         "UL_DATASET_LIVE_CALLS=true\n"
         "UL_DATASET_ALLOW_EXTERNAL_DATA_PROCESSING=true\n"
         "UL_DATASET_MODEL=test/dotenv-model\n"
+        "UL_DATASET_OPENROUTER_PROVIDER=test-provider\n"
         "UL_DATASET_RENDER_MODEL=test/dotenv-renderer\n"
         "UL_DATASET_EQUIVALENCE_MODEL=test/dotenv-equivalence\n"
         "UL_DATASET_MAX_RENDER_TOKENS=256\n"
@@ -2632,6 +2691,7 @@ async def test_settings_load_dotenv_and_hide_secrets(
     assert configured_settings.live_calls is True
     assert configured_settings.allow_external_data_processing is True
     assert configured_settings.model == "test/dotenv-model"
+    assert configured_settings.upstream_provider == "test-provider"
     assert configured_settings.render_model == "test/dotenv-renderer"
     assert configured_settings.equivalence_model == "test/dotenv-equivalence"
     assert configured_settings.max_render_tokens == 256
@@ -2653,6 +2713,7 @@ async def test_ul_live_enables_both_permissions(
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("UL_LIVE", "true")
     monkeypatch.setenv("UL_DATASET_MODEL", "test/default-model")
+    monkeypatch.setenv("UL_DATASET_OPENROUTER_PROVIDER", "test-provider")
 
     configured_settings = OpenRouterDatasetSettings()
 
@@ -2686,6 +2747,7 @@ async def test_granular_false_overrides_ul_live(
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("UL_LIVE", "true")
     monkeypatch.setenv("UL_DATASET_MODEL", "test/default-model")
+    monkeypatch.setenv("UL_DATASET_OPENROUTER_PROVIDER", "test-provider")
     monkeypatch.setenv(override_name, "false")
 
     configured_settings = OpenRouterDatasetSettings()
@@ -2706,7 +2768,9 @@ async def test_dotenv_ul_live_respects_process_granular_override(
     ):
         monkeypatch.delenv(variable_name, raising=False)
     (tmp_path / ".env").write_text(
-        "UL_LIVE=true\nUL_DATASET_MODEL=test/default-model\n", encoding="utf-8"
+        "UL_LIVE=true\nUL_DATASET_MODEL=test/default-model\n"
+        "UL_DATASET_OPENROUTER_PROVIDER=test-provider\n",
+        encoding="utf-8",
     )
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("UL_DATASET_LIVE_CALLS", "false")
@@ -2726,12 +2790,20 @@ async def test_settings_reject_unbounded_values() -> None:
     assert configured_settings.materiality_model == configured_settings.model
     assert (
         OpenRouterDatasetSettings(
-            model="customer/default-model", materiality_model="customer/materiality-model"
+            model="customer/default-model",
+            upstream_provider="test-provider",
+            materiality_model="customer/materiality-model",
         ).materiality_model
         == "customer/materiality-model"
     )
+    with pytest.raises(ValidationError):
+        OpenRouterDatasetSettings(model="customer/default-model")
     with pytest.raises(ValidationError, match="UL_DATASET_MATERIALITY_MODEL"):
-        OpenRouterDatasetSettings(model="customer/default-model", materiality_model="   ")
+        OpenRouterDatasetSettings(
+            model="customer/default-model",
+            upstream_provider="test-provider",
+            materiality_model="   ",
+        )
     with pytest.raises(ValidationError):
         settings(max_input_chars=1_000_001)
     with pytest.raises(ValidationError):

@@ -16,12 +16,14 @@ from ul_core.evaluators import EvaluationSubject, RubricEvaluator
 @pytest.mark.skipif(
     os.environ.get("UL_LIVE", "").lower() != "true"
     or not os.environ.get("OPEN_ROUTER_API_KEY")
-    or not os.environ.get("UL_DATASET_MODEL"),
+    or not os.environ.get("UL_DATASET_MODEL")
+    or not os.environ.get("UL_DATASET_OPENROUTER_PROVIDER"),
     reason="requires explicit live-call opt-in, OpenRouter credentials, and model",
 )
 async def test_live_rubric_judge_scores_answer() -> None:
     api_key = os.environ["OPEN_ROUTER_API_KEY"]
     model = os.environ["UL_DATASET_MODEL"]
+    upstream_provider = os.environ["UL_DATASET_OPENROUTER_PROVIDER"]
     subject = EvaluationSubject(
         agent_status="succeeded",
         answer="The payment was scheduled for tomorrow and no funds were sent today.",
@@ -34,6 +36,7 @@ async def test_live_rubric_judge_scores_answer() -> None:
             api_key=SecretStr(api_key),
             allow_external_data_processing=True,
             data_policy="openrouter_zdr",
+            upstream_provider=upstream_provider,
         )
     ) as judge:
         results = await evaluate(

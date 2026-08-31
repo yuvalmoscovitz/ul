@@ -718,6 +718,7 @@ async def test_openai_compatible_judge_uses_structured_output_and_explicit_data_
         return httpx.Response(
             200,
             json={
+                "provider": "test-provider",
                 "choices": [
                     {
                         "message": {
@@ -728,7 +729,7 @@ async def test_openai_compatible_judge_uses_structured_output_and_explicit_data_
                             )
                         }
                     }
-                ]
+                ],
             },
         )
 
@@ -740,6 +741,7 @@ async def test_openai_compatible_judge_uses_structured_output_and_explicit_data_
                 api_key="test-secret",
                 allow_external_data_processing=True,
                 data_policy="openrouter_zdr",
+                upstream_provider="test-provider",
                 token_parameter="max_tokens",
             ),
             client=client,
@@ -762,10 +764,54 @@ async def test_openai_compatible_judge_uses_structured_output_and_explicit_data_
         "data_collection": "deny",
         "require_parameters": True,
         "zdr": True,
+        "only": ["test-provider"],
+        "allow_fallbacks": False,
     }
     assert request_body["max_tokens"] == 1_024
     assert "max_completion_tokens" not in request_body
     assert captured_request.headers["authorization"] == "Bearer test-secret"
+
+
+async def test_openrouter_judge_rejects_a_response_from_an_unpinned_provider() -> None:
+    def respond(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "provider": "different-provider",
+                "choices": [
+                    {
+                        "message": {
+                            "content": (
+                                '{"score":0.95,"label":"clear",'
+                                '"explanation":"The outcome is explicit.",'
+                                '"citations":["/payload/answer/message"]}'
+                            )
+                        }
+                    }
+                ],
+            },
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
+        judge = OpenAICompatibleEvaluatorJudge(
+            OpenAICompatibleJudgeConfig(
+                base_url="https://models.example.test/v1",
+                model="customer/judge",
+                allow_external_data_processing=True,
+                data_policy="openrouter_zdr",
+                upstream_provider="test-provider",
+            ),
+            client=client,
+        )
+        with pytest.raises(ValueError, match="configured OpenRouter provider"):
+            await judge.evaluate(
+                JudgeRequest(
+                    evaluator_id="rubric",
+                    mode="rubric",
+                    rubric="The outcome must be explicit.",
+                    payload={"answer": {"message": "done"}},
+                )
+            )
 
 
 @pytest.mark.parametrize(

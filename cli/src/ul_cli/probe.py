@@ -662,6 +662,11 @@ def _semantic_settings_snapshot(
             if settings.semantic_provider_type == "openrouter"
             else "provider_default"
         ),
+        upstream_provider=(
+            getattr(settings, "upstream_provider", None)
+            if settings.semantic_provider_type == "openrouter"
+            else None
+        ),
         timeout_seconds=settings.timeout_seconds,
         max_output_tokens=512,
         token_parameter="max_tokens",
@@ -669,6 +674,11 @@ def _semantic_settings_snapshot(
     )
     return DatasetEvidenceSemanticSettings(
         provider=settings.semantic_provider_id,
+        upstream_provider=(
+            getattr(settings, "upstream_provider", None)
+            if settings.semantic_provider_type == "openrouter"
+            else None
+        ),
         endpoint_sha256=settings.semantic_endpoint_sha256,
         model=settings.model,
         render_model=settings.render_model,
@@ -1973,6 +1983,11 @@ def _campaign_confirmation(
             "provider_policy_declared": True,
             "data_collection": "deny",
             "zero_data_retention_required": True,
+            "upstream_provider": (
+                getattr(settings, "upstream_provider", None)
+                if settings.semantic_provider_type == "openrouter"
+                else None
+            ),
             "implication": (
                 "The configured route requires data collection to be denied and zero data "
                 "retention; the evaluator request is still processed externally."

@@ -84,6 +84,10 @@ def _sha256_text(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
+def _normalized_openrouter_provider_name(value: str) -> str:
+    return value.strip().casefold().replace(" ", "-")
+
+
 def _render_seed(raw_input: str, instruction: str) -> int:
     digest = hashlib.sha256(f"{raw_input}\0{instruction}".encode()).digest()
     return int.from_bytes(digest[:4], "big") & 0x7FFF_FFFF
@@ -430,6 +434,13 @@ class OpenRouterDatasetSettings(BaseSettings):
     )
     api_key: SecretStr | None = Field(default=None, validation_alias="OPEN_ROUTER_API_KEY")
     ul_live: bool = Field(default=False, validation_alias="UL_LIVE", exclude=True, repr=False)
+    upstream_provider: str = Field(
+        default=...,
+        min_length=1,
+        max_length=100,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9._/-]*$",
+        validation_alias="UL_DATASET_OPENROUTER_PROVIDER",
+    )
 
     @model_validator(mode="after")
     def validate_and_normalize(self) -> Self:
@@ -735,6 +746,7 @@ def _semantic_configuration_error(
         "UL_DATASET_SEMANTIC_PROVIDER": "provider",
         "UL_DATASET_OPENAI_BASE_URL": "base_url",
         "UL_DATASET_OPENAI_PROVIDER_ID": "provider_id",
+        "UL_DATASET_OPENROUTER_PROVIDER": "upstream_provider",
         "UL_DATASET_MODEL": "model",
         "UL_DATASET_RENDER_MODEL": "render_model",
         "UL_DATASET_EQUIVALENCE_MODEL": "equivalence_model",
@@ -759,6 +771,7 @@ def _semantic_configuration_error(
                 for environment_name, candidate in {
                     "UL_DATASET_OPENAI_BASE_URL": "base_url",
                     "UL_DATASET_OPENAI_PROVIDER_ID": "provider_id",
+                    "UL_DATASET_OPENROUTER_PROVIDER": "upstream_provider",
                     "UL_DATASET_RENDER_MODEL": "render_model",
                     "UL_DATASET_EQUIVALENCE_MODEL": "equivalence_model",
                     "UL_DATASET_MATERIALITY_MODEL": "materiality_model",
@@ -780,6 +793,9 @@ def _semantic_configuration_error(
         "provider_id": (
             "UL_DATASET_OPENAI_PROVIDER_ID must be 1-100 lowercase letters, digits, dots, "
             "underscores, or hyphens and must not be openrouter"
+        ),
+        "upstream_provider": (
+            "UL_DATASET_OPENROUTER_PROVIDER must be a single OpenRouter provider slug"
         ),
         "model": "UL_DATASET_MODEL must be 1-200 non-whitespace characters",
         "render_model": (
@@ -919,6 +935,7 @@ class EvaluatorModelProfilePreflight(BaseModel):
     requested_model: str = Field(min_length=1, max_length=200)
     routed_model: str = Field(min_length=1, max_length=200)
     upstream_provider: str | None = Field(default=None, max_length=200)
+    configured_upstream_provider: str | None = Field(default=None, max_length=100)
     reasoning_mode: SemanticReasoningMode
     required_parameters: tuple[str, ...]
     request_options_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
@@ -1071,6 +1088,7 @@ class OpenRouterSemanticProvider(OpenAICompatibleSemanticProvider):
     endpoint_sha256: str = _sha256_text("https://openrouter.ai/api/v1")
     requires_api_key: bool = True
     trust_environment_transport: bool = True
+    upstream_provider: str = ""
 
     @property
     def enforces_parameter_support(self) -> bool:
@@ -1087,6 +1105,8 @@ class OpenRouterSemanticProvider(OpenAICompatibleSemanticProvider):
             "require_parameters": True,
             "data_collection": "deny",
             "zdr": True,
+            "only": [self.upstream_provider],
+            "allow_fallbacks": False,
         }
 
     def preflight_data_policy(self) -> dict[str, JsonValue]:
@@ -1095,6 +1115,7 @@ class OpenRouterSemanticProvider(OpenAICompatibleSemanticProvider):
             "provider_policy_declared": True,
             "data_collection": "deny",
             "zero_data_retention_required": True,
+            "upstream_provider": self.upstream_provider,
             "implication": (
                 "The configured route requires data collection to be denied and zero data "
                 "retention; the evaluator request is still processed externally."
@@ -1187,6 +1208,12 @@ class SemanticModelDeconstructor:
                 )
             except (ValidationError, ValueError):
                 raise self._compatibility_error(profile, "structured output") from None
+            if isinstance(self.provider, OpenRouterSemanticProvider) and (
+                completion.response.provider is None
+                or _normalized_openrouter_provider_name(completion.response.provider)
+                != _normalized_openrouter_provider_name(self.provider.upstream_provider)
+            ):
+                raise self._compatibility_error(profile, "provider pin")
             routing_enforced = self.provider.enforces_parameter_support
             profile_results.append(
                 EvaluatorModelProfilePreflight(
@@ -1194,6 +1221,11 @@ class SemanticModelDeconstructor:
                     requested_model=profile.model,
                     routed_model=completion.response.model,
                     upstream_provider=completion.response.provider,
+                    configured_upstream_provider=(
+                        self.provider.upstream_provider
+                        if isinstance(self.provider, OpenRouterSemanticProvider)
+                        else None
+                    ),
                     reasoning_mode=profile.reasoning_mode,
                     required_parameters=profile.required_parameters,
                     request_options_sha256=self._profile_request_options_sha256(profile),
@@ -1333,9 +1365,9 @@ class SemanticModelDeconstructor:
             model=self.settings.render_model,
             reasoning=_reasoning_option(self.settings.render_reasoning, "none"),
             max_tokens=self.settings.max_render_tokens,
-            temperature=0.7,
+            temperature=0,
             seed=render_seed,
-            top_p=0.95,
+            top_p=None,
             schema_name="rendered_input",
             schema=_RenderedInput.model_json_schema(mode="validation"),
             strict_schema=True,
@@ -1362,8 +1394,7 @@ class SemanticModelDeconstructor:
                 "requested_model": self.settings.render_model,
                 "prompts": prompt_provenance("semantic.render", temporary_value_prompt),
                 "sampling": {
-                    "temperature": 0.7,
-                    "top_p": 0.95,
+                    "temperature": 0,
                     "seed": render_seed,
                     "max_tokens": self.settings.max_render_tokens,
                 },
@@ -1544,6 +1575,23 @@ class SemanticModelDeconstructor:
                     endpoint_sha256=self.provider.endpoint_sha256,
                 )
             ) from None
+        if (
+            operation != "preflight"
+            and isinstance(self.provider, OpenRouterSemanticProvider)
+            and (
+                response.provider is None
+                or _normalized_openrouter_provider_name(response.provider)
+                != _normalized_openrouter_provider_name(self.provider.upstream_provider)
+            )
+        ):
+            raise ProviderDiagnosticError(
+                _provider_diagnostic(
+                    ValueError("semantic provider did not honor the configured provider pin"),
+                    provider=self.provider.provider_id,
+                    operation=operation,
+                    endpoint_sha256=self.provider.endpoint_sha256,
+                )
+            )
         if operation != "preflight":
             self._cache_semantic_response(cache_key, response)
         return _SemanticCompletion(
@@ -2131,7 +2179,7 @@ def _semantic_completion_provider(
             base_url=settings.semantic_base_url,
             endpoint_sha256=settings.semantic_endpoint_sha256,
         )
-    return OpenRouterSemanticProvider()
+    return OpenRouterSemanticProvider(upstream_provider=settings.upstream_provider)
 
 
 def _evaluator_preflight_profiles(
@@ -2187,9 +2235,9 @@ def _evaluator_preflight_profiles(
             reasoning_mode=settings.render_reasoning,
             reasoning=_reasoning_option(settings.render_reasoning, "none"),
             max_tokens=min(settings.max_render_tokens, _PREFLIGHT_MAX_TOKENS),
-            temperature=0.7,
+            temperature=0,
             seed=render_seed,
-            top_p=0.95,
+            top_p=None,
         ),
         profile(
             role="equivalence",
@@ -2235,6 +2283,11 @@ def _validate_evaluator_preflight(
         (
             profile.roles,
             profile.model,
+            (
+                provider.upstream_provider
+                if isinstance(provider, OpenRouterSemanticProvider)
+                else None
+            ),
             profile.reasoning_mode,
             profile.required_parameters,
             _profile_request_options_sha256(provider, profile),
@@ -2245,6 +2298,7 @@ def _validate_evaluator_preflight(
         (
             profile.roles,
             profile.requested_model,
+            profile.configured_upstream_provider,
             profile.reasoning_mode,
             profile.required_parameters,
             profile.request_options_sha256,

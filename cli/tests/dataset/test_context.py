@@ -147,6 +147,8 @@ def test_run_context_records_canonical_provider_identity() -> None:
     )
 
     assert custom_context.semantic_settings.provider == "customer-gateway"
+    assert custom_context.semantic_settings.upstream_provider is None
+    assert openrouter_context.semantic_settings.upstream_provider == "test-provider"
     assert len(custom_context.semantic_settings.endpoint_sha256) == 64
     assert "https://models.example.test/v1" not in custom_context.model_dump_json()
     assert custom_context.context_sha256 != openrouter_context.context_sha256

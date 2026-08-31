@@ -50,6 +50,7 @@ _TEST_MATERIALITY_EVALUATOR_VERSION_ID = material_variance_evaluator_version_fro
         api_key=SecretStr("test-key"),
         allow_external_data_processing=True,
         data_policy="openrouter_zdr",
+        upstream_provider="test-provider",
         timeout_seconds=60.0,
         max_output_tokens=512,
         token_parameter="max_tokens",
@@ -248,6 +249,7 @@ def _settings(**overrides: object) -> SimpleNamespace:
         "live_calls": True,
         "allow_external_data_processing": True,
         "api_key": SecretStr("test-key"),
+        "upstream_provider": "test-provider",
         "model": "test/deconstructor",
         "render_model": "test/renderer",
         "equivalence_model": "test/equivalence",
@@ -415,6 +417,8 @@ def _evaluator_preflight() -> EvaluatorModelPreflight:
         "require_parameters": True,
         "data_collection": "deny",
         "zdr": True,
+        "only": ["test-provider"],
+        "allow_fallbacks": False,
     }
 
     def request_options_sha256(
@@ -468,6 +472,7 @@ def _evaluator_preflight() -> EvaluatorModelPreflight:
                     "requested_model": "test/deconstructor",
                     "routed_model": "test/deconstructor",
                     "upstream_provider": "test-provider",
+                    "configured_upstream_provider": "test-provider",
                     "reasoning_mode": "required",
                     "required_parameters": (
                         "response_format",
@@ -487,6 +492,7 @@ def _evaluator_preflight() -> EvaluatorModelPreflight:
                     "requested_model": "test/renderer",
                     "routed_model": "test/renderer",
                     "upstream_provider": "test-provider",
+                    "configured_upstream_provider": "test-provider",
                     "reasoning_mode": "required",
                     "required_parameters": (
                         "response_format",
@@ -494,15 +500,13 @@ def _evaluator_preflight() -> EvaluatorModelPreflight:
                         "temperature",
                         "max_tokens",
                         "reasoning",
-                        "top_p",
                     ),
                     "request_options_sha256": request_options_sha256(
                         "test/renderer",
                         "none",
-                        0.7,
+                        0,
                         render_seed,
                         max_tokens=512,
-                        top_p=0.95,
                     ),
                     "parameter_support": "routing_enforced",
                     "unverified_options": (),
@@ -512,6 +516,7 @@ def _evaluator_preflight() -> EvaluatorModelPreflight:
                     "requested_model": "test/equivalence",
                     "routed_model": "test/equivalence",
                     "upstream_provider": "test-provider",
+                    "configured_upstream_provider": "test-provider",
                     "reasoning_mode": "required",
                     "required_parameters": (
                         "response_format",
@@ -531,6 +536,7 @@ def _evaluator_preflight() -> EvaluatorModelPreflight:
                     "requested_model": "test/materiality",
                     "routed_model": "test/materiality",
                     "upstream_provider": "test-provider",
+                    "configured_upstream_provider": "test-provider",
                     "reasoning_mode": "omitted",
                     "required_parameters": (
                         "response_format",
@@ -555,6 +561,7 @@ def _evaluator_preflight() -> EvaluatorModelPreflight:
                 "provider_policy_declared": True,
                 "data_collection": "deny",
                 "zero_data_retention_required": True,
+                "upstream_provider": "test-provider",
                 "implication": (
                     "The configured route requires data collection to be denied and zero data "
                     "retention; the evaluator request is still processed externally."

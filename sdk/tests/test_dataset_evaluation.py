@@ -914,6 +914,7 @@ async def test_repetition_benchmark_reduces_semantic_calls_without_changing_find
             json={
                 "id": f"generation-{provider_requests}",
                 "model": "provider/resolved-model",
+                "provider": "provider-name",
                 "choices": [{"message": {"content": json.dumps(frame_payload)}}],
             },
         )
@@ -921,6 +922,7 @@ async def test_repetition_benchmark_reduces_semantic_calls_without_changing_find
     client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
     semantic_settings = OpenRouterDatasetSettings(
         model="test/default-model",
+        upstream_provider="provider-name",
         live_calls=True,
         allow_external_data_processing=True,
         api_key=SecretStr("test-openrouter-key"),

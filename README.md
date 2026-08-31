@@ -64,12 +64,14 @@ configuration.
 export UL_ENVIRONMENT_AGENT_TOKEN='Bearer secret-from-your-secret-manager'
 export OPEN_ROUTER_API_KEY=your-key-from-a-secret-manager
 export UL_DATASET_MODEL=your-provider/model
+export UL_DATASET_OPENROUTER_PROVIDER=your-provider-slug
 export UL_LIVE=true
 ```
 
 UL uses that model for every semantic task unless you set a task-specific
 `UL_DATASET_RENDER_MODEL`, `UL_DATASET_EQUIVALENCE_MODEL`, or
-`UL_DATASET_MATERIALITY_MODEL` override.
+`UL_DATASET_MATERIALITY_MODEL` override. It sends every semantic request to the
+configured OpenRouter provider with fallback disabled, and uses temperature 0.
 
 Run one small campaign:
 
