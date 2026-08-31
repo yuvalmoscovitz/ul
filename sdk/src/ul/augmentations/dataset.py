@@ -1101,14 +1101,20 @@ def _request_resource_tokens(
     *,
     ignored: Collection[str] = (),
 ) -> set[str]:
-    tokens = set(
+    predicate_tokens = set(
         _semantic_name_tokens(request.predicate, ignored=_ACTION_OPERATION_WORDS.union(ignored))
     )
+    tokens = set(predicate_tokens)
     for factor in frame.factors:
         if not _factor_is_associated_with_request(factor, request):
             continue
         if factor.kind == "entity" and isinstance(factor.value, str):
-            tokens.update(_semantic_name_tokens(factor.value, ignored=ignored))
+            entity_tokens = set(_semantic_name_tokens(factor.value, ignored=ignored))
+            tokens.update(
+                entity_tokens
+                if request.factor_ids
+                else entity_tokens.intersection(predicate_tokens)
+            )
         if factor.kind == "identifier":
             tokens.update(
                 _semantic_name_tokens(

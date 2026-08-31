@@ -1040,6 +1040,56 @@ async def test_self_correction_recovers_exact_factor_association_from_request_ev
     assert result.candidates[0].augmented_input == rendered_output
 
 
+async def test_self_correction_does_not_recover_unrelated_entity_from_broad_evidence() -> None:
+    prior_action: dict[str, JsonValue] = {
+        "action": "salesforce.account.read",
+        "account_id": "006001",
+        "stage_name": "Negotiation/Review",
+    }
+    final_action: dict[str, JsonValue] = {
+        "action": "salesforce.account.update",
+        "account_id": "006001",
+        "stage_name": "Closed Won",
+    }
+    record, source, candidate_frame, rendered_output = grounded_enum_self_correction_frames(
+        prior_actions=[prior_action], final_action=final_action
+    )
+    raw_input = f"Account context. {record.raw_input}"
+    account = SemanticFactor(
+        id="source:account",
+        evidence=(
+            EvidenceReference(source="input", json_pointer="/raw_input", text_quote="Account"),
+        ),
+        confidence=1,
+        status="observed",
+        kind="entity",
+        role="context",
+        value="account",
+    )
+    request = source.request_units[0].model_copy(
+        update={
+            "factor_ids": (),
+            "evidence": (
+                EvidenceReference(source="input", json_pointer="/raw_input", text_quote=raw_input),
+            ),
+        }
+    )
+    unlinked_source = source.model_copy(
+        update={"request_units": (request,), "factors": (*source.factors, account)}
+    )
+    record = record.model_copy(update={"raw_input": raw_input})
+    model = DeterministicSemanticModel(
+        {record.id: unlinked_source}, candidate_frame, f"Account context. {rendered_output}"
+    )
+
+    result = await DatasetAugmentationEngine(model, model).augment(
+        (record,), operator_ids=("input.intent.self_correction",)
+    )
+
+    assert not result.candidates
+    assert result.skips
+
+
 @pytest.mark.parametrize(
     "prior_actions",
     [
