@@ -1116,11 +1116,13 @@ def _request_resource_tokens(
                 else entity_tokens.intersection(predicate_tokens)
             )
         if factor.kind == "identifier":
+            identifier_role_tokens = set(
+                _semantic_name_tokens(factor.role, ignored={"id", "identifier", "object", *ignored})
+            )
             tokens.update(
-                _semantic_name_tokens(
-                    factor.role,
-                    ignored={"id", "identifier", "object", *ignored},
-                )
+                identifier_role_tokens
+                if request.factor_ids
+                else identifier_role_tokens.intersection(predicate_tokens)
             )
     return tokens
 

@@ -1090,6 +1090,40 @@ async def test_self_correction_does_not_recover_unrelated_entity_from_broad_evid
     assert result.skips
 
 
+async def test_self_correction_does_not_recover_unrelated_identifier_role() -> None:
+    prior_action: dict[str, JsonValue] = {
+        "action": "salesforce.account.read",
+        "account_id": "006001",
+        "stage_name": "Negotiation/Review",
+    }
+    final_action: dict[str, JsonValue] = {
+        "action": "salesforce.account.update",
+        "account_id": "006001",
+        "stage_name": "Closed Won",
+    }
+    record, source, candidate_frame, rendered_output = grounded_enum_self_correction_frames(
+        prior_actions=[prior_action], final_action=final_action
+    )
+    request = source.request_units[0].model_copy(update={"factor_ids": ()})
+    factors = tuple(
+        factor.model_copy(update={"role": "account_identifier"})
+        if factor.kind == "identifier"
+        else factor
+        for factor in source.factors
+    )
+    unlinked_source = source.model_copy(update={"request_units": (request,), "factors": factors})
+    model = DeterministicSemanticModel(
+        {record.id: unlinked_source}, candidate_frame, rendered_output
+    )
+
+    result = await DatasetAugmentationEngine(model, model).augment(
+        (record,), operator_ids=("input.intent.self_correction",)
+    )
+
+    assert not result.candidates
+    assert result.skips
+
+
 @pytest.mark.parametrize(
     "prior_actions",
     [
