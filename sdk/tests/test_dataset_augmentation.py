@@ -621,7 +621,14 @@ async def test_builtin_operator_library_is_fixed_versioned_and_reviewable() -> N
         "input.tone.frustrated",
         "input.intent.self_correction",
     )
-    assert {operator.version for operator in operators} == {"1.0.0"}
+    assert {operator.id: operator.version for operator in operators}[
+        "input.tone.frustrated"
+    ] == "1.1.0"
+    assert all(
+        operator.version == "1.0.0"
+        for operator in operators
+        if operator.id != "input.tone.frustrated"
+    )
     assert [operator.id for operator in operators if operator.human_review_required] == [
         "input.tone.frustrated",
         "input.intent.self_correction",
