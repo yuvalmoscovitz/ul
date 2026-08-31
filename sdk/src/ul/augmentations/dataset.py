@@ -938,10 +938,8 @@ def _recorded_action_factor_match(
     for action_index, action in enumerate(action_records):
         if not _action_matches_request_operation(str(action["action"]), request.predicate):
             continue
-        if not _action_matches_request_resource(str(action["action"]), request.predicate):
-            continue
         if not _action_contains_exact_identifiers(
-            action, request_identifier_factors, request.predicate
+            action, frame, request, request_identifier_factors
         ):
             continue
         matching_fields = tuple(
@@ -950,6 +948,7 @@ def _recorded_action_factor_match(
             if not _is_action_identifier_field(field_name)
             and field_name != "action"
             and _semantic_role_matches_action_field(factor.role, field_name, request.predicate)
+            and _action_matches_request_resource(str(action["action"]), frame, request, field_name)
             and not isinstance(value, (dict, list, bool))
             and _self_correction_values_equal(value, factor.value, factor_kind=factor.kind)
         )
@@ -989,8 +988,8 @@ def _request_identifier_factors(
 
 
 def _factor_is_associated_with_request(factor: SemanticFactor, request: RequestUnit) -> bool:
-    if factor.id in request.factor_ids:
-        return True
+    if request.factor_ids:
+        return factor.id in request.factor_ids
     factor_quote = _unique_input_quote(factor)
     if factor_quote is None:
         return False
@@ -1008,8 +1007,9 @@ def _is_action_identifier_field(field_name: str) -> bool:
 
 def _action_contains_exact_identifiers(
     action: Mapping[str, JsonValue],
+    frame: SemanticFrame,
+    request: RequestUnit,
     request_identifier_factors: tuple[SemanticFactor, ...],
-    request_predicate: str,
 ) -> bool:
     action_identifiers = tuple(
         (field_name, value)
@@ -1023,7 +1023,7 @@ def _action_contains_exact_identifiers(
     factors_match_once = all(
         sum(
             _identifier_factor_matches_action_field(
-                factor, field_name, str(action["action"]), request_predicate
+                factor, field_name, str(action["action"]), frame, request
             )
             and type(factor.value) is type(value)
             and factor.value == value
@@ -1035,7 +1035,7 @@ def _action_contains_exact_identifiers(
     fields_match_once = all(
         sum(
             _identifier_factor_matches_action_field(
-                factor, field_name, str(action["action"]), request_predicate
+                factor, field_name, str(action["action"]), frame, request
             )
             and type(factor.value) is type(value)
             and factor.value == value
@@ -1051,7 +1051,8 @@ def _identifier_factor_matches_action_field(
     factor: SemanticFactor,
     field_name: str,
     action_name: str,
-    request_predicate: str,
+    frame: SemanticFrame,
+    request: RequestUnit,
 ) -> bool:
     field_tokens = _semantic_name_tokens(field_name, ignored={"id", "identifier"})
     if not field_tokens:
@@ -1059,7 +1060,7 @@ def _identifier_factor_matches_action_field(
     role_tokens = _semantic_name_tokens(factor.role, ignored={"id", "identifier", "object"})
     if role_tokens:
         return role_tokens == field_tokens
-    request_tokens = set(_semantic_name_tokens(request_predicate, ignored=_ACTION_OPERATION_WORDS))
+    request_tokens = _request_resource_tokens(frame, request)
     action_resource_tokens = set(_action_resource_key(action_name))
     return set(field_tokens) <= request_tokens and set(field_tokens) <= action_resource_tokens
 
@@ -1094,10 +1095,46 @@ def _semantic_name_tokens(name: str, *, ignored: Collection[str]) -> tuple[str, 
     )
 
 
-def _action_matches_request_resource(action_name: str, request_predicate: str) -> bool:
-    request_tokens = set(_semantic_name_tokens(request_predicate, ignored=_ACTION_OPERATION_WORDS))
-    action_resource = _action_resource_key(action_name)
-    return bool(action_resource) and action_resource[-1] in request_tokens
+def _request_resource_tokens(
+    frame: SemanticFrame,
+    request: RequestUnit,
+    *,
+    ignored: Collection[str] = (),
+) -> set[str]:
+    tokens = set(
+        _semantic_name_tokens(request.predicate, ignored=_ACTION_OPERATION_WORDS.union(ignored))
+    )
+    for factor in frame.factors:
+        if not _factor_is_associated_with_request(factor, request):
+            continue
+        if factor.kind == "entity" and isinstance(factor.value, str):
+            tokens.update(_semantic_name_tokens(factor.value, ignored=ignored))
+        if factor.kind == "identifier":
+            tokens.update(
+                _semantic_name_tokens(
+                    factor.role,
+                    ignored={"id", "identifier", "object", *ignored},
+                )
+            )
+    return tokens
+
+
+def _action_matches_request_resource(
+    action_name: str,
+    frame: SemanticFrame,
+    request: RequestUnit,
+    semantic_field_name: str,
+) -> bool:
+    semantic_field_tokens = set(
+        _semantic_name_tokens(semantic_field_name, ignored={"name", "value"})
+    )
+    action_resource = tuple(
+        token for token in _action_resource_key(action_name) if token not in semantic_field_tokens
+    )
+    request_resource_tokens = _request_resource_tokens(
+        frame, request, ignored=semantic_field_tokens
+    )
+    return bool(action_resource) and action_resource[-1] in request_resource_tokens
 
 
 def _grounded_prior_enum_plan(

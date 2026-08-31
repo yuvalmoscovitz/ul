@@ -850,6 +850,7 @@ def grounded_enum_self_correction_frames(
     *,
     prior_actions: list[dict[str, JsonValue]],
     final_action: dict[str, JsonValue] | None = None,
+    request_predicate: str = "update_opportunity_stage",
 ) -> tuple[InteractionRecord, SemanticFrame, SemanticFrame, str]:
     raw_input = (
         "Opportunity 006001 is currently Negotiation/Review. Great news - it just closed! "
@@ -877,6 +878,17 @@ def grounded_enum_self_correction_frames(
         role="identifier",
         value="006001",
     )
+    opportunity_entity = SemanticFactor(
+        id="source:opportunity-entity",
+        evidence=(
+            EvidenceReference(source="input", json_pointer="/raw_input", text_quote="Opportunity"),
+        ),
+        confidence=1,
+        status="observed",
+        kind="entity",
+        role="object",
+        value="opportunity",
+    )
     stage = SemanticFactor(
         id="source:stage",
         evidence=(
@@ -896,13 +908,13 @@ def grounded_enum_self_correction_frames(
         confidence=1,
         status="observed",
         mode="act",
-        predicate="update_opportunity_stage",
-        factor_ids=(opportunity.id, stage.id),
+        predicate=request_predicate,
+        factor_ids=(opportunity_entity.id, opportunity.id, stage.id),
     )
     source = SemanticFrame(
         interaction_id=record.id,
         request_units=(request,),
-        factors=(opportunity, stage),
+        factors=(opportunity_entity, opportunity, stage),
         outcomes=(
             ObservedOutcome(
                 id="source:answer",
@@ -918,11 +930,15 @@ def grounded_enum_self_correction_frames(
         extractor_version="test",
     )
     candidate_opportunity = opportunity.model_copy(update={"id": "candidate:opportunity"})
+    candidate_opportunity_entity = opportunity_entity.model_copy(
+        update={"id": "candidate:opportunity-entity"}
+    )
     candidate_stage = stage.model_copy(update={"id": "candidate:stage"})
     candidate_request = request.model_copy(
         update={
             "id": "candidate:request",
             "factor_ids": (
+                candidate_opportunity_entity.id,
                 candidate_opportunity.id,
                 candidate_stage.id,
             ),
@@ -931,7 +947,7 @@ def grounded_enum_self_correction_frames(
     candidate = SemanticFrame(
         interaction_id=f"{record.id}:input.intent.self_correction",
         request_units=(candidate_request,),
-        factors=(candidate_opportunity, candidate_stage),
+        factors=(candidate_opportunity_entity, candidate_opportunity, candidate_stage),
         communication_acts=(
             CommunicationAct(
                 id="candidate:self-correction",
@@ -980,6 +996,25 @@ async def test_self_correction_accepts_enum_grounded_by_prior_observed_action() 
         "identifier_fields": ["opportunity_id"],
     }
     assert model.rendered_inputs == []
+
+
+async def test_self_correction_accepts_enum_with_coarse_request_predicate() -> None:
+    prior_action: dict[str, JsonValue] = {
+        "action": "salesforce.opportunity.read",
+        "opportunity_id": "006001",
+        "stage_name": "Negotiation/Review",
+    }
+    record, source, candidate_frame, rendered_output = grounded_enum_self_correction_frames(
+        prior_actions=[prior_action], request_predicate="update"
+    )
+    model = DeterministicSemanticModel({record.id: source}, candidate_frame, rendered_output)
+
+    result = await DatasetAugmentationEngine(model, model).augment(
+        (record,), operator_ids=("input.intent.self_correction",)
+    )
+
+    assert result.candidates[0].passed
+    assert result.candidates[0].augmented_input == rendered_output
 
 
 async def test_self_correction_recovers_exact_factor_association_from_request_evidence() -> None:
@@ -1133,6 +1168,18 @@ async def test_self_correction_skips_unsafe_or_ambiguous_prior_enum_actions(
             {
                 "action": "salesforce.account.update",
                 "account_id": "006001",
+                "stage_name": "Closed Won",
+            },
+        ),
+        (
+            {
+                "action": "salesforce.account.stage.read",
+                "id": "006001",
+                "stage_name": "Negotiation/Review",
+            },
+            {
+                "action": "salesforce.account.stage.update",
+                "id": "006001",
                 "stage_name": "Closed Won",
             },
         ),
