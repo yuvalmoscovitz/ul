@@ -2922,11 +2922,7 @@ async def test_live_augmentation_generates_or_safely_rejects_each_candidate() ->
     human_review_operators = {
         candidate.operator_id for candidate in result.candidates if candidate.human_review_required
     }
-    assert "input.tone.frustrated" in human_review_operators
-    assert human_review_operators <= {
-        "input.tone.frustrated",
-        "input.intent.self_correction",
-    }
+    assert human_review_operators <= {"input.intent.self_correction"}
 
 
 async def test_live_equivalence_qualification_across_ten_domains() -> None:

@@ -98,7 +98,6 @@ _DETERMINISTIC_OPERATORS = {
     "input.surface.punctuation_noise",
     "input.surface.grammar_error",
     "input.surface.disfluency_repeat",
-    "input.tone.frustrated",
 }
 
 

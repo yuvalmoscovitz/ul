@@ -164,7 +164,7 @@ def test_list_json_is_stable_sorted_and_complete() -> None:
     assert result.exit_code == 0
     payload = json.loads(result.output)
     assert payload["schema_version"] == "1.0.0"
-    assert len(payload["augmentations"]) == 21
+    assert len(payload["augmentations"]) == 20
     references = [(item["ref"]["id"], item["ref"]["version"]) for item in payload["augmentations"]]
     assert references == sorted(references)
     assert all(isinstance(item["cli_available"], bool) for item in payload["augmentations"])
@@ -191,7 +191,6 @@ def test_guide_and_surface_filter_make_the_library_navigable() -> None:
     assert "Tool and execution" in guide.output
     assert "Trust, policy, and authorization" in guide.output
     assert guide.output.count("@1.0.0 [implemented; not_qualified]") == 20
-    assert "input.tone.frustrated@1.1.0 [implemented; not_qualified]" in guide.output
 
     filtered = runner.invoke(
         app,
@@ -270,10 +269,10 @@ def test_show_reports_materializer_only_without_false_execution_claim() -> None:
 
 
 def test_show_reports_dataset_execution_requirements_without_requiring_invariants() -> None:
-    result = CliRunner().invoke(app, ["augmentations", "show", "input.tone.frustrated"])
+    result = CliRunner().invoke(app, ["augmentations", "show", "input.style.terse"])
 
     assert result.exit_code == 0
-    assert "ul dataset evaluate --operator input.tone.frustrated@1.1.0" in result.output
+    assert "ul dataset evaluate --operator input.style.terse@1.0.0" in result.output
     assert "test environment" in result.output
     assert "committed-state observation" in result.output
     assert "semantic model" in result.output
@@ -351,13 +350,13 @@ def test_plan_json_is_stable_complete_and_project_aware(
     payload = json.loads(first.output)
     assert payload["schema_version"] == "1.0.0"
     assert payload["project"] == {"status": "ready", "reason": None}
-    assert payload["summary"] == {"ready": 9, "blocked": 3, "manual": 9}
+    assert payload["summary"] == {"ready": 9, "blocked": 3, "manual": 8}
     assert payload["inspection"] == {
         "model_calls": 0,
         "environment_calls": 0,
         "network_requests": 0,
     }
-    assert len(payload["augmentations"]) == 21
+    assert len(payload["augmentations"]) == 20
     references = [(item["ref"]["id"], item["ref"]["version"]) for item in payload["augmentations"]]
     assert references == sorted(references)
     assert {item["status"] for item in payload["augmentations"]} <= {
@@ -375,11 +374,6 @@ def test_plan_json_is_stable_complete_and_project_aware(
         "writes": ["structured_input", "conversation"],
     }
     assert _reason_codes(rephrase) == {"requirements_satisfied"}
-
-    frustrated = _planned_augmentation(payload, "input.tone.frustrated")
-    assert frustrated["status"] == "manual"
-    assert frustrated["command"] == "ul run --operator input.tone.frustrated@1.1.0"
-    assert "human_review_required" in _reason_codes(frustrated)
 
     ambiguity = _planned_augmentation(payload, "conversation.ambiguity")
     assert ambiguity["status"] == "manual"
@@ -427,7 +421,7 @@ def test_plan_reads_declared_capabilities_without_constructing_external_clients(
 
     assert result.exit_code == 0, result.output
     payload = json.loads(result.output)
-    assert payload["summary"] == {"ready": 9, "blocked": 0, "manual": 12}
+    assert payload["summary"] == {"ready": 9, "blocked": 0, "manual": 11}
     timeout = _planned_augmentation(payload, "environment.tool.timeout_after_commit")
     assert timeout["status"] == "manual"
     assert timeout["command"] == (
@@ -474,8 +468,8 @@ def test_plan_without_a_project_still_classifies_every_catalog_item(
         "status": "missing",
         "reason": "No UL project found; run 'ul init' first.",
     }
-    assert payload["summary"] == {"ready": 0, "blocked": 14, "manual": 7}
-    assert len(payload["augmentations"]) == 21
+    assert payload["summary"] == {"ready": 0, "blocked": 13, "manual": 7}
+    assert len(payload["augmentations"]) == 20
     rephrase = _planned_augmentation(payload, "input.surface.rephrase")
     assert rephrase["status"] == "blocked"
     assert _reason_codes(rephrase) == {"project_not_configured"}
@@ -493,10 +487,9 @@ def test_plan_human_output_is_actionable_and_attests_zero_calls(
     result = runner.invoke(app, ["augmentations", "plan"], terminal_width=80)
 
     assert result.exit_code == 0, result.output
-    assert "Augmentation readiness: 9 ready, 3 blocked, 9 manual" in result.output
+    assert "Augmentation readiness: 9 ready, 3 blocked, 8 manual" in result.output
     assert "READY input.surface.rephrase@1.0.0" in result.output
     assert "Command: ul run --operator input.surface.rephrase@1.0.0" in result.output
-    assert "MANUAL input.tone.frustrated@1.1.0" in result.output
     assert "BLOCKED environment.tool.timeout_after_commit@1.0.0" in result.output
     assert (
         "Inspection only: 0 model calls, 0 environment calls, 0 network requests." in result.output

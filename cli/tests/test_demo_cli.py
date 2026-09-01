@@ -69,7 +69,7 @@ def test_demo_rejects_symlinked_private_data_directory(
         demo_runner._create_demo_artifact_directory()
 
 
-def test_demo_shows_three_generic_findings_without_credentials_and_retains_valid_evidence(
+def test_demo_shows_two_generic_findings_without_credentials_and_retains_valid_evidence(
     tmp_path: Path,
 ) -> None:
     working_directory = tmp_path / "read-only-working-directory"
@@ -106,19 +106,17 @@ def test_demo_shows_three_generic_findings_without_credentials_and_retains_valid
     assert completed_process.returncode == 0, completed_process.stdout + completed_process.stderr
     assert "UL evaluation report" in completed_process.stdout
     assert "2 customer requests" in completed_process.stdout
-    assert "3 augmentations" in completed_process.stdout
-    assert "3 repeatable findings" in completed_process.stdout
+    assert "2 augmentations" in completed_process.stdout
+    assert "2 repeatable findings" in completed_process.stdout
     assert completed_process.stdout.count("Baseline input") == 2
-    assert completed_process.stdout.count("Augmentation") == 3
+    assert completed_process.stdout.count("Augmentation") == 2
     assert "Typing errors" in completed_process.stdout
-    assert "Frustrated customer" in completed_process.stdout
     assert "Short message" in completed_process.stdout
     normalized_output = " ".join(completed_process.stdout.split())
     assert "subscription cancellation scheduled action is missing" in normalized_output
-    assert "cancellation timing changed from end of the billing period" in normalized_output
     assert "address type changed from delivery address to billing address" in normalized_output
-    assert normalized_output.count("Detected by UL's action comparison") == 3
-    assert normalized_output.count("Seen in 3/3 runs") == 3
+    assert normalized_output.count("Detected by UL's action comparison") == 2
+    assert normalized_output.count("Seen in 3/3 runs") == 2
     assert "no custom rules are used here" in normalized_output
     assert "ul probe interactions.jsonl --target agent:invoke" in normalized_output
     assert "--target https://agent.test/invoke" in normalized_output
@@ -142,9 +140,9 @@ def test_demo_shows_three_generic_findings_without_credentials_and_retains_valid
         json.loads(line) for line in evidence_path.read_text(encoding="utf-8").splitlines()
     ]
     assert len(evidence_records) == 2
-    assert [len(record["cases"]) for record in evidence_records] == [2, 1]
+    assert [len(record["cases"]) for record in evidence_records] == [1, 1]
     assert (
-        sum(len(case["findings"]) for record in evidence_records for case in record["cases"]) == 3
+        sum(len(case["findings"]) for record in evidence_records for case in record["cases"]) == 2
     )
     assert all(
         trial["execution_evidence"] is not None
@@ -154,12 +152,12 @@ def test_demo_shows_three_generic_findings_without_credentials_and_retains_valid
     )
     assert {
         record["execution_plan"]["dataset_planned_target_calls"] for record in evidence_records
-    } == {15}
+    } == {12}
 
     report_result = CliRunner().invoke(app, ["report", str(evidence_path)])
     assert report_result.exit_code == 1, report_result.output
     assert "UL run report" in report_result.output
-    assert "Findings: 3 total; 3 actionable" in report_result.output
+    assert "Findings: 2 total; 2 actionable" in report_result.output
     assert "ul dataset review" in report_result.output
 
 
@@ -175,7 +173,7 @@ def test_demo_report_uses_terminal_colors(tmp_path: Path, monkeypatch: pytest.Mo
 
     rendered = output.getvalue()
     assert "\x1b[" in rendered
-    assert "3 repeatable findings" in rendered
+    assert "2 repeatable findings" in rendered
 
 
 @pytest.mark.skipif(os.name == "nt", reason="symlink creation may require Windows privileges")

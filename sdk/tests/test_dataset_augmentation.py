@@ -618,20 +618,11 @@ async def test_builtin_operator_library_is_fixed_versioned_and_reviewable() -> N
         "input.surface.disfluency_repeat",
         "input.style.terse",
         "input.style.verbose",
-        "input.tone.frustrated",
         "input.intent.self_correction",
     )
-    assert {operator.id: operator.version for operator in operators}[
-        "input.tone.frustrated"
-    ] == "1.1.0"
-    assert all(
-        operator.version == "1.0.0"
-        for operator in operators
-        if operator.id != "input.tone.frustrated"
-    )
+    assert {operator.version for operator in operators} == {"1.0.0"}
     assert [operator.id for operator in operators if operator.human_review_required] == [
-        "input.tone.frustrated",
-        "input.intent.self_correction",
+        "input.intent.self_correction"
     ]
     assert [
         operator.id for operator in operators if operator.applicability_profile == "conditional"
@@ -640,20 +631,6 @@ async def test_builtin_operator_library_is_fixed_versioned_and_reviewable() -> N
         "input.surface.punctuation_noise",
         "input.intent.self_correction",
     ]
-    frustrated_instruction = next(
-        operator.instruction for operator in operators if operator.id == "input.tone.frustrated"
-    )
-    assert all(
-        forbidden_invention in frustrated_instruction
-        for forbidden_invention in (
-            "urgency",
-            "authority",
-            "prior history",
-            "threats",
-            "deadlines",
-            "facts",
-        )
-    )
 
 
 async def test_operator_change_contract_rejects_impossible_target_states() -> None:
@@ -1145,76 +1122,6 @@ async def test_behavior_operators_allow_only_their_communication_change(
     }
 
 
-async def test_frustrated_tone_is_deterministic_visible_and_verbatim() -> None:
-    record = source_record()
-    original_frame = source_frame(record)
-    candidate_frame = behavior_candidate_frame(record, "frustrated")
-    model = DeterministicSemanticModel({record.id: original_frame}, candidate_frame)
-
-    result = await DatasetAugmentationEngine(model, model).augment(
-        (record,), operator_ids=("input.tone.frustrated",)
-    )
-
-    candidate = result.candidates[0]
-    assert candidate.passed
-    assert candidate.augmented_input == f"Ugh, {record.raw_input}"
-    assert candidate.human_review_required
-    assert model.rendered_inputs == []
-    assert candidate.renderer_metadata["algorithm"] == "frustration_interjection_prefix"
-    assert candidate.renderer_metadata["transformation_prompts"] == []
-
-
-async def test_deterministic_frustrated_tone_does_not_require_model_added_label() -> None:
-    record = source_record().model_copy(
-        update={
-            "raw_input": (
-                "Process this week's vendor payments. Review the pending bills in the Payment "
-                "Queue spreadsheet and follow our payment authorization procedure. For approved "
-                "payments, email the vendor confirming the payment is being processed and update "
-                "the Status column to 'Processing'."
-            )
-        }
-    )
-    original_frame = source_frame(record)
-    candidate_frame = source_frame(record, identifier_prefix="candidate").model_copy(
-        update={"outcomes": ()}
-    )
-    model = DeterministicSemanticModel({record.id: original_frame}, candidate_frame)
-
-    result = await DatasetAugmentationEngine(model, model).augment(
-        (record,), operator_ids=("input.tone.frustrated",)
-    )
-
-    candidate = result.candidates[0]
-    assert candidate.passed
-    assert candidate.augmented_input == f"Ugh, {record.raw_input}"
-    assert candidate.renderer_metadata["algorithm"] == "frustration_interjection_prefix"
-
-
-async def test_deterministic_frustrated_tone_without_label_rejects_semantic_drift() -> None:
-    record = source_record()
-    original_frame = source_frame(record)
-    candidate_frame = source_frame(record, identifier_prefix="candidate").model_copy(
-        update={
-            "factors": (
-                original_frame.factors[0].model_copy(
-                    update={"id": "candidate:amount", "value": 999}
-                ),
-                original_frame.factors[1].model_copy(update={"id": "candidate:recipient"}),
-            ),
-            "outcomes": (),
-        }
-    )
-    model = DeterministicSemanticModel({record.id: original_frame}, candidate_frame)
-
-    result = await DatasetAugmentationEngine(model, model).augment(
-        (record,), operator_ids=("input.tone.frustrated",)
-    )
-
-    assert not result.candidates[0].passed
-    assert "factors differ from the expected frame" in result.candidates[0].failure_reasons
-
-
 async def test_behavior_operator_rejects_relations_touching_its_marker() -> None:
     record = source_record()
     original_frame = source_frame(record)
@@ -1248,7 +1155,7 @@ async def test_behavior_operator_rejects_relations_touching_its_marker() -> None
 async def test_behavior_operator_rejects_semantics_hidden_in_its_marker() -> None:
     record = source_record()
     original_frame = source_frame(record)
-    candidate_frame = behavior_candidate_frame(record, "frustrated")
+    candidate_frame = behavior_candidate_frame(record, "terse")
     unsafe_marker = candidate_frame.communication_acts[-1].model_copy(
         update={"attributes": {"urgency": "deadline_today"}}
     )
@@ -1263,11 +1170,11 @@ async def test_behavior_operator_rejects_semantics_hidden_in_its_marker() -> Non
     model = DeterministicSemanticModel(
         {record.id: original_frame},
         candidate_frame,
-        "ugh transfer 100 to alice then tell me the balance",
+        "transfer 100 alice then balance",
     )
 
     result = await DatasetAugmentationEngine(model, model).augment(
-        (record,), operator_ids=("input.tone.frustrated",)
+        (record,), operator_ids=("input.style.terse",)
     )
 
     assert not result.candidates[0].passed

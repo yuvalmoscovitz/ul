@@ -443,8 +443,6 @@ class DeterministicSemanticPipeline:
         allow_temporary_value: bool = False,
     ) -> RenderedUserInput:
         del allow_temporary_value
-        if "frustration" in instruction:
-            return RenderedUserInput(text=raw_input)
         return RenderedUserInput(
             text="Please transfer 100 to Alice.",
             metadata={"model": "deterministic", "seed": 7},
@@ -959,7 +957,7 @@ async def test_runner_rejects_precomputed_operator_or_source_mismatch_before_env
     with pytest.raises(ValueError, match="operators do not match"):
         await runner.run(
             source,
-            operator_ids=("input.tone.frustrated",),
+            operator_ids=("input.style.terse",),
             precomputed_augmentation=precomputed,
         )
     with pytest.raises(ValueError, match="does not match the source interaction"):
@@ -1165,40 +1163,6 @@ async def test_runner_executes_case_variation_with_trusted_equivalence_policy() 
     assert environment.raw_inputs == [source.raw_input, "transfer 100 to Alice."]
 
 
-async def test_runner_executes_deterministic_frustrated_request_without_tone_label() -> None:
-    source = _source()
-    raw_input = source.raw_input
-    source_frame = _frame(source.id, _source_outcomes())
-    candidate_frame = _frame(f"{source.id}:input.tone.frustrated", ())
-
-    class FrustratedTonePipeline(DeterministicSemanticPipeline):
-        async def deconstruct(
-            self,
-            record: InteractionRecord | UserInputRecord,
-            reference_frame: SemanticFrame | None = None,
-        ) -> SemanticFrame:
-            if record.id == source.id:
-                return source_frame
-            if not isinstance(record, InteractionRecord):
-                return candidate_frame.model_copy(update={"interaction_id": record.id})
-            return await super().deconstruct(record, reference_frame)
-
-    pipeline = FrustratedTonePipeline(source_frame.outcomes)
-    environment = DeterministicEnvironment()
-    runner = DatasetEvaluationRunner(
-        DatasetAugmentationEngine(pipeline, pipeline, pipeline), pipeline, environment
-    )
-
-    result = await runner.run(source, operator_ids=("input.tone.frustrated",))
-
-    case = result.cases[0]
-    assert case.candidate.passed
-    assert case.candidate.renderer_metadata["algorithm"] == "frustration_interjection_prefix"
-    assert case.target_output is not None
-    assert case.verdict == "no_divergence"
-    assert environment.raw_inputs == [raw_input, f"Ugh, {raw_input}"]
-
-
 async def test_redacted_runner_evidence_never_persists_environment_secrets(tmp_path: Path) -> None:
     private_directory = tmp_path / "private"
     private_directory.mkdir(mode=0o700)
@@ -1228,7 +1192,7 @@ async def test_redacted_runner_evidence_never_persists_environment_secrets(tmp_p
     source = boundary.protect_record(_source())
     assert isinstance(source, InteractionRecord)
 
-    result = await runner.run(source, operator_ids=("input.tone.frustrated",))
+    result = await runner.run(source, operator_ids=("input.surface.rephrase",))
     evidence = build_customer_evidence_record(
         result,
         repetitions=1,

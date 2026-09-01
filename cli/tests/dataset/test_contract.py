@@ -61,7 +61,6 @@ def test_help_explains_dataset_environment_and_operator_contract() -> None:
     operators = runner.invoke(root_app, ["dataset", "operators"])
     assert operators.exit_code == 0, operators.output
     assert "input.surface.disfluency_repeat" in operators.output
-    assert "input.tone.frustrated" in operators.output
     assert "input.intent.self_correction" in operators.output
 
 
@@ -87,7 +86,6 @@ def test_legacy_operator_list_delegates_to_catalog_and_keeps_existing_call_accou
         "input.surface.punctuation_noise@1.0.0:",
         "input.surface.rephrase@1.0.0:",
         "input.surface.typing_noise@1.0.0:",
-        "input.tone.frustrated@1.1.0:",
     )
 
     dataset = tmp_path / "interactions.jsonl"
