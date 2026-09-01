@@ -6,10 +6,10 @@ import inspect
 import ipaddress
 import json
 import math
-from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from copy import deepcopy
 from types import TracebackType
-from typing import Any, Literal, Protocol, Self, cast
+from typing import Literal, Protocol, Self, cast
 from urllib.parse import urlsplit, urlunsplit
 
 import httpx
@@ -43,6 +43,11 @@ from ul_core.models import ULModel
 from ul_core.prompts import PromptManager
 
 from ul.environment import validate_execution_evidence
+from ul.llm import (
+    LLMClient,
+    LLMClientConfig,
+    LLMRoleConfig,
+)
 
 _PROMPTS = PromptManager.instance()
 _MAXIMUM_CALIBRATION_EXAMPLES = 100
@@ -92,6 +97,12 @@ class OpenAICompatibleJudgeConfig(ULModel):
     api_key: SecretStr | None = Field(default=None, repr=False)
     allow_external_data_processing: Literal[True]
     data_policy: Literal["provider_default", "openrouter_zdr"] = "provider_default"
+    upstream_provider: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=100,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9._/-]*$",
+    )
     timeout_seconds: float = Field(default=60, gt=0, le=300)
     max_output_tokens: int = Field(default=1_024, ge=64, le=8_192)
     token_parameter: Literal["max_tokens", "max_completion_tokens"] = "max_completion_tokens"
@@ -100,6 +111,8 @@ class OpenAICompatibleJudgeConfig(ULModel):
     @model_validator(mode="after")
     def validate_and_normalize_base_url(self) -> Self:
         object.__setattr__(self, "base_url", _validated_judge_base_url(self.base_url))
+        if self.data_policy == "openrouter_zdr" and self.upstream_provider is None:
+            raise ValueError("openrouter_zdr requires upstream_provider")
         return self
 
     def evaluator_judge_version(self) -> EvaluatorJudgeVersion:
@@ -112,6 +125,38 @@ class OpenAICompatibleJudgeConfig(ULModel):
             prompt_version=prompt_version,
             model=self.model,
             configuration_sha256=_sha256_json(configuration),
+        )
+
+    def llm_client_config(self) -> LLMClientConfig:
+        provider_type = (
+            "openrouter" if self.data_policy == "openrouter_zdr" else "openai-compatible"
+        )
+        return LLMClientConfig(
+            provider_id=provider_type,
+            provider_type=provider_type,
+            base_url=self.base_url,
+            api_key=self.api_key,
+            api_key_environment_variable=(
+                "OPEN_ROUTER_API_KEY"
+                if provider_type == "openrouter"
+                else "UL_DATASET_OPENAI_API_KEY"
+            ),
+            api_key_required=provider_type == "openrouter",
+            live_calls=True,
+            allow_external_data_processing=self.allow_external_data_processing,
+            upstream_provider=self.upstream_provider,
+            roles=tuple(
+                LLMRoleConfig(
+                    role=role,
+                    model=self.model,
+                    max_output_tokens=self.max_output_tokens,
+                    token_parameter=self.token_parameter,
+                    reasoning_mode="omitted",
+                )
+                for role in ("deconstruct", "render", "equivalence", "materiality")
+            ),
+            timeout_seconds=self.timeout_seconds,
+            max_response_bytes=self.max_response_bytes,
         )
 
 
@@ -146,24 +191,6 @@ def _is_loopback_host(host: str) -> bool:
         return False
 
 
-class _JudgeMessage(BaseModel):
-    model_config = ConfigDict(extra="ignore", hide_input_in_errors=True)
-
-    content: str = Field(min_length=1)
-
-
-class _JudgeChoice(BaseModel):
-    model_config = ConfigDict(extra="ignore", hide_input_in_errors=True)
-
-    message: _JudgeMessage
-
-
-class _JudgeResponse(BaseModel):
-    model_config = ConfigDict(extra="ignore", hide_input_in_errors=True)
-
-    choices: tuple[_JudgeChoice, ...] = Field(min_length=1)
-
-
 class _JudgeOutput(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
@@ -176,21 +203,28 @@ class _JudgeOutput(BaseModel):
 class OpenAICompatibleEvaluatorJudge:
     def __init__(
         self,
-        config: OpenAICompatibleJudgeConfig,
+        config: OpenAICompatibleJudgeConfig | None = None,
         *,
         client: httpx.AsyncClient | None = None,
+        llm_client: LLMClient | None = None,
     ) -> None:
+        if (config is None) == (llm_client is None):
+            raise ValueError("provide exactly one judge config or shared LLM client")
+        if client is not None and llm_client is not None:
+            raise ValueError("an HTTP client cannot replace the shared LLM client transport")
         self.config = config
-        self._owns_client = client is None
-        self._client = client or httpx.AsyncClient(
-            timeout=config.timeout_seconds,
-            follow_redirects=False,
-            trust_env=False,
-        )
+        self._owns_llm_client = llm_client is None
+        if llm_client is not None:
+            self.llm_client = llm_client
+        else:
+            assert config is not None
+            self.llm_client = LLMClient(config.llm_client_config(), client=client)
 
     @property
     def version(self) -> EvaluatorJudgeVersion:
-        return self.config.evaluator_judge_version()
+        if self.config is not None:
+            return self.config.evaluator_judge_version()
+        return evaluator_judge_version_from_llm_config(self.llm_client.config)
 
     async def __aenter__(self) -> Self:
         return self
@@ -204,80 +238,39 @@ class OpenAICompatibleEvaluatorJudge:
         await self.aclose()
 
     async def aclose(self) -> None:
-        if self._owns_client:
-            await self._client.aclose()
+        if self._owns_llm_client:
+            await self.llm_client.aclose()
 
     async def evaluate(self, request: JudgeRequest) -> EvaluatorDecision:
-        request_body: dict[str, Any] = {
-            "model": self.config.model,
-            "messages": [
-                {
-                    "role": "system",
-                    "content": _PROMPTS.get_prompt("evaluation.judge"),
-                },
-                {
-                    "role": "user",
-                    "content": json.dumps(request.model_dump(mode="json"), sort_keys=True),
-                },
-            ],
-            "response_format": {
-                "type": "json_schema",
-                "json_schema": {
-                    "name": "ul_evaluator_decision",
-                    "strict": True,
-                    "schema": _JudgeOutput.model_json_schema(mode="validation"),
-                },
-            },
-            self.config.token_parameter: self.config.max_output_tokens,
-            "temperature": 0,
-        }
-        if self.config.data_policy == "openrouter_zdr":
-            request_body["provider"] = {
-                "data_collection": "deny",
-                "require_parameters": True,
-                "zdr": True,
-            }
-        headers = {"Content-Type": "application/json"}
-        if self.config.api_key is not None:
-            headers["Authorization"] = f"Bearer {self.config.api_key.get_secret_value()}"
-        endpoint = f"{self.config.base_url}/chat/completions"
-        async with asyncio.timeout(self.config.timeout_seconds):
-            async with self._client.stream(
-                "POST",
-                endpoint,
-                headers={**headers, "Accept-Encoding": "identity"},
-                json=request_body,
-                timeout=self.config.timeout_seconds,
-                follow_redirects=False,
-            ) as response:
-                if not _same_origin(response.url, httpx.URL(endpoint)):
-                    raise ValueError("judge response changed request origin")
-                if 300 <= response.status_code < 400:
-                    raise ValueError("judge redirects are not allowed")
-                response.raise_for_status()
-                if response.headers.get("content-encoding", "identity").strip().lower() != (
-                    "identity"
-                ):
-                    raise ValueError("judge response Content-Encoding is not allowed")
-                response_body = await _read_response(
-                    response,
-                    maximum_bytes=self.config.max_response_bytes,
-                )
-        parsed_response = _JudgeResponse.model_validate_json(response_body)
-        parsed_value = parsed_response.model_dump(mode="json")
-        if _contains_secret(parsed_value, self.config.base_url):
-            raise ValueError("judge response contains the configured endpoint URL")
-        if self.config.api_key is not None and _contains_secret(
-            parsed_value, self.config.api_key.get_secret_value()
-        ):
-            raise ValueError("judge response contains the configured credential")
-        output = _JudgeOutput.model_validate_json(parsed_response.choices[0].message.content)
+        completion = await self.llm_client.complete(
+            role="materiality",
+            seed=0,
+            top_p=None,
+            schema_name="ul_evaluator_decision",
+            schema=_JudgeOutput.model_json_schema(mode="validation"),
+            strict_schema=True,
+            system_prompt=_PROMPTS.get_prompt("evaluation.judge"),
+            user_payload=json.dumps(request.model_dump(mode="json"), sort_keys=True),
+        )
+        output = _JudgeOutput.model_validate_json(completion.choices[0].message.content)
         return EvaluatorDecision(
             score=output.score,
             label=output.label,
             explanation=output.explanation,
             evidence=_judge_evidence(request, output.citations),
         )
+
+
+def evaluator_judge_version_from_llm_config(
+    config: LLMClientConfig,
+) -> EvaluatorJudgeVersion:
+    prompt_version = _PROMPTS.get_template_info("evaluation.judge").version
+    role_config = config.role_config("materiality")
+    return EvaluatorJudgeVersion(
+        prompt_version=prompt_version,
+        model=role_config.model,
+        configuration_sha256=_sha256_json(config.evaluator_judge_configuration("materiality")),
+    )
 
 
 async def evaluate_case(
@@ -1012,40 +1005,6 @@ def _validate_judge_evidence(
         found, _ = _resolve_json_pointer(submitted_request, citation.json_pointer)
         if not found:
             raise ValueError("judge evidence pointer does not resolve")
-
-
-async def _read_response(response: httpx.Response, *, maximum_bytes: int) -> bytes:
-    chunks: list[bytes] = []
-    response_size = 0
-    response_chunks = (
-        _single_chunk(response.content) if response.is_stream_consumed else response.aiter_raw()
-    )
-    async for chunk in response_chunks:
-        response_size += len(chunk)
-        if response_size > maximum_bytes:
-            raise ValueError("judge response exceeds max_response_bytes")
-        chunks.append(chunk)
-    return b"".join(chunks)
-
-
-async def _single_chunk(content: bytes) -> AsyncIterator[bytes]:
-    yield content
-
-
-def _same_origin(left: httpx.URL, right: httpx.URL) -> bool:
-    return (left.scheme, left.host, left.port) == (right.scheme, right.host, right.port)
-
-
-def _contains_secret(value: object, secret: str) -> bool:
-    if isinstance(value, str):
-        return secret in value
-    if isinstance(value, dict):
-        mapping = cast(dict[object, object], value)
-        return any(_contains_secret(item, secret) for item in mapping.values())
-    if isinstance(value, list):
-        sequence = cast(list[object], value)
-        return any(_contains_secret(item, secret) for item in sequence)
-    return False
 
 
 def _json_type(value: JsonValue) -> str:

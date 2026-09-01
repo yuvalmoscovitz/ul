@@ -29,6 +29,7 @@ from ul.dataset_invariants import (
 from ul_cli import dataset_review
 from ul_cli.dataset.evidence import customer as customer_module
 from ul_cli.dataset.presentation import evaluation as presentation_module
+from ul_cli.invariant_findings import reproduced_invariant_rule_pairs
 from ul_cli.main import app as root_app
 from ul_cli.pattern_identity import ensure_project_pattern_identity_key
 from ul_core.dataset import ObservedOutcome
@@ -376,6 +377,189 @@ def test_equivalent_semantic_difference_does_not_suppress_invariant_violation(
         semantic_finding_id: "expected",
         invariant_finding_id: "needs_review",
     }
+
+
+def test_reproduced_invariant_surfaces_despite_full_response_instability(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    result = _evaluation_result(
+        "stable-rule-unstable-response",
+        has_review_finding=True,
+        material_variance_decision="operationally_equivalent",
+    )
+    baseline_trial = result.baseline.trial_set.trials[0]
+    variation_trial_set = result.cases[0].trial_set
+    assert variation_trial_set is not None
+    variation_trial = variation_trial_set.trials[0]
+    assert baseline_trial.target_output is not None
+    assert variation_trial.target_output is not None
+
+    baseline_trials = tuple(
+        baseline_trial.model_copy(
+            update={
+                "repetition": repetition,
+                "target_output": baseline_trial.target_output.model_copy(
+                    update={
+                        "raw_output": {
+                            "actual": 100,
+                            "expected": 100,
+                            "message": f"original-{repetition}",
+                        }
+                    }
+                ),
+                "observed_frame": baseline_trial.observed_frame.model_copy(
+                    update={
+                        "interaction_id": (
+                            f"stable-rule-unstable-response:current_baseline:round-{repetition}"
+                        )
+                    }
+                ),
+            }
+        )
+        for repetition in (1, 2)
+    )
+    variation_trials = tuple(
+        variation_trial.model_copy(
+            update={
+                "repetition": repetition,
+                "target_output": variation_trial.target_output.model_copy(
+                    update={
+                        "raw_output": {
+                            "actual": 200,
+                            "expected": 100,
+                            "message": f"variation-{repetition}",
+                        }
+                    }
+                ),
+                "observed_frame": variation_trial.observed_frame.model_copy(
+                    update={
+                        "interaction_id": (
+                            "stable-rule-unstable-response:input.surface.rephrase:"
+                            f"round-{repetition}"
+                        )
+                    }
+                ),
+            }
+        )
+        for repetition in (1, 2)
+    )
+    result = result.model_copy(
+        update={
+            "baseline": result.baseline.model_copy(
+                update={
+                    "verdict": "inconclusive",
+                    "trial_set": result.baseline.trial_set.model_copy(
+                        update={
+                            "requested_repetitions": 2,
+                            "stability": "unstable",
+                            "trials": baseline_trials,
+                            "outcome_groups": tuple(
+                                DatasetEvaluationOutcomeGroup(
+                                    repetitions=(repetition,), representative_effects=()
+                                )
+                                for repetition in (1, 2)
+                            ),
+                        }
+                    ),
+                }
+            ),
+            "cases": (
+                result.cases[0].model_copy(
+                    update={
+                        "verdict": "divergence_needs_review",
+                        "findings": (),
+                        "material_variance": None,
+                        "trial_set": variation_trial_set.model_copy(
+                            update={
+                                "requested_repetitions": 2,
+                                "stability": "unstable",
+                                "trials": variation_trials,
+                                "outcome_groups": tuple(
+                                    DatasetEvaluationOutcomeGroup(
+                                        repetitions=(repetition,), representative_effects=()
+                                    )
+                                    for repetition in (1, 2)
+                                ),
+                            }
+                        ),
+                    }
+                ),
+            ),
+        }
+    )
+    invariant_suite = DatasetInvariantSuite(
+        schema_version="1.0.0",
+        observation_source="target_output",
+        observation_authority="agent_response",
+        rules=(
+            JsonValuesEqualInvariant(
+                type="json_values_equal",
+                id="values-remain-equal",
+                version="1.0.0",
+                description="The committed values must remain equal.",
+                severity="high",
+                left_pointer="/actual",
+                right_pointer="/expected",
+            ),
+        ),
+    )
+    invariant_evaluation = evaluate_dataset_invariants(result, invariant_suite)
+    assert tuple(trial.status for trial in invariant_evaluation.baseline.rules[0].trials) == (
+        "satisfied",
+        "satisfied",
+    )
+    assert tuple(trial.status for trial in invariant_evaluation.variations[0].rules[0].trials) == (
+        "violated",
+        "violated",
+    )
+    assert reproduced_invariant_rule_pairs(
+        invariant_evaluation, result.cases[0].candidate.operator_id
+    )
+    record = customer_module.build_customer_evidence_record(
+        result,
+        repetitions=2,
+        max_environment_api_calls=4,
+        planned_target_calls=4,
+        invariant_evaluation=invariant_evaluation,
+    )
+    dataset_review._EvidenceRecord.model_validate_json(json.dumps(record))
+    evidence_path = tmp_path / "stable-rule-unstable-response.jsonl"
+    evidence_path.write_text(json.dumps(record) + "\n", encoding="utf-8")
+    _create_pattern_identity_key(tmp_path)
+
+    monkeypatch.setattr(presentation_module.console, "width", 240)
+    presentation_module.print_dataset_results(
+        (result,),
+        evidence_path,
+        invariant_evaluations=(invariant_evaluation,),
+        show_report_guidance=False,
+    )
+    terminal_output = " ".join(capsys.readouterr().out.split())
+    management_report = runner.invoke(root_app, ["dataset", "report", str(evidence_path)])
+    unified_report = runner.invoke(root_app, ["report", str(evidence_path), "--json"])
+    management_output = " ".join(management_report.output.split())
+
+    assert "reproduced invariant: values-remain-equal" in terminal_output
+    assert "Reproduced invariant finding:" in terminal_output
+    assert "original satisfied=2/2; variation violated=2/2" in terminal_output
+    assert "whole-task correctness not established" in terminal_output
+    assert management_report.exit_code == 0, management_report.output
+    assert "Invariant repetitions: original satisfied=2/2; variation violated=2/2" in (
+        management_output
+    )
+    assert "Full-response stability: original=unstable" in management_output
+    assert "whole-task correctness not established" in management_output
+    assert unified_report.exit_code == 1, unified_report.output
+    invariant_summary = next(
+        finding
+        for finding in json.loads(unified_report.output)["findings"]
+        if finding["kind"] == "customer_invariant_violation" and finding["finding_id"] is not None
+    )
+    assert invariant_summary["requested_repetitions"] == 2
+    assert invariant_summary["violated_repetitions"] == 2
+    assert invariant_summary["stability"] == "stable"
 
 
 def test_dataset_report_treats_unstable_behavior_as_actionable(tmp_path: Path) -> None:

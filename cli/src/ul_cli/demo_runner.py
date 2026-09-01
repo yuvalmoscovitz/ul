@@ -28,7 +28,6 @@ console = Console()
 
 _AUGMENTATION_NAMES = {
     "input.surface.typing_noise": "Typing errors",
-    "input.tone.frustrated": "Frustrated customer",
     "input.style.terse": "Short message",
 }
 

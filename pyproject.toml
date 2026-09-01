@@ -35,6 +35,9 @@ dev = [
 
 [tool.pytest.ini_options]
 addopts = "-ra"
+markers = [
+    "live_llm: calls a configured external LLM and requires explicit live opt-in",
+]
 testpaths = [
     "core/tests",
     "sdk/tests",

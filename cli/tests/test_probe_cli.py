@@ -9,6 +9,7 @@ import re
 import stat
 import sys
 import threading
+import venv
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from types import SimpleNamespace
@@ -16,7 +17,7 @@ from typing import Any, cast
 
 import pytest
 import typer
-from dataset._factories import _evaluator_preflight
+from dataset._factories import _evaluator_preflight, _run_config, _settings
 from typer.testing import CliRunner
 from ul import (
     DatasetEvaluationResult,
@@ -26,6 +27,8 @@ from ul import (
     load_json_http_environment_config,
     load_local_target_config,
 )
+from ul.evaluators import evaluator_judge_version_from_llm_config
+from ul.llm import LLMClient, llm_client_config_from_dataset_settings
 from ul_cli import dataset_review
 from ul_cli import probe as probe_module
 from ul_cli import progress_action as progress_action_module
@@ -106,11 +109,16 @@ def _write_callable(path: Path, *, failing: bool = False) -> None:
 
 
 class _CleanRoomSemanticModel:
+    def __init__(self, semantic_settings: Any | None = None) -> None:
+        self.llm_client = LLMClient(
+            llm_client_config_from_dataset_settings(semantic_settings or _settings())
+        )
+
     async def __aenter__(self) -> _CleanRoomSemanticModel:
         return self
 
     async def __aexit__(self, *args: object) -> None:
-        return None
+        await self.llm_client.aclose()
 
     def reuse_preflight(self, result: object) -> None:
         del result
@@ -375,8 +383,8 @@ class _UnknownOutcomeSemanticModel(_ResponseOnlySemanticModel):
 
 
 class _MaterialResponseJudge:
-    def __init__(self, config: object) -> None:
-        self.version = config.evaluator_judge_version()
+    def __init__(self, *, llm_client: LLMClient) -> None:
+        self.version = evaluator_judge_version_from_llm_config(llm_client.config)
 
     async def __aenter__(self) -> _MaterialResponseJudge:
         return self
@@ -517,6 +525,37 @@ def test_callable_smoke_proves_target_call_and_decline_makes_zero_semantic_calls
     assert "repetitions" not in saved
 
 
+def test_callable_missing_dependency_reports_selected_interpreter_remediation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (tmp_path / "customer_agent.py").write_text(
+        "import dependency_not_installed_for_ul_test\n\ndef run(value):\n    return value\n",
+        encoding="utf-8",
+    )
+    dataset = _write_dataset(tmp_path)
+    monkeypatch.chdir(tmp_path)
+
+    result = runner.invoke(
+        app,
+        [
+            "probe",
+            str(dataset),
+            "--target",
+            "customer_agent:run",
+            "--target-interpreter",
+            sys.executable,
+        ],
+        input="y\n",
+    )
+
+    assert result.exit_code == 2
+    assert "Reason: PROBE_TARGET_LOAD_FAILED" in result.output
+    assert "could not load the target callable" in result.output
+    assert "install the callable's dependencies" in result.output
+    assert "Target safe to reuse: yes" in result.output
+
+
 def test_callable_smoke_receives_structured_input_without_printing_private_metadata(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -626,6 +665,11 @@ def test_probe_resume_action_preserves_direct_local_target_options(
 ) -> None:
     _write_callable(tmp_path)
     dataset = _write_dataset(tmp_path)
+    virtualenv = tmp_path / ".venv"
+    venv.EnvBuilder(with_pip=False, symlinks=os.name != "nt").create(virtualenv)
+    interpreter = (
+        virtualenv / "Scripts" / "python.exe" if os.name == "nt" else virtualenv / "bin" / "python"
+    )
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("CUSTOMER_AGENT_TOKEN", "private-agent-key")
     created_runtimes: list[object] = []
@@ -648,7 +692,7 @@ def test_probe_resume_action_preserves_direct_local_target_options(
             "--target-working-directory",
             str(tmp_path),
             "--target-interpreter",
-            sys.executable,
+            str(interpreter),
             "--target-environment-variable",
             "CUSTOMER_AGENT_TOKEN",
         ],
@@ -661,9 +705,7 @@ def test_probe_resume_action_preserves_direct_local_target_options(
     resume_argv = progress_action_module._read_progress_action(public_resume_argv[-1]).argv
     assert resume_argv[resume_argv.index("--target") + 1] == "customer_agent:run"
     assert resume_argv[resume_argv.index("--target-working-directory") + 1] == str(tmp_path)
-    assert resume_argv[resume_argv.index("--target-interpreter") + 1] == str(
-        Path(sys.executable).resolve()
-    )
+    assert resume_argv[resume_argv.index("--target-interpreter") + 1] == str(interpreter.absolute())
     assert "CUSTOMER_AGENT_TOKEN" in resume_argv
 
 
@@ -869,7 +911,7 @@ def test_structured_http_target_runs_real_smoke_and_campaign(
     monkeypatch.setattr(
         campaign_runner_module,
         "create_semantic_model_deconstructor",
-        lambda _settings: _CleanRoomSemanticModel(),
+        lambda semantic_settings: _CleanRoomSemanticModel(semantic_settings),
     )
     arguments = [
         "probe",
@@ -1545,8 +1587,7 @@ def test_campaign_receipt_binds_models_bounds_and_command_wide_smoke_wall(
     plan = probe_module.create_dataset_campaign_plan(
         records=records,
         selected_operator_ids=operator_ids,
-        repetitions=1,
-        target_calls_per_execution=1,
+        run_config=_run_config(),
         settings=settings,
     )
     original = probe_module._campaign_confirmation(plan, settings, resolved, case_limit=10)
@@ -1559,11 +1600,19 @@ def test_campaign_receipt_binds_models_bounds_and_command_wide_smoke_wall(
 
     assert original.semantic_settings_sha256 != changed.semantic_settings_sha256
     assert probe_module._model_sha256(original) != probe_module._model_sha256(changed)
+    changed_provider = probe_module._campaign_confirmation(
+        plan,
+        settings.model_copy(update={"upstream_provider": "different-provider"}),
+        resolved,
+        case_limit=10,
+    )
+    assert original.semantic_settings_sha256 != changed_provider.semantic_settings_sha256
+    assert original.data_policy["upstream_provider"] == settings.upstream_provider
+    assert changed_provider.data_policy["upstream_provider"] == "different-provider"
     different_operator_plan = probe_module.create_dataset_campaign_plan(
         records=records,
         selected_operator_ids=probe_module.validate_operator_ids(["input.surface.case_variation"]),
-        repetitions=1,
-        target_calls_per_execution=1,
+        run_config=_run_config(),
         settings=settings,
     )
     different_operator_confirmation = probe_module._campaign_confirmation(
@@ -1904,7 +1953,7 @@ def test_authenticated_direct_http_pause_resume_preserves_mapping_options(
     monkeypatch.setattr(
         campaign_runner_module,
         "create_semantic_model_deconstructor",
-        lambda _settings: _CleanRoomSemanticModel(),
+        lambda semantic_settings: _CleanRoomSemanticModel(semantic_settings),
     )
     endpoint = f"http://127.0.0.1:{server.server_port}/invoke"
     try:
@@ -2207,7 +2256,7 @@ def test_paused_probe_action_resumes_after_terminal_trial_without_replay(
     monkeypatch.setattr(
         campaign_runner_module,
         "create_semantic_model_deconstructor",
-        lambda _settings: _CleanRoomSemanticModel(),
+        lambda semantic_settings: _CleanRoomSemanticModel(semantic_settings),
     )
     result = runner.invoke(
         app,
@@ -2392,6 +2441,11 @@ def test_stronger_run_preserves_canonical_local_target_configuration(
     dataset = _write_dataset(tmp_path)
     output = tmp_path / ".ul" / "runs" / "evidence.jsonl"
     config_path = tmp_path / "target.json"
+    virtualenv = tmp_path / ".venv"
+    venv.EnvBuilder(with_pip=False, symlinks=os.name != "nt").create(virtualenv)
+    interpreter = (
+        virtualenv / "Scripts" / "python.exe" if os.name == "nt" else virtualenv / "bin" / "python"
+    )
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("CUSTOMER_AGENT_TOKEN", "private-agent-key")
     monkeypatch.setenv("UL_LIVE", "true")
@@ -2423,7 +2477,7 @@ def test_stronger_run_preserves_canonical_local_target_configuration(
         "--target-working-directory",
         str(tmp_path),
         "--target-interpreter",
-        sys.executable,
+        str(interpreter),
         "--target-environment-variable",
         "CUSTOMER_AGENT_TOKEN",
         "--output",
@@ -2445,7 +2499,7 @@ def test_stronger_run_preserves_canonical_local_target_configuration(
     else:
         assert "--target customer_agent:run" in stronger_command
         assert f"--target-working-directory {tmp_path}" in stronger_command
-        assert f"--target-interpreter {Path(sys.executable).resolve()}" in stronger_command
+        assert f"--target-interpreter {interpreter.absolute()}" in stronger_command
         assert "--target-environment-variable CUSTOMER_AGENT_TOKEN" in stronger_command
     assert "private-agent-key" not in stronger_command
 
@@ -2609,8 +2663,11 @@ def test_public_documentation_flow_runs_real_callable_campaign_and_report(
     evidence = evidence_lines[1]
     assert evidence["execution_plan"]["repetitions"] == 2
     assert evidence["execution_plan"]["dataset_planned_target_calls"] == 4
-    assert evidence["run_context"]["semantic_settings"]["provider"] == "openrouter"
-    assert evidence["run_context"]["semantic_settings"]["model"]
+    assert evidence["run_context"]["semantic_settings"]["llm_client"]["provider_id"] == (
+        "openrouter"
+    )
+    llm_roles = evidence["run_context"]["semantic_settings"]["llm_client"]["roles"]
+    assert next(role["model"] for role in llm_roles if role["role"] == "deconstruct")
     assert evidence["run_context"]["target"]["kind"] == "probe_target"
     assert evidence["run_context"]["target"]["receipt"]["confirmation_sha256"]
     assert (
@@ -2732,12 +2789,11 @@ def test_public_probe_runs_answer_only_callable_through_real_worker_and_reports_
         del settings
         return _evaluator_preflight()
 
-    semantic_model = _ResponseOnlySemanticModel()
     monkeypatch.setattr(probe_module, "preflight_evaluator", successful_preflight)
     monkeypatch.setattr(
         campaign_runner_module,
         "create_semantic_model_deconstructor",
-        lambda _settings: semantic_model,
+        lambda semantic_settings: _ResponseOnlySemanticModel(semantic_settings),
     )
 
     result = runner.invoke(
@@ -2809,7 +2865,7 @@ def test_public_probe_runs_raw_text_callable_through_real_worker_without_leaking
     monkeypatch.setattr(
         campaign_runner_module,
         "create_semantic_model_deconstructor",
-        lambda _settings: _ResponseOnlySemanticModel(),
+        lambda semantic_settings: _ResponseOnlySemanticModel(semantic_settings),
     )
 
     result = runner.invoke(
@@ -2916,7 +2972,7 @@ def test_public_probe_maps_invalid_recorded_projection_before_campaign_target_in
     monkeypatch.setattr(
         campaign_runner_module,
         "create_semantic_model_deconstructor",
-        lambda _settings: _CleanRoomSemanticModel(),
+        lambda semantic_settings: _CleanRoomSemanticModel(semantic_settings),
     )
 
     result = runner.invoke(
@@ -3050,8 +3106,7 @@ def _probe_review_and_save_response_regression(
         return _evaluator_preflight()
 
     def clean_room_model(settings: object) -> _RegressionSemanticModel:
-        del settings
-        return _RegressionSemanticModel()
+        return _RegressionSemanticModel(settings)
 
     monkeypatch.setattr(probe_module, "preflight_evaluator", clean_room_preflight)
     monkeypatch.setattr(

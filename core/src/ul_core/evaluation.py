@@ -42,6 +42,7 @@ EnvironmentLifecycleFailureCode = Literal[
     "pool_timeout",
     "transport_protocol",
     "transport_failed",
+    "target_load_failed",
     "environment_state_uncertain",
     "environment_lifecycle_error",
     "environment_cleanup_error",

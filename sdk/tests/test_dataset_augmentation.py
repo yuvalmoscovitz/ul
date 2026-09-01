@@ -363,6 +363,28 @@ async def test_engine_rephrases_and_independently_validates_full_semantics() -> 
     assert not isinstance(model.deconstructed_records[1], InteractionRecord)
 
 
+async def test_engine_replaces_em_dashes_in_llm_generated_input() -> None:
+    record = source_record()
+    original_frame = source_frame(record)
+    candidate_frame = source_frame(record, identifier_prefix="candidate").model_copy(
+        update={"outcomes": ()}
+    )
+    model = DeterministicSemanticModel(
+        {record.id: original_frame},
+        candidate_frame,
+        "Please transfer 100 to Alice—then report my balance.",
+    )
+
+    result = await DatasetAugmentationEngine(model, model).augment((record,))
+
+    candidate = result.candidates[0]
+    assert candidate.passed
+    assert candidate.augmented_input == "Please transfer 100 to Alice then report my balance."
+    reparsed_record = model.deconstructed_records[1]
+    assert isinstance(reparsed_record, UserInputRecord)
+    assert reparsed_record.raw_input == candidate.augmented_input
+
+
 @pytest.mark.parametrize("drift", ["request_order", "relation", "communication", "factor"])
 async def test_engine_rejects_each_kind_of_semantic_drift(drift: str) -> None:
     record = source_record()
@@ -618,7 +640,8 @@ async def test_builtin_operator_library_is_fixed_versioned_and_reviewable() -> N
         "input.surface.disfluency_repeat",
         "input.style.terse",
         "input.style.verbose",
-        "input.tone.frustrated",
+        "input.tone.angry",
+        "input.tone.argumentative",
         "input.intent.self_correction",
     )
     assert {operator.id: operator.version for operator in operators}[
@@ -627,9 +650,26 @@ async def test_builtin_operator_library_is_fixed_versioned_and_reviewable() -> N
     assert {
         operator.version for operator in operators if operator.id != "input.intent.self_correction"
     } == {"1.0.0"}
-    assert [operator.id for operator in operators if operator.human_review_required] == [
-        "input.tone.frustrated",
+    assert [operator.id for operator in operators if operator.generation_mechanism == "llm"] == [
+        "input.surface.rephrase",
+        "input.surface.grammar_error",
+        "input.surface.fragmented_syntax",
+        "input.style.terse",
+        "input.style.verbose",
+        "input.tone.angry",
+        "input.tone.argumentative",
+    ]
+    assert [
+        operator.id for operator in operators if operator.generation_mechanism == "deterministic"
+    ] == [
+        "input.surface.typing_noise",
+        "input.surface.case_variation",
+        "input.surface.punctuation_noise",
+        "input.surface.disfluency_repeat",
         "input.intent.self_correction",
+    ]
+    assert [operator.id for operator in operators if operator.human_review_required] == [
+        "input.intent.self_correction"
     ]
     assert [
         operator.id for operator in operators if operator.applicability_profile == "conditional"
@@ -638,20 +678,6 @@ async def test_builtin_operator_library_is_fixed_versioned_and_reviewable() -> N
         "input.surface.punctuation_noise",
         "input.intent.self_correction",
     ]
-    frustrated_instruction = next(
-        operator.instruction for operator in operators if operator.id == "input.tone.frustrated"
-    )
-    assert all(
-        forbidden_invention in frustrated_instruction
-        for forbidden_invention in (
-            "urgency",
-            "authority",
-            "prior history",
-            "threats",
-            "deadlines",
-            "facts",
-        )
-    )
 
 
 async def test_operator_change_contract_rejects_impossible_target_states() -> None:
@@ -659,6 +685,7 @@ async def test_operator_change_contract_rejects_impossible_target_states() -> No
         DatasetAugmentationOperator(
             id="input.surface.rephrase",
             instruction="Rephrase naturally.",
+            generation_mechanism="llm",
             allowed_change="surface_form_only",
             target_communication_kind="rephrase",
         )
@@ -666,12 +693,14 @@ async def test_operator_change_contract_rejects_impossible_target_states() -> No
         DatasetAugmentationOperator(
             id="input.style.terse",
             instruction="Make it terse.",
+            generation_mechanism="llm",
             allowed_change="declared_communication_form",
         )
     with pytest.raises(ValueError, match="target communication kind"):
         DatasetAugmentationOperator(
             id="input.intent.self_correction",
             instruction="Add a correction.",
+            generation_mechanism="llm",
             allowed_change="structured_self_correction",
         )
 
@@ -1607,6 +1636,12 @@ async def test_self_correction_skips_ineligible_sources(ineligible_reason: str) 
     ("operator_id", "target_kind", "realistic_output", "review_required"),
     [
         (
+            "input.surface.grammar_error",
+            "fragmented_syntax",
+            "Transfer 100 to Alice, then tells me the balance.",
+            False,
+        ),
+        (
             "input.surface.fragmented_syntax",
             "fragmented_syntax",
             "transfer 100 to alice. then balance",
@@ -1617,6 +1652,18 @@ async def test_self_correction_skips_ineligible_sources(ineligible_reason: str) 
             "input.style.verbose",
             "verbose",
             "hey could you transfer 100 to alice and then please let me know the balance",
+            False,
+        ),
+        (
+            "input.tone.angry",
+            "angry",
+            "This is ridiculous—transfer 100 to Alice, then tell me the balance.",
+            False,
+        ),
+        (
+            "input.tone.argumentative",
+            "argumentative",
+            "There is no reason to debate this: transfer 100 to Alice, then tell me the balance.",
             False,
         ),
     ],
@@ -1633,8 +1680,19 @@ async def test_behavior_operators_allow_only_their_communication_change(
     model = DeterministicSemanticModel(
         {record.id: original_frame}, candidate_frame, realistic_output
     )
+    verifier = (
+        DeterministicEquivalenceVerifier(
+            SemanticEquivalenceAssessment(
+                verdict="equivalent",
+                explanation="The tone is moderate and contains no forbidden communication.",
+                verifier_version="test/1",
+            )
+        )
+        if operator_id in {"input.tone.angry", "input.tone.argumentative"}
+        else None
+    )
 
-    result = await DatasetAugmentationEngine(model, model).augment(
+    result = await DatasetAugmentationEngine(model, model, verifier).augment(
         (record,), operator_ids=(operator_id,)
     )
 
@@ -1644,31 +1702,98 @@ async def test_behavior_operators_allow_only_their_communication_change(
     assert candidate.operator_version == "1.0.0"
     assert candidate.allowed_change == "declared_communication_form"
     assert candidate.human_review_required is review_required
-    assert candidate.augmented_input == realistic_output
+    assert candidate.augmented_input == realistic_output.replace("—", " ")
     assert candidate.renderer_metadata == {
         "model": "test/model",
         "seed": 42,
         "transformation_prompts": prompt_provenance(f"augmentation.{operator_id}"),
     }
+    if operator_id == "input.tone.angry":
+        assert "merely adding words" in model.rendered_instructions[0]
+    if operator_id == "input.tone.argumentative":
+        assert "merely making the request emphatic" in model.rendered_instructions[0]
+    if verifier is not None:
+        assert verifier.allowed_surface_changes == [f"moderate_{target_kind}_tone"]
 
 
-async def test_frustrated_tone_is_deterministic_visible_and_verbatim() -> None:
+async def test_tone_operator_fails_closed_without_safety_verifier() -> None:
     record = source_record()
     original_frame = source_frame(record)
-    candidate_frame = behavior_candidate_frame(record, "frustrated")
-    model = DeterministicSemanticModel({record.id: original_frame}, candidate_frame)
+    candidate_frame = behavior_candidate_frame(record, "angry")
+    model = DeterministicSemanticModel(
+        {record.id: original_frame},
+        candidate_frame,
+        "This is ridiculous—transfer 100 to Alice, then tell me the balance.",
+    )
 
     result = await DatasetAugmentationEngine(model, model).augment(
-        (record,), operator_ids=("input.tone.frustrated",)
+        (record,), operator_ids=("input.tone.angry",)
+    )
+
+    assert result.candidates[0].passed is False
+    assert result.candidates[0].failure_reasons == ("tone safety verifier is unavailable",)
+
+
+@pytest.mark.parametrize(
+    ("operator_id", "target_kind", "rendered_output", "forbidden_quote"),
+    [
+        (
+            "input.tone.angry",
+            "angry",
+            "You fucking idiot—transfer 100 to Alice, then tell me the balance.",
+            "fucking idiot",
+        ),
+        (
+            "input.tone.angry",
+            "angry",
+            "Transfer 100 to Alice or I will hurt you, then tell me the balance.",
+            "I will hurt you",
+        ),
+        (
+            "input.tone.argumentative",
+            "argumentative",
+            "There is no debate, you moron: transfer 100 to Alice, then tell me the balance.",
+            "you moron",
+        ),
+    ],
+)
+async def test_tone_operator_rejects_forbidden_hostility(
+    operator_id: str,
+    target_kind: str,
+    rendered_output: str,
+    forbidden_quote: str,
+) -> None:
+    record = source_record()
+    original_frame = source_frame(record)
+    candidate_frame = behavior_candidate_frame(record, target_kind)
+    model = DeterministicSemanticModel(
+        {record.id: original_frame}, candidate_frame, rendered_output
+    )
+    assessment = SemanticEquivalenceAssessment(
+        verdict="different",
+        explanation="The candidate exceeds the moderate tone boundary.",
+        deltas=(
+            SemanticDelta(
+                category="communication",
+                operation="added",
+                candidate_quote=forbidden_quote,
+                description="Forbidden hostile communication was added.",
+            ),
+        ),
+        verifier_version="test/1",
+    )
+    verifier = DeterministicEquivalenceVerifier(assessment)
+
+    result = await DatasetAugmentationEngine(model, model, verifier).augment(
+        (record,), operator_ids=(operator_id,)
     )
 
     candidate = result.candidates[0]
-    assert candidate.passed
-    assert candidate.augmented_input == f"Ugh, {record.raw_input}"
-    assert candidate.human_review_required
-    assert model.rendered_inputs == []
-    assert candidate.renderer_metadata["algorithm"] == "frustration_interjection_prefix"
-    assert candidate.renderer_metadata["transformation_prompts"] == []
+    assert candidate.passed is False
+    assert candidate.failure_reasons == (
+        "tone safety check found a forbidden communication change",
+    )
+    assert candidate.semantic_equivalence_assessment == assessment
 
 
 async def test_behavior_operator_rejects_relations_touching_its_marker() -> None:
@@ -1704,7 +1829,7 @@ async def test_behavior_operator_rejects_relations_touching_its_marker() -> None
 async def test_behavior_operator_rejects_semantics_hidden_in_its_marker() -> None:
     record = source_record()
     original_frame = source_frame(record)
-    candidate_frame = behavior_candidate_frame(record, "frustrated")
+    candidate_frame = behavior_candidate_frame(record, "terse")
     unsafe_marker = candidate_frame.communication_acts[-1].model_copy(
         update={"attributes": {"urgency": "deadline_today"}}
     )
@@ -1719,11 +1844,11 @@ async def test_behavior_operator_rejects_semantics_hidden_in_its_marker() -> Non
     model = DeterministicSemanticModel(
         {record.id: original_frame},
         candidate_frame,
-        "ugh transfer 100 to alice then tell me the balance",
+        "transfer 100 alice then balance",
     )
 
     result = await DatasetAugmentationEngine(model, model).augment(
-        (record,), operator_ids=("input.tone.frustrated",)
+        (record,), operator_ids=("input.style.terse",)
     )
 
     assert not result.candidates[0].passed
@@ -1873,12 +1998,6 @@ async def test_typing_noise_is_deterministic_protects_factors_and_needs_no_model
             "typing_noise",
             "Transfer 100 to Alice,, then tell me the balance.",
             "single_safe_punctuation_duplication",
-        ),
-        (
-            "input.surface.grammar_error",
-            "fragmented_syntax",
-            "Me need you to: Transfer 100 to Alice, then tell me the balance.",
-            "pronoun_case_error_request_prefix",
         ),
     ),
 )
@@ -2437,6 +2556,16 @@ async def test_measurable_behavior_does_not_depend_on_a_model_marker(
             "please could you now transfer the amount of 100 to Alice and then when that is done "
             "could you also please tell me exactly what the current balance is for the account",
             "rendered input is not between 1.5 and 2 times the source length",
+        ),
+        (
+            "input.tone.angry",
+            "Please transfer 100 to Alice and then report the balance",
+            "reparsed frame does not contain required communication kind angry",
+        ),
+        (
+            "input.tone.argumentative",
+            "Please transfer 100 to Alice and then report the balance",
+            "reparsed frame does not contain required communication kind argumentative",
         ),
     ],
 )

@@ -11,7 +11,7 @@ from threading import Thread
 from typing import Annotated, TextIO, cast
 
 import typer
-from ul import load_dataset_semantic_settings
+from ul import OpenRouterDatasetSettings, load_dataset_semantic_settings
 
 from examples.quickstart.defective_agent import create_server
 
@@ -55,6 +55,8 @@ def _subprocess_environment(*, dry_run: bool) -> dict[str, str]:
         "UL_DATASET_EQUIVALENCE_MODEL": settings.equivalence_model,
         "UL_DATASET_MATERIALITY_MODEL": settings.materiality_model,
     }
+    if isinstance(settings, OpenRouterDatasetSettings):
+        environment["UL_DATASET_OPENROUTER_PROVIDER"] = settings.upstream_provider
     if settings.semantic_provider_type != "openrouter":
         environment.update(
             {

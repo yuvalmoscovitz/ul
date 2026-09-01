@@ -1,17 +1,15 @@
 from __future__ import annotations
 
-from typing import Literal
-
 from pydantic import JsonValue
 from ul import (
     DatasetSemanticSettings,
     InteractionRecord,
-    OpenAICompatibleJudgeConfig,
-    material_variance_evaluator_version_from_config,
     semantic_deconstructor_identity,
 )
 from ul.dataset_invariants import DatasetInvariantSuite
 from ul.http_environment import JsonHttpTargetConfig
+from ul.llm import llm_client_config_from_dataset_settings
+from ul.material_variance import material_variance_evaluator_version_from_llm_config
 
 from ul_cli.dataset_review import (
     DatasetEvidenceRedactionCoverage,
@@ -19,6 +17,7 @@ from ul_cli.dataset_review import (
     DatasetEvidenceSemanticSettings,
     create_dataset_evidence_run_context,
 )
+from ul_cli.dataset_run_config import DatasetRunConfig
 
 from ..evaluation.operators import dataset_operator_identity
 
@@ -27,9 +26,7 @@ def build_dataset_evidence_run_context(
     *,
     selected_records: tuple[InteractionRecord, ...],
     selected_operator_ids: tuple[str, ...],
-    evaluation_mode: Literal["variance"] = "variance",
-    repetitions: int,
-    target_timeout_seconds: float = 30.0,
+    run_config: DatasetRunConfig,
     invariant_suite: DatasetInvariantSuite | None,
     target_config: JsonHttpTargetConfig | None,
     target_receipt: dict[str, JsonValue] | None = None,
@@ -37,52 +34,31 @@ def build_dataset_evidence_run_context(
     redaction_policy_sha256: str | None = None,
     redaction_coverage: tuple[DatasetEvidenceRedactionCoverage, ...] = (),
 ) -> DatasetEvidenceRunContext:
-    materiality_config = OpenAICompatibleJudgeConfig(
-        base_url=settings.semantic_base_url,
-        model=settings.materiality_model,
-        api_key=settings.api_key,
-        allow_external_data_processing=True,
-        data_policy=(
-            "openrouter_zdr"
-            if settings.semantic_provider_type == "openrouter"
-            else "provider_default"
-        ),
-        timeout_seconds=settings.timeout_seconds,
-        max_output_tokens=512,
-        token_parameter="max_tokens",
-        max_response_bytes=settings.max_response_bytes,
-    )
+    semantic_settings = dataset_evidence_semantic_settings(settings)
     return create_dataset_evidence_run_context(
         selected_records=selected_records,
         operators=tuple(
             dataset_operator_identity(reference) for reference in selected_operator_ids
         ),
-        evaluation_mode=evaluation_mode,
-        repetitions=repetitions,
-        target_timeout_seconds=target_timeout_seconds,
+        run_config=run_config,
         invariant_suite_sha256=(invariant_suite.sha256 if invariant_suite is not None else None),
         target_config=target_config,
         target_receipt=target_receipt,
-        semantic_settings=DatasetEvidenceSemanticSettings(
-            provider=settings.semantic_provider_id,
-            endpoint_sha256=settings.semantic_endpoint_sha256,
-            model=settings.model,
-            render_model=settings.render_model,
-            equivalence_model=settings.equivalence_model,
-            materiality_model=settings.materiality_model,
-            deconstruct_reasoning=settings.deconstruct_reasoning,
-            render_reasoning=settings.render_reasoning,
-            equivalence_reasoning=settings.equivalence_reasoning,
-            max_input_chars=settings.max_input_chars,
-            max_output_tokens=settings.max_output_tokens,
-            max_render_tokens=settings.max_render_tokens,
-            max_response_bytes=settings.max_response_bytes,
-            timeout_seconds=settings.timeout_seconds,
-            deconstructor_identity=semantic_deconstructor_identity(settings),
-            materiality_evaluator_version_id=(
-                material_variance_evaluator_version_from_config(materiality_config).id
-            ),
-        ),
+        semantic_settings=semantic_settings,
         redaction_policy_sha256=redaction_policy_sha256,
         redaction_coverage=redaction_coverage,
+    )
+
+
+def dataset_evidence_semantic_settings(
+    settings: DatasetSemanticSettings,
+) -> DatasetEvidenceSemanticSettings:
+    llm_config = llm_client_config_from_dataset_settings(settings)
+    return DatasetEvidenceSemanticSettings(
+        llm_client=llm_config.evidence_identity(),
+        max_input_chars=settings.max_input_chars,
+        deconstructor_identity=semantic_deconstructor_identity(settings),
+        materiality_evaluator_version_id=(
+            material_variance_evaluator_version_from_llm_config(llm_config).id
+        ),
     )

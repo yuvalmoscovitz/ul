@@ -3,7 +3,7 @@ import hashlib
 import json
 from collections.abc import Callable, Coroutine
 from pathlib import Path
-from typing import Any, cast, overload
+from typing import Any, NoReturn, cast, overload
 
 import httpx
 import pytest
@@ -27,12 +27,24 @@ from ul.deconstruction import (
     plan_evaluator_preflight_profiles,
     semantic_deconstructor_identity,
 )
+from ul.llm import LLMClient, llm_client_config_from_dataset_settings
 from ul_core.dataset import InteractionRecord, SemanticFrame, UserInputRecord
 from ul_core.prompts import prompt_provenance
 
 pytestmark = pytest.mark.asyncio
 _TEST_API_KEY = SecretStr("test-openrouter-key")
 _TEST_CUSTOMER_API_KEY = SecretStr("test-customer-key")
+_LEGACY_LLM_AUGMENTATIONS_WITHOUT_DEVELOPMENT_VALIDATION = {
+    "input.surface.rephrase",
+    "input.surface.fragmented_syntax",
+    "input.style.terse",
+    "input.style.verbose",
+}
+_EXPECTED_DEVELOPMENT_VALIDATED_LLM_AUGMENTATIONS = {
+    "input.surface.grammar_error",
+    "input.tone.angry",
+    "input.tone.argumentative",
+}
 
 
 def settings(
@@ -48,6 +60,7 @@ def settings(
 ) -> OpenRouterDatasetSettings:
     return OpenRouterDatasetSettings(
         model="test/default-model",
+        upstream_provider="provider-name",
         live_calls=live_calls,
         allow_external_data_processing=allow_external_data_processing,
         api_key=api_key,
@@ -80,11 +93,20 @@ def openai_compatible_settings(
     )
 
 
-def openrouter_live_settings() -> OpenRouterDatasetSettings:
+def _live_llm_unavailable(message: str, *, required: bool) -> NoReturn:
+    if required:
+        pytest.fail(message)
+    pytest.skip(message)
+
+
+def openrouter_live_settings(*, required: bool = False) -> OpenRouterDatasetSettings:
     try:
         return OpenRouterDatasetSettings()
     except ValidationError:
-        pytest.skip("requires an explicit OpenRouter model configuration")
+        _live_llm_unavailable(
+            "requires an explicit OpenRouter model configuration",
+            required=required,
+        )
 
 
 def interaction() -> InteractionRecord:
@@ -101,7 +123,7 @@ def interaction() -> InteractionRecord:
 def synthetic_live_interaction() -> InteractionRecord:
     return InteractionRecord(
         id="synthetic-live-check",
-        raw_input="Please add 3 blue widgets with SKU TEST-42 to cart CART-7.",
+        raw_input="Could you please add 3 blue widgets with SKU TEST-42 to cart CART-7?",
         raw_observed_output={
             "action": "cart_updated",
             "sku": "TEST-42",
@@ -239,12 +261,12 @@ async def test_evaluator_preflight_proves_required_capabilities_and_records_poli
         {"effort": "low"},
         None,
     ]
-    assert [request["temperature"] for request in requests[:4]] == [0, 0.7, 0, 0]
+    assert [request["temperature"] for request in requests[:4]] == [0, 0, 0, 0]
     assert requests[0]["seed"] == 0
     assert requests[1]["seed"] == SemanticModelDeconstructor._render_seed(
         "UL evaluator preflight", "Check renderer compatibility."
     )
-    assert requests[1]["top_p"] == 0.95
+    assert "top_p" not in requests[1]
     assert [request["max_tokens"] for request in requests[:4]] == [321, 512, 321, 512]
     assert requests[0]["response_format"] == {
         "type": "json_schema",
@@ -287,6 +309,7 @@ async def test_evaluator_preflight_proves_required_capabilities_and_records_poli
         "provider_policy_declared": True,
         "data_collection": "deny",
         "zero_data_retention_required": True,
+        "upstream_provider": "provider-name",
         "implication": (
             "The configured route requires data collection to be denied and zero data retention; "
             "the evaluator request is still processed externally."
@@ -310,6 +333,61 @@ async def test_evaluator_preflight_caps_each_sample_at_1024_tokens() -> None:
         await deconstructor.preflight()
 
     assert [request["max_tokens"] for request in requests] == [1_024, 1_024, 1_024, 512]
+    await client.aclose()
+
+
+@pytest.mark.parametrize("returned_provider", ("different-provider", "provider/name"))
+async def test_evaluator_preflight_rejects_an_unpinned_upstream_provider(
+    returned_provider: str,
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        assert body["provider"]["only"] == ["provider-name"]
+        assert body["provider"]["allow_fallbacks"] is False
+        response = completion('{"compatible":true}').json()
+        response["provider"] = returned_provider
+        return httpx.Response(200, json=response)
+
+    client = mock_client(handler)
+    async with create_semantic_model_deconstructor(settings(), client=client) as deconstructor:
+        with pytest.raises(EvaluatorModelCompatibilityError, match="provider pin"):
+            await deconstructor.preflight()
+
+    await client.aclose()
+
+
+async def test_evaluator_preflight_accepts_a_normalized_upstream_provider_name() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        response = completion('{"compatible":true}').json()
+        response["provider"] = "Provider Name"
+        return httpx.Response(200, json=response)
+
+    client = mock_client(handler)
+    configured_settings = settings().model_copy(update={"upstream_provider": "provider-name"})
+    async with create_semantic_model_deconstructor(
+        configured_settings, client=client
+    ) as deconstructor:
+        result = await deconstructor.preflight()
+
+    assert all(profile.upstream_provider == "Provider Name" for profile in result.profiles)
+    assert all(
+        profile.configured_upstream_provider == "provider-name" for profile in result.profiles
+    )
+    await client.aclose()
+
+
+async def test_deconstruction_rejects_a_response_from_an_unpinned_provider() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        response = completion(json.dumps(frame_payload())).json()
+        response["provider"] = "different-provider"
+        return httpx.Response(200, json=response)
+
+    client = mock_client(handler)
+    async with create_semantic_model_deconstructor(settings(), client=client) as deconstructor:
+        with pytest.raises(ProviderDiagnosticError) as error:
+            await deconstructor.deconstruct(interaction())
+
+    assert error.value.diagnostic.category == "invalid_response"
     await client.aclose()
 
 
@@ -427,7 +505,6 @@ async def test_generic_endpoint_deduplicates_without_claiming_parameter_support(
         "seed",
         "temperature",
         "max_tokens",
-        "top_p",
     )
     assert all(
         profile.parameter_support == "endpoint_accepted_unverified" for profile in result.profiles
@@ -606,6 +683,8 @@ async def test_deconstruct_sends_one_bounded_strict_structured_request() -> None
             "require_parameters": True,
             "data_collection": "deny",
             "zdr": True,
+            "only": ["provider-name"],
+            "allow_fallbacks": False,
         }
         assert body["response_format"]["type"] == "json_schema"
         assert body["response_format"]["json_schema"]["strict"] is True
@@ -628,6 +707,8 @@ async def test_deconstruct_sends_one_bounded_strict_structured_request() -> None
         assert [message["role"] for message in body["messages"]] == ["system", "user"]
         assert "fragmented_syntax" in body["messages"][0]["content"]
         assert "frustrated" in body["messages"][0]["content"]
+        assert "angry" in body["messages"][0]["content"]
+        assert "argumentative" in body["messages"][0]["content"]
         assert "self_correction" in body["messages"][0]["content"]
         assert "superseded_by" in body["messages"][0]["content"]
         assert "status to exactly superseded" in body["messages"][0]["content"]
@@ -1050,8 +1131,8 @@ async def test_render_keeps_caller_instruction_out_of_the_system_prompt() -> Non
         assert body["model"] == "test/default-model"
         assert body["reasoning"] == {"effort": "none"}
         assert body["max_tokens"] == 512
-        assert body["temperature"] == 0.7
-        assert body["top_p"] == 0.95
+        assert body["temperature"] == 0
+        assert "top_p" not in body
         assert (
             body["seed"]
             == int.from_bytes(
@@ -1107,8 +1188,7 @@ async def test_render_keeps_caller_instruction_out_of_the_system_prompt() -> Non
             "semantic.render.temporary_value_forbidden",
         ),
         "sampling": {
-            "temperature": 0.7,
-            "top_p": 0.95,
+            "temperature": 0,
             "seed": int.from_bytes(
                 hashlib.sha256(f"{raw_input}\0{instruction}".encode()).digest()[:4],
                 "big",
@@ -1120,6 +1200,39 @@ async def test_render_keeps_caller_instruction_out_of_the_system_prompt() -> Non
     }
     assert not client.is_closed
     await client.aclose()
+
+
+async def test_injected_llm_client_is_the_authority_for_render_configuration() -> None:
+    requests: list[dict[str, object]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(cast(dict[str, object], json.loads(request.content)))
+        return completion('{"rendered_input":"Please pay INV-104."}')
+
+    configured_settings = settings(max_render_tokens=512)
+    base_config = llm_client_config_from_dataset_settings(configured_settings)
+    roles = tuple(
+        role.model_copy(update={"model": "injected/render-model", "max_output_tokens": 777})
+        if role.role == "render"
+        else role
+        for role in base_config.roles
+    )
+    injected_config = base_config.model_copy(update={"roles": roles})
+    transport = mock_client(handler)
+    llm_client = LLMClient(injected_config, client=transport)
+
+    async with create_semantic_model_deconstructor(
+        configured_settings,
+        llm_client=llm_client,
+    ) as deconstructor:
+        rendered = await deconstructor.render("Pay INV-104.", "Use natural phrasing.")
+
+    assert requests[0]["model"] == "injected/render-model"
+    assert requests[0]["max_tokens"] == 777
+    assert rendered.metadata["requested_model"] == "injected/render-model"
+    assert rendered.metadata["sampling"]["max_tokens"] == 777
+    assert not transport.is_closed
+    await transport.aclose()
 
 
 async def test_render_trusted_self_correction_mode_is_caller_controlled() -> None:
@@ -2622,6 +2735,7 @@ async def test_settings_load_dotenv_and_hide_secrets(
         "UL_DATASET_LIVE_CALLS",
         "UL_DATASET_ALLOW_EXTERNAL_DATA_PROCESSING",
         "UL_DATASET_MODEL",
+        "UL_DATASET_OPENROUTER_PROVIDER",
         "UL_DATASET_RENDER_MODEL",
         "UL_DATASET_EQUIVALENCE_MODEL",
         "UL_DATASET_MAX_RENDER_TOKENS",
@@ -2632,6 +2746,7 @@ async def test_settings_load_dotenv_and_hide_secrets(
         "UL_DATASET_LIVE_CALLS=true\n"
         "UL_DATASET_ALLOW_EXTERNAL_DATA_PROCESSING=true\n"
         "UL_DATASET_MODEL=test/dotenv-model\n"
+        "UL_DATASET_OPENROUTER_PROVIDER=test-provider\n"
         "UL_DATASET_RENDER_MODEL=test/dotenv-renderer\n"
         "UL_DATASET_EQUIVALENCE_MODEL=test/dotenv-equivalence\n"
         "UL_DATASET_MAX_RENDER_TOKENS=256\n"
@@ -2643,6 +2758,7 @@ async def test_settings_load_dotenv_and_hide_secrets(
     assert configured_settings.live_calls is True
     assert configured_settings.allow_external_data_processing is True
     assert configured_settings.model == "test/dotenv-model"
+    assert configured_settings.upstream_provider == "test-provider"
     assert configured_settings.render_model == "test/dotenv-renderer"
     assert configured_settings.equivalence_model == "test/dotenv-equivalence"
     assert configured_settings.max_render_tokens == 256
@@ -2664,6 +2780,7 @@ async def test_ul_live_enables_both_permissions(
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("UL_LIVE", "true")
     monkeypatch.setenv("UL_DATASET_MODEL", "test/default-model")
+    monkeypatch.setenv("UL_DATASET_OPENROUTER_PROVIDER", "test-provider")
 
     configured_settings = OpenRouterDatasetSettings()
 
@@ -2697,6 +2814,7 @@ async def test_granular_false_overrides_ul_live(
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("UL_LIVE", "true")
     monkeypatch.setenv("UL_DATASET_MODEL", "test/default-model")
+    monkeypatch.setenv("UL_DATASET_OPENROUTER_PROVIDER", "test-provider")
     monkeypatch.setenv(override_name, "false")
 
     configured_settings = OpenRouterDatasetSettings()
@@ -2717,7 +2835,9 @@ async def test_dotenv_ul_live_respects_process_granular_override(
     ):
         monkeypatch.delenv(variable_name, raising=False)
     (tmp_path / ".env").write_text(
-        "UL_LIVE=true\nUL_DATASET_MODEL=test/default-model\n", encoding="utf-8"
+        "UL_LIVE=true\nUL_DATASET_MODEL=test/default-model\n"
+        "UL_DATASET_OPENROUTER_PROVIDER=test-provider\n",
+        encoding="utf-8",
     )
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("UL_DATASET_LIVE_CALLS", "false")
@@ -2737,12 +2857,20 @@ async def test_settings_reject_unbounded_values() -> None:
     assert configured_settings.materiality_model == configured_settings.model
     assert (
         OpenRouterDatasetSettings(
-            model="customer/default-model", materiality_model="customer/materiality-model"
+            model="customer/default-model",
+            upstream_provider="test-provider",
+            materiality_model="customer/materiality-model",
         ).materiality_model
         == "customer/materiality-model"
     )
+    with pytest.raises(ValidationError):
+        OpenRouterDatasetSettings(model="customer/default-model")
     with pytest.raises(ValidationError, match="UL_DATASET_MATERIALITY_MODEL"):
-        OpenRouterDatasetSettings(model="customer/default-model", materiality_model="   ")
+        OpenRouterDatasetSettings(
+            model="customer/default-model",
+            upstream_provider="test-provider",
+            materiality_model="   ",
+        )
     with pytest.raises(ValidationError):
         settings(max_input_chars=1_000_001)
     with pytest.raises(ValidationError):
@@ -2795,43 +2923,82 @@ async def test_live_deconstruction_with_synthetic_interaction() -> None:
     assert all(element.evidence for element in extracted_elements)
 
 
-async def test_live_augmentation_generates_or_safely_rejects_each_candidate() -> None:
-    configured_settings = openrouter_live_settings()
+async def test_llm_augmentation_development_validation_coverage_is_explicit() -> None:
+    llm_operator_ids = {
+        operator.id
+        for operator in builtin_dataset_augmentation_operators()
+        if operator.generation_mechanism == "llm"
+    }
+
+    assert llm_operator_ids > _LEGACY_LLM_AUGMENTATIONS_WITHOUT_DEVELOPMENT_VALIDATION
+    assert (
+        llm_operator_ids - _LEGACY_LLM_AUGMENTATIONS_WITHOUT_DEVELOPMENT_VALIDATION
+        == _EXPECTED_DEVELOPMENT_VALIDATED_LLM_AUGMENTATIONS
+    )
+
+
+async def test_required_live_llm_validation_fails_closed() -> None:
+    with pytest.raises(pytest.fail.Exception, match="live LLM proof did not run"):
+        _live_llm_unavailable("live LLM proof did not run", required=True)
+
+
+@pytest.mark.live_llm
+async def test_live_llm_augmentations_pass_existing_validity_check(
+    pytestconfig: pytest.Config,
+) -> None:
+    required = bool(pytestconfig.getoption("--require-live-llm"))
+    configured_settings = openrouter_live_settings(required=required)
     if not configured_settings.live_calls or configured_settings.api_key is None:
-        pytest.skip("requires explicit OpenRouter live opt-in and API key")
+        _live_llm_unavailable(
+            "requires explicit OpenRouter live opt-in and API key",
+            required=required,
+        )
     configured_settings = configured_settings.model_copy(
         update={"allow_external_data_processing": True}
     )
 
-    operators = builtin_dataset_augmentation_operators()
-    async with create_semantic_model_deconstructor(configured_settings) as semantic_model:
-        result = await DatasetAugmentationEngine(
-            semantic_model, semantic_model, semantic_model
-        ).augment(
-            (synthetic_live_interaction(),),
-            max_records=1,
-            operator_ids=tuple(operator.id for operator in operators),
-        )
-
-    assert {
-        *(candidate.operator_id for candidate in result.candidates),
-        *(skip.operator_id for skip in result.skips),
-    } == {operator.id for operator in operators}
-    unchanged_candidates = tuple(
-        candidate.operator_id
-        for candidate in result.candidates
-        if candidate.augmented_input == synthetic_live_interaction().raw_input
+    operators = tuple(
+        operator
+        for operator in builtin_dataset_augmentation_operators()
+        if operator.generation_mechanism == "llm"
+        and operator.id not in _LEGACY_LLM_AUGMENTATIONS_WITHOUT_DEVELOPMENT_VALIDATION
     )
-    assert not unchanged_candidates, unchanged_candidates
-    assert all(candidate.passed or candidate.failure_reasons for candidate in result.candidates)
+    assert {operator.id for operator in operators} == (
+        _EXPECTED_DEVELOPMENT_VALIDATED_LLM_AUGMENTATIONS
+    )
+    candidates = []
+    async with create_semantic_model_deconstructor(configured_settings) as semantic_model:
+        engine = DatasetAugmentationEngine(semantic_model, semantic_model, semantic_model)
+        for operator in operators:
+            result = await engine.augment(
+                (synthetic_live_interaction(),),
+                max_records=1,
+                operator_ids=(operator.id,),
+            )
+            assert result.skips == (), operator.id
+            assert len(result.candidates) == 1, operator.id
+            candidate = result.candidates[0]
+            assert candidate.augmented_input != synthetic_live_interaction().raw_input, operator.id
+            communication_kinds = (
+                tuple(act.kind for act in candidate.reparsed_input_frame.communication_acts)
+                if candidate.reparsed_input_frame is not None
+                else ()
+            )
+            assert candidate.passed, (
+                f"{operator.id}: input={candidate.augmented_input!r}; "
+                f"communication_kinds={communication_kinds!r}; "
+                f"equivalence={candidate.semantic_equivalence_assessment!r}; "
+                f"failure_reasons={candidate.failure_reasons!r}"
+            )
+            candidates.append(candidate)
+
+    assert {candidate.operator_id for candidate in candidates} == {
+        operator.id for operator in operators
+    }
     human_review_operators = {
-        candidate.operator_id for candidate in result.candidates if candidate.human_review_required
+        candidate.operator_id for candidate in candidates if candidate.human_review_required
     }
-    assert "input.tone.frustrated" in human_review_operators
-    assert human_review_operators <= {
-        "input.tone.frustrated",
-        "input.intent.self_correction",
-    }
+    assert human_review_operators <= {"input.intent.self_correction"}
 
 
 async def test_live_equivalence_qualification_across_ten_domains() -> None:

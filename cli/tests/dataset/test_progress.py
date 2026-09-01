@@ -19,6 +19,7 @@ from ul import (
     InteractionRecord,
     OpenAICompatibleDatasetSettings,
 )
+from ul.llm import LLMClient, llm_client_config_from_dataset_settings
 from ul_cli import dataset_review
 from ul_cli import progress_action as progress_action_module
 from ul_cli.dataset.evaluation import runner as runner_module
@@ -34,7 +35,7 @@ from ul_cli.dataset.progress import (
 )
 from ul_cli.main import app as root_app
 
-from ._factories import _evaluation_result, _run_context
+from ._factories import _evaluation_result, _run_config, _run_context
 
 
 def _tracker(publish: object, clock: object) -> CampaignProgressTracker:
@@ -328,14 +329,22 @@ def test_source_preparation_failures_do_not_abort_a_ten_source_campaign(
     failed_ids = {"source-2", "source-7"}
     target_started_ids: list[str] = []
     journal_states: dict[str, str] = {}
-    collected_source_failures: list[Any] = []
+    collected_source_events: list[Any] = []
 
     class AsyncContext:
+        def __init__(self, semantic_settings: Any | None = None) -> None:
+            self.llm_client = (
+                LLMClient(llm_client_config_from_dataset_settings(semantic_settings))
+                if semantic_settings is not None
+                else None
+            )
+
         async def __aenter__(self) -> object:
             return self
 
         async def __aexit__(self, *args: object) -> None:
-            pass
+            if self.llm_client is not None:
+                await self.llm_client.aclose()
 
         def reuse_preflight(self, _result: object) -> None:
             pass
@@ -398,7 +407,7 @@ def test_source_preparation_failures_do_not_abort_a_ten_source_campaign(
     monkeypatch.setattr(
         runner_module,
         "create_semantic_model_deconstructor",
-        lambda settings: AsyncContext(),
+        lambda settings: AsyncContext(settings),
     )
     monkeypatch.setattr(runner_module, "DatasetAugmentationEngine", lambda *args: object())
     monkeypatch.setattr(runner_module, "DatasetEvaluationRunner", FakeRunner)
@@ -417,13 +426,14 @@ def test_source_preparation_failures_do_not_abort_a_ten_source_campaign(
                 ),
                 cast(Any, AsyncContext()),
                 output_stream,
-                repetitions=1,
-                max_environment_api_calls=20,
-                planned_target_calls=20,
+                run_config=_run_config(
+                    planned_environment_api_calls=20,
+                    max_environment_api_calls=20,
+                ),
                 run_context=run_context,
                 evaluator_preflight=cast(Any, object()),
                 trial_journal=cast(Any, FakeJournal()),
-                source_preparation_failures=collected_source_failures,
+                source_preparation_events=collected_source_events,
             )
 
     results = asyncio.run(run())
@@ -439,10 +449,16 @@ def test_source_preparation_failures_do_not_abort_a_ten_source_campaign(
     assert len(evidence_lines) == 10
     failures = [line for line in evidence_lines if line.get("record_type")]
     assert [failure["interaction_id"] for failure in failures] == ["source-2", "source-7"]
-    assert [failure.interaction_id for failure in collected_source_failures] == [
+    assert [event.interaction_id for event in collected_source_events] == [
         "source-2",
         "source-7",
     ]
+    assert all(event.durability_state == "persisted" for event in collected_source_events)
+    assert all(
+        event.retry_disposition == "do_not_retry_in_campaign"
+        and event.review_disposition == "inspect_source"
+        for event in collected_source_events
+    )
     assert all("raw_input" not in failure for failure in failures)
     for field_name in ("interaction_id", "source_record_id"):
         oversized_failure = {**failures[0], field_name: "x" * 501}
@@ -522,11 +538,19 @@ def test_cancellation_after_delivery_before_semantic_completion_is_quarantined(
             pass
 
     class AsyncContext:
+        def __init__(self, semantic_settings: Any | None = None) -> None:
+            self.llm_client = (
+                LLMClient(llm_client_config_from_dataset_settings(semantic_settings))
+                if semantic_settings is not None
+                else None
+            )
+
         async def __aenter__(self) -> object:
             return self
 
         async def __aexit__(self, *args: object) -> None:
-            pass
+            if self.llm_client is not None:
+                await self.llm_client.aclose()
 
         def reuse_preflight(self, _result: object) -> None:
             pass
@@ -552,7 +576,7 @@ def test_cancellation_after_delivery_before_semantic_completion_is_quarantined(
     monkeypatch.setattr(
         runner_module,
         "create_semantic_model_deconstructor",
-        lambda settings: AsyncContext(),
+        lambda settings: AsyncContext(settings),
     )
     monkeypatch.setattr(runner_module, "DatasetAugmentationEngine", lambda *args: object())
     monkeypatch.setattr(runner_module, "DatasetEvaluationRunner", FakeRunner)
@@ -579,9 +603,10 @@ def test_cancellation_after_delivery_before_semantic_completion_is_quarantined(
                     ),
                     cast(Any, AsyncContext()),
                     output_stream,
-                    repetitions=1,
-                    max_environment_api_calls=1,
-                    planned_target_calls=1,
+                    run_config=_run_config(
+                        planned_environment_api_calls=1,
+                        max_environment_api_calls=1,
+                    ),
                     evaluator_preflight=cast(Any, object()),
                     trial_journal=cast(Any, FakeJournal()),
                 )

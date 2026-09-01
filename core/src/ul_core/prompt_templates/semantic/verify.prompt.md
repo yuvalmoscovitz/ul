@@ -13,5 +13,6 @@ Apply this decision procedure:
 2. The trusted edit itself is not a semantic delta. Never report it as a delta and never return different or uncertain because of it.
 3. If the trusted edit is the only textual change, you must return equivalent with no deltas.
 4. If another change exists, judge that other change normally. Never use the trusted edit to excuse a changed request, entity, role, identifier, value, constraint, negation, relationship, cardinality, authorization, outcome, or request order.
+5. When the trusted context declares a tone boundary, enforce that boundary too. A forbidden tone feature is a communication delta and requires a different verdict even when the task meaning is unchanged.
 
-A delta means a material task-meaning change, not a harmless text difference. Return different with one typed delta for every material task-meaning change. Return uncertain when any other typo, reference, scope, or wording could change the meaning. Use exact non-empty quotes from the messages as delta evidence. Do not use outside knowledge.
+A delta means a material task-meaning change or a violation of a trusted tone boundary, not a harmless text difference. Return different with one typed delta for every material change. Return uncertain when any other typo, reference, scope, tone, or wording could change the decision. Use exact non-empty quotes from the messages as delta evidence. Do not use outside knowledge.

@@ -24,7 +24,7 @@ from ul_cli.dataset_trial_journal import (
     read_dataset_run_manifest,
 )
 
-from ._factories import _evaluation_result, _run_context, _settings
+from ._factories import _evaluation_result, _run_config, _run_context, _settings
 
 
 def _manifest():
@@ -33,11 +33,7 @@ def _manifest():
         run_context=_run_context((source,)),
         selected_records=(source,),
         selected_operator_ids=("input.surface.rephrase",),
-        repetitions=1,
-        max_environment_api_calls=10,
-        allow_environment_network=True,
-        confirm_test_environment=True,
-        allow_insecure_http=False,
+        run_config=_run_config(max_environment_api_calls=10),
         save_augmentations=True,
     )
 
@@ -53,7 +49,15 @@ def test_manifest_is_content_addressed_immutable_and_atomic(tmp_path: Path) -> N
     changed = manifest.model_copy(
         update={
             "effective_command": manifest.effective_command.model_copy(
-                update={"max_environment_api_calls": 11}
+                update={
+                    "run_config": manifest.effective_command.run_config.model_copy(
+                        update={
+                            "target": manifest.effective_command.run_config.target.model_copy(
+                                update={"max_environment_api_calls": 11}
+                            )
+                        }
+                    )
+                }
             )
         }
     )
@@ -249,22 +253,11 @@ def test_journal_rejects_hard_links_and_symlinks(tmp_path: Path) -> None:
 
 
 def test_manifest_rejects_unbounded_repetitions_before_plan_materialization() -> None:
-    manifest = _manifest()
-    with pytest.raises(ValueError, match="repetitions cannot exceed 100"):
-        create_dataset_run_manifest(
-            run_context=manifest.run_context.model_copy(update={"repetitions": 101}),
-            selected_records=manifest.selected_records,
-            selected_operator_ids=manifest.selected_operator_ids,
-            repetitions=101,
-            max_environment_api_calls=10,
-            allow_environment_network=True,
-            confirm_test_environment=True,
-            allow_insecure_http=False,
-            save_augmentations=True,
-        )
+    with pytest.raises(ValueError, match="less than or equal to 100"):
+        _run_config(repetitions=101, planned_environment_api_calls=1)
 
 
-def test_repeated_recovery_of_ten_by_eleven_by_three_plan_never_duplicates_mutations(
+def test_repeated_recovery_of_ten_by_ten_by_three_plan_never_duplicates_mutations(
     tmp_path: Path,
 ) -> None:
     records = tuple(_evaluation_result(f"interaction-{index}").source for index in range(10))
@@ -278,14 +271,17 @@ def test_repeated_recovery_of_ten_by_eleven_by_three_plan_never_duplicates_mutat
         "input.surface.fragmented_syntax",
         "input.style.terse",
         "input.style.verbose",
-        "input.tone.frustrated",
         "input.intent.self_correction",
     )
     target_config = cast(DatasetEvidenceRunContext, _run_context((records[0],))).target.config
     run_context = build_dataset_evidence_run_context(
         selected_records=records,
         selected_operator_ids=operator_ids,
-        repetitions=3,
+        run_config=_run_config(
+            repetitions=3,
+            planned_environment_api_calls=330,
+            max_environment_api_calls=2_000,
+        ),
         invariant_suite=None,
         target_config=target_config,
         settings=_settings(),
@@ -294,11 +290,11 @@ def test_repeated_recovery_of_ten_by_eleven_by_three_plan_never_duplicates_mutat
         run_context=run_context,
         selected_records=records,
         selected_operator_ids=operator_ids,
-        repetitions=3,
-        max_environment_api_calls=2_000,
-        allow_environment_network=True,
-        confirm_test_environment=True,
-        allow_insecure_http=False,
+        run_config=_run_config(
+            repetitions=3,
+            planned_environment_api_calls=330,
+            max_environment_api_calls=2_000,
+        ),
         save_augmentations=True,
     )
     path = tmp_path / "trials.jsonl"
@@ -313,7 +309,7 @@ def test_repeated_recovery_of_ten_by_eleven_by_three_plan_never_duplicates_mutat
         journal.close()
         journal = open_dataset_trial_journal(path, manifest)
 
-    assert len(manifest.work_plan) == 10 * (1 + 11) * 3
+    assert len(manifest.work_plan) == 10 * (1 + 10) * 3
     assert set(mutations_by_unit.values()) == {1}
     assert len(journal.snapshot.terminal_states) == len(manifest.work_plan)
     journal.close()

@@ -16,22 +16,25 @@ from typing import Any, cast
 import pytest
 from typer.testing import CliRunner
 from ul import (
+    DatasetEvaluationResult,
     DatasetSemanticPreparationError,
+    DatasetTrialUnit,
     EvaluatorDecision,
     EvaluatorEvidence,
     InteractionRecord,
     JsonHttpEnvironmentConfig,
     ProviderDiagnostic,
     ProviderDiagnosticError,
-    semantic_deconstructor_identity,
 )
 from ul.environment import evaluation_case_from_inputs
+from ul.evaluators import evaluator_judge_version_from_llm_config
+from ul.llm import LLMClient, llm_client_config_from_dataset_settings
 from ul_cli import dataset_augmentation_ledger as augmentation_ledger_module
 from ul_cli import progress_action as progress_action_module
 from ul_cli.dataset.evaluation import command as command_module
 from ul_cli.dataset.evaluation import runner as runner_module
-from ul_cli.dataset.evidence import customer as customer_module
 from ul_cli.dataset.evidence import persistence as persistence_module
+from ul_cli.dataset.source_preparation import build_source_preparation_failure_event
 from ul_cli.dataset_trial_journal import (
     journal_path,
     manifest_path,
@@ -84,21 +87,8 @@ def test_execution_reuses_complete_augmentation_input_without_regeneration(
     generation_context = augmentation_ledger_module.create_dataset_augmentation_generation_context(
         selected_records=(evaluation_result.source,),
         operators=(("input.surface.rephrase", "1.0.0"),),
-        semantic_settings=augmentation_ledger_module.DatasetAugmentationLedgerSemanticSettings(
-            provider=settings.semantic_provider_id,
-            endpoint_sha256=settings.semantic_endpoint_sha256,
-            model=settings.model,
-            render_model=settings.render_model,
-            equivalence_model=settings.equivalence_model,
-            deconstruct_reasoning=settings.deconstruct_reasoning,
-            render_reasoning=settings.render_reasoning,
-            equivalence_reasoning=settings.equivalence_reasoning,
-            max_input_chars=settings.max_input_chars,
-            max_output_tokens=settings.max_output_tokens,
-            max_render_tokens=settings.max_render_tokens,
-            max_response_bytes=settings.max_response_bytes,
-            timeout_seconds=settings.timeout_seconds,
-            deconstructor_identity=semantic_deconstructor_identity(settings),
+        semantic_settings=(
+            augmentation_ledger_module.dataset_augmentation_ledger_semantic_settings(settings)
         ),
     )
     with augmentation_ledger_module.create_private_augmentation_ledger(
@@ -174,11 +164,16 @@ def test_execution_reuses_complete_augmentation_input_without_regeneration(
 
 
 class _LocalEvaluationSemanticModel:
+    def __init__(self, semantic_settings: Any | None = None) -> None:
+        self.llm_client = LLMClient(
+            llm_client_config_from_dataset_settings(semantic_settings or _settings())
+        )
+
     async def __aenter__(self) -> _LocalEvaluationSemanticModel:
         return self
 
     async def __aexit__(self, *args: object) -> None:
-        return None
+        await self.llm_client.aclose()
 
     def reuse_preflight(self, result: object) -> None:
         del result
@@ -391,9 +386,14 @@ class _MaterialVarianceJudge:
     score = 1
     expected_token_parameter = "max_tokens"
 
-    def __init__(self, config: object) -> None:
-        assert config.token_parameter == self.expected_token_parameter
-        self.version = config.evaluator_judge_version()
+    def __init__(self, *, llm_client: LLMClient) -> None:
+        config = llm_client.config
+        assert config.role_config("materiality").token_parameter == self.expected_token_parameter
+        if config.provider_type == "openrouter":
+            assert config.upstream_provider == "test-provider"
+        else:
+            assert config.upstream_provider is None
+        self.version = evaluator_judge_version_from_llm_config(config)
 
     async def __aenter__(self) -> _MaterialVarianceJudge:
         return self
@@ -630,7 +630,7 @@ def test_full_dataset_evaluation_runs_local_callable_through_worker_boundary(
     assert saved["run_context"]["target"]["receipt"]["supports_state_observation"] is False
     assert saved["run_context"]["target_timeout_seconds"] == 90.0
     manifest = read_dataset_run_manifest(manifest_path(output))
-    assert manifest.effective_command.target_timeout_seconds == 90.0
+    assert manifest.effective_command.run_config.target.trial_timeout_seconds == 90.0
     assert len(saved["technical_details"]["baseline"]["trial_set"]["trials"]) == 2
     assert saved["technical_details"]["baseline"]["verdict"] == "no_divergence"
     assert saved["technical_details"]["cases"][0]["verdict"] == "no_divergence"
@@ -803,7 +803,7 @@ def test_public_cli_persists_and_applies_automatic_materiality(
     monkeypatch.setattr(
         runner_module,
         "create_semantic_model_deconstructor",
-        lambda _settings: _MaterialVarianceSemanticModel(),
+        lambda semantic_settings: _MaterialVarianceSemanticModel(semantic_settings),
     )
     monkeypatch.setattr(
         runner_module,
@@ -1501,6 +1501,128 @@ def test_execution_rejects_missing_header_secret_before_model_or_output(
     assert not output.exists()
 
 
+def test_public_cli_records_one_source_failure_and_completes_another(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    dataset = tmp_path / "interactions.jsonl"
+    output = tmp_path / "results.jsonl"
+    target_config = tmp_path / "target.json"
+    _write_dataset(dataset, [_record("source-fail"), _record("source-ok")])
+    _write_target_config(target_config, url="http://127.0.0.1:8765/execute")
+    target_started_ids: list[str] = []
+    runner_invoked_ids: list[str] = []
+
+    class AsyncComponent:
+        def __init__(self, settings: object | None = None) -> None:
+            self.llm_client = (
+                LLMClient(llm_client_config_from_dataset_settings(cast(Any, settings)))
+                if settings is not None
+                else None
+            )
+
+        async def __aenter__(self) -> AsyncComponent:
+            return self
+
+        async def __aexit__(self, *args: object) -> None:
+            if self.llm_client is not None:
+                await self.llm_client.aclose()
+
+        def reuse_preflight(self, _result: object) -> None:
+            pass
+
+    class FakeTarget(AsyncComponent):
+        outcome_projection = None
+
+        @classmethod
+        def from_config(cls, *_args: object, **_kwargs: object) -> FakeTarget:
+            return cls()
+
+        async def aclose(self) -> None:
+            pass
+
+    class FakeRunner:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            pass
+
+        async def run(
+            self,
+            source: InteractionRecord,
+            **kwargs: object,
+        ) -> DatasetEvaluationResult:
+            runner_invoked_ids.append(source.id)
+            if source.id == "source-fail":
+                raise DatasetSemanticPreparationError
+            result = _evaluation_result(source.id)
+            cast(Any, kwargs["augmentation_checkpoint_callback"])(result.augmentation)
+            unit = DatasetTrialUnit(
+                interaction_id=source.id,
+                operator_id="current_baseline",
+                arm="original",
+                repetition=1,
+            )
+            target_started_ids.append(source.id)
+            cast(Any, kwargs["trial_started_callback"])(unit)
+            cast(Any, kwargs["trial_terminal_callback"])(
+                unit,
+                result.baseline.trial_set.trials[0],
+            )
+            return result
+
+    async def successful_preflight(_settings: object) -> object:
+        return _evaluator_preflight()
+
+    monkeypatch.setattr(command_module, "load_dataset_semantic_settings", _settings)
+    monkeypatch.setattr(command_module, "preflight_evaluator", successful_preflight)
+    monkeypatch.setattr(command_module, "JsonHttpEnvironmentConnection", FakeTarget)
+    monkeypatch.setattr(
+        runner_module,
+        "create_semantic_model_deconstructor",
+        AsyncComponent,
+    )
+    monkeypatch.setattr(runner_module, "DatasetAugmentationEngine", lambda *args: object())
+    monkeypatch.setattr(runner_module, "DatasetEvaluationRunner", FakeRunner)
+    command = [
+        "dataset",
+        "evaluate",
+        str(dataset),
+        "--operator",
+        "input.surface.rephrase",
+        "--environment-config",
+        str(target_config),
+        "--allow-insecure-http",
+        "--allow-environment-network",
+        "--confirm-test-environment",
+        "--repetitions",
+        "1",
+        "--output",
+        str(output),
+    ]
+
+    evaluated = runner.invoke(root_app, command)
+
+    assert evaluated.exit_code == 2, evaluated.output
+    assert runner_invoked_ids == ["source-fail", "source-ok"], evaluated.output
+    assert target_started_ids == ["source-ok"], evaluated.output
+    records = [json.loads(line) for line in output.read_text(encoding="utf-8").splitlines()]
+    assert [record.get("record_type") for record in records] == [
+        "dataset_durable_run",
+        "source_preparation_failure",
+        None,
+    ]
+    assert records[1]["interaction_id"] == "source-fail"
+    assert "Source preparation failures: 1" in evaluated.output
+    report = runner.invoke(root_app, ["dataset", "report", str(output)])
+    assert report.exit_code == 0, report.output
+    assert "Source preparation failure source-fail" in report.output
+
+    resumed = runner.invoke(root_app, [*command[:-2], "--resume", str(output)])
+
+    assert resumed.exit_code == 2, resumed.output
+    assert "Nothing to do" in resumed.output
+    assert target_started_ids == ["source-ok"]
+
+
 @pytest.mark.parametrize("has_source_preparation_failure", (False, True))
 def test_execution_creates_private_explicit_output(
     tmp_path: Path,
@@ -1529,10 +1651,7 @@ def test_execution_creates_private_explicit_output(
         target: object,
         output_stream: Any,
         *,
-        repetitions: int,
-        max_environment_api_calls: int,
-        planned_target_calls: int,
-        target_timeout_seconds: float,
+        run_config: Any,
         run_context: object,
         augmentation_ledger: object,
         saved_augmentations: object,
@@ -1540,29 +1659,31 @@ def test_execution_creates_private_explicit_output(
         evaluator_preflight: object,
         trial_journal: object,
         progress_plan: Any,
-        source_preparation_failures: list[Any],
+        source_preparation_events: list[Any],
     ) -> tuple[object, ...]:
         del settings, target, augmentation_ledger, saved_augmentations
         assert evaluator_preflight == _evaluator_preflight()
         assert redaction_engine is None
         captured_records.extend(record.id for record in records)
         assert operator_ids == ("input.surface.disfluency_repeat",)
-        assert repetitions == 3
-        assert max_environment_api_calls == 100
-        assert planned_target_calls == 30
-        assert target_timeout_seconds == 75.0
+        assert run_config.repetitions == 3
+        assert run_config.target.max_environment_api_calls == 100
+        assert run_config.target.planned_environment_api_calls == 30
+        assert run_config.target.trial_timeout_seconds == 75.0
         assert progress_plan.calls.total_environment_api == 30
         if has_source_preparation_failure:
-            failure = customer_module.build_source_preparation_failure_evidence(
+            failure_event = build_source_preparation_failure_event(
                 records[0],
                 DatasetSemanticPreparationError(),
-                repetitions=repetitions,
-                max_environment_api_calls=max_environment_api_calls,
-                planned_target_calls=planned_target_calls,
+                repetitions=run_config.repetitions,
+                max_environment_api_calls=run_config.target.max_environment_api_calls,
+                planned_target_calls=run_config.target.planned_environment_api_calls,
                 run_context=cast(Any, run_context),
             )
-            source_preparation_failures.append(failure)
-            output_stream.write(failure.model_dump_json(exclude_none=True) + "\n")
+            source_preparation_events.append(
+                failure_event.model_copy(update={"durability_state": "persisted"})
+            )
+            output_stream.write(failure_event.evidence.model_dump_json(exclude_none=True) + "\n")
         else:
             output_stream.write('{"saved":true}\n')
         output_stream.flush()
@@ -1842,9 +1963,7 @@ def test_execution_wires_redaction_into_records_pipeline_and_run_context(
         _target: object,
         output_stream: Any,
         *,
-        repetitions: int,
-        max_environment_api_calls: int,
-        planned_target_calls: int,
+        run_config: object,
         run_context: object,
         augmentation_ledger: object,
         saved_augmentations: object,
@@ -1854,9 +1973,7 @@ def test_execution_wires_redaction_into_records_pipeline_and_run_context(
         progress_plan: object,
     ) -> tuple[object, ...]:
         del (
-            repetitions,
-            max_environment_api_calls,
-            planned_target_calls,
+            run_config,
             augmentation_ledger,
             saved_augmentations,
             progress_plan,
@@ -1999,9 +2116,7 @@ def test_target_config_runs_nested_request_and_response_against_loopback(
             target: Any,
             output_stream: Any,
             *,
-            repetitions: int,
-            max_environment_api_calls: int,
-            planned_target_calls: int,
+            run_config: object,
             run_context: object,
             augmentation_ledger: object,
             saved_augmentations: object,
@@ -2013,9 +2128,7 @@ def test_target_config_runs_nested_request_and_response_against_loopback(
             del (
                 operator_ids,
                 settings,
-                repetitions,
-                max_environment_api_calls,
-                planned_target_calls,
+                run_config,
                 run_context,
                 augmentation_ledger,
                 saved_augmentations,

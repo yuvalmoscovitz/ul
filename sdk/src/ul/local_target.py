@@ -134,6 +134,8 @@ class LocalTargetDryRunPlan(_StrictModel):
     target_id: str
     target_kind: Literal["python_callable", "command"]
     worker_command: tuple[str, ...]
+    selected_executable: str
+    resolved_executable: str
     capability_level: Literal["response_only"] = "response_only"
     maximum_executions: int = Field(ge=1)
     maximum_active_wall_seconds: float = Field(gt=0)
@@ -198,11 +200,13 @@ class _LocalTargetFailure(RuntimeError):
         *,
         delivery_uncertain: bool,
         not_delivered: bool = False,
+        safe_reason: str | None = None,
     ) -> None:
-        super().__init__("local target execution failed")
+        super().__init__(safe_reason or "local target execution failed")
         self.code: EnvironmentLifecycleFailureCode = code
         self.delivery_uncertain = delivery_uncertain
         self.not_delivered = not_delivered
+        self.safe_reason = safe_reason
 
 
 @dataclass(frozen=True)
@@ -314,10 +318,15 @@ def validate_local_target_config(config: LocalTargetConfig) -> None:
 
 def create_local_target_dry_run_plan(config: LocalTargetConfig) -> LocalTargetDryRunPlan:
     validate_local_target_config(config)
+    selected_executable = Path(_target_command(config)[0])
+    with _open_executable_identity(selected_executable) as (_, executable_identity):
+        resolved_executable = executable_identity.resolved_path
     return LocalTargetDryRunPlan(
         target_id=config.target_id,
         target_kind=config.kind,
         worker_command=_target_command(config),
+        selected_executable=str(selected_executable),
+        resolved_executable=str(resolved_executable),
         maximum_executions=config.limits.max_executions,
         maximum_active_wall_seconds=(
             config.limits.total_execution_timeout_seconds + config.limits.shutdown_timeout_seconds
@@ -409,9 +418,10 @@ class _LocalTargetInvoker:
                 await self._terminate()
                 raise CapabilityExecutionError(
                     failure.code,
-                    "local target execution failed",
+                    failure.safe_reason or "local target execution failed",
                     delivery_uncertain=failure.delivery_uncertain,
                     not_delivered=failure.not_delivered,
+                    _reason_is_safe=failure.safe_reason is not None,
                 ) from None
 
     async def aclose(self) -> None:
@@ -487,6 +497,12 @@ class _LocalTargetInvoker:
         with _open_executable_identity(executable_path) as (descriptor, identity):
             if identity != self._executable_identity:
                 raise _ExecutableIdentityError
+            if (
+                isinstance(self._config, PythonCallableTargetConfig)
+                and sys.platform != "win32"
+                and executable_path != identity.resolved_path
+            ):
+                environment["__PYVENV_LAUNCHER__"] = str(executable_path)
             command = _supervised_target_command(
                 self._config,
                 identity,
@@ -651,6 +667,17 @@ class _LocalTargetInvoker:
                     "response_mapping",
                     delivery_uncertain=delivery_uncertain,
                 )
+            if (
+                error_message.code == "target_load_failed"
+                and isinstance(self._config, PythonCallableTargetConfig)
+                and message.get("type") == "start"
+            ):
+                raise _LocalTargetFailure(
+                    "target_load_failed",
+                    delivery_uncertain=False,
+                    not_delivered=True,
+                    safe_reason="Python target could not be loaded by the selected interpreter",
+                )
             raise _LocalTargetFailure(
                 "environment_lifecycle_error",
                 delivery_uncertain=delivery_uncertain,
@@ -699,6 +726,8 @@ class _LocalTargetInvoker:
                 "execution_attempt": self._execution_count,
                 "runtime_name": runtime.name,
                 "runtime_version": runtime.version,
+                "selected_executable": _target_command(self._config)[0],
+                "resolved_executable": str(self._executable_identity.resolved_path),
                 "executable_sha256": self._executable_sha256,
             },
         )
@@ -845,9 +874,9 @@ def _supervised_target_command(
     *,
     platform: str,
 ) -> tuple[str, ...]:
-    target_command = (str(identity.resolved_path), *_target_command(config)[1:])
+    target_command = _target_command(config)
     if platform != "win32":
-        return target_command
+        return (str(identity.resolved_path), *target_command[1:])
     supervisor = Path(__file__).with_name("_windows_job_worker.py").resolve()
     return (
         sys.executable,

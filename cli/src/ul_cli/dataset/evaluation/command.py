@@ -28,7 +28,6 @@ from ul import (
     OpenRouterDatasetSettings,
     ProviderDiagnosticError,
     load_dataset_semantic_settings,
-    semantic_deconstructor_identity,
 )
 from ul.dataset_invariants import (
     DatasetInvariantEvaluation,
@@ -52,12 +51,13 @@ from ul_cli.dataset.progress import (
     create_campaign_next_commands,
     create_campaign_progress_runtime,
 )
+from ul_cli.dataset.source_preparation import DatasetSourcePreparationFailureEvent
 from ul_cli.dataset_augmentation_ledger import (
     DatasetAugmentationGenerationContext,
     DatasetAugmentationLedger,
-    DatasetAugmentationLedgerSemanticSettings,
     create_dataset_augmentation_generation_context,
     create_private_augmentation_ledger,
+    dataset_augmentation_ledger_semantic_settings,
     open_augmentation_ledger_for_resume,
     read_augmentation_ledger,
 )
@@ -65,8 +65,8 @@ from ul_cli.dataset_campaign import create_dataset_campaign_plan
 from ul_cli.dataset_review import (
     DatasetEvidenceRunContext,
     DatasetResumeEvidence,
-    DatasetSourcePreparationFailureEvidence,
 )
+from ul_cli.dataset_run_config import DatasetRunConfig, TargetExecutionConfig
 from ul_cli.dataset_trial_journal import (
     DatasetRunManifest,
     DatasetTrialJournal,
@@ -155,7 +155,7 @@ def _resolve_target_timeout_seconds(
     recorded_manifest: DatasetRunManifest | None,
 ) -> float:
     recorded = (
-        recorded_manifest.effective_command.target_timeout_seconds
+        recorded_manifest.effective_command.run_config.target.trial_timeout_seconds
         if recorded_manifest is not None
         else _DEFAULT_TARGET_TIMEOUT_SECONDS
     )
@@ -734,17 +734,18 @@ def evaluate_dataset(
                 param_hint="--resume",
             )
         recorded_command = recorded_manifest_for_resume.effective_command
-        repetitions = repetitions or recorded_command.repetitions
+        recorded_run_config = recorded_command.run_config
+        repetitions = repetitions or recorded_run_config.repetitions
         max_environment_api_calls = (
-            max_environment_api_calls or recorded_command.max_environment_api_calls
+            max_environment_api_calls or recorded_run_config.target.max_environment_api_calls
         )
         allow_environment_network = (
-            allow_environment_network or recorded_command.allow_environment_network
+            allow_environment_network or recorded_run_config.target.allow_network_egress
         )
         confirm_test_environment = (
-            confirm_test_environment or recorded_command.confirm_test_environment
+            confirm_test_environment or recorded_run_config.target.test_environment_confirmed
         )
-        allow_insecure_http = allow_insecure_http or recorded_command.allow_insecure_http
+        allow_insecure_http = allow_insecure_http or recorded_run_config.target.allow_insecure_http
         if operator is None:
             operator = list(recorded_manifest_for_resume.selected_operator_ids)
         if data is None:
@@ -1050,6 +1051,19 @@ def evaluate_dataset(
                 f"exceeding --max-environment-api-calls {max_environment_api_calls}; reduce "
                 "--limit, --operator, or --repetitions, or explicitly raise the call budget"
             )
+        run_config = DatasetRunConfig(
+            evaluation_mode=evaluation_mode,
+            repetitions=repetitions,
+            target=TargetExecutionConfig(
+                trial_timeout_seconds=target_timeout_seconds,
+                max_environment_api_calls=max_environment_api_calls,
+                environment_api_calls_per_trial=target_calls_per_execution,
+                planned_environment_api_calls=initial_target_calls,
+                allow_network_egress=(allow_environment_network or loaded_local_target is not None),
+                test_environment_confirmed=confirm_test_environment,
+                allow_insecure_http=allow_insecure_http,
+            ),
+        )
         if not dry_run and resume is None:
             if output is None:
                 raise typer.BadParameter("execution requires --output", param_hint="--output")
@@ -1076,9 +1090,7 @@ def evaluate_dataset(
             build_dataset_evidence_run_context(
                 selected_records=selected_records,
                 selected_operator_ids=selected_operators,
-                evaluation_mode=evaluation_mode,
-                repetitions=repetitions,
-                target_timeout_seconds=target_timeout_seconds,
+                run_config=run_config,
                 invariant_suite=invariant_suite,
                 target_config=(
                     None if direct_http_target_receipt is not None else normalized_target_config
@@ -1103,22 +1115,7 @@ def evaluate_dataset(
                 dataset_operator_identity(operator_reference)
                 for operator_reference in selected_operators
             ),
-            semantic_settings=DatasetAugmentationLedgerSemanticSettings(
-                provider=settings.semantic_provider_id,
-                endpoint_sha256=settings.semantic_endpoint_sha256,
-                model=settings.model,
-                render_model=settings.render_model,
-                equivalence_model=settings.equivalence_model,
-                deconstruct_reasoning=settings.deconstruct_reasoning,
-                render_reasoning=settings.render_reasoning,
-                equivalence_reasoning=settings.equivalence_reasoning,
-                max_input_chars=settings.max_input_chars,
-                max_output_tokens=settings.max_output_tokens,
-                max_render_tokens=settings.max_render_tokens,
-                max_response_bytes=settings.max_response_bytes,
-                timeout_seconds=settings.timeout_seconds,
-                deconstructor_identity=semantic_deconstructor_identity(settings),
-            ),
+            semantic_settings=dataset_augmentation_ledger_semantic_settings(settings),
             redaction_policy_sha256=(
                 redaction_engine.policy.digest if redaction_engine is not None else None
             ),
@@ -1219,12 +1216,7 @@ def evaluate_dataset(
             run_context=run_context,
             selected_records=all_selected_records,
             selected_operator_ids=selected_operators,
-            repetitions=repetitions,
-            target_timeout_seconds=target_timeout_seconds,
-            max_environment_api_calls=max_environment_api_calls,
-            allow_environment_network=allow_environment_network,
-            confirm_test_environment=confirm_test_environment,
-            allow_insecure_http=allow_insecure_http,
+            run_config=run_config,
             save_augmentations=augmentations_output is not None,
             semantic_provider_type=settings.semantic_provider_type,
             semantic_base_url=settings.semantic_base_url,
@@ -1389,14 +1381,11 @@ def evaluate_dataset(
     campaign_plan = create_dataset_campaign_plan(
         records=selected_records,
         selected_operator_ids=selected_operators,
-        repetitions=repetitions,
-        target_calls_per_execution=target_calls_per_execution,
-        target_timeout_seconds=target_timeout_seconds,
+        run_config=run_config,
         settings=settings,
         saved_augmentations=saved_augmentations,
         show_sensitive_values=show_sensitive_values,
         requires_preflight=evaluator_preflight is None and bool(selected_records),
-        evaluation_mode=evaluation_mode,
         fixture_status=(
             run_context.fixture.status
             if run_context is not None and run_context.fixture is not None
@@ -1414,10 +1403,11 @@ def evaluate_dataset(
         ),
     )
     potential_target_calls = campaign_plan.calls.total_environment_api
-    if potential_target_calls > max_environment_api_calls:
+    if potential_target_calls > run_config.target.max_environment_api_calls:
         raise typer.BadParameter(
             f"remaining selection would make up to {potential_target_calls} environment API calls, "
-            f"exceeding --max-environment-api-calls {max_environment_api_calls}; reduce --limit, "
+            "exceeding --max-environment-api-calls "
+            f"{run_config.target.max_environment_api_calls}; reduce --limit, "
             "--operator, "
             "or --repetitions, or explicitly raise the call budget"
         )
@@ -1442,10 +1432,10 @@ def evaluate_dataset(
             target_header_environment_variables=(
                 loaded_target_config.headers_from_env if loaded_target_config is not None else {}
             ),
-            repetitions=repetitions,
-            target_timeout_seconds=target_timeout_seconds,
-            max_environment_api_calls=max_environment_api_calls,
-            target_calls_per_execution=target_calls_per_execution,
+            repetitions=run_config.repetitions,
+            target_timeout_seconds=run_config.target.trial_timeout_seconds,
+            max_environment_api_calls=run_config.target.max_environment_api_calls,
+            target_calls_per_execution=run_config.target.environment_api_calls_per_trial,
             target_supports_state_observation=(
                 json_http_environment_capabilities(loaded_target_config).supports_state_observation
                 if loaded_target_config is not None
@@ -1613,14 +1603,14 @@ def evaluate_dataset(
                 raise ValueError(
                     "HTTP execution requires --confirm-target with the exact displayed digest"
                 )
-            if not allow_environment_network:
+            if not run_config.target.allow_network_egress:
                 raise ValueError("environment execution requires --allow-environment-network")
             execution_target = JsonHttpEnvironmentConnection.from_config(
                 loaded_target_config,
-                test_environment_confirmed=True,
-                allow_insecure_http=allow_insecure_http,
-                timeout_seconds=target_timeout_seconds,
-                max_environment_api_calls=max_environment_api_calls,
+                test_environment_confirmed=run_config.target.test_environment_confirmed,
+                allow_insecure_http=run_config.target.allow_insecure_http,
+                timeout_seconds=run_config.target.trial_timeout_seconds,
+                max_environment_api_calls=run_config.target.max_environment_api_calls,
             )
     except ValueError as error:
         raise typer.BadParameter(
@@ -1661,7 +1651,7 @@ def evaluate_dataset(
         ),
         target_call_budget=campaign_plan.calls.total_environment_api,
         semantic_call_budget=campaign_plan.calls.total_semantic_model,
-        environment_call_budget=max_environment_api_calls,
+        environment_call_budget=run_config.target.max_environment_api_calls,
         token_budget=campaign_plan.tokens.maximum,
         maximum_wall_time_seconds=campaign_plan.timing.maximum_wall_time_seconds,
         next_commands=create_campaign_next_commands(output, resume_argv=resume_argv),
@@ -1804,7 +1794,7 @@ def evaluate_dataset(
     assert output_stream is not None
     assert finding_reference_context is not None
     invariant_evaluations: list[DatasetInvariantEvaluation] = []
-    source_preparation_failures: list[DatasetSourcePreparationFailureEvidence] = []
+    source_preparation_events: list[DatasetSourcePreparationFailureEvent] = []
     try:
         with output_stream:
             evaluation_parameters = inspect.signature(evaluate_interaction_records).parameters
@@ -1819,11 +1809,6 @@ def evaluate_dataset(
                 durable_arguments["progress_runtime"] = progress_runtime
             if "complete_progress" in evaluation_parameters or accepts_extra_arguments:
                 durable_arguments["complete_progress"] = False
-            if (
-                "environment_calls_per_target_call" in evaluation_parameters
-                or accepts_extra_arguments
-            ):
-                durable_arguments["environment_calls_per_target_call"] = target_calls_per_execution
             if trial_journal is not None and (
                 "trial_journal" in evaluation_parameters or accepts_extra_arguments
             ):
@@ -1832,10 +1817,8 @@ def evaluate_dataset(
                 "progress_json" in evaluation_parameters or accepts_extra_arguments
             ):
                 durable_arguments["progress_json"] = True
-            if "source_preparation_failures" in evaluation_parameters or accepts_extra_arguments:
-                durable_arguments["source_preparation_failures"] = source_preparation_failures
-            if "target_timeout_seconds" in evaluation_parameters or accepts_extra_arguments:
-                durable_arguments["target_timeout_seconds"] = target_timeout_seconds
+            if "source_preparation_events" in evaluation_parameters or accepts_extra_arguments:
+                durable_arguments["source_preparation_events"] = source_preparation_events
             evaluation_runner = cast(Any, evaluate_interaction_records)
             if invariant_suite is not None:
                 evaluation_coroutine = evaluation_runner(
@@ -1844,14 +1827,7 @@ def evaluate_dataset(
                     settings,
                     execution_target,
                     output_stream,
-                    repetitions=repetitions,
-                    max_environment_api_calls=max_environment_api_calls,
-                    planned_target_calls=(
-                        (len(selected_records) + skipped_count)
-                        * repetitions
-                        * (1 + len(selected_operators))
-                        * target_calls_per_execution
-                    ),
+                    run_config=run_config,
                     run_context=run_context,
                     augmentation_ledger=augmentation_ledger,
                     saved_augmentations=saved_augmentations,
@@ -1868,14 +1844,7 @@ def evaluate_dataset(
                     settings,
                     execution_target,
                     output_stream,
-                    repetitions=repetitions,
-                    max_environment_api_calls=max_environment_api_calls,
-                    planned_target_calls=(
-                        (len(selected_records) + skipped_count)
-                        * repetitions
-                        * (1 + len(selected_operators))
-                        * target_calls_per_execution
-                    ),
+                    run_config=run_config,
                     run_context=run_context,
                     augmentation_ledger=augmentation_ledger,
                     saved_augmentations=saved_augmentations,
@@ -1935,7 +1904,7 @@ def evaluate_dataset(
     progress_runtime.tracker.emit(status="running", stage="report")
     all_source_preparation_failures = (
         resume_evidence.source_preparation_failures if resume_evidence is not None else ()
-    ) + tuple(source_preparation_failures)
+    ) + tuple(event.evidence for event in source_preparation_events)
     try:
         print_dataset_results(
             results,
@@ -2034,8 +2003,9 @@ def _print_local_target_identity(target: ResolvedLocalTarget) -> None:
     print_dataset_plain(f"  Kind: {target.kind}")
     print_dataset_plain(f"  Config sha256: {target.config_sha256}")
     print_dataset_plain(f"  Confirmation sha256: {target.confirmation_sha256}")
+    print_dataset_plain(f"  Selected executable: {confirmation.selected_executable}")
     print_dataset_plain(
-        f"  Executable: {confirmation.executable.path} ({confirmation.executable.sha256})"
+        f"  Executable identity: {confirmation.executable.path} ({confirmation.executable.sha256})"
     )
     for artifact in confirmation.artifacts:
         print_dataset_plain(f"  Artifact: {artifact.path} ({artifact.sha256})")
@@ -2071,30 +2041,9 @@ def _manifest_incompatibility_reason(
             requested.target_timeout_seconds,
         ),
         (
-            "evaluator.provider",
-            recorded.semantic_settings.provider,
-            requested.semantic_settings.provider,
-        ),
-        (
-            "evaluator.endpoint_sha256",
-            recorded.semantic_settings.endpoint_sha256,
-            requested.semantic_settings.endpoint_sha256,
-        ),
-        ("evaluator.model", recorded.semantic_settings.model, requested.semantic_settings.model),
-        (
-            "evaluator.render_model",
-            recorded.semantic_settings.render_model,
-            requested.semantic_settings.render_model,
-        ),
-        (
-            "evaluator.equivalence_model",
-            recorded.semantic_settings.equivalence_model,
-            requested.semantic_settings.equivalence_model,
-        ),
-        (
-            "evaluator.materiality_model",
-            recorded.semantic_settings.materiality_model,
-            requested.semantic_settings.materiality_model,
+            "evaluator.llm_client",
+            recorded.semantic_settings.llm_client,
+            requested.semantic_settings.llm_client,
         ),
         (
             "evaluator.materiality_version",
@@ -2102,34 +2051,9 @@ def _manifest_incompatibility_reason(
             requested.semantic_settings.materiality_evaluator_version_id,
         ),
         (
-            "evaluator.reasoning",
-            (
-                recorded.semantic_settings.deconstruct_reasoning,
-                recorded.semantic_settings.render_reasoning,
-                recorded.semantic_settings.equivalence_reasoning,
-            ),
-            (
-                requested.semantic_settings.deconstruct_reasoning,
-                requested.semantic_settings.render_reasoning,
-                requested.semantic_settings.equivalence_reasoning,
-            ),
-        ),
-        (
-            "evaluator.limits",
-            (
-                recorded.semantic_settings.max_input_chars,
-                recorded.semantic_settings.max_output_tokens,
-                recorded.semantic_settings.max_render_tokens,
-                recorded.semantic_settings.max_response_bytes,
-                recorded.semantic_settings.timeout_seconds,
-            ),
-            (
-                requested.semantic_settings.max_input_chars,
-                requested.semantic_settings.max_output_tokens,
-                requested.semantic_settings.max_render_tokens,
-                requested.semantic_settings.max_response_bytes,
-                requested.semantic_settings.timeout_seconds,
-            ),
+            "evaluator.max_input_chars",
+            recorded.semantic_settings.max_input_chars,
+            requested.semantic_settings.max_input_chars,
         ),
         ("dataset", recorded.selected_dataset_sha256, requested.selected_dataset_sha256),
         ("redaction", recorded.redaction_policy_sha256, requested.redaction_policy_sha256),
@@ -2141,41 +2065,48 @@ def _restore_recorded_semantic_settings(
     manifest: DatasetRunManifest,
 ) -> DatasetSemanticSettings:
     recorded = manifest.run_context.semantic_settings
+    llm_client = recorded.llm_client
+    deconstruct = llm_client.role_config("deconstruct")
+    render = llm_client.role_config("render")
+    equivalence = llm_client.role_config("equivalence")
+    materiality = llm_client.role_config("materiality")
     command = manifest.effective_command
     if command.semantic_provider_type == "openai-compatible":
         return OpenAICompatibleDatasetSettings(
             live_calls=command.semantic_live_calls,
             allow_external_data_processing=command.semantic_allow_external_data_processing,
-            model=recorded.model,
-            render_model=recorded.render_model,
-            equivalence_model=recorded.equivalence_model,
-            materiality_model=recorded.materiality_model or recorded.model,
-            deconstruct_reasoning=recorded.deconstruct_reasoning,
-            render_reasoning=recorded.render_reasoning,
-            equivalence_reasoning=recorded.equivalence_reasoning,
+            model=deconstruct.model,
+            render_model=render.model,
+            equivalence_model=equivalence.model,
+            materiality_model=materiality.model,
+            deconstruct_reasoning=deconstruct.reasoning_mode,
+            render_reasoning=render.reasoning_mode,
+            equivalence_reasoning=equivalence.reasoning_mode,
             max_input_chars=recorded.max_input_chars,
-            max_output_tokens=recorded.max_output_tokens,
-            max_render_tokens=recorded.max_render_tokens,
-            max_response_bytes=recorded.max_response_bytes,
-            timeout_seconds=recorded.timeout_seconds,
-            provider_id=recorded.provider,
+            max_output_tokens=deconstruct.max_output_tokens,
+            max_render_tokens=render.max_output_tokens,
+            max_response_bytes=llm_client.max_response_bytes,
+            timeout_seconds=llm_client.timeout_seconds,
+            provider_id=llm_client.provider_id,
             base_url=command.semantic_base_url,
         )
+    assert llm_client.upstream_provider is not None
     return OpenRouterDatasetSettings(
         live_calls=command.semantic_live_calls,
         allow_external_data_processing=command.semantic_allow_external_data_processing,
-        model=recorded.model,
-        render_model=recorded.render_model,
-        equivalence_model=recorded.equivalence_model,
-        materiality_model=recorded.materiality_model or recorded.model,
-        deconstruct_reasoning=recorded.deconstruct_reasoning,
-        render_reasoning=recorded.render_reasoning,
-        equivalence_reasoning=recorded.equivalence_reasoning,
+        model=deconstruct.model,
+        render_model=render.model,
+        equivalence_model=equivalence.model,
+        materiality_model=materiality.model,
+        deconstruct_reasoning=deconstruct.reasoning_mode,
+        render_reasoning=render.reasoning_mode,
+        equivalence_reasoning=equivalence.reasoning_mode,
         max_input_chars=recorded.max_input_chars,
-        max_output_tokens=recorded.max_output_tokens,
-        max_render_tokens=recorded.max_render_tokens,
-        max_response_bytes=recorded.max_response_bytes,
-        timeout_seconds=recorded.timeout_seconds,
+        max_output_tokens=deconstruct.max_output_tokens,
+        max_render_tokens=render.max_output_tokens,
+        max_response_bytes=llm_client.max_response_bytes,
+        timeout_seconds=llm_client.timeout_seconds,
+        upstream_provider=llm_client.upstream_provider,
     )
 
 
@@ -2186,6 +2117,7 @@ def _effective_command_incompatibility_reason(
     left = recorded.effective_command
     right = requested.effective_command
     checks = (
+        ("run_config", left.run_config, right.run_config),
         ("invariant_suite_source", left.invariant_suite_source, right.invariant_suite_source),
         ("redaction_policy_source", left.redaction_policy_source, right.redaction_policy_source),
         ("redaction_state_path", left.redaction_state_path, right.redaction_state_path),
@@ -2208,17 +2140,6 @@ def _effective_command_incompatibility_reason(
             "augmentations_output_path",
             left.augmentations_output_path,
             right.augmentations_output_path,
-        ),
-        ("repetitions", left.repetitions, right.repetitions),
-        (
-            "target_timeout_seconds",
-            left.target_timeout_seconds,
-            right.target_timeout_seconds,
-        ),
-        (
-            "max_environment_api_calls",
-            left.max_environment_api_calls,
-            right.max_environment_api_calls,
         ),
     )
     return next((name for name, old, new in checks if old != new), None)

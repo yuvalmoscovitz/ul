@@ -20,7 +20,6 @@ from ul import (
     EvaluatorModelPreflight,
     InteractionRecord,
     OpenAICompatibleEvaluatorJudge,
-    OpenAICompatibleJudgeConfig,
     ProjectedResponseSemanticDeconstructor,
     RedactedSemanticPipeline,
     RedactionEngine,
@@ -34,18 +33,18 @@ from ul.dataset_invariants import (
 from ul.http_environment import JsonHttpEnvironmentConnection
 from ul.local_target import LocalTargetConnection
 
+from ul_cli.dataset.source_preparation import (
+    DatasetSourcePreparationFailureEvent,
+    build_source_preparation_failure_event,
+    persist_source_preparation_failure_event,
+)
 from ul_cli.dataset_augmentation_ledger import DatasetAugmentationLedger
 from ul_cli.dataset_campaign import DatasetCampaignPlan
-from ul_cli.dataset_review import (
-    DatasetEvidenceRunContext,
-    DatasetSourcePreparationFailureEvidence,
-)
+from ul_cli.dataset_review import DatasetEvidenceRunContext
+from ul_cli.dataset_run_config import DatasetRunConfig
 from ul_cli.dataset_trial_journal import DatasetTrialJournal
 
-from ..evidence.customer import (
-    build_customer_evidence_record,
-    build_source_preparation_failure_evidence,
-)
+from ..evidence.customer import build_customer_evidence_record
 from ..progress import (
     CampaignControlRequested,
     CampaignNextCommands,
@@ -67,17 +66,13 @@ async def evaluate_interaction_records(
     target: JsonHttpEnvironmentConnection | LocalTargetConnection,
     output_stream: TextIO,
     *,
-    repetitions: int,
-    max_environment_api_calls: int,
-    planned_target_calls: int,
-    target_timeout_seconds: float = 30.0,
+    run_config: DatasetRunConfig,
     run_context: DatasetEvidenceRunContext | None = None,
     augmentation_ledger: DatasetAugmentationLedger | None = None,
     saved_augmentations: dict[str, DatasetAugmentationResult] | None = None,
     invariant_suite: DatasetInvariantSuite | None = None,
     invariant_evaluations: list[DatasetInvariantEvaluation] | None = None,
     redaction_engine: RedactionEngine | None = None,
-    allow_network_egress: bool = True,
     evaluator_preflight: EvaluatorModelPreflight,
     trial_journal: DatasetTrialJournal | None = None,
     progress_json: bool = False,
@@ -85,12 +80,11 @@ async def evaluate_interaction_records(
     progress_next_commands: CampaignNextCommands | None = None,
     progress_runtime: CampaignProgressRuntime | None = None,
     complete_progress: bool = True,
-    environment_calls_per_target_call: int = 1,
     isolate_source_preparation_failures: bool = True,
-    source_preparation_failures: list[DatasetSourcePreparationFailureEvidence] | None = None,
+    source_preparation_events: list[DatasetSourcePreparationFailureEvent] | None = None,
 ) -> tuple[DatasetEvaluationResult, ...]:
-    if environment_calls_per_target_call < 1:
-        raise ValueError("environment calls per target call must be positive")
+    repetitions = run_config.repetitions
+    target_config = run_config.target
     results: list[DatasetEvaluationResult] = []
     work_upper_bound = len(records) * repetitions * (1 + len(operator_ids))
     semantic_call_budget = progress_plan.calls.total_semantic_model if progress_plan else 0
@@ -103,12 +97,12 @@ async def evaluate_interaction_records(
         progress_runtime = create_campaign_progress_runtime(
             case_count=len(records),
             work_upper_bound=work_upper_bound,
-            target_call_budget=planned_target_calls,
+            target_call_budget=target_config.planned_environment_api_calls,
             semantic_call_budget=semantic_call_budget,
-            environment_call_budget=max_environment_api_calls,
+            environment_call_budget=target_config.max_environment_api_calls,
             token_budget=token_budget,
             maximum_wall_time_seconds=(
-                max(1, work_upper_bound) * target_timeout_seconds
+                max(1, work_upper_bound) * target_config.trial_timeout_seconds
                 + semantic_call_budget * semantic_timeout_seconds
             ),
             next_commands=progress_next_commands,
@@ -120,7 +114,9 @@ async def evaluate_interaction_records(
     initial_target_calls, _, initial_environment_calls, _ = progress_tracker.actual_usage
     actual_target_calls = 0
     active_trial: tuple[int, DatasetTrialUnit] | None = None
-    had_source_preparation_failure = False
+    recorded_source_preparation_events = (
+        source_preparation_events if source_preparation_events is not None else []
+    )
 
     def durable_flush() -> None:
         if trial_journal is not None:
@@ -140,23 +136,7 @@ async def evaluate_interaction_records(
     deconstructor.reuse_preflight(evaluator_preflight)
     if not settings.allow_external_data_processing:
         raise ValueError("material variance judging requires external data processing approval")
-    materiality_judge = OpenAICompatibleEvaluatorJudge(
-        OpenAICompatibleJudgeConfig(
-            base_url=settings.semantic_base_url,
-            model=settings.materiality_model,
-            api_key=settings.api_key,
-            allow_external_data_processing=settings.allow_external_data_processing,
-            data_policy=(
-                "openrouter_zdr"
-                if settings.semantic_provider_type == "openrouter"
-                else "provider_default"
-            ),
-            timeout_seconds=settings.timeout_seconds,
-            max_output_tokens=512,
-            token_parameter="max_tokens",
-            max_response_bytes=settings.max_response_bytes,
-        )
-    )
+    materiality_judge = OpenAICompatibleEvaluatorJudge(llm_client=deconstructor.llm_client)
     material_variance_evaluator = DatasetMaterialVarianceJudge(
         materiality_judge,
         max_input_chars=settings.max_input_chars,
@@ -187,13 +167,9 @@ async def evaluate_interaction_records(
                 ),
                 evaluation_deconstructor,
                 evaluation_target,
-                target_timeout_seconds=target_timeout_seconds,
-                allow_network_egress=allow_network_egress,
-                evaluation_mode=(
-                    run_context.evaluation_mode
-                    if run_context is not None and run_context.evaluation_mode is not None
-                    else "variance"
-                ),
+                target_timeout_seconds=target_config.trial_timeout_seconds,
+                allow_network_egress=target_config.allow_network_egress,
+                evaluation_mode=run_config.evaluation_mode,
                 source_outcome_projection=source_outcome_projection,
                 material_variance_evaluator=material_variance_evaluator,
             )
@@ -299,7 +275,6 @@ async def evaluate_interaction_records(
                         trial_terminal_callback=trial_terminal,
                     )
                 except DatasetSourcePreparationError as error:
-                    had_source_preparation_failure = True
                     if not isolate_source_preparation_failures:
                         raise
                     if active_trial is not None:
@@ -310,24 +285,24 @@ async def evaluate_interaction_records(
                         raise AssertionError(
                             "source preparation failure evidence requires a run context"
                         ) from error
-                    failure_evidence = build_source_preparation_failure_evidence(
+                    failure_event = build_source_preparation_failure_event(
                         record,
                         error,
                         repetitions=repetitions,
-                        max_environment_api_calls=max_environment_api_calls,
-                        planned_target_calls=planned_target_calls,
+                        max_environment_api_calls=target_config.max_environment_api_calls,
+                        planned_target_calls=target_config.planned_environment_api_calls,
                         run_context=run_context,
                     )
-                    output_stream.write(
-                        json.dumps(
-                            failure_evidence.model_dump(mode="json", exclude_none=True),
-                            ensure_ascii=False,
-                        )
-                        + "\n"
+                    if any(
+                        event.interaction_id == failure_event.interaction_id
+                        for event in recorded_source_preparation_events
+                    ):
+                        raise ValueError("source preparation failure was recorded twice") from error
+                    failure_event = persist_source_preparation_failure_event(
+                        failure_event,
+                        output_stream,
+                        durable_flush,
                     )
-                    durable_flush()
-                    if source_preparation_failures is not None:
-                        source_preparation_failures.append(failure_evidence)
                     failed_units = 0
                     units = [
                         DatasetTrialUnit(
@@ -354,13 +329,19 @@ async def evaluate_interaction_records(
                         ):
                             continue
                         if trial_journal is not None:
-                            trial_journal.terminal(unit, "errored", error.code)
+                            trial_journal.terminal(
+                                unit,
+                                "errored",
+                                failure_event.failure_category,
+                            )
                         failed_units += 1
                     if failed_units:
                         progress_tracker.source_preparation_failed(
                             case_number=case_number,
                             failed_units=failed_units,
+                            event=failure_event,
                         )
+                    recorded_source_preparation_events.append(failure_event)
                     continue
                 except (DatasetTargetDeliveryUncertain, asyncio.CancelledError):
                     signal_control.target_call_finished()
@@ -396,7 +377,7 @@ async def evaluate_interaction_records(
                         None
                         if initial_environment_calls is None
                         else initial_environment_calls
-                        + actual_target_calls * environment_calls_per_target_call
+                        + actual_target_calls * target_config.environment_api_calls_per_trial
                     ),
                     tokens=None,
                 )
@@ -410,8 +391,8 @@ async def evaluate_interaction_records(
                         build_customer_evidence_record(
                             result,
                             repetitions=repetitions,
-                            max_environment_api_calls=max_environment_api_calls,
-                            planned_target_calls=planned_target_calls,
+                            max_environment_api_calls=target_config.max_environment_api_calls,
+                            planned_target_calls=target_config.planned_environment_api_calls,
                             run_context=run_context,
                             invariant_evaluation=invariant_evaluation,
                         ),
@@ -423,7 +404,7 @@ async def evaluate_interaction_records(
                 results.append(result)
     if complete_progress:
         progress_tracker.emit(
-            status="failed" if had_source_preparation_failure else "completed",
+            status="failed" if recorded_source_preparation_events else "completed",
             stage="terminal",
         )
     return tuple(results)

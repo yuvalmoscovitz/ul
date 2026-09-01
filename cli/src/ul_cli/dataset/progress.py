@@ -12,7 +12,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from types import FrameType
-from typing import Literal, Protocol
+from typing import TYPE_CHECKING, Literal, Protocol
 
 from pydantic import ConfigDict, Field, model_validator
 from rich.console import Console
@@ -20,6 +20,9 @@ from ul import DatasetEvaluationTrial, DatasetTrialUnit
 from ul_core.models import ULModel
 
 from ul_cli.progress_action import create_progress_action
+
+if TYPE_CHECKING:
+    from ul_cli.dataset.source_preparation import DatasetSourcePreparationFailureEvent
 
 CampaignStage = Literal[
     "smoke",
@@ -382,9 +385,17 @@ class CampaignProgressTracker:
             environment="reusable",
         )
 
-    def source_preparation_failed(self, *, case_number: int, failed_units: int) -> None:
+    def source_preparation_failed(
+        self,
+        *,
+        case_number: int,
+        failed_units: int,
+        event: DatasetSourcePreparationFailureEvent,
+    ) -> None:
         if failed_units < 1:
             raise ValueError("source preparation failure must terminate at least one trial unit")
+        if event.durability_state != "persisted":
+            raise ValueError("source preparation progress requires durable evidence")
         self._failed += failed_units
         self.emit(
             status="running",

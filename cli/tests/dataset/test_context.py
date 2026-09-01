@@ -16,6 +16,7 @@ from ul_cli.dataset.evidence import context as context_module
 from ._factories import (
     _evaluation_result,
     _isolated_response_target_config,
+    _run_config,
     _run_context,
     _settings,
 )
@@ -49,9 +50,13 @@ def test_run_context_binds_explicit_reasoning_omission() -> None:
         ),
     )
 
-    assert omitted.semantic_settings.deconstruct_reasoning == "omitted"
-    assert omitted.semantic_settings.render_reasoning == "omitted"
-    assert omitted.semantic_settings.equivalence_reasoning == "required"
+    assert omitted.semantic_settings.llm_client.role_config("deconstruct").reasoning_mode == (
+        "omitted"
+    )
+    assert omitted.semantic_settings.llm_client.role_config("render").reasoning_mode == "omitted"
+    assert omitted.semantic_settings.llm_client.role_config("equivalence").reasoning_mode == (
+        "required"
+    )
     assert omitted.context_sha256 != required.context_sha256
 
 
@@ -114,7 +119,7 @@ def test_run_context_records_canonical_provider_identity() -> None:
     custom_context = context_module.build_dataset_evidence_run_context(
         selected_records=(record,),
         selected_operator_ids=("input.surface.rephrase",),
-        repetitions=1,
+        run_config=_run_config(),
         invariant_suite=None,
         target_config=JsonHttpEnvironmentConfig.model_validate(
             {
@@ -146,7 +151,9 @@ def test_run_context_records_canonical_provider_identity() -> None:
         settings=custom_settings,
     )
 
-    assert custom_context.semantic_settings.provider == "customer-gateway"
-    assert len(custom_context.semantic_settings.endpoint_sha256) == 64
+    assert custom_context.semantic_settings.llm_client.provider_id == "customer-gateway"
+    assert custom_context.semantic_settings.llm_client.upstream_provider is None
+    assert openrouter_context.semantic_settings.llm_client.upstream_provider == "test-provider"
+    assert len(custom_context.semantic_settings.llm_client.endpoint_sha256) == 64
     assert "https://models.example.test/v1" not in custom_context.model_dump_json()
     assert custom_context.context_sha256 != openrouter_context.context_sha256

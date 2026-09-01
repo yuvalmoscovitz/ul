@@ -57,9 +57,12 @@ from ul.dataset_invariants import (
 from ul.dataset_regression import dataset_regression_target_config_sha256
 from ul.environment import validate_outcome_projection_evidence
 from ul.http_environment import JsonHttpIsolatedResponseConfig, JsonHttpTargetConfig
+from ul.llm import LLMClientIdentity
 from ul.outcome_projection import OutcomeProjection
 from ul_core.augmentations.definitions import builtin_augmentation_catalog
 
+from ul_cli.dataset_run_config import DatasetRunConfig
+from ul_cli.invariant_findings import is_reproduced_invariant_difference
 from ul_cli.pattern_identity import (
     PatternIdentityKeyError,
     ReviewHistoryKeyError,
@@ -236,20 +239,8 @@ class DatasetEvidenceOperator(_StrictModel):
 
 
 class DatasetEvidenceSemanticSettings(_StrictModel):
-    provider: str = Field(min_length=1, max_length=100)
-    endpoint_sha256: str = Field(pattern=_SHA256_PATTERN)
-    model: str
-    render_model: str
-    equivalence_model: str
-    materiality_model: str | None = None
-    deconstruct_reasoning: Literal["required", "omitted"] = "required"
-    render_reasoning: Literal["required", "omitted"] = "required"
-    equivalence_reasoning: Literal["required", "omitted"] = "required"
+    llm_client: LLMClientIdentity
     max_input_chars: int = Field(ge=1)
-    max_output_tokens: int = Field(ge=1)
-    max_render_tokens: int = Field(ge=1)
-    max_response_bytes: int = Field(ge=1)
-    timeout_seconds: float = Field(gt=0)
     deconstructor_identity: SemanticDeconstructorIdentity | None = None
     materiality_evaluator_version_id: str | None = Field(
         default=None,
@@ -357,16 +348,6 @@ class DatasetEvidenceRunContext(_StrictModel):
             context_content.pop("redaction_policy_sha256")
         if not self.redaction_coverage:
             context_content.pop("redaction_coverage")
-        if self.semantic_settings.deconstructor_identity is None:
-            cast(dict[str, object], context_content["semantic_settings"]).pop(
-                "deconstructor_identity"
-            )
-        if self.semantic_settings.materiality_model is None:
-            cast(dict[str, object], context_content["semantic_settings"]).pop("materiality_model")
-        if self.semantic_settings.materiality_evaluator_version_id is None:
-            cast(dict[str, object], context_content["semantic_settings"]).pop(
-                "materiality_evaluator_version_id"
-            )
         if "target_timeout_seconds" not in self.model_fields_set:
             context_content.pop("target_timeout_seconds")
         expected_context_sha256 = _canonical_json_sha256(context_content)
@@ -652,9 +633,7 @@ def create_dataset_evidence_run_context(
     *,
     selected_records: tuple[InteractionRecord, ...],
     operators: tuple[tuple[str, str], ...],
-    evaluation_mode: Literal["variance"] = "variance",
-    repetitions: int,
-    target_timeout_seconds: float = 30.0,
+    run_config: DatasetRunConfig,
     invariant_suite_sha256: str | None,
     target_config: JsonHttpTargetConfig | None = None,
     target_receipt: dict[str, JsonValue] | None = None,
@@ -694,13 +673,13 @@ def create_dataset_evidence_run_context(
         "pipeline_version": _DATASET_EVALUATION_PIPELINE_VERSION,
         "selected_dataset_sha256": selected_dataset_sha256,
         "operators": [operator.model_dump(mode="json") for operator in operator_snapshots],
-        "evaluation_mode": evaluation_mode,
-        "repetitions": repetitions,
-        "target_timeout_seconds": target_timeout_seconds,
+        "evaluation_mode": run_config.evaluation_mode,
+        "repetitions": run_config.repetitions,
+        "target_timeout_seconds": run_config.target.trial_timeout_seconds,
         "invariant_suite_sha256": invariant_suite_sha256,
         "target": target.model_dump(mode="json"),
         "fixture": fixture.model_dump(mode="json"),
-        "semantic_settings": semantic_settings.model_dump(mode="json", exclude_none=True),
+        "semantic_settings": semantic_settings.model_dump(mode="json"),
     }
     if redaction_policy_sha256 is not None:
         content["redaction_policy_sha256"] = redaction_policy_sha256
@@ -711,9 +690,9 @@ def create_dataset_evidence_run_context(
     return DatasetEvidenceRunContext(
         selected_dataset_sha256=selected_dataset_sha256,
         operators=operator_snapshots,
-        evaluation_mode=evaluation_mode,
-        repetitions=repetitions,
-        target_timeout_seconds=target_timeout_seconds,
+        evaluation_mode=run_config.evaluation_mode,
+        repetitions=run_config.repetitions,
+        target_timeout_seconds=run_config.target.trial_timeout_seconds,
         invariant_suite_sha256=invariant_suite_sha256,
         target=target,
         fixture=fixture,
@@ -1307,10 +1286,10 @@ def _summarize_dataset_evidence(
                 declared_severity=variation_rule.severity,
                 review_status=review_status,
                 review_severity=review_severity,
-                requested_repetitions=observations.requested_repetitions,
-                conclusive_repetitions=observations.observed_repetitions,
-                inconclusive_repetitions=observations.inconclusive_repetitions,
-                stability=observations.stability,
+                requested_repetitions=len(variation_rule.trials),
+                conclusive_repetitions=len(variation_rule.trials),
+                inconclusive_repetitions=0,
+                stability="stable",
                 evidence_authorities=(
                     "customer_declared",
                     "deterministic_evaluator",
@@ -1399,6 +1378,21 @@ def _summarize_dataset_evidence(
                 )
                 if observations is None:
                     raise AssertionError("violated invariant rules require observations")
+                conclusive_repetitions = sum(
+                    trial.status != "not_evaluable" for trial in rule.trials
+                )
+                inconclusive_repetitions = len(rule.trials) - conclusive_repetitions
+                conclusive_statuses = {
+                    trial.status for trial in rule.trials if trial.status != "not_evaluable"
+                }
+                rule_stability = (
+                    "stable"
+                    if not inconclusive_repetitions and len(conclusive_statuses) == 1
+                    else "unstable"
+                    if len(conclusive_statuses) > 1
+                    else "inconclusive"
+                )
+                non_promoted_inconclusive = operator_id is not None or rule_stability != "stable"
                 finding_summaries.append(
                     FindingSummary(
                         kind="customer_invariant_violation",
@@ -1408,10 +1402,12 @@ def _summarize_dataset_evidence(
                         rule_id=rule.rule_id,
                         rule_version=rule.rule_version,
                         declared_severity=rule.severity,
-                        requested_repetitions=observations.requested_repetitions,
-                        conclusive_repetitions=observations.observed_repetitions,
-                        inconclusive_repetitions=observations.inconclusive_repetitions,
-                        stability=observations.stability,
+                        review_status=("inconclusive" if non_promoted_inconclusive else None),
+                        review_severity=("unrated" if non_promoted_inconclusive else None),
+                        requested_repetitions=len(rule.trials),
+                        conclusive_repetitions=conclusive_repetitions,
+                        inconclusive_repetitions=inconclusive_repetitions,
+                        stability=rule_stability,
                         violated_repetitions=sum(
                             trial.status == "violated" for trial in rule.trials
                         ),
@@ -2151,8 +2147,13 @@ def report_dataset_evidence(
             )
             _print_plain(f"Description: {variation_rule.description}")
         _print_plain("Test variation: " + case.operator_id.replace(".", " / ").replace("_", " "))
+        stability_label = (
+            "Evidence stability"
+            if indexed_finding.semantic_finding is not None
+            else "Full-response stability"
+        )
         _print_plain(
-            "Evidence stability: original="
+            f"{stability_label}: original="
             + _observations_summary(loaded_record.evidence.current_baseline.observations)
             + "; variation="
             + _observations_summary(case.observations)
@@ -2163,6 +2164,11 @@ def report_dataset_evidence(
             if baseline_rule is None or variation_rule is None:
                 raise AssertionError("invariant finding requires both rule results")
             _print_plain(
+                f"Invariant repetitions: original satisfied={len(baseline_rule.trials)}/"
+                f"{len(baseline_rule.trials)}; variation violated="
+                f"{len(variation_rule.trials)}/{len(variation_rule.trials)}"
+            )
+            _print_plain(
                 f"Rule transition: original={baseline_rule.status}; "
                 f"variation={variation_rule.status}"
             )
@@ -2171,6 +2177,10 @@ def report_dataset_evidence(
                     f"Variation rule trial {trial.repetition}: {trial.status}; "
                     f"{_invariant_trial_location(trial)}; reason={trial.reason_code}"
                 )
+            _print_plain(
+                "Finding limitations: causality not established; production prevalence not "
+                "measured; whole-task correctness not established."
+            )
         if show_sensitive_values and indexed_finding.finding_id == sensitive_finding_id:
             for sensitive_line in sensitive_lines:
                 _print_sensitive_plain(sensitive_line)
@@ -2987,7 +2997,7 @@ def _index_findings(
                 baseline_rule = baseline_rules.get(variation_rule.rule_id)
                 if baseline_rule is None:
                     raise _ReviewInputError("invariant variation rule is missing from the baseline")
-                if baseline_rule.status != "satisfied" or variation_rule.status != "violated":
+                if not is_reproduced_invariant_difference(baseline_rule, variation_rule):
                     continue
                 finding_id = _invariant_finding_id(
                     finding_id_prefix,
