@@ -966,7 +966,7 @@ def probe(
                         ("--target-working-directory", str(target_working_directory.resolve()))
                     )
                 if target_interpreter is not None:
-                    resume_argv.extend(("--target-interpreter", str(target_interpreter.resolve())))
+                    resume_argv.extend(("--target-interpreter", str(target_interpreter.absolute())))
                 for name in target_environment_variable or ():
                     resume_argv.extend(("--target-environment-variable", name))
             if allow_insecure_http:
@@ -2369,7 +2369,7 @@ def _print_stronger_run(
                 ("--target-working-directory", str(target_working_directory.resolve()))
             )
         if target_interpreter is not None:
-            arguments.extend(("--target-interpreter", str(target_interpreter.resolve())))
+            arguments.extend(("--target-interpreter", str(target_interpreter.absolute())))
         for name in target_environment_variables:
             arguments.extend(("--target-environment-variable", name))
     for artifact in target_artifacts:

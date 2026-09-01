@@ -9,6 +9,7 @@ import re
 import stat
 import sys
 import threading
+import venv
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from types import SimpleNamespace
@@ -664,6 +665,11 @@ def test_probe_resume_action_preserves_direct_local_target_options(
 ) -> None:
     _write_callable(tmp_path)
     dataset = _write_dataset(tmp_path)
+    virtualenv = tmp_path / ".venv"
+    venv.EnvBuilder(with_pip=False, symlinks=os.name != "nt").create(virtualenv)
+    interpreter = (
+        virtualenv / "Scripts" / "python.exe" if os.name == "nt" else virtualenv / "bin" / "python"
+    )
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("CUSTOMER_AGENT_TOKEN", "private-agent-key")
     created_runtimes: list[object] = []
@@ -686,7 +692,7 @@ def test_probe_resume_action_preserves_direct_local_target_options(
             "--target-working-directory",
             str(tmp_path),
             "--target-interpreter",
-            sys.executable,
+            str(interpreter),
             "--target-environment-variable",
             "CUSTOMER_AGENT_TOKEN",
         ],
@@ -699,9 +705,7 @@ def test_probe_resume_action_preserves_direct_local_target_options(
     resume_argv = progress_action_module._read_progress_action(public_resume_argv[-1]).argv
     assert resume_argv[resume_argv.index("--target") + 1] == "customer_agent:run"
     assert resume_argv[resume_argv.index("--target-working-directory") + 1] == str(tmp_path)
-    assert resume_argv[resume_argv.index("--target-interpreter") + 1] == str(
-        Path(sys.executable).resolve()
-    )
+    assert resume_argv[resume_argv.index("--target-interpreter") + 1] == str(interpreter.absolute())
     assert "CUSTOMER_AGENT_TOKEN" in resume_argv
 
 
@@ -2437,6 +2441,11 @@ def test_stronger_run_preserves_canonical_local_target_configuration(
     dataset = _write_dataset(tmp_path)
     output = tmp_path / ".ul" / "runs" / "evidence.jsonl"
     config_path = tmp_path / "target.json"
+    virtualenv = tmp_path / ".venv"
+    venv.EnvBuilder(with_pip=False, symlinks=os.name != "nt").create(virtualenv)
+    interpreter = (
+        virtualenv / "Scripts" / "python.exe" if os.name == "nt" else virtualenv / "bin" / "python"
+    )
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("CUSTOMER_AGENT_TOKEN", "private-agent-key")
     monkeypatch.setenv("UL_LIVE", "true")
@@ -2468,7 +2477,7 @@ def test_stronger_run_preserves_canonical_local_target_configuration(
         "--target-working-directory",
         str(tmp_path),
         "--target-interpreter",
-        sys.executable,
+        str(interpreter),
         "--target-environment-variable",
         "CUSTOMER_AGENT_TOKEN",
         "--output",
@@ -2490,7 +2499,7 @@ def test_stronger_run_preserves_canonical_local_target_configuration(
     else:
         assert "--target customer_agent:run" in stronger_command
         assert f"--target-working-directory {tmp_path}" in stronger_command
-        assert f"--target-interpreter {Path(sys.executable).resolve()}" in stronger_command
+        assert f"--target-interpreter {interpreter.absolute()}" in stronger_command
         assert "--target-environment-variable CUSTOMER_AGENT_TOKEN" in stronger_command
     assert "private-agent-key" not in stronger_command
 

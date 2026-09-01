@@ -497,6 +497,12 @@ class _LocalTargetInvoker:
         with _open_executable_identity(executable_path) as (descriptor, identity):
             if identity != self._executable_identity:
                 raise _ExecutableIdentityError
+            if (
+                isinstance(self._config, PythonCallableTargetConfig)
+                and sys.platform != "win32"
+                and executable_path != identity.resolved_path
+            ):
+                environment["__PYVENV_LAUNCHER__"] = str(executable_path)
             command = _supervised_target_command(
                 self._config,
                 identity,
@@ -661,7 +667,11 @@ class _LocalTargetInvoker:
                     "response_mapping",
                     delivery_uncertain=delivery_uncertain,
                 )
-            if error_message.code == "target_load_failed":
+            if (
+                error_message.code == "target_load_failed"
+                and isinstance(self._config, PythonCallableTargetConfig)
+                and message.get("type") == "start"
+            ):
                 raise _LocalTargetFailure(
                     "target_load_failed",
                     delivery_uncertain=False,
@@ -866,7 +876,7 @@ def _supervised_target_command(
 ) -> tuple[str, ...]:
     target_command = _target_command(config)
     if platform != "win32":
-        return target_command
+        return (str(identity.resolved_path), *target_command[1:])
     supervisor = Path(__file__).with_name("_windows_job_worker.py").resolve()
     return (
         sys.executable,

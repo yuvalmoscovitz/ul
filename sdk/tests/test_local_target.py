@@ -662,6 +662,10 @@ def _write_failure_worker(tmp_path: Path, behavior: str) -> Path:
         "crash": "exit 9",
         "malformed": "printf '%s\\n' 'not-json'",
         "oversized": "/usr/bin/printf '%010000d\\n' 0",
+        "target_load_failed": (
+            'printf \'{"protocol_version":"1.0.0","type":"error",'
+            '"request_id":"%s","code":"target_load_failed"}\\n\' "$request_id"'
+        ),
         "shutdown_hang": (
             'printf \'{"protocol_version":"1.0.0","type":"result",'
             '"request_id":"%s","response":"ok","execution_events":[]}\\n\' '
@@ -807,6 +811,33 @@ def test_windows_python_worker_uses_selected_scripts_interpreter_layout(tmp_path
     assert supervised[separator + 1] == str(selected_interpreter)
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX executable symlink layout")
+def test_posix_python_command_remains_pinned_when_selected_symlink_is_swapped(
+    tmp_path: Path,
+) -> None:
+    confirmed_interpreter = tmp_path / "confirmed-python"
+    replacement_interpreter = tmp_path / "replacement-python"
+    confirmed_interpreter.write_bytes(Path(sys.executable).read_bytes())
+    replacement_interpreter.write_bytes(Path(sys.executable).read_bytes())
+    confirmed_interpreter.chmod(0o700)
+    replacement_interpreter.chmod(0o700)
+    selected_interpreter = tmp_path / "python"
+    selected_interpreter.symlink_to(confirmed_interpreter)
+    config = _python_config(tmp_path, "customer_agent:run").model_copy(
+        update={"interpreter": selected_interpreter}
+    )
+
+    with _open_executable_identity(selected_interpreter) as (_, identity):
+        supervised = _supervised_target_command(config, identity, platform=sys.platform)
+        selected_interpreter.unlink()
+        selected_interpreter.symlink_to(replacement_interpreter)
+        selected_interpreter.unlink()
+        selected_interpreter.symlink_to(confirmed_interpreter)
+
+    assert supervised[0] == str(confirmed_interpreter)
+    assert supervised[0] != str(selected_interpreter)
+
+
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX executable-script test")
 @pytest.mark.parametrize(
     ("behavior", "expected_code"),
@@ -814,6 +845,7 @@ def test_windows_python_worker_uses_selected_scripts_interpreter_layout(tmp_path
         ("crash", "transport_failed"),
         ("malformed", "invalid_json"),
         ("oversized", "response_too_large"),
+        ("target_load_failed", "environment_lifecycle_error"),
     ],
 )
 @pytest.mark.asyncio
@@ -834,6 +866,8 @@ async def test_command_failures_become_deterministic_safe_evidence(
     assert evidence.lifecycle.terminal_status == "failed"
     assert evidence.lifecycle.failure_code == expected_code
     assert evidence.lifecycle.failure_reason == "probe invocation failed"
+    if behavior == "target_load_failed":
+        assert evidence.lifecycle.delivery == "uncertain"
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX executable-script test")
