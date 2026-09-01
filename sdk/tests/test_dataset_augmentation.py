@@ -2631,6 +2631,12 @@ async def test_llm_operator_retries_an_unchanged_generation_once() -> None:
     assert (
         "renderer did not change the source input" in candidate.renderer_metadata["retry_reasons"]
     )
+    grammar_instruction = next(
+        operator.instruction
+        for operator in builtin_dataset_augmentation_operators()
+        if operator.id == "input.surface.grammar_error"
+    )
+    assert grammar_instruction in model.rendered_instructions[1]
     assert "previous attempt was invalid" in model.rendered_instructions[1]
 
 
