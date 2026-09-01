@@ -1357,7 +1357,7 @@ def test_resume_rejects_changed_evaluation_plan(tmp_path: Path) -> None:
             "--environment-config",
             str(target_config),
             "--operator",
-            "input.tone.frustrated",
+            "input.style.terse",
             "--repetitions",
             "1",
             "--resume",

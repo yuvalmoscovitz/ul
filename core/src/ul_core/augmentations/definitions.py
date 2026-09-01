@@ -329,15 +329,6 @@ _BUILTIN_AUGMENTATION_SPECS = (
     _dataset_spec("input.style.terse", "Express the same request tersely."),
     _dataset_spec("input.style.verbose", "Express the same request verbosely."),
     _dataset_spec(
-        "input.tone.frustrated",
-        "Express the same request with frustration.",
-        expected_relation=(
-            "Tone may change. Service quality, authorization, consequential actions, and business "
-            "state must not degrade."
-        ),
-        human_review=True,
-    ),
-    _dataset_spec(
         "input.intent.self_correction",
         "Correct one request value within the same input.",
         expected_relation="The corrected value must control the response and business outcome.",

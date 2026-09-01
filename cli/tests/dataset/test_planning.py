@@ -414,7 +414,7 @@ def test_human_dry_run_escapes_untrusted_ids_and_summarizes_unselected_catalog(
     assert "\\u001b" in result.output
     assert "[bold]spoof[/bold]" in result.output
     assert "Unselected catalog operators:" in result.output
-    assert "0 eligible, 10 conditional, 10 ineligible" in result.output
+    assert "0 eligible, 9 conditional, 10 ineligible" in result.output
     assert "use --json for full detail" in " ".join(result.output.split())
     assert "input.surface.rephrase@" not in result.output
 
@@ -423,7 +423,7 @@ def test_campaign_plan_warns_about_missing_review_and_provider_parameters() -> N
     source = _evaluation_result("interaction-1").source
     plan = campaign_module.create_dataset_campaign_plan(
         records=(source,),
-        selected_operator_ids=("input.tone.frustrated",),
+        selected_operator_ids=("input.intent.self_correction",),
         run_config=_run_config(),
         settings=cast(
             Any,

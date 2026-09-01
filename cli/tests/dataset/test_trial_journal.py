@@ -257,7 +257,7 @@ def test_manifest_rejects_unbounded_repetitions_before_plan_materialization() ->
         _run_config(repetitions=101, planned_environment_api_calls=1)
 
 
-def test_repeated_recovery_of_ten_by_eleven_by_three_plan_never_duplicates_mutations(
+def test_repeated_recovery_of_ten_by_ten_by_three_plan_never_duplicates_mutations(
     tmp_path: Path,
 ) -> None:
     records = tuple(_evaluation_result(f"interaction-{index}").source for index in range(10))
@@ -271,7 +271,6 @@ def test_repeated_recovery_of_ten_by_eleven_by_three_plan_never_duplicates_mutat
         "input.surface.fragmented_syntax",
         "input.style.terse",
         "input.style.verbose",
-        "input.tone.frustrated",
         "input.intent.self_correction",
     )
     target_config = cast(DatasetEvidenceRunContext, _run_context((records[0],))).target.config
@@ -280,7 +279,7 @@ def test_repeated_recovery_of_ten_by_eleven_by_three_plan_never_duplicates_mutat
         selected_operator_ids=operator_ids,
         run_config=_run_config(
             repetitions=3,
-            planned_environment_api_calls=360,
+            planned_environment_api_calls=330,
             max_environment_api_calls=2_000,
         ),
         invariant_suite=None,
@@ -293,7 +292,7 @@ def test_repeated_recovery_of_ten_by_eleven_by_three_plan_never_duplicates_mutat
         selected_operator_ids=operator_ids,
         run_config=_run_config(
             repetitions=3,
-            planned_environment_api_calls=360,
+            planned_environment_api_calls=330,
             max_environment_api_calls=2_000,
         ),
         save_augmentations=True,
@@ -310,7 +309,7 @@ def test_repeated_recovery_of_ten_by_eleven_by_three_plan_never_duplicates_mutat
         journal.close()
         journal = open_dataset_trial_journal(path, manifest)
 
-    assert len(manifest.work_plan) == 10 * (1 + 11) * 3
+    assert len(manifest.work_plan) == 10 * (1 + 10) * 3
     assert set(mutations_by_unit.values()) == {1}
     assert len(journal.snapshot.terminal_states) == len(manifest.work_plan)
     journal.close()

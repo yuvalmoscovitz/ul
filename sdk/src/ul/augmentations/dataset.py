@@ -51,7 +51,6 @@ OperatorId = Literal[
     "input.surface.disfluency_repeat",
     "input.style.terse",
     "input.style.verbose",
-    "input.tone.frustrated",
     "input.intent.self_correction",
 ]
 AllowedChange = Literal[
@@ -71,7 +70,6 @@ _OPERATOR_PROMPT_NAMES: dict[OperatorId, str] = {
     "input.surface.disfluency_repeat": "augmentation.input.surface.disfluency_repeat",
     "input.style.terse": "augmentation.input.style.terse",
     "input.style.verbose": "augmentation.input.style.verbose",
-    "input.tone.frustrated": "augmentation.input.tone.frustrated",
     "input.intent.self_correction": "augmentation.input.intent.self_correction",
 }
 
@@ -172,12 +170,6 @@ _BUILTIN_OPERATORS = (
         operator_id="input.style.verbose",
         allowed_change="declared_communication_form",
         target_communication_kind="verbose",
-    ),
-    _builtin_operator(
-        operator_id="input.tone.frustrated",
-        allowed_change="declared_communication_form",
-        target_communication_kind="frustrated",
-        target_marker_required=True,
     ),
     _builtin_operator(
         operator_id="input.intent.self_correction",
@@ -471,8 +463,6 @@ class DatasetAugmentationEngine:
                     rendered_input = _add_grammar_error(record, operator)
                 elif operator.id == "input.surface.disfluency_repeat":
                     rendered_input = _add_word_repetition(record, expected_input_frame, operator)
-                elif operator.id == "input.tone.frustrated":
-                    rendered_input = _add_frustrated_tone(record, operator)
                 elif operator.allowed_change == "structured_self_correction":
                     transformation_prompt_names = (
                         _OPERATOR_PROMPT_NAMES[operator.id],
@@ -1606,17 +1596,6 @@ def _add_grammar_error(
         text=f"Me need you to: {record.raw_input}",
         metadata=_deterministic_renderer_metadata(
             record, operator, "pronoun_case_error_request_prefix"
-        ),
-    )
-
-
-def _add_frustrated_tone(
-    record: InteractionRecord, operator: DatasetAugmentationOperator
-) -> RenderedUserInput:
-    return RenderedUserInput(
-        text=f"Ugh, {record.raw_input}",
-        metadata=_deterministic_renderer_metadata(
-            record, operator, "frustration_interjection_prefix"
         ),
     )
 

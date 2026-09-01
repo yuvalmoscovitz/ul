@@ -192,7 +192,7 @@ def _candidate(
             "operator_id": operator_id,
             "operator_version": "1.0.0",
             "allowed_change": "declared_communication_form",
-            "human_review_required": operator_id == "input.tone.frustrated",
+            "human_review_required": False,
             "projection": create_dataset_augmentation_projection(source),
             "changed_paths": (source.augmentation_path,),
             "augmented_input": augmented_input,
@@ -271,10 +271,6 @@ async def run_demo_evaluations() -> tuple[DatasetEvaluationResult, ...]:
             (
                 "input.surface.typing_noise",
                 "Plase cancle my subscription at the end of this biling period.",
-            ),
-            (
-                "input.tone.frustrated",
-                "I'm fed up with this. Cancel my subscription at the end of this billing period.",
             ),
         ),
     )

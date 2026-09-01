@@ -443,8 +443,6 @@ class DeterministicSemanticPipeline:
         allow_temporary_value: bool = False,
     ) -> RenderedUserInput:
         del allow_temporary_value
-        if "frustration" in instruction:
-            return RenderedUserInput(text=raw_input)
         return RenderedUserInput(
             text="Please transfer 100 to Alice.",
             metadata={"model": "deterministic", "seed": 7},
@@ -959,7 +957,7 @@ async def test_runner_rejects_precomputed_operator_or_source_mismatch_before_env
     with pytest.raises(ValueError, match="operators do not match"):
         await runner.run(
             source,
-            operator_ids=("input.tone.frustrated",),
+            operator_ids=("input.style.terse",),
             precomputed_augmentation=precomputed,
         )
     with pytest.raises(ValueError, match="does not match the source interaction"):
@@ -993,7 +991,7 @@ async def test_runner_executes_only_accepted_candidates_and_keeps_rejected_candi
     runner, semantic_pipeline, target = _runner(observed_outcomes)
 
     result = await runner.run(
-        _source(), operator_ids=("input.surface.rephrase", "input.tone.frustrated")
+        _source(), operator_ids=("input.surface.rephrase", "input.surface.fragmented_syntax")
     )
 
     assert len(result.cases) == 2
@@ -1194,7 +1192,7 @@ async def test_redacted_runner_evidence_never_persists_environment_secrets(tmp_p
     source = boundary.protect_record(_source())
     assert isinstance(source, InteractionRecord)
 
-    result = await runner.run(source, operator_ids=("input.tone.frustrated",))
+    result = await runner.run(source, operator_ids=("input.surface.rephrase",))
     evidence = build_customer_evidence_record(
         result,
         repetitions=1,
@@ -2239,7 +2237,7 @@ async def test_runner_classifies_extra_effect_with_new_arguments_as_unexpected()
 async def test_case_model_rejects_inconsistent_execution_and_verdicts() -> None:
     runner, _, _ = _runner(_source_outcomes())
     result = await runner.run(
-        _source(), operator_ids=("input.surface.rephrase", "input.tone.frustrated")
+        _source(), operator_ids=("input.surface.rephrase", "input.surface.fragmented_syntax")
     )
     with pytest.raises(ValidationError, match="one explicit comparison surface"):
         DatasetEvaluationOutcomeGroup(
