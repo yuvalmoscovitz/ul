@@ -360,6 +360,10 @@ every accepted variation. UL includes these choices and their request, token, ti
 bounds in the paid/network confirmation receipt. It writes normal private UL evidence JSONL and
 prints the unified report. A hosted UL account is not required.
 
+For an isolated-response HTTP target, add `--concurrency N` to keep up to `N` target requests in
+flight. The default is `1`, and the accepted range is `1` through `100`. UL rejects concurrency
+above `1` for stateful-lifecycle and local targets because their trials cannot safely overlap.
+
 For automation, bind both confirmations to the exact digests printed by a prior dry review:
 
 ```bash

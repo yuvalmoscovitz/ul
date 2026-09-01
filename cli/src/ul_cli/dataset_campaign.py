@@ -75,11 +75,12 @@ class CampaignFixturePlan(_StrictModel):
 
 class CampaignTimingPlan(_StrictModel):
     target_trial_timeout_seconds: float = Field(gt=0, le=3_600)
+    target_request_concurrency: int = Field(ge=1, le=100)
     maximum_wall_time_seconds: float = Field(gt=0)
 
 
 class DatasetCampaignPlan(_StrictModel):
-    schema_version: Literal["1.3.0"] = "1.3.0"
+    schema_version: Literal["1.4.0"] = "1.4.0"
     evaluation_mode: Literal["variance"] = "variance"
     fixture: CampaignFixturePlan | None = None
     examples: tuple[CampaignExamplePlan, ...]
@@ -252,6 +253,7 @@ def create_dataset_campaign_plan(
         tokens=CampaignTokenRange(minimum=0, maximum=maximum_completion_tokens),
         timing=CampaignTimingPlan(
             target_trial_timeout_seconds=target_config.trial_timeout_seconds,
+            target_request_concurrency=run_config.concurrency,
             maximum_wall_time_seconds=maximum_wall_time_seconds,
         ),
         warnings=tuple(warnings),

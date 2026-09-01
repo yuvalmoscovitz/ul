@@ -206,6 +206,54 @@ async def test_isolated_response_executes_one_request_and_labels_response_only_e
     assert evidence.lifecycle.cleanup_reset is None
 
 
+async def test_isolated_response_requests_can_overlap_within_the_call_budget() -> None:
+    active_requests = 0
+    maximum_active_requests = 0
+    overlap_observed = asyncio.Event()
+    release_requests = asyncio.Event()
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal active_requests, maximum_active_requests
+        active_requests += 1
+        maximum_active_requests = max(maximum_active_requests, active_requests)
+        if active_requests == 2:
+            overlap_observed.set()
+        try:
+            await release_requests.wait()
+            payload = json.loads(request.content)
+            return _raw_response(
+                json.dumps({"response": {"input": payload["input"]}}).encode("utf-8")
+            )
+        finally:
+            active_requests -= 1
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    environment = JsonHttpEnvironmentConnection.from_config(
+        _isolated_response_config(),
+        test_environment_confirmed=True,
+        max_environment_api_calls=2,
+        client=client,
+    )
+    executions = (
+        asyncio.create_task(environment.execute(_case("first", max_calls=1))),
+        asyncio.create_task(environment.execute(_case("second", max_calls=1))),
+    )
+    try:
+        await asyncio.wait_for(overlap_observed.wait(), timeout=1)
+        assert active_requests == 2
+        assert maximum_active_requests == 2
+    finally:
+        release_requests.set()
+    evidence = await asyncio.gather(*executions)
+    await client.aclose()
+
+    assert [item.final_response for item in evidence] == [
+        {"input": "first"},
+        {"input": "second"},
+    ]
+    assert maximum_active_requests == 2
+
+
 async def test_http_template_selects_typed_rich_case_context_without_interpolation() -> None:
     requests: list[dict[str, object]] = []
 

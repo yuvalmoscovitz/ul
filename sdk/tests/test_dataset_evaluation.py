@@ -661,6 +661,60 @@ class IsolatedTimeoutThenSuccessEnvironment:
         )
 
 
+class ConcurrentIsolatedEnvironment:
+    environment_id = "concurrent-isolated-test-environment"
+    config_sha256 = "3" * 64
+    capabilities = EnvironmentCapabilities(
+        request_isolation="per_request_attested",
+        supports_conversations=False,
+        supports_state_observation=False,
+        cancellation_guarantee="none",
+    )
+
+    def __init__(self) -> None:
+        self.active_requests = 0
+        self.maximum_active_requests = 0
+        self.overlap_observed = asyncio.Event()
+        self.release_requests = asyncio.Event()
+
+    def api_calls_for_case(self, case: EvaluationCase) -> int:
+        return 1
+
+    async def execute(self, case: EvaluationCase) -> ExecutionEvidence:
+        self.active_requests += 1
+        self.maximum_active_requests = max(
+            self.maximum_active_requests,
+            self.active_requests,
+        )
+        if self.active_requests == 2:
+            self.overlap_observed.set()
+        try:
+            await self.release_requests.wait()
+            response = _raw_output_for_actions((_source_outcomes()[0],))
+            return ExecutionEvidence(
+                evidence_scope="response_only",
+                case_id=case.id,
+                environment_id=self.environment_id,
+                environment_config_sha256=self.config_sha256,
+                turns=(
+                    EnvironmentTurnEvidence(
+                        turn_id=case.turns[0].id,
+                        response=response,
+                    ),
+                ),
+                final_response=response,
+                lifecycle=EnvironmentLifecycleEvidence(
+                    terminal_status="succeeded",
+                    completed_phases=("execute_turn",),
+                    delivery="certain",
+                    cleanup="not_attempted",
+                    environment_state_uncertain=False,
+                ),
+            )
+        finally:
+            self.active_requests -= 1
+
+
 class FailingEnvironment(DeterministicEnvironment):
     def __init__(self, fail_on_execution: int) -> None:
         super().__init__()
@@ -3225,6 +3279,57 @@ async def test_runner_requires_remote_environment_network_opt_in() -> None:
         environment,
         allow_network_egress=True,
     )
+
+
+@pytest.mark.parametrize("maximum", [0, 101, True])
+async def test_runner_rejects_invalid_target_request_concurrency(maximum: int) -> None:
+    semantic_pipeline = DeterministicSemanticPipeline((_source_outcomes()[0],))
+
+    with pytest.raises(ValueError, match="between 1 and 100"):
+        _DatasetEvaluationRunner(
+            DatasetAugmentationEngine(semantic_pipeline, semantic_pipeline),
+            semantic_pipeline,
+            ConcurrentIsolatedEnvironment(),
+            allow_network_egress=True,
+            max_concurrent_target_requests=maximum,
+        )
+
+
+async def test_runner_requires_request_isolation_for_concurrency() -> None:
+    semantic_pipeline = DeterministicSemanticPipeline((_source_outcomes()[0],))
+
+    with pytest.raises(ValueError, match="attested per-request isolation"):
+        _DatasetEvaluationRunner(
+            DatasetAugmentationEngine(semantic_pipeline, semantic_pipeline),
+            semantic_pipeline,
+            DeterministicEnvironment(),
+            allow_network_egress=True,
+            max_concurrent_target_requests=2,
+        )
+
+
+async def test_runner_bounds_and_overlaps_isolated_target_requests() -> None:
+    semantic_pipeline = DeterministicSemanticPipeline((_source_outcomes()[0],))
+    environment = ConcurrentIsolatedEnvironment()
+    runner = _DatasetEvaluationRunner(
+        DatasetAugmentationEngine(semantic_pipeline, semantic_pipeline),
+        semantic_pipeline,
+        environment,
+        allow_network_egress=True,
+        max_concurrent_target_requests=2,
+    )
+
+    evaluation = asyncio.create_task(runner.run(_source(), repetitions=3))
+    await asyncio.wait_for(environment.overlap_observed.wait(), timeout=1)
+
+    assert environment.active_requests == 2
+    assert environment.maximum_active_requests == 2
+
+    environment.release_requests.set()
+    result = await evaluation
+
+    assert result.baseline.trial_set.requested_repetitions == 3
+    assert environment.maximum_active_requests == 2
 
 
 @pytest.mark.parametrize("evaluation_mode", ["correctness", "preference"])

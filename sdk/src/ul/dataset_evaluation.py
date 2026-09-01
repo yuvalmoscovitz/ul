@@ -499,6 +499,7 @@ class DatasetEvaluationRunner:
         evaluation_mode: DatasetEvaluationMode = "variance",
         source_outcome_projection: OutcomeProjection | None = None,
         material_variance_evaluator: DatasetMaterialVarianceEvaluator | None = None,
+        max_concurrent_target_requests: int = 1,
     ) -> None:
         if evaluation_mode != "variance":
             raise ValueError(
@@ -512,6 +513,16 @@ class DatasetEvaluationRunner:
             raise ValueError("dataset execution requires a customer-managed environment")
         if not allow_network_egress:
             raise ValueError("remote environment API access requires explicit network opt-in")
+        if (
+            type(max_concurrent_target_requests) is not int
+            or not 1 <= max_concurrent_target_requests <= 100
+        ):
+            raise ValueError("max_concurrent_target_requests must be between 1 and 100")
+        if (
+            max_concurrent_target_requests > 1
+            and environment.capabilities.request_isolation != "per_request_attested"
+        ):
+            raise ValueError("concurrent target requests require attested per-request isolation")
         self._augmentation_engine = augmentation_engine
         self._deconstructor = deconstructor
         self._environment = environment
@@ -519,6 +530,7 @@ class DatasetEvaluationRunner:
         self._evaluation_mode: Literal["variance"] = evaluation_mode
         self._source_outcome_projection = source_outcome_projection
         self._material_variance_evaluator = material_variance_evaluator
+        self._max_concurrent_target_requests = max_concurrent_target_requests
         self._target_state_uncertain = False
 
     async def run(
@@ -581,12 +593,40 @@ class DatasetEvaluationRunner:
         accepted_candidates = tuple(
             candidate for candidate in augmentation.candidates if candidate.passed
         )
-        baseline_trials: list[DatasetEvaluationTrial] = []
-        candidate_trials: dict[str, list[DatasetEvaluationTrial]] = {
-            candidate.operator_id: [] for candidate in accepted_candidates
+        baseline_trials_by_repetition: dict[int, DatasetEvaluationTrial] = {}
+        candidate_trials_by_repetition: dict[str, dict[int, DatasetEvaluationTrial]] = {
+            candidate.operator_id: {} for candidate in accepted_candidates
         }
         recovered_trials = prior_trials or {}
-        for repetition in range(1, repetitions + 1):
+        target_request_semaphore = asyncio.Semaphore(self._max_concurrent_target_requests)
+
+        async def execute_trial(
+            unit: DatasetTrialUnit,
+            *,
+            interaction_id: str,
+            raw_input: str,
+            reference_frame: SemanticFrame,
+            subject: Literal["current baseline", "variation"],
+            variation_id: str,
+        ) -> DatasetEvaluationTrial:
+            async with target_request_semaphore:
+                if trial_started_callback is not None:
+                    trial_started_callback(unit)
+                trial = await self._execute_trial(
+                    repetition=unit.repetition,
+                    interaction_id=interaction_id,
+                    raw_input=raw_input,
+                    reference_frame=reference_frame,
+                    source=source,
+                    subject=subject,
+                    variation_id=variation_id,
+                    comparison_surface=comparison_surface,
+                )
+                if trial_terminal_callback is not None:
+                    trial_terminal_callback(unit, trial)
+                return trial
+
+        async def execute_repetition(repetition: int) -> None:
             baseline_unit = DatasetTrialUnit(
                 interaction_id=source.id,
                 operator_id="current_baseline",
@@ -595,22 +635,17 @@ class DatasetEvaluationRunner:
             )
             baseline_trial = recovered_trials.get(baseline_unit.id)
             if baseline_trial is None:
-                if trial_started_callback is not None:
-                    trial_started_callback(baseline_unit)
-                baseline_trial = await self._execute_trial(
-                    repetition=repetition,
+                baseline_trial = await execute_trial(
+                    baseline_unit,
                     interaction_id=f"{source.id}:current_baseline:round-{repetition}",
                     raw_input=source.raw_input,
                     reference_frame=source_frame,
-                    source=source,
                     subject="current baseline",
                     variation_id="current_baseline",
-                    comparison_surface=comparison_surface,
                 )
-                if trial_terminal_callback is not None:
-                    trial_terminal_callback(baseline_unit, baseline_trial)
-            baseline_trials.append(baseline_trial)
-            for candidate in accepted_candidates:
+            baseline_trials_by_repetition[repetition] = baseline_trial
+
+            async def execute_candidate(candidate: DatasetAugmentationCandidate) -> None:
                 candidate_unit = DatasetTrialUnit(
                     interaction_id=source.id,
                     operator_id=candidate.operator_id,
@@ -619,8 +654,10 @@ class DatasetEvaluationRunner:
                 )
                 recovered_candidate_trial = recovered_trials.get(candidate_unit.id)
                 if recovered_candidate_trial is not None:
-                    candidate_trials[candidate.operator_id].append(recovered_candidate_trial)
-                    continue
+                    candidate_trials_by_repetition[candidate.operator_id][repetition] = (
+                        recovered_candidate_trial
+                    )
+                    return
                 if baseline_trial.inconclusive_reasons:
                     skipped_trial = DatasetEvaluationTrial(
                         repetition=repetition,
@@ -628,28 +665,54 @@ class DatasetEvaluationRunner:
                             "paired original repetition was inconclusive; variation not executed",
                         ),
                     )
-                    candidate_trials[candidate.operator_id].append(skipped_trial)
+                    candidate_trials_by_repetition[candidate.operator_id][repetition] = (
+                        skipped_trial
+                    )
                     if trial_terminal_callback is not None:
                         trial_terminal_callback(candidate_unit, skipped_trial)
-                    continue
+                    return
                 reference_frame = baseline_trial.observed_frame
                 if reference_frame is None:
                     raise AssertionError("conclusive baseline trial requires an observed frame")
-                if trial_started_callback is not None:
-                    trial_started_callback(candidate_unit)
-                candidate_trial = await self._execute_trial(
-                    repetition=repetition,
+                candidate_trial = await execute_trial(
+                    candidate_unit,
                     interaction_id=(f"{source.id}:{candidate.operator_id}:round-{repetition}"),
                     raw_input=candidate.augmented_input,
                     reference_frame=reference_frame,
-                    source=source,
                     subject="variation",
                     variation_id=candidate.operator_id,
-                    comparison_surface=comparison_surface,
                 )
-                candidate_trials[candidate.operator_id].append(candidate_trial)
-                if trial_terminal_callback is not None:
-                    trial_terminal_callback(candidate_unit, candidate_trial)
+                candidate_trials_by_repetition[candidate.operator_id][repetition] = candidate_trial
+
+            async with asyncio.TaskGroup() as candidate_tasks:
+                for candidate in accepted_candidates:
+                    candidate_tasks.create_task(execute_candidate(candidate))
+
+        delivery_uncertain = False
+        try:
+            if self._max_concurrent_target_requests == 1:
+                for repetition in range(1, repetitions + 1):
+                    await execute_repetition(repetition)
+            else:
+                async with asyncio.TaskGroup() as repetition_tasks:
+                    for repetition in range(1, repetitions + 1):
+                        repetition_tasks.create_task(execute_repetition(repetition))
+        except* DatasetTargetDeliveryUncertain:
+            delivery_uncertain = True
+        if delivery_uncertain:
+            raise DatasetTargetDeliveryUncertain(
+                "target delivery is uncertain; in-flight trials were stopped and are not retried"
+            ) from None
+
+        baseline_trials = [
+            baseline_trials_by_repetition[repetition] for repetition in range(1, repetitions + 1)
+        ]
+        candidate_trials = {
+            operator_id: [
+                trials_by_repetition[repetition] for repetition in range(1, repetitions + 1)
+            ]
+            for operator_id, trials_by_repetition in candidate_trials_by_repetition.items()
+        }
 
         baseline_trial_set = _group_evaluation_trials(
             tuple(baseline_trials), source.raw_input, source_frame, comparison_surface

@@ -28,4 +28,5 @@ class TargetExecutionConfig(_StrictModel):
 class DatasetRunConfig(_StrictModel):
     evaluation_mode: Literal["variance"] = "variance"
     repetitions: int = Field(ge=1, le=100)
+    concurrency: int = Field(default=1, ge=1, le=100)
     target: TargetExecutionConfig

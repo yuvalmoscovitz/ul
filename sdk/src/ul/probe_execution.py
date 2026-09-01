@@ -232,6 +232,12 @@ class ComposedEnvironmentExecutor:
         self._repetition = repetition
         self._outcome_projection = outcome_projection
         self._lock = asyncio.Lock()
+        self._parallel_response_execution = (
+            invoker.capabilities.request_isolation == "per_request_attested"
+            and state_environment is None
+            and observation_source is None
+            and worker_trace_flusher is None
+        )
         self._state_uncertain = False
         self._invoker_sync_runner = _SyncAdapterRunner("ul-probe-invoker")
         self._observer_sync_runner = _SyncAdapterRunner("ul-probe-observer")
@@ -314,41 +320,44 @@ class ComposedEnvironmentExecutor:
         required_calls = self.api_calls_for_case(case)
         if required_calls > case.max_environment_api_calls:
             raise ValueError("evaluation case exceeds its environment API call budget")
+        if self._parallel_response_execution:
+            return await self._execute_case(case)
         async with self._lock:
-            probe_context = case.probe_context
-            context_variation_id = probe_context.get("ul.variation.id")
-            context_repetition = probe_context.get("ul.repetition")
-            variation_id = (
-                context_variation_id
-                if isinstance(context_variation_id, str)
-                else self._variation_id
-            )
-            repetition = (
-                context_repetition
-                if isinstance(context_repetition, int) and not isinstance(context_repetition, bool)
-                else self._repetition
-            )
-            if variation_id is not None and not 1 <= len(variation_id) <= 500:
-                raise ValueError("case variation ID must contain between 1 and 500 characters")
-            if repetition is not None and repetition < 1:
-                raise ValueError("case repetition must be a positive integer")
-            execution_context = _ProbeExecutionContext(
-                campaign_id=self._campaign_id,
-                case_id=case.id,
-                probe_id=f"ul-probe-{secrets.token_hex(16)}",
-                attempt_id=f"ul-attempt-{secrets.token_hex(16)}",
-                session_id=f"ul-session-{secrets.token_hex(16)}",
-                trace_id=secrets.token_hex(16),
-                variation_id=variation_id,
-                repetition=repetition,
-                probe_context=probe_context,
-            )
-            async with asyncio.timeout(case.timeout_seconds):
-                if self._state_environment is None:
-                    evidence = await self._execute_response_only(case, execution_context)
-                else:
-                    evidence = await self._execute_with_state(case, execution_context)
-            return await self._attach_observations(case, evidence, execution_context)
+            return await self._execute_case(case)
+
+    async def _execute_case(self, case: EvaluationCase) -> ExecutionEvidence:
+        probe_context = case.probe_context
+        context_variation_id = probe_context.get("ul.variation.id")
+        context_repetition = probe_context.get("ul.repetition")
+        variation_id = (
+            context_variation_id if isinstance(context_variation_id, str) else self._variation_id
+        )
+        repetition = (
+            context_repetition
+            if isinstance(context_repetition, int) and not isinstance(context_repetition, bool)
+            else self._repetition
+        )
+        if variation_id is not None and not 1 <= len(variation_id) <= 500:
+            raise ValueError("case variation ID must contain between 1 and 500 characters")
+        if repetition is not None and repetition < 1:
+            raise ValueError("case repetition must be a positive integer")
+        execution_context = _ProbeExecutionContext(
+            campaign_id=self._campaign_id,
+            case_id=case.id,
+            probe_id=f"ul-probe-{secrets.token_hex(16)}",
+            attempt_id=f"ul-attempt-{secrets.token_hex(16)}",
+            session_id=f"ul-session-{secrets.token_hex(16)}",
+            trace_id=secrets.token_hex(16),
+            variation_id=variation_id,
+            repetition=repetition,
+            probe_context=probe_context,
+        )
+        async with asyncio.timeout(case.timeout_seconds):
+            if self._state_environment is None:
+                evidence = await self._execute_response_only(case, execution_context)
+            else:
+                evidence = await self._execute_with_state(case, execution_context)
+        return await self._attach_observations(case, evidence, execution_context)
 
     async def _execute_response_only(
         self,

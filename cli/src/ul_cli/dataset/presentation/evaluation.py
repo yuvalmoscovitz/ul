@@ -81,6 +81,7 @@ def print_dataset_plan(
         "correctness not assessed)"
     )
     console.print(f"Repetitions: {repetitions} per original and accepted variation")
+    console.print(f"Concurrent target requests: {campaign_plan.timing.target_request_concurrency}")
     console.print(f"Target trial timeout: {target_timeout_seconds:g} seconds")
     console.print(
         f"Maximum planned wall time: {campaign_plan.timing.maximum_wall_time_seconds:g} seconds"
