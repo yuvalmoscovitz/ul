@@ -677,6 +677,7 @@ def self_correction_candidate_frame(record: InteractionRecord) -> SemanticFrame:
 
 async def test_builtin_operator_library_is_fixed_versioned_and_reviewable() -> None:
     operators = builtin_dataset_augmentation_operators()
+    instructions = {operator.id: operator.instruction for operator in operators}
 
     assert tuple(operator.id for operator in operators) == (
         "input.surface.rephrase",
@@ -729,6 +730,8 @@ async def test_builtin_operator_library_is_fixed_versioned_and_reviewable() -> N
     assert [operator.id for operator in operators if operator.human_review_required] == [
         "input.intent.self_correction"
     ]
+    assert "Never abbreviate a month name" in instructions["input.style.terse"]
+    assert 'Do not use\n"frustrated" as the only tone marker' in instructions["input.tone.angry"]
     assert [
         operator.id for operator in operators if operator.applicability_profile == "conditional"
     ] == [
