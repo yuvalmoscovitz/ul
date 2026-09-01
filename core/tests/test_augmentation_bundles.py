@@ -33,6 +33,11 @@ def test_builtin_bundles_are_versioned_selection_and_budget_policies() -> None:
     ]
     assert everyday.budget.maximum_cases == 10
     assert everyday.budget.maximum_fan_out_per_case == 3
+    unclear = catalog.get("unclear-changing-requests")
+    self_correction = next(
+        policy for policy in unclear.operators if policy.ref.id == "input.intent.self_correction"
+    )
+    assert self_correction.model_calls == 3
 
 
 def test_bundle_plan_fans_out_independently_and_exposes_bounded_work() -> None:

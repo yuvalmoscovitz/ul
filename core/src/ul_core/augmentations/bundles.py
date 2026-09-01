@@ -421,7 +421,7 @@ _BUILTIN_BUNDLES = (
                 "input.intent.self_correction",
                 version="1.1.0",
                 mode="dataset_variation",
-                model_calls=4,
+                model_calls=3,
                 mutation_risk="state",
                 reset_required=True,
             ),

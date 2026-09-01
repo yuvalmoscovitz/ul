@@ -939,6 +939,21 @@ def _self_correction_plan(
         if factor.kind == "enum":
             if recorded_action_match is None:
                 continue
+            field_name = recorded_action_match[2]
+            active_field_factor_ids = tuple(
+                candidate.id
+                for candidate in frame.factors
+                if candidate.status != "superseded"
+                and candidate.kind == "enum"
+                and _factor_is_associated_with_request(candidate, request)
+                and _semantic_role_matches_action_field(
+                    candidate.role,
+                    field_name,
+                    request.predicate,
+                )
+            )
+            if active_field_factor_ids != (factor.id,):
+                continue
             grounded_plan = _grounded_prior_enum_plan(
                 record, frame, request, factor, recorded_action_match
             )
@@ -1215,6 +1230,25 @@ def _grounded_prior_enum_plan(
     final_resource = _action_resource_key(str(final_action["action"]))
     if not final_resource:
         return None
+    for later_action in _recorded_action_records(record)[final_action_index + 1 :]:
+        later_action_name = str(later_action["action"])
+        later_identifiers = tuple(
+            sorted(
+                (name, value)
+                for name, value in later_action.items()
+                if _is_action_identifier_field(name)
+                and isinstance(value, (str, int, float))
+                and not isinstance(value, bool)
+            )
+        )
+        later_action_tokens = set(re.findall(r"[a-z0-9]+", later_action_name.casefold()))
+        if (
+            later_identifiers == final_identifiers
+            and _action_resource_key(later_action_name) == final_resource
+            and field_name in later_action
+            and later_action_tokens.intersection(_ACTION_OPERATION_WORDS)
+        ):
+            return None
     prior_observations: list[tuple[int, str]] = []
     prior_matches: list[tuple[int, str]] = []
     for action_index, action in enumerate(_recorded_action_records(record)[:final_action_index]):

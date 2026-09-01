@@ -1338,6 +1338,89 @@ async def test_self_correction_skips_prior_enum_observed_after_final_action() ->
     assert result.skips
 
 
+async def test_self_correction_skips_enum_when_final_value_is_later_overwritten() -> None:
+    prior_action: dict[str, JsonValue] = {
+        "action": "salesforce.opportunity.read",
+        "opportunity_id": "006001",
+        "stage_name": "Negotiation/Review",
+    }
+    record, source, candidate_frame, rendered_output = grounded_enum_self_correction_frames(
+        prior_actions=[prior_action]
+    )
+    actions = cast(dict[str, JsonValue], record.raw_observed_output)["actions"]
+    assert isinstance(actions, list)
+    overwritten_record = record.model_copy(
+        update={
+            "raw_observed_output": {
+                "actions": [
+                    *actions,
+                    {
+                        "action": "salesforce.opportunity.update",
+                        "opportunity_id": "006001",
+                        "stage_name": "Closed Lost",
+                    },
+                ]
+            }
+        }
+    )
+    model = DeterministicSemanticModel(
+        {overwritten_record.id: source}, candidate_frame, rendered_output
+    )
+
+    result = await DatasetAugmentationEngine(model, model).augment(
+        (overwritten_record,), operator_ids=("input.intent.self_correction",)
+    )
+
+    assert not result.candidates
+    assert result.skips
+
+
+async def test_self_correction_skips_multiple_active_final_values_for_same_field() -> None:
+    prior_action: dict[str, JsonValue] = {
+        "action": "salesforce.opportunity.read",
+        "opportunity_id": "006001",
+        "stage_name": "Negotiation/Review",
+    }
+    record, source, candidate_frame, rendered_output = grounded_enum_self_correction_frames(
+        prior_actions=[prior_action]
+    )
+    ambiguous_record = record.model_copy(
+        update={"raw_input": f"{record.raw_input} Also mark it as Closed Lost."}
+    )
+    other_stage = source.factors[2].model_copy(
+        update={
+            "id": "source:other-stage",
+            "evidence": (
+                EvidenceReference(
+                    source="input",
+                    json_pointer="/raw_input",
+                    text_quote="Closed Lost",
+                ),
+            ),
+            "value": "Closed Lost",
+        }
+    )
+    request = source.request_units[0]
+    ambiguous_source = source.model_copy(
+        update={
+            "request_units": (
+                request.model_copy(update={"factor_ids": (*request.factor_ids, other_stage.id)}),
+            ),
+            "factors": (*source.factors, other_stage),
+        }
+    )
+    model = DeterministicSemanticModel(
+        {ambiguous_record.id: ambiguous_source}, candidate_frame, rendered_output
+    )
+
+    result = await DatasetAugmentationEngine(model, model).augment(
+        (ambiguous_record,), operator_ids=("input.intent.self_correction",)
+    )
+
+    assert not result.candidates
+    assert result.skips
+
+
 async def test_self_correction_skips_prior_enum_found_only_in_recorded_trace() -> None:
     prior_action: dict[str, JsonValue] = {
         "action": "salesforce.opportunity.read",
