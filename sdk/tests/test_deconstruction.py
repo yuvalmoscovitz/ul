@@ -43,6 +43,8 @@ _LEGACY_LLM_AUGMENTATIONS_WITHOUT_DEVELOPMENT_VALIDATION = {
 }
 _EXPECTED_DEVELOPMENT_VALIDATED_LLM_AUGMENTATIONS = {
     "input.surface.grammar_error",
+    "input.tone.angry",
+    "input.tone.argumentative",
 }
 
 
@@ -122,7 +124,7 @@ def interaction() -> InteractionRecord:
 def synthetic_live_interaction() -> InteractionRecord:
     return InteractionRecord(
         id="synthetic-live-check",
-        raw_input="Please add 3 blue widgets with SKU TEST-42 to cart CART-7.",
+        raw_input="Could you please add 3 blue widgets with SKU TEST-42 to cart CART-7?",
         raw_observed_output={
             "action": "cart_updated",
             "sku": "TEST-42",
@@ -706,6 +708,8 @@ async def test_deconstruct_sends_one_bounded_strict_structured_request() -> None
         assert [message["role"] for message in body["messages"]] == ["system", "user"]
         assert "fragmented_syntax" in body["messages"][0]["content"]
         assert "frustrated" in body["messages"][0]["content"]
+        assert "angry" in body["messages"][0]["content"]
+        assert "argumentative" in body["messages"][0]["content"]
         assert "self_correction" in body["messages"][0]["content"]
         assert "superseded_by" in body["messages"][0]["content"]
         assert "status to exactly superseded" in body["messages"][0]["content"]
@@ -2965,7 +2969,17 @@ async def test_live_llm_augmentations_pass_existing_validity_check(
             assert len(result.candidates) == 1, operator.id
             candidate = result.candidates[0]
             assert candidate.augmented_input != synthetic_live_interaction().raw_input, operator.id
-            assert candidate.passed, {operator.id: candidate.failure_reasons}
+            communication_kinds = (
+                tuple(act.kind for act in candidate.reparsed_input_frame.communication_acts)
+                if candidate.reparsed_input_frame is not None
+                else ()
+            )
+            assert candidate.passed, (
+                f"{operator.id}: input={candidate.augmented_input!r}; "
+                f"communication_kinds={communication_kinds!r}; "
+                f"equivalence={candidate.semantic_equivalence_assessment!r}; "
+                f"failure_reasons={candidate.failure_reasons!r}"
+            )
             candidates.append(candidate)
 
     assert {candidate.operator_id for candidate in candidates} == {

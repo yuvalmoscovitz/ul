@@ -125,6 +125,42 @@ def _enable_semantic_execution(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("OPEN_ROUTER_API_KEY", "test-key")
 
 
+def _initialize_isolated_response_project(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    dataset_path = tmp_path / "interactions.jsonl"
+    dataset_path.write_text(
+        json.dumps(
+            {
+                "id": "interaction-1",
+                "input": "Transfer 100 to Alice.",
+                "output": {"status": "recorded"},
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(tmp_path)
+    result = runner.invoke(
+        app,
+        [
+            "init",
+            str(dataset_path),
+            "--environment-url",
+            "https://agent.example.test/v1/chat/completions",
+            "--adapter-tier",
+            "isolated-response",
+            "--allow-environment-network",
+            "--confirm-test-environment",
+            "--confirm-request-isolation",
+            "--confirm-safe-test-target",
+            "--isolated-preset",
+            "openai-chat",
+            "--agent-model",
+            "customer-agent-v1",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+
+
 def _planned_augmentation(payload: dict[str, object], augmentation_id: str) -> dict[str, object]:
     augmentations = payload["augmentations"]
     assert isinstance(augmentations, list)
@@ -164,7 +200,7 @@ def test_list_json_is_stable_sorted_and_complete() -> None:
     assert result.exit_code == 0
     payload = json.loads(result.output)
     assert payload["schema_version"] == "1.0.0"
-    assert len(payload["augmentations"]) == 20
+    assert len(payload["augmentations"]) == 22
     references = [(item["ref"]["id"], item["ref"]["version"]) for item in payload["augmentations"]]
     assert references == sorted(references)
     assert all(isinstance(item["cli_available"], bool) for item in payload["augmentations"])
@@ -190,7 +226,7 @@ def test_guide_and_surface_filter_make_the_library_navigable() -> None:
     assert "World and business state" in guide.output
     assert "Tool and execution" in guide.output
     assert "Trust, policy, and authorization" in guide.output
-    assert guide.output.count("@1.0.0 [implemented; not_qualified]") == 20
+    assert guide.output.count("@1.0.0 [implemented; not_qualified]") == 22
 
     filtered = runner.invoke(
         app,
@@ -281,6 +317,16 @@ def test_show_reports_dataset_execution_requirements_without_requiring_invariant
     assert "nonempty user input" in result.output
 
 
+@pytest.mark.parametrize("operator_id", ["input.tone.angry", "input.tone.argumentative"])
+def test_show_reports_tones_as_response_only(operator_id: str) -> None:
+    result = CliRunner().invoke(app, ["augmentations", "show", operator_id])
+
+    assert result.exit_code == 0
+    assert "test environment" in result.output
+    assert "semantic model" in result.output
+    assert "committed-state observation" not in result.output
+
+
 def test_show_labels_conditional_operator_and_explains_its_rule() -> None:
     result = CliRunner().invoke(app, ["augmentations", "show", "input.intent.self_correction"])
 
@@ -350,13 +396,13 @@ def test_plan_json_is_stable_complete_and_project_aware(
     payload = json.loads(first.output)
     assert payload["schema_version"] == "1.0.0"
     assert payload["project"] == {"status": "ready", "reason": None}
-    assert payload["summary"] == {"ready": 9, "blocked": 3, "manual": 8}
+    assert payload["summary"] == {"ready": 11, "blocked": 3, "manual": 8}
     assert payload["inspection"] == {
         "model_calls": 0,
         "environment_calls": 0,
         "network_requests": 0,
     }
-    assert len(payload["augmentations"]) == 20
+    assert len(payload["augmentations"]) == 22
     references = [(item["ref"]["id"], item["ref"]["version"]) for item in payload["augmentations"]]
     assert references == sorted(references)
     assert {item["status"] for item in payload["augmentations"]} <= {
@@ -421,7 +467,7 @@ def test_plan_reads_declared_capabilities_without_constructing_external_clients(
 
     assert result.exit_code == 0, result.output
     payload = json.loads(result.output)
-    assert payload["summary"] == {"ready": 9, "blocked": 0, "manual": 11}
+    assert payload["summary"] == {"ready": 11, "blocked": 0, "manual": 11}
     timeout = _planned_augmentation(payload, "environment.tool.timeout_after_commit")
     assert timeout["status"] == "manual"
     assert timeout["command"] == (
@@ -430,6 +476,22 @@ def test_plan_reads_declared_capabilities_without_constructing_external_clients(
     )
     assert "stress_case_not_configured" in _reason_codes(timeout)
     assert "environment_capability_missing" not in _reason_codes(timeout)
+
+
+def test_tones_are_ready_for_an_isolated_response_project(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _initialize_isolated_response_project(tmp_path, monkeypatch)
+    _enable_semantic_execution(monkeypatch)
+
+    result = runner.invoke(app, ["augmentations", "plan", "--json"])
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    for operator_id in ("input.tone.angry", "input.tone.argumentative"):
+        planned = _planned_augmentation(payload, operator_id)
+        assert planned["status"] == "ready"
+        assert "environment_state_observation_unsupported" not in _reason_codes(planned)
 
 
 def test_bundle_plan_uses_configured_project_runtime_readiness(
@@ -468,8 +530,8 @@ def test_plan_without_a_project_still_classifies_every_catalog_item(
         "status": "missing",
         "reason": "No UL project found; run 'ul init' first.",
     }
-    assert payload["summary"] == {"ready": 0, "blocked": 13, "manual": 7}
-    assert len(payload["augmentations"]) == 20
+    assert payload["summary"] == {"ready": 0, "blocked": 15, "manual": 7}
+    assert len(payload["augmentations"]) == 22
     rephrase = _planned_augmentation(payload, "input.surface.rephrase")
     assert rephrase["status"] == "blocked"
     assert _reason_codes(rephrase) == {"project_not_configured"}
@@ -487,7 +549,7 @@ def test_plan_human_output_is_actionable_and_attests_zero_calls(
     result = runner.invoke(app, ["augmentations", "plan"], terminal_width=80)
 
     assert result.exit_code == 0, result.output
-    assert "Augmentation readiness: 9 ready, 3 blocked, 8 manual" in result.output
+    assert "Augmentation readiness: 11 ready, 3 blocked, 8 manual" in result.output
     assert "READY input.surface.rephrase@1.0.0" in result.output
     assert "Command: ul run --operator input.surface.rephrase@1.0.0" in result.output
     assert "BLOCKED environment.tool.timeout_after_commit@1.0.0" in result.output

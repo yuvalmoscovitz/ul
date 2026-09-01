@@ -35,6 +35,7 @@ from ul_core.prompts import PromptManager, prompt_provenance
 
 _PROMPTS = PromptManager.instance()
 _MAX_DECOMPOSED_RELATION_ENDPOINTS = 10_000
+_TONE_SAFETY_KINDS = {"angry", "argumentative"}
 
 
 def _is_none(value: object) -> bool:
@@ -51,6 +52,8 @@ OperatorId = Literal[
     "input.surface.disfluency_repeat",
     "input.style.terse",
     "input.style.verbose",
+    "input.tone.angry",
+    "input.tone.argumentative",
     "input.intent.self_correction",
 ]
 AllowedChange = Literal[
@@ -71,6 +74,8 @@ _OPERATOR_PROMPT_NAMES: dict[OperatorId, str] = {
     "input.surface.disfluency_repeat": "augmentation.input.surface.disfluency_repeat",
     "input.style.terse": "augmentation.input.style.terse",
     "input.style.verbose": "augmentation.input.style.verbose",
+    "input.tone.angry": "augmentation.input.tone.angry",
+    "input.tone.argumentative": "augmentation.input.tone.argumentative",
     "input.intent.self_correction": "augmentation.input.intent.self_correction",
 }
 
@@ -183,6 +188,20 @@ _BUILTIN_OPERATORS = (
         generation_mechanism="llm",
         allowed_change="declared_communication_form",
         target_communication_kind="verbose",
+    ),
+    _builtin_operator(
+        operator_id="input.tone.angry",
+        generation_mechanism="llm",
+        allowed_change="declared_communication_form",
+        target_communication_kind="angry",
+        target_marker_required=True,
+    ),
+    _builtin_operator(
+        operator_id="input.tone.argumentative",
+        generation_mechanism="llm",
+        allowed_change="declared_communication_form",
+        target_communication_kind="argumentative",
+        target_marker_required=True,
     ),
     _builtin_operator(
         operator_id="input.intent.self_correction",
@@ -589,6 +608,29 @@ class DatasetAugmentationEngine:
                                 ]
                             else:
                                 failure_reasons = ["semantic equivalence check was uncertain"]
+                    if (
+                        operator.target_communication_kind in _TONE_SAFETY_KINDS
+                        and not surface_footprint_reasons
+                        and not failure_reasons
+                    ):
+                        if self._equivalence_verifier is None:
+                            failure_reasons = ["tone safety verifier is unavailable"]
+                        else:
+                            try:
+                                equivalence_assessment = await self._equivalence_verifier.verify(
+                                    record.raw_input,
+                                    augmented_input,
+                                    allowed_surface_change=_allowed_surface_change(operator.id),
+                                )
+                            except ValueError:
+                                failure_reasons = ["tone safety validation failed"]
+                            else:
+                                if equivalence_assessment.verdict == "different":
+                                    failure_reasons = [
+                                        "tone safety check found a forbidden communication change"
+                                    ]
+                                elif equivalence_assessment.verdict == "uncertain":
+                                    failure_reasons = ["tone safety check was uncertain"]
                 failure_reasons.extend(surface_footprint_reasons)
                 if augmented_input == record.raw_input:
                     failure_reasons.append("renderer did not change the source input")
@@ -1403,6 +1445,10 @@ def _allowed_surface_change(operator_id: OperatorId) -> SemanticAllowedSurfaceCh
         return "single_unprotected_case_change"
     if operator_id == "input.surface.punctuation_noise":
         return "single_unprotected_punctuation_insertion"
+    if operator_id == "input.tone.angry":
+        return "moderate_angry_tone"
+    if operator_id == "input.tone.argumentative":
+        return "moderate_argumentative_tone"
     return "none"
 
 

@@ -147,7 +147,13 @@ def create_dataset_campaign_plan(
         resolve_dataset_augmentation_operator(reference).generation_mechanism == "llm"
         for reference in selected_operator_ids
     )
+    tone_safety_operator_count = sum(
+        resolve_dataset_augmentation_operator(reference).target_communication_kind
+        in {"angry", "argumentative"}
+        for reference in selected_operator_ids
+    )
     generation_calls = materialization_record_count * semantic_generation_operator_count
+    tone_safety_calls = materialization_record_count * tone_safety_operator_count
     source_deconstruction_calls = materialization_record_count
     candidate_deconstruction_calls = materialization_record_count * operator_count
     equivalence_calls = materialization_record_count * operator_count
@@ -157,6 +163,7 @@ def create_dataset_campaign_plan(
         source_deconstruction_calls
         + candidate_deconstruction_calls
         + equivalence_calls
+        + tone_safety_calls
         + trial_evaluator_calls
     )
     preflight_profiles = plan_evaluator_preflight_profiles(settings) if requires_preflight else ()
@@ -175,6 +182,7 @@ def create_dataset_campaign_plan(
         + deconstruction_calls * settings.max_output_tokens
         + generation_calls * settings.max_render_tokens
         + equivalence_calls * min(settings.max_output_tokens, 1_024)
+        + tone_safety_calls * min(settings.max_output_tokens, 1_024)
         + materiality_calls * 512
     )
     warnings = list(_model_parameter_warnings(settings))

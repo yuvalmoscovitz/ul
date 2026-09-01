@@ -508,6 +508,8 @@ SemanticAllowedSurfaceChange = Literal[
     "none",
     "single_unprotected_case_change",
     "single_unprotected_punctuation_insertion",
+    "moderate_angry_tone",
+    "moderate_argumentative_tone",
 ]
 
 

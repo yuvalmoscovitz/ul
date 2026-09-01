@@ -618,6 +618,8 @@ async def test_builtin_operator_library_is_fixed_versioned_and_reviewable() -> N
         "input.surface.disfluency_repeat",
         "input.style.terse",
         "input.style.verbose",
+        "input.tone.angry",
+        "input.tone.argumentative",
         "input.intent.self_correction",
     )
     assert {operator.version for operator in operators} == {"1.0.0"}
@@ -627,6 +629,8 @@ async def test_builtin_operator_library_is_fixed_versioned_and_reviewable() -> N
         "input.surface.fragmented_syntax",
         "input.style.terse",
         "input.style.verbose",
+        "input.tone.angry",
+        "input.tone.argumentative",
         "input.intent.self_correction",
     ]
     assert [operator.id for operator in operators if operator.human_review_required] == [
@@ -1106,6 +1110,18 @@ async def test_self_correction_skips_ineligible_sources(ineligible_reason: str) 
             "hey could you transfer 100 to alice and then please let me know the balance",
             False,
         ),
+        (
+            "input.tone.angry",
+            "angry",
+            "This is ridiculous—transfer 100 to Alice, then tell me the balance.",
+            False,
+        ),
+        (
+            "input.tone.argumentative",
+            "argumentative",
+            "There is no reason to debate this: transfer 100 to Alice, then tell me the balance.",
+            False,
+        ),
     ],
 )
 async def test_behavior_operators_allow_only_their_communication_change(
@@ -1120,8 +1136,19 @@ async def test_behavior_operators_allow_only_their_communication_change(
     model = DeterministicSemanticModel(
         {record.id: original_frame}, candidate_frame, realistic_output
     )
+    verifier = (
+        DeterministicEquivalenceVerifier(
+            SemanticEquivalenceAssessment(
+                verdict="equivalent",
+                explanation="The tone is moderate and contains no forbidden communication.",
+                verifier_version="test/1",
+            )
+        )
+        if operator_id in {"input.tone.angry", "input.tone.argumentative"}
+        else None
+    )
 
-    result = await DatasetAugmentationEngine(model, model).augment(
+    result = await DatasetAugmentationEngine(model, model, verifier).augment(
         (record,), operator_ids=(operator_id,)
     )
 
@@ -1137,6 +1164,92 @@ async def test_behavior_operators_allow_only_their_communication_change(
         "seed": 42,
         "transformation_prompts": prompt_provenance(f"augmentation.{operator_id}"),
     }
+    if operator_id == "input.tone.angry":
+        assert "merely adding words" in model.rendered_instructions[0]
+    if operator_id == "input.tone.argumentative":
+        assert "merely making the request emphatic" in model.rendered_instructions[0]
+    if verifier is not None:
+        assert verifier.allowed_surface_changes == [f"moderate_{target_kind}_tone"]
+
+
+async def test_tone_operator_fails_closed_without_safety_verifier() -> None:
+    record = source_record()
+    original_frame = source_frame(record)
+    candidate_frame = behavior_candidate_frame(record, "angry")
+    model = DeterministicSemanticModel(
+        {record.id: original_frame},
+        candidate_frame,
+        "This is ridiculous—transfer 100 to Alice, then tell me the balance.",
+    )
+
+    result = await DatasetAugmentationEngine(model, model).augment(
+        (record,), operator_ids=("input.tone.angry",)
+    )
+
+    assert result.candidates[0].passed is False
+    assert result.candidates[0].failure_reasons == ("tone safety verifier is unavailable",)
+
+
+@pytest.mark.parametrize(
+    ("operator_id", "target_kind", "rendered_output", "forbidden_quote"),
+    [
+        (
+            "input.tone.angry",
+            "angry",
+            "You fucking idiot—transfer 100 to Alice, then tell me the balance.",
+            "fucking idiot",
+        ),
+        (
+            "input.tone.angry",
+            "angry",
+            "Transfer 100 to Alice or I will hurt you, then tell me the balance.",
+            "I will hurt you",
+        ),
+        (
+            "input.tone.argumentative",
+            "argumentative",
+            "There is no debate, you moron: transfer 100 to Alice, then tell me the balance.",
+            "you moron",
+        ),
+    ],
+)
+async def test_tone_operator_rejects_forbidden_hostility(
+    operator_id: str,
+    target_kind: str,
+    rendered_output: str,
+    forbidden_quote: str,
+) -> None:
+    record = source_record()
+    original_frame = source_frame(record)
+    candidate_frame = behavior_candidate_frame(record, target_kind)
+    model = DeterministicSemanticModel(
+        {record.id: original_frame}, candidate_frame, rendered_output
+    )
+    assessment = SemanticEquivalenceAssessment(
+        verdict="different",
+        explanation="The candidate exceeds the moderate tone boundary.",
+        deltas=(
+            SemanticDelta(
+                category="communication",
+                operation="added",
+                candidate_quote=forbidden_quote,
+                description="Forbidden hostile communication was added.",
+            ),
+        ),
+        verifier_version="test/1",
+    )
+    verifier = DeterministicEquivalenceVerifier(assessment)
+
+    result = await DatasetAugmentationEngine(model, model, verifier).augment(
+        (record,), operator_ids=(operator_id,)
+    )
+
+    candidate = result.candidates[0]
+    assert candidate.passed is False
+    assert candidate.failure_reasons == (
+        "tone safety check found a forbidden communication change",
+    )
+    assert candidate.semantic_equivalence_assessment == assessment
 
 
 async def test_behavior_operator_rejects_relations_touching_its_marker() -> None:
@@ -1899,6 +2012,16 @@ async def test_measurable_behavior_does_not_depend_on_a_model_marker(
             "please could you now transfer the amount of 100 to Alice and then when that is done "
             "could you also please tell me exactly what the current balance is for the account",
             "rendered input is not between 1.5 and 2 times the source length",
+        ),
+        (
+            "input.tone.angry",
+            "Please transfer 100 to Alice and then report the balance",
+            "reparsed frame does not contain required communication kind angry",
+        ),
+        (
+            "input.tone.argumentative",
+            "Please transfer 100 to Alice and then report the balance",
+            "reparsed frame does not contain required communication kind argumentative",
         ),
     ],
 )

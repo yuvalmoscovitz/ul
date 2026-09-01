@@ -345,6 +345,19 @@ def test_campaign_plan_counts_grammar_error_as_llm_generation() -> None:
     assert "candidate generation requires a semantic model call" in grammar_operator.reasons
 
 
+def test_campaign_plan_counts_tone_safety_validation() -> None:
+    plan = campaign_module.create_dataset_campaign_plan(
+        records=(_evaluation_result("interaction-1").source,),
+        selected_operator_ids=("input.tone.angry",),
+        run_config=_run_config(),
+        settings=command_module.load_dataset_semantic_settings(),
+    )
+
+    assert plan.calls.variation_generation == 1
+    assert plan.calls.evaluators == 6
+    assert plan.calls.total_semantic_model == 12
+
+
 @pytest.mark.parametrize("candidate_state", ["rejected", "missing"])
 def test_campaign_plan_does_not_count_known_non_executable_variations(
     candidate_state: str,
@@ -431,7 +444,7 @@ def test_human_dry_run_escapes_untrusted_ids_and_summarizes_unselected_catalog(
     assert "\\u001b" in result.output
     assert "[bold]spoof[/bold]" in result.output
     assert "Unselected catalog operators:" in result.output
-    assert "0 eligible, 9 conditional, 10 ineligible" in result.output
+    assert "0 eligible, 11 conditional, 10 ineligible" in result.output
     assert "use --json for full detail" in " ".join(result.output.split())
     assert "input.surface.rephrase@" not in result.output
 
