@@ -612,19 +612,26 @@ class DatasetEvaluationRunner:
             async with target_request_semaphore:
                 if trial_started_callback is not None:
                     trial_started_callback(unit)
-                trial = await self._execute_trial(
-                    repetition=unit.repetition,
-                    interaction_id=interaction_id,
-                    raw_input=raw_input,
-                    reference_frame=reference_frame,
-                    source=source,
-                    subject=subject,
-                    variation_id=variation_id,
-                    comparison_surface=comparison_surface,
-                )
-                if trial_terminal_callback is not None:
-                    trial_terminal_callback(unit, trial)
-                return trial
+                try:
+                    trial = await self._execute_trial(
+                        repetition=unit.repetition,
+                        interaction_id=interaction_id,
+                        raw_input=raw_input,
+                        reference_frame=reference_frame,
+                        source=source,
+                        subject=subject,
+                        variation_id=variation_id,
+                        comparison_surface=comparison_surface,
+                    )
+                    if trial_terminal_callback is not None:
+                        trial_terminal_callback(unit, trial)
+                    return trial
+                except asyncio.CancelledError:
+                    self._target_state_uncertain = True
+                    raise DatasetTargetDeliveryUncertain(
+                        "target delivery is uncertain; environment quarantined and trial not "
+                        "retried"
+                    ) from None
 
         async def execute_repetition(repetition: int) -> None:
             baseline_unit = DatasetTrialUnit(
@@ -684,11 +691,16 @@ class DatasetEvaluationRunner:
                 )
                 candidate_trials_by_repetition[candidate.operator_id][repetition] = candidate_trial
 
-            async with asyncio.TaskGroup() as candidate_tasks:
+            if self._max_concurrent_target_requests == 1:
                 for candidate in accepted_candidates:
-                    candidate_tasks.create_task(execute_candidate(candidate))
+                    await execute_candidate(candidate)
+            else:
+                async with asyncio.TaskGroup() as candidate_tasks:
+                    for candidate in accepted_candidates:
+                        candidate_tasks.create_task(execute_candidate(candidate))
 
         delivery_uncertain = False
+        unexpected_error: BaseException | None = None
         try:
             if self._max_concurrent_target_requests == 1:
                 for repetition in range(1, repetitions + 1):
@@ -699,10 +711,14 @@ class DatasetEvaluationRunner:
                         repetition_tasks.create_task(execute_repetition(repetition))
         except* DatasetTargetDeliveryUncertain:
             delivery_uncertain = True
+        except* BaseException as error:
+            unexpected_error = error
         if delivery_uncertain:
             raise DatasetTargetDeliveryUncertain(
                 "target delivery is uncertain; in-flight trials were stopped and are not retried"
             ) from None
+        if unexpected_error is not None:
+            raise unexpected_error
 
         baseline_trials = [
             baseline_trials_by_repetition[repetition] for repetition in range(1, repetitions + 1)

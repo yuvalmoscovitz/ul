@@ -287,7 +287,7 @@ def test_signal_cancels_every_inflight_target_call() -> None:
 
 
 def test_progress_counts_multiple_running_trials() -> None:
-    clock_values = iter((1.0, 2.0, 3.0, 4.0))
+    clock_values = iter((1.0, 2.0, 3.0, 4.0, 5.0))
     events = []
     tracker = _tracker(events.append, lambda: next(clock_values))
     first = DatasetTrialUnit(
@@ -305,10 +305,13 @@ def test_progress_counts_multiple_running_trials() -> None:
 
     tracker.trial_started(case_number=1, unit=first)
     tracker.trial_started(case_number=2, unit=second)
+    skipped = second.model_copy(update={"interaction_id": "skipped"})
+    tracker.trial_skipped(case_number=3, unit=skipped)
     tracker.trial_delivery_uncertain(case_number=1, unit=first)
 
     assert events[1].work.running == 2
-    assert events[2].work.running == 1
+    assert events[2].work.running == 2
+    assert events[3].work.running == 1
 
 
 def test_uncertain_delivery_is_terminal_and_quarantined() -> None:

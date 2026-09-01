@@ -250,16 +250,23 @@ async def evaluate_interaction_records(
                     case_position: int = case_number,
                 ) -> None:
                     task = asyncio.current_task()
+                    trial_was_started = task is not None and task in active_trials
                     if task is not None:
                         signal_control.target_call_finished(task)
                         active_trials.pop(task, None)
                     if trial_journal is not None:
                         trial_journal.finish(unit, trial)
-                    progress_tracker.trial_terminal(
-                        case_number=case_position,
-                        unit=unit,
-                        trial=trial,
-                    )
+                    if trial_was_started:
+                        progress_tracker.trial_terminal(
+                            case_number=case_position,
+                            unit=unit,
+                            trial=trial,
+                        )
+                    else:
+                        progress_tracker.trial_skipped(
+                            case_number=case_position,
+                            unit=unit,
+                        )
                     if run_config.concurrency == 1:
                         stop_at_requested_boundary()
 

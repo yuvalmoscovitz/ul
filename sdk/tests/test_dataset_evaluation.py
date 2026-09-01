@@ -715,6 +715,30 @@ class ConcurrentIsolatedEnvironment:
             self.active_requests -= 1
 
 
+class BlockingObservedSemanticPipeline(DeterministicSemanticPipeline):
+    def __init__(self, *, fail_first: bool = False) -> None:
+        super().__init__((_source_outcomes()[0],))
+        self.fail_first = fail_first
+        self.started_count = 0
+        self.all_started = asyncio.Event()
+
+    async def deconstruct(
+        self,
+        record: InteractionRecord | UserInputRecord,
+        reference_frame: SemanticFrame | None = None,
+    ) -> SemanticFrame:
+        if not isinstance(record, InteractionRecord) or record.id == "source":
+            return await super().deconstruct(record, reference_frame)
+        self.started_count += 1
+        if self.started_count == 2:
+            self.all_started.set()
+        await self.all_started.wait()
+        if self.fail_first and ":round-1" in record.id:
+            raise AssertionError("independent semantic failure")
+        await asyncio.Event().wait()
+        raise AssertionError("blocked semantic request returned")
+
+
 class FailingEnvironment(DeterministicEnvironment):
     def __init__(self, fail_on_execution: int) -> None:
         super().__init__()
@@ -3330,6 +3354,51 @@ async def test_runner_bounds_and_overlaps_isolated_target_requests() -> None:
 
     assert result.baseline.trial_set.requested_repetitions == 3
     assert environment.maximum_active_requests == 2
+
+
+async def test_cancellation_after_target_response_still_quarantines_started_trial() -> None:
+    semantic_pipeline = BlockingObservedSemanticPipeline()
+    environment = ConcurrentIsolatedEnvironment()
+    environment.release_requests.set()
+    started_tasks: list[asyncio.Task[object]] = []
+    runner = _DatasetEvaluationRunner(
+        DatasetAugmentationEngine(semantic_pipeline, semantic_pipeline),
+        semantic_pipeline,
+        environment,
+        allow_network_egress=True,
+        max_concurrent_target_requests=2,
+    )
+
+    evaluation = asyncio.create_task(
+        runner.run(
+            _source(),
+            repetitions=2,
+            trial_started_callback=lambda unit: started_tasks.append(
+                cast(asyncio.Task[object], asyncio.current_task())
+            ),
+        )
+    )
+    await asyncio.wait_for(semantic_pipeline.all_started.wait(), timeout=1)
+    started_tasks[0].cancel()
+
+    with pytest.raises(DatasetTargetDeliveryUncertain):
+        await evaluation
+
+
+async def test_delivery_uncertainty_wins_over_mixed_parallel_failure() -> None:
+    semantic_pipeline = BlockingObservedSemanticPipeline(fail_first=True)
+    environment = ConcurrentIsolatedEnvironment()
+    environment.release_requests.set()
+    runner = _DatasetEvaluationRunner(
+        DatasetAugmentationEngine(semantic_pipeline, semantic_pipeline),
+        semantic_pipeline,
+        environment,
+        allow_network_egress=True,
+        max_concurrent_target_requests=2,
+    )
+
+    with pytest.raises(DatasetTargetDeliveryUncertain):
+        await runner.run(_source(), repetitions=2)
 
 
 @pytest.mark.parametrize("evaluation_mode", ["correctness", "preference"])
