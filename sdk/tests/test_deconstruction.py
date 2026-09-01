@@ -2977,6 +2977,7 @@ async def test_live_llm_augmentations_pass_existing_validity_check(
             assert candidate.passed, (
                 f"{operator.id}: input={candidate.augmented_input!r}; "
                 f"communication_kinds={communication_kinds!r}; "
+                f"equivalence={candidate.semantic_equivalence_assessment!r}; "
                 f"failure_reasons={candidate.failure_reasons!r}"
             )
             candidates.append(candidate)

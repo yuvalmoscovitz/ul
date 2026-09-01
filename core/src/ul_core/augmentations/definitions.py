@@ -224,6 +224,7 @@ def _dataset_spec(
         "business state must stay the same."
     ),
     human_review: bool = False,
+    state_observation: bool = True,
     applicability_profile: AugmentationApplicabilityProfile = "broad",
     applicability_rule: str = "Applies to any nonempty user input with recorded source semantics.",
 ) -> BuiltinAugmentationSpec:
@@ -251,7 +252,7 @@ def _dataset_spec(
                     required_source_features=("production interaction",),
                     semantic_model=True,
                     environment=True,
-                    state_observation=True,
+                    state_observation=state_observation,
                     human_review=human_review,
                 ),
             ),
@@ -328,10 +329,15 @@ _BUILTIN_AUGMENTATION_SPECS = (
     _dataset_spec("input.surface.disfluency_repeat", "Repeat a word as a natural disfluency."),
     _dataset_spec("input.style.terse", "Express the same request tersely."),
     _dataset_spec("input.style.verbose", "Express the same request verbosely."),
-    _dataset_spec("input.tone.angry", "Express the same request with moderate anger."),
+    _dataset_spec(
+        "input.tone.angry",
+        "Express the same request with moderate anger.",
+        state_observation=False,
+    ),
     _dataset_spec(
         "input.tone.argumentative",
         "Express the same request as an argumentative challenge.",
+        state_observation=False,
     ),
     _dataset_spec(
         "input.intent.self_correction",

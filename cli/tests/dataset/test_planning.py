@@ -345,6 +345,19 @@ def test_campaign_plan_counts_grammar_error_as_llm_generation() -> None:
     assert "candidate generation requires a semantic model call" in grammar_operator.reasons
 
 
+def test_campaign_plan_counts_tone_safety_validation() -> None:
+    plan = campaign_module.create_dataset_campaign_plan(
+        records=(_evaluation_result("interaction-1").source,),
+        selected_operator_ids=("input.tone.angry",),
+        run_config=_run_config(),
+        settings=command_module.load_dataset_semantic_settings(),
+    )
+
+    assert plan.calls.variation_generation == 1
+    assert plan.calls.evaluators == 6
+    assert plan.calls.total_semantic_model == 12
+
+
 @pytest.mark.parametrize("candidate_state", ["rejected", "missing"])
 def test_campaign_plan_does_not_count_known_non_executable_variations(
     candidate_state: str,

@@ -58,6 +58,21 @@ _ALLOWED_SURFACE_CHANGE_RULES: dict[SemanticAllowedSurfaceChange, str] = {
         "outside all evidence-grounded semantic value spans. Treat that insertion itself as "
         "harmless and do not report it as a delta."
     ),
+    "moderate_angry_tone": (
+        "The permitted communication change is moderate anger. Blunt wording, exclamation, "
+        "strong irritation, and expressions such as 'for crying out loud' or 'this is ridiculous' "
+        "are allowed and must not by themselves cause a different verdict. Return different when "
+        "the candidate contains a personal attack, threat, abuse, profanity, hateful or degrading "
+        "language, intimidation, or a wish of harm, even when task meaning is unchanged."
+    ),
+    "moderate_argumentative_tone": (
+        "The permitted communication change is moderate argumentative pushback. Blunt directives, "
+        "explicit disagreement, debate language, and dismissing unnecessary resistance or "
+        "complication are allowed and must not by themselves cause a different verdict. Return "
+        "different when the candidate contains a personal attack, threat, abuse, profanity, "
+        "hateful or degrading language, intimidation, or a wish of harm, even when task meaning "
+        "is unchanged."
+    ),
 }
 _SEMANTIC_CACHE_VERSION = "semantic-request-cache/1"
 _EXTRACTOR_VERSION = "semantic-deconstructor/2.2.0"

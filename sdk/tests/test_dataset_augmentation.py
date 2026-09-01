@@ -1136,8 +1136,19 @@ async def test_behavior_operators_allow_only_their_communication_change(
     model = DeterministicSemanticModel(
         {record.id: original_frame}, candidate_frame, realistic_output
     )
+    verifier = (
+        DeterministicEquivalenceVerifier(
+            SemanticEquivalenceAssessment(
+                verdict="equivalent",
+                explanation="The tone is moderate and contains no forbidden communication.",
+                verifier_version="test/1",
+            )
+        )
+        if operator_id in {"input.tone.angry", "input.tone.argumentative"}
+        else None
+    )
 
-    result = await DatasetAugmentationEngine(model, model).augment(
+    result = await DatasetAugmentationEngine(model, model, verifier).augment(
         (record,), operator_ids=(operator_id,)
     )
 
@@ -1157,6 +1168,88 @@ async def test_behavior_operators_allow_only_their_communication_change(
         assert "merely adding words" in model.rendered_instructions[0]
     if operator_id == "input.tone.argumentative":
         assert "merely making the request emphatic" in model.rendered_instructions[0]
+    if verifier is not None:
+        assert verifier.allowed_surface_changes == [f"moderate_{target_kind}_tone"]
+
+
+async def test_tone_operator_fails_closed_without_safety_verifier() -> None:
+    record = source_record()
+    original_frame = source_frame(record)
+    candidate_frame = behavior_candidate_frame(record, "angry")
+    model = DeterministicSemanticModel(
+        {record.id: original_frame},
+        candidate_frame,
+        "This is ridiculous—transfer 100 to Alice, then tell me the balance.",
+    )
+
+    result = await DatasetAugmentationEngine(model, model).augment(
+        (record,), operator_ids=("input.tone.angry",)
+    )
+
+    assert result.candidates[0].passed is False
+    assert result.candidates[0].failure_reasons == ("tone safety verifier is unavailable",)
+
+
+@pytest.mark.parametrize(
+    ("operator_id", "target_kind", "rendered_output", "forbidden_quote"),
+    [
+        (
+            "input.tone.angry",
+            "angry",
+            "You fucking idiot—transfer 100 to Alice, then tell me the balance.",
+            "fucking idiot",
+        ),
+        (
+            "input.tone.angry",
+            "angry",
+            "Transfer 100 to Alice or I will hurt you, then tell me the balance.",
+            "I will hurt you",
+        ),
+        (
+            "input.tone.argumentative",
+            "argumentative",
+            "There is no debate, you moron: transfer 100 to Alice, then tell me the balance.",
+            "you moron",
+        ),
+    ],
+)
+async def test_tone_operator_rejects_forbidden_hostility(
+    operator_id: str,
+    target_kind: str,
+    rendered_output: str,
+    forbidden_quote: str,
+) -> None:
+    record = source_record()
+    original_frame = source_frame(record)
+    candidate_frame = behavior_candidate_frame(record, target_kind)
+    model = DeterministicSemanticModel(
+        {record.id: original_frame}, candidate_frame, rendered_output
+    )
+    assessment = SemanticEquivalenceAssessment(
+        verdict="different",
+        explanation="The candidate exceeds the moderate tone boundary.",
+        deltas=(
+            SemanticDelta(
+                category="communication",
+                operation="added",
+                candidate_quote=forbidden_quote,
+                description="Forbidden hostile communication was added.",
+            ),
+        ),
+        verifier_version="test/1",
+    )
+    verifier = DeterministicEquivalenceVerifier(assessment)
+
+    result = await DatasetAugmentationEngine(model, model, verifier).augment(
+        (record,), operator_ids=(operator_id,)
+    )
+
+    candidate = result.candidates[0]
+    assert candidate.passed is False
+    assert candidate.failure_reasons == (
+        "tone safety check found a forbidden communication change",
+    )
+    assert candidate.semantic_equivalence_assessment == assessment
 
 
 async def test_behavior_operator_rejects_relations_touching_its_marker() -> None:

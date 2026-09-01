@@ -77,6 +77,16 @@ def test_dataset_augmentation_declares_actual_execution_requirements() -> None:
     )
 
 
+def test_tone_augmentations_require_only_response_observation() -> None:
+    catalog = builtin_augmentation_catalog()
+
+    for operator_id in ("input.tone.angry", "input.tone.argumentative"):
+        requirements = catalog.get(operator_id).bindings[0].requirements
+        assert requirements.semantic_model is True
+        assert requirements.environment is True
+        assert requirements.state_observation is False
+
+
 def test_dataset_applicability_contracts_are_discoverable_before_execution() -> None:
     catalog = builtin_augmentation_catalog()
     broad = catalog.get("input.surface.grammar_error")

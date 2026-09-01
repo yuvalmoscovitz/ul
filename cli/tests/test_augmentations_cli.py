@@ -125,6 +125,42 @@ def _enable_semantic_execution(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("OPEN_ROUTER_API_KEY", "test-key")
 
 
+def _initialize_isolated_response_project(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    dataset_path = tmp_path / "interactions.jsonl"
+    dataset_path.write_text(
+        json.dumps(
+            {
+                "id": "interaction-1",
+                "input": "Transfer 100 to Alice.",
+                "output": {"status": "recorded"},
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(tmp_path)
+    result = runner.invoke(
+        app,
+        [
+            "init",
+            str(dataset_path),
+            "--environment-url",
+            "https://agent.example.test/v1/chat/completions",
+            "--adapter-tier",
+            "isolated-response",
+            "--allow-environment-network",
+            "--confirm-test-environment",
+            "--confirm-request-isolation",
+            "--confirm-safe-test-target",
+            "--isolated-preset",
+            "openai-chat",
+            "--agent-model",
+            "customer-agent-v1",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+
+
 def _planned_augmentation(payload: dict[str, object], augmentation_id: str) -> dict[str, object]:
     augmentations = payload["augmentations"]
     assert isinstance(augmentations, list)
@@ -281,6 +317,16 @@ def test_show_reports_dataset_execution_requirements_without_requiring_invariant
     assert "nonempty user input" in result.output
 
 
+@pytest.mark.parametrize("operator_id", ["input.tone.angry", "input.tone.argumentative"])
+def test_show_reports_tones_as_response_only(operator_id: str) -> None:
+    result = CliRunner().invoke(app, ["augmentations", "show", operator_id])
+
+    assert result.exit_code == 0
+    assert "test environment" in result.output
+    assert "semantic model" in result.output
+    assert "committed-state observation" not in result.output
+
+
 def test_show_labels_conditional_operator_and_explains_its_rule() -> None:
     result = CliRunner().invoke(app, ["augmentations", "show", "input.intent.self_correction"])
 
@@ -430,6 +476,22 @@ def test_plan_reads_declared_capabilities_without_constructing_external_clients(
     )
     assert "stress_case_not_configured" in _reason_codes(timeout)
     assert "environment_capability_missing" not in _reason_codes(timeout)
+
+
+def test_tones_are_ready_for_an_isolated_response_project(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _initialize_isolated_response_project(tmp_path, monkeypatch)
+    _enable_semantic_execution(monkeypatch)
+
+    result = runner.invoke(app, ["augmentations", "plan", "--json"])
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    for operator_id in ("input.tone.angry", "input.tone.argumentative"):
+        planned = _planned_augmentation(payload, operator_id)
+        assert planned["status"] == "ready"
+        assert "environment_state_observation_unsupported" not in _reason_codes(planned)
 
 
 def test_bundle_plan_uses_configured_project_runtime_readiness(

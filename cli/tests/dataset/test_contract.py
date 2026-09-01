@@ -123,7 +123,7 @@ def test_legacy_operator_list_delegates_to_catalog_and_keeps_existing_call_accou
         )
         assert tone_dry_run.exit_code == 0, tone_dry_run.output
         assert f"Operators: {tone_operator}@1.0.0" in tone_dry_run.output
-        assert "Potential semantic model calls: up to 15" in tone_dry_run.output
+        assert "Potential semantic model calls: up to 16" in tone_dry_run.output
         assert "Potential environment API calls: up to 6" in tone_dry_run.output
 
     wrong_version = runner.invoke(

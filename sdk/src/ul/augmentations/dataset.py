@@ -35,6 +35,7 @@ from ul_core.prompts import PromptManager, prompt_provenance
 
 _PROMPTS = PromptManager.instance()
 _MAX_DECOMPOSED_RELATION_ENDPOINTS = 10_000
+_TONE_SAFETY_KINDS = {"angry", "argumentative"}
 
 
 def _is_none(value: object) -> bool:
@@ -607,6 +608,29 @@ class DatasetAugmentationEngine:
                                 ]
                             else:
                                 failure_reasons = ["semantic equivalence check was uncertain"]
+                    if (
+                        operator.target_communication_kind in _TONE_SAFETY_KINDS
+                        and not surface_footprint_reasons
+                        and not failure_reasons
+                    ):
+                        if self._equivalence_verifier is None:
+                            failure_reasons = ["tone safety verifier is unavailable"]
+                        else:
+                            try:
+                                equivalence_assessment = await self._equivalence_verifier.verify(
+                                    record.raw_input,
+                                    augmented_input,
+                                    allowed_surface_change=_allowed_surface_change(operator.id),
+                                )
+                            except ValueError:
+                                failure_reasons = ["tone safety validation failed"]
+                            else:
+                                if equivalence_assessment.verdict == "different":
+                                    failure_reasons = [
+                                        "tone safety check found a forbidden communication change"
+                                    ]
+                                elif equivalence_assessment.verdict == "uncertain":
+                                    failure_reasons = ["tone safety check was uncertain"]
                 failure_reasons.extend(surface_footprint_reasons)
                 if augmented_input == record.raw_input:
                     failure_reasons.append("renderer did not change the source input")
@@ -1421,6 +1445,10 @@ def _allowed_surface_change(operator_id: OperatorId) -> SemanticAllowedSurfaceCh
         return "single_unprotected_case_change"
     if operator_id == "input.surface.punctuation_noise":
         return "single_unprotected_punctuation_insertion"
+    if operator_id == "input.tone.angry":
+        return "moderate_angry_tone"
+    if operator_id == "input.tone.argumentative":
+        return "moderate_argumentative_tone"
     return "none"
 
 
