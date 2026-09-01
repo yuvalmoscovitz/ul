@@ -24,7 +24,7 @@ def test_builtin_bundles_are_versioned_selection_and_budget_policies() -> None:
         "unclear-changing-requests",
     ]
     everyday = catalog.get("everyday-customers")
-    assert everyday.version == "1.0.0"
+    assert everyday.version == "1.1.0"
     assert everyday.composition == "independent_only"
     assert [policy.ref.id for policy in everyday.operators] == [
         "input.surface.typing_noise",
@@ -67,7 +67,7 @@ def test_bundle_plan_fans_out_independently_and_exposes_bounded_work() -> None:
         probe.changed_surfaces == ("structured_input", "conversation") for probe in plan.probes
     )
     assert len({probe.canonical_id for probe in plan.probes}) == 6
-    assert plan.totals.model_calls == 22
+    assert plan.totals.model_calls == 26
     assert plan.totals.target_calls == 6
     assert plan.totals.maximum_duration_seconds == 540
     assert plan.totals.maximum_cost_usd == 1.5
@@ -187,7 +187,7 @@ def test_bundle_plan_enforces_fan_out_and_mutation_bounds() -> None:
         reset_required=True,
     )
     terse = typing.model_copy(
-        update={"ref": AugmentationRef(id="input.style.terse", version="1.0.0")}
+        update={"ref": AugmentationRef(id="input.style.terse", version="1.1.0")}
     )
     fan_out_bundle = AugmentationBundle(
         id="fan-out-bound",

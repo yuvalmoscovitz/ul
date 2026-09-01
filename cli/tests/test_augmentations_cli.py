@@ -226,7 +226,7 @@ def test_guide_and_surface_filter_make_the_library_navigable() -> None:
     assert "World and business state" in guide.output
     assert "Tool and execution" in guide.output
     assert "Trust, policy, and authorization" in guide.output
-    assert guide.output.count("@1.0.0 [implemented; not_qualified]") == 20
+    assert guide.output.count("@1.0.0 [implemented; not_qualified]") == 14
     assert "input.intent.self_correction@1.1.0 [implemented; not_qualified]" in guide.output
     assert "input.surface.disfluency_repeat@1.1.0 [implemented; not_qualified]" in guide.output
 
@@ -310,7 +310,7 @@ def test_show_reports_dataset_execution_requirements_without_requiring_invariant
     result = CliRunner().invoke(app, ["augmentations", "show", "input.style.terse"])
 
     assert result.exit_code == 0
-    assert "ul dataset evaluate --operator input.style.terse@1.0.0" in result.output
+    assert "ul dataset evaluate --operator input.style.terse@1.1.0" in result.output
     assert "test environment" in result.output
     assert "committed-state observation" in result.output
     assert "semantic model" in result.output

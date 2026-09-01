@@ -324,23 +324,29 @@ _BUILTIN_AUGMENTATION_SPECS = (
             "Applies only when punctuation can be inserted outside a protected semantic value."
         ),
     ),
-    _dataset_spec("input.surface.grammar_error", "Add one harmless grammatical error."),
-    _dataset_spec("input.surface.fragmented_syntax", "Use plausible fragmented syntax."),
+    _dataset_spec(
+        "input.surface.grammar_error", "Add one harmless grammatical error.", version="1.1.0"
+    ),
+    _dataset_spec(
+        "input.surface.fragmented_syntax", "Use plausible fragmented syntax.", version="1.1.0"
+    ),
     _dataset_spec(
         "input.surface.disfluency_repeat",
         "Repeat a word as a natural disfluency.",
         version="1.1.0",
     ),
-    _dataset_spec("input.style.terse", "Express the same request tersely."),
-    _dataset_spec("input.style.verbose", "Express the same request verbosely."),
+    _dataset_spec("input.style.terse", "Express the same request tersely.", version="1.1.0"),
+    _dataset_spec("input.style.verbose", "Express the same request verbosely.", version="1.1.0"),
     _dataset_spec(
         "input.tone.angry",
         "Express the same request with moderate anger.",
+        version="1.1.0",
         state_observation=False,
     ),
     _dataset_spec(
         "input.tone.argumentative",
         "Express the same request as an argumentative challenge.",
+        version="1.1.0",
         state_observation=False,
     ),
     _dataset_spec(

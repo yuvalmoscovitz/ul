@@ -204,7 +204,6 @@ _BUILTIN_OPERATORS = (
         generation_mechanism="llm",
         allowed_change="declared_communication_form",
         target_communication_kind="angry",
-        target_marker_required=True,
     ),
     _builtin_operator(
         operator_id="input.tone.argumentative",
@@ -1789,6 +1788,11 @@ def _surface_footprint_reasons(
         augmented_input
     ):
         return ("rendered input only changes case, spacing, or punctuation",)
+    if (
+        operator_id == "input.surface.grammar_error"
+        and re.match(r"(?i)^can you [a-z]+s\b", augmented_input) is None
+    ):
+        return ("rendered input must begin with an explicit subject-verb agreement error",)
     if operator_id == "input.surface.case_variation" and not _is_single_case_change(
         source_input, augmented_input
     ):
@@ -1797,13 +1801,15 @@ def _surface_footprint_reasons(
         source_input, augmented_input
     ):
         return ("rendered input must insert exactly one punctuation character",)
-    if operator_id == "input.style.terse" and augmented_word_count * 20 > source_word_count * 19:
+    if operator_id == "input.style.terse" and augmented_word_count * 20 > source_word_count * 17:
         return ("rendered input is not visibly shorter than the source",)
     if operator_id == "input.style.verbose" and not (
         source_word_count * 5 <= augmented_word_count * 4
         and augmented_word_count <= source_word_count * 3
     ):
         return ("rendered input is not between 1.25 and 3 times the source length",)
+    if operator_id == "input.tone.angry" and re.search(r"(?i)\balready!", augmented_input) is None:
+        return ("rendered input must integrate angry impatience inside the request",)
     if operator_id == "input.surface.disfluency_repeat":
         source_repetition_count = sum(
             first.casefold() == second.casefold()

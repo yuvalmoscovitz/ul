@@ -331,7 +331,7 @@ class CorrectingSemanticModel(DeterministicSemanticModel):
         self.rendered_output = (
             raw_input
             if not self.rendered_inputs
-            else "Transfer 100 to Alice, then tell me balance."
+            else "Can you transfers 100 to Alice, then tell me the balance?"
         )
         return await super().render(
             raw_input,
@@ -697,17 +697,27 @@ async def test_builtin_operator_library_is_fixed_versioned_and_reviewable() -> N
         "input.intent.self_correction"
     ] == "1.1.0"
     assert {
-        operator.id: operator.version
-        for operator in operators
-        if operator.id in {"input.surface.disfluency_repeat", "input.intent.self_correction"}
+        operator.id: operator.version for operator in operators if operator.version == "1.1.0"
     } == {
+        "input.surface.grammar_error": "1.1.0",
+        "input.surface.fragmented_syntax": "1.1.0",
         "input.surface.disfluency_repeat": "1.1.0",
+        "input.style.terse": "1.1.0",
+        "input.style.verbose": "1.1.0",
+        "input.tone.angry": "1.1.0",
+        "input.tone.argumentative": "1.1.0",
         "input.intent.self_correction": "1.1.0",
     }
     assert {
         operator.version
         for operator in operators
-        if operator.id not in {"input.surface.disfluency_repeat", "input.intent.self_correction"}
+        if operator.id
+        in {
+            "input.surface.rephrase",
+            "input.surface.typing_noise",
+            "input.surface.case_variation",
+            "input.surface.punctuation_noise",
+        }
     } == {"1.0.0"}
     assert [operator.id for operator in operators if operator.generation_mechanism == "llm"] == [
         "input.surface.rephrase",
@@ -731,7 +741,7 @@ async def test_builtin_operator_library_is_fixed_versioned_and_reviewable() -> N
         "input.intent.self_correction"
     ]
     assert "Never abbreviate a month name" in instructions["input.style.terse"]
-    assert 'Do not use\n"frustrated" as the only tone marker' in instructions["input.tone.angry"]
+    assert 'End the\nrewritten first command with "already!"' in instructions["input.tone.angry"]
     assert [
         operator.id for operator in operators if operator.applicability_profile == "conditional"
     ] == [
@@ -1782,7 +1792,7 @@ async def test_self_correction_skips_ineligible_sources(ineligible_reason: str) 
         (
             "input.surface.grammar_error",
             "fragmented_syntax",
-            "Transfer 100 to Alice, then tells me the balance.",
+            "Can you transfers 100 to Alice, then tell me the balance?",
             False,
         ),
         (
@@ -1801,7 +1811,7 @@ async def test_self_correction_skips_ineligible_sources(ineligible_reason: str) 
         (
             "input.tone.angry",
             "angry",
-            "This is ridiculous—transfer 100 to Alice, then tell me the balance.",
+            "Transfer 100 to Alice already! Then tell me the balance.",
             False,
         ),
         (
@@ -1843,7 +1853,7 @@ async def test_behavior_operators_allow_only_their_communication_change(
     candidate = result.candidates[0]
     assert candidate.passed
     assert candidate.operator_id == operator_id
-    assert candidate.operator_version == "1.0.0"
+    assert candidate.operator_version == "1.1.0"
     assert candidate.allowed_change == "declared_communication_form"
     assert candidate.human_review_required is review_required
     assert candidate.augmented_input == realistic_output.replace("—", " ")
@@ -1853,7 +1863,7 @@ async def test_behavior_operators_allow_only_their_communication_change(
         "transformation_prompts": prompt_provenance(f"augmentation.{operator_id}"),
     }
     if operator_id == "input.tone.angry":
-        assert "merely adding words" in model.rendered_instructions[0]
+        assert "stock prefix" in model.rendered_instructions[0].casefold()
     if operator_id == "input.tone.argumentative":
         assert "merely making the request emphatic" in model.rendered_instructions[0]
     if verifier is not None:
@@ -1867,7 +1877,7 @@ async def test_tone_operator_fails_closed_without_safety_verifier() -> None:
     model = DeterministicSemanticModel(
         {record.id: original_frame},
         candidate_frame,
-        "This is ridiculous—transfer 100 to Alice, then tell me the balance.",
+        "Transfer 100 to Alice already! Then tell me the balance.",
     )
 
     result = await DatasetAugmentationEngine(model, model).augment(
@@ -1884,13 +1894,13 @@ async def test_tone_operator_fails_closed_without_safety_verifier() -> None:
         (
             "input.tone.angry",
             "angry",
-            "You fucking idiot—transfer 100 to Alice, then tell me the balance.",
+            "You fucking idiot—transfer 100 to Alice already! Then tell me the balance.",
             "fucking idiot",
         ),
         (
             "input.tone.angry",
             "angry",
-            "Transfer 100 to Alice or I will hurt you, then tell me the balance.",
+            "Transfer 100 to Alice already! I will hurt you; then tell me the balance.",
             "I will hurt you",
         ),
         (
@@ -2626,7 +2636,7 @@ async def test_llm_operator_retries_an_unchanged_generation_once() -> None:
 
     candidate = result.candidates[0]
     assert candidate.passed
-    assert candidate.augmented_input == "Transfer 100 to Alice, then tell me balance."
+    assert candidate.augmented_input == "Can you transfers 100 to Alice, then tell me the balance?"
     assert len(model.rendered_inputs) == 2
     assert (
         "renderer did not change the source input" in candidate.renderer_metadata["retry_reasons"]
@@ -2649,6 +2659,11 @@ async def test_llm_operator_retries_an_unchanged_generation_once() -> None:
             "rendered input only changes case, spacing, or punctuation",
         ),
         (
+            "input.surface.grammar_error",
+            "Please transfer 100 to Alice and then report the balance",
+            "rendered input must begin with an explicit subject-verb agreement error",
+        ),
+        (
             "input.surface.fragmented_syntax",
             "Please transfer 100 to Alice and then report the balance",
             "reparsed frame does not contain required communication kind fragmented_syntax",
@@ -2665,7 +2680,7 @@ async def test_llm_operator_retries_an_unchanged_generation_once() -> None:
         (
             "input.tone.angry",
             "Please transfer 100 to Alice and then report the balance",
-            "reparsed frame does not contain required communication kind angry",
+            "rendered input must integrate angry impatience inside the request",
         ),
         (
             "input.tone.argumentative",
