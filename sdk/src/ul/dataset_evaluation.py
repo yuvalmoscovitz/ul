@@ -699,26 +699,27 @@ class DatasetEvaluationRunner:
                     for candidate in accepted_candidates:
                         candidate_tasks.create_task(execute_candidate(candidate))
 
-        delivery_uncertain = False
-        unexpected_error: BaseException | None = None
-        try:
-            if self._max_concurrent_target_requests == 1:
-                for repetition in range(1, repetitions + 1):
-                    await execute_repetition(repetition)
-            else:
+        if self._max_concurrent_target_requests == 1:
+            for repetition in range(1, repetitions + 1):
+                await execute_repetition(repetition)
+        else:
+            delivery_uncertain = False
+            unexpected_error: BaseException | None = None
+            try:
                 async with asyncio.TaskGroup() as repetition_tasks:
                     for repetition in range(1, repetitions + 1):
                         repetition_tasks.create_task(execute_repetition(repetition))
-        except* DatasetTargetDeliveryUncertain:
-            delivery_uncertain = True
-        except* BaseException as error:
-            unexpected_error = error
-        if delivery_uncertain:
-            raise DatasetTargetDeliveryUncertain(
-                "target delivery is uncertain; in-flight trials were stopped and are not retried"
-            ) from None
-        if unexpected_error is not None:
-            raise unexpected_error
+            except* DatasetTargetDeliveryUncertain:
+                delivery_uncertain = True
+            except* BaseException as error:
+                unexpected_error = error
+            if delivery_uncertain:
+                raise DatasetTargetDeliveryUncertain(
+                    "target delivery is uncertain; in-flight trials were stopped and are not "
+                    "retried"
+                ) from None
+            if unexpected_error is not None:
+                raise unexpected_error
 
         baseline_trials = [
             baseline_trials_by_repetition[repetition] for repetition in range(1, repetitions + 1)
