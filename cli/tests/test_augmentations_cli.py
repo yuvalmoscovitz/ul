@@ -226,7 +226,8 @@ def test_guide_and_surface_filter_make_the_library_navigable() -> None:
     assert "World and business state" in guide.output
     assert "Tool and execution" in guide.output
     assert "Trust, policy, and authorization" in guide.output
-    assert guide.output.count("@1.0.0 [implemented; not_qualified]") == 22
+    assert guide.output.count("@1.0.0 [implemented; not_qualified]") == 21
+    assert "input.intent.self_correction@1.1.0 [implemented; not_qualified]" in guide.output
 
     filtered = runner.invoke(
         app,

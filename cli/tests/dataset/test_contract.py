@@ -64,7 +64,7 @@ def test_help_explains_dataset_environment_and_operator_contract() -> None:
     assert "input.intent.self_correction" in operators.output
 
 
-def test_legacy_operator_list_delegates_to_catalog_and_keeps_existing_call_accounting(
+def test_legacy_operator_list_delegates_to_catalog_and_counts_deterministic_correction(
     tmp_path: Path,
 ) -> None:
     operators = runner.invoke(root_app, ["dataset", "operators"])
@@ -76,7 +76,7 @@ def test_legacy_operator_list_delegates_to_catalog_and_keeps_existing_call_accou
         if line.startswith("- ")
     )
     assert listed_operator_ids == (
-        "input.intent.self_correction@1.0.0:",
+        "input.intent.self_correction@1.1.0:",
         "input.style.terse@1.0.0:",
         "input.style.verbose@1.0.0:",
         "input.surface.case_variation@1.0.0:",
@@ -99,14 +99,14 @@ def test_legacy_operator_list_delegates_to_catalog_and_keeps_existing_call_accou
             "evaluate",
             str(dataset),
             "--operator",
-            "input.intent.self_correction@1.0.0",
+            "input.intent.self_correction@1.1.0",
             "--dry-run",
         ],
     )
 
     assert dry_run.exit_code == 0, dry_run.output
-    assert "Operators: input.intent.self_correction@1.0.0" in dry_run.output
-    assert "Potential semantic model calls: up to 15" in dry_run.output
+    assert "Operators: input.intent.self_correction@1.1.0" in dry_run.output
+    assert "Potential semantic model calls: up to 14" in dry_run.output
     assert "Potential environment API calls: up to 6" in dry_run.output
 
     for tone_operator in ("input.tone.angry", "input.tone.argumentative"):

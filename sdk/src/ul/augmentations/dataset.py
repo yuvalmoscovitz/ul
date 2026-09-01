@@ -5,7 +5,8 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-from collections.abc import Iterable, Mapping
+from collections.abc import Collection, Iterable, Mapping
+from dataclasses import dataclass
 from decimal import Decimal
 from itertools import islice, pairwise
 from typing import Any, Literal, Self, cast
@@ -19,6 +20,7 @@ from ul_core.contracts import (
     SemanticRenderer,
 )
 from ul_core.dataset import (
+    CommunicationAct,
     EvidenceReference,
     InteractionRecord,
     RenderedUserInput,
@@ -36,6 +38,14 @@ from ul_core.prompts import PromptManager, prompt_provenance
 _PROMPTS = PromptManager.instance()
 _MAX_DECOMPOSED_RELATION_ENDPOINTS = 10_000
 _TONE_SAFETY_KINDS = {"angry", "argumentative"}
+
+
+@dataclass(frozen=True)
+class _SelfCorrectionPlan:
+    factor: SemanticFactor
+    provisional_quote: str
+    provisional_value: JsonValue
+    grounding: dict[str, JsonValue]
 
 
 def _is_none(value: object) -> bool:
@@ -205,7 +215,7 @@ _BUILTIN_OPERATORS = (
     ),
     _builtin_operator(
         operator_id="input.intent.self_correction",
-        generation_mechanism="llm",
+        generation_mechanism="deterministic",
         allowed_change="structured_self_correction",
         target_communication_kind="self_correction",
         target_marker_required=True,
@@ -428,8 +438,7 @@ class DatasetAugmentationEngine:
             generated_inputs: set[str] = set()
             for operator in selected_operators:
                 transformation_prompt_names: tuple[str, ...] = ()
-                selected_correction_factor: SemanticFactor | None = None
-                planned_provisional_quote: str | None = None
+                self_correction_plan: _SelfCorrectionPlan | None = None
                 if (
                     operator.id == "input.surface.case_variation"
                     and _first_cased_letter(record.raw_input, expected_input_frame) is None
@@ -457,32 +466,14 @@ class DatasetAugmentationEngine:
                     )
                     continue
                 if operator.allowed_change == "structured_self_correction":
-                    selected_correction_factor = _select_self_correction_factor(
-                        record, source_frame
-                    )
-                    if selected_correction_factor is None:
+                    self_correction_plan = _self_correction_plan(record, source_frame)
+                    if self_correction_plan is None:
                         skips.append(
                             DatasetAugmentationSkip(
                                 source_interaction_id=record.id,
                                 operator_id=operator.id,
                                 operator_version=operator.version,
                                 reason=operator.applicability_rule,
-                            )
-                        )
-                        continue
-                    planned_provisional_quote = _planned_provisional_quote(
-                        selected_correction_factor, record.raw_input
-                    )
-                    if planned_provisional_quote is None:
-                        skips.append(
-                            DatasetAugmentationSkip(
-                                source_interaction_id=record.id,
-                                operator_id=operator.id,
-                                operator_version=operator.version,
-                                reason=(
-                                    "The selected source value cannot be safely changed into a "
-                                    "distinct temporary value."
-                                ),
                             )
                         )
                         continue
@@ -495,24 +486,12 @@ class DatasetAugmentationEngine:
                 elif operator.id == "input.surface.disfluency_repeat":
                     rendered_input = _add_word_repetition(record, expected_input_frame, operator)
                 elif operator.allowed_change == "structured_self_correction":
-                    transformation_prompt_names = (
-                        _OPERATOR_PROMPT_NAMES[operator.id],
-                        "augmentation.input.intent.self_correction_argument",
-                    )
-                    if selected_correction_factor is None:
+                    if self_correction_plan is None:
                         raise AssertionError("self-correction requires a selected factor")
-                    correction_quote = _unique_input_quote(selected_correction_factor)
-                    if correction_quote is None:
-                        raise AssertionError("selected correction factor requires a unique quote")
-                    argument_instruction = _PROMPTS.get_prompt(
-                        "augmentation.input.intent.self_correction_argument",
-                        source_text=json.dumps(correction_quote, ensure_ascii=False),
-                        temporary_text=json.dumps(planned_provisional_quote, ensure_ascii=False),
-                    )
-                    rendered_input = await self._renderer.render(
-                        record.raw_input,
-                        f"{operator.instruction} {argument_instruction}",
-                        allow_temporary_value=True,
+                    rendered_input = _add_self_correction(
+                        record,
+                        operator,
+                        self_correction_plan,
                     )
                 else:
                     transformation_prompt_names = (_OPERATOR_PROMPT_NAMES[operator.id],)
@@ -523,6 +502,8 @@ class DatasetAugmentationEngine:
                     **rendered_input.metadata,
                     "transformation_prompts": prompt_provenance(*transformation_prompt_names),
                 }
+                if self_correction_plan is not None:
+                    renderer_metadata["self_correction_grounding"] = self_correction_plan.grounding
                 augmented_input = rendered_input.text
                 if operator.generation_mechanism == "llm":
                     augmented_input = augmented_input.replace("—", " ")
@@ -550,22 +531,22 @@ class DatasetAugmentationEngine:
                             _semantic_difference_reasons(expected_input_frame, reparsed_frame)
                         )
                     elif operator.allowed_change == "structured_self_correction":
-                        if selected_correction_factor is None:
+                        if self_correction_plan is None:
                             raise AssertionError("self-correction requires a selected factor")
-                        if planned_provisional_quote is None:
-                            raise AssertionError("self-correction requires a provisional value")
                         reparsed_frame = _normalize_planned_self_correction_frame(
                             reparsed_frame,
-                            selected_correction_factor,
-                            planned_provisional_quote,
+                            self_correction_plan.factor,
+                            self_correction_plan.provisional_quote,
+                            self_correction_plan.provisional_value,
+                            record.raw_input,
                             augmented_input,
                         )
                         failure_reasons = list(
                             _structured_self_correction_difference_reasons(
                                 expected_input_frame,
                                 reparsed_frame,
-                                selected_correction_factor,
-                                planned_provisional_quote,
+                                self_correction_plan.factor,
+                                self_correction_plan.provisional_quote,
                                 record.raw_input,
                                 augmented_input,
                             )
@@ -885,7 +866,7 @@ def _declared_communication_form_difference_reasons(
     return min(candidate_differences, key=len)
 
 
-_SELF_CORRECTION_FACTOR_KINDS = ("money", "number", "date_time", "duration")
+_SELF_CORRECTION_FACTOR_KINDS = ("money", "number", "date_time", "duration", "enum")
 _ACTION_OPERATION_WORDS = frozenset(
     {
         "add",
@@ -906,11 +887,12 @@ _ACTION_OPERATION_WORDS = frozenset(
         "write",
     }
 )
+_OBSERVATION_OPERATION_WORDS = frozenset({"get", "list", "read", "retrieve", "search"})
 
 
-def _select_self_correction_factor(
+def _self_correction_plan(
     record: InteractionRecord, frame: SemanticFrame
-) -> SemanticFactor | None:
+) -> _SelfCorrectionPlan | None:
     if any(act.kind == "self_correction" for act in frame.communication_acts) or any(
         relation.kind == "superseded_by" for relation in frame.relations
     ):
@@ -929,100 +911,410 @@ def _select_self_correction_factor(
         factor.id: tuple(
             request
             for request in frame.request_units
-            if request.mode == "act" and factor.id in request.factor_ids
+            if request.mode == "act" and _factor_is_associated_with_request(factor, request)
         )
         for factor in frame.factors
     }
-    eligible_factors = tuple(
-        factor
-        for factor in frame.factors
-        if len(act_requests_by_factor_id[factor.id]) == 1
-        and factor.kind in _SELF_CORRECTION_FACTOR_KINDS
-        and factor.status in {"explicit", "observed"}
-        and _is_self_correction_value(factor.value)
-        and (
-            any(
-                _json_key(outcome.fields.get(factor.role)) == _json_key(factor.value)
-                for outcome in action_outcomes_by_request_id[
-                    act_requests_by_factor_id[factor.id][0].id
-                ]
+    plans: list[_SelfCorrectionPlan] = []
+    for factor in frame.factors:
+        requests = act_requests_by_factor_id[factor.id]
+        source_quote = _unique_input_quote(factor)
+        if (
+            len(requests) != 1
+            or factor.kind not in _SELF_CORRECTION_FACTOR_KINDS
+            or factor.status not in {"confirmed", "explicit", "observed"}
+            or not _is_self_correction_value(factor.value)
+            or source_quote is None
+            or record.raw_input.count(source_quote) != 1
+        ):
+            continue
+        request = requests[0]
+        recorded_action_match = _recorded_action_factor_match(record, frame, request, factor)
+        is_grounded = recorded_action_match is not None or any(
+            _json_key(outcome.fields.get(factor.role)) == _json_key(factor.value)
+            for outcome in action_outcomes_by_request_id[request.id]
+        )
+        if not is_grounded:
+            continue
+        if factor.kind == "enum":
+            if recorded_action_match is None:
+                continue
+            field_name = recorded_action_match[2]
+            active_field_factor_ids = tuple(
+                candidate.id
+                for candidate in frame.factors
+                if candidate.status != "superseded"
+                and candidate.kind == "enum"
+                and _factor_is_associated_with_request(candidate, request)
+                and _semantic_role_matches_action_field(
+                    candidate.role,
+                    field_name,
+                    request.predicate,
+                )
             )
-            or _recorded_action_contains_unique_factor_value(
-                record,
-                frame,
-                act_requests_by_factor_id[factor.id][0],
-                factor,
+            if active_field_factor_ids != (factor.id,):
+                continue
+            grounded_plan = _grounded_prior_enum_plan(
+                record, frame, request, factor, recorded_action_match
+            )
+            if grounded_plan is not None:
+                plans.append(grounded_plan)
+            continue
+        provisional_quote = _planned_provisional_quote(factor, record.raw_input)
+        if provisional_quote is None:
+            continue
+        plans.append(
+            _SelfCorrectionPlan(
+                factor=factor,
+                provisional_quote=provisional_quote,
+                provisional_value=_planned_provisional_value(factor, provisional_quote),
+                grounding={"origin": "deterministic_numeric"},
             )
         )
-        and (quote := _unique_input_quote(factor)) is not None
-        and record.raw_input.count(quote) == 1
-    )
-    if not eligible_factors:
+    if not plans:
         return None
     factor_kind_priority = {
         kind: priority for priority, kind in enumerate(_SELF_CORRECTION_FACTOR_KINDS)
     }
     return min(
-        eligible_factors,
-        key=lambda factor: (factor_kind_priority[factor.kind], frame.factors.index(factor)),
+        plans,
+        key=lambda plan: (
+            factor_kind_priority[plan.factor.kind],
+            frame.factors.index(plan.factor),
+        ),
     )
 
 
-def _recorded_action_contains_unique_factor_value(
+def _recorded_action_factor_match(
     record: InteractionRecord,
     frame: SemanticFrame,
     request: RequestUnit,
     factor: SemanticFactor,
-) -> bool:
+) -> tuple[int, Mapping[str, JsonValue], str] | None:
+    action_records = _recorded_action_records(record)
+    request_identifier_factors = _request_identifier_factors(frame, request)
+    if not request_identifier_factors:
+        return None
+    matches: list[tuple[int, Mapping[str, JsonValue], str]] = []
+    for action_index, action in enumerate(action_records):
+        if not _action_matches_request_operation(str(action["action"]), request.predicate):
+            continue
+        if not _action_contains_exact_identifiers(
+            action, frame, request, request_identifier_factors
+        ):
+            continue
+        matching_fields = tuple(
+            field_name
+            for field_name, value in action.items()
+            if not _is_action_identifier_field(field_name)
+            and field_name != "action"
+            and _semantic_role_matches_action_field(factor.role, field_name, request.predicate)
+            and _action_matches_request_resource(str(action["action"]), frame, request, field_name)
+            and not isinstance(value, (dict, list, bool))
+            and _self_correction_values_equal(value, factor.value, factor_kind=factor.kind)
+        )
+        if len(matching_fields) == 1:
+            matches.append((action_index, action, matching_fields[0]))
+    return matches[0] if len(matches) == 1 else None
+
+
+def _recorded_action_records(
+    record: InteractionRecord,
+) -> tuple[Mapping[str, JsonValue], ...]:
     observed_output = record.raw_observed_output
-    action_records: tuple[Mapping[str, JsonValue], ...] = ()
     if isinstance(observed_output, dict):
         if isinstance(observed_output.get("action"), str):
-            action_records = (observed_output,)
-        else:
-            raw_actions = observed_output.get("actions")
-            if isinstance(raw_actions, list) and len(raw_actions) <= 10_000:
-                action_records = tuple(
-                    action
-                    for action in raw_actions
-                    if isinstance(action, dict) and isinstance(action.get("action"), str)
-                )
-    request_identifier_values = tuple(
-        identifier_factor.value
+            return (observed_output,)
+        raw_actions = observed_output.get("actions")
+        if isinstance(raw_actions, list) and len(raw_actions) <= 10_000:
+            return tuple(
+                action
+                for action in raw_actions
+                if isinstance(action, dict) and isinstance(action.get("action"), str)
+            )
+    return ()
+
+
+def _request_identifier_factors(
+    frame: SemanticFrame, request: RequestUnit
+) -> tuple[SemanticFactor, ...]:
+    return tuple(
+        identifier_factor
         for identifier_factor in frame.factors
-        if identifier_factor.id in request.factor_ids
+        if _factor_is_associated_with_request(identifier_factor, request)
         and identifier_factor.kind == "identifier"
         and isinstance(identifier_factor.value, (str, int, float))
         and not isinstance(identifier_factor.value, bool)
     )
-    if not request_identifier_values:
+
+
+def _factor_is_associated_with_request(factor: SemanticFactor, request: RequestUnit) -> bool:
+    if request.factor_ids:
+        return factor.id in request.factor_ids
+    factor_quote = _unique_input_quote(factor)
+    if factor_quote is None:
         return False
-    associated_actions = tuple(
-        action
-        for action in action_records
-        if _action_matches_request_operation(str(action["action"]), request.predicate)
-        and all(
-            sum(
-                type(identifier_value) is type(value) and identifier_value == value
-                for field_name, value in action.items()
-                if field_name == "id" or field_name.endswith("_id")
+    return any(
+        evidence.source == "input"
+        and evidence.text_quote is not None
+        and factor_quote in evidence.text_quote
+        for evidence in request.evidence
+    )
+
+
+def _is_action_identifier_field(field_name: str) -> bool:
+    return field_name == "id" or field_name.endswith("_id")
+
+
+def _action_contains_exact_identifiers(
+    action: Mapping[str, JsonValue],
+    frame: SemanticFrame,
+    request: RequestUnit,
+    request_identifier_factors: tuple[SemanticFactor, ...],
+) -> bool:
+    action_identifiers = tuple(
+        (field_name, value)
+        for field_name, value in action.items()
+        if _is_action_identifier_field(field_name)
+        and isinstance(value, (str, int, float))
+        and not isinstance(value, bool)
+    )
+    if len(action_identifiers) != len(request_identifier_factors):
+        return False
+    factors_match_once = all(
+        sum(
+            _identifier_factor_matches_action_field(
+                factor, field_name, str(action["action"]), frame, request
             )
-            == 1
-            for identifier_value in request_identifier_values
+            and type(factor.value) is type(value)
+            and factor.value == value
+            for field_name, value in action_identifiers
+        )
+        == 1
+        for factor in request_identifier_factors
+    )
+    fields_match_once = all(
+        sum(
+            _identifier_factor_matches_action_field(
+                factor, field_name, str(action["action"]), frame, request
+            )
+            and type(factor.value) is type(value)
+            and factor.value == value
+            for factor in request_identifier_factors
+        )
+        == 1
+        for field_name, value in action_identifiers
+    )
+    return factors_match_once and fields_match_once
+
+
+def _identifier_factor_matches_action_field(
+    factor: SemanticFactor,
+    field_name: str,
+    action_name: str,
+    frame: SemanticFrame,
+    request: RequestUnit,
+) -> bool:
+    field_tokens = _semantic_name_tokens(field_name, ignored={"id", "identifier"})
+    if not field_tokens:
+        return field_name == "id" and factor.role in {"id", "identifier"}
+    role_tokens = _semantic_name_tokens(factor.role, ignored={"id", "identifier", "object"})
+    if role_tokens:
+        return role_tokens == field_tokens
+    request_tokens = _request_resource_tokens(frame, request)
+    action_resource_tokens = set(_action_resource_key(action_name))
+    return set(field_tokens) <= request_tokens and set(field_tokens) <= action_resource_tokens
+
+
+def _semantic_role_matches_action_field(role: str, field_name: str, request_predicate: str) -> bool:
+    ignored = {
+        "current",
+        "desired",
+        "final",
+        "from",
+        "object",
+        "name",
+        "new",
+        "requested",
+        "target",
+        "to",
+        "value",
+    }
+    role_tokens = _semantic_name_tokens(role, ignored=ignored)
+    field_tokens = _semantic_name_tokens(field_name, ignored=ignored)
+    if not field_tokens:
+        return False
+    if role_tokens:
+        return role_tokens == field_tokens
+    request_tokens = set(_semantic_name_tokens(request_predicate, ignored=_ACTION_OPERATION_WORDS))
+    return set(field_tokens) <= request_tokens
+
+
+def _semantic_name_tokens(name: str, *, ignored: Collection[str]) -> tuple[str, ...]:
+    return tuple(
+        token for token in re.findall(r"[a-z0-9]+", name.casefold()) if token not in ignored
+    )
+
+
+def _request_resource_tokens(
+    frame: SemanticFrame,
+    request: RequestUnit,
+    *,
+    ignored: Collection[str] = (),
+) -> set[str]:
+    predicate_tokens = set(
+        _semantic_name_tokens(request.predicate, ignored=_ACTION_OPERATION_WORDS.union(ignored))
+    )
+    tokens = set(predicate_tokens)
+    for factor in frame.factors:
+        if not _factor_is_associated_with_request(factor, request):
+            continue
+        if factor.kind == "entity" and isinstance(factor.value, str):
+            entity_tokens = set(_semantic_name_tokens(factor.value, ignored=ignored))
+            tokens.update(
+                entity_tokens
+                if request.factor_ids
+                else entity_tokens.intersection(predicate_tokens)
+            )
+        if factor.kind == "identifier":
+            identifier_role_tokens = set(
+                _semantic_name_tokens(factor.role, ignored={"id", "identifier", "object", *ignored})
+            )
+            tokens.update(
+                identifier_role_tokens
+                if request.factor_ids
+                else identifier_role_tokens.intersection(predicate_tokens)
+            )
+    return tokens
+
+
+def _action_matches_request_resource(
+    action_name: str,
+    frame: SemanticFrame,
+    request: RequestUnit,
+    semantic_field_name: str,
+) -> bool:
+    semantic_field_tokens = set(
+        _semantic_name_tokens(semantic_field_name, ignored={"name", "value"})
+    )
+    action_resource = tuple(
+        token for token in _action_resource_key(action_name) if token not in semantic_field_tokens
+    )
+    request_resource_tokens = _request_resource_tokens(
+        frame, request, ignored=semantic_field_tokens
+    )
+    return bool(action_resource) and action_resource[-1] in request_resource_tokens
+
+
+def _grounded_prior_enum_plan(
+    record: InteractionRecord,
+    frame: SemanticFrame,
+    request: RequestUnit,
+    factor: SemanticFactor,
+    final_match: tuple[int, Mapping[str, JsonValue], str],
+) -> _SelfCorrectionPlan | None:
+    if not isinstance(factor.value, str):
+        return None
+    final_action_index, final_action, field_name = final_match
+    final_identifiers = tuple(
+        sorted(
+            (name, value)
+            for name, value in final_action.items()
+            if _is_action_identifier_field(name)
+            and isinstance(value, (str, int, float))
+            and not isinstance(value, bool)
         )
     )
-    if len(associated_actions) != 1:
-        return False
-    matching_fields = tuple(
-        field_name
-        for field_name, value in associated_actions[0].items()
-        if field_name != "action"
-        and field_name != "id"
-        and not field_name.endswith("_id")
-        and not isinstance(value, (dict, list, bool))
-        and _self_correction_values_equal(value, factor.value, factor_kind=factor.kind)
+    if not final_identifiers:
+        return None
+    final_resource = _action_resource_key(str(final_action["action"]))
+    if not final_resource:
+        return None
+    for later_action in _recorded_action_records(record)[final_action_index + 1 :]:
+        later_action_name = str(later_action["action"])
+        later_identifiers = tuple(
+            sorted(
+                (name, value)
+                for name, value in later_action.items()
+                if _is_action_identifier_field(name)
+                and isinstance(value, (str, int, float))
+                and not isinstance(value, bool)
+            )
+        )
+        later_action_tokens = set(re.findall(r"[a-z0-9]+", later_action_name.casefold()))
+        if (
+            later_identifiers == final_identifiers
+            and _action_resource_key(later_action_name) == final_resource
+            and field_name in later_action
+            and later_action_tokens.intersection(_ACTION_OPERATION_WORDS)
+        ):
+            return None
+    prior_observations: list[tuple[int, str]] = []
+    prior_matches: list[tuple[int, str]] = []
+    for action_index, action in enumerate(_recorded_action_records(record)[:final_action_index]):
+        if not _is_observation_action(str(action["action"])):
+            continue
+        if _action_resource_key(str(action["action"])) != final_resource:
+            continue
+        prior_identifiers = tuple(
+            sorted(
+                (name, value)
+                for name, value in action.items()
+                if _is_action_identifier_field(name)
+                and isinstance(value, (str, int, float))
+                and not isinstance(value, bool)
+            )
+        )
+        prior_value = action.get(field_name)
+        if (
+            prior_identifiers == final_identifiers
+            and isinstance(prior_value, str)
+            and prior_value != factor.value
+        ):
+            prior_observations.append((action_index, prior_value))
+        if (
+            prior_identifiers == final_identifiers
+            and isinstance(prior_value, str)
+            and prior_value != factor.value
+            and _safe_enum_provisional_quote(prior_value)
+            and record.raw_input.count(prior_value) == 1
+        ):
+            prior_matches.append((action_index, prior_value))
+    if len(prior_observations) != 1 or len(prior_matches) != 1:
+        return None
+    prior_action_index, prior_value = prior_matches[0]
+    return _SelfCorrectionPlan(
+        factor=factor,
+        provisional_quote=prior_value,
+        provisional_value=prior_value,
+        grounding={
+            "origin": "prior_observed_action",
+            "field_name": field_name,
+            "source_occurrences": 1,
+            "prior_action_index": prior_action_index,
+            "final_action_index": final_action_index,
+            "identifier_fields": [name for name, _ in final_identifiers],
+        },
     )
-    return len(matching_fields) == 1
+
+
+def _action_resource_key(action_name: str) -> tuple[str, ...]:
+    operation_words = _ACTION_OPERATION_WORDS | _OBSERVATION_OPERATION_WORDS
+    return tuple(
+        token
+        for token in re.findall(r"[a-z0-9]+", action_name.casefold())
+        if token not in operation_words
+    )
+
+
+def _is_observation_action(action_name: str) -> bool:
+    tokens = set(re.findall(r"[a-z0-9]+", action_name.casefold()))
+    observation_operations = {token for token in tokens if token in _OBSERVATION_OPERATION_WORDS}
+    return len(observation_operations) == 1 and not tokens.intersection(_ACTION_OPERATION_WORDS)
+
+
+def _safe_enum_provisional_quote(value: str) -> bool:
+    return re.fullmatch(r"[\w][\w /&().'-]{0,63}", value) is not None
 
 
 def _action_matches_request_operation(action_name: str, request_predicate: str) -> bool:
@@ -1221,17 +1513,19 @@ def _structured_self_correction_difference_reasons(
     artifact_elements = (provisional_factor, correction_act, correction_relation)
     if any(not _has_input_evidence(element) for element in artifact_elements):
         return ("self-correction artifacts require direct input evidence",)
-    if provisional_quote in source_input:
-        return ("provisional value must be new to the augmented input",)
-    if augmented_input.count(provisional_quote) != 1 or augmented_input.count(final_quote) != 1:
+    expected_provisional_source_count = 1 if selected_source_factor.kind == "enum" else 0
+    if source_input.count(provisional_quote) != expected_provisional_source_count:
+        return ("provisional value has unsupported source occurrences",)
+    if (
+        augmented_input.count(provisional_quote) != expected_provisional_source_count + 1
+        or augmented_input.count(final_quote) != 1
+    ):
         return ("provisional and final values must each appear exactly once",)
-    if augmented_input.index(provisional_quote) >= augmented_input.index(final_quote):
+    final_start = augmented_input.index(final_quote)
+    provisional_start = augmented_input.rfind(provisional_quote, 0, final_start)
+    if provisional_start < 0:
         return ("provisional value must appear before the final value",)
-    between_values = augmented_input[
-        augmented_input.index(provisional_quote) + len(provisional_quote) : augmented_input.index(
-            final_quote
-        )
-    ]
+    between_values = augmented_input[provisional_start + len(provisional_quote) : final_start]
     if (
         re.fullmatch(
             r"\s*[,;:.\u2013\u2014-]*\s*(?:actually|correction|i\s+mean|rather|sorry)"
@@ -1247,7 +1541,6 @@ def _structured_self_correction_difference_reasons(
         for element in (correction_act, correction_relation)
     ):
         return ("correction act and relation evidence must span both values in order",)
-    provisional_start = augmented_input.index(provisional_quote)
     final_end = augmented_input.index(final_quote) + len(final_quote)
     reconstructed_source_input = (
         augmented_input[:provisional_start] + final_quote + augmented_input[final_end:]
@@ -1261,22 +1554,25 @@ def _normalize_planned_self_correction_frame(
     frame: SemanticFrame,
     selected_source_factor: SemanticFactor,
     planned_provisional_quote: str,
+    planned_provisional_value: JsonValue,
+    source_input: str,
     augmented_input: str,
 ) -> SemanticFrame:
     correction_acts = tuple(
         act for act in frame.communication_acts if act.kind == "self_correction"
     )
-    if len(correction_acts) != 1 or any(
+    if len(correction_acts) > 1 or any(
         relation.kind == "superseded_by" for relation in frame.relations
     ):
         return frame
-    correction_act = correction_acts[0]
-    if correction_act.attributes or correction_act.factor_ids:
+    correction_act = correction_acts[0] if correction_acts else None
+    if correction_act is not None and (correction_act.attributes or correction_act.factor_ids):
         return frame
     selected_source_quote = _unique_input_quote(selected_source_factor)
     if (
         selected_source_quote is None
-        or augmented_input.count(planned_provisional_quote) != 1
+        or augmented_input.count(planned_provisional_quote)
+        != source_input.count(planned_provisional_quote) + 1
         or augmented_input.count(selected_source_quote) != 1
         or augmented_input.index(planned_provisional_quote)
         >= augmented_input.index(selected_source_quote)
@@ -1292,17 +1588,41 @@ def _normalize_planned_self_correction_frame(
             factor_kind=selected_source_factor.kind,
         )
         and _unique_input_quote(factor) == selected_source_quote
-        and sum(factor.id in request.factor_ids for request in frame.request_units) == 1
+        and sum(
+            request.mode == "act" and _factor_is_associated_with_request(factor, request)
+            for request in frame.request_units
+        )
+        == 1
     )
     if len(final_factors) != 1:
         return frame
-    provisional_value = _planned_provisional_value(
-        selected_source_factor, planned_provisional_quote
-    )
-    if provisional_value is None:
+    if planned_provisional_value is None:
         return frame
-    provisional_id = f"{correction_act.id}:provisional"
-    relation_id = f"{correction_act.id}:superseded-by"
+    final_factor = final_factors[0]
+    existing_provisional_factors = tuple(
+        factor
+        for factor in frame.factors
+        if factor.status == "superseded"
+        and (factor.kind, factor.role) == (final_factor.kind, final_factor.role)
+        and _self_correction_values_equal(
+            factor.value,
+            planned_provisional_value,
+            factor_kind=selected_source_factor.kind,
+        )
+        and _unique_input_quote(factor) == planned_provisional_quote
+        and not any(factor.id in request.factor_ids for request in frame.request_units)
+    )
+    if len(existing_provisional_factors) > 1:
+        return frame
+    correction_act_id = (
+        correction_act.id if correction_act is not None else f"{final_factor.id}:self-correction"
+    )
+    provisional_id = (
+        existing_provisional_factors[0].id
+        if existing_provisional_factors
+        else f"{correction_act_id}:provisional"
+    )
+    relation_id = f"{correction_act_id}:superseded-by"
     existing_ids = {
         *(request.id for request in frame.request_units),
         *(factor.id for factor in frame.factors),
@@ -1310,11 +1630,18 @@ def _normalize_planned_self_correction_frame(
         *(act.id for act in frame.communication_acts),
         *(outcome.id for outcome in frame.outcomes),
     }
-    if provisional_id in existing_ids or relation_id in existing_ids:
+    new_ids = {relation_id}
+    if correction_act is None:
+        new_ids.add(correction_act_id)
+    if not existing_provisional_factors:
+        new_ids.add(provisional_id)
+    if new_ids & existing_ids:
         return frame
-    final_factor = final_factors[0]
-    repair_start = augmented_input.index(planned_provisional_quote)
-    repair_end = augmented_input.index(selected_source_quote) + len(selected_source_quote)
+    final_start = augmented_input.index(selected_source_quote)
+    repair_start = augmented_input.rfind(planned_provisional_quote, 0, final_start)
+    if repair_start < 0:
+        return frame
+    repair_end = final_start + len(selected_source_quote)
     repair_evidence = (
         EvidenceReference(
             source="input",
@@ -1322,44 +1649,60 @@ def _normalize_planned_self_correction_frame(
             text_quote=augmented_input[repair_start:repair_end],
         ),
     )
-    provisional_factor = SemanticFactor(
-        id=provisional_id,
-        evidence=(
-            EvidenceReference(
-                source="input",
-                json_pointer="/raw_input",
-                text_quote=planned_provisional_quote,
+    confidence = (
+        correction_act.confidence if correction_act is not None else final_factor.confidence
+    )
+    provisional_factor = (
+        existing_provisional_factors[0]
+        if existing_provisional_factors
+        else SemanticFactor(
+            id=provisional_id,
+            evidence=(
+                EvidenceReference(
+                    source="input",
+                    json_pointer="/raw_input",
+                    text_quote=planned_provisional_quote,
+                ),
             ),
-        ),
-        confidence=correction_act.confidence,
-        status="superseded",
-        kind=selected_source_factor.kind,
-        role=selected_source_factor.role,
-        value=provisional_value,
+            confidence=confidence,
+            status="superseded",
+            kind=selected_source_factor.kind,
+            role=selected_source_factor.role,
+            value=planned_provisional_value,
+        )
+    )
+    normalized_correction_act = CommunicationAct(
+        id=correction_act_id,
+        evidence=repair_evidence,
+        confidence=confidence,
+        status=correction_act.status if correction_act is not None else "explicit",
+        kind="self_correction",
+        factor_ids=(provisional_factor.id, final_factor.id),
     )
     correction_relation = SemanticRelation(
         id=relation_id,
         evidence=repair_evidence,
-        confidence=correction_act.confidence,
-        status=correction_act.status,
+        confidence=confidence,
+        status=normalized_correction_act.status,
         kind="superseded_by",
         source_ids=(provisional_factor.id,),
         target_ids=(final_factor.id,),
     )
     return frame.model_copy(
         update={
-            "factors": (*frame.factors, provisional_factor),
+            "factors": (
+                frame.factors
+                if existing_provisional_factors
+                else (*frame.factors, provisional_factor)
+            ),
             "relations": (*frame.relations, correction_relation),
-            "communication_acts": tuple(
-                act.model_copy(
-                    update={
-                        "evidence": repair_evidence,
-                        "factor_ids": (provisional_factor.id, final_factor.id),
-                    }
+            "communication_acts": (
+                tuple(
+                    normalized_correction_act if act.id == correction_act_id else act
+                    for act in frame.communication_acts
                 )
-                if act.id == correction_act.id
-                else act
-                for act in frame.communication_acts
+                if correction_act is not None
+                else (*frame.communication_acts, normalized_correction_act)
             ),
         }
     )
@@ -1509,6 +1852,25 @@ def _deterministic_renderer_metadata(
             "big",
         ),
     }
+
+
+def _add_self_correction(
+    record: InteractionRecord,
+    operator: DatasetAugmentationOperator,
+    plan: _SelfCorrectionPlan,
+) -> RenderedUserInput:
+    correction_quote = _unique_input_quote(plan.factor)
+    if correction_quote is None or record.raw_input.count(correction_quote) != 1:
+        raise AssertionError("selected correction factor requires one unique quote")
+    correction = f"{plan.provisional_quote}, sorry {correction_quote}"
+    return RenderedUserInput(
+        text=record.raw_input.replace(correction_quote, correction),
+        metadata=_deterministic_renderer_metadata(
+            record,
+            operator,
+            "grounded_self_correction_insertion",
+        ),
+    )
 
 
 def _add_case_variation(

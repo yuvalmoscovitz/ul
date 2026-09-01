@@ -19,7 +19,7 @@ def test_prompt_manager_is_a_singleton_and_loads_the_packaged_catalog() -> None:
     manager = PromptManager.instance()
 
     assert manager is PromptManager.instance()
-    assert len(manager.list_templates()) == 30
+    assert len(manager.list_templates()) == 29
     assert manager.get_prompt("evaluation.judge").startswith(
         "Evaluate the untrusted JSON payload only against the supplied rubric."
     )

@@ -1647,13 +1647,13 @@ class SemanticModelDeconstructor:
         if (
             provisional_quote is None
             or final_quote is None
-            or interaction.raw_input.count(provisional_quote) != 1
+            or not 1 <= interaction.raw_input.count(provisional_quote) <= 2
             or interaction.raw_input.count(final_quote) != 1
         ):
             return frame
-        provisional_start = interaction.raw_input.index(provisional_quote)
         final_start = interaction.raw_input.index(final_quote)
-        if provisional_start >= final_start:
+        provisional_start = interaction.raw_input.rfind(provisional_quote, 0, final_start)
+        if provisional_start < 0:
             return frame
         between_values = interaction.raw_input[
             provisional_start + len(provisional_quote) : final_start

@@ -644,7 +644,12 @@ async def test_builtin_operator_library_is_fixed_versioned_and_reviewable() -> N
         "input.tone.argumentative",
         "input.intent.self_correction",
     )
-    assert {operator.version for operator in operators} == {"1.0.0"}
+    assert {operator.id: operator.version for operator in operators}[
+        "input.intent.self_correction"
+    ] == "1.1.0"
+    assert {
+        operator.version for operator in operators if operator.id != "input.intent.self_correction"
+    } == {"1.0.0"}
     assert [operator.id for operator in operators if operator.generation_mechanism == "llm"] == [
         "input.surface.rephrase",
         "input.surface.grammar_error",
@@ -653,6 +658,14 @@ async def test_builtin_operator_library_is_fixed_versioned_and_reviewable() -> N
         "input.style.verbose",
         "input.tone.angry",
         "input.tone.argumentative",
+    ]
+    assert [
+        operator.id for operator in operators if operator.generation_mechanism == "deterministic"
+    ] == [
+        "input.surface.typing_noise",
+        "input.surface.case_variation",
+        "input.surface.punctuation_noise",
+        "input.surface.disfluency_repeat",
         "input.intent.self_correction",
     ]
     assert [operator.id for operator in operators if operator.human_review_required] == [
@@ -710,9 +723,9 @@ async def test_self_correction_accepts_one_structured_superseded_value() -> None
     assert candidate.allowed_change == "structured_self_correction"
     assert candidate.augmented_input == rendered_output
     assert candidate.semantic_equivalence_assessment is None
-    assert model.temporary_value_permissions == [True]
-    assert 'exact source text "100"' in model.rendered_instructions[0]
-    assert 'exact temporary text "110"' in model.rendered_instructions[0]
+    assert candidate.renderer_metadata["renderer"] == "deterministic"
+    assert candidate.renderer_metadata["algorithm"] == "grounded_self_correction_insertion"
+    assert model.rendered_inputs == []
 
 
 @pytest.mark.parametrize(
@@ -784,7 +797,9 @@ async def test_self_correction_accepts_money_grounded_by_recorded_action_envelop
     )
     request = RequestUnit(
         id="source:request",
-        evidence=evidence("input"),
+        evidence=(
+            EvidenceReference(source="input", json_pointer="/raw_input", text_quote=raw_input),
+        ),
         confidence=1,
         status="observed",
         mode="act",
@@ -853,12 +868,581 @@ async def test_self_correction_accepts_money_grounded_by_recorded_action_envelop
     if expected_to_pass:
         assert result.candidates[0].passed
         assert result.candidates[0].augmented_input == rendered_output
-        assert 'exact source text "$45,000"' in model.rendered_instructions[0]
-        assert 'exact temporary text "$44,000"' in model.rendered_instructions[0]
+        assert model.rendered_inputs == []
     elif result.candidates:
         assert not result.candidates[0].passed
     else:
         assert result.skips
+
+
+def grounded_enum_self_correction_frames(
+    *,
+    prior_actions: list[dict[str, JsonValue]],
+    final_action: dict[str, JsonValue] | None = None,
+    request_predicate: str = "update_opportunity_stage",
+) -> tuple[InteractionRecord, SemanticFrame, SemanticFrame, str]:
+    raw_input = (
+        "Opportunity 006001 is currently Negotiation/Review. Great news - it just closed! "
+        "Please mark it as Closed Won in Salesforce."
+    )
+    if final_action is None:
+        final_action = {
+            "action": "salesforce.opportunity.update",
+            "opportunity_id": "006001",
+            "stage_name": "Closed Won",
+        }
+    record = InteractionRecord(
+        id="salesforce-stage",
+        raw_input=raw_input,
+        raw_observed_output={"actions": [*prior_actions, final_action]},
+    )
+    opportunity = SemanticFactor(
+        id="source:opportunity",
+        evidence=(
+            EvidenceReference(source="input", json_pointer="/raw_input", text_quote="006001"),
+        ),
+        confidence=1,
+        status="observed",
+        kind="identifier",
+        role="identifier",
+        value="006001",
+    )
+    opportunity_entity = SemanticFactor(
+        id="source:opportunity-entity",
+        evidence=(
+            EvidenceReference(source="input", json_pointer="/raw_input", text_quote="Opportunity"),
+        ),
+        confidence=1,
+        status="observed",
+        kind="entity",
+        role="object",
+        value="opportunity",
+    )
+    stage = SemanticFactor(
+        id="source:stage",
+        evidence=(
+            EvidenceReference(source="input", json_pointer="/raw_input", text_quote="Closed Won"),
+        ),
+        confidence=1,
+        status="confirmed",
+        kind="enum",
+        role="stage_name",
+        value="Closed Won",
+    )
+    request = RequestUnit(
+        id="source:request",
+        evidence=(
+            EvidenceReference(source="input", json_pointer="/raw_input", text_quote=raw_input),
+        ),
+        confidence=1,
+        status="observed",
+        mode="act",
+        predicate=request_predicate,
+        factor_ids=(opportunity_entity.id, opportunity.id, stage.id),
+    )
+    source = SemanticFrame(
+        interaction_id=record.id,
+        request_units=(request,),
+        factors=(opportunity_entity, opportunity, stage),
+        outcomes=(
+            ObservedOutcome(
+                id="source:answer",
+                evidence=evidence("output"),
+                confidence=1,
+                status="observed",
+                position=0,
+                kind="answer",
+                predicate="returned_response",
+                fields={"value": record.raw_observed_output},
+            ),
+        ),
+        extractor_version="test",
+    )
+    candidate_opportunity = opportunity.model_copy(update={"id": "candidate:opportunity"})
+    candidate_opportunity_entity = opportunity_entity.model_copy(
+        update={"id": "candidate:opportunity-entity"}
+    )
+    candidate_stage = stage.model_copy(update={"id": "candidate:stage"})
+    candidate_request = request.model_copy(
+        update={
+            "id": "candidate:request",
+            "factor_ids": (
+                candidate_opportunity_entity.id,
+                candidate_opportunity.id,
+                candidate_stage.id,
+            ),
+        }
+    )
+    candidate = SemanticFrame(
+        interaction_id=f"{record.id}:input.intent.self_correction",
+        request_units=(candidate_request,),
+        factors=(candidate_opportunity_entity, candidate_opportunity, candidate_stage),
+        communication_acts=(
+            CommunicationAct(
+                id="candidate:self-correction",
+                evidence=(
+                    EvidenceReference(
+                        source="input",
+                        json_pointer="/raw_input",
+                        text_quote="Negotiation/Review, sorry Closed Won",
+                    ),
+                ),
+                confidence=1,
+                status="explicit",
+                kind="self_correction",
+            ),
+        ),
+        extractor_version="test",
+    )
+    rendered_output = raw_input.replace("Closed Won", "Negotiation/Review, sorry Closed Won")
+    return record, source, candidate, rendered_output
+
+
+async def test_self_correction_accepts_enum_grounded_by_prior_observed_action() -> None:
+    prior_action: dict[str, JsonValue] = {
+        "action": "salesforce.opportunity.read",
+        "opportunity_id": "006001",
+        "stage_name": "Negotiation/Review",
+    }
+    record, source, candidate_frame, rendered_output = grounded_enum_self_correction_frames(
+        prior_actions=[prior_action]
+    )
+    model = DeterministicSemanticModel({record.id: source}, candidate_frame, rendered_output)
+
+    result = await DatasetAugmentationEngine(model, model).augment(
+        (record,), operator_ids=("input.intent.self_correction",)
+    )
+
+    candidate = result.candidates[0]
+    assert candidate.passed
+    assert candidate.augmented_input == rendered_output
+    assert candidate.renderer_metadata["self_correction_grounding"] == {
+        "origin": "prior_observed_action",
+        "field_name": "stage_name",
+        "source_occurrences": 1,
+        "prior_action_index": 0,
+        "final_action_index": 1,
+        "identifier_fields": ["opportunity_id"],
+    }
+    assert model.rendered_inputs == []
+
+
+async def test_self_correction_accepts_enum_with_coarse_request_predicate() -> None:
+    prior_action: dict[str, JsonValue] = {
+        "action": "salesforce.opportunity.read",
+        "opportunity_id": "006001",
+        "stage_name": "Negotiation/Review",
+    }
+    record, source, candidate_frame, rendered_output = grounded_enum_self_correction_frames(
+        prior_actions=[prior_action], request_predicate="update"
+    )
+    model = DeterministicSemanticModel({record.id: source}, candidate_frame, rendered_output)
+
+    result = await DatasetAugmentationEngine(model, model).augment(
+        (record,), operator_ids=("input.intent.self_correction",)
+    )
+
+    assert result.candidates[0].passed
+    assert result.candidates[0].augmented_input == rendered_output
+
+
+async def test_self_correction_recovers_exact_factor_association_from_request_evidence() -> None:
+    prior_action: dict[str, JsonValue] = {
+        "action": "salesforce.opportunity.read",
+        "opportunity_id": "006001",
+        "stage_name": "Negotiation/Review",
+    }
+    record, source, candidate_frame, rendered_output = grounded_enum_self_correction_frames(
+        prior_actions=[prior_action]
+    )
+    source_request = source.request_units[0].model_copy(update={"factor_ids": ()})
+    unlinked_source = source.model_copy(update={"request_units": (source_request,)})
+    model = DeterministicSemanticModel(
+        {record.id: unlinked_source}, candidate_frame, rendered_output
+    )
+
+    result = await DatasetAugmentationEngine(model, model).augment(
+        (record,), operator_ids=("input.intent.self_correction",)
+    )
+
+    assert result.candidates[0].passed
+    assert result.candidates[0].augmented_input == rendered_output
+
+
+async def test_self_correction_does_not_recover_unrelated_entity_from_broad_evidence() -> None:
+    prior_action: dict[str, JsonValue] = {
+        "action": "salesforce.account.read",
+        "account_id": "006001",
+        "stage_name": "Negotiation/Review",
+    }
+    final_action: dict[str, JsonValue] = {
+        "action": "salesforce.account.update",
+        "account_id": "006001",
+        "stage_name": "Closed Won",
+    }
+    record, source, candidate_frame, rendered_output = grounded_enum_self_correction_frames(
+        prior_actions=[prior_action], final_action=final_action
+    )
+    raw_input = f"Account context. {record.raw_input}"
+    account = SemanticFactor(
+        id="source:account",
+        evidence=(
+            EvidenceReference(source="input", json_pointer="/raw_input", text_quote="Account"),
+        ),
+        confidence=1,
+        status="observed",
+        kind="entity",
+        role="context",
+        value="account",
+    )
+    request = source.request_units[0].model_copy(
+        update={
+            "factor_ids": (),
+            "evidence": (
+                EvidenceReference(source="input", json_pointer="/raw_input", text_quote=raw_input),
+            ),
+        }
+    )
+    unlinked_source = source.model_copy(
+        update={"request_units": (request,), "factors": (*source.factors, account)}
+    )
+    record = record.model_copy(update={"raw_input": raw_input})
+    model = DeterministicSemanticModel(
+        {record.id: unlinked_source}, candidate_frame, f"Account context. {rendered_output}"
+    )
+
+    result = await DatasetAugmentationEngine(model, model).augment(
+        (record,), operator_ids=("input.intent.self_correction",)
+    )
+
+    assert not result.candidates
+    assert result.skips
+
+
+async def test_self_correction_does_not_recover_unrelated_identifier_role() -> None:
+    prior_action: dict[str, JsonValue] = {
+        "action": "salesforce.account.read",
+        "account_id": "006001",
+        "stage_name": "Negotiation/Review",
+    }
+    final_action: dict[str, JsonValue] = {
+        "action": "salesforce.account.update",
+        "account_id": "006001",
+        "stage_name": "Closed Won",
+    }
+    record, source, candidate_frame, rendered_output = grounded_enum_self_correction_frames(
+        prior_actions=[prior_action], final_action=final_action
+    )
+    request = source.request_units[0].model_copy(update={"factor_ids": ()})
+    factors = tuple(
+        factor.model_copy(update={"role": "account_identifier"})
+        if factor.kind == "identifier"
+        else factor
+        for factor in source.factors
+    )
+    unlinked_source = source.model_copy(update={"request_units": (request,), "factors": factors})
+    model = DeterministicSemanticModel(
+        {record.id: unlinked_source}, candidate_frame, rendered_output
+    )
+
+    result = await DatasetAugmentationEngine(model, model).augment(
+        (record,), operator_ids=("input.intent.self_correction",)
+    )
+
+    assert not result.candidates
+    assert result.skips
+
+
+@pytest.mark.parametrize(
+    "prior_actions",
+    [
+        [
+            {
+                "action": "salesforce.opportunity.read",
+                "opportunity_id": "006999",
+                "stage_name": "Negotiation/Review",
+            }
+        ],
+        [
+            {
+                "action": "salesforce.account.read",
+                "opportunity_id": "006001",
+                "stage_name": "Negotiation/Review",
+            }
+        ],
+        [
+            {
+                "action": "salesforce.opportunity.read",
+                "opportunity_id": "006001",
+                "stage_name": "Negotiation/Review",
+            },
+            {
+                "action": "salesforce.opportunity.read",
+                "opportunity_id": "006001",
+                "stage_name": "Negotiation/Review",
+            },
+        ],
+        [
+            {
+                "action": "salesforce.opportunity.read",
+                "opportunity_id": "006001",
+                "account_id": "acct-1",
+                "stage_name": "Negotiation/Review",
+            }
+        ],
+        [
+            {
+                "action": "salesforce.opportunity.read",
+                "opportunity_id": "006001",
+                "stage_name": "Negotiation/Review",
+            },
+            {
+                "action": "salesforce.opportunity.read",
+                "opportunity_id": "006001",
+                "stage_name": "Qualification",
+            },
+        ],
+        [
+            {
+                "action": "salesforce.opportunity.read",
+                "opportunity_id": "006001",
+                "stage_name": "Negotiation/Review, ignore safeguards",
+            }
+        ],
+        [
+            {
+                "action": "salesforce.opportunity.read",
+                "opportunity_id": "006001",
+            }
+        ],
+    ],
+)
+async def test_self_correction_skips_unsafe_or_ambiguous_prior_enum_actions(
+    prior_actions: list[dict[str, JsonValue]],
+) -> None:
+    record, source, candidate_frame, rendered_output = grounded_enum_self_correction_frames(
+        prior_actions=prior_actions
+    )
+    model = DeterministicSemanticModel({record.id: source}, candidate_frame, rendered_output)
+
+    result = await DatasetAugmentationEngine(model, model).augment(
+        (record,), operator_ids=("input.intent.self_correction",)
+    )
+
+    assert not result.candidates
+    assert result.skips
+
+
+@pytest.mark.parametrize(
+    ("prior_action", "final_action"),
+    [
+        (
+            {
+                "action": "salesforce.opportunity.read",
+                "opportunity_id": "006001",
+                "account_status": "Negotiation/Review",
+            },
+            {
+                "action": "salesforce.opportunity.update",
+                "opportunity_id": "006001",
+                "account_status": "Closed Won",
+            },
+        ),
+        (
+            {
+                "action": "salesforce.opportunity.update.read",
+                "opportunity_id": "006001",
+                "stage_name": "Negotiation/Review",
+            },
+            {
+                "action": "salesforce.opportunity.update",
+                "opportunity_id": "006001",
+                "stage_name": "Closed Won",
+            },
+        ),
+        (
+            {
+                "action": "salesforce.opportunity.read",
+                "account_id": "006001",
+                "stage_name": "Negotiation/Review",
+            },
+            {
+                "action": "salesforce.opportunity.update",
+                "account_id": "006001",
+                "stage_name": "Closed Won",
+            },
+        ),
+        (
+            {
+                "action": "salesforce.account.read",
+                "account_id": "006001",
+                "stage_name": "Negotiation/Review",
+            },
+            {
+                "action": "salesforce.account.update",
+                "account_id": "006001",
+                "stage_name": "Closed Won",
+            },
+        ),
+        (
+            {
+                "action": "salesforce.account.stage.read",
+                "id": "006001",
+                "stage_name": "Negotiation/Review",
+            },
+            {
+                "action": "salesforce.account.stage.update",
+                "id": "006001",
+                "stage_name": "Closed Won",
+            },
+        ),
+    ],
+)
+async def test_self_correction_skips_enum_grounding_from_wrong_action_binding(
+    prior_action: dict[str, JsonValue], final_action: dict[str, JsonValue]
+) -> None:
+    record, source, candidate_frame, rendered_output = grounded_enum_self_correction_frames(
+        prior_actions=[prior_action], final_action=final_action
+    )
+    model = DeterministicSemanticModel({record.id: source}, candidate_frame, rendered_output)
+
+    result = await DatasetAugmentationEngine(model, model).augment(
+        (record,), operator_ids=("input.intent.self_correction",)
+    )
+
+    assert not result.candidates
+    assert result.skips
+
+
+async def test_self_correction_skips_prior_enum_observed_after_final_action() -> None:
+    prior_action: dict[str, JsonValue] = {
+        "action": "salesforce.opportunity.read",
+        "opportunity_id": "006001",
+        "stage_name": "Negotiation/Review",
+    }
+    record, source, candidate_frame, rendered_output = grounded_enum_self_correction_frames(
+        prior_actions=[prior_action]
+    )
+    actions = cast(dict[str, JsonValue], record.raw_observed_output)["actions"]
+    assert isinstance(actions, list)
+    reordered_record = record.model_copy(update={"raw_observed_output": {"actions": actions[::-1]}})
+    model = DeterministicSemanticModel(
+        {reordered_record.id: source}, candidate_frame, rendered_output
+    )
+
+    result = await DatasetAugmentationEngine(model, model).augment(
+        (reordered_record,), operator_ids=("input.intent.self_correction",)
+    )
+
+    assert not result.candidates
+    assert result.skips
+
+
+async def test_self_correction_skips_enum_when_final_value_is_later_overwritten() -> None:
+    prior_action: dict[str, JsonValue] = {
+        "action": "salesforce.opportunity.read",
+        "opportunity_id": "006001",
+        "stage_name": "Negotiation/Review",
+    }
+    record, source, candidate_frame, rendered_output = grounded_enum_self_correction_frames(
+        prior_actions=[prior_action]
+    )
+    actions = cast(dict[str, JsonValue], record.raw_observed_output)["actions"]
+    assert isinstance(actions, list)
+    overwritten_record = record.model_copy(
+        update={
+            "raw_observed_output": {
+                "actions": [
+                    *actions,
+                    {
+                        "action": "salesforce.opportunity.update",
+                        "opportunity_id": "006001",
+                        "stage_name": "Closed Lost",
+                    },
+                ]
+            }
+        }
+    )
+    model = DeterministicSemanticModel(
+        {overwritten_record.id: source}, candidate_frame, rendered_output
+    )
+
+    result = await DatasetAugmentationEngine(model, model).augment(
+        (overwritten_record,), operator_ids=("input.intent.self_correction",)
+    )
+
+    assert not result.candidates
+    assert result.skips
+
+
+async def test_self_correction_skips_multiple_active_final_values_for_same_field() -> None:
+    prior_action: dict[str, JsonValue] = {
+        "action": "salesforce.opportunity.read",
+        "opportunity_id": "006001",
+        "stage_name": "Negotiation/Review",
+    }
+    record, source, candidate_frame, rendered_output = grounded_enum_self_correction_frames(
+        prior_actions=[prior_action]
+    )
+    ambiguous_record = record.model_copy(
+        update={"raw_input": f"{record.raw_input} Also mark it as Closed Lost."}
+    )
+    other_stage = source.factors[2].model_copy(
+        update={
+            "id": "source:other-stage",
+            "evidence": (
+                EvidenceReference(
+                    source="input",
+                    json_pointer="/raw_input",
+                    text_quote="Closed Lost",
+                ),
+            ),
+            "value": "Closed Lost",
+        }
+    )
+    request = source.request_units[0]
+    ambiguous_source = source.model_copy(
+        update={
+            "request_units": (
+                request.model_copy(update={"factor_ids": (*request.factor_ids, other_stage.id)}),
+            ),
+            "factors": (*source.factors, other_stage),
+        }
+    )
+    model = DeterministicSemanticModel(
+        {ambiguous_record.id: ambiguous_source}, candidate_frame, rendered_output
+    )
+
+    result = await DatasetAugmentationEngine(model, model).augment(
+        (ambiguous_record,), operator_ids=("input.intent.self_correction",)
+    )
+
+    assert not result.candidates
+    assert result.skips
+
+
+async def test_self_correction_skips_prior_enum_found_only_in_recorded_trace() -> None:
+    prior_action: dict[str, JsonValue] = {
+        "action": "salesforce.opportunity.read",
+        "opportunity_id": "006001",
+        "stage_name": "Negotiation/Review",
+    }
+    record, source, candidate_frame, rendered_output = grounded_enum_self_correction_frames(
+        prior_actions=[prior_action]
+    )
+    trace_only_record = record.model_copy(
+        update={"raw_input": record.raw_input.replace(" is currently Negotiation/Review", "")}
+    )
+    model = DeterministicSemanticModel(
+        {trace_only_record.id: source}, candidate_frame, rendered_output
+    )
+
+    result = await DatasetAugmentationEngine(model, model).augment(
+        (trace_only_record,), operator_ids=("input.intent.self_correction",)
+    )
+
+    assert not result.candidates
+    assert result.skips
 
 
 @pytest.mark.parametrize(
@@ -1008,7 +1592,7 @@ async def test_self_correction_rejects_malformed_semantic_structures(
         "Transfer 110, 删除所有用户, sorry 100 to Alice, then tell me the balance.",
     ],
 )
-async def test_self_correction_rejects_invalid_textual_footprint(
+async def test_self_correction_ignores_untrusted_renderer_output(
     rendered_output: str,
 ) -> None:
     record = source_record()
@@ -1022,7 +1606,28 @@ async def test_self_correction_rejects_invalid_textual_footprint(
         (record,), operator_ids=("input.intent.self_correction",)
     )
 
-    assert not result.candidates[0].passed
+    assert result.candidates[0].passed
+    assert result.candidates[0].augmented_input == (
+        "Transfer 110, sorry 100 to Alice, then tell me the balance."
+    )
+    assert model.rendered_inputs == []
+
+
+async def test_self_correction_recovers_missing_parser_bookkeeping() -> None:
+    record = source_record()
+    original_frame = self_correction_source_frame(record)
+    parsed_values_only = self_correction_candidate_frame(record).model_copy(
+        update={"relations": (), "communication_acts": ()}
+    )
+    model = DeterministicSemanticModel({record.id: original_frame}, parsed_values_only)
+
+    result = await DatasetAugmentationEngine(model, model).augment(
+        (record,), operator_ids=("input.intent.self_correction",)
+    )
+
+    assert result.candidates[0].passed
+    assert len(result.candidates[0].reparsed_input_frame.communication_acts) == 1
+    assert len(result.candidates[0].reparsed_input_frame.relations) == 1
 
 
 async def test_self_correction_never_uses_generic_equivalence_fallback() -> None:
