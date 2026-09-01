@@ -608,7 +608,7 @@ def _is_loopback_host(host: str) -> bool:
 
 def _normalized_provider_name(value: str) -> str:
     normalized = value.strip().casefold().replace(" ", "-")
-    if normalized == "google-vertex" or normalized.startswith("google-vertex/"):
+    if normalized == "google-vertex":
         return "google"
     return normalized
 

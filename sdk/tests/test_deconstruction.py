@@ -3,7 +3,7 @@ import hashlib
 import json
 from collections.abc import Callable, Coroutine
 from pathlib import Path
-from typing import Any, cast, overload
+from typing import Any, NoReturn, cast, overload
 
 import httpx
 import pytest
@@ -92,11 +92,20 @@ def openai_compatible_settings(
     )
 
 
-def openrouter_live_settings() -> OpenRouterDatasetSettings:
+def _live_llm_unavailable(message: str, *, required: bool) -> NoReturn:
+    if required:
+        pytest.fail(message)
+    pytest.skip(message)
+
+
+def openrouter_live_settings(*, required: bool = False) -> OpenRouterDatasetSettings:
     try:
         return OpenRouterDatasetSettings()
     except ValidationError:
-        pytest.skip("requires an explicit OpenRouter model configuration")
+        _live_llm_unavailable(
+            "requires an explicit OpenRouter model configuration",
+            required=required,
+        )
 
 
 def interaction() -> InteractionRecord:
@@ -2914,11 +2923,22 @@ async def test_llm_augmentation_development_validation_coverage_is_explicit() ->
     )
 
 
+async def test_required_live_llm_validation_fails_closed() -> None:
+    with pytest.raises(pytest.fail.Exception, match="live LLM proof did not run"):
+        _live_llm_unavailable("live LLM proof did not run", required=True)
+
+
 @pytest.mark.live_llm
-async def test_live_llm_augmentations_pass_existing_validity_check() -> None:
-    configured_settings = openrouter_live_settings()
+async def test_live_llm_augmentations_pass_existing_validity_check(
+    pytestconfig: pytest.Config,
+) -> None:
+    required = bool(pytestconfig.getoption("--require-live-llm"))
+    configured_settings = openrouter_live_settings(required=required)
     if not configured_settings.live_calls or configured_settings.api_key is None:
-        pytest.skip("requires explicit OpenRouter live opt-in and API key")
+        _live_llm_unavailable(
+            "requires explicit OpenRouter live opt-in and API key",
+            required=required,
+        )
     configured_settings = configured_settings.model_copy(
         update={"allow_external_data_processing": True}
     )

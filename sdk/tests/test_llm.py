@@ -10,6 +10,7 @@ from ul.deconstruction import OpenAICompatibleDatasetSettings
 from ul.llm import (
     LLMClient,
     LLMClientConfig,
+    LLMProviderMismatchError,
     LLMRoleConfig,
     llm_client_config_from_dataset_settings,
 )
@@ -144,6 +145,35 @@ async def test_google_vertex_pin_accepts_openrouter_google_response_identity() -
         )
 
     assert completion.provider == "Google"
+
+
+async def test_regional_google_vertex_pin_rejects_generic_google_response_identity() -> None:
+    def respond(request: httpx.Request) -> httpx.Response:
+        body = cast(dict[str, object], json.loads(request.content))
+        return httpx.Response(
+            200,
+            json={
+                "id": "generation-1",
+                "model": body["model"],
+                "provider": "Google",
+                "choices": [{"message": {"content": "{}"}}],
+            },
+        )
+
+    config = _config().model_copy(update={"upstream_provider": "google-vertex/us-east5"})
+    async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as transport:
+        client = LLMClient(config, client=transport)
+        with pytest.raises(LLMProviderMismatchError):
+            await client.complete(
+                role="materiality",
+                seed=0,
+                top_p=None,
+                schema_name="test_response",
+                schema={"type": "object"},
+                strict_schema=True,
+                system_prompt="Return JSON.",
+                user_payload="{}",
+            )
 
 
 async def test_llm_configuration_is_frozen_and_secret_free_in_evidence() -> None:

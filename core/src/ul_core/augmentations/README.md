@@ -117,7 +117,8 @@ configured live model:
 
 ```console
 uv run pytest -q \
-  sdk/tests/test_deconstruction.py::test_live_llm_augmentations_pass_existing_validity_check
+  sdk/tests/test_deconstruction.py::test_live_llm_augmentations_pass_existing_validity_check \
+  --require-live-llm
 ```
 
 The non-live coverage contract fails when a new LLM operator is not included in this development
