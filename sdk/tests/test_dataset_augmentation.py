@@ -363,6 +363,28 @@ async def test_engine_rephrases_and_independently_validates_full_semantics() -> 
     assert not isinstance(model.deconstructed_records[1], InteractionRecord)
 
 
+async def test_engine_replaces_em_dashes_in_llm_generated_input() -> None:
+    record = source_record()
+    original_frame = source_frame(record)
+    candidate_frame = source_frame(record, identifier_prefix="candidate").model_copy(
+        update={"outcomes": ()}
+    )
+    model = DeterministicSemanticModel(
+        {record.id: original_frame},
+        candidate_frame,
+        "Please transfer 100 to Alice—then report my balance.",
+    )
+
+    result = await DatasetAugmentationEngine(model, model).augment((record,))
+
+    candidate = result.candidates[0]
+    assert candidate.passed
+    assert candidate.augmented_input == "Please transfer 100 to Alice then report my balance."
+    reparsed_record = model.deconstructed_records[1]
+    assert isinstance(reparsed_record, UserInputRecord)
+    assert reparsed_record.raw_input == candidate.augmented_input
+
+
 @pytest.mark.parametrize("drift", ["request_order", "relation", "communication", "factor"])
 async def test_engine_rejects_each_kind_of_semantic_drift(drift: str) -> None:
     record = source_record()
@@ -1158,7 +1180,7 @@ async def test_behavior_operators_allow_only_their_communication_change(
     assert candidate.operator_version == "1.0.0"
     assert candidate.allowed_change == "declared_communication_form"
     assert candidate.human_review_required is review_required
-    assert candidate.augmented_input == realistic_output
+    assert candidate.augmented_input == realistic_output.replace("—", " ")
     assert candidate.renderer_metadata == {
         "model": "test/model",
         "seed": 42,

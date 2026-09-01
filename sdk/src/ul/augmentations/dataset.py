@@ -524,6 +524,8 @@ class DatasetAugmentationEngine:
                     "transformation_prompts": prompt_provenance(*transformation_prompt_names),
                 }
                 augmented_input = rendered_input.text
+                if operator.generation_mechanism == "llm":
+                    augmented_input = augmented_input.replace("—", " ")
                 surface_footprint_reasons = _surface_footprint_reasons(
                     operator.id, record.raw_input, augmented_input
                 )
