@@ -173,6 +173,7 @@ class _TargetConfirmation(_StrictModel):
     kind: Literal["python_callable", "command", "http"]
     reference: str
     config_sha256: str
+    selected_executable: str | None = None
     executable: _ArtifactIdentity | None = None
     artifacts: tuple[_ArtifactIdentity, ...] = ()
     environment: tuple[_EnvironmentIdentity, ...] = ()
@@ -965,7 +966,7 @@ def probe(
                         ("--target-working-directory", str(target_working_directory.resolve()))
                     )
                 if target_interpreter is not None:
-                    resume_argv.extend(("--target-interpreter", str(target_interpreter.resolve())))
+                    resume_argv.extend(("--target-interpreter", str(target_interpreter.absolute())))
                 for name in target_environment_variable or ():
                     resume_argv.extend(("--target-environment-variable", name))
             if allow_insecure_http:
@@ -1437,6 +1438,7 @@ def _local_target(
         kind=local_confirmation.kind,
         reference=local_confirmation.reference,
         config_sha256=local_confirmation.config_sha256,
+        selected_executable=local_confirmation.selected_executable,
         executable=_ArtifactIdentity(
             path=local_confirmation.executable.path,
             sha256=local_confirmation.executable.sha256,
@@ -1490,7 +1492,11 @@ def _confirm_target(resolved_target: _ResolvedTarget, *, confirmed_digest: str |
     console.print(f"  Confirmation sha256: {resolved_target.confirmation_sha256}")
     if resolved_target.confirmation.executable is not None:
         executable = resolved_target.confirmation.executable
-        console.print(f"  Executable: {executable.path} ({executable.sha256})")
+        if resolved_target.confirmation.selected_executable is not None:
+            console.print(
+                f"  Selected executable: {resolved_target.confirmation.selected_executable}"
+            )
+        console.print(f"  Executable identity: {executable.path} ({executable.sha256})")
     for artifact in resolved_target.confirmation.artifacts:
         console.print(f"  Artifact: {artifact.path} ({artifact.sha256})")
     for environment in resolved_target.confirmation.environment:
@@ -1607,6 +1613,15 @@ async def _run_smoke(
             target_safe_to_reuse=target_safe_to_reuse,
         ) from None
     if evidence.lifecycle.terminal_status != "succeeded":
+        if evidence.lifecycle.failure_code == "target_load_failed":
+            raise ProbeFailure(
+                "smoke invocation",
+                "PROBE_TARGET_LOAD_FAILED",
+                "The selected Python interpreter could not load the target callable.",
+                "Verify --target-working-directory and install the callable's dependencies into "
+                "the selected --target-interpreter, then retry.",
+                target_safe_to_reuse=True,
+            )
         raise ProbeFailure(
             "smoke invocation",
             "PROBE_SMOKE_INCONCLUSIVE",
@@ -2354,7 +2369,7 @@ def _print_stronger_run(
                 ("--target-working-directory", str(target_working_directory.resolve()))
             )
         if target_interpreter is not None:
-            arguments.extend(("--target-interpreter", str(target_interpreter.resolve())))
+            arguments.extend(("--target-interpreter", str(target_interpreter.absolute())))
         for name in target_environment_variables:
             arguments.extend(("--target-environment-variable", name))
     for artifact in target_artifacts:

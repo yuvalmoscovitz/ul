@@ -42,6 +42,7 @@ class LocalTargetConfirmation(_StrictModel):
     kind: Literal["python_callable", "command"]
     reference: str
     config_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    selected_executable: str
     executable: TargetArtifactIdentity
     artifacts: tuple[TargetArtifactIdentity, ...]
     environment: tuple[TargetEnvironmentIdentity, ...] = ()
@@ -102,7 +103,7 @@ def resolve_local_target(
         config = PythonCallableTargetConfig(
             target_id="probe-" + hashlib.sha256(reference.encode()).hexdigest()[:16],
             working_directory=(working_directory or Path.cwd()).resolve(),
-            interpreter=(interpreter or Path(sys.executable)).resolve(),
+            interpreter=Path(os.path.abspath(interpreter or Path(sys.executable))),
             target=reference,
             environment_allowlist=environment_allowlist,
         )
@@ -174,6 +175,7 @@ def local_target_evidence_receipt(target: ResolvedLocalTarget) -> dict[str, Json
         "config_sha256": confirmation.config_sha256,
         "confirmation_sha256": target.confirmation_sha256,
         "supports_state_observation": False,
+        "selected_executable": confirmation.selected_executable,
         "executable_sha256": confirmation.executable.sha256,
         "artifact_sha256": [artifact.sha256 for artifact in confirmation.artifacts],
         "environment": [item.model_dump(mode="json") for item in confirmation.environment],
@@ -285,6 +287,7 @@ def _local_target_confirmation(
     explicit_artifacts: tuple[Path, ...],
 ) -> LocalTargetConfirmation:
     if isinstance(config, PythonCallableTargetConfig):
+        selected_executable = str(config.interpreter)
         executable = _artifact_identity(
             _resolve_executable(config.interpreter, config.working_directory)
         )
@@ -293,11 +296,13 @@ def _local_target_confirmation(
     else:
         artifacts = _command_artifacts(config, explicit_artifacts)
         executable = artifacts[0]
+        selected_executable = str(config.argv[0])
         callable_name = None
     return LocalTargetConfirmation(
         kind=config.kind,
         reference=reference,
         config_sha256=digest,
+        selected_executable=selected_executable,
         executable=executable,
         artifacts=artifacts,
         environment=tuple(

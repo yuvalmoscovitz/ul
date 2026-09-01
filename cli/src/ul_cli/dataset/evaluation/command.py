@@ -2003,8 +2003,9 @@ def _print_local_target_identity(target: ResolvedLocalTarget) -> None:
     print_dataset_plain(f"  Kind: {target.kind}")
     print_dataset_plain(f"  Config sha256: {target.config_sha256}")
     print_dataset_plain(f"  Confirmation sha256: {target.confirmation_sha256}")
+    print_dataset_plain(f"  Selected executable: {confirmation.selected_executable}")
     print_dataset_plain(
-        f"  Executable: {confirmation.executable.path} ({confirmation.executable.sha256})"
+        f"  Executable identity: {confirmation.executable.path} ({confirmation.executable.sha256})"
     )
     for artifact in confirmation.artifacts:
         print_dataset_plain(f"  Artifact: {artifact.path} ({artifact.sha256})")
