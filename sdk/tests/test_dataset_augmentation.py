@@ -621,6 +621,14 @@ async def test_builtin_operator_library_is_fixed_versioned_and_reviewable() -> N
         "input.intent.self_correction",
     )
     assert {operator.version for operator in operators} == {"1.0.0"}
+    assert [operator.id for operator in operators if operator.generation_mechanism == "llm"] == [
+        "input.surface.rephrase",
+        "input.surface.grammar_error",
+        "input.surface.fragmented_syntax",
+        "input.style.terse",
+        "input.style.verbose",
+        "input.intent.self_correction",
+    ]
     assert [operator.id for operator in operators if operator.human_review_required] == [
         "input.intent.self_correction"
     ]
@@ -638,6 +646,7 @@ async def test_operator_change_contract_rejects_impossible_target_states() -> No
         DatasetAugmentationOperator(
             id="input.surface.rephrase",
             instruction="Rephrase naturally.",
+            generation_mechanism="llm",
             allowed_change="surface_form_only",
             target_communication_kind="rephrase",
         )
@@ -645,12 +654,14 @@ async def test_operator_change_contract_rejects_impossible_target_states() -> No
         DatasetAugmentationOperator(
             id="input.style.terse",
             instruction="Make it terse.",
+            generation_mechanism="llm",
             allowed_change="declared_communication_form",
         )
     with pytest.raises(ValueError, match="target communication kind"):
         DatasetAugmentationOperator(
             id="input.intent.self_correction",
             instruction="Add a correction.",
+            generation_mechanism="llm",
             allowed_change="structured_self_correction",
         )
 
@@ -1077,6 +1088,12 @@ async def test_self_correction_skips_ineligible_sources(ineligible_reason: str) 
     ("operator_id", "target_kind", "realistic_output", "review_required"),
     [
         (
+            "input.surface.grammar_error",
+            "fragmented_syntax",
+            "Transfer 100 to Alice, then tells me the balance.",
+            False,
+        ),
+        (
             "input.surface.fragmented_syntax",
             "fragmented_syntax",
             "transfer 100 to alice. then balance",
@@ -1324,12 +1341,6 @@ async def test_typing_noise_is_deterministic_protects_factors_and_needs_no_model
             "typing_noise",
             "Transfer 100 to Alice,, then tell me the balance.",
             "single_safe_punctuation_duplication",
-        ),
-        (
-            "input.surface.grammar_error",
-            "fragmented_syntax",
-            "Me need you to: Transfer 100 to Alice, then tell me the balance.",
-            "pronoun_case_error_request_prefix",
         ),
     ),
 )

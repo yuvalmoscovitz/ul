@@ -4,5 +4,9 @@ import pytest
 
 
 @pytest.fixture(autouse=True)
-def configure_test_semantic_model(monkeypatch: pytest.MonkeyPatch) -> None:
+def configure_test_semantic_model(
+    monkeypatch: pytest.MonkeyPatch, request: pytest.FixtureRequest
+) -> None:
+    if request.node.get_closest_marker("live_llm") is not None:
+        return
     monkeypatch.setenv("UL_DATASET_MODEL", "test/default-model")

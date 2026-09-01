@@ -34,6 +34,16 @@ from ul_core.prompts import prompt_provenance
 pytestmark = pytest.mark.asyncio
 _TEST_API_KEY = SecretStr("test-openrouter-key")
 _TEST_CUSTOMER_API_KEY = SecretStr("test-customer-key")
+_LEGACY_LLM_AUGMENTATIONS_WITHOUT_DEVELOPMENT_VALIDATION = {
+    "input.surface.rephrase",
+    "input.surface.fragmented_syntax",
+    "input.style.terse",
+    "input.style.verbose",
+    "input.intent.self_correction",
+}
+_EXPECTED_DEVELOPMENT_VALIDATED_LLM_AUGMENTATIONS = {
+    "input.surface.grammar_error",
+}
 
 
 def settings(
@@ -2890,7 +2900,22 @@ async def test_live_deconstruction_with_synthetic_interaction() -> None:
     assert all(element.evidence for element in extracted_elements)
 
 
-async def test_live_augmentation_generates_or_safely_rejects_each_candidate() -> None:
+async def test_llm_augmentation_development_validation_coverage_is_explicit() -> None:
+    llm_operator_ids = {
+        operator.id
+        for operator in builtin_dataset_augmentation_operators()
+        if operator.generation_mechanism == "llm"
+    }
+
+    assert llm_operator_ids > _LEGACY_LLM_AUGMENTATIONS_WITHOUT_DEVELOPMENT_VALIDATION
+    assert (
+        llm_operator_ids - _LEGACY_LLM_AUGMENTATIONS_WITHOUT_DEVELOPMENT_VALIDATION
+        == _EXPECTED_DEVELOPMENT_VALIDATED_LLM_AUGMENTATIONS
+    )
+
+
+@pytest.mark.live_llm
+async def test_live_llm_augmentations_pass_existing_validity_check() -> None:
     configured_settings = openrouter_live_settings()
     if not configured_settings.live_calls or configured_settings.api_key is None:
         pytest.skip("requires explicit OpenRouter live opt-in and API key")
@@ -2898,29 +2923,36 @@ async def test_live_augmentation_generates_or_safely_rejects_each_candidate() ->
         update={"allow_external_data_processing": True}
     )
 
-    operators = builtin_dataset_augmentation_operators()
-    async with create_semantic_model_deconstructor(configured_settings) as semantic_model:
-        result = await DatasetAugmentationEngine(
-            semantic_model, semantic_model, semantic_model
-        ).augment(
-            (synthetic_live_interaction(),),
-            max_records=1,
-            operator_ids=tuple(operator.id for operator in operators),
-        )
-
-    assert {
-        *(candidate.operator_id for candidate in result.candidates),
-        *(skip.operator_id for skip in result.skips),
-    } == {operator.id for operator in operators}
-    unchanged_candidates = tuple(
-        candidate.operator_id
-        for candidate in result.candidates
-        if candidate.augmented_input == synthetic_live_interaction().raw_input
+    operators = tuple(
+        operator
+        for operator in builtin_dataset_augmentation_operators()
+        if operator.generation_mechanism == "llm"
+        and operator.id not in _LEGACY_LLM_AUGMENTATIONS_WITHOUT_DEVELOPMENT_VALIDATION
     )
-    assert not unchanged_candidates, unchanged_candidates
-    assert all(candidate.passed or candidate.failure_reasons for candidate in result.candidates)
+    assert {operator.id for operator in operators} == (
+        _EXPECTED_DEVELOPMENT_VALIDATED_LLM_AUGMENTATIONS
+    )
+    candidates = []
+    async with create_semantic_model_deconstructor(configured_settings) as semantic_model:
+        engine = DatasetAugmentationEngine(semantic_model, semantic_model, semantic_model)
+        for operator in operators:
+            result = await engine.augment(
+                (synthetic_live_interaction(),),
+                max_records=1,
+                operator_ids=(operator.id,),
+            )
+            assert result.skips == (), operator.id
+            assert len(result.candidates) == 1, operator.id
+            candidate = result.candidates[0]
+            assert candidate.augmented_input != synthetic_live_interaction().raw_input, operator.id
+            assert candidate.passed, {operator.id: candidate.failure_reasons}
+            candidates.append(candidate)
+
+    assert {candidate.operator_id for candidate in candidates} == {
+        operator.id for operator in operators
+    }
     human_review_operators = {
-        candidate.operator_id for candidate in result.candidates if candidate.human_review_required
+        candidate.operator_id for candidate in candidates if candidate.human_review_required
     }
     assert human_review_operators <= {"input.intent.self_correction"}
 

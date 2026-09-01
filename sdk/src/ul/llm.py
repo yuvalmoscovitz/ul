@@ -607,7 +607,10 @@ def _is_loopback_host(host: str) -> bool:
 
 
 def _normalized_provider_name(value: str) -> str:
-    return value.strip().casefold().replace(" ", "-")
+    normalized = value.strip().casefold().replace(" ", "-")
+    if normalized == "google-vertex" or normalized.startswith("google-vertex/"):
+        return "google"
+    return normalized
 
 
 def _same_origin(left: httpx.URL, right: httpx.URL) -> bool:
