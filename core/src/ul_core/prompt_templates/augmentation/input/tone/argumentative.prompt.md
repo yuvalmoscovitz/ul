@@ -15,3 +15,7 @@ constraint, authorization, and request order. Do not turn the request into somet
 do. Do not use reluctant compliance, resignation, sarcasm, or conditional wording. Do not add a
 request for explanation, a refusal, a choice, a consent change, or any new claim about a past
 interaction, delay, mistake, policy, motive, consequence, or urgency.
+Keep the challenge short and conversational, then give the request directly. Natural wording can
+say "This isn't up for debate" or "Let's not overcomplicate this." Avoid abstract, staged phrases
+such as "I don't see why anyone would dispute this," "there is no point in arguing about this," or
+"this is the only correct way."

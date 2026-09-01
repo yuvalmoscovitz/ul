@@ -320,6 +320,26 @@ class DeterministicSemanticModel:
         )
 
 
+class CorrectingSemanticModel(DeterministicSemanticModel):
+    async def render(
+        self,
+        raw_input: str,
+        instruction: str,
+        *,
+        allow_temporary_value: bool = False,
+    ) -> RenderedUserInput:
+        self.rendered_output = (
+            raw_input
+            if not self.rendered_inputs
+            else "Transfer 100 to Alice, then tell me balance."
+        )
+        return await super().render(
+            raw_input,
+            instruction,
+            allow_temporary_value=allow_temporary_value,
+        )
+
+
 class DeterministicEquivalenceVerifier:
     def __init__(self, assessment: SemanticEquivalenceAssessment | None) -> None:
         self.assessment = assessment
@@ -361,6 +381,34 @@ async def test_engine_rephrases_and_independently_validates_full_semantics() -> 
     assert model.rendered_inputs == [record.raw_input]
     assert isinstance(model.deconstructed_records[1], UserInputRecord)
     assert not isinstance(model.deconstructed_records[1], InteractionRecord)
+
+
+async def test_engine_groups_multiple_records_by_requested_operator_order() -> None:
+    first_record = source_record("first")
+    second_record = source_record("second")
+    first_frame = source_frame(first_record)
+    second_frame = source_frame(second_record)
+    candidate_frame = source_frame(first_record, identifier_prefix="candidate").model_copy(
+        update={"outcomes": ()}
+    )
+    model = DeterministicSemanticModel(
+        {first_record.id: first_frame, second_record.id: second_frame},
+        candidate_frame,
+    )
+
+    result = await DatasetAugmentationEngine(model, model).augment(
+        (first_record, second_record),
+        operator_ids=("input.surface.typing_noise", "input.surface.case_variation"),
+    )
+
+    assert [
+        (candidate.operator_id, candidate.source_interaction_id) for candidate in result.candidates
+    ] == [
+        ("input.surface.typing_noise", "first"),
+        ("input.surface.typing_noise", "second"),
+        ("input.surface.case_variation", "first"),
+        ("input.surface.case_variation", "second"),
+    ]
 
 
 async def test_engine_replaces_em_dashes_in_llm_generated_input() -> None:
@@ -2055,7 +2103,9 @@ async def test_engine_rejects_candidate_frame_for_another_input() -> None:
 
 
 async def test_typing_noise_is_deterministic_protects_factors_and_needs_no_model_marker() -> None:
-    record = source_record()
+    record = source_record().model_copy(
+        update={"raw_input": f"{source_record().raw_input} Use DataStream Analytics."}
+    )
     original_frame = source_frame(record)
     reparsed_candidate = source_frame(record, identifier_prefix="candidate").model_copy(
         update={"outcomes": ()}
@@ -2071,6 +2121,7 @@ async def test_typing_noise_is_deterministic_protects_factors_and_needs_no_model
     assert candidate.augmented_input != record.raw_input
     assert "100" in candidate.augmented_input
     assert "Alice" in candidate.augmented_input
+    assert "DataStream Analytics" in candidate.augmented_input
     assert model.rendered_inputs == []
     assert candidate.renderer_metadata["renderer"] == "deterministic"
     assert candidate.renderer_metadata["algorithm"] == "protected_adjacent_transposition"
@@ -2560,6 +2611,26 @@ async def test_measurable_behavior_does_not_depend_on_a_model_marker(
     assert result.candidates[0].passed
 
 
+async def test_llm_operator_retries_an_unchanged_generation_once() -> None:
+    record = source_record()
+    original_frame = source_frame(record)
+    candidate_frame = behavior_candidate_frame(record, "fragmented_syntax")
+    model = CorrectingSemanticModel({record.id: original_frame}, candidate_frame)
+
+    result = await DatasetAugmentationEngine(model, model).augment(
+        (record,), operator_ids=("input.surface.grammar_error",)
+    )
+
+    candidate = result.candidates[0]
+    assert candidate.passed
+    assert candidate.augmented_input == "Transfer 100 to Alice, then tell me balance."
+    assert len(model.rendered_inputs) == 2
+    assert (
+        "renderer did not change the source input" in candidate.renderer_metadata["retry_reasons"]
+    )
+    assert "previous attempt was invalid" in model.rendered_instructions[1]
+
+
 @pytest.mark.parametrize(
     ("operator_id", "rendered_output", "failure"),
     [
@@ -2580,7 +2651,7 @@ async def test_measurable_behavior_does_not_depend_on_a_model_marker(
             "account and please take all the time you need to carefully make sure the request "
             "is handled "
             "before sending a detailed confirmation back to me when everything is complete",
-            "rendered input is not between 1.5 and 4 times the source length",
+            "rendered input is not between 1.25 and 3 times the source length",
         ),
         (
             "input.tone.angry",

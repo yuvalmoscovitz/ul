@@ -496,18 +496,35 @@ class DatasetAugmentationEngine:
                     rendered_input = await self._renderer.render(
                         record.raw_input, operator.instruction
                     )
-                renderer_metadata: dict[str, JsonValue] = {
-                    **rendered_input.metadata,
-                    "transformation_prompts": prompt_provenance(*transformation_prompt_names),
-                }
-                if self_correction_plan is not None:
-                    renderer_metadata["self_correction_grounding"] = self_correction_plan.grounding
                 augmented_input = rendered_input.text
                 if operator.generation_mechanism == "llm":
                     augmented_input = augmented_input.replace("—", " ")
                 surface_footprint_reasons = _surface_footprint_reasons(
                     operator.id, record.raw_input, augmented_input
                 )
+                retry_reasons = surface_footprint_reasons
+                if augmented_input == record.raw_input:
+                    retry_reasons = (*retry_reasons, "renderer did not change the source input")
+                if operator.generation_mechanism == "llm" and retry_reasons:
+                    rendered_input = await self._renderer.render(
+                        record.raw_input,
+                        f"{operator.instruction}\n\n"
+                        "Your previous attempt was invalid for these reasons: "
+                        f"{'; '.join(retry_reasons)}. Return a corrected transformation that "
+                        "satisfies the original instruction.",
+                    )
+                    augmented_input = rendered_input.text.replace("—", " ")
+                    surface_footprint_reasons = _surface_footprint_reasons(
+                        operator.id, record.raw_input, augmented_input
+                    )
+                renderer_metadata: dict[str, JsonValue] = {
+                    **rendered_input.metadata,
+                    "transformation_prompts": prompt_provenance(*transformation_prompt_names),
+                }
+                if operator.generation_mechanism == "llm" and retry_reasons:
+                    renderer_metadata["retry_reasons"] = list(retry_reasons)
+                if self_correction_plan is not None:
+                    renderer_metadata["self_correction_grounding"] = self_correction_plan.grounding
                 candidate_record = UserInputRecord(
                     id=f"{record.id}:{operator.id}",
                     raw_input=augmented_input,
@@ -673,6 +690,23 @@ class DatasetAugmentationEngine:
                         failure_reasons=tuple(failure_reasons),
                     )
                 )
+        operator_positions = {
+            (operator.id, operator.version): position
+            for position, operator in enumerate(selected_operators)
+        }
+        source_positions = {record.id: position for position, record in enumerate(source_records)}
+        candidates.sort(
+            key=lambda candidate: (
+                operator_positions[(candidate.operator_id, candidate.operator_version)],
+                source_positions[candidate.source_interaction_id],
+            )
+        )
+        skips.sort(
+            key=lambda skip: (
+                operator_positions[(skip.operator_id, skip.operator_version)],
+                source_positions[skip.source_interaction_id],
+            )
+        )
         return DatasetAugmentationResult(
             operator_references=tuple(
                 DatasetAugmentationOperatorReference(id=operator.id, version=operator.version)
@@ -1763,13 +1797,13 @@ def _surface_footprint_reasons(
         source_input, augmented_input
     ):
         return ("rendered input must insert exactly one punctuation character",)
-    if operator_id == "input.style.terse" and augmented_word_count * 10 > source_word_count * 9:
+    if operator_id == "input.style.terse" and augmented_word_count * 20 > source_word_count * 19:
         return ("rendered input is not visibly shorter than the source",)
     if operator_id == "input.style.verbose" and not (
-        source_word_count * 15 <= augmented_word_count * 10
-        and augmented_word_count <= source_word_count * 4
+        source_word_count * 5 <= augmented_word_count * 4
+        and augmented_word_count <= source_word_count * 3
     ):
-        return ("rendered input is not between 1.5 and 4 times the source length",)
+        return ("rendered input is not between 1.25 and 3 times the source length",)
     if operator_id == "input.surface.disfluency_repeat":
         source_repetition_count = sum(
             first.casefold() == second.casefold()
@@ -1807,12 +1841,18 @@ def _add_typing_noise(
     protected_words = _protected_factor_words(frame)
     eligible_words: list[tuple[int, int, tuple[int, ...]]] = []
     for match in re.finditer(r"[A-Za-z]+", record.raw_input):
-        if len(match.group()) < 4 or match.group().casefold() in protected_words:
+        word = match.group()
+        if (
+            len(word) < 4
+            or word.casefold() in protected_words
+            or (
+                any(character.isupper() for character in word)
+                and not _is_sentence_initial_word(record.raw_input, match.start())
+            )
+        ):
             continue
         swap_positions = tuple(
-            index
-            for index in range(1, len(match.group()) - 1)
-            if match.group()[index] != match.group()[index + 1]
+            index for index in range(1, len(word) - 1) if word[index] != word[index + 1]
         )
         if swap_positions:
             eligible_words.append((match.start(), match.end(), swap_positions))
@@ -1835,6 +1875,11 @@ def _add_typing_noise(
             "seed": seed,
         },
     )
+
+
+def _is_sentence_initial_word(text: str, word_start: int) -> bool:
+    prefix = text[:word_start].rstrip()
+    return not prefix or prefix[-1] in ".!?"
 
 
 def _deterministic_renderer_metadata(
