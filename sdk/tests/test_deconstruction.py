@@ -34,14 +34,13 @@ from ul_core.prompts import prompt_provenance
 pytestmark = pytest.mark.asyncio
 _TEST_API_KEY = SecretStr("test-openrouter-key")
 _TEST_CUSTOMER_API_KEY = SecretStr("test-customer-key")
-_LEGACY_LLM_AUGMENTATIONS_WITHOUT_DEVELOPMENT_VALIDATION = {
+_EXPECTED_DEVELOPMENT_VALIDATED_LLM_AUGMENTATIONS = {
     "input.surface.rephrase",
+    "input.surface.grammar_error",
     "input.surface.fragmented_syntax",
+    "input.surface.disfluency_repeat",
     "input.style.terse",
     "input.style.verbose",
-}
-_EXPECTED_DEVELOPMENT_VALIDATED_LLM_AUGMENTATIONS = {
-    "input.surface.grammar_error",
     "input.tone.angry",
     "input.tone.argumentative",
 }
@@ -125,11 +124,8 @@ def synthetic_live_interaction() -> InteractionRecord:
         id="synthetic-live-check",
         raw_input="Could you please add 3 blue widgets with SKU TEST-42 to cart CART-7?",
         raw_observed_output={
-            "action": "cart_updated",
-            "sku": "TEST-42",
-            "quantity": 3,
-            "color": "blue",
-            "cart_id": "CART-7",
+            "updated": True,
+            "items_added": 3,
         },
     )
 
@@ -257,7 +253,7 @@ async def test_evaluator_preflight_proves_required_capabilities_and_records_poli
     ]
     assert [request.get("reasoning") for request in requests[:4]] == [
         {"effort": "minimal"},
-        {"effort": "none"},
+        {"effort": "minimal"},
         {"effort": "low"},
         None,
     ]
@@ -1129,7 +1125,7 @@ async def test_render_keeps_caller_instruction_out_of_the_system_prompt() -> Non
     def handler(request: httpx.Request) -> httpx.Response:
         body = json.loads(request.content)
         assert body["model"] == "test/default-model"
-        assert body["reasoning"] == {"effort": "none"}
+        assert body["reasoning"] == {"effort": "minimal"}
         assert body["max_tokens"] == 512
         assert body["temperature"] == 0
         assert "top_p" not in body
@@ -1196,7 +1192,7 @@ async def test_render_keeps_caller_instruction_out_of_the_system_prompt() -> Non
             & 0x7FFF_FFFF,
             "max_tokens": 512,
         },
-        "semantic_reasoning": {"mode": "required", "effort": "none"},
+        "semantic_reasoning": {"mode": "required", "effort": "minimal"},
     }
     assert not client.is_closed
     await client.aclose()
@@ -2930,11 +2926,7 @@ async def test_llm_augmentation_development_validation_coverage_is_explicit() ->
         if operator.generation_mechanism == "llm"
     }
 
-    assert llm_operator_ids > _LEGACY_LLM_AUGMENTATIONS_WITHOUT_DEVELOPMENT_VALIDATION
-    assert (
-        llm_operator_ids - _LEGACY_LLM_AUGMENTATIONS_WITHOUT_DEVELOPMENT_VALIDATION
-        == _EXPECTED_DEVELOPMENT_VALIDATED_LLM_AUGMENTATIONS
-    )
+    assert llm_operator_ids == _EXPECTED_DEVELOPMENT_VALIDATED_LLM_AUGMENTATIONS
 
 
 async def test_required_live_llm_validation_fails_closed() -> None:
@@ -2961,7 +2953,6 @@ async def test_live_llm_augmentations_pass_existing_validity_check(
         operator
         for operator in builtin_dataset_augmentation_operators()
         if operator.generation_mechanism == "llm"
-        and operator.id not in _LEGACY_LLM_AUGMENTATIONS_WITHOUT_DEVELOPMENT_VALIDATION
     )
     assert {operator.id for operator in operators} == (
         _EXPECTED_DEVELOPMENT_VALIDATED_LLM_AUGMENTATIONS

@@ -3,4 +3,13 @@ name = "augmentation.input.style.verbose"
 description = "Rewrites an input in a visibly wordier everyday style."
 author = "UL"
 +++
-Rewrite the user input as a natural, visibly wordier everyday message, roughly one and a half to two times as many words. Expand only through harmless restatement, never new facts, motivations, requests, constraints, or context. Preserve every value, identifier, relationship, and request order, and mention each value and identifier exactly once. Use only casual filler and pronouns referring back to the same request; do not add statements about what the user needs or why. For example only, 'book 2 seats' could become 'hey could you just book 2 seats, just put them in there for me'. Never copy the example or make the result more formal.
+Rewrite the user input as a natural, visibly wordier everyday message. Count the words in the
+source and output: the result must contain at least one and a half times as many words and must never
+contain more than four times as many words. Expand with at most one short greeting or politeness
+phrase and a harmless restatement of the same action. Do not add social small talk, wishes about the
+reader's day, or a separate thank-you sentence. Never add facts, motivations, requests, constraints,
+or context.
+Preserve every content-bearing noun phrase, value, identifier, relationship, authorization, and
+request order. Mention each value and identifier exactly once. Do not replace a source noun phrase
+with "it," "them," "those," or another pronoun, and do not add a new referential phrase. Keep the
+result casual rather than formal.

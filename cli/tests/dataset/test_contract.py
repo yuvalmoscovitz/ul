@@ -80,7 +80,7 @@ def test_legacy_operator_list_delegates_to_catalog_and_counts_deterministic_corr
         "input.style.terse@1.0.0:",
         "input.style.verbose@1.0.0:",
         "input.surface.case_variation@1.0.0:",
-        "input.surface.disfluency_repeat@1.0.0:",
+        "input.surface.disfluency_repeat@1.1.0:",
         "input.surface.fragmented_syntax@1.0.0:",
         "input.surface.grammar_error@1.0.0:",
         "input.surface.punctuation_noise@1.0.0:",

@@ -648,12 +648,23 @@ async def test_builtin_operator_library_is_fixed_versioned_and_reviewable() -> N
         "input.intent.self_correction"
     ] == "1.1.0"
     assert {
-        operator.version for operator in operators if operator.id != "input.intent.self_correction"
+        operator.id: operator.version
+        for operator in operators
+        if operator.id in {"input.surface.disfluency_repeat", "input.intent.self_correction"}
+    } == {
+        "input.surface.disfluency_repeat": "1.1.0",
+        "input.intent.self_correction": "1.1.0",
+    }
+    assert {
+        operator.version
+        for operator in operators
+        if operator.id not in {"input.surface.disfluency_repeat", "input.intent.self_correction"}
     } == {"1.0.0"}
     assert [operator.id for operator in operators if operator.generation_mechanism == "llm"] == [
         "input.surface.rephrase",
         "input.surface.grammar_error",
         "input.surface.fragmented_syntax",
+        "input.surface.disfluency_repeat",
         "input.style.terse",
         "input.style.verbose",
         "input.tone.angry",
@@ -665,7 +676,6 @@ async def test_builtin_operator_library_is_fixed_versioned_and_reviewable() -> N
         "input.surface.typing_noise",
         "input.surface.case_variation",
         "input.surface.punctuation_noise",
-        "input.surface.disfluency_repeat",
         "input.intent.self_correction",
     ]
     assert [operator.id for operator in operators if operator.human_review_required] == [
@@ -2489,13 +2499,17 @@ async def test_punctuation_noise_skips_when_every_insertion_point_is_protected()
     assert "outside a protected semantic value" in result.skips[0].reason
 
 
-async def test_word_repetition_is_deterministic_and_protects_factors() -> None:
+async def test_word_repetition_uses_llm_and_preserves_protected_values() -> None:
     record = source_record()
     original_frame = source_frame(record)
     reparsed_candidate = source_frame(record, identifier_prefix="candidate").model_copy(
         update={"outcomes": ()}
     )
-    model = DeterministicSemanticModel({record.id: original_frame}, reparsed_candidate)
+    model = DeterministicSemanticModel(
+        {record.id: original_frame},
+        reparsed_candidate,
+        "Transfer 100 to Alice, then then tell me the balance.",
+    )
 
     result = await DatasetAugmentationEngine(model, model).augment(
         (record,), operator_ids=("input.surface.disfluency_repeat",)
@@ -2505,86 +2519,11 @@ async def test_word_repetition_is_deterministic_and_protects_factors() -> None:
     assert candidate.passed
     assert "100" in candidate.augmented_input
     assert "Alice" in candidate.augmented_input
-    assert model.rendered_inputs == []
-    assert candidate.renderer_metadata["renderer"] == "deterministic"
-    assert candidate.renderer_metadata["algorithm"] == ("protected_immediate_word_repetition")
-    assert candidate.renderer_metadata["transformation_prompts"] == []
-
-
-async def test_factor_evidence_does_not_protect_unrelated_words_in_its_span() -> None:
-    record = InteractionRecord(
-        id="source",
-        raw_input="Pay AC-100.",
-        raw_observed_output={"action": "payment_committed"},
+    assert model.rendered_inputs == [record.raw_input]
+    assert candidate.renderer_metadata["model"] == "test/model"
+    assert candidate.renderer_metadata["transformation_prompts"] == prompt_provenance(
+        "augmentation.input.surface.disfluency_repeat"
     )
-    identifier = SemanticFactor(
-        id="identifier",
-        evidence=(
-            EvidenceReference(source="input", json_pointer="/raw_input", text_quote="AC-100"),
-        ),
-        confidence=1,
-        status="observed",
-        kind="identifier",
-        role="invoice_identifier",
-        value="AC-100",
-    )
-    inferred_object = SemanticFactor(
-        id="object",
-        evidence=(
-            EvidenceReference(
-                source="input",
-                json_pointer="/raw_input",
-                text_quote="Pay AC-100",
-            ),
-        ),
-        confidence=1,
-        status="observed",
-        kind="entity",
-        role="object",
-        value="invoice",
-    )
-    request = RequestUnit(
-        id="request",
-        evidence=(EvidenceReference(source="input", json_pointer="/raw_input", text_quote="Pay"),),
-        confidence=1,
-        status="observed",
-        mode="act",
-        predicate="pay",
-        factor_ids=(identifier.id, inferred_object.id),
-    )
-    original_frame = SemanticFrame(
-        interaction_id=record.id,
-        request_units=(request,),
-        factors=(identifier, inferred_object),
-        outcomes=(
-            ObservedOutcome(
-                id="outcome",
-                evidence=(
-                    EvidenceReference(
-                        source="output",
-                        json_pointer="/raw_observed_output/action",
-                        text_quote="payment_committed",
-                    ),
-                ),
-                confidence=1,
-                status="observed",
-                request_unit_ids=(request.id,),
-                position=0,
-                kind="action",
-                predicate="payment_committed",
-            ),
-        ),
-        extractor_version="test",
-    )
-    candidate_frame = original_frame.model_copy(update={"outcomes": ()})
-    model = DeterministicSemanticModel({record.id: original_frame}, candidate_frame)
-
-    result = await DatasetAugmentationEngine(model, model).augment(
-        (record,), operator_ids=("input.surface.disfluency_repeat",)
-    )
-
-    assert result.candidates[0].passed
-    assert result.candidates[0].augmented_input == "Pay pay AC-100."
 
 
 @pytest.mark.parametrize(
@@ -2636,9 +2575,12 @@ async def test_measurable_behavior_does_not_depend_on_a_model_marker(
         ),
         (
             "input.style.verbose",
-            "please could you now transfer the amount of 100 to Alice and then when that is done "
-            "could you also please tell me exactly what the current balance is for the account",
-            "rendered input is not between 1.5 and 2 times the source length",
+            "please could you now transfer the amount of 100 to Alice and then when that is "
+            "done could you also please tell me exactly what the current balance is for the "
+            "account and please take all the time you need to carefully make sure the request "
+            "is handled "
+            "before sending a detailed confirmation back to me when everything is complete",
+            "rendered input is not between 1.5 and 4 times the source length",
         ),
         (
             "input.tone.angry",

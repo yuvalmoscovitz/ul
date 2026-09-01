@@ -326,7 +326,11 @@ _BUILTIN_AUGMENTATION_SPECS = (
     ),
     _dataset_spec("input.surface.grammar_error", "Add one harmless grammatical error."),
     _dataset_spec("input.surface.fragmented_syntax", "Use plausible fragmented syntax."),
-    _dataset_spec("input.surface.disfluency_repeat", "Repeat a word as a natural disfluency."),
+    _dataset_spec(
+        "input.surface.disfluency_repeat",
+        "Repeat a word as a natural disfluency.",
+        version="1.1.0",
+    ),
     _dataset_spec("input.style.terse", "Express the same request tersely."),
     _dataset_spec("input.style.verbose", "Express the same request verbosely."),
     _dataset_spec(

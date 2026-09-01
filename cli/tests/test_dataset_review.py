@@ -113,7 +113,7 @@ def _evidence_record(*, finding_id: str = FINDING_ID) -> dict[str, Any]:
         "cases": [
             {
                 "operator_id": "input.surface.disfluency_repeat",
-                "operator_version": "1.0.0",
+                "operator_version": "1.1.0",
                 "augmented_input": "Pay pay AC-100.",
                 "status": "REPEATABLE DIFFERENCE — REVIEW",
                 "variation_accepted": True,
@@ -204,7 +204,7 @@ def _technical_details() -> dict[str, Any]:
     candidate = DatasetAugmentationCandidate(
         source_interaction_id="quickstart-payment",
         operator_id="input.surface.disfluency_repeat",
-        operator_version="1.0.0",
+        operator_version="1.1.0",
         projection=create_dataset_augmentation_projection(
             InteractionRecord(
                 id="quickstart-payment",
@@ -257,7 +257,7 @@ def _technical_details() -> dict[str, Any]:
             raw_observed_output={"final_amount": 100, "corrected_amount": 100},
         ),
         augmentation=DatasetAugmentationResult(
-            operator_references=({"id": candidate.operator_id, "version": "1.0.0"},),
+            operator_references=({"id": candidate.operator_id, "version": "1.1.0"},),
             source_records=(
                 InteractionRecord(
                     id="quickstart-payment",
@@ -455,7 +455,7 @@ def test_root_json_report_is_stable_and_omits_private_dataset_fields(tmp_path: P
                     "ulpf_v1_b5dd705fb4db534431680decfe8b221fbebfd049d7b7aba99c2b59af966a2ca3"
                 ),
                 "pattern_snapshot_id": (
-                    "ulps_v1_ebcde01bff883fa43fcfa740b674d2ad614afbd8d67a5147b701809a1b136ba6"
+                    "ulps_v1_9948b29c65c3fc3d0cba1a5798d96fc4cbe63e7fbd95fdae73f03efe685bd654"
                 ),
                 "kind": "behavior_difference",
                 "category": "changed_grounded_effect_argument",
@@ -480,7 +480,7 @@ def test_root_json_report_is_stable_and_omits_private_dataset_fields(tmp_path: P
                 "operators": [
                     {
                         "operator_id": "input.surface.disfluency_repeat",
-                        "operator_version": "1.0.0",
+                        "operator_version": "1.1.0",
                         "summary": "Repeat a word as a natural disfluency.",
                     }
                 ],
@@ -493,7 +493,7 @@ def test_root_json_report_is_stable_and_omits_private_dataset_fields(tmp_path: P
                     {
                         "finding_id": FINDING_ID,
                         "evidence_record_ref": (
-                            "ulpe_v1_717751ec28be57ec84779be550f7280d7e0c5a4377c2a092300cb3a13fe1aff5"
+                            "ulpe_v1_847c7ab8d1d75b79c06b4d2c35580b1ed6210af63434e13dff38f893a0c35d31"
                         ),
                         "membership_reasons": [
                             "same_action_shape",
@@ -516,7 +516,7 @@ def test_root_json_report_is_stable_and_omits_private_dataset_fields(tmp_path: P
                 "kind": "behavior_difference",
                 "category": "changed_grounded_effect_argument",
                 "operator_id": "input.surface.disfluency_repeat",
-                "operator_version": "1.0.0",
+                "operator_version": "1.1.0",
                 "rule_id": None,
                 "rule_version": None,
                 "declared_severity": None,
@@ -1535,7 +1535,7 @@ def test_invariant_finding_rejects_changed_values_and_id_tracks_variation_identi
         "interaction_id": "quickstart-payment",
         "original_input": "Pay AC-100.",
         "operator_id": "input.surface.disfluency_repeat",
-        "operator_version": "1.0.0",
+        "operator_version": "1.1.0",
         "augmented_input": "Pay pay AC-100.",
         "suite_sha256": first["invariant_evaluation"]["suite_sha256"],
         "observation_authority": "committed_state_snapshot",

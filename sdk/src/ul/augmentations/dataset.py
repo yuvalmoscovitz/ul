@@ -183,7 +183,7 @@ _BUILTIN_OPERATORS = (
     ),
     _builtin_operator(
         operator_id="input.surface.disfluency_repeat",
-        generation_mechanism="deterministic",
+        generation_mechanism="llm",
         allowed_change="declared_communication_form",
         target_communication_kind="repetition",
     ),
@@ -483,8 +483,6 @@ class DatasetAugmentationEngine:
                     rendered_input = _add_case_variation(record, expected_input_frame, operator)
                 elif operator.id == "input.surface.punctuation_noise":
                     rendered_input = _add_punctuation_noise(record, expected_input_frame, operator)
-                elif operator.id == "input.surface.disfluency_repeat":
-                    rendered_input = _add_word_repetition(record, expected_input_frame, operator)
                 elif operator.allowed_change == "structured_self_correction":
                     if self_correction_plan is None:
                         raise AssertionError("self-correction requires a selected factor")
@@ -1769,9 +1767,9 @@ def _surface_footprint_reasons(
         return ("rendered input is not visibly shorter than the source",)
     if operator_id == "input.style.verbose" and not (
         source_word_count * 15 <= augmented_word_count * 10
-        and augmented_word_count <= source_word_count * 2
+        and augmented_word_count <= source_word_count * 4
     ):
-        return ("rendered input is not between 1.5 and 2 times the source length",)
+        return ("rendered input is not between 1.5 and 4 times the source length",)
     if operator_id == "input.surface.disfluency_repeat":
         source_repetition_count = sum(
             first.casefold() == second.casefold()
@@ -2008,41 +2006,6 @@ def _is_single_punctuation_insertion(source_input: str, augmented_input: str) ->
         augmented_input[index] in ",.!?;:"
         and f"{augmented_input[:index]}{augmented_input[index + 1 :]}" == source_input
         for index in range(len(augmented_input))
-    )
-
-
-def _add_word_repetition(
-    record: InteractionRecord,
-    frame: SemanticFrame,
-    operator: DatasetAugmentationOperator,
-) -> RenderedUserInput:
-    seed = int.from_bytes(
-        hashlib.sha256(f"{record.id}\0{operator.id}\0{operator.version}".encode()).digest()[:4],
-        "big",
-    )
-    protected_words = _protected_factor_words(frame)
-    eligible_words = tuple(
-        match
-        for match in re.finditer(r"[A-Za-z]+", record.raw_input)
-        if len(match.group()) >= 3 and match.group().casefold() not in protected_words
-    )
-    if not eligible_words:
-        rendered_text = record.raw_input
-    else:
-        match = eligible_words[seed % len(eligible_words)]
-        repeated_word = match.group()
-        if repeated_word[:1].isupper() and repeated_word[1:].islower():
-            repeated_word = repeated_word.lower()
-        rendered_text = (
-            f"{record.raw_input[: match.end()]} {repeated_word}{record.raw_input[match.end() :]}"
-        )
-    return RenderedUserInput(
-        text=rendered_text,
-        metadata={
-            "renderer": "deterministic",
-            "algorithm": "protected_immediate_word_repetition",
-            "seed": seed,
-        },
     )
 
 

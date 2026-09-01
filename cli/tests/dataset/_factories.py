@@ -529,7 +529,7 @@ def _evaluator_preflight() -> EvaluatorModelPreflight:
                     ),
                     "request_options_sha256": request_options_sha256(
                         "test/renderer",
-                        "none",
+                        "minimal",
                         0,
                         render_seed,
                         max_tokens=512,

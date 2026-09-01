@@ -2500,7 +2500,7 @@ async def test_numeric_identifier_representations_remain_distinct() -> None:
 
     result = await runner.run(
         source,
-        operator_ids=("input.surface.disfluency_repeat",),
+        operator_ids=("input.surface.rephrase",),
         repetitions=2,
     )
 

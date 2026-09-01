@@ -55,7 +55,7 @@ def _llm_client_identity(model: str) -> LLMClientIdentity:
                 model="test/render-model",
                 max_output_tokens=512,
                 reasoning_mode="required",
-                reasoning_effort="none",
+                reasoning_effort="minimal",
             ),
             LLMRoleConfig(
                 role="equivalence",
