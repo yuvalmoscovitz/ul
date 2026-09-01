@@ -108,3 +108,18 @@ Runtime: `core/src/ul_core/augmentations/scenario.py` (`BoundaryShiftAugmentatio
 Every built-in currently has `implementation_status=implemented` and
 `qualification_status=not_qualified`. Unit tests verify contracts and transformation behavior. They
 do not prove that an augmentation produces useful failures against a live agent or LLM.
+
+## Developing LLM-generated augmentations
+
+Every new or materially changed LLM-generated dataset augmentation must declare
+`generation_mechanism="llm"` and pass the production renderer's existing validity check against a
+configured live model:
+
+```console
+uv run pytest -q \
+  sdk/tests/test_deconstruction.py::test_live_llm_augmentations_pass_existing_validity_check \
+  --require-live-llm
+```
+
+The non-live coverage contract fails when a new LLM operator is not included in this development
+gate. This development check is separate from release qualification against a live customer agent.

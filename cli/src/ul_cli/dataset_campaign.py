@@ -9,6 +9,7 @@ from ul import (
     EvaluatorPreflightProfilePlan,
     InteractionRecord,
     plan_evaluator_preflight_profiles,
+    resolve_dataset_augmentation_operator,
 )
 from ul_core.augmentations.definitions import (
     BuiltinAugmentationSpec,
@@ -92,15 +93,6 @@ class DatasetCampaignPlan(_StrictModel):
     inspection_environment_calls: Literal[0] = 0
 
 
-_DETERMINISTIC_OPERATORS = {
-    "input.surface.typing_noise",
-    "input.surface.case_variation",
-    "input.surface.punctuation_noise",
-    "input.surface.grammar_error",
-    "input.surface.disfluency_repeat",
-}
-
-
 def create_dataset_campaign_plan(
     *,
     records: tuple[InteractionRecord, ...],
@@ -152,7 +144,7 @@ def create_dataset_campaign_plan(
     )
     materialization_record_count = len(records_without_saved_augmentation)
     semantic_generation_operator_count = sum(
-        reference.partition("@")[0] not in _DETERMINISTIC_OPERATORS
+        resolve_dataset_augmentation_operator(reference).generation_mechanism == "llm"
         for reference in selected_operator_ids
     )
     generation_calls = materialization_record_count * semantic_generation_operator_count
@@ -335,7 +327,8 @@ def _operator_plan(
     deterministic_reason = (
         "candidate materialization is deterministic and free after source semantics are known; "
         "no candidate was generated during this zero-call inspection"
-        if operator.ref.id in _DETERMINISTIC_OPERATORS
+        if resolve_dataset_augmentation_operator(operator.ref.id).generation_mechanism
+        == "deterministic"
         else "candidate generation requires a semantic model call"
     )
     return CampaignOperatorPlan(

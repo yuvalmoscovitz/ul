@@ -328,6 +328,23 @@ def test_campaign_plan_derives_execution_totals_and_timeout_from_run_config() ->
         run_config.repetitions = 3  # type: ignore[misc]
 
 
+def test_campaign_plan_counts_grammar_error_as_llm_generation() -> None:
+    plan = campaign_module.create_dataset_campaign_plan(
+        records=(_evaluation_result("interaction-1").source,),
+        selected_operator_ids=("input.surface.grammar_error",),
+        run_config=_run_config(),
+        settings=command_module.load_dataset_semantic_settings(),
+    )
+
+    grammar_operator = next(
+        operator
+        for operator in plan.examples[0].operators
+        if operator.id == "input.surface.grammar_error"
+    )
+    assert plan.calls.variation_generation == 1
+    assert "candidate generation requires a semantic model call" in grammar_operator.reasons
+
+
 @pytest.mark.parametrize("candidate_state", ["rejected", "missing"])
 def test_campaign_plan_does_not_count_known_non_executable_variations(
     candidate_state: str,

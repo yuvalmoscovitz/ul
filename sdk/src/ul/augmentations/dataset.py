@@ -59,6 +59,7 @@ AllowedChange = Literal[
     "structured_self_correction",
 ]
 OperatorApplicabilityProfile = Literal["broad", "conditional"]
+OperatorGenerationMechanism = Literal["deterministic", "llm"]
 
 _OPERATOR_PROMPT_NAMES: dict[OperatorId, str] = {
     "input.surface.rephrase": "augmentation.input.surface.rephrase",
@@ -85,6 +86,7 @@ class DatasetAugmentationOperator(ULModel):
         default="Applies to any nonempty user input with recorded source semantics.",
         min_length=1,
     )
+    generation_mechanism: OperatorGenerationMechanism
     allowed_change: AllowedChange
     target_communication_kind: str | None = Field(default=None, min_length=1)
     target_marker_required: bool = False
@@ -106,6 +108,7 @@ class DatasetAugmentationOperator(ULModel):
 def _builtin_operator(
     operator_id: OperatorId,
     *,
+    generation_mechanism: OperatorGenerationMechanism,
     allowed_change: AllowedChange,
     target_communication_kind: str | None = None,
     target_marker_required: bool = False,
@@ -118,6 +121,7 @@ def _builtin_operator(
         instruction=_PROMPTS.get_prompt(_OPERATOR_PROMPT_NAMES[operator_id]),
         applicability_profile=definition.applicability_profile,
         applicability_rule=definition.applicability_rule,
+        generation_mechanism=generation_mechanism,
         allowed_change=allowed_change,
         target_communication_kind=target_communication_kind,
         target_marker_required=target_marker_required,
@@ -128,51 +132,61 @@ def _builtin_operator(
 _BUILTIN_OPERATORS = (
     _builtin_operator(
         operator_id="input.surface.rephrase",
+        generation_mechanism="llm",
         allowed_change="surface_form_only",
     ),
     _builtin_operator(
         operator_id="input.surface.typing_noise",
+        generation_mechanism="deterministic",
         allowed_change="declared_communication_form",
         target_communication_kind="typing_noise",
     ),
     _builtin_operator(
         operator_id="input.surface.case_variation",
+        generation_mechanism="deterministic",
         allowed_change="declared_communication_form",
         target_communication_kind="typing_noise",
     ),
     _builtin_operator(
         operator_id="input.surface.punctuation_noise",
+        generation_mechanism="deterministic",
         allowed_change="declared_communication_form",
         target_communication_kind="typing_noise",
     ),
     _builtin_operator(
         operator_id="input.surface.grammar_error",
+        generation_mechanism="llm",
         allowed_change="declared_communication_form",
         target_communication_kind="fragmented_syntax",
     ),
     _builtin_operator(
         operator_id="input.surface.fragmented_syntax",
+        generation_mechanism="llm",
         allowed_change="declared_communication_form",
         target_communication_kind="fragmented_syntax",
         target_marker_required=True,
     ),
     _builtin_operator(
         operator_id="input.surface.disfluency_repeat",
+        generation_mechanism="deterministic",
         allowed_change="declared_communication_form",
         target_communication_kind="repetition",
     ),
     _builtin_operator(
         operator_id="input.style.terse",
+        generation_mechanism="llm",
         allowed_change="declared_communication_form",
         target_communication_kind="terse",
     ),
     _builtin_operator(
         operator_id="input.style.verbose",
+        generation_mechanism="llm",
         allowed_change="declared_communication_form",
         target_communication_kind="verbose",
     ),
     _builtin_operator(
         operator_id="input.intent.self_correction",
+        generation_mechanism="llm",
         allowed_change="structured_self_correction",
         target_communication_kind="self_correction",
         target_marker_required=True,
@@ -459,8 +473,6 @@ class DatasetAugmentationEngine:
                     rendered_input = _add_case_variation(record, expected_input_frame, operator)
                 elif operator.id == "input.surface.punctuation_noise":
                     rendered_input = _add_punctuation_noise(record, expected_input_frame, operator)
-                elif operator.id == "input.surface.grammar_error":
-                    rendered_input = _add_grammar_error(record, operator)
                 elif operator.id == "input.surface.disfluency_repeat":
                     rendered_input = _add_word_repetition(record, expected_input_frame, operator)
                 elif operator.allowed_change == "structured_self_correction":
@@ -1586,17 +1598,6 @@ def _is_single_punctuation_insertion(source_input: str, augmented_input: str) ->
         augmented_input[index] in ",.!?;:"
         and f"{augmented_input[:index]}{augmented_input[index + 1 :]}" == source_input
         for index in range(len(augmented_input))
-    )
-
-
-def _add_grammar_error(
-    record: InteractionRecord, operator: DatasetAugmentationOperator
-) -> RenderedUserInput:
-    return RenderedUserInput(
-        text=f"Me need you to: {record.raw_input}",
-        metadata=_deterministic_renderer_metadata(
-            record, operator, "pronoun_case_error_request_prefix"
-        ),
     )
 
 
