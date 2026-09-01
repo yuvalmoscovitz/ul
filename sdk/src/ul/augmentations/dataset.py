@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+from collections import Counter
 from collections.abc import Collection, Iterable, Mapping
 from dataclasses import dataclass
 from decimal import Decimal
@@ -172,7 +173,8 @@ _BUILTIN_OPERATORS = (
         operator_id="input.surface.grammar_error",
         generation_mechanism="llm",
         allowed_change="declared_communication_form",
-        target_communication_kind="fragmented_syntax",
+        target_communication_kind="grammar_error",
+        target_marker_required=True,
     ),
     _builtin_operator(
         operator_id="input.surface.fragmented_syntax",
@@ -204,6 +206,7 @@ _BUILTIN_OPERATORS = (
         generation_mechanism="llm",
         allowed_change="declared_communication_form",
         target_communication_kind="angry",
+        target_marker_required=True,
     ),
     _builtin_operator(
         operator_id="input.tone.argumentative",
@@ -1784,32 +1787,33 @@ def _surface_footprint_reasons(
     source_word_count = len(re.findall(r"\w+", source_input, flags=re.UNICODE))
     augmented_words = re.findall(r"\w+", augmented_input, flags=re.UNICODE)
     augmented_word_count = len(augmented_words)
-    if operator_id == "input.surface.rephrase" and _word_key(source_input) == _word_key(
-        augmented_input
+    changed_word_count = _changed_word_count(source_input, augmented_input)
+    if operator_id == "input.surface.rephrase" and changed_word_count < max(
+        2, source_word_count // 4
     ):
-        return ("rendered input only changes case, spacing, or punctuation",)
+        return ("rendered input does not change enough wording",)
+    if operator_id == "input.surface.grammar_error" and changed_word_count < 2:
+        return ("rendered input must contain at least two visible word errors",)
     if (
-        operator_id == "input.surface.grammar_error"
-        and re.match(r"(?i)^can you [a-z]+s\b", augmented_input) is None
+        operator_id == "input.surface.fragmented_syntax"
+        and len(tuple(part for part in re.split(r"[.;\n]+", augmented_input) if part.strip())) < 2
     ):
-        return ("rendered input must begin with an explicit subject-verb agreement error",)
+        return ("rendered input must contain at least two clipped fragments",)
     if operator_id == "input.surface.case_variation" and not _is_single_case_change(
         source_input, augmented_input
     ):
         return ("rendered input must contain exactly one single-code-point case change",)
-    if operator_id == "input.surface.punctuation_noise" and not _is_single_punctuation_insertion(
+    if operator_id == "input.surface.punctuation_noise" and not _is_disruptive_punctuation_noise(
         source_input, augmented_input
     ):
-        return ("rendered input must insert exactly one punctuation character",)
-    if operator_id == "input.style.terse" and augmented_word_count * 20 > source_word_count * 17:
+        return ("rendered input must add a long punctuation run or many line breaks",)
+    if operator_id == "input.style.terse" and augmented_word_count * 5 > source_word_count * 4:
         return ("rendered input is not visibly shorter than the source",)
     if operator_id == "input.style.verbose" and not (
-        source_word_count * 5 <= augmented_word_count * 4
-        and augmented_word_count <= source_word_count * 3
+        source_word_count * 2 <= augmented_word_count
+        and augmented_word_count * 2 <= source_word_count * 7
     ):
-        return ("rendered input is not between 1.25 and 3 times the source length",)
-    if operator_id == "input.tone.angry" and re.search(r"(?i)\balready!", augmented_input) is None:
-        return ("rendered input must integrate angry impatience inside the request",)
+        return ("rendered input is not between 2 and 3.5 times the source length",)
     if operator_id == "input.surface.disfluency_repeat":
         source_repetition_count = sum(
             first.casefold() == second.casefold()
@@ -1820,18 +1824,44 @@ def _surface_footprint_reasons(
         )
         if augmented_repetition_count != source_repetition_count + 1:
             return ("rendered input must contain exactly one immediate word repetition",)
+    if (
+        operator_id == "input.tone.angry"
+        and re.search(
+            r"(?i)\b(?:fuck\w*|shit\w*|stupid|idiot|moron|damn\w*|asshole|useless|dumb)\b",
+            augmented_input,
+        )
+        is None
+    ):
+        return ("rendered input must sound unmistakably angry and hostile",)
+    if (
+        operator_id == "input.tone.argumentative"
+        and re.search(
+            r"(?i)\b(?:last time|again|wrong|stop|ever|once in your life|get anything right|"
+            r"do one thing right|can(?:not|'t) you (?:get|do|ever))\b",
+            augmented_input,
+        )
+        is None
+    ):
+        return ("rendered input must accuse or challenge an agent that keeps failing",)
     return ()
+
+
+def _changed_word_count(source_input: str, augmented_input: str) -> int:
+    source_words = Counter(re.findall(r"\w+", source_input.casefold(), flags=re.UNICODE))
+    augmented_words = Counter(re.findall(r"\w+", augmented_input.casefold(), flags=re.UNICODE))
+    shared_word_count = sum((source_words & augmented_words).values())
+    return max(sum(source_words.values()), sum(augmented_words.values())) - shared_word_count
 
 
 def _allowed_surface_change(operator_id: OperatorId) -> SemanticAllowedSurfaceChange:
     if operator_id == "input.surface.case_variation":
         return "single_unprotected_case_change"
     if operator_id == "input.surface.punctuation_noise":
-        return "single_unprotected_punctuation_insertion"
+        return "unprotected_punctuation_noise"
     if operator_id == "input.tone.angry":
-        return "moderate_angry_tone"
+        return "hostile_angry_tone"
     if operator_id == "input.tone.argumentative":
-        return "moderate_argumentative_tone"
+        return "hostile_argumentative_tone"
     return "none"
 
 
@@ -1844,48 +1874,62 @@ def _add_typing_noise(
         hashlib.sha256(f"{record.id}\0{operator.id}\0{operator.version}".encode()).digest()[:4],
         "big",
     )
-    protected_words = _protected_factor_words(frame)
-    eligible_words: list[tuple[int, int, tuple[int, ...]]] = []
+    protected_spans = _protected_input_spans(record.raw_input, frame)
+    eligible_words: list[tuple[int, int, str]] = []
     for match in re.finditer(r"[A-Za-z]+", record.raw_input):
         word = match.group()
-        if (
-            len(word) < 4
-            or word.casefold() in protected_words
-            or (
-                any(character.isupper() for character in word)
-                and not _is_sentence_initial_word(record.raw_input, match.start())
-            )
+        if len(word) < 3 or any(
+            _position_is_protected(position, protected_spans)
+            for position in range(match.start(), match.end())
         ):
             continue
-        swap_positions = tuple(
-            index for index in range(1, len(word) - 1) if word[index] != word[index + 1]
-        )
-        if swap_positions:
-            eligible_words.append((match.start(), match.end(), swap_positions))
+        eligible_words.append((match.start(), match.end(), word))
     if not eligible_words:
         rendered_text = record.raw_input
+        edit_count = 0
     else:
-        start, end, swap_positions = eligible_words[seed % len(eligible_words)]
-        characters = list(record.raw_input[start:end])
-        swap_index = swap_positions[seed % len(swap_positions)]
-        characters[swap_index], characters[swap_index + 1] = (
-            characters[swap_index + 1],
-            characters[swap_index],
+        ranked_words = sorted(
+            eligible_words,
+            key=lambda item: hashlib.sha256(f"{seed}\0{item[0]}".encode()).digest(),
         )
-        rendered_text = f"{record.raw_input[:start]}{''.join(characters)}{record.raw_input[end:]}"
+        edit_count = 4 + seed % 2
+        mutations = {start: word for start, _end, word in ranked_words}
+        for edit_index in range(edit_count):
+            start, _end, _word = ranked_words[edit_index % len(ranked_words)]
+            word = mutations[start]
+            operation = (seed + edit_index) % 3
+            position = 1 + (seed + edit_index) % max(1, len(word) - 2)
+            if operation == 0 and len(word) >= 3:
+                swap_position = min(position, len(word) - 2)
+                characters = list(word)
+                characters[swap_position], characters[swap_position + 1] = (
+                    characters[swap_position + 1],
+                    characters[swap_position],
+                )
+                mutated = "".join(characters)
+                if mutated == word:
+                    mutated = f"{word[:swap_position]}{word[swap_position + 1 :]}"
+            elif operation == 1 and len(word) > 3:
+                mutated = f"{word[:position]}{word[position + 1 :]}"
+            else:
+                mutated = f"{word[:position]}{word[position]}{word[position:]}"
+            mutations[start] = mutated
+        pieces: list[str] = []
+        cursor = 0
+        for start, end, _word in eligible_words:
+            pieces.extend((record.raw_input[cursor:start], mutations[start]))
+            cursor = end
+        pieces.append(record.raw_input[cursor:])
+        rendered_text = "".join(pieces)
     return RenderedUserInput(
         text=rendered_text,
         metadata={
             "renderer": "deterministic",
-            "algorithm": "protected_adjacent_transposition",
+            "algorithm": "four_or_five_unprotected_typing_edits",
             "seed": seed,
+            "edit_count": edit_count,
         },
     )
-
-
-def _is_sentence_initial_word(text: str, word_start: int) -> bool:
-    prefix = text[:word_start].rstrip()
-    return not prefix or prefix[-1] in ".!?"
 
 
 def _deterministic_renderer_metadata(
@@ -1962,11 +2006,38 @@ def _add_punctuation_noise(
     frame: SemanticFrame,
     operator: DatasetAugmentationOperator,
 ) -> RenderedUserInput:
-    insertion = _punctuation_insertion(record.raw_input, frame)
-    if insertion is None:
-        raise AssertionError("punctuation noise requires an unprotected insertion point")
-    position, punctuation, algorithm = insertion
-    rendered_text = f"{record.raw_input[:position]}{punctuation}{record.raw_input[position:]}"
+    seed = int.from_bytes(
+        hashlib.sha256(f"{record.id}\0{operator.id}\0{operator.version}".encode()).digest()[:4],
+        "big",
+    )
+    protected_spans = _protected_input_spans(record.raw_input, frame)
+    safe_spaces = tuple(
+        index
+        for index, character in enumerate(record.raw_input)
+        if character.isspace() and not _position_is_protected(index, protected_spans)
+    )
+    mode = seed % 3
+    if mode == 0 and safe_spaces:
+        selected_spaces = set(safe_spaces[:10])
+        rendered_text = "".join(
+            "\n" if index in selected_spaces else character
+            for index, character in enumerate(record.raw_input)
+        )
+        missing_newlines = 10 - len(selected_spaces)
+        if missing_newlines:
+            insertion_point = min(selected_spaces)
+            extra_newlines = "\n" * missing_newlines
+            rendered_text = (
+                f"{rendered_text[:insertion_point]}{extra_newlines}"
+                f"{rendered_text[insertion_point:]}"
+            )
+        algorithm = "ten_scattered_line_breaks"
+    elif mode == 1:
+        rendered_text = f"{record.raw_input}!!!!!!!!!1"
+        algorithm = "long_exclamation_run"
+    else:
+        rendered_text = f"{record.raw_input}............"
+        algorithm = "long_period_run"
     return RenderedUserInput(
         text=rendered_text,
         metadata=_deterministic_renderer_metadata(record, operator, algorithm),
@@ -2050,29 +2121,15 @@ def _is_single_case_change(source_input: str, augmented_input: str) -> bool:
     )
 
 
-def _is_single_punctuation_insertion(source_input: str, augmented_input: str) -> bool:
-    if len(augmented_input) != len(source_input) + 1:
+def _is_disruptive_punctuation_noise(source_input: str, augmented_input: str) -> bool:
+    normalized_source = re.sub(r"\s+", " ", source_input).strip()
+    normalized_augmented = re.sub(r"\s+", " ", augmented_input).strip()
+    if normalized_source == normalized_augmented:
+        return augmented_input.count("\n") - source_input.count("\n") >= 10
+    if not augmented_input.startswith(source_input):
         return False
-    return any(
-        augmented_input[index] in ",.!?;:"
-        and f"{augmented_input[:index]}{augmented_input[index + 1 :]}" == source_input
-        for index in range(len(augmented_input))
-    )
-
-
-def _protected_factor_words(frame: SemanticFrame) -> set[str]:
-    protected_words: set[str] = set()
-    for factor in frame.factors:
-        if not isinstance(factor.value, str):
-            continue
-        value_words = {word.casefold() for word in re.findall(r"[A-Za-z]+", factor.value)}
-        for evidence in factor.evidence:
-            if evidence.source == "input" and evidence.text_quote is not None:
-                evidence_words = {
-                    word.casefold() for word in re.findall(r"[A-Za-z]+", evidence.text_quote)
-                }
-                protected_words.update(value_words & evidence_words)
-    return protected_words
+    suffix = augmented_input[len(source_input) :]
+    return re.fullmatch(r"!{4,}1?|\.{6,}", suffix) is not None
 
 
 def _ambiguous_node_reason(frame: SemanticFrame) -> str | None:
@@ -2378,10 +2435,6 @@ def _version_tuple(version: str) -> tuple[int, int, int]:
 
 def _text_key(text: str) -> str:
     return " ".join(text.split()).casefold()
-
-
-def _word_key(text: str) -> tuple[str, ...]:
-    return tuple(word.casefold() for word in re.findall(r"\w+", text, flags=re.UNICODE))
 
 
 def _json_key(value: Any) -> str:

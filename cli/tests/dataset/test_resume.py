@@ -60,7 +60,7 @@ def test_evidence_run_context_binds_deconstructor_identity() -> None:
     current_context = cast(dataset_review.DatasetEvidenceRunContext, _run_context(records))
     legacy_context = dataset_review.create_dataset_evidence_run_context(
         selected_records=records,
-        operators=(("input.surface.rephrase", "1.0.0"),),
+        operators=(("input.surface.rephrase", "1.1.0"),),
         run_config=_run_config(),
         invariant_suite_sha256=None,
         target_config=current_context.target.config,
@@ -345,7 +345,7 @@ def test_resume_accepts_completed_trials_with_durable_augmentation_input(
     settings = _settings()
     generation_context = augmentation_ledger_module.create_dataset_augmentation_generation_context(
         selected_records=(evaluation.source,),
-        operators=(("input.surface.rephrase", "1.0.0"),),
+        operators=(("input.surface.rephrase", "1.1.0"),),
         semantic_settings=(
             augmentation_ledger_module.dataset_augmentation_ledger_semantic_settings(settings)
         ),
@@ -472,7 +472,7 @@ def test_resume_skips_already_processed_interaction_ids(
     run_context = _run_context(selected_records)
     generation_context = augmentation_ledger_module.create_dataset_augmentation_generation_context(
         selected_records=selected_records,
-        operators=(("input.surface.rephrase", "1.0.0"),),
+        operators=(("input.surface.rephrase", "1.1.0"),),
         semantic_settings=(
             augmentation_ledger_module.dataset_augmentation_ledger_semantic_settings(_settings())
         ),
@@ -679,7 +679,7 @@ def test_resume_dry_run_rejects_ledger_that_disagrees_with_completed_evidence(
     )
     generation_context = augmentation_ledger_module.create_dataset_augmentation_generation_context(
         selected_records=selected_records,
-        operators=(("input.surface.rephrase", "1.0.0"),),
+        operators=(("input.surface.rephrase", "1.1.0"),),
         semantic_settings=(
             augmentation_ledger_module.dataset_augmentation_ledger_semantic_settings(_settings())
         ),

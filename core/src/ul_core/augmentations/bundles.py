@@ -385,11 +385,12 @@ _DEFAULT_BUDGET = AugmentationBundleBudget(
 _BUILTIN_BUNDLES = (
     AugmentationBundle(
         id="everyday-customers",
-        version="1.1.0",
+        version="1.2.0",
         summary="Probe ordinary wording, typing, and information-density variation.",
         operators=(
             _policy(
                 "input.surface.typing_noise",
+                version="1.1.0",
                 mode="dataset_variation",
                 model_calls=3,
                 mutation_risk="state",
@@ -397,7 +398,7 @@ _BUILTIN_BUNDLES = (
             ),
             _policy(
                 "input.style.terse",
-                version="1.1.0",
+                version="1.2.0",
                 mode="dataset_variation",
                 model_calls=5,
                 mutation_risk="state",
@@ -405,7 +406,7 @@ _BUILTIN_BUNDLES = (
             ),
             _policy(
                 "input.style.verbose",
-                version="1.1.0",
+                version="1.2.0",
                 mode="dataset_variation",
                 model_calls=5,
                 mutation_risk="state",

@@ -696,29 +696,20 @@ async def test_builtin_operator_library_is_fixed_versioned_and_reviewable() -> N
     assert {operator.id: operator.version for operator in operators}[
         "input.intent.self_correction"
     ] == "1.1.0"
-    assert {
-        operator.id: operator.version for operator in operators if operator.version == "1.1.0"
-    } == {
-        "input.surface.grammar_error": "1.1.0",
-        "input.surface.fragmented_syntax": "1.1.0",
-        "input.surface.disfluency_repeat": "1.1.0",
-        "input.style.terse": "1.1.0",
-        "input.style.verbose": "1.1.0",
-        "input.tone.angry": "1.1.0",
-        "input.tone.argumentative": "1.1.0",
+    assert {operator.id: operator.version for operator in operators} == {
+        "input.surface.rephrase": "1.1.0",
+        "input.surface.typing_noise": "1.1.0",
+        "input.surface.case_variation": "1.0.0",
+        "input.surface.punctuation_noise": "1.1.0",
+        "input.surface.grammar_error": "1.2.0",
+        "input.surface.fragmented_syntax": "1.2.0",
+        "input.surface.disfluency_repeat": "1.2.0",
+        "input.style.terse": "1.2.0",
+        "input.style.verbose": "1.2.0",
+        "input.tone.angry": "1.2.0",
+        "input.tone.argumentative": "1.2.0",
         "input.intent.self_correction": "1.1.0",
     }
-    assert {
-        operator.version
-        for operator in operators
-        if operator.id
-        in {
-            "input.surface.rephrase",
-            "input.surface.typing_noise",
-            "input.surface.case_variation",
-            "input.surface.punctuation_noise",
-        }
-    } == {"1.0.0"}
     assert [operator.id for operator in operators if operator.generation_mechanism == "llm"] == [
         "input.surface.rephrase",
         "input.surface.grammar_error",
@@ -740,8 +731,8 @@ async def test_builtin_operator_library_is_fixed_versioned_and_reviewable() -> N
     assert [operator.id for operator in operators if operator.human_review_required] == [
         "input.intent.self_correction"
     ]
-    assert "Never abbreviate a month name" in instructions["input.style.terse"]
-    assert 'End the\nrewritten first command with "already!"' in instructions["input.tone.angry"]
+    assert "shortest natural text-message command" in instructions["input.style.terse"]
+    assert "insulting, profane" in instructions["input.tone.angry"]
     assert [
         operator.id for operator in operators if operator.applicability_profile == "conditional"
     ] == [
@@ -1791,8 +1782,8 @@ async def test_self_correction_skips_ineligible_sources(ineligible_reason: str) 
     [
         (
             "input.surface.grammar_error",
-            "fragmented_syntax",
-            "Can you transfers 100 to Alice, then tell me the balance?",
+            "grammar_error",
+            "transfr 100 to Alice then tells me balance",
             False,
         ),
         (
@@ -1805,19 +1796,21 @@ async def test_self_correction_skips_ineligible_sources(ineligible_reason: str) 
         (
             "input.style.verbose",
             "verbose",
-            "hey could you transfer 100 to alice and then please let me know the balance",
+            "hey can you please transfer 100 to alice and then once thats done just let me "
+            "know what the balance is",
             False,
         ),
         (
             "input.tone.angry",
             "angry",
-            "Transfer 100 to Alice already! Then tell me the balance.",
+            "stupid fuck transfer 100 to Alice then tell me the balance!!!!!!1",
             False,
         ),
         (
             "input.tone.argumentative",
             "argumentative",
-            "There is no reason to debate this: transfer 100 to Alice, then tell me the balance.",
+            "for the last time transfer 100 to Alice then tell me the balance, can you do one "
+            "thing right? stop being wrong",
             False,
         ),
     ],
@@ -1853,7 +1846,7 @@ async def test_behavior_operators_allow_only_their_communication_change(
     candidate = result.candidates[0]
     assert candidate.passed
     assert candidate.operator_id == operator_id
-    assert candidate.operator_version == "1.1.0"
+    assert candidate.operator_version == "1.2.0"
     assert candidate.allowed_change == "declared_communication_form"
     assert candidate.human_review_required is review_required
     assert candidate.augmented_input == realistic_output.replace("—", " ")
@@ -1863,11 +1856,11 @@ async def test_behavior_operators_allow_only_their_communication_change(
         "transformation_prompts": prompt_provenance(f"augmentation.{operator_id}"),
     }
     if operator_id == "input.tone.angry":
-        assert "stock prefix" in model.rendered_instructions[0].casefold()
+        assert "insulting, profane" in model.rendered_instructions[0].casefold()
     if operator_id == "input.tone.argumentative":
-        assert "merely making the request emphatic" in model.rendered_instructions[0]
+        assert "keeps failing" in model.rendered_instructions[0]
     if verifier is not None:
-        assert verifier.allowed_surface_changes == [f"moderate_{target_kind}_tone"]
+        assert verifier.allowed_surface_changes == [f"hostile_{target_kind}_tone"]
 
 
 async def test_tone_operator_fails_closed_without_safety_verifier() -> None:
@@ -1877,7 +1870,7 @@ async def test_tone_operator_fails_closed_without_safety_verifier() -> None:
     model = DeterministicSemanticModel(
         {record.id: original_frame},
         candidate_frame,
-        "Transfer 100 to Alice already! Then tell me the balance.",
+        "stupid fuck transfer 100 to Alice then tell me the balance!!!!!!1",
     )
 
     result = await DatasetAugmentationEngine(model, model).augment(
@@ -1894,20 +1887,15 @@ async def test_tone_operator_fails_closed_without_safety_verifier() -> None:
         (
             "input.tone.angry",
             "angry",
-            "You fucking idiot—transfer 100 to Alice already! Then tell me the balance.",
-            "fucking idiot",
-        ),
-        (
-            "input.tone.angry",
-            "angry",
-            "Transfer 100 to Alice already! I will hurt you; then tell me the balance.",
+            "stupid fuck transfer 100 to Alice. I will hurt you. Then tell me the balance!!!",
             "I will hurt you",
         ),
         (
             "input.tone.argumentative",
             "argumentative",
-            "There is no debate, you moron: transfer 100 to Alice, then tell me the balance.",
-            "you moron",
+            "for the last time transfer 100 to Alice or I will destroy you, then tell me the "
+            "balance.",
+            "I will destroy you",
         ),
     ],
 )
@@ -1925,7 +1913,7 @@ async def test_tone_operator_rejects_forbidden_hostility(
     )
     assessment = SemanticEquivalenceAssessment(
         verdict="different",
-        explanation="The candidate exceeds the moderate tone boundary.",
+        explanation="The candidate adds a threat.",
         deltas=(
             SemanticDelta(
                 category="communication",
@@ -2133,11 +2121,11 @@ async def test_typing_noise_is_deterministic_protects_factors_and_needs_no_model
     assert candidate.passed
     assert candidate.augmented_input != record.raw_input
     assert "100" in candidate.augmented_input
-    assert "Alice" in candidate.augmented_input
     assert "DataStream Analytics" in candidate.augmented_input
     assert model.rendered_inputs == []
     assert candidate.renderer_metadata["renderer"] == "deterministic"
-    assert candidate.renderer_metadata["algorithm"] == "protected_adjacent_transposition"
+    assert candidate.renderer_metadata["algorithm"] == "four_or_five_unprotected_typing_edits"
+    assert candidate.renderer_metadata["edit_count"] in {4, 5}
     assert candidate.renderer_metadata["transformation_prompts"] == []
 
 
@@ -2153,8 +2141,8 @@ async def test_typing_noise_is_deterministic_protects_factors_and_needs_no_model
         (
             "input.surface.punctuation_noise",
             "typing_noise",
-            "Transfer 100 to Alice,, then tell me the balance.",
-            "single_safe_punctuation_duplication",
+            "",
+            "",
         ),
     ),
 )
@@ -2175,8 +2163,16 @@ async def test_broad_surface_operators_are_deterministic_and_preserve_source_tex
 
     candidate = result.candidates[0]
     assert candidate.passed
-    assert candidate.augmented_input == expected_input
-    assert candidate.renderer_metadata["algorithm"] == algorithm
+    if operator_id == "input.surface.punctuation_noise":
+        assert candidate.augmented_input != record.raw_input
+        assert candidate.renderer_metadata["algorithm"] in {
+            "ten_scattered_line_breaks",
+            "long_exclamation_run",
+            "long_period_run",
+        }
+    else:
+        assert candidate.augmented_input == expected_input
+        assert candidate.renderer_metadata["algorithm"] == algorithm
     assert candidate.renderer_metadata["transformation_prompts"] == []
     assert model.rendered_inputs == []
 
@@ -2267,7 +2263,7 @@ async def test_case_variation_avoids_protected_values_and_expanding_case_mapping
         ),
         (
             "input.surface.punctuation_noise",
-            "single_unprotected_punctuation_insertion",
+            "unprotected_punctuation_noise",
             "extra_style_label",
         ),
     ],
@@ -2367,7 +2363,9 @@ async def test_punctuation_noise_avoids_punctuation_inside_semantic_values() -> 
     )
 
     assert result.candidates[0].passed
-    assert result.candidates[0].augmented_input == "P,ay $1,000 at 12:30"
+    assert result.candidates[0].augmented_input != record.raw_input
+    assert "$1,000" in result.candidates[0].augmented_input
+    assert "12:30" in result.candidates[0].augmented_input
 
 
 async def test_punctuation_noise_accepts_equivalent_list_factor_decomposition() -> None:
@@ -2399,10 +2397,10 @@ async def test_punctuation_noise_accepts_equivalent_list_factor_decomposition() 
         ),
         "verdict": "equivalent",
     }
-    assert candidate.augmented_input == (
-        "In the Status Report Google Sheet,, update API Gateway Upgrade to Completed "
-        "and Mobile App Redesign to In Progress."
-    )
+    assert candidate.augmented_input != record.raw_input
+    assert "Status Report Google Sheet" in candidate.augmented_input
+    assert "API Gateway Upgrade" in candidate.augmented_input
+    assert "Mobile App Redesign" in candidate.augmented_input
 
 
 @pytest.mark.parametrize(
@@ -2596,7 +2594,8 @@ async def test_word_repetition_uses_llm_and_preserves_protected_values() -> None
         ("input.style.terse", "transfer 100 alice then balance"),
         (
             "input.style.verbose",
-            "hey could you transfer 100 to alice and after that tell me what the balance is",
+            "hey so could you please transfer 100 to alice and then once thats done can you tell "
+            "me what the balance is",
         ),
         (
             "input.surface.disfluency_repeat",
@@ -2627,7 +2626,7 @@ async def test_measurable_behavior_does_not_depend_on_a_model_marker(
 async def test_llm_operator_retries_an_unchanged_generation_once() -> None:
     record = source_record()
     original_frame = source_frame(record)
-    candidate_frame = behavior_candidate_frame(record, "fragmented_syntax")
+    candidate_frame = behavior_candidate_frame(record, "grammar_error")
     model = CorrectingSemanticModel({record.id: original_frame}, candidate_frame)
 
     result = await DatasetAugmentationEngine(model, model).augment(
@@ -2656,17 +2655,17 @@ async def test_llm_operator_retries_an_unchanged_generation_once() -> None:
         (
             "input.surface.rephrase",
             "transfer 100 to Alice then tell me the balance",
-            "rendered input only changes case, spacing, or punctuation",
+            "rendered input does not change enough wording",
         ),
         (
             "input.surface.grammar_error",
             "Please transfer 100 to Alice and then report the balance",
-            "rendered input must begin with an explicit subject-verb agreement error",
+            "reparsed frame does not contain required communication kind grammar_error",
         ),
         (
             "input.surface.fragmented_syntax",
             "Please transfer 100 to Alice and then report the balance",
-            "reparsed frame does not contain required communication kind fragmented_syntax",
+            "rendered input must contain at least two clipped fragments",
         ),
         (
             "input.style.verbose",
@@ -2675,12 +2674,12 @@ async def test_llm_operator_retries_an_unchanged_generation_once() -> None:
             "account and please take all the time you need to carefully make sure the request "
             "is handled "
             "before sending a detailed confirmation back to me when everything is complete",
-            "rendered input is not between 1.25 and 3 times the source length",
+            "rendered input is not between 2 and 3.5 times the source length",
         ),
         (
             "input.tone.angry",
             "Please transfer 100 to Alice and then report the balance",
-            "rendered input must integrate angry impatience inside the request",
+            "reparsed frame does not contain required communication kind angry",
         ),
         (
             "input.tone.argumentative",
@@ -2735,7 +2734,7 @@ async def test_engine_selects_an_exact_versioned_operator_reference() -> None:
     model = DeterministicSemanticModel({})
 
     result = await DatasetAugmentationEngine(model, model).augment(
-        (), operator_ids=("input.surface.rephrase@1.0.0",)
+        (), operator_ids=("input.surface.rephrase@1.1.0",)
     )
 
     assert result.source_frames == ()
@@ -2832,13 +2831,15 @@ async def test_engine_retains_invalid_candidate_and_continues_to_later_operators
         "model": "test/model",
         "seed": 42,
         "transformation_prompts": prompt_provenance("augmentation.input.surface.rephrase"),
+        "retry_reasons": ["rendered input does not change enough wording"],
     }
     assert invalid_candidate.reparsed_input_frame is None
     assert invalid_candidate.failure_reasons == (
         "candidate semantic deconstruction failed validation",
+        "rendered input does not change enough wording",
     )
     assert result.candidates[1].reparsed_input_frame is not None
-    assert len(model.rendered_inputs) == 1
+    assert len(model.rendered_inputs) == 2
 
 
 async def test_engine_propagates_source_deconstruction_validation_failure() -> None:

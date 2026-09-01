@@ -444,7 +444,7 @@ class DeterministicSemanticPipeline:
     ) -> RenderedUserInput:
         del allow_temporary_value
         return RenderedUserInput(
-            text="Please transfer 100 to Alice.",
+            text="Send Alice the 100.",
             metadata={"model": "deterministic", "seed": 7},
         )
 
@@ -1021,7 +1021,7 @@ async def test_runner_executes_only_accepted_candidates_and_keeps_rejected_candi
     assert rejected.target_output is None
     assert rejected.observed_frame is None
     assert rejected.findings == ()
-    assert target.raw_inputs == ["Transfer 100 to Alice.", "Please transfer 100 to Alice."]
+    assert target.raw_inputs == ["Transfer 100 to Alice.", "Send Alice the 100."]
     last_reference = semantic_pipeline.references[-1]
     assert last_reference == result.baseline.observed_frame
     assert last_reference is not None
@@ -1086,10 +1086,10 @@ async def test_runner_executes_punctuation_candidate_with_equivalent_list_decomp
     assert environment.raw_inputs == [
         source.raw_input,
         (
-            "In the Status Report Google Sheet,, update the following: 1) Find the row for "
+            "In the Status Report Google Sheet, update the following: 1) Find the row for "
             "'API Gateway Upgrade' and change Status to 'Completed'. 2) Find the row for "
             "'Mobile App Redesign' and change Status to 'In Progress'. Use spreadsheet "
-            "ss_status, worksheet ws_report."
+            "ss_status, worksheet ws_report............."
         ),
     ]
 
@@ -2392,7 +2392,7 @@ async def test_repetitions_are_interleaved_and_group_equivalent_observations() -
         target.raw_inputs
         == [
             "Transfer 100 to Alice.",
-            "Please transfer 100 to Alice.",
+            "Send Alice the 100.",
         ]
         * 3
     )
@@ -2604,10 +2604,10 @@ async def test_inconclusive_original_round_skips_only_its_paired_variation() -> 
 
     assert target.raw_inputs == [
         "Transfer 100 to Alice.",
-        "Please transfer 100 to Alice.",
+        "Send Alice the 100.",
         "Transfer 100 to Alice.",
         "Transfer 100 to Alice.",
-        "Please transfer 100 to Alice.",
+        "Send Alice the 100.",
     ]
     assert result.baseline.trial_set.stability == "inconclusive"
     case = result.cases[0]

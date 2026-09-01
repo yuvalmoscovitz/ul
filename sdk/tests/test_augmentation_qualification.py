@@ -298,7 +298,7 @@ def test_reports_round_trip_without_overwriting_prior_evidence(tmp_path: Path) -
         applicability_profile="broad",
         attempts=_attempts(corpus, operator, profile="broad"),
     )
-    destination = tmp_path / "input.surface.rephrase@1.0.0.json"
+    destination = tmp_path / "input.surface.rephrase@1.1.0.json"
 
     write_augmentation_qualification_report(destination, report)
 

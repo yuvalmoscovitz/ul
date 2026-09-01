@@ -24,7 +24,7 @@ def test_builtin_bundles_are_versioned_selection_and_budget_policies() -> None:
         "unclear-changing-requests",
     ]
     everyday = catalog.get("everyday-customers")
-    assert everyday.version == "1.1.0"
+    assert everyday.version == "1.2.0"
     assert everyday.composition == "independent_only"
     assert [policy.ref.id for policy in everyday.operators] == [
         "input.surface.typing_noise",
@@ -111,7 +111,7 @@ def test_bundle_plan_reports_skips_and_deduplicates_canonical_probes() -> None:
 
 def test_bundle_plan_enforces_every_hard_bound() -> None:
     policy = BundleOperatorPolicy(
-        ref=AugmentationRef(id="input.surface.typing_noise", version="1.0.0"),
+        ref=AugmentationRef(id="input.surface.typing_noise", version="1.1.0"),
         mode="dataset_variation",
         model_calls=3,
         target_calls=1,
@@ -161,7 +161,7 @@ def test_bundle_plan_rejects_chained_composition_and_mutation_without_reset() ->
         )
     with pytest.raises(ValueError, match="require reset"):
         BundleOperatorPolicy(
-            ref=AugmentationRef(id="input.surface.typing_noise", version="1.0.0"),
+            ref=AugmentationRef(id="input.surface.typing_noise", version="1.1.0"),
             mode="dataset_variation",
             model_calls=0,
             target_calls=1,
@@ -177,7 +177,7 @@ def test_bundle_plan_enforces_fan_out_and_mutation_bounds() -> None:
         available_features=frozenset(("production interaction",)),
     )
     typing = BundleOperatorPolicy(
-        ref=AugmentationRef(id="input.surface.typing_noise", version="1.0.0"),
+        ref=AugmentationRef(id="input.surface.typing_noise", version="1.1.0"),
         mode="dataset_variation",
         model_calls=3,
         target_calls=1,
@@ -187,7 +187,7 @@ def test_bundle_plan_enforces_fan_out_and_mutation_bounds() -> None:
         reset_required=True,
     )
     terse = typing.model_copy(
-        update={"ref": AugmentationRef(id="input.style.terse", version="1.1.0")}
+        update={"ref": AugmentationRef(id="input.style.terse", version="1.2.0")}
     )
     fan_out_bundle = AugmentationBundle(
         id="fan-out-bound",
@@ -259,7 +259,7 @@ def test_bundle_plan_blocks_missing_runtime_readiness_and_unqualified_operators(
 
 def test_bundle_plan_rejects_conflicting_canonical_policies() -> None:
     first = BundleOperatorPolicy(
-        ref=AugmentationRef(id="input.surface.typing_noise", version="1.0.0"),
+        ref=AugmentationRef(id="input.surface.typing_noise", version="1.1.0"),
         mode="dataset_variation",
         model_calls=0,
         target_calls=0,

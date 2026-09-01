@@ -196,7 +196,7 @@ def _evidence_record() -> dict[str, Any]:
         "cases": [
             {
                 "operator_id": "input.surface.disfluency_repeat",
-                "operator_version": "1.1.0",
+                "operator_version": "1.2.0",
                 "augmented_input": "Pay pay AC-100.",
                 "status": "REPEATABLE DIFFERENCE — REVIEW",
                 "variation_accepted": True,
@@ -250,7 +250,7 @@ def _technical_details() -> dict[str, Any]:
     candidate = DatasetAugmentationCandidate(
         source_interaction_id="quickstart-payment",
         operator_id="input.surface.disfluency_repeat",
-        operator_version="1.1.0",
+        operator_version="1.2.0",
         projection=create_dataset_augmentation_projection(
             InteractionRecord(
                 id="quickstart-payment",
@@ -300,7 +300,7 @@ def _technical_details() -> dict[str, Any]:
             raw_observed_output={},
         ),
         augmentation=DatasetAugmentationResult(
-            operator_references=({"id": candidate.operator_id, "version": "1.1.0"},),
+            operator_references=({"id": candidate.operator_id, "version": "1.2.0"},),
             source_records=(
                 InteractionRecord(
                     id="quickstart-payment",

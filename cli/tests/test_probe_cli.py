@@ -346,7 +346,8 @@ class _ResponseOnlySemanticModel(_CleanRoomSemanticModel):
         allow_temporary_value: bool = False,
     ) -> RenderedUserInput:
         del instruction, allow_temporary_value
-        return RenderedUserInput(text=f"{raw_input} please")
+        del raw_input
+        return RenderedUserInput(text="cant login what should i do")
 
 
 class _UnknownOutcomeSemanticModel(_ResponseOnlySemanticModel):
@@ -2769,7 +2770,7 @@ def test_public_probe_runs_answer_only_callable_through_real_worker_and_reports_
         "    with Path('target-invocations.jsonl').open('a', encoding='utf-8') as stream:\n"
         "        stream.write(json.dumps(value) + '\\n')\n"
         "    recommendation = ('Retry the login. PRIVATE_RESPONSE_CANARY' "
-        "if value.endswith(' please') else "
+        "if value.startswith('cant login') else "
         "'Escalate to support. PRIVATE_RESPONSE_CANARY')\n"
         "    return {'recommendation': recommendation}\n",
         encoding="utf-8",
@@ -2842,7 +2843,7 @@ def test_public_probe_runs_raw_text_callable_through_real_worker_without_leaking
         "    with Path('target-invocations').open('a', encoding='utf-8') as stream:\n"
         "        stream.write('called\\n')\n"
         "    return ('Retry the login. RAW_TEXT_PRIVATE_CANARY' "
-        "if value.endswith(' please') else "
+        "if value.startswith('cant login') else "
         "'Escalate to support. RAW_TEXT_PRIVATE_CANARY')\n",
         encoding="utf-8",
     )

@@ -2958,18 +2958,19 @@ async def test_live_llm_augmentations_pass_existing_validity_check(
         _EXPECTED_DEVELOPMENT_VALIDATED_LLM_AUGMENTATIONS
     )
     candidates = []
+    interaction = synthetic_live_interaction()
     async with create_semantic_model_deconstructor(configured_settings) as semantic_model:
         engine = DatasetAugmentationEngine(semantic_model, semantic_model, semantic_model)
         for operator in operators:
             result = await engine.augment(
-                (synthetic_live_interaction(),),
+                (interaction,),
                 max_records=1,
                 operator_ids=(operator.id,),
             )
             assert result.skips == (), operator.id
             assert len(result.candidates) == 1, operator.id
             candidate = result.candidates[0]
-            assert candidate.augmented_input != synthetic_live_interaction().raw_input, operator.id
+            assert candidate.augmented_input != interaction.raw_input, operator.id
             communication_kinds = (
                 tuple(act.kind for act in candidate.reparsed_input_frame.communication_acts)
                 if candidate.reparsed_input_frame is not None

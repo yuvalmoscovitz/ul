@@ -174,7 +174,7 @@ def test_binding_rejects_owner_mode_mismatch_and_unsafe_environment_fault() -> N
 def test_catalog_resolves_latest_and_rejects_unknown_versions() -> None:
     catalog = builtin_augmentation_catalog()
 
-    assert catalog.get("input.surface.rephrase").ref.version == "1.0.0"
+    assert catalog.get("input.surface.rephrase").ref.version == "1.1.0"
     with pytest.raises(KeyError):
         catalog.get("input.surface.rephrase", "2.0.0")
 
