@@ -618,6 +618,8 @@ async def test_builtin_operator_library_is_fixed_versioned_and_reviewable() -> N
         "input.surface.disfluency_repeat",
         "input.style.terse",
         "input.style.verbose",
+        "input.tone.angry",
+        "input.tone.argumentative",
         "input.intent.self_correction",
     )
     assert {operator.version for operator in operators} == {"1.0.0"}
@@ -627,6 +629,8 @@ async def test_builtin_operator_library_is_fixed_versioned_and_reviewable() -> N
         "input.surface.fragmented_syntax",
         "input.style.terse",
         "input.style.verbose",
+        "input.tone.angry",
+        "input.tone.argumentative",
         "input.intent.self_correction",
     ]
     assert [operator.id for operator in operators if operator.human_review_required] == [
@@ -1106,6 +1110,18 @@ async def test_self_correction_skips_ineligible_sources(ineligible_reason: str) 
             "hey could you transfer 100 to alice and then please let me know the balance",
             False,
         ),
+        (
+            "input.tone.angry",
+            "angry",
+            "This is ridiculous—transfer 100 to Alice, then tell me the balance.",
+            False,
+        ),
+        (
+            "input.tone.argumentative",
+            "argumentative",
+            "There is no reason to debate this: transfer 100 to Alice, then tell me the balance.",
+            False,
+        ),
     ],
 )
 async def test_behavior_operators_allow_only_their_communication_change(
@@ -1137,6 +1153,10 @@ async def test_behavior_operators_allow_only_their_communication_change(
         "seed": 42,
         "transformation_prompts": prompt_provenance(f"augmentation.{operator_id}"),
     }
+    if operator_id == "input.tone.angry":
+        assert "merely adding words" in model.rendered_instructions[0]
+    if operator_id == "input.tone.argumentative":
+        assert "merely making the request emphatic" in model.rendered_instructions[0]
 
 
 async def test_behavior_operator_rejects_relations_touching_its_marker() -> None:
@@ -1899,6 +1919,16 @@ async def test_measurable_behavior_does_not_depend_on_a_model_marker(
             "please could you now transfer the amount of 100 to Alice and then when that is done "
             "could you also please tell me exactly what the current balance is for the account",
             "rendered input is not between 1.5 and 2 times the source length",
+        ),
+        (
+            "input.tone.angry",
+            "Please transfer 100 to Alice and then report the balance",
+            "reparsed frame does not contain required communication kind angry",
+        ),
+        (
+            "input.tone.argumentative",
+            "Please transfer 100 to Alice and then report the balance",
+            "reparsed frame does not contain required communication kind argumentative",
         ),
     ],
 )

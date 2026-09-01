@@ -17,7 +17,7 @@ def test_builtin_catalog_is_unique_sorted_and_immutable() -> None:
     catalog = builtin_augmentation_catalog()
     references = tuple((item.ref.id, item.ref.version) for item in catalog.list())
 
-    assert len(references) == 20
+    assert len(references) == 22
     assert references == tuple(sorted(references))
     assert len(references) == len(set(references))
     with pytest.raises(ValidationError, match="frozen"):

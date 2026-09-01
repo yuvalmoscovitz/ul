@@ -51,6 +51,8 @@ OperatorId = Literal[
     "input.surface.disfluency_repeat",
     "input.style.terse",
     "input.style.verbose",
+    "input.tone.angry",
+    "input.tone.argumentative",
     "input.intent.self_correction",
 ]
 AllowedChange = Literal[
@@ -71,6 +73,8 @@ _OPERATOR_PROMPT_NAMES: dict[OperatorId, str] = {
     "input.surface.disfluency_repeat": "augmentation.input.surface.disfluency_repeat",
     "input.style.terse": "augmentation.input.style.terse",
     "input.style.verbose": "augmentation.input.style.verbose",
+    "input.tone.angry": "augmentation.input.tone.angry",
+    "input.tone.argumentative": "augmentation.input.tone.argumentative",
     "input.intent.self_correction": "augmentation.input.intent.self_correction",
 }
 
@@ -183,6 +187,20 @@ _BUILTIN_OPERATORS = (
         generation_mechanism="llm",
         allowed_change="declared_communication_form",
         target_communication_kind="verbose",
+    ),
+    _builtin_operator(
+        operator_id="input.tone.angry",
+        generation_mechanism="llm",
+        allowed_change="declared_communication_form",
+        target_communication_kind="angry",
+        target_marker_required=True,
+    ),
+    _builtin_operator(
+        operator_id="input.tone.argumentative",
+        generation_mechanism="llm",
+        allowed_change="declared_communication_form",
+        target_communication_kind="argumentative",
+        target_marker_required=True,
     ),
     _builtin_operator(
         operator_id="input.intent.self_correction",

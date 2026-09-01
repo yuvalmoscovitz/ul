@@ -328,6 +328,11 @@ _BUILTIN_AUGMENTATION_SPECS = (
     _dataset_spec("input.surface.disfluency_repeat", "Repeat a word as a natural disfluency."),
     _dataset_spec("input.style.terse", "Express the same request tersely."),
     _dataset_spec("input.style.verbose", "Express the same request verbosely."),
+    _dataset_spec("input.tone.angry", "Express the same request with moderate anger."),
+    _dataset_spec(
+        "input.tone.argumentative",
+        "Express the same request as an argumentative challenge.",
+    ),
     _dataset_spec(
         "input.intent.self_correction",
         "Correct one request value within the same input.",

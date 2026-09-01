@@ -54,6 +54,8 @@ Runtime: `sdk/src/ul/augmentations/dataset.py`
 | `input.surface.disfluency_repeat` | Repeat a word as a natural disfluency. | The wording may change. Task meaning, authorization, consequential actions, and business state must stay the same. |
 | `input.style.terse` | Express the same request tersely. | The wording may change. Task meaning, authorization, consequential actions, and business state must stay the same. |
 | `input.style.verbose` | Express the same request verbosely. | The wording may change. Task meaning, authorization, consequential actions, and business state must stay the same. |
+| `input.tone.angry` | Express the same request with moderate anger. | The wording may change. Task meaning, authorization, consequential actions, and business state must stay the same. |
+| `input.tone.argumentative` | Express the same request as an argumentative challenge. | The wording may change. Task meaning, authorization, consequential actions, and business state must stay the same. |
 | `input.intent.self_correction` | Correct one request value within the same input. | The corrected value must control the response and business outcome. |
 
 ### Task semantics
