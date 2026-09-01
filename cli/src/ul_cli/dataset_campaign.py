@@ -9,11 +9,14 @@ from ul import (
     EvaluatorPreflightProfilePlan,
     InteractionRecord,
     plan_evaluator_preflight_profiles,
+    resolve_dataset_augmentation_operator,
 )
 from ul_core.augmentations.definitions import (
     BuiltinAugmentationSpec,
     builtin_augmentation_catalog,
 )
+
+from ul_cli.dataset_run_config import DatasetRunConfig
 
 
 class _StrictModel(BaseModel):
@@ -46,6 +49,7 @@ class CampaignCallCounts(_StrictModel):
     retries: int = Field(ge=0)
     preflight: int = Field(ge=0)
     evaluators: int = Field(ge=0)
+    materiality: int = Field(ge=0)
     variation_generation: int = Field(ge=0)
     total_semantic_model: int = Field(ge=0)
     total_environment_api: int = Field(ge=0)
@@ -69,8 +73,13 @@ class CampaignFixturePlan(_StrictModel):
     version: str | None = None
 
 
+class CampaignTimingPlan(_StrictModel):
+    target_trial_timeout_seconds: float = Field(gt=0, le=3_600)
+    maximum_wall_time_seconds: float = Field(gt=0)
+
+
 class DatasetCampaignPlan(_StrictModel):
-    schema_version: Literal["1.1.0"] = "1.1.0"
+    schema_version: Literal["1.3.0"] = "1.3.0"
     evaluation_mode: Literal["variance"] = "variance"
     fixture: CampaignFixturePlan | None = None
     examples: tuple[CampaignExamplePlan, ...]
@@ -78,36 +87,27 @@ class DatasetCampaignPlan(_StrictModel):
     preflight_profiles: tuple[EvaluatorPreflightProfilePlan, ...]
     tokens: CampaignTokenRange
     money: CampaignMoneyRange | None = None
+    timing: CampaignTimingPlan
     warnings: tuple[str, ...] = ()
     inspection_model_calls: Literal[0] = 0
     inspection_environment_calls: Literal[0] = 0
-
-
-_DETERMINISTIC_OPERATORS = {
-    "input.surface.typing_noise",
-    "input.surface.case_variation",
-    "input.surface.punctuation_noise",
-    "input.surface.grammar_error",
-    "input.surface.disfluency_repeat",
-    "input.tone.frustrated",
-}
 
 
 def create_dataset_campaign_plan(
     *,
     records: tuple[InteractionRecord, ...],
     selected_operator_ids: tuple[str, ...],
-    repetitions: int,
-    target_calls_per_execution: int,
+    run_config: DatasetRunConfig,
     settings: DatasetSemanticSettings,
     saved_augmentations: dict[str, DatasetAugmentationResult] | None = None,
     show_sensitive_values: bool = False,
     requires_preflight: bool = True,
-    evaluation_mode: Literal["variance"] = "variance",
     fixture_status: Literal["configured", "missing", "not_required"] | None = None,
     fixture_id: str | None = None,
     fixture_version: str | None = None,
 ) -> DatasetCampaignPlan:
+    repetitions = run_config.repetitions
+    target_config = run_config.target
     saved = saved_augmentations or {}
     selected_ids = {reference.partition("@")[0] for reference in selected_operator_ids}
     catalog = builtin_augmentation_catalog().list()
@@ -144,23 +144,35 @@ def create_dataset_campaign_plan(
     )
     materialization_record_count = len(records_without_saved_augmentation)
     semantic_generation_operator_count = sum(
-        reference.partition("@")[0] not in _DETERMINISTIC_OPERATORS
+        resolve_dataset_augmentation_operator(reference).generation_mechanism == "llm"
+        for reference in selected_operator_ids
+    )
+    tone_safety_operator_count = sum(
+        resolve_dataset_augmentation_operator(reference).target_communication_kind
+        in {"angry", "argumentative"}
         for reference in selected_operator_ids
     )
     generation_calls = materialization_record_count * semantic_generation_operator_count
+    tone_safety_calls = materialization_record_count * tone_safety_operator_count
     source_deconstruction_calls = materialization_record_count
     candidate_deconstruction_calls = materialization_record_count * operator_count
     equivalence_calls = materialization_record_count * operator_count
     trial_evaluator_calls = execution_calls
+    materiality_calls = variation_candidate_count
     evaluator_calls = (
         source_deconstruction_calls
         + candidate_deconstruction_calls
         + equivalence_calls
+        + tone_safety_calls
         + trial_evaluator_calls
     )
     preflight_profiles = plan_evaluator_preflight_profiles(settings) if requires_preflight else ()
     preflight_calls = len(preflight_profiles)
-    total_semantic_calls = evaluator_calls + generation_calls + preflight_calls
+    total_semantic_calls = evaluator_calls + materiality_calls + generation_calls + preflight_calls
+    maximum_wall_time_seconds = (
+        max(1, execution_calls) * target_config.trial_timeout_seconds
+        + total_semantic_calls * settings.timeout_seconds
+    )
 
     deconstruction_calls = (
         source_deconstruction_calls + candidate_deconstruction_calls + trial_evaluator_calls
@@ -170,6 +182,8 @@ def create_dataset_campaign_plan(
         + deconstruction_calls * settings.max_output_tokens
         + generation_calls * settings.max_render_tokens
         + equivalence_calls * min(settings.max_output_tokens, 1_024)
+        + tone_safety_calls * min(settings.max_output_tokens, 1_024)
+        + materiality_calls * 512
     )
     warnings = list(_model_parameter_warnings(settings))
     candidate_inputs_available = any(
@@ -206,7 +220,7 @@ def create_dataset_campaign_plan(
             "findings can be reproduced."
         )
     return DatasetCampaignPlan(
-        evaluation_mode=evaluation_mode,
+        evaluation_mode=run_config.evaluation_mode,
         fixture=(
             CampaignFixturePlan(
                 status=fixture_status,
@@ -225,12 +239,17 @@ def create_dataset_campaign_plan(
             retries=0,
             preflight=preflight_calls,
             evaluators=evaluator_calls,
+            materiality=materiality_calls,
             variation_generation=generation_calls,
             total_semantic_model=total_semantic_calls,
-            total_environment_api=execution_calls * target_calls_per_execution,
+            total_environment_api=(execution_calls * target_config.environment_api_calls_per_trial),
         ),
         preflight_profiles=preflight_profiles,
         tokens=CampaignTokenRange(minimum=0, maximum=maximum_completion_tokens),
+        timing=CampaignTimingPlan(
+            target_trial_timeout_seconds=target_config.trial_timeout_seconds,
+            maximum_wall_time_seconds=maximum_wall_time_seconds,
+        ),
         warnings=tuple(warnings),
     )
 
@@ -316,7 +335,8 @@ def _operator_plan(
     deterministic_reason = (
         "candidate materialization is deterministic and free after source semantics are known; "
         "no candidate was generated during this zero-call inspection"
-        if operator.ref.id in _DETERMINISTIC_OPERATORS
+        if resolve_dataset_augmentation_operator(operator.ref.id).generation_mechanism
+        == "deterministic"
         else "candidate generation requires a semantic model call"
     )
     return CampaignOperatorPlan(

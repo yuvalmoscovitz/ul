@@ -528,6 +528,8 @@ def _print_human_report(report: UnifiedReport, evidence: Path) -> None:
                     "(configured by your team)"
                 )
                 typer.echo("  Why grouped: same customer-defined rule.")
+            elif pattern.category == "changed_response":
+                typer.echo("  Why grouped: same finding category and private response shape.")
             else:
                 typer.echo("  Why grouped: same finding category and private action shape.")
             prior_reviews = [

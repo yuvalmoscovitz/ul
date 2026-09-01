@@ -185,7 +185,7 @@ def test_public_probe_smoke_is_one_target_call_and_zero_semantic_calls(
     normalized_output = " ".join(output.split())
     assert "Smoke target invocation succeeded" in normalized_output
     assert "Command-wide environment API requests: 3 (includes smoke)" in normalized_output
-    assert "Semantic-model calls: up to 8" in normalized_output
+    assert "Semantic-model calls: up to 10" in normalized_output
     assert "No semantic-model calls were made" in normalized_output
     assert elapsed_seconds < 300
     assert len(receipt.read_text(encoding="utf-8").splitlines()) == 1

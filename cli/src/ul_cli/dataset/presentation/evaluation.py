@@ -19,6 +19,7 @@ from ul.dataset_invariants import (
 
 from ul_cli.dataset_campaign import DatasetCampaignPlan
 from ul_cli.dataset_review import DatasetEvidenceRedactionCoverage
+from ul_cli.invariant_findings import reproduced_invariant_rule_pairs
 
 from ..evidence.customer import baseline_customer_status, case_customer_status, trial_set_summary
 from .runtime import console, print_dataset_plain
@@ -28,6 +29,7 @@ _FINDING_LABELS = {
     "unexpected_effect": "unexpected action",
     "missing_effect": "missing action",
     "changed_grounded_effect_argument": "changed action value",
+    "changed_response": "changed response",
 }
 
 
@@ -42,6 +44,7 @@ def print_dataset_plan(
     target_endpoint: str | None,
     target_header_environment_variables: dict[str, str],
     repetitions: int,
+    target_timeout_seconds: float,
     max_environment_api_calls: int,
     target_calls_per_execution: int,
     target_supports_state_observation: bool | None,
@@ -50,6 +53,7 @@ def print_dataset_plan(
     fixture_version: str | None,
     invariant_suite: DatasetInvariantSuite | None,
     output: Path | None,
+    augmentations_input: Path | None,
     augmentations_output: Path | None,
     semantic_provider_id: str,
     semantic_endpoint_sha256: str,
@@ -77,6 +81,10 @@ def print_dataset_plan(
         "correctness not assessed)"
     )
     console.print(f"Repetitions: {repetitions} per original and accepted variation")
+    console.print(f"Target trial timeout: {target_timeout_seconds:g} seconds")
+    console.print(
+        f"Maximum planned wall time: {campaign_plan.timing.maximum_wall_time_seconds:g} seconds"
+    )
     if invariant_suite is None:
         console.print("Customer invariants: none")
     else:
@@ -93,7 +101,8 @@ def print_dataset_plan(
         f"repetition_rounds={campaign_plan.calls.repetitions}, "
         f"retries={campaign_plan.calls.retries}, "
         f"preflight={campaign_plan.calls.preflight}, "
-        f"evaluators={campaign_plan.calls.evaluators}"
+        f"evaluators={campaign_plan.calls.evaluators}, "
+        f"materiality={campaign_plan.calls.materiality}"
     )
     for profile in campaign_plan.preflight_profiles:
         print_dataset_plain(
@@ -177,7 +186,9 @@ def print_dataset_plan(
         )
     if output is not None:
         console.print(f"Evidence destination: {output}")
-    if augmentations_output is None:
+    if augmentations_input is not None:
+        print_dataset_plain(f"Reusing accepted augmentations: {augmentations_input}")
+    elif augmentations_output is None:
         console.print(
             "Augmentations will not be saved. Interrupted generation may repeat model calls."
         )
@@ -263,7 +274,11 @@ def print_dataset_results(
     augmentations_output: Path | None = None,
     invariant_evaluations: tuple[DatasetInvariantEvaluation, ...] = (),
     show_report_guidance: bool = True,
+    source_preparation_failure_count: int = 0,
 ) -> None:
+    invariant_evaluations_by_interaction = {
+        evaluation.interaction_id: evaluation for evaluation in invariant_evaluations
+    }
     evaluation_modes = {getattr(result, "evaluation_mode", "variance") for result in results}
     if len(evaluation_modes) > 1:
         raise ValueError("dataset results contain incompatible evaluation modes")
@@ -292,13 +307,22 @@ def print_dataset_results(
         )
         for case in result.cases:
             case_number += 1
+            finding_labels = [_FINDING_LABELS[finding.category] for finding in case.findings]
+            invariant_evaluation = invariant_evaluations_by_interaction.get(result.source.id)
+            if invariant_evaluation is not None:
+                finding_labels.extend(
+                    f"reproduced invariant: {variation_rule.rule_id}"
+                    for _, variation_rule in reproduced_invariant_rule_pairs(
+                        invariant_evaluation, case.candidate.operator_id
+                    )
+                )
             table.add_row(
                 str(case_number),
                 case.candidate.operator_id,
                 case_customer_status(result, case),
                 case.trial_set.stability if case.trial_set is not None else "—",
                 trial_set_summary(case.trial_set),
-                ", ".join(_FINDING_LABELS[finding.category] for finding in case.findings) or "—",
+                ", ".join(finding_labels) or "—",
             )
     console.print(table)
     actual_semantic_calls = sum(
@@ -311,6 +335,11 @@ def print_dataset_results(
         "Semantic evaluator calls: "
         f"{actual_semantic_calls} actual; {semantic_cache_hits} private cache hit(s)"
     )
+    if source_preparation_failure_count:
+        console.print(
+            f"Source preparation failures: {source_preparation_failure_count}; "
+            "no target calls were made for those sources."
+        )
     if invariant_evaluations:
         _print_invariant_results(invariant_evaluations)
     console.print(f"Complete evidence: {output}")
@@ -321,15 +350,26 @@ def print_dataset_results(
     if augmentations_output is not None:
         print_dataset_plain(f"Saved augmentations: {augmentations_output}")
     if show_report_guidance:
+        console.print(f"Next: ul dataset report {output}")
         if has_decision_ready_findings:
-            console.print(f"Next: ul report {finding_output}")
-            console.print(f"Private dataset details: ul dataset report {output}")
-        else:
-            console.print(f"Next: ul dataset report {output}")
+            console.print(f"Actionable finding export: ul report {finding_output}")
 
 
 def result_needs_review(result: DatasetEvaluationResult) -> bool:
-    return any(case.verdict == "divergence_needs_review" for case in result.cases)
+    return dataset_result_exit_code(result) == 1
+
+
+def dataset_result_exit_code(result: DatasetEvaluationResult) -> int:
+    has_inconclusive_materiality = False
+    for case in result.cases:
+        if case.verdict != "divergence_needs_review":
+            continue
+        material_variance = getattr(case, "material_variance", None)
+        if material_variance is None or material_variance.decision == "material_variance":
+            return 1
+        if material_variance.decision == "insufficient_evidence":
+            has_inconclusive_materiality = True
+    return 2 if has_inconclusive_materiality else 0
 
 
 def dataset_invariant_exit_code(
@@ -360,6 +400,23 @@ def _print_invariant_results(
     for evaluation in evaluations:
         print_dataset_plain(f"Interaction: {evaluation.interaction_id}")
         print_dataset_plain(f"Declared observation authority: {evaluation.observation_authority}")
+        for variation in evaluation.variations:
+            if variation.operator_id is None:
+                continue
+            for baseline_rule, variation_rule in reproduced_invariant_rule_pairs(
+                evaluation, variation.operator_id
+            ):
+                print_dataset_plain(
+                    "Reproduced invariant finding: "
+                    f"rule={variation_rule.rule_id}; operator={variation.operator_id}; "
+                    f"original satisfied={len(baseline_rule.trials)}/{len(baseline_rule.trials)}; "
+                    f"variation violated={len(variation_rule.trials)}/"
+                    f"{len(variation_rule.trials)}; authority={evaluation.observation_authority}"
+                )
+                print_dataset_plain(
+                    "Finding limitations: causality not established; production prevalence not "
+                    "measured; whole-task correctness not established."
+                )
         for arm in (evaluation.baseline, *evaluation.variations):
             arm_name = "original" if arm.arm == "baseline" else f"variation ({arm.operator_id})"
             for rule in arm.rules:

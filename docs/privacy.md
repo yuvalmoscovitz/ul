@@ -119,3 +119,10 @@ mappings. Raw interaction text may itself contain secrets when redaction is abse
 Mode `0600` limits filesystem access on Unix but does not encrypt or redact the contents. Use `--augmentations-output` to place
 it in an approved retention location, or `--no-save-augmentations` when policy prohibits local
 retention and repeated generation is acceptable.
+
+Use `--augmentations-input PATH` to run a fresh campaign against the exact complete ledger from an
+earlier campaign. UL opens the file read-only and requires private ownership and permissions, an
+exact dataset/operator/semantic-generation context match, valid record hashes, and full selected
+dataset coverage. The new campaign manifest records the resolved input path and ledger SHA-256.
+The target configuration is intentionally independent, so the same accepted inputs can be tested
+against a different target without regenerating or editing them.

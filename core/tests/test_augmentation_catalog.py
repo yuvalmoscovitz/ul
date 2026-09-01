@@ -17,7 +17,7 @@ def test_builtin_catalog_is_unique_sorted_and_immutable() -> None:
     catalog = builtin_augmentation_catalog()
     references = tuple((item.ref.id, item.ref.version) for item in catalog.list())
 
-    assert len(references) == 21
+    assert len(references) == 22
     assert references == tuple(sorted(references))
     assert len(references) == len(set(references))
     with pytest.raises(ValidationError, match="frozen"):
@@ -75,6 +75,16 @@ def test_dataset_augmentation_declares_actual_execution_requirements() -> None:
         reads=("structured_input", "conversation"),
         writes=("structured_input", "conversation"),
     )
+
+
+def test_tone_augmentations_require_only_response_observation() -> None:
+    catalog = builtin_augmentation_catalog()
+
+    for operator_id in ("input.tone.angry", "input.tone.argumentative"):
+        requirements = catalog.get(operator_id).bindings[0].requirements
+        assert requirements.semantic_model is True
+        assert requirements.environment is True
+        assert requirements.state_observation is False
 
 
 def test_dataset_applicability_contracts_are_discoverable_before_execution() -> None:

@@ -14,6 +14,7 @@ from ul_cli.main import app as root_app
 
 from ._factories import (
     _evaluation_result,
+    _run_config,
     _settings,
 )
 from ._files import (
@@ -68,7 +69,7 @@ def test_dry_run_validates_and_makes_no_external_calls(
     assert "Selected interactions: 1" in result.output
     assert "Evaluation mode: variance" in result.output
     assert "Repetitions: 3 per original and accepted variation" in result.output
-    assert "Potential semantic model calls: up to 12" in result.output
+    assert "Potential semantic model calls: up to 14" in result.output
     assert "Potential environment API calls: up to 30" in result.output
     assert "authorized maximum: 100" in result.output
     assert "Semantic models receive historical inputs and outputs" in result.output
@@ -84,6 +85,35 @@ def test_dry_run_validates_and_makes_no_external_calls(
     assert "estimate a production failure rate" in result.output
     assert "No model or environment API requests sent." in result.output
     assert "Transfer 100" not in result.output
+
+
+@pytest.mark.parametrize("timeout", ("0", "nan", "3601"))
+def test_dry_run_rejects_unbounded_target_timeout(
+    tmp_path: Path,
+    timeout: str,
+) -> None:
+    dataset = tmp_path / "interactions.jsonl"
+    target_config = tmp_path / "target.json"
+    _write_dataset(dataset, [_record()])
+    _write_target_config(target_config)
+
+    result = runner.invoke(
+        root_app,
+        [
+            "dataset",
+            "evaluate",
+            str(dataset),
+            "--environment-config",
+            str(target_config),
+            "--target-timeout-seconds",
+            timeout,
+            "--dry-run",
+        ],
+    )
+
+    assert result.exit_code == 2
+    normalized_output = " ".join(_ANSI_ESCAPE_PATTERN.sub("", result.output).split())
+    assert "target-timeout-seconds" in normalized_output
 
 
 def test_dry_run_json_exposes_per_example_campaign_and_exact_call_plan(
@@ -118,6 +148,8 @@ def test_dry_run_json_exposes_per_example_campaign_and_exact_call_plan(
             str(target_config),
             "--repetitions",
             "2",
+            "--target-timeout-seconds",
+            "75",
             "--dry-run",
             "--json",
         ],
@@ -125,7 +157,7 @@ def test_dry_run_json_exposes_per_example_campaign_and_exact_call_plan(
 
     assert result.exit_code == 0, result.output
     payload = json.loads(result.output)
-    assert payload["schema_version"] == "1.1.0"
+    assert payload["schema_version"] == "1.3.0"
     assert payload["evaluation_mode"] == "variance"
     assert payload["fixture"] == {"status": "missing", "id": None, "version": None}
     assert any("no fixture identity" in warning.casefold() for warning in payload["warnings"])
@@ -138,10 +170,11 @@ def test_dry_run_json_exposes_per_example_campaign_and_exact_call_plan(
         "repetitions": 2,
         "repetition_executions": 4,
         "retries": 0,
-        "preflight": 3,
+        "preflight": 4,
         "evaluators": 7,
+        "materiality": 1,
         "variation_generation": 0,
-        "total_semantic_model": 10,
+        "total_semantic_model": 12,
         "total_environment_api": 20,
     }
     assert payload["calls"]["preflight"] == len(payload["preflight_profiles"])
@@ -149,15 +182,21 @@ def test_dry_run_json_exposes_per_example_campaign_and_exact_call_plan(
         ["deconstruct"],
         ["render"],
         ["equivalence"],
+        ["materiality"],
     ]
     assert (
-        sum(profile["max_completion_tokens"] for profile in payload["preflight_profiles"]) == 2_560
+        sum(profile["max_completion_tokens"] for profile in payload["preflight_profiles"]) == 3_072
     )
     assert payload["calls"]["total_semantic_model"] == (
         payload["calls"]["preflight"]
         + payload["calls"]["evaluators"]
+        + payload["calls"]["materiality"]
         + payload["calls"]["variation_generation"]
     )
+    assert payload["timing"] == {
+        "target_trial_timeout_seconds": 75.0,
+        "maximum_wall_time_seconds": 1020.0,
+    }
     planned_operator = next(
         operator
         for operator in payload["examples"][0]["operators"]
@@ -168,7 +207,7 @@ def test_dry_run_json_exposes_per_example_campaign_and_exact_call_plan(
     assert "deterministic and free" in planned_operator["reasons"][1]
     assert payload["tokens"] == {
         "minimum": 0,
-        "maximum": 28_160,
+        "maximum": 29_184,
         "scope": "completion_tokens",
     }
     assert payload["money"] is None
@@ -205,8 +244,7 @@ def test_campaign_plan_json_preserves_fixture_contract(
     plan = campaign_module.create_dataset_campaign_plan(
         records=(_evaluation_result("interaction-1").source,),
         selected_operator_ids=("input.surface.rephrase",),
-        repetitions=1,
-        target_calls_per_execution=1,
+        run_config=_run_config(),
         settings=cast(Any, _settings()),
         fixture_status=cast(Any, status),
         fixture_id=fixture_id,
@@ -230,8 +268,7 @@ def test_campaign_plan_exposes_precomputed_candidate_without_new_generation() ->
     plan = campaign_module.create_dataset_campaign_plan(
         records=(evaluation_result.source,),
         selected_operator_ids=("input.surface.rephrase",),
-        repetitions=1,
-        target_calls_per_execution=1,
+        run_config=_run_config(),
         settings=command_module.load_dataset_semantic_settings(),
         saved_augmentations={evaluation_result.source.id: evaluation_result.augmentation},
     )
@@ -250,8 +287,7 @@ def test_campaign_plan_exposes_precomputed_candidate_without_new_generation() ->
     sensitive_plan = campaign_module.create_dataset_campaign_plan(
         records=(evaluation_result.source,),
         selected_operator_ids=("input.surface.rephrase",),
-        repetitions=1,
-        target_calls_per_execution=1,
+        run_config=_run_config(),
         settings=command_module.load_dataset_semantic_settings(),
         saved_augmentations={evaluation_result.source.id: evaluation_result.augmentation},
         show_sensitive_values=True,
@@ -268,6 +304,60 @@ def test_campaign_plan_exposes_precomputed_candidate_without_new_generation() ->
     assert any("sensitive data" in warning for warning in sensitive_plan.warnings)
 
 
+def test_campaign_plan_derives_execution_totals_and_timeout_from_run_config() -> None:
+    run_config = _run_config(
+        repetitions=2,
+        environment_api_calls_per_trial=3,
+        planned_environment_api_calls=12,
+        max_environment_api_calls=12,
+        trial_timeout_seconds=47,
+    )
+
+    plan = campaign_module.create_dataset_campaign_plan(
+        records=(_evaluation_result("interaction-1").source,),
+        selected_operator_ids=("input.surface.rephrase",),
+        run_config=run_config,
+        settings=command_module.load_dataset_semantic_settings(),
+    )
+
+    assert plan.calls.baseline == 2
+    assert plan.calls.variation == 2
+    assert plan.calls.total_environment_api == 12
+    assert plan.timing.target_trial_timeout_seconds == 47
+    with pytest.raises(ValueError, match="frozen"):
+        run_config.repetitions = 3  # type: ignore[misc]
+
+
+def test_campaign_plan_counts_grammar_error_as_llm_generation() -> None:
+    plan = campaign_module.create_dataset_campaign_plan(
+        records=(_evaluation_result("interaction-1").source,),
+        selected_operator_ids=("input.surface.grammar_error",),
+        run_config=_run_config(),
+        settings=command_module.load_dataset_semantic_settings(),
+    )
+
+    grammar_operator = next(
+        operator
+        for operator in plan.examples[0].operators
+        if operator.id == "input.surface.grammar_error"
+    )
+    assert plan.calls.variation_generation == 1
+    assert "candidate generation requires a semantic model call" in grammar_operator.reasons
+
+
+def test_campaign_plan_counts_tone_safety_validation() -> None:
+    plan = campaign_module.create_dataset_campaign_plan(
+        records=(_evaluation_result("interaction-1").source,),
+        selected_operator_ids=("input.tone.angry",),
+        run_config=_run_config(),
+        settings=command_module.load_dataset_semantic_settings(),
+    )
+
+    assert plan.calls.variation_generation == 1
+    assert plan.calls.evaluators == 6
+    assert plan.calls.total_semantic_model == 12
+
+
 @pytest.mark.parametrize("candidate_state", ["rejected", "missing"])
 def test_campaign_plan_does_not_count_known_non_executable_variations(
     candidate_state: str,
@@ -280,8 +370,11 @@ def test_campaign_plan_does_not_count_known_non_executable_variations(
     plan = campaign_module.create_dataset_campaign_plan(
         records=(evaluation_result.source,),
         selected_operator_ids=("input.surface.rephrase",),
-        repetitions=3,
-        target_calls_per_execution=5,
+        run_config=_run_config(
+            repetitions=3,
+            environment_api_calls_per_trial=5,
+            planned_environment_api_calls=30,
+        ),
         settings=command_module.load_dataset_semantic_settings(),
         saved_augmentations={evaluation_result.source.id: saved_augmentation},
     )
@@ -290,7 +383,7 @@ def test_campaign_plan_does_not_count_known_non_executable_variations(
     assert plan.calls.variation == 0
     assert plan.calls.repetition_executions == 3
     assert plan.calls.evaluators == 3
-    assert plan.calls.total_semantic_model == 6
+    assert plan.calls.total_semantic_model == 7
     assert plan.calls.total_environment_api == 15
 
 
@@ -301,8 +394,7 @@ def test_campaign_plan_keeps_unattempted_operators_conditional() -> None:
     plan = campaign_module.create_dataset_campaign_plan(
         records=(evaluation_result.source,),
         selected_operator_ids=("input.surface.rephrase",),
-        repetitions=1,
-        target_calls_per_execution=1,
+        run_config=_run_config(),
         settings=command_module.load_dataset_semantic_settings(),
         saved_augmentations={evaluation_result.source.id: saved_augmentation},
     )
@@ -352,7 +444,7 @@ def test_human_dry_run_escapes_untrusted_ids_and_summarizes_unselected_catalog(
     assert "\\u001b" in result.output
     assert "[bold]spoof[/bold]" in result.output
     assert "Unselected catalog operators:" in result.output
-    assert "0 eligible, 10 conditional, 10 ineligible" in result.output
+    assert "0 eligible, 11 conditional, 10 ineligible" in result.output
     assert "use --json for full detail" in " ".join(result.output.split())
     assert "input.surface.rephrase@" not in result.output
 
@@ -361,9 +453,8 @@ def test_campaign_plan_warns_about_missing_review_and_provider_parameters() -> N
     source = _evaluation_result("interaction-1").source
     plan = campaign_module.create_dataset_campaign_plan(
         records=(source,),
-        selected_operator_ids=("input.tone.frustrated",),
-        repetitions=1,
-        target_calls_per_execution=1,
+        selected_operator_ids=("input.intent.self_correction",),
+        run_config=_run_config(),
         settings=cast(
             Any,
             _settings(
@@ -453,6 +544,7 @@ def test_augmentation_persistence_options_are_discoverable_at_80_columns(
 
     assert result.exit_code == 0, result.output
     normalized_output = " ".join(_ANSI_ESCAPE_PATTERN.sub("", result.output).split())
+    assert "--augmentations-input" in normalized_output
     assert "--augmentations-output" in normalized_output
     assert "--no-save-augmentations" in normalized_output
 
@@ -561,6 +653,70 @@ def test_custom_augmentations_output_conflicts_with_no_save(tmp_path: Path) -> N
     assert "used with --no-save-augmentations" in normalized_output
     assert not evidence.exists()
     assert not augmentations.exists()
+
+
+def test_augmentation_input_conflicts_with_augmentation_output(tmp_path: Path) -> None:
+    dataset = tmp_path / "interactions.jsonl"
+    evidence = tmp_path / "results.jsonl"
+    augmentation_input = tmp_path / "accepted.jsonl"
+    augmentation_output = tmp_path / "new.jsonl"
+    _write_dataset(dataset, [_record()])
+    augmentation_input.touch(mode=0o600)
+
+    result = runner.invoke(
+        root_app,
+        [
+            "dataset",
+            "evaluate",
+            str(dataset),
+            "--output",
+            str(evidence),
+            "--augmentations-input",
+            str(augmentation_input),
+            "--augmentations-output",
+            str(augmentation_output),
+            "--dry-run",
+        ],
+    )
+
+    assert result.exit_code == 2
+    normalized_output = " ".join(
+        _ANSI_ESCAPE_PATTERN.sub("", result.output).replace("│", " ").split()
+    )
+    assert "cannot be combined" in normalized_output
+    assert not evidence.exists()
+    assert not augmentation_output.exists()
+
+
+def test_augmentation_input_requires_complete_selected_dataset(tmp_path: Path) -> None:
+    dataset = tmp_path / "interactions.jsonl"
+    evidence = tmp_path / "results.jsonl"
+    augmentation_input = tmp_path / "accepted.jsonl"
+    _write_dataset(dataset, [_record()])
+    augmentation_input.touch(mode=0o600)
+
+    result = runner.invoke(
+        root_app,
+        [
+            "dataset",
+            "evaluate",
+            str(dataset),
+            "--output",
+            str(evidence),
+            "--augmentations-input",
+            str(augmentation_input),
+            "--dry-run",
+        ],
+    )
+
+    assert result.exit_code == 2
+    normalized_output = " ".join(
+        _ANSI_ESCAPE_PATTERN.sub("", result.output).replace("│", " ").split()
+    )
+    assert "augmentation input must contain every selected interaction exactly once" in (
+        normalized_output
+    )
+    assert not evidence.exists()
 
 
 def test_redaction_dry_run_reports_value_free_coverage_without_key_or_state(

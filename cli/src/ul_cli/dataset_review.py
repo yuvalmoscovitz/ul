@@ -10,7 +10,7 @@ import stat
 import sys
 import tempfile
 import unicodedata
-from collections.abc import Callable, Generator
+from collections.abc import Callable, Generator, Iterable
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -21,7 +21,15 @@ from uuid import uuid4
 import typer
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, ValidationError, model_validator
 from rich.console import Console
-from ul import DatasetEvaluationResult, InteractionRecord
+from ul import (
+    DatasetComparisonCompatibilityError,
+    DatasetEvaluationResult,
+    DatasetSemanticPreparationError,
+    DatasetSourceOutcomeProjectionError,
+    InteractionRecord,
+    MaterialVarianceAssessment,
+    SemanticDeconstructorIdentity,
+)
 from ul.dataset_invariants import (
     DatasetInvariantArrayUniqueRuleEvaluation,
     DatasetInvariantArrayUniqueTrialEvaluation,
@@ -49,9 +57,12 @@ from ul.dataset_invariants import (
 from ul.dataset_regression import dataset_regression_target_config_sha256
 from ul.environment import validate_outcome_projection_evidence
 from ul.http_environment import JsonHttpIsolatedResponseConfig, JsonHttpTargetConfig
+from ul.llm import LLMClientIdentity
 from ul.outcome_projection import OutcomeProjection
 from ul_core.augmentations.definitions import builtin_augmentation_catalog
 
+from ul_cli.dataset_run_config import DatasetRunConfig
+from ul_cli.invariant_findings import is_reproduced_invariant_difference
 from ul_cli.pattern_identity import (
     PatternIdentityKeyError,
     ReviewHistoryKeyError,
@@ -104,7 +115,7 @@ _REVIEW_ID_PATTERN = r"^ulr_[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{
 _PATTERN_REVIEW_ID_PATTERN = (
     r"^ulpr_[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
 )
-_DATASET_EVALUATION_PIPELINE_VERSION = "1.4.0"
+_DATASET_EVALUATION_PIPELINE_VERSION = "1.6.0"
 _MAXIMUM_PATTERN_EFFECTS = 100
 _MAXIMUM_PATTERN_FIELDS = 100
 _MAXIMUM_PATTERN_LABEL_CHARACTERS = 500
@@ -228,16 +239,13 @@ class DatasetEvidenceOperator(_StrictModel):
 
 
 class DatasetEvidenceSemanticSettings(_StrictModel):
-    provider: str = Field(min_length=1, max_length=100)
-    endpoint_sha256: str = Field(pattern=_SHA256_PATTERN)
-    model: str
-    render_model: str
-    equivalence_model: str
+    llm_client: LLMClientIdentity
     max_input_chars: int = Field(ge=1)
-    max_output_tokens: int = Field(ge=1)
-    max_render_tokens: int = Field(ge=1)
-    max_response_bytes: int = Field(ge=1)
-    timeout_seconds: float = Field(gt=0)
+    deconstructor_identity: SemanticDeconstructorIdentity | None = None
+    materiality_evaluator_version_id: str | None = Field(
+        default=None,
+        pattern=r"^ulev_v1_[0-9a-f]{64}$",
+    )
 
 
 class DatasetEvidenceRedactionCoverage(_StrictModel):
@@ -284,12 +292,15 @@ class DatasetEvidenceFixture(_StrictModel):
 
 
 class DatasetEvidenceRunContext(_StrictModel):
-    schema_version: Literal["1.1.0", "1.2.0", "1.3.0"] = "1.3.0"
-    pipeline_version: Literal["1.2.0", "1.3.0", "1.4.0"] = _DATASET_EVALUATION_PIPELINE_VERSION
+    schema_version: Literal["1.1.0", "1.2.0", "1.3.0", "1.4.0", "1.5.0"] = "1.5.0"
+    pipeline_version: Literal["1.2.0", "1.3.0", "1.4.0", "1.5.0", "1.6.0"] = (
+        _DATASET_EVALUATION_PIPELINE_VERSION
+    )
     selected_dataset_sha256: str = Field(pattern=_SHA256_PATTERN)
     operators: tuple[DatasetEvidenceOperator, ...] = Field(min_length=1)
     evaluation_mode: Literal["variance"] | None = None
     repetitions: int = Field(ge=1)
+    target_timeout_seconds: float = Field(default=30.0, gt=0, le=3_600)
     invariant_suite_sha256: str | None = Field(default=None, pattern=_SHA256_PATTERN)
     target: DatasetEvidenceTarget
     fixture: DatasetEvidenceFixture | None = None
@@ -304,17 +315,27 @@ class DatasetEvidenceRunContext(_StrictModel):
             ("1.1.0", "1.2.0"),
             ("1.2.0", "1.3.0"),
             ("1.3.0", "1.4.0"),
+            ("1.4.0", "1.5.0"),
+            ("1.5.0", "1.6.0"),
         }:
             raise ValueError("run context schema and pipeline versions must match")
-        if self.schema_version in {"1.2.0", "1.3.0"} and self.evaluation_mode is None:
+        if (
+            self.schema_version in {"1.2.0", "1.3.0", "1.4.0", "1.5.0"}
+            and self.evaluation_mode is None
+        ):
             raise ValueError(
                 f"run context schema {self.schema_version} requires an evaluation mode"
             )
         if self.schema_version == "1.1.0" and "evaluation_mode" in self.model_fields_set:
             raise ValueError("run context schema 1.1.0 does not include evaluation mode")
-        if self.schema_version == "1.3.0" and self.fixture is None:
-            raise ValueError("run context schema 1.3.0 requires fixture identity status")
-        if self.schema_version != "1.3.0" and "fixture" in self.model_fields_set:
+        if self.schema_version in {"1.3.0", "1.4.0", "1.5.0"} and self.fixture is None:
+            raise ValueError(
+                f"run context schema {self.schema_version} requires fixture identity status"
+            )
+        if (
+            self.schema_version not in {"1.3.0", "1.4.0", "1.5.0"}
+            and "fixture" in self.model_fields_set
+        ):
             raise ValueError(
                 f"run context schema {self.schema_version} does not include fixture identity"
             )
@@ -327,9 +348,58 @@ class DatasetEvidenceRunContext(_StrictModel):
             context_content.pop("redaction_policy_sha256")
         if not self.redaction_coverage:
             context_content.pop("redaction_coverage")
+        if "target_timeout_seconds" not in self.model_fields_set:
+            context_content.pop("target_timeout_seconds")
         expected_context_sha256 = _canonical_json_sha256(context_content)
         if self.context_sha256 != expected_context_sha256:
             raise ValueError("run context digest must match its canonical content")
+        return self
+
+
+class DatasetSourcePreparationFailureEvidence(_StrictModel):
+    schema_version: Literal["1.0.0"] = "1.0.0"
+    record_type: Literal["source_preparation_failure"] = "source_preparation_failure"
+    evaluation_mode: Literal["variance"] = "variance"
+    interaction_id: str = Field(min_length=1, max_length=500)
+    source_record_id: str | None = cast(Any, Field)(
+        default=None,
+        min_length=1,
+        max_length=500,
+        exclude_if=_is_none,
+    )
+    failure_stage: Literal["semantic_preparation"] = "semantic_preparation"
+    reason_code: Literal[
+        "source_semantic_preparation_failed",
+        "source_outcome_projection_failed",
+        "source_comparison_surface_incompatible",
+    ]
+    summary: str = Field(min_length=1, max_length=500)
+    remediation: str = Field(min_length=1, max_length=500)
+    execution_plan: _ExecutionPlan
+    run_context: DatasetEvidenceRunContext
+
+    @model_validator(mode="after")
+    def validate_context(self) -> Self:
+        if self.run_context.evaluation_mode != self.evaluation_mode:
+            raise ValueError("source failure evaluation mode must match its run context")
+        if self.execution_plan.repetitions != self.run_context.repetitions:
+            raise ValueError("source failure repetitions must match its run context")
+        expected_text = {
+            "source_semantic_preparation_failed": (
+                DatasetSemanticPreparationError.explanation,
+                DatasetSemanticPreparationError.remediation,
+            ),
+            "source_outcome_projection_failed": (
+                DatasetSourceOutcomeProjectionError.explanation,
+                DatasetSourceOutcomeProjectionError.remediation,
+            ),
+            "source_comparison_surface_incompatible": (
+                DatasetComparisonCompatibilityError.explanation,
+                DatasetComparisonCompatibilityError.remediation,
+            ),
+        }[self.reason_code]
+        if (self.summary, self.remediation) != expected_text:
+            raise ValueError("source failure guidance must match its reason code")
         return self
 
 
@@ -351,6 +421,7 @@ class _Case(_StrictModel):
     variation_rejection_reasons: list[str]
     observations: _Observations | None
     findings: list[_Finding]
+    material_variance: MaterialVarianceAssessment | None = None
     cross_examination: FindingCrossExaminationSummary | None = None
     inconclusive_reasons: list[str]
 
@@ -368,6 +439,8 @@ class _EvidenceRecord(_StrictModel):
         "1.11.0",
         "1.12.0",
         "1.13.0",
+        "1.14.0",
+        "1.15.0",
     ]
     evaluation_mode: Literal["variance"] | None = None
     interaction_id: str
@@ -387,15 +460,26 @@ class _EvidenceRecord(_StrictModel):
 
     @model_validator(mode="after")
     def validate_invariant_evaluation(self) -> Self:
-        current_schemas = {"1.8.0", "1.9.0", "1.10.0", "1.11.0", "1.12.0", "1.13.0"}
+        current_schemas = {
+            "1.8.0",
+            "1.9.0",
+            "1.10.0",
+            "1.11.0",
+            "1.12.0",
+            "1.13.0",
+            "1.14.0",
+            "1.15.0",
+        }
         if self.schema_version not in {
             "1.10.0",
             "1.11.0",
             "1.12.0",
             "1.13.0",
+            "1.14.0",
+            "1.15.0",
         } and "pattern_facets" in (self.model_fields_set):
             raise ValueError("vertical pattern facets require evidence schema 1.10.0")
-        if self.schema_version in {"1.12.0", "1.13.0"}:
+        if self.schema_version in {"1.12.0", "1.13.0", "1.14.0", "1.15.0"}:
             if any(case.cross_examination is None for case in self.cases):
                 raise ValueError("current evidence schemas require case cross-examination")
         elif any("cross_examination" in case.model_fields_set for case in self.cases):
@@ -428,6 +512,8 @@ class _EvidenceRecord(_StrictModel):
                 "1.11.0",
                 "1.12.0",
                 "1.13.0",
+                "1.14.0",
+                "1.15.0",
             }
             and "run_context" in self.model_fields_set
         ):
@@ -449,6 +535,8 @@ class _EvidenceRecord(_StrictModel):
             "1.11.0",
             "1.12.0",
             "1.13.0",
+            "1.14.0",
+            "1.15.0",
         }:
             raise ValueError("extended invariant results require evidence schema 1.6.0")
         if (
@@ -457,7 +545,40 @@ class _EvidenceRecord(_StrictModel):
             and self.run_context.evaluation_mode != self.evaluation_mode
         ):
             raise ValueError("evidence evaluation mode must match its run context")
-        if self.schema_version == "1.13.0":
+        has_response_findings = any(
+            finding.category == "changed_response"
+            for case in self.cases
+            for finding in case.findings
+        )
+        technical_comparison_surface = (
+            self.technical_details.get("comparison_surface")
+            if isinstance(self.technical_details, dict)
+            else None
+        )
+        if self.schema_version not in {"1.14.0", "1.15.0"} and (
+            has_response_findings or technical_comparison_surface == "response"
+        ):
+            raise ValueError("response comparison evidence requires schema 1.14.0")
+        if has_response_findings and technical_comparison_surface != "response":
+            raise ValueError("response findings require response comparison technical evidence")
+        if self.schema_version == "1.15.0":
+            if any((case.material_variance is None) != (not case.findings) for case in self.cases):
+                raise ValueError("schema 1.15.0 requires materiality for every semantic finding")
+            if self.run_context is not None:
+                expected_materiality_version = (
+                    self.run_context.semantic_settings.materiality_evaluator_version_id
+                )
+                if expected_materiality_version is None or any(
+                    case.material_variance is not None
+                    and case.material_variance.evaluator_version_id != expected_materiality_version
+                    for case in self.cases
+                ):
+                    raise ValueError(
+                        "materiality assessment version must match the evidence run context"
+                    )
+        elif any("material_variance" in case.model_fields_set for case in self.cases):
+            raise ValueError("legacy evidence cannot contain material variance assessments")
+        if self.schema_version in {"1.13.0", "1.14.0", "1.15.0"}:
             from ul_cli.dataset.evidence.customer import build_customer_evidence_record
 
             technical_result = DatasetEvaluationResult.model_validate(
@@ -475,6 +596,15 @@ class _EvidenceRecord(_StrictModel):
                 case.cross_examination is None
                 or case.cross_examination.model_dump(mode="json")
                 != expected_case["cross_examination"]
+                or (
+                    self.schema_version == "1.15.0"
+                    and (
+                        case.material_variance.model_dump(mode="json")
+                        if case.material_variance is not None
+                        else None
+                    )
+                    != expected_case.get("material_variance")
+                )
                 for case, expected_case in zip(self.cases, expected_cases, strict=True)
             ):
                 raise ValueError(
@@ -491,7 +621,9 @@ class _EvidenceRecord(_StrictModel):
 @dataclass(frozen=True)
 class DatasetResumeEvidence:
     processed_ids: frozenset[str]
+    source_preparation_failures: tuple[DatasetSourcePreparationFailureEvidence, ...]
     has_review_findings: bool
+    has_inconclusive_materiality: bool
     invariant_evaluations: tuple[DatasetInvariantEvaluation, ...]
     technical_results: tuple[DatasetEvaluationResult, ...]
     raw_evidence_sha256: str
@@ -501,8 +633,7 @@ def create_dataset_evidence_run_context(
     *,
     selected_records: tuple[InteractionRecord, ...],
     operators: tuple[tuple[str, str], ...],
-    evaluation_mode: Literal["variance"] = "variance",
-    repetitions: int,
+    run_config: DatasetRunConfig,
     invariant_suite_sha256: str | None,
     target_config: JsonHttpTargetConfig | None = None,
     target_receipt: dict[str, JsonValue] | None = None,
@@ -538,12 +669,13 @@ def create_dataset_evidence_run_context(
         else DatasetEvidenceFixture(status="not_required")
     )
     content = {
-        "schema_version": "1.3.0",
+        "schema_version": "1.5.0",
         "pipeline_version": _DATASET_EVALUATION_PIPELINE_VERSION,
         "selected_dataset_sha256": selected_dataset_sha256,
         "operators": [operator.model_dump(mode="json") for operator in operator_snapshots],
-        "evaluation_mode": evaluation_mode,
-        "repetitions": repetitions,
+        "evaluation_mode": run_config.evaluation_mode,
+        "repetitions": run_config.repetitions,
+        "target_timeout_seconds": run_config.target.trial_timeout_seconds,
         "invariant_suite_sha256": invariant_suite_sha256,
         "target": target.model_dump(mode="json"),
         "fixture": fixture.model_dump(mode="json"),
@@ -558,8 +690,9 @@ def create_dataset_evidence_run_context(
     return DatasetEvidenceRunContext(
         selected_dataset_sha256=selected_dataset_sha256,
         operators=operator_snapshots,
-        evaluation_mode=evaluation_mode,
-        repetitions=repetitions,
+        evaluation_mode=run_config.evaluation_mode,
+        repetitions=run_config.repetitions,
+        target_timeout_seconds=run_config.target.trial_timeout_seconds,
         invariant_suite_sha256=invariant_suite_sha256,
         target=target,
         fixture=fixture,
@@ -601,7 +734,9 @@ def validate_dataset_resume_evidence(
     if not raw_lines:
         return DatasetResumeEvidence(
             processed_ids=frozenset(),
+            source_preparation_failures=(),
             has_review_findings=False,
+            has_inconclusive_materiality=False,
             invariant_evaluations=(),
             technical_results=(),
             raw_evidence_sha256=hashlib.sha256(raw_evidence).hexdigest(),
@@ -613,9 +748,47 @@ def validate_dataset_resume_evidence(
     selected_records_by_id = {record.id: record for record in selected_records}
     processed_ids: set[str] = set()
     has_review_findings = False
+    has_inconclusive_materiality = False
     invariant_evaluations: list[DatasetInvariantEvaluation] = []
     technical_results: list[DatasetEvaluationResult] = []
+    source_preparation_failures: list[DatasetSourcePreparationFailureEvidence] = []
     for raw_line in raw_lines:
+        try:
+            decoded_line: object = json.loads(raw_line)
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            raise ValueError("resume evidence is not valid UL JSONL") from None
+        decoded_record = (
+            cast(dict[str, object], decoded_line) if isinstance(decoded_line, dict) else None
+        )
+        if (
+            decoded_record is not None
+            and decoded_record.get("record_type") == "source_preparation_failure"
+        ):
+            try:
+                source_failure = DatasetSourcePreparationFailureEvidence.model_validate_json(
+                    raw_line
+                )
+            except (ValidationError, ValueError):
+                raise ValueError("resume evidence is not valid UL JSONL") from None
+            if source_failure.run_context != expected_context:
+                raise ValueError("resume evidence is incompatible with the current evaluation plan")
+            if source_failure.interaction_id in processed_ids:
+                raise ValueError("resume evidence contains duplicate interaction IDs")
+            selected_record = selected_records_by_id.get(source_failure.interaction_id)
+            if selected_record is None:
+                raise ValueError(
+                    "resume evidence contains an interaction outside the selected dataset"
+                )
+            expected_source_record_id = (
+                selected_record.source_interaction_id
+                if getattr(selected_record, "augmentation_target", None) is not None
+                else None
+            )
+            if source_failure.source_record_id != expected_source_record_id:
+                raise ValueError("resume source failure does not match the selected dataset")
+            processed_ids.add(source_failure.interaction_id)
+            source_preparation_failures.append(source_failure)
+            continue
         try:
             evidence = _EvidenceRecord.model_validate_json(raw_line)
         except (ValidationError, ValueError):
@@ -632,6 +805,8 @@ def validate_dataset_resume_evidence(
                 "1.11.0",
                 "1.12.0",
                 "1.13.0",
+                "1.14.0",
+                "1.15.0",
             }
             or evidence.run_context is None
         ):
@@ -696,15 +871,24 @@ def validate_dataset_resume_evidence(
         )
         if evidence.model_dump(mode="json") != projected_evidence:
             raise ValueError("resume evidence public summary does not match its technical details")
-        has_review_findings |= any(
-            case.verdict == "divergence_needs_review" for case in technical_result.cases
-        )
+        for case in technical_result.cases:
+            if case.verdict != "divergence_needs_review":
+                continue
+            if (
+                case.material_variance is None
+                or case.material_variance.decision == "material_variance"
+            ):
+                has_review_findings = True
+            elif case.material_variance.decision == "insufficient_evidence":
+                has_inconclusive_materiality = True
         if expected_invariant_evaluation is not None:
             invariant_evaluations.append(expected_invariant_evaluation)
         processed_ids.add(evidence.interaction_id)
     return DatasetResumeEvidence(
         processed_ids=frozenset(processed_ids),
+        source_preparation_failures=tuple(source_preparation_failures),
         has_review_findings=has_review_findings,
+        has_inconclusive_materiality=has_inconclusive_materiality,
         invariant_evaluations=tuple(invariant_evaluations),
         technical_results=tuple(technical_results),
         raw_evidence_sha256=hashlib.sha256(raw_evidence).hexdigest(),
@@ -896,6 +1080,12 @@ class _LoadedEvidenceRecord(BaseModel):
     sha256: str
 
 
+@dataclass(frozen=True)
+class _LoadedEvidenceDocument:
+    records: list[_LoadedEvidenceRecord]
+    source_failures: tuple[DatasetSourcePreparationFailureEvidence, ...]
+
+
 @dataclass
 class _LockedReviewsFile:
     path: Path
@@ -911,6 +1101,22 @@ class _IndexedFinding:
     semantic_finding: _Finding | None = None
     baseline_rule: DatasetInvariantRuleResult | None = None
     variation_rule: DatasetInvariantRuleResult | None = None
+
+
+def _effective_finding_status(
+    indexed_finding: _IndexedFinding,
+    active_review: ReviewRecord | None,
+) -> FindingReviewStatus:
+    if active_review is not None:
+        return active_review.status
+    if indexed_finding.kind == "customer_invariant_violation":
+        return "needs_review"
+    automatic_materiality = indexed_finding.case.material_variance
+    if automatic_materiality is None or automatic_materiality.decision == "material_variance":
+        return "needs_review"
+    if automatic_materiality.decision == "operationally_equivalent":
+        return "expected"
+    return "inconclusive"
 
 
 class ConfirmedDatasetFinding(BaseModel):
@@ -959,6 +1165,7 @@ _BEHAVIOR_FINDING_SUMMARIES: dict[str, FindingSummaryText] = {
     "unexpected_effect": "The changed input made the agent take a new action.",
     "missing_effect": "The changed input made the agent skip a baseline action.",
     "changed_grounded_effect_argument": "The changed input altered an important action detail.",
+    "changed_response": "The changed input changed the agent's observed response.",
     "unstable_behavior": "The changed input produced inconsistent behavior across repetitions.",
 }
 
@@ -987,8 +1194,10 @@ def _summarize_dataset_evidence(
     *,
     pattern_identity_key: bytes,
 ) -> UnifiedReport:
-    evidence_records = _load_evidence(evidence)
-    evaluation_mode = _dataset_evaluation_mode(evidence_records)
+    evidence_document = _load_evidence_document(evidence)
+    evidence_records = evidence_document.records
+    source_failures = evidence_document.source_failures
+    evaluation_mode = _dataset_evaluation_mode(evidence_records, source_failures)
     review_records = _load_reviews(reviews or _default_reviews_path(evidence))
     indexed_findings = _index_findings(evidence_records)
     _validate_review_history(
@@ -1004,9 +1213,7 @@ def _summarize_dataset_evidence(
     indexed_invariant_keys: set[tuple[str, str, str, str]] = set()
     for indexed_finding in indexed_findings.values():
         active_review = active_reviews.get(indexed_finding.finding_id)
-        review_status: FindingReviewStatus = (
-            active_review.status if active_review is not None else "needs_review"
-        )
+        review_status = _effective_finding_status(indexed_finding, active_review)
         review_severity: FindingSeverity = (
             active_review.severity if active_review is not None else "unrated"
         )
@@ -1079,10 +1286,10 @@ def _summarize_dataset_evidence(
                 declared_severity=variation_rule.severity,
                 review_status=review_status,
                 review_severity=review_severity,
-                requested_repetitions=observations.requested_repetitions,
-                conclusive_repetitions=observations.observed_repetitions,
-                inconclusive_repetitions=observations.inconclusive_repetitions,
-                stability=observations.stability,
+                requested_repetitions=len(variation_rule.trials),
+                conclusive_repetitions=len(variation_rule.trials),
+                inconclusive_repetitions=0,
+                stability="stable",
                 evidence_authorities=(
                     "customer_declared",
                     "deterministic_evaluator",
@@ -1171,6 +1378,21 @@ def _summarize_dataset_evidence(
                 )
                 if observations is None:
                     raise AssertionError("violated invariant rules require observations")
+                conclusive_repetitions = sum(
+                    trial.status != "not_evaluable" for trial in rule.trials
+                )
+                inconclusive_repetitions = len(rule.trials) - conclusive_repetitions
+                conclusive_statuses = {
+                    trial.status for trial in rule.trials if trial.status != "not_evaluable"
+                }
+                rule_stability = (
+                    "stable"
+                    if not inconclusive_repetitions and len(conclusive_statuses) == 1
+                    else "unstable"
+                    if len(conclusive_statuses) > 1
+                    else "inconclusive"
+                )
+                non_promoted_inconclusive = operator_id is not None or rule_stability != "stable"
                 finding_summaries.append(
                     FindingSummary(
                         kind="customer_invariant_violation",
@@ -1180,10 +1402,12 @@ def _summarize_dataset_evidence(
                         rule_id=rule.rule_id,
                         rule_version=rule.rule_version,
                         declared_severity=rule.severity,
-                        requested_repetitions=observations.requested_repetitions,
-                        conclusive_repetitions=observations.observed_repetitions,
-                        inconclusive_repetitions=observations.inconclusive_repetitions,
-                        stability=observations.stability,
+                        review_status=("inconclusive" if non_promoted_inconclusive else None),
+                        review_severity=("unrated" if non_promoted_inconclusive else None),
+                        requested_repetitions=len(rule.trials),
+                        conclusive_repetitions=conclusive_repetitions,
+                        inconclusive_repetitions=inconclusive_repetitions,
+                        stability=rule_stability,
                         violated_repetitions=sum(
                             trial.status == "violated" for trial in rule.trials
                         ),
@@ -1202,7 +1426,8 @@ def _summarize_dataset_evidence(
     if summary.actionable_finding_count:
         report_review_status: ReportReviewStatus = "action_required"
     elif (
-        summary.review_status_counts.inconclusive
+        source_failures
+        or summary.review_status_counts.inconclusive
         or "not_evaluable" in invariant_statuses
         or _dataset_evidence_is_inconclusive(evidence_records)
     ):
@@ -1217,7 +1442,7 @@ def _summarize_dataset_evidence(
         loaded_record.evidence.run_context.target
         for loaded_record in evidence_records
         if loaded_record.evidence.run_context is not None
-    )
+    ) + tuple(source_failure.run_context.target for source_failure in source_failures)
     response_only_targets = tuple(
         (
             target.kind == "probe_target"
@@ -1233,7 +1458,10 @@ def _summarize_dataset_evidence(
     return UnifiedReport(
         evidence_type="dataset_evaluation",
         evidence_schema_versions=tuple(
-            sorted({record.evidence.schema_version for record in evidence_records})
+            sorted(
+                {record.evidence.schema_version for record in evidence_records}
+                | ({"source-preparation-failure/1.0.0"} if source_failures else set())
+            )
         ),
         response_state_evidence_scope=("response_only" if response_only else "response_and_state"),
         evaluation_mode=evaluation_mode,
@@ -1263,10 +1491,14 @@ def _summarize_dataset_evidence(
 
 def _dataset_evaluation_mode(
     records: list[_LoadedEvidenceRecord],
+    source_failures: tuple[DatasetSourcePreparationFailureEvidence, ...] = (),
 ) -> Literal["variance"] | None:
     evaluation_modes: set[Literal["variance"] | None] = {
         record.evidence.evaluation_mode for record in records
     }
+    evaluation_modes.update(failure.evaluation_mode for failure in source_failures)
+    if not evaluation_modes:
+        return None
     if len(evaluation_modes) != 1:
         raise _ReviewInputError("evidence combines incompatible evaluation modes")
     return next(iter(evaluation_modes))
@@ -1480,6 +1712,8 @@ def _build_failure_patterns(
                     (
                         "same_customer_rule"
                         if first.kind == "customer_invariant_violation"
+                        else "same_response_shape"
+                        if first.category == "changed_response"
                         else "same_action_shape"
                     ),
                     "same_outcome_stability",
@@ -1505,19 +1739,19 @@ def _build_failure_patterns(
                         "rule"
                         if first.kind == "customer_invariant_violation"
                         else "outcome"
-                        if first.category == "unstable_behavior"
+                        if first.category in {"unstable_behavior", "changed_response"}
                         else "action"
                     ),
                     evidence_level=(
                         "evaluated_rule"
                         if first.kind == "customer_invariant_violation"
                         else "model_derived_outcome"
-                        if first.category == "unstable_behavior"
+                        if first.category in {"unstable_behavior", "changed_response"}
                         and "model_derived_unverified" in first.evidence_authorities
                         else "model_derived_action"
                         if "model_derived_unverified" in first.evidence_authorities
                         else "observed_outcome"
-                        if first.category == "unstable_behavior"
+                        if first.category in {"unstable_behavior", "changed_response"}
                         else "observed_action"
                     ),
                     mechanism_pseudonym=pattern_mechanism_pseudonym(
@@ -1587,6 +1821,34 @@ def _dataset_evidence_is_inconclusive(records: list[_LoadedEvidenceRecord]) -> b
     return False
 
 
+def _dataset_case_report_bucket(
+    case: _Case,
+) -> Literal[
+    "consequential",
+    "equivalent",
+    "inconclusive",
+    "unstable",
+    "unclassified",
+    "no_difference",
+    "not_evaluated",
+]:
+    if not case.variation_accepted:
+        return "not_evaluated"
+    if case.material_variance is not None:
+        if case.material_variance.decision == "material_variance":
+            return "consequential"
+        if case.material_variance.decision == "operationally_equivalent":
+            return "equivalent"
+        return "inconclusive"
+    if case.observations is not None and case.observations.stability == "unstable":
+        return "unstable"
+    if case.inconclusive_reasons or case.observations is None:
+        return "inconclusive"
+    if case.findings:
+        return "unclassified"
+    return "no_difference"
+
+
 def report_dataset_evidence(
     evidence: Annotated[
         Path,
@@ -1602,7 +1864,7 @@ def report_dataset_evidence(
         bool,
         typer.Option(
             help=(
-                "Show capped values for one reviewable invariant finding. Values may contain "
+                "Show capped private values for one finding. Values may contain "
                 "secrets or PII and may enter terminal scrollback, CI output, or logs."
             )
         ),
@@ -1614,11 +1876,20 @@ def report_dataset_evidence(
             help="Finding ID whose invariant values may be disclosed.",
         ),
     ] = None,
+    all_findings: Annotated[
+        bool,
+        typer.Option(
+            "--all-findings",
+            help="Also list automatically equivalent or human-resolved findings.",
+        ),
+    ] = False,
 ) -> None:
     """Show findings and their human review state without model or network calls."""
     reviews_path = reviews or _default_reviews_path(evidence)
     try:
-        evidence_records = _load_evidence(evidence)
+        evidence_document = _load_evidence_document(evidence)
+        evidence_records = evidence_document.records
+        source_failures = evidence_document.source_failures
         review_records = _load_reviews(reviews_path)
         findings = _index_findings(evidence_records)
         _validate_review_history(
@@ -1634,13 +1905,13 @@ def report_dataset_evidence(
             sensitive_finding = findings.get(sensitive_finding_id)
             if sensitive_finding is None:
                 raise _ReviewInputError("sensitive-value finding ID was not found in the evidence")
-            if sensitive_finding.baseline_rule is None or sensitive_finding.variation_rule is None:
-                raise _ReviewInputError(
-                    "sensitive values are available only for a reviewable invariant finding"
+            sensitive_lines = (
+                _bounded_sensitive_semantic_lines(sensitive_finding)
+                if sensitive_finding.semantic_finding is not None
+                else _bounded_sensitive_invariant_lines(
+                    cast(DatasetInvariantRuleResult, sensitive_finding.baseline_rule),
+                    cast(DatasetInvariantRuleResult, sensitive_finding.variation_rule),
                 )
-            sensitive_lines = _bounded_sensitive_invariant_lines(
-                sensitive_finding.baseline_rule,
-                sensitive_finding.variation_rule,
             )
         elif sensitive_finding_id is not None:
             raise _ReviewInputError("--finding is valid only with --show-sensitive-values")
@@ -1649,29 +1920,200 @@ def report_dataset_evidence(
 
     active_reviews = _active_reviews(review_records)
     status_counts = {
-        status: 0
+        status: sum(review.status == status for review in active_reviews.values())
         for status in ("needs_review", "confirmed", "expected", "unsupported", "inconclusive")
     }
-    for indexed_finding in findings.values():
-        active_review = active_reviews.get(indexed_finding.finding_id)
-        status_counts[active_review.status if active_review else "needs_review"] += 1
 
-    _print_plain(f"Dataset finding report: {len(findings)} finding(s)")
-    evaluation_mode = _dataset_evaluation_mode(evidence_records)
-    if evaluation_mode is not None:
-        _print_plain(
-            f"Evaluation mode: {evaluation_mode} (historical output is not an expected answer; "
-            "correctness not assessed)"
+    cases = [case for loaded_record in evidence_records for case in loaded_record.evidence.cases]
+    comparison_counts = {
+        bucket: sum(_dataset_case_report_bucket(case) == bucket for case in cases)
+        for bucket in (
+            "consequential",
+            "equivalent",
+            "inconclusive",
+            "unstable",
+            "unclassified",
+            "no_difference",
+            "not_evaluated",
         )
+    }
+    findings_by_case: dict[int, list[_IndexedFinding]] = {}
+    for indexed_finding in findings.values():
+        findings_by_case.setdefault(id(indexed_finding.case), []).append(indexed_finding)
+    consequential_count = 0
+    unresolved_count = len(source_failures)
+    for case in cases:
+        case_bucket = _dataset_case_report_bucket(case)
+        case_findings = findings_by_case.get(id(case), [])
+        if not case_findings:
+            consequential_count += case_bucket in {"consequential", "unstable"}
+            unresolved_count += case_bucket in {"inconclusive", "unclassified"}
+            continue
+        effective_statuses = {
+            _effective_finding_status(
+                indexed_finding,
+                active_reviews.get(indexed_finding.finding_id),
+            )
+            for indexed_finding in case_findings
+        }
+        if effective_statuses & {"confirmed", "needs_review"}:
+            consequential_count += 1
+        elif "inconclusive" in effective_statuses:
+            unresolved_count += 1
+    if consequential_count:
+        result_summary = (
+            f"ACTION REQUIRED — {consequential_count} consequential behavior "
+            f"change{'s' if consequential_count != 1 else ''} found"
+        )
+    elif unresolved_count:
+        result_summary = f"INCONCLUSIVE — {unresolved_count} item(s) need attention"
+    else:
+        result_summary = "CLEAR — no consequential behavior changes found"
+
+    _print_plain("UL dataset report")
+    _print_plain(f"Result: {result_summary}")
     _print_plain(
-        "Reviews: " + ", ".join(f"{status}={count}" for status, count in status_counts.items())
+        f"Semantic comparisons: total={len(cases)}, completed="
+        f"{len(cases) - comparison_counts['not_evaluated']}, "
+        f"no_observed_difference={comparison_counts['no_difference']}"
     )
+    _print_plain(
+        "Automatic decisions: "
+        f"consequential={comparison_counts['consequential']}, "
+        f"equivalent={comparison_counts['equivalent']}, "
+        f"inconclusive={comparison_counts['inconclusive']}"
+    )
+    if (
+        comparison_counts["unstable"]
+        or comparison_counts["unclassified"]
+        or comparison_counts["not_evaluated"]
+    ):
+        _print_plain(
+            "Other: "
+            f"unstable={comparison_counts['unstable']}, "
+            f"unclassified={comparison_counts['unclassified']}, "
+            f"not_evaluated={comparison_counts['not_evaluated']}"
+        )
+    invariant_findings = [
+        indexed_finding
+        for indexed_finding in findings.values()
+        if indexed_finding.kind == "customer_invariant_violation"
+    ]
+    if invariant_findings:
+        invariant_attention_count = sum(
+            _effective_finding_status(
+                indexed_finding,
+                active_reviews.get(indexed_finding.finding_id),
+            )
+            in {"needs_review", "confirmed"}
+            for indexed_finding in invariant_findings
+        )
+        _print_plain(
+            "Customer invariant violations: "
+            f"total={len(invariant_findings)}, require_attention={invariant_attention_count}"
+        )
+    evaluation_mode = _dataset_evaluation_mode(evidence_records, source_failures)
+    if evaluation_mode is not None:
+        _print_plain(f"Scope: {evaluation_mode}; correctness and severity were not assessed")
+    if active_reviews:
+        _print_plain(
+            "Human review overrides: "
+            + ", ".join(f"{status}={count}" for status, count in status_counts.items() if count)
+        )
+    _print_plain(f"Source preparation failures: {len(source_failures)}")
+    for source_failure in source_failures:
+        _print_plain("")
+        _print_plain(f"Source preparation failure {source_failure.interaction_id}")
+        _print_plain(f"Stage: {source_failure.failure_stage}")
+        _print_plain(f"Reason: {source_failure.reason_code}")
+        _print_plain(f"Summary: {source_failure.summary}")
+        _print_plain(f"Next: {source_failure.remediation}")
     if show_sensitive_values:
         _print_plain(
-            "WARNING: showing selected invariant values; they may contain secrets or PII and "
+            "WARNING: showing selected private values; they may contain secrets or PII and "
             "may be retained in terminal scrollback, CI output, or logs."
         )
-    for indexed_finding in findings.values():
+    visible_findings = [
+        indexed_finding
+        for indexed_finding in findings.values()
+        if all_findings
+        or indexed_finding.finding_id == sensitive_finding_id
+        or _effective_finding_status(
+            indexed_finding,
+            active_reviews.get(indexed_finding.finding_id),
+        )
+        in {"needs_review", "confirmed", "inconclusive"}
+    ]
+
+    def finding_section(indexed_finding: _IndexedFinding) -> str:
+        status = _effective_finding_status(
+            indexed_finding,
+            active_reviews.get(indexed_finding.finding_id),
+        )
+        if status == "inconclusive":
+            return "Inconclusive comparisons"
+        if status in {"expected", "unsupported"}:
+            return "Resolved or equivalent differences"
+        if status == "confirmed":
+            return "Consequential behavior changes"
+        if (
+            indexed_finding.case.material_variance is not None
+            and indexed_finding.case.material_variance.decision == "material_variance"
+        ):
+            return "Consequential behavior changes"
+        return "Findings needing review"
+
+    section_order = {
+        "Consequential behavior changes": 0,
+        "Findings needing review": 1,
+        "Inconclusive comparisons": 2,
+        "Resolved or equivalent differences": 3,
+    }
+    visible_findings.sort(
+        key=lambda indexed_finding: (
+            section_order[finding_section(indexed_finding)],
+            indexed_finding.finding_id,
+        )
+    )
+    current_section: str | None = None
+    section_item_number = 0
+    semantic_finding_case_ids = {
+        id(indexed_finding.case)
+        for indexed_finding in findings.values()
+        if indexed_finding.kind == "semantic_difference"
+    }
+    unrepresented_unstable_cases = [
+        (loaded_record, case)
+        for loaded_record in evidence_records
+        for case in loaded_record.evidence.cases
+        if _dataset_case_report_bucket(case) == "unstable"
+        and id(case) not in semantic_finding_case_ids
+    ]
+    if unrepresented_unstable_cases:
+        _print_plain("")
+        _print_plain("Consequential behavior changes")
+        current_section = "Consequential behavior changes"
+        for loaded_record, case in unrepresented_unstable_cases:
+            section_item_number += 1
+            _print_plain("")
+            _print_plain(
+                f"{section_item_number}. Behavior changed inconsistently across repeated trials."
+            )
+            _print_plain(
+                "Case: " + (case.source_record_id or loaded_record.evidence.interaction_id)
+            )
+            _print_plain(
+                "Test variation: " + case.operator_id.replace(".", " / ").replace("_", " ")
+            )
+            _print_plain("Evidence stability: " + _observations_summary(case.observations))
+    for indexed_finding in visible_findings:
+        section = finding_section(indexed_finding)
+        if section != current_section:
+            _print_plain("")
+            _print_plain(section)
+            current_section = section
+            section_item_number = 0
+        section_item_number += 1
         loaded_record = indexed_finding.evidence_record
         case = indexed_finding.case
         matching_reviews = [
@@ -1681,54 +2123,51 @@ def report_dataset_evidence(
         ]
         latest_review = active_reviews.get(indexed_finding.finding_id)
         _print_plain("")
-        _print_plain(f"Finding {indexed_finding.finding_id}")
         if indexed_finding.semantic_finding is not None:
             finding = indexed_finding.semantic_finding
-            _print_plain(f"Machine status: {case.status}")
+            _print_plain(f"{section_item_number}. {finding.summary}")
             _print_plain(f"Category: {finding.category}")
-            _print_plain(f"Summary: {finding.summary}")
+            if case.material_variance is not None:
+                _print_plain("Reason: " + case.material_variance.reason_code.replace("_", " "))
         else:
             baseline_rule = indexed_finding.baseline_rule
             variation_rule = indexed_finding.variation_rule
             if baseline_rule is None or variation_rule is None:
                 raise AssertionError("invariant finding requires both rule results")
+            _print_plain(f"{section_item_number}. Customer-defined rule changed state.")
+            _print_plain("Category: customer_invariant_violation")
             _print_plain(f"Semantic comparison status: {case.status}")
             _print_plain(
                 f"Invariant finding status: original={baseline_rule.status}; "
                 f"variation={variation_rule.status}"
-            )
-            _print_plain("Category: customer_invariant_violation")
-            _print_plain(
-                f"Summary: Customer rule {variation_rule.rule_id} was satisfied by the original "
-                "and violated by the variation."
             )
             _print_plain(
                 f"Rule: {variation_rule.rule_id} ({variation_rule.rule_version}); "
                 f"type={variation_rule.rule_type}; declared_severity={variation_rule.severity}"
             )
             _print_plain(f"Description: {variation_rule.description}")
-        _print_plain(f"Original: {loaded_record.evidence.original_input}")
-        _print_plain(f"Variation: {case.augmented_input}")
-        _print_plain(f"Operator: {case.operator_id} ({case.operator_version})")
-        _print_plain(
-            "Original trials: "
-            + _observations_summary(loaded_record.evidence.current_baseline.observations)
+        _print_plain("Test variation: " + case.operator_id.replace(".", " / ").replace("_", " "))
+        stability_label = (
+            "Evidence stability"
+            if indexed_finding.semantic_finding is not None
+            else "Full-response stability"
         )
-        _print_plain("Variation trials: " + _observations_summary(case.observations))
-        if indexed_finding.semantic_finding is not None:
-            _print_plain(
-                "Reference effects: "
-                + _effects_summary(indexed_finding.semantic_finding.reference_effects)
-            )
-            _print_plain(
-                "Observed effects: "
-                + _effects_summary(indexed_finding.semantic_finding.observed_effects)
-            )
-        else:
+        _print_plain(
+            f"{stability_label}: original="
+            + _observations_summary(loaded_record.evidence.current_baseline.observations)
+            + "; variation="
+            + _observations_summary(case.observations)
+        )
+        if indexed_finding.semantic_finding is None:
             baseline_rule = indexed_finding.baseline_rule
             variation_rule = indexed_finding.variation_rule
             if baseline_rule is None or variation_rule is None:
                 raise AssertionError("invariant finding requires both rule results")
+            _print_plain(
+                f"Invariant repetitions: original satisfied={len(baseline_rule.trials)}/"
+                f"{len(baseline_rule.trials)}; variation violated="
+                f"{len(variation_rule.trials)}/{len(variation_rule.trials)}"
+            )
             _print_plain(
                 f"Rule transition: original={baseline_rule.status}; "
                 f"variation={variation_rule.status}"
@@ -1738,11 +2177,16 @@ def report_dataset_evidence(
                     f"Variation rule trial {trial.repetition}: {trial.status}; "
                     f"{_invariant_trial_location(trial)}; reason={trial.reason_code}"
                 )
-            if show_sensitive_values and indexed_finding.finding_id == sensitive_finding_id:
-                for sensitive_line in sensitive_lines:
-                    _print_sensitive_plain(sensitive_line)
+            _print_plain(
+                "Finding limitations: causality not established; production prevalence not "
+                "measured; whole-task correctness not established."
+            )
+        if show_sensitive_values and indexed_finding.finding_id == sensitive_finding_id:
+            for sensitive_line in sensitive_lines:
+                _print_sensitive_plain(sensitive_line)
         if latest_review is None:
-            _print_plain(f"Latest review: needs_review (history: {len(matching_reviews)})")
+            if case.material_variance is None:
+                _print_plain(f"Decision: needs review (history: {len(matching_reviews)})")
         else:
             _print_plain(
                 f"Latest review: {latest_review.status}, severity={latest_review.severity}, "
@@ -1750,7 +2194,45 @@ def report_dataset_evidence(
                 f"(history: {len(matching_reviews)})"
             )
             _print_plain(f"Review reason: {latest_review.reason}")
-        _print_plain(f"Evidence record SHA-256: {loaded_record.sha256}")
+        _print_plain(f"Finding {indexed_finding.finding_id}")
+        if not show_sensitive_values:
+            _print_plain(
+                "Inspect private values: ul dataset report "
+                f"{shlex.quote(str(evidence))} --finding "
+                f"{shlex.quote(indexed_finding.finding_id)} --show-sensitive-values"
+            )
+
+    unrepresented_inconclusive_cases = [
+        (loaded_record, case)
+        for loaded_record in evidence_records
+        for case in loaded_record.evidence.cases
+        if _dataset_case_report_bucket(case) == "inconclusive"
+        and id(case) not in semantic_finding_case_ids
+    ]
+    if unrepresented_inconclusive_cases:
+        if current_section != "Inconclusive comparisons":
+            _print_plain("")
+            _print_plain("Inconclusive comparisons")
+            section_item_number = 0
+        for loaded_record, case in unrepresented_inconclusive_cases:
+            section_item_number += 1
+            reasons = tuple(case.inconclusive_reasons)
+            if not reasons:
+                reason = (
+                    "variation observations unavailable"
+                    if case.observations is None
+                    else "variation behavior was not stable"
+                )
+                reasons = (reason,)
+            _print_plain("")
+            _print_plain(f"{section_item_number}. Comparison could not be classified.")
+            _print_plain(
+                "Case: " + (case.source_record_id or loaded_record.evidence.interaction_id)
+            )
+            _print_plain(
+                "Test variation: " + case.operator_id.replace(".", " / ").replace("_", " ")
+            )
+            _print_plain("Reasons: " + ", ".join(reasons))
 
     invariant_evaluations = [
         loaded_record.evidence.invariant_evaluation
@@ -1773,11 +2255,13 @@ def report_dataset_evidence(
 
     _print_plain("")
     _print_plain(f"Complete technical evidence: {evidence}")
-    _print_plain(f"Review history: {reviews_path}")
-    _print_plain(
-        "Review meanings: confirmed=problem in context; expected=supported acceptable difference; "
-        "unsupported=machine claim not supported; inconclusive=insufficient context."
-    )
+    if review_records:
+        _print_plain(f"Review history: {reviews_path}")
+        _print_plain(
+            "Review meanings: confirmed=problem in context; expected=supported acceptable "
+            "difference; unsupported=machine claim not supported; "
+            "inconclusive=insufficient context."
+        )
     _print_plain(
         "Limitation: UL reports observed differences. A human review is a contextual judgment, "
         "not proof of correctness, causation, or production frequency."
@@ -2124,7 +2608,7 @@ def _default_reviews_path(evidence: Path) -> Path:
     return evidence.with_suffix(".reviews.jsonl")
 
 
-def _load_evidence(path: Path) -> list[_LoadedEvidenceRecord]:
+def _load_evidence_document(path: Path) -> _LoadedEvidenceDocument:
     try:
         raw = _read_bounded_regular_file(path, _MAXIMUM_EVIDENCE_BYTES)
     except OSError as error:
@@ -2139,17 +2623,53 @@ def _load_evidence(path: Path) -> list[_LoadedEvidenceRecord]:
     if any(not raw_line.strip() for raw_line in raw_lines):
         raise _ReviewInputError("evidence contains an empty JSONL record")
     records: list[_LoadedEvidenceRecord] = []
+    source_failures: list[DatasetSourcePreparationFailureEvidence] = []
+    successful_interaction_ids: set[str] = set()
+    failed_interaction_ids: set[str] = set()
     try:
         for raw_line in raw_lines:
-            records.append(
-                _LoadedEvidenceRecord(
+            decoded_line: object = json.loads(raw_line)
+            decoded_record = (
+                cast(dict[str, object], decoded_line) if isinstance(decoded_line, dict) else None
+            )
+            if (
+                decoded_record is not None
+                and decoded_record.get("record_type") == "source_preparation_failure"
+            ):
+                source_failure = DatasetSourcePreparationFailureEvidence.model_validate_json(
+                    raw_line
+                )
+                interaction_id = source_failure.interaction_id
+                if (
+                    interaction_id in successful_interaction_ids
+                    or interaction_id in failed_interaction_ids
+                ):
+                    raise ValueError("duplicate interaction ID")
+                failed_interaction_ids.add(interaction_id)
+                source_failures.append(source_failure)
+            else:
+                loaded_record = _LoadedEvidenceRecord(
                     evidence=_EvidenceRecord.model_validate_json(raw_line),
                     sha256=hashlib.sha256(raw_line).hexdigest(),
                 )
-            )
-    except (ValidationError, ValueError):
-        raise _ReviewInputError("evidence is not valid UL schema through 1.13.0 JSONL") from None
-    return records
+                interaction_id = loaded_record.evidence.interaction_id
+                if interaction_id in failed_interaction_ids:
+                    raise ValueError("duplicate interaction ID")
+                successful_interaction_ids.add(interaction_id)
+                records.append(loaded_record)
+    except (UnicodeDecodeError, json.JSONDecodeError, ValidationError, ValueError):
+        raise _ReviewInputError(
+            "evidence is not valid UL dataset evidence JSONL; expected success schema through "
+            "1.15.0 or source-preparation-failure/1.0.0"
+        ) from None
+    return _LoadedEvidenceDocument(
+        records=records,
+        source_failures=tuple(source_failures),
+    )
+
+
+def _load_evidence(path: Path) -> list[_LoadedEvidenceRecord]:
+    return _load_evidence_document(path).records
 
 
 def dataset_durable_run_marker_manifest_sha256(raw_line: bytes) -> str | None:
@@ -2179,7 +2699,7 @@ def dataset_durable_run_marker_manifest_sha256(raw_line: bytes) -> str | None:
 
 def is_reportable_dataset_evidence(path: Path) -> bool:
     try:
-        _load_evidence(path)
+        _load_evidence_document(path)
     except _ReviewInputError:
         return False
     return True
@@ -2477,7 +2997,7 @@ def _index_findings(
                 baseline_rule = baseline_rules.get(variation_rule.rule_id)
                 if baseline_rule is None:
                     raise _ReviewInputError("invariant variation rule is missing from the baseline")
-                if baseline_rule.status != "satisfied" or variation_rule.status != "violated":
+                if not is_reproduced_invariant_difference(baseline_rule, variation_rule):
                     continue
                 finding_id = _invariant_finding_id(
                     finding_id_prefix,
@@ -2924,22 +3444,30 @@ def _observations_summary(observations: _Observations | None) -> str:
     )
 
 
-def _effects_summary(effects: list[_Effect]) -> str:
-    if not effects:
-        return "none"
-    return "; ".join(
-        json.dumps(
-            {
-                "kind": effect.kind,
-                "predicate": effect.predicate,
-                "fields": effect.fields,
-                "propositions": effect.propositions,
-                "status": effect.status,
-            },
-            ensure_ascii=False,
-            sort_keys=True,
+def _bounded_sensitive_semantic_lines(
+    indexed_finding: _IndexedFinding,
+) -> tuple[str, ...]:
+    finding = indexed_finding.semantic_finding
+    if finding is None:
+        raise AssertionError("semantic disclosure requires a semantic finding")
+    return _bounded_sensitive_lines(
+        (
+            _sensitive_json_line(
+                "Original input",
+                {"value": indexed_finding.evidence_record.evidence.original_input},
+            ),
+            _sensitive_json_line(
+                "Variation input", {"value": indexed_finding.case.augmented_input}
+            ),
+            _sensitive_json_line(
+                "Reference effects",
+                {"value": [effect.model_dump(mode="json") for effect in finding.reference_effects]},
+            ),
+            _sensitive_json_line(
+                "Observed effects",
+                {"value": [effect.model_dump(mode="json") for effect in finding.observed_effects]},
+            ),
         )
-        for effect in effects
     )
 
 
@@ -2990,9 +3518,13 @@ def _bounded_sensitive_invariant_lines(
     baseline_rule: DatasetInvariantRuleResult,
     variation_rule: DatasetInvariantRuleResult,
 ) -> tuple[str, ...]:
+    return _bounded_sensitive_lines(_sensitive_invariant_lines(baseline_rule, variation_rule))
+
+
+def _bounded_sensitive_lines(lines_to_check: Iterable[str]) -> tuple[str, ...]:
     lines: list[str] = []
     encoded_bytes = 0
-    for line in _sensitive_invariant_lines(baseline_rule, variation_rule):
+    for line in lines_to_check:
         encoded_bytes += len((_sanitize_plain_text(line) + "\n").encode("utf-8"))
         lines.append(line)
         if (

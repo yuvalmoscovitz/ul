@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import stat
 import sys
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, cast
@@ -14,16 +16,25 @@ from typing import Any, cast
 import pytest
 from typer.testing import CliRunner
 from ul import (
+    DatasetEvaluationResult,
+    DatasetSemanticPreparationError,
+    DatasetTrialUnit,
+    EvaluatorDecision,
+    EvaluatorEvidence,
     InteractionRecord,
     JsonHttpEnvironmentConfig,
     ProviderDiagnostic,
     ProviderDiagnosticError,
 )
 from ul.environment import evaluation_case_from_inputs
+from ul.evaluators import evaluator_judge_version_from_llm_config
+from ul.llm import LLMClient, llm_client_config_from_dataset_settings
+from ul_cli import dataset_augmentation_ledger as augmentation_ledger_module
 from ul_cli import progress_action as progress_action_module
 from ul_cli.dataset.evaluation import command as command_module
 from ul_cli.dataset.evaluation import runner as runner_module
 from ul_cli.dataset.evidence import persistence as persistence_module
+from ul_cli.dataset.source_preparation import build_source_preparation_failure_event
 from ul_cli.dataset_trial_journal import (
     journal_path,
     manifest_path,
@@ -48,6 +59,7 @@ from ul_core.dataset import (
 )
 
 from ._factories import (
+    _evaluation_result,
     _evaluator_preflight,
     _settings,
 )
@@ -61,12 +73,107 @@ runner = CliRunner()
 _ANSI_ESCAPE_PATTERN = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 
 
+def test_execution_reuses_complete_augmentation_input_without_regeneration(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    evaluation_result = _evaluation_result("interaction-1", has_review_finding=True)
+    dataset = tmp_path / "interactions.jsonl"
+    augmentation_input = tmp_path / "accepted.augmentations.jsonl"
+    output = tmp_path / "fresh-target-results.jsonl"
+    target_config = tmp_path / "fresh-target.json"
+    _write_dataset(dataset, [_record()])
+    _write_target_config(target_config, url="http://127.0.0.1:8765/execute")
+    settings = _settings()
+    generation_context = augmentation_ledger_module.create_dataset_augmentation_generation_context(
+        selected_records=(evaluation_result.source,),
+        operators=(("input.surface.rephrase", "1.0.0"),),
+        semantic_settings=(
+            augmentation_ledger_module.dataset_augmentation_ledger_semantic_settings(settings)
+        ),
+    )
+    with augmentation_ledger_module.create_private_augmentation_ledger(
+        augmentation_input,
+        generation_context=generation_context,
+        selected_records=(evaluation_result.source,),
+    ) as ledger:
+        ledger.append(
+            source=evaluation_result.source,
+            augmentation=evaluation_result.augmentation,
+        )
+    accepted_bytes = augmentation_input.read_bytes()
+    captured_saved_augmentations: dict[str, object] = {}
+
+    class FakeTarget:
+        @classmethod
+        def from_config(cls, *_args: object, **_kwargs: object) -> FakeTarget:
+            return cls()
+
+    async def fake_evaluate(
+        records: tuple[InteractionRecord, ...],
+        _operator_ids: tuple[str, ...],
+        _settings: object,
+        _target: object,
+        output_stream: Any,
+        **arguments: object,
+    ) -> tuple[object, ...]:
+        assert records == (evaluation_result.source,)
+        assert arguments["augmentation_ledger"] is None
+        captured_saved_augmentations.update(
+            cast(dict[str, object], arguments["saved_augmentations"])
+        )
+        output_stream.write('{"saved":true}\n')
+        output_stream.flush()
+        return ()
+
+    monkeypatch.setattr(command_module, "load_dataset_semantic_settings", lambda: settings)
+    monkeypatch.setattr(command_module, "JsonHttpEnvironmentConnection", FakeTarget)
+    monkeypatch.setattr(command_module, "evaluate_interaction_records", fake_evaluate)
+
+    result = runner.invoke(
+        root_app,
+        [
+            "dataset",
+            "evaluate",
+            str(dataset),
+            "--operator",
+            "input.surface.rephrase",
+            "--environment-config",
+            str(target_config),
+            "--allow-insecure-http",
+            "--allow-environment-network",
+            "--confirm-test-environment",
+            "--repetitions",
+            "1",
+            "--augmentations-input",
+            str(augmentation_input),
+            "--output",
+            str(output),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert captured_saved_augmentations == {"interaction-1": evaluation_result.augmentation}
+    assert augmentation_input.read_bytes() == accepted_bytes
+    assert not (tmp_path / "fresh-target-results.augmentations.jsonl").exists()
+    manifest = read_dataset_run_manifest(manifest_path(output))
+    assert manifest.effective_command.augmentations_input_path == str(augmentation_input.resolve())
+    assert (
+        manifest.effective_command.augmentations_input_sha256
+        == hashlib.sha256(accepted_bytes).hexdigest()
+    )
+
+
 class _LocalEvaluationSemanticModel:
+    def __init__(self, semantic_settings: Any | None = None) -> None:
+        self.llm_client = LLMClient(
+            llm_client_config_from_dataset_settings(semantic_settings or _settings())
+        )
+
     async def __aenter__(self) -> _LocalEvaluationSemanticModel:
         return self
 
     async def __aexit__(self, *args: object) -> None:
-        return None
+        await self.llm_client.aclose()
 
     def reuse_preflight(self, result: object) -> None:
         del result
@@ -77,8 +184,28 @@ class _LocalEvaluationSemanticModel:
         reference_frame: SemanticFrame | None = None,
     ) -> SemanticFrame:
         if not isinstance(record, InteractionRecord):
-            assert reference_frame is not None
-            return reference_frame.model_copy(update={"interaction_id": record.id})
+            if reference_frame is not None:
+                return reference_frame.model_copy(update={"interaction_id": record.id})
+            return SemanticFrame(
+                interaction_id=record.id,
+                request_units=(
+                    RequestUnit(
+                        id="lookup-request",
+                        evidence=(
+                            EvidenceReference(
+                                source="input",
+                                json_pointer="/raw_input",
+                                text_quote=None,
+                            ),
+                        ),
+                        confidence=1,
+                        status="explicit",
+                        mode="ask",
+                        predicate="lookup",
+                    ),
+                ),
+                extractor_version="local-evaluation-test",
+            )
         return SemanticFrame(
             interaction_id=record.id,
             request_units=(
@@ -144,6 +271,154 @@ class _LocalEvaluationSemanticModel:
             verdict="equivalent",
             explanation="The requests are equivalent.",
             verifier_version="local-evaluation-test",
+        )
+
+
+class _WrappedActionFieldSemanticModel(_LocalEvaluationSemanticModel):
+    async def deconstruct(
+        self,
+        record: InteractionRecord | UserInputRecord,
+        reference_frame: SemanticFrame | None = None,
+    ) -> SemanticFrame:
+        frame = await super().deconstruct(record, reference_frame)
+        if not isinstance(record, InteractionRecord):
+            return frame
+        wrapped_outcomes = tuple(
+            outcome.model_copy(
+                update={
+                    "evidence": (
+                        EvidenceReference(
+                            source="output",
+                            json_pointer="/raw_observed_output/actions/0",
+                            text_quote=None,
+                        ),
+                    ),
+                    "fields": {
+                        name: {
+                            "value": value,
+                            "evidence": [
+                                {
+                                    "source": "output",
+                                    "json_pointer": f"/raw_observed_output/actions/0/{name}",
+                                }
+                            ],
+                        }
+                        for name, value in {
+                            "ticket": 42,
+                            "body.intent": "order",
+                            "body.note.text": "Return status for ticket 42.",
+                            "authoredOn": "stale-reference-only-value",
+                        }.items()
+                    },
+                }
+            )
+            for outcome in frame.outcomes
+        )
+        return frame.model_copy(update={"outcomes": wrapped_outcomes})
+
+
+class _MaterialVarianceSemanticModel(_LocalEvaluationSemanticModel):
+    async def render(
+        self,
+        raw_input: str,
+        instruction: str,
+        *,
+        allow_temporary_value: bool = False,
+    ) -> RenderedUserInput:
+        del raw_input, instruction, allow_temporary_value
+        return RenderedUserInput(text="Please return status for ticket 42.")
+
+    async def deconstruct(
+        self,
+        record: InteractionRecord | UserInputRecord,
+        reference_frame: SemanticFrame | None = None,
+    ) -> SemanticFrame:
+        frame = await super().deconstruct(record, reference_frame)
+        if not isinstance(record, InteractionRecord):
+            return frame
+        raw_output = cast(dict[str, Any], record.raw_observed_output)
+        ticket = cast(int, raw_output["ticket"])
+        return frame.model_copy(
+            update={
+                "outcomes": tuple(
+                    outcome.model_copy(update={"fields": {"ticket": ticket}})
+                    for outcome in frame.outcomes
+                )
+            }
+        )
+
+
+class _ResponseMaterialVarianceSemanticModel(_MaterialVarianceSemanticModel):
+    async def deconstruct(
+        self,
+        record: InteractionRecord | UserInputRecord,
+        reference_frame: SemanticFrame | None = None,
+    ) -> SemanticFrame:
+        frame = await _LocalEvaluationSemanticModel.deconstruct(self, record, reference_frame)
+        if not isinstance(record, InteractionRecord):
+            return frame
+        return frame.model_copy(
+            update={
+                "outcomes": (
+                    ObservedOutcome(
+                        id="returned-response",
+                        evidence=(
+                            EvidenceReference(
+                                source="output",
+                                json_pointer="/raw_observed_output",
+                                text_quote=None,
+                            ),
+                        ),
+                        confidence=1,
+                        status="observed",
+                        position=0,
+                        kind="answer",
+                        predicate="returned_response",
+                        fields={"value": record.raw_observed_output},
+                    ),
+                )
+            }
+        )
+
+
+class _MaterialVarianceJudge:
+    label = "material_variance:grounded_argument_changed"
+    score = 1
+    expected_token_parameter = "max_tokens"
+
+    def __init__(self, *, llm_client: LLMClient) -> None:
+        config = llm_client.config
+        assert config.role_config("materiality").token_parameter == self.expected_token_parameter
+        if config.provider_type == "openrouter":
+            assert config.upstream_provider == "test-provider"
+        else:
+            assert config.upstream_provider is None
+        self.version = evaluator_judge_version_from_llm_config(config)
+
+    async def __aenter__(self) -> _MaterialVarianceJudge:
+        return self
+
+    async def __aexit__(self, *args: object) -> None:
+        pass
+
+    async def evaluate(self, request: object) -> EvaluatorDecision:
+        del request
+        return EvaluatorDecision(
+            score=self.score,
+            label=self.label,
+            explanation="Changed ticket.",
+            evidence=(
+                EvaluatorEvidence(
+                    source="judge_payload",
+                    json_pointer="/payload/answer/findings/0/baseline_effects/0",
+                    description="baseline",
+                ),
+                EvaluatorEvidence(
+                    source="judge_payload",
+                    json_pointer="/payload/answer/findings/0/variation_effects/0",
+                    description="variation",
+                ),
+            ),
         )
 
 
@@ -262,31 +537,59 @@ def test_execution_requires_config_network_confirmation_environment_and_output(
 
 
 @pytest.mark.parametrize("asynchronous", [False, True])
+@pytest.mark.parametrize("wrapped_action_fields", [False, True])
 def test_full_dataset_evaluation_runs_local_callable_through_worker_boundary(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     asynchronous: bool,
+    wrapped_action_fields: bool,
 ) -> None:
     dataset = tmp_path / "interactions.jsonl"
     output = tmp_path / "results.jsonl"
+    canonical_action = {
+        "action": "lookup",
+        "ticket": 42,
+        "body.intent": "order",
+        "body.note.text": "Return status for ticket 42.",
+    }
+    recorded_output = (
+        {"actions": [canonical_action]}
+        if wrapped_action_fields
+        else {"action": "lookup", "ticket": 42}
+    )
     dataset.write_text(
-        '{"id":"case-1","input":"Return status for ticket 42.",'
-        '"output":{"action":"lookup","ticket":42}}\n',
+        json.dumps(
+            {
+                "id": "case-1",
+                "input": "Return status for ticket 42.",
+                "output": recorded_output,
+            }
+        )
+        + "\n",
         encoding="utf-8",
     )
     function_prefix = "async " if asynchronous else ""
     await_statement = "    await asyncio.sleep(0)\n" if asynchronous else ""
+    returned_output = (
+        repr({"actions": [canonical_action]})
+        if wrapped_action_fields
+        else "{'action': 'lookup', 'ticket': 42, 'received': value}"
+    )
     (tmp_path / "customer_agent.py").write_text(
         "import asyncio\n\n"
         f"{function_prefix}def run(value):\n"
         f"{await_statement}"
-        "    return {'action': 'lookup', 'ticket': 42, 'received': value}\n",
+        f"    return {returned_output}\n",
         encoding="utf-8",
     )
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("UL_LIVE", "true")
     monkeypatch.setenv("OPEN_ROUTER_API_KEY", "test-key")
-    semantic_model = _LocalEvaluationSemanticModel()
+    semantic_model = (
+        _WrappedActionFieldSemanticModel()
+        if wrapped_action_fields
+        else _LocalEvaluationSemanticModel()
+    )
 
     async def successful_preflight(_settings: object) -> object:
         return _evaluator_preflight()
@@ -313,6 +616,8 @@ def test_full_dataset_evaluation_runs_local_callable_through_worker_boundary(
             "--confirm-test-environment",
             "--repetitions",
             "2",
+            "--target-timeout-seconds",
+            "90",
             "--output",
             str(output),
         ],
@@ -323,13 +628,39 @@ def test_full_dataset_evaluation_runs_local_callable_through_worker_boundary(
     assert saved["run_context"]["target"]["kind"] == "probe_target"
     assert saved["run_context"]["fixture"]["status"] == "not_required"
     assert saved["run_context"]["target"]["receipt"]["supports_state_observation"] is False
+    assert saved["run_context"]["target_timeout_seconds"] == 90.0
+    manifest = read_dataset_run_manifest(manifest_path(output))
+    assert manifest.effective_command.run_config.target.trial_timeout_seconds == 90.0
     assert len(saved["technical_details"]["baseline"]["trial_set"]["trials"]) == 2
+    assert saved["technical_details"]["baseline"]["verdict"] == "no_divergence"
+    assert saved["technical_details"]["cases"][0]["verdict"] == "no_divergence"
+    observed_fields = saved["technical_details"]["baseline"]["trial_set"]["trials"][0][
+        "observed_frame"
+    ]["outcomes"][0]["fields"]
+    assert observed_fields["ticket"] == 42
+    if wrapped_action_fields:
+        assert observed_fields == {
+            "ticket": 42,
+            "body.intent": "order",
+            "body.note.text": "Return status for ticket 42.",
+            "authoredOn": {
+                "value": "stale-reference-only-value",
+                "evidence": [
+                    {
+                        "source": "output",
+                        "json_pointer": "/raw_observed_output/actions/0/authoredOn",
+                    }
+                ],
+            },
+        }
+    final_response = saved["technical_details"]["baseline"]["trial_set"]["trials"][0][
+        "execution_evidence"
+    ]["final_response"]
     assert (
-        saved["technical_details"]["baseline"]["trial_set"]["trials"][0]["execution_evidence"][
-            "final_response"
-        ]["ticket"]
-        == 42
-    )
+        final_response["actions"][0]["ticket"]
+        if wrapped_action_fields
+        else final_response["ticket"]
+    ) == 42
     if not asynchronous:
         missing_target_resume = runner.invoke(
             root_app,
@@ -358,6 +689,455 @@ def test_full_dataset_evaluation_runs_local_callable_through_worker_boundary(
         assert "Resume compatible: 1 complete interaction(s) skipped; 0 remaining" in (
             resumed.output
         )
+        assert "Target trial timeout: 90 seconds" in resumed.output
+        incompatible_resume = runner.invoke(
+            root_app,
+            [
+                "dataset",
+                "evaluate",
+                "--resume",
+                str(output),
+                "--target",
+                "customer_agent:run",
+                "--confirm-target",
+                target.confirmation_sha256,
+                "--target-timeout-seconds",
+                "91",
+                "--dry-run",
+            ],
+        )
+        assert incompatible_resume.exit_code == 2
+        normalized_incompatible_error = " ".join(
+            _ANSI_ESCAPE_PATTERN.sub("", incompatible_resume.output).split()
+        )
+        assert "incompatible with the current evaluation plan" in normalized_incompatible_error
+
+
+@pytest.mark.parametrize(
+    (
+        "label",
+        "score",
+        "decision",
+        "reason_code",
+        "expected_exit_code",
+        "settings_overrides",
+    ),
+    (
+        (
+            "material_variance:grounded_argument_changed",
+            1,
+            "material_variance",
+            "grounded_argument_changed",
+            1,
+            {},
+        ),
+        (
+            "operationally_equivalent:same_real_world_effect",
+            0,
+            "operationally_equivalent",
+            "same_real_world_effect",
+            0,
+            {},
+        ),
+        (
+            "insufficient_evidence:missing_comparison_evidence",
+            0.5,
+            "insufficient_evidence",
+            "missing_comparison_evidence",
+            2,
+            {},
+        ),
+        (
+            "material_variance:grounded_argument_changed",
+            1,
+            "material_variance",
+            "grounded_argument_changed",
+            1,
+            {
+                "semantic_provider_id": "generic-test",
+                "semantic_provider_type": "openai-compatible",
+                "semantic_base_url": "https://evaluator.example/v1",
+                "semantic_endpoint_sha256": "f" * 64,
+                "api_key_required": False,
+                "api_key_environment_variable": "UL_DATASET_OPENAI_API_KEY",
+            },
+        ),
+    ),
+)
+def test_public_cli_persists_and_applies_automatic_materiality(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    label: str,
+    score: float,
+    decision: str,
+    reason_code: str,
+    expected_exit_code: int,
+    settings_overrides: dict[str, object],
+) -> None:
+    dataset = tmp_path / "interactions.jsonl"
+    output = tmp_path / "results.jsonl"
+    dataset.write_text(
+        '{"id":"case-1","input":"Return status for ticket 42.",'
+        '"output":{"action":"lookup","ticket":42}}\n',
+        encoding="utf-8",
+    )
+    (tmp_path / "customer_agent.py").write_text(
+        "def run(value):\n"
+        "    ticket = 43 if value.startswith('Please') else 42\n"
+        "    return {'action': 'lookup', 'ticket': ticket}\n",
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("UL_LIVE", "true")
+    monkeypatch.setenv("OPEN_ROUTER_API_KEY", "test-key")
+
+    async def successful_preflight(_settings: object) -> object:
+        return _evaluator_preflight()
+
+    monkeypatch.setattr(
+        command_module,
+        "load_dataset_semantic_settings",
+        lambda: _settings(**settings_overrides),
+    )
+    monkeypatch.setattr(command_module, "preflight_evaluator", successful_preflight)
+    monkeypatch.setattr(
+        runner_module,
+        "create_semantic_model_deconstructor",
+        lambda semantic_settings: _MaterialVarianceSemanticModel(semantic_settings),
+    )
+    monkeypatch.setattr(
+        runner_module,
+        "OpenAICompatibleEvaluatorJudge",
+        _MaterialVarianceJudge,
+    )
+    monkeypatch.setattr(_MaterialVarianceJudge, "label", label)
+    monkeypatch.setattr(_MaterialVarianceJudge, "score", score)
+    target = resolve_local_target("customer_agent:run")
+
+    evaluated = runner.invoke(
+        root_app,
+        [
+            "dataset",
+            "evaluate",
+            str(dataset),
+            "--operator",
+            "input.surface.rephrase",
+            "--target",
+            "customer_agent:run",
+            "--confirm-target",
+            target.confirmation_sha256,
+            "--confirm-test-environment",
+            "--repetitions",
+            "1",
+            "--output",
+            str(output),
+        ],
+    )
+
+    assert evaluated.exit_code == expected_exit_code, evaluated.output
+    saved = json.loads(output.read_text(encoding="utf-8").splitlines()[1])
+    comparison = saved["cases"][0]
+    assert comparison["material_variance"]["decision"] == decision
+    assert comparison["material_variance"]["reason_code"] == reason_code
+    assert saved["technical_details"]["semantic_calls"]["actual_calls"] == 1
+    normalized_output = " ".join(evaluated.output.split())
+    assert "Next: ul dataset report" in normalized_output
+
+    report = runner.invoke(root_app, ["dataset", "report", str(output), "--all-findings"])
+
+    assert report.exit_code == 0, report.output
+    report_decision = {
+        "material_variance": "consequential",
+        "operationally_equivalent": "equivalent",
+        "insufficient_evidence": "inconclusive",
+    }[decision]
+    assert f"{report_decision}=1" in report.output
+    assert f"Reason: {reason_code.replace('_', ' ')}" in report.output
+    finding_output = output.with_name(f"{output.name}.findings.jsonl")
+    if decision == "material_variance":
+        assert finding_output.stat().st_size > 0
+        assert "Actionable finding export: ul report" in normalized_output
+    else:
+        assert finding_output.stat().st_size == 0
+        assert "Actionable finding export: ul report" not in normalized_output
+
+
+def test_public_cli_does_not_let_judge_suppress_removed_committed_action(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    dataset = tmp_path / "interactions.jsonl"
+    output = tmp_path / "results.jsonl"
+    dataset.write_text(
+        '{"id":"case-1","input":"Create record 42.",'
+        '"output":{"answer":[],"actions":[{"action":"CREATE_RECORD","id":42}]}}\n',
+        encoding="utf-8",
+    )
+    (tmp_path / "customer_agent.py").write_text(
+        "def run(value):\n"
+        "    actions = [] if value.startswith('Please') else "
+        "[{'action': 'CREATE_RECORD', 'id': 42}]\n"
+        "    return {'answer': [], 'actions': actions}\n",
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("UL_LIVE", "true")
+    monkeypatch.setenv("OPEN_ROUTER_API_KEY", "test-key")
+
+    async def successful_preflight(_settings: object) -> object:
+        return _evaluator_preflight()
+
+    monkeypatch.setattr(command_module, "load_dataset_semantic_settings", _settings)
+    monkeypatch.setattr(command_module, "preflight_evaluator", successful_preflight)
+    monkeypatch.setattr(
+        runner_module,
+        "create_semantic_model_deconstructor",
+        lambda _settings: _ResponseMaterialVarianceSemanticModel(),
+    )
+    monkeypatch.setattr(runner_module, "OpenAICompatibleEvaluatorJudge", _MaterialVarianceJudge)
+    monkeypatch.setattr(
+        _MaterialVarianceJudge,
+        "label",
+        "operationally_equivalent:same_real_world_effect",
+    )
+    monkeypatch.setattr(_MaterialVarianceJudge, "score", 0)
+    target = resolve_local_target("customer_agent:run")
+
+    evaluated = runner.invoke(
+        root_app,
+        [
+            "dataset",
+            "evaluate",
+            str(dataset),
+            "--operator",
+            "input.surface.rephrase",
+            "--target",
+            "customer_agent:run",
+            "--confirm-target",
+            target.confirmation_sha256,
+            "--confirm-test-environment",
+            "--repetitions",
+            "1",
+            "--output",
+            str(output),
+        ],
+    )
+
+    assert evaluated.exit_code == 1, evaluated.output
+    saved = json.loads(output.read_text(encoding="utf-8").splitlines()[1])
+    comparison = saved["cases"][0]
+    assert comparison["material_variance"]["decision"] == "material_variance"
+    assert comparison["material_variance"]["reason_code"] == "action_removed"
+    assert saved["technical_details"]["semantic_calls"]["actual_calls"] == 0
+
+    report = runner.invoke(root_app, ["dataset", "report", str(output)])
+
+    assert report.exit_code == 0, report.output
+    assert "ACTION REQUIRED" in report.output
+    assert "consequential=1" in report.output
+
+
+def test_dataset_evaluation_allows_http_target_response_after_thirty_seconds(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request_count = 0
+
+    class SlowTargetHandler(BaseHTTPRequestHandler):
+        def do_POST(self) -> None:
+            nonlocal request_count
+            content_length = int(self.headers["Content-Length"])
+            json.loads(self.rfile.read(content_length))
+            request_count += 1
+            if request_count == 1:
+                time.sleep(31)
+            response = json.dumps({"result": {"action": "lookup", "ticket": 42}}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(response)))
+            self.end_headers()
+            self.wfile.write(response)
+
+        def log_message(self, format: str, *args: object) -> None:
+            pass
+
+    try:
+        server = ThreadingHTTPServer(("127.0.0.1", 0), SlowTargetHandler)
+    except PermissionError:
+        pytest.skip("the test environment does not allow binding a loopback server")
+    server_thread = threading.Thread(target=server.serve_forever)
+    server_thread.start()
+    dataset = tmp_path / "interactions.jsonl"
+    output = tmp_path / "results.jsonl"
+    dataset.write_text(
+        '{"id":"case-1","input":"Return status for ticket 42.",'
+        '"output":{"action":"lookup","ticket":42}}\n',
+        encoding="utf-8",
+    )
+    url = f"http://127.0.0.1:{server.server_port}/invoke"
+    direct_options = {
+        "allow_insecure_http": True,
+        "request_json_template": '{"input":"{{input}}"}',
+        "response_json_pointer": "/result",
+        "request_isolation_attested": True,
+        "safe_test_target_attested": True,
+    }
+    resolved_target = resolve_http_target(url, **direct_options)
+    semantic_model = _LocalEvaluationSemanticModel()
+
+    async def successful_preflight(_settings: object) -> object:
+        return _evaluator_preflight()
+
+    monkeypatch.setenv("UL_LIVE", "true")
+    monkeypatch.setenv("OPEN_ROUTER_API_KEY", "test-key")
+    monkeypatch.setattr(command_module, "load_dataset_semantic_settings", _settings)
+    monkeypatch.setattr(command_module, "preflight_evaluator", successful_preflight)
+    monkeypatch.setattr(
+        runner_module,
+        "create_semantic_model_deconstructor",
+        lambda _settings: semantic_model,
+    )
+    try:
+        result = runner.invoke(
+            root_app,
+            [
+                "dataset",
+                "evaluate",
+                str(dataset),
+                "--target",
+                url,
+                "--request-json-template",
+                cast(str, direct_options["request_json_template"]),
+                "--response-json-pointer",
+                "/result",
+                "--confirm-request-isolation",
+                "--confirm-safe-test-target",
+                "--confirm-target",
+                resolved_target.confirmation_sha256,
+                "--allow-insecure-http",
+                "--allow-environment-network",
+                "--confirm-test-environment",
+                "--repetitions",
+                "1",
+                "--target-timeout-seconds",
+                "35",
+                "--output",
+                str(output),
+            ],
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+        server_thread.join()
+
+    assert result.exit_code == 0, result.output
+    assert request_count == 2
+    saved = json.loads(output.read_text(encoding="utf-8").splitlines()[1])
+    baseline_trial = saved["technical_details"]["baseline"]["trial_set"]["trials"][0]
+    variation_trial = saved["technical_details"]["cases"][0]["trial_set"]["trials"][0]
+    assert baseline_trial["execution_evidence"]["final_response"]["ticket"] == 42
+    assert variation_trial["execution_evidence"]["final_response"]["ticket"] == 42
+
+
+def test_declared_projection_compares_raw_recorded_tool_calls_through_public_cli(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    dataset = tmp_path / "interactions.jsonl"
+    output = tmp_path / "results.jsonl"
+    dataset.write_text(
+        '{"id":"case-1","input":"Return status for ticket 42.",'
+        '"output":{"tool_calls":[{"name":"lookup",'
+        '"arguments":"{\\"ticket\\":42}"}]}}\n',
+        encoding="utf-8",
+    )
+    (tmp_path / "customer_agent.py").write_text(
+        "import json\n\n"
+        "def run(value):\n"
+        "    return {'tool_calls': [{'name': 'lookup', "
+        "'arguments': json.dumps({'ticket': 42})}]}\n",
+        encoding="utf-8",
+    )
+    target_config = tmp_path / "target.json"
+    target_config.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "kind": "python_callable",
+                "target_id": "projected-tool-agent",
+                "working_directory": str(tmp_path),
+                "interpreter": str(Path(sys.executable).resolve()),
+                "target": "customer_agent:run",
+                "outcome": {
+                    "compose": {
+                        "fields": {"action": "/tool_calls/0/name"},
+                        "spread": {
+                            "selector": "/tool_calls/0/arguments",
+                            "decode": "json_string",
+                        },
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("UL_LIVE", "true")
+    monkeypatch.setenv("OPEN_ROUTER_API_KEY", "test-key")
+
+    class ProjectedResponseSemanticModel(_LocalEvaluationSemanticModel):
+        async def render(
+            self,
+            raw_input: str,
+            instruction: str,
+            *,
+            allow_temporary_value: bool = False,
+        ) -> RenderedUserInput:
+            del raw_input, instruction, allow_temporary_value
+            return RenderedUserInput(text="Please return status for ticket 42.")
+
+    semantic_model = ProjectedResponseSemanticModel()
+
+    async def successful_preflight(_settings: object) -> object:
+        return _evaluator_preflight()
+
+    monkeypatch.setattr(command_module, "load_dataset_semantic_settings", _settings)
+    monkeypatch.setattr(command_module, "preflight_evaluator", successful_preflight)
+    monkeypatch.setattr(
+        runner_module,
+        "create_semantic_model_deconstructor",
+        lambda _settings: semantic_model,
+    )
+    target = resolve_local_target(str(target_config))
+
+    result = runner.invoke(
+        root_app,
+        [
+            "dataset",
+            "evaluate",
+            str(dataset),
+            "--target",
+            str(target_config),
+            "--confirm-target",
+            target.confirmation_sha256,
+            "--confirm-test-environment",
+            "--repetitions",
+            "1",
+            "--output",
+            str(output),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    evidence = json.loads(output.read_text(encoding="utf-8").splitlines()[1])
+    details = evidence["technical_details"]
+    assert details["comparison_surface"] == "response"
+    assert details["baseline"]["verdict"] == "no_divergence"
+    assert details["cases"][0]["verdict"] == "no_divergence"
+    assert details["baseline"]["trial_set"]["trials"][0]["target_output"]["raw_output"] == {
+        "action": "lookup",
+        "ticket": 42,
+    }
 
 
 def test_local_target_pause_action_preserves_binding_and_resumes(
@@ -721,8 +1501,133 @@ def test_execution_rejects_missing_header_secret_before_model_or_output(
     assert not output.exists()
 
 
+def test_public_cli_records_one_source_failure_and_completes_another(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    dataset = tmp_path / "interactions.jsonl"
+    output = tmp_path / "results.jsonl"
+    target_config = tmp_path / "target.json"
+    _write_dataset(dataset, [_record("source-fail"), _record("source-ok")])
+    _write_target_config(target_config, url="http://127.0.0.1:8765/execute")
+    target_started_ids: list[str] = []
+    runner_invoked_ids: list[str] = []
+
+    class AsyncComponent:
+        def __init__(self, settings: object | None = None) -> None:
+            self.llm_client = (
+                LLMClient(llm_client_config_from_dataset_settings(cast(Any, settings)))
+                if settings is not None
+                else None
+            )
+
+        async def __aenter__(self) -> AsyncComponent:
+            return self
+
+        async def __aexit__(self, *args: object) -> None:
+            if self.llm_client is not None:
+                await self.llm_client.aclose()
+
+        def reuse_preflight(self, _result: object) -> None:
+            pass
+
+    class FakeTarget(AsyncComponent):
+        outcome_projection = None
+
+        @classmethod
+        def from_config(cls, *_args: object, **_kwargs: object) -> FakeTarget:
+            return cls()
+
+        async def aclose(self) -> None:
+            pass
+
+    class FakeRunner:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            pass
+
+        async def run(
+            self,
+            source: InteractionRecord,
+            **kwargs: object,
+        ) -> DatasetEvaluationResult:
+            runner_invoked_ids.append(source.id)
+            if source.id == "source-fail":
+                raise DatasetSemanticPreparationError
+            result = _evaluation_result(source.id)
+            cast(Any, kwargs["augmentation_checkpoint_callback"])(result.augmentation)
+            unit = DatasetTrialUnit(
+                interaction_id=source.id,
+                operator_id="current_baseline",
+                arm="original",
+                repetition=1,
+            )
+            target_started_ids.append(source.id)
+            cast(Any, kwargs["trial_started_callback"])(unit)
+            cast(Any, kwargs["trial_terminal_callback"])(
+                unit,
+                result.baseline.trial_set.trials[0],
+            )
+            return result
+
+    async def successful_preflight(_settings: object) -> object:
+        return _evaluator_preflight()
+
+    monkeypatch.setattr(command_module, "load_dataset_semantic_settings", _settings)
+    monkeypatch.setattr(command_module, "preflight_evaluator", successful_preflight)
+    monkeypatch.setattr(command_module, "JsonHttpEnvironmentConnection", FakeTarget)
+    monkeypatch.setattr(
+        runner_module,
+        "create_semantic_model_deconstructor",
+        AsyncComponent,
+    )
+    monkeypatch.setattr(runner_module, "DatasetAugmentationEngine", lambda *args: object())
+    monkeypatch.setattr(runner_module, "DatasetEvaluationRunner", FakeRunner)
+    command = [
+        "dataset",
+        "evaluate",
+        str(dataset),
+        "--operator",
+        "input.surface.rephrase",
+        "--environment-config",
+        str(target_config),
+        "--allow-insecure-http",
+        "--allow-environment-network",
+        "--confirm-test-environment",
+        "--repetitions",
+        "1",
+        "--output",
+        str(output),
+    ]
+
+    evaluated = runner.invoke(root_app, command)
+
+    assert evaluated.exit_code == 2, evaluated.output
+    assert runner_invoked_ids == ["source-fail", "source-ok"], evaluated.output
+    assert target_started_ids == ["source-ok"], evaluated.output
+    records = [json.loads(line) for line in output.read_text(encoding="utf-8").splitlines()]
+    assert [record.get("record_type") for record in records] == [
+        "dataset_durable_run",
+        "source_preparation_failure",
+        None,
+    ]
+    assert records[1]["interaction_id"] == "source-fail"
+    assert "Source preparation failures: 1" in evaluated.output
+    report = runner.invoke(root_app, ["dataset", "report", str(output)])
+    assert report.exit_code == 0, report.output
+    assert "Source preparation failure source-fail" in report.output
+
+    resumed = runner.invoke(root_app, [*command[:-2], "--resume", str(output)])
+
+    assert resumed.exit_code == 2, resumed.output
+    assert "Nothing to do" in resumed.output
+    assert target_started_ids == ["source-ok"]
+
+
+@pytest.mark.parametrize("has_source_preparation_failure", (False, True))
 def test_execution_creates_private_explicit_output(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    has_source_preparation_failure: bool,
 ) -> None:
     dataset = tmp_path / "interactions.jsonl"
     output = tmp_path / "results.jsonl"
@@ -736,6 +1641,7 @@ def test_execution_creates_private_explicit_output(
         def from_config(cls, config: JsonHttpEnvironmentConfig, **options: object) -> FakeTarget:
             assert config.execute_turn.url == "http://127.0.0.1:8765/execute"
             assert options["test_environment_confirmed"] is True
+            assert options["timeout_seconds"] == 75.0
             return cls()
 
     async def fake_evaluate(
@@ -745,9 +1651,7 @@ def test_execution_creates_private_explicit_output(
         target: object,
         output_stream: Any,
         *,
-        repetitions: int,
-        max_environment_api_calls: int,
-        planned_target_calls: int,
+        run_config: Any,
         run_context: object,
         augmentation_ledger: object,
         saved_augmentations: object,
@@ -755,17 +1659,33 @@ def test_execution_creates_private_explicit_output(
         evaluator_preflight: object,
         trial_journal: object,
         progress_plan: Any,
+        source_preparation_events: list[Any],
     ) -> tuple[object, ...]:
-        del settings, target, run_context, augmentation_ledger, saved_augmentations
+        del settings, target, augmentation_ledger, saved_augmentations
         assert evaluator_preflight == _evaluator_preflight()
         assert redaction_engine is None
         captured_records.extend(record.id for record in records)
         assert operator_ids == ("input.surface.disfluency_repeat",)
-        assert repetitions == 3
-        assert max_environment_api_calls == 100
-        assert planned_target_calls == 30
+        assert run_config.repetitions == 3
+        assert run_config.target.max_environment_api_calls == 100
+        assert run_config.target.planned_environment_api_calls == 30
+        assert run_config.target.trial_timeout_seconds == 75.0
         assert progress_plan.calls.total_environment_api == 30
-        output_stream.write('{"saved":true}\n')
+        if has_source_preparation_failure:
+            failure_event = build_source_preparation_failure_event(
+                records[0],
+                DatasetSemanticPreparationError(),
+                repetitions=run_config.repetitions,
+                max_environment_api_calls=run_config.target.max_environment_api_calls,
+                planned_target_calls=run_config.target.planned_environment_api_calls,
+                run_context=cast(Any, run_context),
+            )
+            source_preparation_events.append(
+                failure_event.model_copy(update={"durability_state": "persisted"})
+            )
+            output_stream.write(failure_event.evidence.model_dump_json(exclude_none=True) + "\n")
+        else:
+            output_stream.write('{"saved":true}\n')
         output_stream.flush()
         return ()
 
@@ -789,22 +1709,31 @@ def test_execution_creates_private_explicit_output(
             "--allow-insecure-http",
             "--allow-environment-network",
             "--confirm-test-environment",
+            "--target-timeout-seconds",
+            "75",
             "--output",
             str(output),
         ],
     )
 
-    assert result.exit_code == 0, result.output
+    assert result.exit_code == (2 if has_source_preparation_failure else 0), result.output
     assert captured_records == ["interaction-1"]
     output_lines = output.read_text(encoding="utf-8").splitlines()
     assert json.loads(output_lines[0])["record_type"] == "dataset_durable_run"
-    assert output_lines[1] == '{"saved":true}'
+    if has_source_preparation_failure:
+        assert json.loads(output_lines[1])["record_type"] == "source_preparation_failure"
+        assert "Source preparation failures: 1" in result.output
+        assert "failed stage=terminal" in result.output
+    else:
+        assert output_lines[1] == '{"saved":true}'
     assert stat.S_IMODE(output.stat().st_mode) == 0o600
     assert "Complete evidence" in result.output
     assert "Next: ul dataset report" in result.output
     assert "Transfer 100" not in result.output
     report_position = result.output.index("stage=report")
-    completion_position = result.output.index("completed stage=terminal")
+    completion_position = result.output.index(
+        "failed stage=terminal" if has_source_preparation_failure else "completed stage=terminal"
+    )
     assert report_position < completion_position
     assert result.output.count("next_action=") == 1
 
@@ -827,6 +1756,8 @@ def test_execution_creates_private_explicit_output(
             "--allow-insecure-http",
             "--allow-environment-network",
             "--confirm-test-environment",
+            "--target-timeout-seconds",
+            "75",
             "--output",
             str(failed_output),
         ],
@@ -1032,9 +1963,7 @@ def test_execution_wires_redaction_into_records_pipeline_and_run_context(
         _target: object,
         output_stream: Any,
         *,
-        repetitions: int,
-        max_environment_api_calls: int,
-        planned_target_calls: int,
+        run_config: object,
         run_context: object,
         augmentation_ledger: object,
         saved_augmentations: object,
@@ -1044,9 +1973,7 @@ def test_execution_wires_redaction_into_records_pipeline_and_run_context(
         progress_plan: object,
     ) -> tuple[object, ...]:
         del (
-            repetitions,
-            max_environment_api_calls,
-            planned_target_calls,
+            run_config,
             augmentation_ledger,
             saved_augmentations,
             progress_plan,
@@ -1189,9 +2116,7 @@ def test_target_config_runs_nested_request_and_response_against_loopback(
             target: Any,
             output_stream: Any,
             *,
-            repetitions: int,
-            max_environment_api_calls: int,
-            planned_target_calls: int,
+            run_config: object,
             run_context: object,
             augmentation_ledger: object,
             saved_augmentations: object,
@@ -1203,9 +2128,7 @@ def test_target_config_runs_nested_request_and_response_against_loopback(
             del (
                 operator_ids,
                 settings,
-                repetitions,
-                max_environment_api_calls,
-                planned_target_calls,
+                run_config,
                 run_context,
                 augmentation_ledger,
                 saved_augmentations,

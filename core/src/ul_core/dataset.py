@@ -336,9 +336,26 @@ class ObservedAgentOutput(_StrictULModel):
 
 
 class EvidenceReference(_StrictULModel):
-    source: Literal["input", "output"]
-    json_pointer: str
-    text_quote: str | None = Field(min_length=1)
+    source: Literal["input", "output"] = Field(
+        description=(
+            "Selects the matching wrapper member: input selects raw_input and output selects "
+            "raw_observed_output."
+        )
+    )
+    json_pointer: str = Field(
+        max_length=4_096,
+        description=(
+            "RFC 6901 pointer into the interaction wrapper. It must resolve exactly within the "
+            "member selected by source; never point to a sibling that merely contains a match."
+        ),
+    )
+    text_quote: str | None = Field(
+        min_length=1,
+        description=(
+            "Exact non-empty substring of the string selected by json_pointer. Use null when "
+            "json_pointer selects an object, array, number, boolean, or null."
+        ),
+    )
 
     @model_validator(mode="after")
     def validate_location(self) -> Self:
@@ -382,8 +399,18 @@ class ObservedOutcome(_SemanticElement):
     request_unit_ids: tuple[str, ...] = ()
     position: int = Field(ge=0)
     kind: str = Field(min_length=1)
-    predicate: str = Field(min_length=1)
-    fields: dict[str, JsonValue] = Field(default_factory=dict)
+    predicate: str = Field(
+        min_length=1,
+        description="Exact observable answer or action name supported by this outcome's evidence.",
+    )
+    fields: dict[str, JsonValue] = Field(
+        default_factory=dict,
+        description=(
+            "Direct observable outcome fields. For actions, include only primitive sibling values "
+            "from the coherently evidenced action object; never wrap values in semantic or "
+            "evidence objects."
+        ),
+    )
     propositions: tuple[str, ...] = ()
 
 
@@ -475,6 +502,15 @@ class SemanticDelta(_StrictULModel):
         if self.source_quote is None and self.candidate_quote is None:
             raise ValueError("semantic deltas require source or candidate evidence")
         return self
+
+
+SemanticAllowedSurfaceChange = Literal[
+    "none",
+    "single_unprotected_case_change",
+    "single_unprotected_punctuation_insertion",
+    "moderate_angry_tone",
+    "moderate_argumentative_tone",
+]
 
 
 class SemanticEquivalenceAssessment(_StrictULModel):

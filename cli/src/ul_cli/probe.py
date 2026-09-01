@@ -25,8 +25,10 @@ import httpx
 import typer
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, ValidationError
 from ul import (
+    DatasetComparisonCompatibilityError,
     DatasetEvaluationResult,
     DatasetSemanticSettings,
+    DatasetSourceOutcomeProjectionError,
     EvaluationCase,
     EvaluatorModelPreflight,
     ExecutionEvidence,
@@ -41,6 +43,7 @@ from ul.http_environment import (
     json_http_environment_capabilities,
     json_http_environment_config_urls,
 )
+from ul.llm import llm_client_config_from_dataset_settings
 from ul.local_target import (
     LocalTargetConfig,
     LocalTargetConnection,
@@ -61,6 +64,7 @@ from ul_cli.dataset.evaluation.records import (
     validate_model_input_bounds,
 )
 from ul_cli.dataset.evaluation.runner import evaluate_interaction_records
+from ul_cli.dataset.evidence.context import dataset_evidence_semantic_settings
 from ul_cli.dataset.evidence.persistence import (
     create_durable_evidence_output,
     default_augmentations_output,
@@ -81,9 +85,9 @@ from ul_cli.dataset.progress import (
 from ul_cli.dataset.storage.private_files import create_private_output, open_resume_descriptor
 from ul_cli.dataset_augmentation_ledger import (
     DatasetAugmentationLedger,
-    DatasetAugmentationLedgerSemanticSettings,
     create_dataset_augmentation_generation_context,
     create_private_augmentation_ledger,
+    dataset_augmentation_ledger_semantic_settings,
     open_augmentation_ledger_for_resume,
 )
 from ul_cli.dataset_campaign import DatasetCampaignPlan, create_dataset_campaign_plan
@@ -92,6 +96,7 @@ from ul_cli.dataset_review import (
     DatasetEvidenceSemanticSettings,
     create_dataset_evidence_run_context,
 )
+from ul_cli.dataset_run_config import DatasetRunConfig, TargetExecutionConfig
 from ul_cli.dataset_trial_journal import (
     DatasetTrialJournal,
     create_dataset_run_manifest,
@@ -648,18 +653,7 @@ def _persist_probe_quarantine(
 def _semantic_settings_snapshot(
     settings: DatasetSemanticSettings,
 ) -> DatasetEvidenceSemanticSettings:
-    return DatasetEvidenceSemanticSettings(
-        provider=settings.semantic_provider_id,
-        endpoint_sha256=settings.semantic_endpoint_sha256,
-        model=settings.model,
-        render_model=settings.render_model,
-        equivalence_model=settings.equivalence_model,
-        max_input_chars=settings.max_input_chars,
-        max_output_tokens=settings.max_output_tokens,
-        max_render_tokens=settings.max_render_tokens,
-        max_response_bytes=settings.max_response_bytes,
-        timeout_seconds=settings.timeout_seconds,
-    )
+    return dataset_evidence_semantic_settings(settings)
 
 
 def _target_evidence_receipt(resolved_target: _ResolvedTarget) -> dict[str, JsonValue]:
@@ -914,11 +908,32 @@ def probe(
         try:
             settings = load_dataset_semantic_settings()
             validate_model_input_bounds(records, settings.max_input_chars)
+            run_config = DatasetRunConfig(
+                repetitions=repetitions,
+                target=TargetExecutionConfig(
+                    trial_timeout_seconds=_TARGET_TIMEOUT_SECONDS,
+                    max_environment_api_calls=(
+                        len(records)
+                        * repetitions
+                        * (1 + len(selected_operator_ids))
+                        * resolved_target.calls_per_execution
+                    ),
+                    environment_api_calls_per_trial=resolved_target.calls_per_execution,
+                    planned_environment_api_calls=(
+                        len(records)
+                        * repetitions
+                        * (1 + len(selected_operator_ids))
+                        * resolved_target.calls_per_execution
+                    ),
+                    allow_network_egress=True,
+                    test_environment_confirmed=True,
+                    allow_insecure_http=allow_insecure_http,
+                ),
+            )
             plan = create_dataset_campaign_plan(
                 records=records,
                 selected_operator_ids=selected_operator_ids,
-                repetitions=repetitions,
-                target_calls_per_execution=resolved_target.calls_per_execution,
+                run_config=run_config,
                 settings=settings,
             )
             campaign_confirmation = _campaign_confirmation(
@@ -978,7 +993,7 @@ def probe(
                 operators=tuple(
                     dataset_operator_identity(reference) for reference in selected_operator_ids
                 ),
-                repetitions=repetitions,
+                run_config=run_config,
                 invariant_suite_sha256=None,
                 target_receipt=_target_evidence_receipt(resolved_target),
                 semantic_settings=_semantic_settings_snapshot(settings),
@@ -1129,14 +1144,13 @@ def probe(
             resolved_target=resolved_target,
             settings=settings,
             plan=plan,
+            run_config=run_config,
             output=output,
-            repetitions=repetitions,
             remaining_target_seconds=remaining_target_seconds,
             run_context=run_context,
             progress_runtime=progress_runtime,
             evaluator_preflight=evaluator_preflight,
             resume_campaign=resume_checkpoint is not None,
-            allow_insecure_http=allow_insecure_http,
             resolve_quarantine_after=resolve_quarantine_after,
         )
         projection_failure = _campaign_projection_failure(results, output)
@@ -1946,6 +1960,7 @@ def _campaign_confirmation(
     *,
     case_limit: int,
 ) -> _CampaignConfirmation:
+    llm_config = llm_client_config_from_dataset_settings(settings)
     planned_target_seconds = (
         resolved_target.calls_per_execution + plan.calls.repetition_executions
     ) * _TARGET_TIMEOUT_SECONDS
@@ -1954,35 +1969,16 @@ def _campaign_confirmation(
         if resolved_target.maximum_active_target_seconds is not None
         else planned_target_seconds
     )
-    if settings.semantic_provider_type == "openrouter":
-        data_policy: dict[str, object] = {
-            "external_processing": True,
-            "provider_policy_declared": True,
-            "data_collection": "deny",
-            "zero_data_retention_required": True,
-            "implication": (
-                "The configured route requires data collection to be denied and zero data "
-                "retention; the evaluator request is still processed externally."
-            ),
-        }
-    else:
-        data_policy = {
-            "external_processing": True,
-            "provider_policy_declared": False,
-            "implication": (
-                "The configured endpoint receives evaluator prompts and sample data; UL cannot "
-                "verify its retention or training policy."
-            ),
-        }
+    data_policy = llm_config.data_policy()
     return _CampaignConfirmation(
         target_confirmation_sha256=resolved_target.confirmation_sha256,
-        semantic_provider_id=settings.semantic_provider_id,
-        semantic_provider_type=settings.semantic_provider_type,
-        semantic_endpoint_sha256=settings.semantic_endpoint_sha256,
+        semantic_provider_id=llm_config.provider_id,
+        semantic_provider_type=llm_config.provider_type,
+        semantic_endpoint_sha256=llm_config.endpoint_sha256,
         semantic_settings_sha256=_model_sha256(_semantic_settings_snapshot(settings)),
         campaign_plan_sha256=_model_sha256(plan),
         case_limit=case_limit,
-        data_policy=data_policy,
+        data_policy=cast(dict[str, object], data_policy),
         command_environment_api_requests=(
             resolved_target.calls_per_execution + plan.calls.total_environment_api
         ),
@@ -2041,14 +2037,13 @@ def _run_campaign(
     resolved_target: _ResolvedTarget,
     settings: DatasetSemanticSettings,
     plan: DatasetCampaignPlan,
+    run_config: DatasetRunConfig,
     output: Path,
-    repetitions: int,
     remaining_target_seconds: float | None,
     run_context: DatasetEvidenceRunContext,
     progress_runtime: CampaignProgressRuntime,
     evaluator_preflight: EvaluatorModelPreflight | None,
     resume_campaign: bool,
-    allow_insecure_http: bool,
     resolve_quarantine_after: Literal["environment-reset", "environment-replacement"] | None,
 ) -> tuple[DatasetEvaluationResult, ...]:
     resolved_target.revalidate_identity()
@@ -2077,28 +2072,13 @@ def _run_campaign(
             dataset_operator_identity(operator_reference)
             for operator_reference in selected_operator_ids
         ),
-        semantic_settings=DatasetAugmentationLedgerSemanticSettings(
-            provider=settings.semantic_provider_id,
-            endpoint_sha256=settings.semantic_endpoint_sha256,
-            model=settings.model,
-            render_model=settings.render_model,
-            equivalence_model=settings.equivalence_model,
-            max_input_chars=settings.max_input_chars,
-            max_output_tokens=settings.max_output_tokens,
-            max_render_tokens=settings.max_render_tokens,
-            max_response_bytes=settings.max_response_bytes,
-            timeout_seconds=settings.timeout_seconds,
-        ),
+        semantic_settings=dataset_augmentation_ledger_semantic_settings(settings),
     )
     expected_manifest = create_dataset_run_manifest(
         run_context=run_context,
         selected_records=records,
         selected_operator_ids=selected_operator_ids,
-        repetitions=repetitions,
-        max_environment_api_calls=plan.calls.total_environment_api,
-        allow_environment_network=True,
-        confirm_test_environment=True,
-        allow_insecure_http=allow_insecure_http,
+        run_config=run_config,
         save_augmentations=True,
         semantic_provider_type=settings.semantic_provider_type,
         semantic_base_url=settings.semantic_base_url,
@@ -2274,13 +2254,11 @@ def _run_campaign(
                         settings,
                         connection,
                         output_stream,
-                        repetitions=repetitions,
-                        max_environment_api_calls=plan.calls.total_environment_api,
-                        planned_target_calls=plan.calls.total_environment_api,
+                        run_config=run_config,
                         progress_plan=plan,
                         progress_runtime=progress_runtime,
                         complete_progress=False,
-                        environment_calls_per_target_call=(resolved_target.calls_per_execution),
+                        isolate_source_preparation_failures=False,
                         run_context=run_context,
                         evaluator_preflight=evaluator_preflight,
                         trial_journal=trial_journal,
@@ -2294,6 +2272,22 @@ def _run_campaign(
                     "PROBE_PAUSED_DURING_CAMPAIGN",
                     "The campaign paused at a durable trial boundary.",
                     "Run the opaque resume action to continue only unfinished trials.",
+                    target_safe_to_reuse=True,
+                ) from None
+            except DatasetComparisonCompatibilityError as error:
+                raise ProbeFailure(
+                    "evaluation",
+                    "PROBE_SOURCE_COMPARISON_INCOMPATIBLE",
+                    error.explanation,
+                    error.remediation,
+                    target_safe_to_reuse=True,
+                ) from None
+            except DatasetSourceOutcomeProjectionError as error:
+                raise ProbeFailure(
+                    "evaluation",
+                    "PROBE_SOURCE_OUTCOME_PROJECTION_INVALID",
+                    error.explanation,
+                    error.remediation,
                     target_safe_to_reuse=True,
                 ) from None
             except Exception:

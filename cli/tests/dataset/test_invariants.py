@@ -13,6 +13,7 @@ from typer.testing import CliRunner
 from ul import (
     DatasetEvaluationResult,
     ObservedAgentOutput,
+    OpenAICompatibleDatasetSettings,
 )
 from ul.dataset_invariants import (
     DatasetInvariantEvaluation,
@@ -20,6 +21,7 @@ from ul.dataset_invariants import (
     JsonValueEqualsLiteralInvariant,
     NoNewEffectInvariant,
 )
+from ul.llm import LLMClient, llm_client_config_from_dataset_settings
 from ul_cli import dataset_review
 from ul_cli.dataset.evaluation import command as command_module
 from ul_cli.dataset.evaluation import runner as runner_module
@@ -38,6 +40,7 @@ from ._factories import (
     _evaluation_result,
     _evaluator_preflight,
     _invariant_evaluation,
+    _run_config,
     _run_context,
 )
 from ._files import (
@@ -75,7 +78,7 @@ def test_invariant_dry_run_reports_rules_authority_and_no_extra_calls(
     assert "Declared observation authority: committed_state_snapshot" in result.output
     assert "Additional model calls for customer invariants: 0" in result.output
     assert "Additional environment API calls for customer invariants: 0" in result.output
-    assert "Potential semantic model calls: up to 12" in result.output
+    assert "Potential semantic model calls: up to 14" in result.output
     assert "Potential environment API calls: up to 6" in result.output
 
 
@@ -181,7 +184,7 @@ def test_extended_invariants_use_new_evidence_schema_and_hide_values_from_termin
     presentation_module._print_invariant_results((invariant_evaluation,))
     terminal_output = capsys.readouterr().out
 
-    assert parsed.schema_version == "1.13.0"
+    assert parsed.schema_version == "1.15.0"
     assert parsed.evaluation_mode == "variance"
     assert parsed.run_context is not None
     assert parsed.run_context.evaluation_mode == "variance"
@@ -347,11 +350,19 @@ def test_invariant_evaluation_reuses_results_without_extra_runner_calls(
     stored_evaluations: list[DatasetInvariantEvaluation] = []
 
     class AsyncContext:
+        def __init__(self, semantic_settings: Any | None = None) -> None:
+            self.llm_client = (
+                LLMClient(llm_client_config_from_dataset_settings(semantic_settings))
+                if semantic_settings is not None
+                else None
+            )
+
         async def __aenter__(self) -> object:
             return self
 
         async def __aexit__(self, *args: object) -> None:
-            pass
+            if self.llm_client is not None:
+                await self.llm_client.aclose()
 
         def reuse_preflight(self, result: object) -> None:
             assert result == _evaluator_preflight()
@@ -375,7 +386,7 @@ def test_invariant_evaluation_reuses_results_without_extra_runner_calls(
     monkeypatch.setattr(
         runner_module,
         "create_semantic_model_deconstructor",
-        lambda settings: AsyncContext(),
+        lambda settings: AsyncContext(settings),
     )
     monkeypatch.setattr(runner_module, "DatasetAugmentationEngine", lambda *args: object())
     monkeypatch.setattr(runner_module, "DatasetEvaluationRunner", FakeRunner)
@@ -394,12 +405,17 @@ def test_invariant_evaluation_reuses_results_without_extra_runner_calls(
             runner_module.evaluate_interaction_records(
                 (cast(Any, SimpleNamespace()),),
                 ("input.surface.rephrase",),
-                cast(Any, SimpleNamespace()),
+                OpenAICompatibleDatasetSettings(
+                    allow_external_data_processing=True,
+                    base_url="https://evaluator.example/v1",
+                    model="test-model",
+                ),
                 cast(Any, AsyncContext()),
                 output_stream,
-                repetitions=1,
-                max_environment_api_calls=2,
-                planned_target_calls=2,
+                run_config=_run_config(
+                    planned_environment_api_calls=2,
+                    max_environment_api_calls=2,
+                ),
                 invariant_suite=suite,
                 invariant_evaluations=stored_evaluations,
                 evaluator_preflight=_evaluator_preflight(),

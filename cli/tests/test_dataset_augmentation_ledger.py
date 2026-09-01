@@ -13,13 +13,16 @@ from ul import (
     CaseFixtureReference,
     DatasetAugmentationResult,
     InteractionRecord,
+    OpenRouterDatasetSettings,
     RichInteractionCase,
     SemanticFrame,
     VisibleContextTurn,
     create_dataset_augmentation_projection,
     project_rich_interaction_case,
+    semantic_deconstructor_identity,
 )
 from ul.augmentations.dataset import DatasetAugmentationCandidate
+from ul.llm import LLMClientIdentity, LLMRoleConfig
 from ul_cli import dataset_augmentation_ledger as ledger_module
 from ul_cli.dataset_augmentation_ledger import (
     DatasetAugmentationLedgerSemanticSettings,
@@ -31,6 +34,47 @@ from ul_cli.dataset_augmentation_ledger import (
 )
 
 _ENDPOINT_SHA256 = "1" * 64
+
+
+def _llm_client_identity(model: str) -> LLMClientIdentity:
+    return LLMClientIdentity(
+        provider_id="test-provider",
+        provider_type="openrouter",
+        upstream_provider="test-provider",
+        endpoint_sha256=_ENDPOINT_SHA256,
+        roles=(
+            LLMRoleConfig(
+                role="deconstruct",
+                model=model,
+                max_output_tokens=4_096,
+                reasoning_mode="required",
+                reasoning_effort="minimal",
+            ),
+            LLMRoleConfig(
+                role="render",
+                model="test/render-model",
+                max_output_tokens=512,
+                reasoning_mode="required",
+                reasoning_effort="none",
+            ),
+            LLMRoleConfig(
+                role="equivalence",
+                model="test/equivalence-model",
+                max_output_tokens=1_024,
+                reasoning_mode="required",
+                reasoning_effort="low",
+            ),
+            LLMRoleConfig(
+                role="materiality",
+                model="test/materiality-model",
+                max_output_tokens=512,
+                reasoning_mode="omitted",
+            ),
+        ),
+        timeout_seconds=60.0,
+        max_response_bytes=1_000_000,
+        data_policy={},
+    )
 
 
 def _source(identifier: str = "interaction-1") -> InteractionRecord:
@@ -88,22 +132,24 @@ def _context(
     selected_records: tuple[InteractionRecord, ...],
     *,
     model: str = "test/model",
+    include_deconstructor_identity: bool = True,
+    source_outcome_projection_sha256: str | None = None,
 ):
     return create_dataset_augmentation_generation_context(
         selected_records=selected_records,
         operators=(("input.surface.rephrase", "1.0.0"),),
         semantic_settings=DatasetAugmentationLedgerSemanticSettings(
-            provider="test-provider",
-            endpoint_sha256=_ENDPOINT_SHA256,
-            model=model,
-            render_model="test/render-model",
-            equivalence_model="test/equivalence-model",
+            llm_client=_llm_client_identity(model),
             max_input_chars=50_000,
-            max_output_tokens=4_096,
-            max_render_tokens=512,
-            max_response_bytes=1_000_000,
-            timeout_seconds=60.0,
+            deconstructor_identity=(
+                semantic_deconstructor_identity(
+                    OpenRouterDatasetSettings(model="test/default-model")
+                )
+                if include_deconstructor_identity
+                else None
+            ),
         ),
+        source_outcome_projection_sha256=source_outcome_projection_sha256,
     )
 
 
@@ -174,6 +220,32 @@ def test_generation_context_hash_binds_rich_fixture_context_and_target() -> None
     assert baseline.context_sha256 != changed_fixture.context_sha256
     assert baseline.context_sha256 != changed_context.context_sha256
     assert baseline.context_sha256 != changed_target.context_sha256
+
+
+def test_generation_context_hash_binds_deconstructor_identity() -> None:
+    source = _source()
+    current_context = _context((source,))
+    legacy_context = _context((source,), include_deconstructor_identity=False)
+
+    assert current_context.context_sha256 != legacy_context.context_sha256
+    assert current_context.semantic_settings.deconstructor_identity is not None
+    assert legacy_context.semantic_settings.deconstructor_identity is None
+    legacy_payload = legacy_context.model_dump(mode="json")
+    legacy_payload["semantic_settings"].pop("deconstructor_identity")
+    assert type(legacy_context).model_validate_json(json.dumps(legacy_payload)) == legacy_context
+
+
+def test_generation_context_hash_binds_source_outcome_projection() -> None:
+    source = _source()
+    first = _context((source,), source_outcome_projection_sha256="2" * 64)
+    second = _context((source,), source_outcome_projection_sha256="3" * 64)
+    legacy = _context((source,))
+
+    assert first.context_sha256 != second.context_sha256
+    assert first.context_sha256 != legacy.context_sha256
+    legacy_payload = legacy.model_dump(mode="json")
+    legacy_payload.pop("source_outcome_projection_sha256")
+    assert type(legacy).model_validate_json(json.dumps(legacy_payload)) == legacy
 
 
 def test_resume_rejects_truncated_record(tmp_path: Path) -> None:

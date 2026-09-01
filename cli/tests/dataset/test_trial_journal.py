@@ -4,9 +4,18 @@ from pathlib import Path
 from typing import cast
 
 import pytest
-from ul import DatasetTrialUnit
+from ul import (
+    DatasetSemanticPreparationError,
+    DatasetSourceOutcomeProjectionError,
+    DatasetTrialUnit,
+)
+from ul_cli.dataset.evaluation.command import (
+    _attempted_target_calls,
+    _reconcile_source_preparation_failures,
+)
 from ul_cli.dataset.evidence.context import build_dataset_evidence_run_context
-from ul_cli.dataset_review import DatasetEvidenceRunContext
+from ul_cli.dataset.evidence.customer import build_source_preparation_failure_evidence
+from ul_cli.dataset_review import DatasetEvidenceRunContext, DatasetResumeEvidence
 from ul_cli.dataset_trial_journal import (
     create_dataset_run_manifest,
     create_dataset_trial_journal,
@@ -15,7 +24,7 @@ from ul_cli.dataset_trial_journal import (
     read_dataset_run_manifest,
 )
 
-from ._factories import _evaluation_result, _run_context, _settings
+from ._factories import _evaluation_result, _run_config, _run_context, _settings
 
 
 def _manifest():
@@ -24,11 +33,7 @@ def _manifest():
         run_context=_run_context((source,)),
         selected_records=(source,),
         selected_operator_ids=("input.surface.rephrase",),
-        repetitions=1,
-        max_environment_api_calls=10,
-        allow_environment_network=True,
-        confirm_test_environment=True,
-        allow_insecure_http=False,
+        run_config=_run_config(max_environment_api_calls=10),
         save_augmentations=True,
     )
 
@@ -44,7 +49,15 @@ def test_manifest_is_content_addressed_immutable_and_atomic(tmp_path: Path) -> N
     changed = manifest.model_copy(
         update={
             "effective_command": manifest.effective_command.model_copy(
-                update={"max_environment_api_calls": 11}
+                update={
+                    "run_config": manifest.effective_command.run_config.model_copy(
+                        update={
+                            "target": manifest.effective_command.run_config.target.model_copy(
+                                update={"max_environment_api_calls": 11}
+                            )
+                        }
+                    )
+                }
             )
         }
     )
@@ -91,6 +104,62 @@ def test_terminal_trial_is_recovered_and_cannot_be_recorded_twice(tmp_path: Path
     resumed = open_dataset_trial_journal(path, manifest)
     assert resumed.snapshot.recovered_trials == {unit.id: trial}
     resumed.close()
+
+
+def test_resume_reconciles_an_interrupted_source_failure_without_target_calls(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "trials.jsonl"
+    manifest = _manifest()
+    failure = build_source_preparation_failure_evidence(
+        manifest.selected_records[0],
+        DatasetSemanticPreparationError(),
+        repetitions=1,
+        max_environment_api_calls=10,
+        planned_target_calls=2,
+        run_context=manifest.run_context,
+    )
+    journal = create_dataset_trial_journal(path, manifest)
+    journal.terminal(
+        manifest.work_plan[0],
+        "errored",
+        failure.reason_code,
+    )
+    journal.close()
+    resumed = open_dataset_trial_journal(path, manifest)
+    resume_evidence = DatasetResumeEvidence(
+        processed_ids=frozenset({failure.interaction_id}),
+        source_preparation_failures=(failure,),
+        has_review_findings=False,
+        has_inconclusive_materiality=False,
+        invariant_evaluations=(),
+        technical_results=(),
+        raw_evidence_sha256="0" * 64,
+    )
+
+    _reconcile_source_preparation_failures(resumed, resume_evidence)
+
+    snapshot = resumed.snapshot
+    assert snapshot.terminal_states == {unit.id: "errored" for unit in manifest.work_plan}
+    assert set(snapshot.terminal_reason_codes.values()) == {failure.reason_code}
+    assert _attempted_target_calls(snapshot) == 0
+    resumed.close()
+
+
+def test_source_outcome_projection_failure_builds_durable_evidence() -> None:
+    manifest = _manifest()
+
+    failure = build_source_preparation_failure_evidence(
+        manifest.selected_records[0],
+        DatasetSourceOutcomeProjectionError(),
+        repetitions=1,
+        max_environment_api_calls=10,
+        planned_target_calls=2,
+        run_context=manifest.run_context,
+    )
+
+    assert failure.reason_code == "source_outcome_projection_failed"
+    assert "declared outcome projection" in failure.summary
 
 
 def test_skipped_trial_is_recovered_without_duplicate_terminal_transition(tmp_path: Path) -> None:
@@ -184,22 +253,11 @@ def test_journal_rejects_hard_links_and_symlinks(tmp_path: Path) -> None:
 
 
 def test_manifest_rejects_unbounded_repetitions_before_plan_materialization() -> None:
-    manifest = _manifest()
-    with pytest.raises(ValueError, match="repetitions cannot exceed 100"):
-        create_dataset_run_manifest(
-            run_context=manifest.run_context.model_copy(update={"repetitions": 101}),
-            selected_records=manifest.selected_records,
-            selected_operator_ids=manifest.selected_operator_ids,
-            repetitions=101,
-            max_environment_api_calls=10,
-            allow_environment_network=True,
-            confirm_test_environment=True,
-            allow_insecure_http=False,
-            save_augmentations=True,
-        )
+    with pytest.raises(ValueError, match="less than or equal to 100"):
+        _run_config(repetitions=101, planned_environment_api_calls=1)
 
 
-def test_repeated_recovery_of_ten_by_eleven_by_three_plan_never_duplicates_mutations(
+def test_repeated_recovery_of_ten_by_ten_by_three_plan_never_duplicates_mutations(
     tmp_path: Path,
 ) -> None:
     records = tuple(_evaluation_result(f"interaction-{index}").source for index in range(10))
@@ -213,14 +271,17 @@ def test_repeated_recovery_of_ten_by_eleven_by_three_plan_never_duplicates_mutat
         "input.surface.fragmented_syntax",
         "input.style.terse",
         "input.style.verbose",
-        "input.tone.frustrated",
         "input.intent.self_correction",
     )
     target_config = cast(DatasetEvidenceRunContext, _run_context((records[0],))).target.config
     run_context = build_dataset_evidence_run_context(
         selected_records=records,
         selected_operator_ids=operator_ids,
-        repetitions=3,
+        run_config=_run_config(
+            repetitions=3,
+            planned_environment_api_calls=330,
+            max_environment_api_calls=2_000,
+        ),
         invariant_suite=None,
         target_config=target_config,
         settings=_settings(),
@@ -229,11 +290,11 @@ def test_repeated_recovery_of_ten_by_eleven_by_three_plan_never_duplicates_mutat
         run_context=run_context,
         selected_records=records,
         selected_operator_ids=operator_ids,
-        repetitions=3,
-        max_environment_api_calls=2_000,
-        allow_environment_network=True,
-        confirm_test_environment=True,
-        allow_insecure_http=False,
+        run_config=_run_config(
+            repetitions=3,
+            planned_environment_api_calls=330,
+            max_environment_api_calls=2_000,
+        ),
         save_augmentations=True,
     )
     path = tmp_path / "trials.jsonl"
@@ -248,7 +309,7 @@ def test_repeated_recovery_of_ten_by_eleven_by_three_plan_never_duplicates_mutat
         journal.close()
         journal = open_dataset_trial_journal(path, manifest)
 
-    assert len(manifest.work_plan) == 10 * (1 + 11) * 3
+    assert len(manifest.work_plan) == 10 * (1 + 10) * 3
     assert set(mutations_by_unit.values()) == {1}
     assert len(journal.snapshot.terminal_states) == len(manifest.work_plan)
     journal.close()

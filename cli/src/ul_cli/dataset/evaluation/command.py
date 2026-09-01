@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
+import math
 import os
 import shlex
 import sys
@@ -22,6 +23,7 @@ from ul import (
     DatasetSemanticSettings,
     EvaluatorModelCompatibilityError,
     EvaluatorModelPreflight,
+    InteractionRecord,
     OpenAICompatibleDatasetSettings,
     OpenRouterDatasetSettings,
     ProviderDiagnosticError,
@@ -49,19 +51,26 @@ from ul_cli.dataset.progress import (
     create_campaign_next_commands,
     create_campaign_progress_runtime,
 )
+from ul_cli.dataset.source_preparation import DatasetSourcePreparationFailureEvent
 from ul_cli.dataset_augmentation_ledger import (
+    DatasetAugmentationGenerationContext,
     DatasetAugmentationLedger,
-    DatasetAugmentationLedgerSemanticSettings,
     create_dataset_augmentation_generation_context,
     create_private_augmentation_ledger,
+    dataset_augmentation_ledger_semantic_settings,
     open_augmentation_ledger_for_resume,
     read_augmentation_ledger,
 )
 from ul_cli.dataset_campaign import create_dataset_campaign_plan
-from ul_cli.dataset_review import DatasetEvidenceRunContext, DatasetResumeEvidence
+from ul_cli.dataset_review import (
+    DatasetEvidenceRunContext,
+    DatasetResumeEvidence,
+)
+from ul_cli.dataset_run_config import DatasetRunConfig, TargetExecutionConfig
 from ul_cli.dataset_trial_journal import (
     DatasetRunManifest,
     DatasetTrialJournal,
+    DatasetTrialJournalSnapshot,
     create_dataset_run_manifest,
     create_dataset_trial_journal,
     create_quarantine_resolution,
@@ -110,6 +119,7 @@ from ..evidence.persistence import (
 )
 from ..presentation.evaluation import (
     dataset_invariant_exit_code,
+    dataset_result_exit_code,
     print_dataset_plan,
     print_dataset_results,
     print_evaluator_preflight,
@@ -130,7 +140,167 @@ from .runner import evaluate_interaction_records, preflight_evaluator
 _MAXIMUM_DATASET_RECORDS = 100
 _MAXIMUM_REPETITIONS = 100
 _DEFAULT_MAXIMUM_ENVIRONMENT_API_CALLS = 100
+_DEFAULT_TARGET_TIMEOUT_SECONDS = 30.0
+_MAXIMUM_TARGET_TIMEOUT_SECONDS = 3_600.0
 _MAXIMUM_FINDING_SNAPSHOT_BYTES = 128_000_000
+_SOURCE_PREPARATION_REASON_CODES = {
+    "source_semantic_preparation_failed",
+    "source_outcome_projection_failed",
+    "source_comparison_surface_incompatible",
+}
+
+
+def _resolve_target_timeout_seconds(
+    requested: float | None,
+    recorded_manifest: DatasetRunManifest | None,
+) -> float:
+    recorded = (
+        recorded_manifest.effective_command.run_config.target.trial_timeout_seconds
+        if recorded_manifest is not None
+        else _DEFAULT_TARGET_TIMEOUT_SECONDS
+    )
+    resolved = recorded if requested is None else requested
+    if not math.isfinite(resolved) or resolved <= 0:
+        raise typer.BadParameter(
+            "target timeout must be positive and finite",
+            param_hint="--target-timeout-seconds",
+        )
+    return resolved
+
+
+def _source_outcome_projection_sha256(
+    target_config: JsonHttpTargetConfig | None,
+    local_target: ResolvedLocalTarget | None,
+) -> str | None:
+    projection = local_target.config.outcome if local_target is not None else None
+    if projection is None and target_config is not None:
+        projection = target_config.outcome
+    return projection.digest if projection is not None else None
+
+
+def _load_complete_augmentation_input(
+    path: Path | None,
+    *,
+    expected_context: DatasetAugmentationGenerationContext,
+    selected_records: tuple[InteractionRecord, ...],
+    recorded_sha256: str | None,
+) -> tuple[dict[str, DatasetAugmentationResult], str | None]:
+    if path is None:
+        return {}, None
+    snapshot = read_augmentation_ledger(
+        path,
+        expected_context=expected_context,
+        selected_records=selected_records,
+    )
+    expected_source_ids = frozenset(record.id for record in selected_records)
+    if snapshot.processed_source_ids != expected_source_ids:
+        raise ValueError("augmentation input must contain every selected interaction exactly once")
+    if recorded_sha256 is not None and recorded_sha256 != snapshot.raw_ledger_sha256:
+        raise ValueError("augmentation input digest does not match the recorded campaign")
+    return (
+        {record.source.id: record.augmentation for record in snapshot.records},
+        snapshot.raw_ledger_sha256,
+    )
+
+
+def _restore_recorded_augmentation_input(
+    requested: Path | None,
+    recorded_manifest: DatasetRunManifest | None,
+) -> Path | None:
+    if requested is not None or recorded_manifest is None:
+        return requested
+    recorded_path = recorded_manifest.effective_command.augmentations_input_path
+    return Path(recorded_path) if recorded_path is not None else None
+
+
+def _resolve_augmentation_output(
+    *,
+    augmentations_input: Path | None,
+    augmentations_output: Path | None,
+    no_save_augmentations: bool,
+    evidence_output: Path | None,
+) -> Path | None:
+    if augmentations_output is not None and no_save_augmentations:
+        raise typer.BadParameter(
+            "--augmentations-output cannot be used with --no-save-augmentations",
+            param_hint="--augmentations-output",
+        )
+    if augmentations_input is not None and augmentations_output is not None:
+        raise typer.BadParameter(
+            "--augmentations-input cannot be combined with --augmentations-output",
+            param_hint="--augmentations-input",
+        )
+    if (
+        augmentations_output is not None
+        or no_save_augmentations
+        or augmentations_input is not None
+        or evidence_output is None
+    ):
+        return augmentations_output
+    return default_augmentations_output(evidence_output)
+
+
+def _close_trial_journal(trial_journal: DatasetTrialJournal | None) -> None:
+    if trial_journal is not None:
+        trial_journal.close()
+
+
+def _validate_resume_augmentation_durability(
+    manifest: DatasetRunManifest,
+    trial_journal: DatasetTrialJournal,
+    resume_evidence: DatasetResumeEvidence | None,
+) -> None:
+    command = manifest.effective_command
+    if command.save_augmentations or command.augmentations_input_path is not None:
+        return
+    source_failure_ids = {
+        failure.interaction_id
+        for failure in (
+            resume_evidence.source_preparation_failures if resume_evidence is not None else ()
+        )
+    }
+    terminal_interaction_ids = {
+        unit.interaction_id
+        for unit in manifest.work_plan
+        if unit.id in trial_journal.snapshot.terminal_states
+    }
+    if terminal_interaction_ids - source_failure_ids:
+        raise ValueError(
+            "resume_incompatible:augmentation_not_durable; start a new output with "
+            "augmentation retention enabled"
+        )
+
+
+def _reconcile_source_preparation_failures(
+    trial_journal: DatasetTrialJournal,
+    resume_evidence: DatasetResumeEvidence,
+) -> None:
+    snapshot = trial_journal.snapshot
+    failures_by_interaction_id = {
+        failure.interaction_id: failure for failure in resume_evidence.source_preparation_failures
+    }
+    for unit in trial_journal.manifest.work_plan:
+        failure = failures_by_interaction_id.get(unit.interaction_id)
+        if failure is None:
+            continue
+        terminal_state = snapshot.terminal_states.get(unit.id)
+        if terminal_state is None:
+            trial_journal.terminal(unit, "errored", failure.reason_code)
+            continue
+        reason_code = snapshot.terminal_reason_codes.get(unit.id)
+        if terminal_state == "errored" and reason_code == failure.reason_code:
+            continue
+        if unit.arm == "probe" and terminal_state in {"inapplicable", "rejected"}:
+            continue
+        raise ValueError("source failure evidence conflicts with durable trial state")
+
+
+def _attempted_target_calls(snapshot: DatasetTrialJournalSnapshot) -> int:
+    return sum(
+        state in {"completed", "errored", "inconclusive", "quarantined"}
+        and snapshot.terminal_reason_codes.get(unit_id) not in _SOURCE_PREPARATION_REASON_CODES
+        for unit_id, state in snapshot.terminal_states.items()
+    )
 
 
 def _write_finding_package_snapshot(
@@ -299,6 +469,21 @@ def evaluate_dataset(
         Path | None,
         typer.Option(help="New JSONL file for complete local evidence."),
     ] = None,
+    augmentations_input: Annotated[
+        Path | None,
+        typer.Option(
+            "--augmentations-input",
+            exists=True,
+            file_okay=True,
+            dir_okay=False,
+            readable=True,
+            resolve_path=True,
+            help=(
+                "Reuse a complete private augmentation JSONL from an earlier UL campaign "
+                "without regenerating candidates."
+            ),
+        ),
+    ] = None,
     augmentations_output: Annotated[
         Path | None,
         typer.Option(
@@ -354,6 +539,15 @@ def evaluate_dataset(
         typer.Option(
             min=1,
             help="Fresh-state environment executions per original input and accepted variation.",
+        ),
+    ] = None,
+    target_timeout_seconds: Annotated[
+        float | None,
+        typer.Option(
+            "--target-timeout-seconds",
+            min=0,
+            max=_MAXIMUM_TARGET_TIMEOUT_SECONDS,
+            help="Maximum seconds allowed for each target trial.",
         ),
     ] = None,
     max_environment_api_calls: Annotated[
@@ -486,8 +680,10 @@ def evaluate_dataset(
     --confirm-request-isolation --confirm-safe-test-target --dry-run
 
     Discover operators: ul augmentations list --mode dataset_variation
+    Augmentation reuse: --augmentations-input PATH
     Augmentation retention: --augmentations-output PATH or --no-save-augmentations
     """
+    augmentations_input_was_explicit = augmentations_input is not None
     augmentations_output_was_explicit = augmentations_output is not None
     redaction_state_was_explicit = redaction_state is not None
     recorded_manifest_for_resume = None
@@ -538,17 +734,18 @@ def evaluate_dataset(
                 param_hint="--resume",
             )
         recorded_command = recorded_manifest_for_resume.effective_command
-        repetitions = repetitions or recorded_command.repetitions
+        recorded_run_config = recorded_command.run_config
+        repetitions = repetitions or recorded_run_config.repetitions
         max_environment_api_calls = (
-            max_environment_api_calls or recorded_command.max_environment_api_calls
+            max_environment_api_calls or recorded_run_config.target.max_environment_api_calls
         )
         allow_environment_network = (
-            allow_environment_network or recorded_command.allow_environment_network
+            allow_environment_network or recorded_run_config.target.allow_network_egress
         )
         confirm_test_environment = (
-            confirm_test_environment or recorded_command.confirm_test_environment
+            confirm_test_environment or recorded_run_config.target.test_environment_confirmed
         )
-        allow_insecure_http = allow_insecure_http or recorded_command.allow_insecure_http
+        allow_insecure_http = allow_insecure_http or recorded_run_config.target.allow_insecure_http
         if operator is None:
             operator = list(recorded_manifest_for_resume.selected_operator_ids)
         if data is None:
@@ -559,6 +756,10 @@ def evaluate_dataset(
         if redaction_state is None and recorded_command.redaction_state_path is not None:
             redaction_state = Path(recorded_command.redaction_state_path)
     repetitions = repetitions or 3
+    target_timeout_seconds = _resolve_target_timeout_seconds(
+        target_timeout_seconds,
+        recorded_manifest_for_resume,
+    )
     direct_http_options_used = (
         http_preset is not None
         or request_json_template is not None
@@ -605,11 +806,9 @@ def evaluate_dataset(
             "Historical dataset output is grounding evidence, not an expected answer.",
             param_hint="--evaluation-mode",
         )
-    if augmentations_output is not None and no_save_augmentations:
-        raise typer.BadParameter(
-            "--augmentations-output cannot be used with --no-save-augmentations",
-            param_hint="--augmentations-output",
-        )
+    augmentations_input = _restore_recorded_augmentation_input(
+        augmentations_input, recorded_manifest_for_resume
+    )
     if resume is not None:
         if output is not None and output.resolve() != resume.resolve():
             raise typer.BadParameter(
@@ -618,8 +817,12 @@ def evaluate_dataset(
             )
         if output is None:
             output = resume
-    if not no_save_augmentations and augmentations_output is None and output is not None:
-        augmentations_output = default_augmentations_output(output)
+    augmentations_output = _resolve_augmentation_output(
+        augmentations_input=augmentations_input,
+        augmentations_output=augmentations_output,
+        no_save_augmentations=no_save_augmentations,
+        evidence_output=output,
+    )
     if (
         output is not None
         and augmentations_output is not None
@@ -848,6 +1051,19 @@ def evaluate_dataset(
                 f"exceeding --max-environment-api-calls {max_environment_api_calls}; reduce "
                 "--limit, --operator, or --repetitions, or explicitly raise the call budget"
             )
+        run_config = DatasetRunConfig(
+            evaluation_mode=evaluation_mode,
+            repetitions=repetitions,
+            target=TargetExecutionConfig(
+                trial_timeout_seconds=target_timeout_seconds,
+                max_environment_api_calls=max_environment_api_calls,
+                environment_api_calls_per_trial=target_calls_per_execution,
+                planned_environment_api_calls=initial_target_calls,
+                allow_network_egress=(allow_environment_network or loaded_local_target is not None),
+                test_environment_confirmed=confirm_test_environment,
+                allow_insecure_http=allow_insecure_http,
+            ),
+        )
         if not dry_run and resume is None:
             if output is None:
                 raise typer.BadParameter("execution requires --output", param_hint="--output")
@@ -874,8 +1090,7 @@ def evaluate_dataset(
             build_dataset_evidence_run_context(
                 selected_records=selected_records,
                 selected_operator_ids=selected_operators,
-                evaluation_mode=evaluation_mode,
-                repetitions=repetitions,
+                run_config=run_config,
                 invariant_suite=invariant_suite,
                 target_config=(
                     None if direct_http_target_receipt is not None else normalized_target_config
@@ -900,20 +1115,13 @@ def evaluate_dataset(
                 dataset_operator_identity(operator_reference)
                 for operator_reference in selected_operators
             ),
-            semantic_settings=DatasetAugmentationLedgerSemanticSettings(
-                provider=settings.semantic_provider_id,
-                endpoint_sha256=settings.semantic_endpoint_sha256,
-                model=settings.model,
-                render_model=settings.render_model,
-                equivalence_model=settings.equivalence_model,
-                max_input_chars=settings.max_input_chars,
-                max_output_tokens=settings.max_output_tokens,
-                max_render_tokens=settings.max_render_tokens,
-                max_response_bytes=settings.max_response_bytes,
-                timeout_seconds=settings.timeout_seconds,
-            ),
+            semantic_settings=dataset_augmentation_ledger_semantic_settings(settings),
             redaction_policy_sha256=(
                 redaction_engine.policy.digest if redaction_engine is not None else None
+            ),
+            source_outcome_projection_sha256=_source_outcome_projection_sha256(
+                normalized_target_config,
+                loaded_local_target,
             ),
         )
     except (DatasetInputError, ValidationError, ValueError, RuntimeError) as error:
@@ -936,7 +1144,26 @@ def evaluate_dataset(
 
     resume_evidence: DatasetResumeEvidence | None = None
     saved_augmentations: dict[str, DatasetAugmentationResult] = {}
+    augmentations_input_sha256: str | None = None
     skipped_count = 0
+    try:
+        saved_augmentations, augmentations_input_sha256 = _load_complete_augmentation_input(
+            augmentations_input,
+            expected_context=augmentation_generation_context,
+            selected_records=all_selected_records,
+            recorded_sha256=(
+                recorded_manifest_for_resume.effective_command.augmentations_input_sha256
+                if recorded_manifest_for_resume is not None
+                else None
+            ),
+        )
+    except (OSError, ValueError) as error:
+        _close_trial_journal(trial_journal)
+        message = str(error) if isinstance(error, ValueError) else error.__class__.__name__
+        raise typer.BadParameter(
+            f"cannot safely reuse augmentation input ({message})",
+            param_hint="--augmentations-input",
+        ) from None
     if resume is not None:
         assert output is not None
         assert run_context is not None
@@ -947,6 +1174,8 @@ def evaluate_dataset(
                 selected_records=selected_records,
                 invariant_suite=invariant_suite,
             )
+            if trial_journal is not None:
+                _reconcile_source_preparation_failures(trial_journal, resume_evidence)
             if augmentations_output is not None and augmentations_output.exists():
                 augmentation_snapshot = read_augmentation_ledger(
                     augmentations_output,
@@ -987,12 +1216,8 @@ def evaluate_dataset(
             run_context=run_context,
             selected_records=all_selected_records,
             selected_operator_ids=selected_operators,
-            repetitions=repetitions,
-            max_environment_api_calls=max_environment_api_calls,
-            allow_environment_network=allow_environment_network,
-            confirm_test_environment=confirm_test_environment,
-            allow_insecure_http=allow_insecure_http,
-            save_augmentations=not no_save_augmentations,
+            run_config=run_config,
+            save_augmentations=augmentations_output is not None,
             semantic_provider_type=settings.semantic_provider_type,
             semantic_base_url=settings.semantic_base_url,
             semantic_live_calls=settings.live_calls,
@@ -1048,6 +1273,17 @@ def evaluate_dataset(
                     else None
                 )
             ),
+            augmentations_input_path=(
+                str(augmentations_input.resolve())
+                if augmentations_input is not None
+                and (recorded_manifest_for_resume is None or augmentations_input_was_explicit)
+                else (
+                    recorded_manifest_for_resume.effective_command.augmentations_input_path
+                    if recorded_manifest_for_resume is not None
+                    else None
+                )
+            ),
+            augmentations_input_sha256=augmentations_input_sha256,
             http_target_confirmation=_recorded_or_resolved_http_confirmation(
                 resolved_http_target, recorded_manifest_for_resume
             ),
@@ -1110,14 +1346,9 @@ def evaluate_dataset(
                         )
                 elif resolve_quarantine_after is not None:
                     raise ValueError("resume_incompatible:no_quarantined_trials_to_resolve")
-                if (
-                    not recorded_manifest.effective_command.save_augmentations
-                    and trial_journal.snapshot.terminal_states
-                ):
-                    raise ValueError(
-                        "resume_incompatible:augmentation_not_durable; start a new output with "
-                        "augmentation retention enabled"
-                    )
+                _validate_resume_augmentation_durability(
+                    recorded_manifest, trial_journal, resume_evidence
+                )
         except (OSError, ValueError) as error:
             if trial_journal is not None:
                 trial_journal.close()
@@ -1150,13 +1381,11 @@ def evaluate_dataset(
     campaign_plan = create_dataset_campaign_plan(
         records=selected_records,
         selected_operator_ids=selected_operators,
-        repetitions=repetitions,
-        target_calls_per_execution=target_calls_per_execution,
+        run_config=run_config,
         settings=settings,
         saved_augmentations=saved_augmentations,
         show_sensitive_values=show_sensitive_values,
         requires_preflight=evaluator_preflight is None and bool(selected_records),
-        evaluation_mode=evaluation_mode,
         fixture_status=(
             run_context.fixture.status
             if run_context is not None and run_context.fixture is not None
@@ -1174,10 +1403,11 @@ def evaluate_dataset(
         ),
     )
     potential_target_calls = campaign_plan.calls.total_environment_api
-    if potential_target_calls > max_environment_api_calls:
+    if potential_target_calls > run_config.target.max_environment_api_calls:
         raise typer.BadParameter(
             f"remaining selection would make up to {potential_target_calls} environment API calls, "
-            f"exceeding --max-environment-api-calls {max_environment_api_calls}; reduce --limit, "
+            "exceeding --max-environment-api-calls "
+            f"{run_config.target.max_environment_api_calls}; reduce --limit, "
             "--operator, "
             "or --repetitions, or explicitly raise the call budget"
         )
@@ -1202,9 +1432,10 @@ def evaluate_dataset(
             target_header_environment_variables=(
                 loaded_target_config.headers_from_env if loaded_target_config is not None else {}
             ),
-            repetitions=repetitions,
-            max_environment_api_calls=max_environment_api_calls,
-            target_calls_per_execution=target_calls_per_execution,
+            repetitions=run_config.repetitions,
+            target_timeout_seconds=run_config.target.trial_timeout_seconds,
+            max_environment_api_calls=run_config.target.max_environment_api_calls,
+            target_calls_per_execution=run_config.target.environment_api_calls_per_trial,
             target_supports_state_observation=(
                 json_http_environment_capabilities(loaded_target_config).supports_state_observation
                 if loaded_target_config is not None
@@ -1227,6 +1458,7 @@ def evaluate_dataset(
             ),
             invariant_suite=invariant_suite,
             output=output,
+            augmentations_input=augmentations_input,
             augmentations_output=augmentations_output,
             semantic_provider_id=settings.semantic_provider_id,
             semantic_endpoint_sha256=settings.semantic_endpoint_sha256,
@@ -1294,6 +1526,12 @@ def evaluate_dataset(
             f"Resume compatible: all {skipped_count} selected interaction(s) are complete in "
             f"{output}. Nothing to do."
         )
+        source_preparation_failure_count = len(resume_evidence.source_preparation_failures)
+        if source_preparation_failure_count:
+            console.print(
+                f"Source preparation failures: {source_preparation_failure_count}; "
+                "no target calls were made for those sources."
+            )
         if trial_journal is not None:
             trial_journal.close()
         previous_invariant_exit_code = dataset_invariant_exit_code(
@@ -1303,6 +1541,10 @@ def evaluate_dataset(
             raise typer.Exit(code=previous_invariant_exit_code)
         if resume_evidence.has_review_findings:
             raise typer.Exit(code=1)
+        if resume_evidence.has_inconclusive_materiality:
+            raise typer.Exit(code=2)
+        if source_preparation_failure_count:
+            raise typer.Exit(code=2)
         raise typer.Exit(code=0)
 
     if loaded_target_config is None and loaded_local_target is None:
@@ -1361,13 +1603,14 @@ def evaluate_dataset(
                 raise ValueError(
                     "HTTP execution requires --confirm-target with the exact displayed digest"
                 )
-            if not allow_environment_network:
+            if not run_config.target.allow_network_egress:
                 raise ValueError("environment execution requires --allow-environment-network")
             execution_target = JsonHttpEnvironmentConnection.from_config(
                 loaded_target_config,
-                test_environment_confirmed=True,
-                allow_insecure_http=allow_insecure_http,
-                max_environment_api_calls=max_environment_api_calls,
+                test_environment_confirmed=run_config.target.test_environment_confirmed,
+                allow_insecure_http=run_config.target.allow_insecure_http,
+                timeout_seconds=run_config.target.trial_timeout_seconds,
+                max_environment_api_calls=run_config.target.max_environment_api_calls,
             )
     except ValueError as error:
         raise typer.BadParameter(
@@ -1408,26 +1651,17 @@ def evaluate_dataset(
         ),
         target_call_budget=campaign_plan.calls.total_environment_api,
         semantic_call_budget=campaign_plan.calls.total_semantic_model,
-        environment_call_budget=max_environment_api_calls,
+        environment_call_budget=run_config.target.max_environment_api_calls,
         token_budget=campaign_plan.tokens.maximum,
-        maximum_wall_time_seconds=(
-            max(
-                1,
-                campaign_plan.calls.total_environment_api
-                + campaign_plan.calls.total_semantic_model,
-            )
-            * settings.timeout_seconds
-        ),
+        maximum_wall_time_seconds=campaign_plan.timing.maximum_wall_time_seconds,
         next_commands=create_campaign_next_commands(output, resume_argv=resume_argv),
         json_output=progress_json,
     )
     if trial_journal is not None:
-        terminal_states = trial_journal.snapshot.terminal_states
+        journal_snapshot = trial_journal.snapshot
+        terminal_states = journal_snapshot.terminal_states
         progress_runtime.tracker.hydrate_terminal_states(terminal_states)
-        attempted_target_calls = sum(
-            state in {"completed", "errored", "inconclusive", "quarantined"}
-            for state in terminal_states.values()
-        )
+        attempted_target_calls = _attempted_target_calls(journal_snapshot)
         progress_runtime.tracker.record_usage(
             target_calls=attempted_target_calls,
             semantic_calls=None,
@@ -1559,8 +1793,8 @@ def evaluate_dataset(
 
     assert output_stream is not None
     assert finding_reference_context is not None
-    has_review_findings = False
     invariant_evaluations: list[DatasetInvariantEvaluation] = []
+    source_preparation_events: list[DatasetSourcePreparationFailureEvent] = []
     try:
         with output_stream:
             evaluation_parameters = inspect.signature(evaluate_interaction_records).parameters
@@ -1575,11 +1809,6 @@ def evaluate_dataset(
                 durable_arguments["progress_runtime"] = progress_runtime
             if "complete_progress" in evaluation_parameters or accepts_extra_arguments:
                 durable_arguments["complete_progress"] = False
-            if (
-                "environment_calls_per_target_call" in evaluation_parameters
-                or accepts_extra_arguments
-            ):
-                durable_arguments["environment_calls_per_target_call"] = target_calls_per_execution
             if trial_journal is not None and (
                 "trial_journal" in evaluation_parameters or accepts_extra_arguments
             ):
@@ -1588,6 +1817,8 @@ def evaluate_dataset(
                 "progress_json" in evaluation_parameters or accepts_extra_arguments
             ):
                 durable_arguments["progress_json"] = True
+            if "source_preparation_events" in evaluation_parameters or accepts_extra_arguments:
+                durable_arguments["source_preparation_events"] = source_preparation_events
             evaluation_runner = cast(Any, evaluate_interaction_records)
             if invariant_suite is not None:
                 evaluation_coroutine = evaluation_runner(
@@ -1596,14 +1827,7 @@ def evaluate_dataset(
                     settings,
                     execution_target,
                     output_stream,
-                    repetitions=repetitions,
-                    max_environment_api_calls=max_environment_api_calls,
-                    planned_target_calls=(
-                        (len(selected_records) + skipped_count)
-                        * repetitions
-                        * (1 + len(selected_operators))
-                        * target_calls_per_execution
-                    ),
+                    run_config=run_config,
                     run_context=run_context,
                     augmentation_ledger=augmentation_ledger,
                     saved_augmentations=saved_augmentations,
@@ -1620,14 +1844,7 @@ def evaluate_dataset(
                     settings,
                     execution_target,
                     output_stream,
-                    repetitions=repetitions,
-                    max_environment_api_calls=max_environment_api_calls,
-                    planned_target_calls=(
-                        (len(selected_records) + skipped_count)
-                        * repetitions
-                        * (1 + len(selected_operators))
-                        * target_calls_per_execution
-                    ),
+                    run_config=run_config,
                     run_context=run_context,
                     augmentation_ledger=augmentation_ledger,
                     saved_augmentations=saved_augmentations,
@@ -1640,7 +1857,7 @@ def evaluate_dataset(
             prior_invariant_evaluations = (
                 resume_evidence.invariant_evaluations if resume_evidence is not None else ()
             )
-            has_review_findings = _write_finding_package_snapshot(
+            _write_finding_package_snapshot(
                 finding_output,
                 (*prior_results, *results),
                 (*prior_invariant_evaluations, *invariant_evaluations),
@@ -1685,6 +1902,9 @@ def evaluate_dataset(
             f"{len(results)} newly evaluated."
         )
     progress_runtime.tracker.emit(status="running", stage="report")
+    all_source_preparation_failures = (
+        resume_evidence.source_preparation_failures if resume_evidence is not None else ()
+    ) + tuple(event.evidence for event in source_preparation_events)
     try:
         print_dataset_results(
             results,
@@ -1692,11 +1912,15 @@ def evaluate_dataset(
             augmentations_output=augmentations_output,
             invariant_evaluations=tuple(invariant_evaluations),
             show_report_guidance=show_report_guidance,
+            source_preparation_failure_count=len(all_source_preparation_failures),
         )
     except Exception:
         progress_runtime.tracker.emit(status="failed", stage="terminal")
         raise
-    progress_runtime.tracker.emit(status="completed", stage="terminal")
+    progress_runtime.tracker.emit(
+        status="failed" if all_source_preparation_failures else "completed",
+        stage="terminal",
+    )
     prior_invariant_evaluations = (
         resume_evidence.invariant_evaluations if resume_evidence is not None else ()
     )
@@ -1707,8 +1931,21 @@ def evaluate_dataset(
         raise typer.Exit(code=1)
     if evaluation_exit_code == 2:
         raise typer.Exit(code=2)
-    if has_review_findings or (resume_evidence is not None and resume_evidence.has_review_findings):
+    all_semantic_results = (
+        *(resume_evidence.technical_results if resume_evidence is not None else ()),
+        *results,
+    )
+    semantic_exit_code = max(
+        (dataset_result_exit_code(result) for result in all_semantic_results),
+        default=0,
+        key=lambda code: {0: 0, 2: 1, 1: 2}[code],
+    )
+    if semantic_exit_code == 1:
         raise typer.Exit(code=1)
+    if semantic_exit_code == 2:
+        raise typer.Exit(code=2)
+    if all_source_preparation_failures:
+        raise typer.Exit(code=2)
 
 
 def _recorded_http_target_config(
@@ -1799,42 +2036,24 @@ def _manifest_incompatibility_reason(
         ("projection", recorded.invariant_suite_sha256, requested.invariant_suite_sha256),
         ("operators", recorded.operators, requested.operators),
         (
-            "evaluator.provider",
-            recorded.semantic_settings.provider,
-            requested.semantic_settings.provider,
+            "target_timeout_seconds",
+            recorded.target_timeout_seconds,
+            requested.target_timeout_seconds,
         ),
         (
-            "evaluator.endpoint_sha256",
-            recorded.semantic_settings.endpoint_sha256,
-            requested.semantic_settings.endpoint_sha256,
-        ),
-        ("evaluator.model", recorded.semantic_settings.model, requested.semantic_settings.model),
-        (
-            "evaluator.render_model",
-            recorded.semantic_settings.render_model,
-            requested.semantic_settings.render_model,
+            "evaluator.llm_client",
+            recorded.semantic_settings.llm_client,
+            requested.semantic_settings.llm_client,
         ),
         (
-            "evaluator.equivalence_model",
-            recorded.semantic_settings.equivalence_model,
-            requested.semantic_settings.equivalence_model,
+            "evaluator.materiality_version",
+            recorded.semantic_settings.materiality_evaluator_version_id,
+            requested.semantic_settings.materiality_evaluator_version_id,
         ),
         (
-            "evaluator.limits",
-            (
-                recorded.semantic_settings.max_input_chars,
-                recorded.semantic_settings.max_output_tokens,
-                recorded.semantic_settings.max_render_tokens,
-                recorded.semantic_settings.max_response_bytes,
-                recorded.semantic_settings.timeout_seconds,
-            ),
-            (
-                requested.semantic_settings.max_input_chars,
-                requested.semantic_settings.max_output_tokens,
-                requested.semantic_settings.max_render_tokens,
-                requested.semantic_settings.max_response_bytes,
-                requested.semantic_settings.timeout_seconds,
-            ),
+            "evaluator.max_input_chars",
+            recorded.semantic_settings.max_input_chars,
+            requested.semantic_settings.max_input_chars,
         ),
         ("dataset", recorded.selected_dataset_sha256, requested.selected_dataset_sha256),
         ("redaction", recorded.redaction_policy_sha256, requested.redaction_policy_sha256),
@@ -1846,33 +2065,48 @@ def _restore_recorded_semantic_settings(
     manifest: DatasetRunManifest,
 ) -> DatasetSemanticSettings:
     recorded = manifest.run_context.semantic_settings
+    llm_client = recorded.llm_client
+    deconstruct = llm_client.role_config("deconstruct")
+    render = llm_client.role_config("render")
+    equivalence = llm_client.role_config("equivalence")
+    materiality = llm_client.role_config("materiality")
     command = manifest.effective_command
     if command.semantic_provider_type == "openai-compatible":
         return OpenAICompatibleDatasetSettings(
             live_calls=command.semantic_live_calls,
             allow_external_data_processing=command.semantic_allow_external_data_processing,
-            model=recorded.model,
-            render_model=recorded.render_model,
-            equivalence_model=recorded.equivalence_model,
+            model=deconstruct.model,
+            render_model=render.model,
+            equivalence_model=equivalence.model,
+            materiality_model=materiality.model,
+            deconstruct_reasoning=deconstruct.reasoning_mode,
+            render_reasoning=render.reasoning_mode,
+            equivalence_reasoning=equivalence.reasoning_mode,
             max_input_chars=recorded.max_input_chars,
-            max_output_tokens=recorded.max_output_tokens,
-            max_render_tokens=recorded.max_render_tokens,
-            max_response_bytes=recorded.max_response_bytes,
-            timeout_seconds=recorded.timeout_seconds,
-            provider_id=recorded.provider,
+            max_output_tokens=deconstruct.max_output_tokens,
+            max_render_tokens=render.max_output_tokens,
+            max_response_bytes=llm_client.max_response_bytes,
+            timeout_seconds=llm_client.timeout_seconds,
+            provider_id=llm_client.provider_id,
             base_url=command.semantic_base_url,
         )
+    assert llm_client.upstream_provider is not None
     return OpenRouterDatasetSettings(
         live_calls=command.semantic_live_calls,
         allow_external_data_processing=command.semantic_allow_external_data_processing,
-        model=recorded.model,
-        render_model=recorded.render_model,
-        equivalence_model=recorded.equivalence_model,
+        model=deconstruct.model,
+        render_model=render.model,
+        equivalence_model=equivalence.model,
+        materiality_model=materiality.model,
+        deconstruct_reasoning=deconstruct.reasoning_mode,
+        render_reasoning=render.reasoning_mode,
+        equivalence_reasoning=equivalence.reasoning_mode,
         max_input_chars=recorded.max_input_chars,
-        max_output_tokens=recorded.max_output_tokens,
-        max_render_tokens=recorded.max_render_tokens,
-        max_response_bytes=recorded.max_response_bytes,
-        timeout_seconds=recorded.timeout_seconds,
+        max_output_tokens=deconstruct.max_output_tokens,
+        max_render_tokens=render.max_output_tokens,
+        max_response_bytes=llm_client.max_response_bytes,
+        timeout_seconds=llm_client.timeout_seconds,
+        upstream_provider=llm_client.upstream_provider,
     )
 
 
@@ -1883,6 +2117,7 @@ def _effective_command_incompatibility_reason(
     left = recorded.effective_command
     right = requested.effective_command
     checks = (
+        ("run_config", left.run_config, right.run_config),
         ("invariant_suite_source", left.invariant_suite_source, right.invariant_suite_source),
         ("redaction_policy_source", left.redaction_policy_source, right.redaction_policy_source),
         ("redaction_state_path", left.redaction_state_path, right.redaction_state_path),
@@ -1892,15 +2127,19 @@ def _effective_command_incompatibility_reason(
             right.redaction_state_sha256,
         ),
         (
+            "augmentations_input_path",
+            left.augmentations_input_path,
+            right.augmentations_input_path,
+        ),
+        (
+            "augmentations_input_sha256",
+            left.augmentations_input_sha256,
+            right.augmentations_input_sha256,
+        ),
+        (
             "augmentations_output_path",
             left.augmentations_output_path,
             right.augmentations_output_path,
-        ),
-        ("repetitions", left.repetitions, right.repetitions),
-        (
-            "max_environment_api_calls",
-            left.max_environment_api_calls,
-            right.max_environment_api_calls,
         ),
     )
     return next((name for name, old, new in checks if old != new), None)

@@ -16,14 +16,18 @@ from typing import Any, cast
 
 import pytest
 import typer
-from dataset._factories import _evaluator_preflight
+from dataset._factories import _evaluator_preflight, _run_config, _settings
 from typer.testing import CliRunner
 from ul import (
     DatasetEvaluationResult,
+    EvaluatorDecision,
+    EvaluatorEvidence,
     InteractionRecord,
     load_json_http_environment_config,
     load_local_target_config,
 )
+from ul.evaluators import evaluator_judge_version_from_llm_config
+from ul.llm import LLMClient, llm_client_config_from_dataset_settings
 from ul_cli import dataset_review
 from ul_cli import probe as probe_module
 from ul_cli import progress_action as progress_action_module
@@ -104,11 +108,16 @@ def _write_callable(path: Path, *, failing: bool = False) -> None:
 
 
 class _CleanRoomSemanticModel:
+    def __init__(self, semantic_settings: Any | None = None) -> None:
+        self.llm_client = LLMClient(
+            llm_client_config_from_dataset_settings(semantic_settings or _settings())
+        )
+
     async def __aenter__(self) -> _CleanRoomSemanticModel:
         return self
 
     async def __aexit__(self, *args: object) -> None:
-        return None
+        await self.llm_client.aclose()
 
     def reuse_preflight(self, result: object) -> None:
         del result
@@ -119,8 +128,28 @@ class _CleanRoomSemanticModel:
         reference_frame: SemanticFrame | None = None,
     ) -> SemanticFrame:
         if not isinstance(record, InteractionRecord):
-            assert reference_frame is not None
-            return reference_frame.model_copy(update={"interaction_id": record.id})
+            if reference_frame is not None:
+                return reference_frame.model_copy(update={"interaction_id": record.id})
+            return SemanticFrame(
+                interaction_id=record.id,
+                request_units=(
+                    RequestUnit(
+                        id="lookup-request",
+                        evidence=(
+                            EvidenceReference(
+                                source="input",
+                                json_pointer="/raw_input",
+                                text_quote=None,
+                            ),
+                        ),
+                        confidence=1,
+                        status="explicit",
+                        mode="ask",
+                        predicate="lookup",
+                    ),
+                ),
+                extractor_version="clean-room-test",
+            )
         return SemanticFrame(
             interaction_id=record.id,
             request_units=(
@@ -251,6 +280,144 @@ class _RegressionSemanticModel(_CleanRoomSemanticModel):
     ) -> RenderedUserInput:
         del instruction, allow_temporary_value
         return RenderedUserInput(text=f"{raw_input} [accepted variation]")
+
+
+class _ResponseOnlySemanticModel(_CleanRoomSemanticModel):
+    async def deconstruct(
+        self,
+        record: InteractionRecord | UserInputRecord,
+        reference_frame: SemanticFrame | None = None,
+    ) -> SemanticFrame:
+        if not isinstance(record, InteractionRecord):
+            assert reference_frame is not None
+            return reference_frame.model_copy(update={"interaction_id": record.id})
+        output = record.raw_observed_output
+        if isinstance(output, str):
+            recommendation = output
+            output_pointer = "/raw_observed_output"
+        else:
+            output = cast(dict[str, Any], output)
+            recommendation = cast(str, output["recommendation"])
+            output_pointer = "/raw_observed_output/recommendation"
+        return SemanticFrame(
+            interaction_id=record.id,
+            request_units=(
+                RequestUnit(
+                    id="support-request",
+                    evidence=(
+                        EvidenceReference(
+                            source="input", json_pointer="/raw_input", text_quote=None
+                        ),
+                    ),
+                    confidence=1,
+                    status="explicit",
+                    mode="ask",
+                    predicate="support_recommendation",
+                ),
+            ),
+            outcomes=(
+                ObservedOutcome(
+                    id="support-answer",
+                    evidence=(
+                        EvidenceReference(
+                            source="output",
+                            json_pointer=output_pointer,
+                            text_quote=recommendation,
+                        ),
+                    ),
+                    confidence=1,
+                    status="observed",
+                    request_unit_ids=("support-request",),
+                    position=0,
+                    kind="answer",
+                    predicate="support_recommendation",
+                    fields={"text": recommendation},
+                ),
+            ),
+            extractor_version="response-only-e2e-test",
+        )
+
+    async def render(
+        self,
+        raw_input: str,
+        instruction: str,
+        *,
+        allow_temporary_value: bool = False,
+    ) -> RenderedUserInput:
+        del instruction, allow_temporary_value
+        return RenderedUserInput(text=f"{raw_input} please")
+
+
+class _UnknownOutcomeSemanticModel(_ResponseOnlySemanticModel):
+    async def deconstruct(
+        self,
+        record: InteractionRecord | UserInputRecord,
+        reference_frame: SemanticFrame | None = None,
+    ) -> SemanticFrame:
+        if not isinstance(record, InteractionRecord):
+            assert reference_frame is not None
+            return reference_frame.model_copy(update={"interaction_id": record.id})
+        return SemanticFrame(
+            interaction_id=record.id,
+            outcomes=(
+                ObservedOutcome(
+                    id="tool-result",
+                    evidence=(
+                        EvidenceReference(
+                            source="output",
+                            json_pointer="/raw_observed_output/result",
+                            text_quote=None,
+                        ),
+                    ),
+                    confidence=1,
+                    status="observed",
+                    position=0,
+                    kind="tool_result",
+                    predicate="lookup",
+                    fields={"value": "complete"},
+                ),
+            ),
+            extractor_version="unknown-outcome-test",
+        )
+
+
+class _MaterialResponseJudge:
+    def __init__(self, *, llm_client: LLMClient) -> None:
+        self.version = evaluator_judge_version_from_llm_config(llm_client.config)
+
+    async def __aenter__(self) -> _MaterialResponseJudge:
+        return self
+
+    async def __aexit__(self, *args: object) -> None:
+        pass
+
+    async def evaluate(self, request: object) -> EvaluatorDecision:
+        del request
+        return EvaluatorDecision(
+            score=1,
+            label="material_variance:response_meaning_changed",
+            explanation="The response recommendation changed.",
+            evidence=(
+                EvaluatorEvidence(
+                    source="judge_payload",
+                    json_pointer="/payload/answer/findings/0/baseline_effects/0",
+                    description="baseline",
+                ),
+                EvaluatorEvidence(
+                    source="judge_payload",
+                    json_pointer="/payload/answer/findings/0/variation_effects/0",
+                    description="variation",
+                ),
+            ),
+        )
+
+
+def _use_material_response_judge(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        campaign_runner_module,
+        "OpenAICompatibleEvaluatorJudge",
+        _MaterialResponseJudge,
+    )
 
 
 def test_declining_target_confirmation_imports_nothing_and_calls_nothing(
@@ -740,7 +907,7 @@ def test_structured_http_target_runs_real_smoke_and_campaign(
     monkeypatch.setattr(
         campaign_runner_module,
         "create_semantic_model_deconstructor",
-        lambda _settings: _CleanRoomSemanticModel(),
+        lambda semantic_settings: _CleanRoomSemanticModel(semantic_settings),
     )
     arguments = [
         "probe",
@@ -784,6 +951,126 @@ def test_structured_http_target_runs_real_smoke_and_campaign(
         assert load_json_http_environment_config(config_path).execute.request_json_template == {
             "payload": "{{input}}"
         }
+
+
+def test_http_smoke_projects_openai_tool_call_without_executable_adapter(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    received_requests: list[object] = []
+
+    class TargetHandler(BaseHTTPRequestHandler):
+        def do_POST(self) -> None:
+            content_length = int(self.headers["Content-Length"])
+            received_requests.append(json.loads(self.rfile.read(content_length)))
+            response = json.dumps(
+                {
+                    "choices": [
+                        {
+                            "message": {
+                                "tool_calls": [
+                                    {
+                                        "type": "function",
+                                        "function": {
+                                            "name": "record_observation",
+                                            "arguments": json.dumps(
+                                                {
+                                                    "ticket": 42,
+                                                    "value": "118/77 mmHg",
+                                                    "body": {
+                                                        "subject": {"reference": "Patient/123"}
+                                                    },
+                                                }
+                                            ),
+                                        },
+                                    }
+                                ]
+                            }
+                        }
+                    ]
+                }
+            ).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(response)))
+            self.end_headers()
+            self.wfile.write(response)
+
+        def log_message(self, format: str, *args: object) -> None:
+            del format, args
+
+    try:
+        server = ThreadingHTTPServer(("127.0.0.1", 0), TargetHandler)
+    except PermissionError:
+        pytest.skip("the test environment does not allow binding a loopback server")
+    server_thread = threading.Thread(target=server.serve_forever)
+    server_thread.start()
+    config = tmp_path / "tool-call-target.json"
+    config.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "adapter_tier": "isolated_response",
+                "environment_id": "tool-call-target",
+                "request_isolation_attested": True,
+                "safe_test_target_attested": True,
+                "headers_from_env": {},
+                "execute": {
+                    "url": f"http://127.0.0.1:{server.server_port}/invoke",
+                    "request_json_template": {
+                        "messages": [{"role": "user", "content": "{{input}}"}]
+                    },
+                    "response_json_pointer": "",
+                },
+                "outcome": {
+                    "compose": {
+                        "fields": {
+                            "action": "/choices/0/message/tool_calls/0/function/name",
+                        },
+                        "spread": {
+                            "selector": "/choices/0/message/tool_calls/0/function/arguments",
+                            "decode": "json_string",
+                            "flatten": True,
+                        },
+                    },
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    dataset = _write_dataset(tmp_path)
+    monkeypatch.chdir(tmp_path)
+
+    async def unexpected_preflight(*args: object, **kwargs: object) -> None:
+        raise AssertionError("semantic preflight must not run before paid confirmation")
+
+    monkeypatch.setattr(probe_module, "preflight_evaluator", unexpected_preflight)
+    try:
+        result = runner.invoke(
+            app,
+            [
+                "probe",
+                str(dataset),
+                "--target",
+                str(config),
+                "--allow-insecure-http",
+            ],
+            input="y\nn\n",
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+        server_thread.join()
+
+    assert result.exit_code == 0, result.output
+    assert received_requests == [
+        {"messages": [{"role": "user", "content": "Echo grounded example 1."}]}
+    ]
+    compact_output = "".join(result.output.split())
+    assert '"action":"record_observation"' in compact_output
+    assert '"ticket":42' in compact_output
+    assert '"value":"118/77mmHg"' in compact_output
+    assert '"body.subject.reference":"Patient/123"' in compact_output
 
 
 def test_direct_http_rejects_echoed_nonstandard_header_before_semantic_evaluation(
@@ -1075,6 +1362,7 @@ def test_run_target_receipt_records_projection_definition_and_digest(tmp_path: P
         "amount": None,
         "effects": None,
         "complete_result": None,
+        "compose": None,
         "private_json_pointers": [],
     }
     assert receipt["outcome_projection_sha256"] == resolved.config.outcome.digest
@@ -1295,8 +1583,7 @@ def test_campaign_receipt_binds_models_bounds_and_command_wide_smoke_wall(
     plan = probe_module.create_dataset_campaign_plan(
         records=records,
         selected_operator_ids=operator_ids,
-        repetitions=1,
-        target_calls_per_execution=1,
+        run_config=_run_config(),
         settings=settings,
     )
     original = probe_module._campaign_confirmation(plan, settings, resolved, case_limit=10)
@@ -1309,11 +1596,19 @@ def test_campaign_receipt_binds_models_bounds_and_command_wide_smoke_wall(
 
     assert original.semantic_settings_sha256 != changed.semantic_settings_sha256
     assert probe_module._model_sha256(original) != probe_module._model_sha256(changed)
+    changed_provider = probe_module._campaign_confirmation(
+        plan,
+        settings.model_copy(update={"upstream_provider": "different-provider"}),
+        resolved,
+        case_limit=10,
+    )
+    assert original.semantic_settings_sha256 != changed_provider.semantic_settings_sha256
+    assert original.data_policy["upstream_provider"] == settings.upstream_provider
+    assert changed_provider.data_policy["upstream_provider"] == "different-provider"
     different_operator_plan = probe_module.create_dataset_campaign_plan(
         records=records,
         selected_operator_ids=probe_module.validate_operator_ids(["input.surface.case_variation"]),
-        repetitions=1,
-        target_calls_per_execution=1,
+        run_config=_run_config(),
         settings=settings,
     )
     different_operator_confirmation = probe_module._campaign_confirmation(
@@ -1654,7 +1949,7 @@ def test_authenticated_direct_http_pause_resume_preserves_mapping_options(
     monkeypatch.setattr(
         campaign_runner_module,
         "create_semantic_model_deconstructor",
-        lambda _settings: _CleanRoomSemanticModel(),
+        lambda semantic_settings: _CleanRoomSemanticModel(semantic_settings),
     )
     endpoint = f"http://127.0.0.1:{server.server_port}/invoke"
     try:
@@ -1957,7 +2252,7 @@ def test_paused_probe_action_resumes_after_terminal_trial_without_replay(
     monkeypatch.setattr(
         campaign_runner_module,
         "create_semantic_model_deconstructor",
-        lambda _settings: _CleanRoomSemanticModel(),
+        lambda semantic_settings: _CleanRoomSemanticModel(semantic_settings),
     )
     result = runner.invoke(
         app,
@@ -2267,7 +2562,8 @@ def test_public_documentation_flow_runs_real_callable_campaign_and_report(
     dataset = tmp_path / "interactions.jsonl"
     dataset.write_text(
         '{"id":"case-1","input":"Return the status for ticket 42.",'
-        '"output":{"action":"lookup","ticket":42}}\n',
+        '"output":{"result":{"action":"lookup","ticket":42,'
+        '"customer":{"email":"private@example.test"}}}}\n',
         encoding="utf-8",
     )
     config = _write_projected_callable_config(
@@ -2358,8 +2654,11 @@ def test_public_documentation_flow_runs_real_callable_campaign_and_report(
     evidence = evidence_lines[1]
     assert evidence["execution_plan"]["repetitions"] == 2
     assert evidence["execution_plan"]["dataset_planned_target_calls"] == 4
-    assert evidence["run_context"]["semantic_settings"]["provider"] == "openrouter"
-    assert evidence["run_context"]["semantic_settings"]["model"]
+    assert evidence["run_context"]["semantic_settings"]["llm_client"]["provider_id"] == (
+        "openrouter"
+    )
+    llm_roles = evidence["run_context"]["semantic_settings"]["llm_client"]["roles"]
+    assert next(role["model"] for role in llm_roles if role["role"] == "deconstruct")
     assert evidence["run_context"]["target"]["kind"] == "probe_target"
     assert evidence["run_context"]["target"]["receipt"]["confirmation_sha256"]
     assert (
@@ -2400,7 +2699,7 @@ def test_campaign_projection_failure_retains_exact_reason_and_partial_work(
     dataset = tmp_path / "interactions.jsonl"
     dataset.write_text(
         '{"id":"case-1","input":"Return the status for ticket 42.",'
-        '"output":{"action":"lookup","ticket":42}}\n',
+        '"output":{"result":{"action":"lookup","ticket":42}}}\n',
         encoding="utf-8",
     )
     config = _write_projected_callable_config(
@@ -2447,6 +2746,237 @@ def test_campaign_projection_failure_retains_exact_reason_and_partial_work(
     assert failure["lifecycle_failure"]["failed_phase"] == "outcome_projection"
     assert failure["lifecycle_failure"]["environment_state_may_remain"] is True
     assert "result evaluation was not run" in failure["inconclusive_reasons"][0]
+
+
+def test_public_probe_runs_answer_only_callable_through_real_worker_and_reports_response_change(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _use_material_response_judge(monkeypatch)
+    (tmp_path / "agent.py").write_text(
+        "import json\n"
+        "from pathlib import Path\n\n"
+        "def run(value):\n"
+        "    with Path('target-invocations.jsonl').open('a', encoding='utf-8') as stream:\n"
+        "        stream.write(json.dumps(value) + '\\n')\n"
+        "    recommendation = ('Retry the login. PRIVATE_RESPONSE_CANARY' "
+        "if value.endswith(' please') else "
+        "'Escalate to support. PRIVATE_RESPONSE_CANARY')\n"
+        "    return {'recommendation': recommendation}\n",
+        encoding="utf-8",
+    )
+    dataset = tmp_path / "interactions.jsonl"
+    dataset.write_text(
+        '{"id":"case-1","input":"I cannot log in. What should I do?",'
+        '"output":{"recommendation":"Escalate to support. PRIVATE_RESPONSE_CANARY"}}\n',
+        encoding="utf-8",
+    )
+    output = tmp_path / "evidence.jsonl"
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("UL_LIVE", "true")
+    monkeypatch.setenv("OPEN_ROUTER_API_KEY", "test-key")
+
+    async def successful_preflight(settings: object) -> object:
+        del settings
+        return _evaluator_preflight()
+
+    monkeypatch.setattr(probe_module, "preflight_evaluator", successful_preflight)
+    monkeypatch.setattr(
+        campaign_runner_module,
+        "create_semantic_model_deconstructor",
+        lambda semantic_settings: _ResponseOnlySemanticModel(semantic_settings),
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "probe",
+            str(dataset),
+            "--target",
+            "agent:run",
+            "--output",
+            str(output),
+            "--operator",
+            "input.surface.rephrase",
+            "--limit",
+            "1",
+        ],
+        input="y\ny\n",
+    )
+
+    assert result.exit_code == 1, result.output
+    normalized_output = " ".join(result.output.split())
+    assert "changed the agent's observed response" in normalized_output
+    assert "Response evidence: observed" in normalized_output
+    assert "private response shape" in normalized_output
+    assert "PRIVATE_RESPONSE_CANARY" not in result.output
+    assert len((tmp_path / "target-invocations.jsonl").read_text().splitlines()) == 3
+    evidence_lines = [json.loads(line) for line in output.read_text().splitlines()]
+    assert len(evidence_lines) == 2
+    finding = evidence_lines[1]["cases"][0]["findings"][0]
+    cross_examination = evidence_lines[1]["cases"][0]["cross_examination"]
+    assert finding["category"] == "changed_response"
+    assert cross_examination["response_evidence"]["conclusion"] == "observed"
+    assert cross_examination["committed_state_evidence"]["conclusion"] == "unavailable"
+    assert all(effect["kind"] == "answer" for effect in finding["reference_effects"])
+    assert all(effect["kind"] == "answer" for effect in finding["observed_effects"])
+
+
+def test_public_probe_runs_raw_text_callable_through_real_worker_without_leaking_response(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _use_material_response_judge(monkeypatch)
+    (tmp_path / "agent.py").write_text(
+        "from pathlib import Path\n\n"
+        "def run(value):\n"
+        "    with Path('target-invocations').open('a', encoding='utf-8') as stream:\n"
+        "        stream.write('called\\n')\n"
+        "    return ('Retry the login. RAW_TEXT_PRIVATE_CANARY' "
+        "if value.endswith(' please') else "
+        "'Escalate to support. RAW_TEXT_PRIVATE_CANARY')\n",
+        encoding="utf-8",
+    )
+    dataset = tmp_path / "interactions.jsonl"
+    dataset.write_text(
+        '{"id":"case-1","input":"I cannot log in. What should I do?",'
+        '"output":"Escalate to support. RAW_TEXT_PRIVATE_CANARY"}\n',
+        encoding="utf-8",
+    )
+    output = tmp_path / "evidence.jsonl"
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("UL_LIVE", "true")
+    monkeypatch.setenv("OPEN_ROUTER_API_KEY", "test-key")
+
+    async def successful_preflight(settings: object) -> object:
+        del settings
+        return _evaluator_preflight()
+
+    monkeypatch.setattr(probe_module, "preflight_evaluator", successful_preflight)
+    monkeypatch.setattr(
+        campaign_runner_module,
+        "create_semantic_model_deconstructor",
+        lambda semantic_settings: _ResponseOnlySemanticModel(semantic_settings),
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "probe",
+            str(dataset),
+            "--target",
+            "agent:run",
+            "--output",
+            str(output),
+            "--operator",
+            "input.surface.rephrase",
+            "--limit",
+            "1",
+        ],
+        input="y\ny\n",
+    )
+
+    assert result.exit_code == 1, result.output
+    assert "RAW_TEXT_PRIVATE_CANARY" not in result.output
+    assert len((tmp_path / "target-invocations").read_text().splitlines()) == 3
+    evidence = json.loads(output.read_text().splitlines()[1])
+    assert evidence["cases"][0]["findings"][0]["category"] == "changed_response"
+
+
+def test_public_probe_maps_source_compatibility_before_campaign_target_invocation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (tmp_path / "agent.py").write_text(
+        "from pathlib import Path\n\n"
+        "def run(value):\n"
+        "    with Path('target-invocations').open('a', encoding='utf-8') as stream:\n"
+        "        stream.write('called\\n')\n"
+        "    return {'result': 'complete'}\n",
+        encoding="utf-8",
+    )
+    dataset = tmp_path / "interactions.jsonl"
+    dataset.write_text(
+        '{"id":"case-1","input":"Look it up.","output":{"result":"complete"}}\n',
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("UL_LIVE", "true")
+    monkeypatch.setenv("OPEN_ROUTER_API_KEY", "test-key")
+
+    async def successful_preflight(settings: object) -> object:
+        del settings
+        return _evaluator_preflight()
+
+    monkeypatch.setattr(probe_module, "preflight_evaluator", successful_preflight)
+    monkeypatch.setattr(
+        campaign_runner_module,
+        "create_semantic_model_deconstructor",
+        lambda _settings: _UnknownOutcomeSemanticModel(),
+    )
+
+    result = runner.invoke(
+        app,
+        ["probe", str(dataset), "--target", "agent:run", "--limit", "1"],
+        input="y\ny\n",
+    )
+
+    assert result.exit_code == 2, result.output
+    assert "PROBE_SOURCE_COMPARISON_INCOMPATIBLE" in result.output
+    assert "no coherent action or grounded response" in result.output
+    assert "Record the agent's returned text or JSON response" in result.output
+    assert "Target safe to reuse: yes" in result.output
+    assert (tmp_path / "target-invocations").read_text().splitlines() == ["called"]
+
+
+def test_public_probe_maps_invalid_recorded_projection_before_campaign_target_invocation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (tmp_path / "agent.py").write_text(
+        "from pathlib import Path\n\n"
+        "def run(value):\n"
+        "    with Path('target-invocations').open('a', encoding='utf-8') as stream:\n"
+        "        stream.write('called\\n')\n"
+        "    return {'result': {'action': 'lookup'}}\n",
+        encoding="utf-8",
+    )
+    dataset = tmp_path / "interactions.jsonl"
+    dataset.write_text(
+        '{"id":"case-1","input":"Look it up.","output":{"missing":true}}\n',
+        encoding="utf-8",
+    )
+    config = _write_projected_callable_config(
+        tmp_path,
+        {"schema_version": "1.0.0", "complete_result": "/result"},
+        target="agent:run",
+    )
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("UL_LIVE", "true")
+    monkeypatch.setenv("OPEN_ROUTER_API_KEY", "test-key")
+
+    async def successful_preflight(settings: object) -> object:
+        del settings
+        return _evaluator_preflight()
+
+    monkeypatch.setattr(probe_module, "preflight_evaluator", successful_preflight)
+    monkeypatch.setattr(
+        campaign_runner_module,
+        "create_semantic_model_deconstructor",
+        lambda semantic_settings: _CleanRoomSemanticModel(semantic_settings),
+    )
+
+    result = runner.invoke(
+        app,
+        ["probe", str(dataset), "--target", str(config), "--limit", "1"],
+        input="y\ny\n",
+    )
+
+    assert result.exit_code == 2, result.output
+    assert "PROBE_SOURCE_OUTCOME_PROJECTION_INVALID" in result.output
+    assert "does not satisfy the target's declared outcome projection" in result.output
+    assert "Target safe to reuse: yes" in result.output
+    assert (tmp_path / "target-invocations").read_text().splitlines() == ["called"]
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX executable-script test")
@@ -2567,8 +3097,7 @@ def _probe_review_and_save_response_regression(
         return _evaluator_preflight()
 
     def clean_room_model(settings: object) -> _RegressionSemanticModel:
-        del settings
-        return _RegressionSemanticModel()
+        return _RegressionSemanticModel(settings)
 
     monkeypatch.setattr(probe_module, "preflight_evaluator", clean_room_preflight)
     monkeypatch.setattr(
@@ -2668,6 +3197,7 @@ def test_real_callable_probe_review_save_and_replay_without_bridge(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    _use_material_response_judge(monkeypatch)
     (tmp_path / "customer_agent.py").write_text(
         "def run(value):\n"
         "    changed = '[accepted variation]' in value\n"
@@ -2722,6 +3252,7 @@ def test_real_authenticated_http_probe_review_save_and_replay_without_bridge(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    _use_material_response_judge(monkeypatch)
     received_authorization: list[str | None] = []
 
     class RegressionTargetHandler(BaseHTTPRequestHandler):

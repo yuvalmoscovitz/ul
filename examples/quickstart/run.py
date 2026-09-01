@@ -11,7 +11,7 @@ from threading import Thread
 from typing import Annotated, TextIO, cast
 
 import typer
-from ul import load_dataset_semantic_settings
+from ul import OpenRouterDatasetSettings, load_dataset_semantic_settings
 
 from examples.quickstart.defective_agent import create_server
 
@@ -20,11 +20,6 @@ _PROJECT_DIRECTORY = _QUICKSTART_DIRECTORY.parents[1]
 _DATASET_PATH = _QUICKSTART_DIRECTORY / "dataset.jsonl"
 _INVARIANTS_PATH = _QUICKSTART_DIRECTORY / "invariants.json"
 _TARGET_TEMPLATE_PATH = _QUICKSTART_DIRECTORY / "target.json"
-_QUICKSTART_MODEL_ENVIRONMENT = {
-    "UL_DATASET_MODEL": "google/gemini-3.5-flash",
-    "UL_DATASET_RENDER_MODEL": "google/gemini-2.5-flash",
-    "UL_DATASET_EQUIVALENCE_MODEL": "google/gemini-3.5-flash",
-}
 
 
 def _create_private_file(path: Path) -> TextIO:
@@ -54,17 +49,22 @@ def load_target_template(base_url: str | None = None) -> dict[str, object]:
 
 def _subprocess_environment(*, dry_run: bool) -> dict[str, str]:
     settings = load_dataset_semantic_settings()
-    if settings.semantic_provider_type == "openrouter":
-        environment = dict(_QUICKSTART_MODEL_ENVIRONMENT)
-    else:
-        environment = {
-            "UL_DATASET_SEMANTIC_PROVIDER": "openai-compatible",
-            "UL_DATASET_OPENAI_PROVIDER_ID": settings.semantic_provider_id,
-            "UL_DATASET_OPENAI_BASE_URL": settings.semantic_base_url,
-            "UL_DATASET_MODEL": settings.model,
-            "UL_DATASET_RENDER_MODEL": settings.render_model,
-            "UL_DATASET_EQUIVALENCE_MODEL": settings.equivalence_model,
-        }
+    environment = {
+        "UL_DATASET_MODEL": settings.model,
+        "UL_DATASET_RENDER_MODEL": settings.render_model,
+        "UL_DATASET_EQUIVALENCE_MODEL": settings.equivalence_model,
+        "UL_DATASET_MATERIALITY_MODEL": settings.materiality_model,
+    }
+    if isinstance(settings, OpenRouterDatasetSettings):
+        environment["UL_DATASET_OPENROUTER_PROVIDER"] = settings.upstream_provider
+    if settings.semantic_provider_type != "openrouter":
+        environment.update(
+            {
+                "UL_DATASET_SEMANTIC_PROVIDER": "openai-compatible",
+                "UL_DATASET_OPENAI_PROVIDER_ID": settings.semantic_provider_id,
+                "UL_DATASET_OPENAI_BASE_URL": settings.semantic_base_url,
+            }
+        )
     if dry_run:
         if "PYTHONPATH" in os.environ:
             environment["PYTHONPATH"] = os.environ["PYTHONPATH"]

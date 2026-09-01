@@ -98,6 +98,11 @@ displayed `--confirm-target` digest, and `--output`. Pause/resume uses the priva
 snapshot. Header secret values never enter a resume command or run artifact; their hashes are bound
 to the confirmation, and resume stops if a credential value changes.
 
+Each dataset target trial has a 30-second outer deadline by default. Use
+`--target-timeout-seconds SECONDS` for a slower test agent, up to 3600 seconds. The selected value
+appears in the dry-run plan and is bound into evidence and resume compatibility. A target adapter
+may enforce a shorter internal deadline; raise that adapter limit separately when needed.
+
 UL binds the resolved executable, the direct Python module and UL worker, allowlisted environment
 value digests, and command arguments that resolve to files. Repeat `--target-artifact PATH` for
 every transitive Python helper, command script, bundle, or other executable dependency that is not
@@ -223,6 +228,52 @@ pointers address the normalized object and are replaced with `[PRIVATE]` in the 
 preview. The full normalized result remains private evidence. Projections are bounded to 64 KB and
 do not run code or expressions.
 
+For a nested tool-call response, construct the normalized object from declared locations instead
+of writing an adapter. This OpenAI-compatible example selects the function name and spreads the
+decoded argument object:
+
+```json
+{
+  "outcome": {
+    "schema_version": "1.0.0",
+    "compose": {
+      "schema_version": "1.0.0",
+      "fields": {
+        "action": "/choices/0/message/tool_calls/0/function/name"
+      },
+      "spread": {
+        "schema_version": "1.0.0",
+        "selector": "/choices/0/message/tool_calls/0/function/arguments",
+        "decode": "json_string",
+        "flatten": true
+      }
+    }
+  }
+}
+```
+
+`compose.fields` maps normalized field names to selectors. The optional `spread` adds fields from
+one selected object. Use `decode: "json_string"` when that object is encoded inside a string, or
+leave `decode` as `"none"` when the selected value is already an object, as in many Anthropic,
+Gemini, and custom response shapes. `flatten: true` converts nested object and array leaves into
+direct canonical fields such as `body.subject.reference` and `items[0].code`, which gives each
+grounded field one coherent action record. Choose a tool-call index explicitly when a response can
+contain several calls.
+
+During dataset evaluation, UL applies this same declared projection to each historical `output`
+and every fresh target response. The historical result establishes the response comparison
+surface, and UL compares fresh baseline and variation objects directly. The semantic model
+receives the input for augmentation but does not have to infer the tool-call envelope. A
+historical output that does not satisfy the projection is recorded as a source preparation failure
+before any target call for that case.
+
+Missing values, malformed JSON, duplicate keys, non-object spreads, selected/spread collisions,
+and ambiguous names after flattening fail closed before semantic evaluation. Construction is
+bounded and supports only selection, optional JSON-string decoding, spreading, and flattening. It
+does not execute a tool, infer a response shape, run expressions, or validate model-generated
+arguments against a tool schema; the target remains responsible for validating arguments before
+execution.
+
 ## 3. Inspect the smoke proof
 
 The first result includes a bounded structural summary and digest of the live raw target response,
@@ -291,6 +342,8 @@ Configure the existing UL semantic provider only when you are ready for the disp
 
 ```bash
 export OPEN_ROUTER_API_KEY=YOUR_SECRET_FROM_A_SECRET_MANAGER
+export UL_DATASET_MODEL=your-provider/model
+export UL_DATASET_OPENROUTER_PROVIDER=your-provider-slug
 export UL_LIVE=true
 
 ul probe interactions.jsonl \

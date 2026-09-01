@@ -98,6 +98,14 @@ async def _resolve[T](value: T | Awaitable[T]) -> T:
     return value
 
 
+def _schedule_threadsafe(
+    loop: asyncio.AbstractEventLoop,
+    callback: Callable[..., object],
+    *args: object,
+) -> None:
+    loop.call_soon_threadsafe(callback, *args)
+
+
 class _SyncAdapterRunner:
     def __init__(self, thread_name_prefix: str) -> None:
         self._thread_name = thread_name_prefix
@@ -132,12 +140,12 @@ class _SyncAdapterRunner:
                 with self._lock:
                     self._running = False
                 with suppress(RuntimeError):
-                    loop.call_soon_threadsafe(deliver_error, error)
+                    _schedule_threadsafe(loop, deliver_error, error)
             else:
                 with self._lock:
                     self._running = False
                 with suppress(RuntimeError):
-                    loop.call_soon_threadsafe(deliver_result, value)
+                    _schedule_threadsafe(loop, deliver_result, value)
 
         threading.Thread(
             target=run,

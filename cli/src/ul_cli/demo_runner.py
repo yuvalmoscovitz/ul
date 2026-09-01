@@ -28,7 +28,6 @@ console = Console()
 
 _AUGMENTATION_NAMES = {
     "input.surface.typing_noise": "Typing errors",
-    "input.tone.frustrated": "Frustrated customer",
     "input.style.terse": "Short message",
 }
 
@@ -120,6 +119,8 @@ def _display_field_value(field_name: str, value: JsonValue) -> str:
 
 
 def _describe_finding(finding: DatasetEvaluationFinding) -> str:
+    if finding.category == "changed_response":
+        return "UL detected a repeatable response difference."
     if finding.category == "missing_effect":
         predicate = finding.expected_effects[0].predicate.replace("_", " ")
         return f"UL detected that the {predicate} action is missing."

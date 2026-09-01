@@ -1,16 +1,13 @@
 from __future__ import annotations
 
-import asyncio
 import hashlib
 import ipaddress
 import json
-import re
 from collections import OrderedDict
-from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from dataclasses import replace as dataclass_replace
 from types import TracebackType
-from typing import Any, Literal, Protocol, Self, cast
+from typing import Any, Literal, Self, cast
 from urllib.parse import urlsplit, urlunsplit
 
 import httpx
@@ -27,18 +24,85 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 from ul_core.dataset import (
     EvidenceReference,
     InteractionRecord,
+    ObservedOutcome,
     RenderedUserInput,
+    SemanticAllowedSurfaceChange,
     SemanticEquivalenceAssessment,
     SemanticFactor,
     SemanticFrame,
+    SemanticRelation,
     UserInputRecord,
 )
 from ul_core.prompts import PromptManager, prompt_provenance
 
+from ul.llm import (
+    LLMClient,
+    LLMClientConfig,
+    LLMCompletion,
+    LLMPreflightHTTPError,
+    LLMProviderMismatchError,
+    LLMRole,
+    llm_client_config_from_dataset_settings,
+)
+
 _PROMPTS = PromptManager.instance()
+_ALLOWED_SURFACE_CHANGE_RULES: dict[SemanticAllowedSurfaceChange, str] = {
+    "none": "No caller-verified surface edit is declared.",
+    "single_unprotected_case_change": (
+        "The caller deterministically verified exactly one Unicode letter changed case outside "
+        "all evidence-grounded semantic value spans. You must treat that casing edit itself as "
+        "harmless."
+    ),
+    "single_unprotected_punctuation_insertion": (
+        "The caller deterministically verified exactly one punctuation character was inserted "
+        "outside all evidence-grounded semantic value spans. Treat that insertion itself as "
+        "harmless and do not report it as a delta."
+    ),
+    "moderate_angry_tone": (
+        "The permitted communication change is moderate anger. Blunt wording, exclamation, "
+        "strong irritation, and expressions such as 'for crying out loud' or 'this is ridiculous' "
+        "are allowed and must not by themselves cause a different verdict. Return different when "
+        "the candidate contains a personal attack, threat, abuse, profanity, hateful or degrading "
+        "language, intimidation, or a wish of harm, even when task meaning is unchanged."
+    ),
+    "moderate_argumentative_tone": (
+        "The permitted communication change is moderate argumentative pushback. Blunt directives, "
+        "explicit disagreement, debate language, and dismissing unnecessary resistance or "
+        "complication are allowed and must not by themselves cause a different verdict. Return "
+        "different when the candidate contains a personal attack, threat, abuse, profanity, "
+        "hateful or degrading language, intimidation, or a wish of harm, even when task meaning "
+        "is unchanged."
+    ),
+}
 _SEMANTIC_CACHE_VERSION = "semantic-request-cache/1"
+_EXTRACTOR_VERSION = "semantic-deconstructor/2.2.0"
+_EQUIVALENCE_VERIFIER_VERSION = "semantic-equivalence-verifier/2.0.0"
 _MAXIMUM_SEMANTIC_CACHE_ENTRIES = 256
 _MAXIMUM_SEMANTIC_CACHE_BYTES = 16 * 1024 * 1024
+_GROUNDING_REMEDIATION = (
+    "Choose an exact pointer into the declared source and use an exact substring only when that "
+    "pointer selects a string."
+)
+
+type SemanticElementCollection = Literal[
+    "request_units",
+    "factors",
+    "relations",
+    "communication_acts",
+    "outcomes",
+]
+type SemanticGroundingReason = Literal[
+    "outcome_for_input_only_record",
+    "observed_outcome_missing",
+    "output_evidence_missing",
+    "element_evidence_missing",
+    "output_evidence_without_output",
+    "pointer_source_mismatch",
+    "pointer_unresolved",
+    "quote_missing_for_string",
+    "quote_for_non_string",
+    "quote_not_exact",
+]
 
 
 def _sha256_text(value: str) -> str:
@@ -48,6 +112,237 @@ def _sha256_text(value: str) -> str:
 def _render_seed(raw_input: str, instruction: str) -> int:
     digest = hashlib.sha256(f"{raw_input}\0{instruction}".encode()).digest()
     return int.from_bytes(digest[:4], "big") & 0x7FFF_FFFF
+
+
+class SemanticDeconstructorIdentity(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    extractor_contract: str = Field(min_length=1, max_length=200)
+    prompt_behavior_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    response_schema_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    identity_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+    @model_validator(mode="after")
+    def validate_digest(self) -> Self:
+        expected_identity = _canonical_json_sha256(
+            self.model_dump(mode="json", exclude={"identity_sha256"})
+        )
+        if self.identity_sha256 != expected_identity:
+            raise ValueError("semantic deconstructor identity digest must match its components")
+        return self
+
+
+class SemanticGroundingDiagnostic(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    collection: SemanticElementCollection
+    element_index: int | None = Field(default=None, ge=0)
+    evidence_index: int | None = Field(default=None, ge=0)
+    json_pointer: str | None = Field(default=None, max_length=4_096)
+    reason: SemanticGroundingReason
+    remediation: Literal[
+        "Choose an exact pointer into the declared source and use an exact substring only when "
+        "that pointer selects a string."
+    ] = (
+        "Choose an exact pointer into the declared source and use an exact substring only when "
+        "that pointer selects a string."
+    )
+
+
+class SemanticGroundingError(ValueError):
+    def __init__(self, diagnostic: SemanticGroundingDiagnostic) -> None:
+        self.diagnostic = diagnostic
+        location = diagnostic.collection
+        if diagnostic.element_index is not None:
+            location = f"{location}[{diagnostic.element_index}]"
+        if diagnostic.evidence_index is not None:
+            location = f"{location}.evidence[{diagnostic.evidence_index}]"
+        pointer = f" at {diagnostic.json_pointer}" if diagnostic.json_pointer is not None else ""
+        super().__init__(
+            f"Semantic grounding failed for {location}{pointer} "
+            f"({diagnostic.reason}). Next: {diagnostic.remediation}"
+        )
+
+
+def _canonical_json_sha256(value: object) -> str:
+    serialized = json.dumps(
+        value,
+        ensure_ascii=False,
+        allow_nan=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return _sha256_text(serialized)
+
+
+def _safe_diagnostic_json_pointer(
+    source: Literal["input", "output"],
+    json_pointer: str,
+) -> str:
+    trusted_root = "/raw_input" if source == "input" else "/raw_observed_output"
+    if json_pointer == trusted_root:
+        return trusted_root
+    return f"{trusted_root}/<pointer-sha256:{_sha256_text(json_pointer)[:12]}>"
+
+
+def _semantic_frame_response_schema(*, observed_output_present: bool) -> dict[str, Any]:
+    schema = SemanticFrame.model_json_schema(mode="validation")
+    definitions = cast(dict[str, dict[str, Any]], schema["$defs"])
+    for definition_name in (
+        "RequestUnit",
+        "SemanticFactor",
+        "SemanticRelation",
+        "CommunicationAct",
+        "ObservedOutcome",
+    ):
+        definition = definitions[definition_name]
+        properties = cast(dict[str, dict[str, Any]], definition["properties"])
+        properties["evidence"]["minItems"] = 1
+        required = cast(list[str], definition["required"])
+        if "evidence" not in required:
+            required.append("evidence")
+    if observed_output_present:
+        properties = cast(dict[str, dict[str, Any]], schema["properties"])
+        properties["outcomes"]["minItems"] = 1
+        required = cast(list[str], schema.setdefault("required", []))
+        if "outcomes" not in required:
+            required.append("outcomes")
+    return schema
+
+
+def _semantic_deconstructor_identity(extractor_contract: str) -> SemanticDeconstructorIdentity:
+    content = {
+        "extractor_contract": extractor_contract,
+        "prompt_behavior_sha256": _PROMPTS.get_template_info("semantic.deconstruct").version,
+        "response_schema_sha256": _canonical_json_sha256(
+            {
+                "input_only": _semantic_frame_response_schema(observed_output_present=False),
+                "observed_output": _semantic_frame_response_schema(observed_output_present=True),
+            }
+        ),
+    }
+    return SemanticDeconstructorIdentity(
+        **content,
+        identity_sha256=_canonical_json_sha256(content),
+    )
+
+
+def canonicalize_evidenced_action_fields(
+    record: InteractionRecord | UserInputRecord,
+    frame: SemanticFrame,
+) -> SemanticFrame:
+    if not isinstance(record, InteractionRecord):
+        return frame
+    evidence_payload: JsonValue = {
+        "raw_input": record.raw_input,
+        "raw_observed_output": record.raw_observed_output,
+    }
+    action_predicate_counts: dict[str, int] = {}
+    for outcome in frame.outcomes:
+        if outcome.kind == "action":
+            action_predicate_counts[outcome.predicate] = (
+                action_predicate_counts.get(outcome.predicate, 0) + 1
+            )
+    normalized_outcomes = tuple(
+        _canonicalize_evidenced_action_outcome(
+            evidence_payload,
+            outcome,
+            include_missing_fields=action_predicate_counts.get(outcome.predicate, 0) > 1,
+        )
+        for outcome in frame.outcomes
+    )
+    if normalized_outcomes == frame.outcomes:
+        return frame
+    return frame.model_copy(update={"outcomes": normalized_outcomes})
+
+
+def _resolve_json_pointer(value: JsonValue, pointer: str) -> JsonValue:
+    if not pointer:
+        return value
+    current: object = value
+    for encoded_token in pointer[1:].split("/"):
+        token = encoded_token.replace("~1", "/").replace("~0", "~")
+        if isinstance(current, dict):
+            current_mapping = cast(dict[str, object], current)
+            if token in current_mapping:
+                current = current_mapping[token]
+                continue
+        valid_array_index = token == "0" or (token.isdecimal() and not token.startswith("0"))
+        if isinstance(current, list) and valid_array_index:
+            current_sequence = cast(list[object], current)
+            index = int(token)
+            if index < len(current_sequence):
+                current = current_sequence[index]
+                continue
+        raise ValueError("evidence json_pointer does not resolve")
+    return cast(JsonValue, current)
+
+
+def _canonicalize_evidenced_action_outcome(
+    evidence_payload: JsonValue,
+    outcome: ObservedOutcome,
+    *,
+    include_missing_fields: bool = False,
+) -> ObservedOutcome:
+    if outcome.kind != "action":
+        return outcome
+    evidenced_action_objects: dict[int, dict[str, JsonValue]] = {}
+    for evidence in outcome.evidence:
+        if evidence.source != "output":
+            continue
+        try:
+            evidence_value = _resolve_json_pointer(evidence_payload, evidence.json_pointer)
+        except ValueError:
+            continue
+        action_object: dict[str, JsonValue] | None = None
+        if isinstance(evidence_value, dict):
+            action_object = evidence_value
+        elif evidence.json_pointer.rsplit("/", 1)[-1] == "action":
+            parent_pointer = evidence.json_pointer.rsplit("/", 1)[0]
+            try:
+                parent_value = _resolve_json_pointer(evidence_payload, parent_pointer)
+            except ValueError:
+                continue
+            if isinstance(parent_value, dict):
+                action_object = parent_value
+        if (
+            action_object is not None
+            and isinstance(action_object.get("action"), str)
+            and action_object["action"] == outcome.predicate
+        ):
+            evidenced_action_objects[id(action_object)] = action_object
+    if len(evidenced_action_objects) != 1:
+        return outcome
+    action_object = next(iter(evidenced_action_objects.values()))
+    canonical_fields = dict(outcome.fields)
+    for name, model_value in outcome.fields.items():
+        if name not in action_object:
+            continue
+        if name == "action":
+            return outcome
+        canonical_value = action_object[name]
+        if isinstance(canonical_value, (dict, list)):
+            return outcome
+        if isinstance(model_value, dict):
+            if "value" not in model_value or not set(model_value) <= {"value", "evidence"}:
+                return outcome
+            model_value = model_value["value"]
+        if (
+            isinstance(model_value, (dict, list))
+            or type(model_value) is not type(canonical_value)
+            or model_value != canonical_value
+        ):
+            return outcome
+        canonical_fields[name] = canonical_value
+    if include_missing_fields:
+        canonical_fields.update(
+            (name, value)
+            for name, value in action_object.items()
+            if name != "action"
+            and name not in canonical_fields
+            and not isinstance(value, (dict, list))
+        )
+    return outcome.model_copy(update={"fields": canonical_fields})
 
 
 class ProviderDiagnostic(BaseModel):
@@ -79,6 +374,9 @@ class ProviderDiagnosticError(RuntimeError):
             f"({diagnostic.category}; retryable: {'yes' if diagnostic.retryable else 'no'}). "
             f"Next: {diagnostic.suggested_action}"
         )
+
+
+type SemanticReasoningMode = Literal["required", "omitted"]
 
 
 def _provider_diagnostic(
@@ -143,33 +441,69 @@ class OpenRouterDatasetSettings(BaseSettings):
     )
     api_key: SecretStr | None = Field(default=None, validation_alias="OPEN_ROUTER_API_KEY")
     ul_live: bool = Field(default=False, validation_alias="UL_LIVE", exclude=True, repr=False)
+    upstream_provider: str = Field(
+        default=...,
+        min_length=1,
+        max_length=100,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9._/-]*$",
+        validation_alias="UL_DATASET_OPENROUTER_PROVIDER",
+    )
 
     @model_validator(mode="after")
-    def apply_ul_live_shorthand(self) -> Self:
+    def validate_and_normalize(self) -> Self:
         if self.ul_live:
             if "live_calls" not in self.model_fields_set:
                 self.live_calls = True
             if "allow_external_data_processing" not in self.model_fields_set:
                 self.allow_external_data_processing = True
+        if not self.model.strip():
+            raise ValueError("UL_DATASET_MODEL must contain non-whitespace text")
+        if not self.render_model:
+            self.render_model = self.model
+        elif not self.render_model.strip():
+            raise ValueError("UL_DATASET_RENDER_MODEL must contain non-whitespace text")
+        if not self.equivalence_model:
+            self.equivalence_model = self.model
+        elif not self.equivalence_model.strip():
+            raise ValueError("UL_DATASET_EQUIVALENCE_MODEL must contain non-whitespace text")
+        if not self.materiality_model:
+            self.materiality_model = self.model
+        elif not self.materiality_model.strip():
+            raise ValueError("UL_DATASET_MATERIALITY_MODEL must contain non-whitespace text")
         return self
 
     model: str = Field(
-        default="google/gemini-2.5-flash",
+        default=...,
         min_length=1,
         max_length=200,
         validation_alias="UL_DATASET_MODEL",
     )
     render_model: str = Field(
-        default="x-ai/grok-4.3",
-        min_length=1,
+        default="",
         max_length=200,
         validation_alias="UL_DATASET_RENDER_MODEL",
     )
     equivalence_model: str = Field(
-        default="google/gemini-3.5-flash",
-        min_length=1,
+        default="",
         max_length=200,
         validation_alias="UL_DATASET_EQUIVALENCE_MODEL",
+    )
+    materiality_model: str = Field(
+        default="",
+        max_length=200,
+        validation_alias="UL_DATASET_MATERIALITY_MODEL",
+    )
+    deconstruct_reasoning: SemanticReasoningMode = Field(
+        default="required",
+        validation_alias="UL_DATASET_DECONSTRUCT_REASONING",
+    )
+    render_reasoning: SemanticReasoningMode = Field(
+        default="required",
+        validation_alias="UL_DATASET_RENDER_REASONING",
+    )
+    equivalence_reasoning: SemanticReasoningMode = Field(
+        default="required",
+        validation_alias="UL_DATASET_EQUIVALENCE_REASONING",
     )
     max_input_chars: int = Field(
         default=50_000,
@@ -275,6 +609,23 @@ class OpenAICompatibleDatasetSettings(BaseSettings):
         max_length=200,
         validation_alias="UL_DATASET_EQUIVALENCE_MODEL",
     )
+    materiality_model: str = Field(
+        default="",
+        max_length=200,
+        validation_alias="UL_DATASET_MATERIALITY_MODEL",
+    )
+    deconstruct_reasoning: SemanticReasoningMode = Field(
+        default="required",
+        validation_alias="UL_DATASET_DECONSTRUCT_REASONING",
+    )
+    render_reasoning: SemanticReasoningMode = Field(
+        default="required",
+        validation_alias="UL_DATASET_RENDER_REASONING",
+    )
+    equivalence_reasoning: SemanticReasoningMode = Field(
+        default="required",
+        validation_alias="UL_DATASET_EQUIVALENCE_REASONING",
+    )
     max_input_chars: int = Field(
         default=50_000,
         ge=1,
@@ -326,6 +677,10 @@ class OpenAICompatibleDatasetSettings(BaseSettings):
             self.equivalence_model = self.model
         elif not self.equivalence_model.strip():
             raise ValueError("UL_DATASET_EQUIVALENCE_MODEL must contain non-whitespace text")
+        if not self.materiality_model:
+            self.materiality_model = self.model
+        elif not self.materiality_model.strip():
+            raise ValueError("UL_DATASET_MATERIALITY_MODEL must contain non-whitespace text")
         return self
 
     @property
@@ -343,6 +698,10 @@ class OpenAICompatibleDatasetSettings(BaseSettings):
     @property
     def semantic_endpoint_sha256(self) -> str:
         return _sha256_text(self.semantic_base_url)
+
+    @property
+    def upstream_provider(self) -> None:
+        return None
 
     @property
     def api_key_environment_variable(self) -> str:
@@ -398,9 +757,14 @@ def _semantic_configuration_error(
         "UL_DATASET_SEMANTIC_PROVIDER": "provider",
         "UL_DATASET_OPENAI_BASE_URL": "base_url",
         "UL_DATASET_OPENAI_PROVIDER_ID": "provider_id",
+        "UL_DATASET_OPENROUTER_PROVIDER": "upstream_provider",
         "UL_DATASET_MODEL": "model",
         "UL_DATASET_RENDER_MODEL": "render_model",
         "UL_DATASET_EQUIVALENCE_MODEL": "equivalence_model",
+        "UL_DATASET_MATERIALITY_MODEL": "materiality_model",
+        "UL_DATASET_DECONSTRUCT_REASONING": "deconstruct_reasoning",
+        "UL_DATASET_RENDER_REASONING": "render_reasoning",
+        "UL_DATASET_EQUIVALENCE_REASONING": "equivalence_reasoning",
         "UL_DATASET_MAX_INPUT_CHARS": "max_input_chars",
         "UL_DATASET_MAX_OUTPUT_TOKENS": "max_output_tokens",
         "UL_DATASET_MAX_RENDER_TOKENS": "max_render_tokens",
@@ -418,9 +782,14 @@ def _semantic_configuration_error(
                 for environment_name, candidate in {
                     "UL_DATASET_OPENAI_BASE_URL": "base_url",
                     "UL_DATASET_OPENAI_PROVIDER_ID": "provider_id",
+                    "UL_DATASET_OPENROUTER_PROVIDER": "upstream_provider",
                     "UL_DATASET_RENDER_MODEL": "render_model",
                     "UL_DATASET_EQUIVALENCE_MODEL": "equivalence_model",
+                    "UL_DATASET_MATERIALITY_MODEL": "materiality_model",
                     "UL_DATASET_MODEL": "model",
+                    "UL_DATASET_DECONSTRUCT_REASONING": "deconstruct_reasoning",
+                    "UL_DATASET_RENDER_REASONING": "render_reasoning",
+                    "UL_DATASET_EQUIVALENCE_REASONING": "equivalence_reasoning",
                 }.items()
                 if environment_name in safe_detail
             ),
@@ -436,6 +805,9 @@ def _semantic_configuration_error(
             "UL_DATASET_OPENAI_PROVIDER_ID must be 1-100 lowercase letters, digits, dots, "
             "underscores, or hyphens and must not be openrouter"
         ),
+        "upstream_provider": (
+            "UL_DATASET_OPENROUTER_PROVIDER must be a single OpenRouter provider slug"
+        ),
         "model": "UL_DATASET_MODEL must be 1-200 non-whitespace characters",
         "render_model": (
             "UL_DATASET_RENDER_MODEL must be 1-200 non-whitespace characters when set"
@@ -443,6 +815,12 @@ def _semantic_configuration_error(
         "equivalence_model": (
             "UL_DATASET_EQUIVALENCE_MODEL must be 1-200 non-whitespace characters when set"
         ),
+        "materiality_model": (
+            "UL_DATASET_MATERIALITY_MODEL must be 1-200 non-whitespace characters when set"
+        ),
+        "deconstruct_reasoning": ("UL_DATASET_DECONSTRUCT_REASONING must be required or omitted"),
+        "render_reasoning": "UL_DATASET_RENDER_REASONING must be required or omitted",
+        "equivalence_reasoning": ("UL_DATASET_EQUIVALENCE_REASONING must be required or omitted"),
         "max_input_chars": "UL_DATASET_MAX_INPUT_CHARS must be between 1 and 1000000",
         "max_output_tokens": "UL_DATASET_MAX_OUTPUT_TOKENS must be between 1 and 32768",
         "max_render_tokens": "UL_DATASET_MAX_RENDER_TOKENS must be between 1 and 4096",
@@ -495,45 +873,6 @@ def _is_loopback_host(host: str) -> bool:
         return False
 
 
-class _ResponseMessage(BaseModel):
-    model_config = ConfigDict(extra="ignore", hide_input_in_errors=True)
-
-    content: str
-
-
-class _ResponseChoice(BaseModel):
-    model_config = ConfigDict(extra="ignore", hide_input_in_errors=True)
-
-    message: _ResponseMessage
-
-
-class _UsageMetadata(BaseModel):
-    model_config = ConfigDict(extra="ignore", strict=True, hide_input_in_errors=True)
-
-    prompt_tokens: int | None = Field(default=None, ge=0, le=1_000_000_000_000)
-    completion_tokens: int | None = Field(default=None, ge=0, le=1_000_000_000_000)
-    total_tokens: int | None = Field(default=None, ge=0, le=1_000_000_000_000)
-    cost: float | None = Field(
-        default=None,
-        ge=0,
-        le=1_000_000_000,
-        allow_inf_nan=False,
-    )
-
-    def evidence_value(self) -> dict[str, JsonValue]:
-        return cast(dict[str, JsonValue], self.model_dump(mode="json", exclude_none=True))
-
-
-class _ChatCompletionResponse(BaseModel):
-    model_config = ConfigDict(extra="ignore", hide_input_in_errors=True)
-
-    id: str = Field(min_length=1, max_length=500)
-    model: str = Field(min_length=1, max_length=200)
-    provider: str | None = Field(default=None, max_length=200)
-    choices: tuple[_ResponseChoice, ...] = Field(min_length=1)
-    usage: _UsageMetadata | None = None
-
-
 @dataclass(frozen=True)
 class SemanticCallMetrics:
     actual_calls: int
@@ -542,7 +881,7 @@ class SemanticCallMetrics:
 
 @dataclass(frozen=True)
 class _SemanticCompletion:
-    response: _ChatCompletionResponse
+    response: LLMCompletion
     cache_hit: bool
     cache_key: str | None
 
@@ -562,10 +901,14 @@ class _EvaluatorPreflightSample(BaseModel):
 class EvaluatorModelProfilePreflight(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
-    roles: tuple[Literal["deconstruct", "render", "equivalence"], ...] = Field(min_length=1)
+    roles: tuple[Literal["deconstruct", "render", "equivalence", "materiality"], ...] = Field(
+        min_length=1
+    )
     requested_model: str = Field(min_length=1, max_length=200)
     routed_model: str = Field(min_length=1, max_length=200)
     upstream_provider: str | None = Field(default=None, max_length=200)
+    configured_upstream_provider: str | None = Field(default=None, max_length=100)
+    reasoning_mode: SemanticReasoningMode
     required_parameters: tuple[str, ...]
     request_options_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     parameter_support: Literal["routing_enforced", "endpoint_accepted_unverified"]
@@ -589,8 +932,11 @@ class EvaluatorModelPreflight(BaseModel):
 class EvaluatorPreflightProfilePlan(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
-    roles: tuple[Literal["deconstruct", "render", "equivalence"], ...] = Field(min_length=1)
+    roles: tuple[Literal["deconstruct", "render", "equivalence", "materiality"], ...] = Field(
+        min_length=1
+    )
     requested_model: str = Field(min_length=1, max_length=200)
+    reasoning_mode: SemanticReasoningMode
     max_completion_tokens: int = Field(ge=1)
     required_parameters: tuple[str, ...]
 
@@ -602,17 +948,11 @@ class EvaluatorModelCompatibilityError(ValueError):
 _PREFLIGHT_MAX_TOKENS = 1_024
 
 
-class _EvaluatorPreflightHTTPError(ValueError):
-    def __init__(self, capability: str) -> None:
-        self.capability = capability
-        super().__init__(capability)
-
-
 @dataclass(frozen=True)
 class _EvaluatorPreflightProfile:
-    roles: tuple[Literal["deconstruct", "render", "equivalence"], ...]
+    roles: tuple[Literal["deconstruct", "render", "equivalence", "materiality"], ...]
     model: str
-    reasoning: dict[str, JsonValue]
+    reasoning_mode: SemanticReasoningMode
     max_tokens: int
     temperature: float
     seed: int
@@ -620,149 +960,22 @@ class _EvaluatorPreflightProfile:
     required_parameters: tuple[str, ...]
 
 
-class SemanticCompletionProvider(Protocol):
-    @property
-    def provider_id(self) -> str: ...
-
-    @property
-    def base_url(self) -> str: ...
-
-    @property
-    def endpoint_sha256(self) -> str: ...
-
-    @property
-    def extractor_version(self) -> str: ...
-
-    @property
-    def equivalence_verifier_version(self) -> str: ...
-
-    @property
-    def requires_api_key(self) -> bool: ...
-
-    @property
-    def trust_environment_transport(self) -> bool: ...
-
-    def add_request_options(
-        self,
-        request_body: dict[str, Any],
-        reasoning: dict[str, JsonValue],
-    ) -> None: ...
-
-    def generation_metadata(
-        self,
-        response: _ChatCompletionResponse,
-    ) -> dict[str, JsonValue]: ...
-
-    def preflight_data_policy(self) -> dict[str, JsonValue]: ...
-
-    @property
-    def enforces_parameter_support(self) -> bool: ...
-
-
-@dataclass(frozen=True)
-class OpenAICompatibleSemanticProvider:
-    provider_id: str
-    base_url: str
-    endpoint_sha256: str
-    extractor_version: str = "semantic-deconstructor/2.0.0"
-    equivalence_verifier_version: str = "semantic-equivalence-verifier/2.0.0"
-    requires_api_key: bool = False
-    trust_environment_transport: bool = False
-
-    @property
-    def enforces_parameter_support(self) -> bool:
-        return False
-
-    def add_request_options(
-        self,
-        request_body: dict[str, Any],
-        reasoning: dict[str, JsonValue],
-    ) -> None:
-        return None
-
-    def generation_metadata(
-        self,
-        response: _ChatCompletionResponse,
-    ) -> dict[str, JsonValue]:
-        usage = response.usage.evidence_value() if response.usage is not None else {}
-        return {
-            "semantic_provider": self.provider_id,
-            "semantic_protocol": "openai-chat-completions",
-            "semantic_endpoint_sha256": self.endpoint_sha256,
-            "semantic_generation_id": response.id,
-            "semantic_model": response.model,
-            "semantic_upstream_provider": response.provider,
-            "semantic_usage": usage,
-        }
-
-    def preflight_data_policy(self) -> dict[str, JsonValue]:
-        return {
-            "external_processing": True,
-            "provider_policy_declared": False,
-            "implication": (
-                "The configured endpoint receives evaluator prompts and sample data; UL cannot "
-                "verify its retention or training policy."
-            ),
-        }
-
-
-@dataclass(frozen=True)
-class OpenRouterSemanticProvider(OpenAICompatibleSemanticProvider):
-    provider_id: str = "openrouter"
-    base_url: str = "https://openrouter.ai/api/v1"
-    endpoint_sha256: str = _sha256_text("https://openrouter.ai/api/v1")
-    requires_api_key: bool = True
-    trust_environment_transport: bool = True
-
-    @property
-    def enforces_parameter_support(self) -> bool:
-        return True
-
-    def add_request_options(
-        self,
-        request_body: dict[str, Any],
-        reasoning: dict[str, JsonValue],
-    ) -> None:
-        request_body["reasoning"] = reasoning
-        request_body["provider"] = {
-            "require_parameters": True,
-            "data_collection": "deny",
-            "zdr": True,
-        }
-
-    def preflight_data_policy(self) -> dict[str, JsonValue]:
-        return {
-            "external_processing": True,
-            "provider_policy_declared": True,
-            "data_collection": "deny",
-            "zero_data_retention_required": True,
-            "implication": (
-                "The configured route requires data collection to be denied and zero data "
-                "retention; the evaluator request is still processed externally."
-            ),
-        }
+type SemanticCompletionProvider = LLMClient
 
 
 class SemanticModelDeconstructor:
     def __init__(
         self,
         settings: DatasetSemanticSettings,
-        provider: SemanticCompletionProvider,
+        llm_client: LLMClient,
         *,
-        client: httpx.AsyncClient | None = None,
+        owns_llm_client: bool,
     ) -> None:
         self.settings = settings
-        self.provider = provider
-        self._owns_client = client is None
-        self._client = client or httpx.AsyncClient(
-            timeout=self.settings.timeout_seconds,
-            follow_redirects=False,
-            trust_env=self.provider.trust_environment_transport,
-        )
+        self.llm_client = llm_client
+        self._owns_llm_client = owns_llm_client
         self._preflight_result: EvaluatorModelPreflight | None = None
-        self._semantic_response_cache: OrderedDict[str, tuple[_ChatCompletionResponse, int]] = (
-            OrderedDict()
-        )
+        self._semantic_response_cache: OrderedDict[str, tuple[LLMCompletion, int]] = OrderedDict()
         self._semantic_response_cache_bytes = 0
         self._semantic_actual_calls = 0
         self._semantic_cache_hits = 0
@@ -788,8 +1001,8 @@ class SemanticModelDeconstructor:
     async def aclose(self) -> None:
         self._semantic_response_cache.clear()
         self._semantic_response_cache_bytes = 0
-        if self._owns_client:
-            await self._client.aclose()
+        if self._owns_llm_client:
+            await self.llm_client.aclose()
 
     async def preflight(self) -> EvaluatorModelPreflight:
         profile_results: list[EvaluatorModelProfilePreflight] = []
@@ -797,10 +1010,8 @@ class SemanticModelDeconstructor:
             try:
                 completion = await self._request(
                     operation="preflight",
-                    model=profile.model,
-                    reasoning=profile.reasoning,
+                    role=profile.roles[0],
                     max_tokens=profile.max_tokens,
-                    temperature=profile.temperature,
                     seed=profile.seed,
                     top_p=profile.top_p,
                     schema_name="evaluator_preflight",
@@ -812,8 +1023,13 @@ class SemanticModelDeconstructor:
                 )
             except TimeoutError:
                 raise self._compatibility_error(profile, "timeout") from None
-            except _EvaluatorPreflightHTTPError as error:
-                raise self._compatibility_error(profile, error.capability) from None
+            except LLMPreflightHTTPError as error:
+                raise self._compatibility_error(
+                    profile,
+                    _preflight_http_capability(error.status_code, error.body),
+                ) from None
+            except LLMProviderMismatchError:
+                raise self._compatibility_error(profile, "provider pin") from None
             except ProviderDiagnosticError as error:
                 capability = {
                     "timeout": "timeout",
@@ -828,13 +1044,17 @@ class SemanticModelDeconstructor:
                 )
             except (ValidationError, ValueError):
                 raise self._compatibility_error(profile, "structured output") from None
-            routing_enforced = self.provider.enforces_parameter_support
+            if completion.response.model is None:
+                raise self._compatibility_error(profile, "model identity")
+            routing_enforced = self.llm_client.config.enforces_parameter_support
             profile_results.append(
                 EvaluatorModelProfilePreflight(
                     roles=profile.roles,
                     requested_model=profile.model,
                     routed_model=completion.response.model,
                     upstream_provider=completion.response.provider,
+                    configured_upstream_provider=(self.llm_client.config.upstream_provider),
+                    reasoning_mode=profile.reasoning_mode,
                     required_parameters=profile.required_parameters,
                     request_options_sha256=self._profile_request_options_sha256(profile),
                     parameter_support=(
@@ -851,28 +1071,28 @@ class SemanticModelDeconstructor:
             )
         )
         self._preflight_result = EvaluatorModelPreflight(
-            provider=self.provider.provider_id,
-            endpoint_sha256=self.provider.endpoint_sha256,
+            provider=self.llm_client.config.provider_id,
+            endpoint_sha256=self.llm_client.config.endpoint_sha256,
             profiles=tuple(profile_results),
             verified_capabilities=(
                 ("routing", "structured_output", "required_parameters")
-                if self.provider.enforces_parameter_support
+                if self.llm_client.config.enforces_parameter_support
                 else ("routing", "structured_output")
             ),
             unverified_options=unverified_options,
-            data_policy=self.provider.preflight_data_policy(),
+            data_policy=self.llm_client.config.data_policy(),
         )
         return self._preflight_result
 
     def reuse_preflight(self, result: EvaluatorModelPreflight) -> None:
-        _validate_evaluator_preflight(self.provider, self._preflight_profiles(), result)
+        _validate_evaluator_preflight(self.llm_client.config, self._preflight_profiles(), result)
         self._preflight_result = result
 
     def _preflight_profiles(self) -> tuple[_EvaluatorPreflightProfile, ...]:
-        return _evaluator_preflight_profiles(self.settings, self.provider)
+        return _evaluator_preflight_profiles(self.llm_client.config)
 
     def _profile_request_options_sha256(self, profile: _EvaluatorPreflightProfile) -> str:
-        return _profile_request_options_sha256(self.provider, profile)
+        return _profile_request_options_sha256(self.llm_client.config, profile)
 
     def _compatibility_error(
         self,
@@ -901,16 +1121,17 @@ class SemanticModelDeconstructor:
         if reference_frame is not None:
             request_payload["reference_vocabulary"] = self._reference_vocabulary(reference_frame)
         untrusted_record = self._bounded_json(request_payload)
+        role_config = self.llm_client.config.role_config("deconstruct")
         completion = await self._request(
             operation="deconstruct",
-            model=self.settings.model,
-            reasoning={"effort": "minimal"},
-            max_tokens=self.settings.max_output_tokens,
-            temperature=0,
+            role="deconstruct",
+            max_tokens=role_config.max_output_tokens,
             seed=0,
             top_p=None,
             schema_name="semantic_frame",
-            schema=SemanticFrame.model_json_schema(mode="validation"),
+            schema=_semantic_frame_response_schema(
+                observed_output_present=observed_output is not None
+            ),
             strict_schema=True,
             system_prompt=_PROMPTS.get_prompt("semantic.deconstruct"),
             untrusted_payload=untrusted_record,
@@ -921,9 +1142,13 @@ class SemanticModelDeconstructor:
                 {
                     "schema_version": "1.0.0",
                     "interaction_id": record.id,
-                    "extractor_version": self.provider.extractor_version,
+                    "extractor_version": _EXTRACTOR_VERSION,
                     "metadata": {
                         **self._generation_metadata(completion),
+                        "semantic_deconstructor_identity": _semantic_deconstructor_identity(
+                            _EXTRACTOR_VERSION
+                        ).model_dump(mode="json"),
+                        "semantic_reasoning": role_config.reasoning_metadata(),
                         "prompts": prompt_provenance("semantic.deconstruct"),
                     },
                 }
@@ -933,13 +1158,13 @@ class SemanticModelDeconstructor:
             self._discard_cached_completion(completion)
             raise self._invalid_response(error, operation="deconstruct") from None
         try:
-            frame = self._expand_unambiguous_evidence_quotes(record, frame)
+            frame = self._normalize_self_correction_relation_kind(frame)
             frame = self._ground_self_correction_evidence(record, frame)
             self._validate_evidence(record, frame)
-        except ValueError:
+        except SemanticGroundingError as error:
             self._discard_cached_completion(completion)
-            raise
-        return frame
+            raise error from None
+        return canonicalize_evidenced_action_fields(record, frame)
 
     async def render(
         self,
@@ -960,14 +1185,13 @@ class SemanticModelDeconstructor:
             else "semantic.render.temporary_value_forbidden"
         )
         temporary_value_rule = _PROMPTS.get_prompt(temporary_value_prompt)
+        role_config = self.llm_client.config.role_config("render")
         completion = await self._request(
             operation="render",
-            model=self.settings.render_model,
-            reasoning={"effort": "none"},
-            max_tokens=self.settings.max_render_tokens,
-            temperature=0.7,
+            role="render",
+            max_tokens=role_config.max_output_tokens,
             seed=render_seed,
-            top_p=0.95,
+            top_p=None,
             schema_name="rendered_input",
             schema=_RenderedInput.model_json_schema(mode="validation"),
             strict_schema=True,
@@ -991,14 +1215,14 @@ class SemanticModelDeconstructor:
             text=rendered,
             metadata={
                 **self._generation_metadata(completion),
-                "requested_model": self.settings.render_model,
+                "requested_model": role_config.model,
                 "prompts": prompt_provenance("semantic.render", temporary_value_prompt),
                 "sampling": {
-                    "temperature": 0.7,
-                    "top_p": 0.95,
+                    "temperature": 0,
                     "seed": render_seed,
-                    "max_tokens": self.settings.max_render_tokens,
+                    "max_tokens": role_config.max_output_tokens,
                 },
+                "semantic_reasoning": role_config.reasoning_metadata(),
             },
         )
 
@@ -1006,22 +1230,26 @@ class SemanticModelDeconstructor:
         self,
         source_input: str,
         candidate_input: str,
+        *,
+        allowed_surface_change: SemanticAllowedSurfaceChange = "none",
     ) -> SemanticEquivalenceAssessment:
         untrusted_payload = self._bounded_json(
             {"source_input": source_input, "candidate_input": candidate_input}
         )
+        role_config = self.llm_client.config.role_config("equivalence")
         completion = await self._request(
             operation="verify",
-            model=self.settings.equivalence_model,
-            reasoning={"effort": "low"},
-            max_tokens=min(self.settings.max_output_tokens, 1_024),
-            temperature=0,
+            role="equivalence",
+            max_tokens=role_config.max_output_tokens,
             seed=0,
             top_p=None,
             schema_name="semantic_equivalence_assessment",
             schema=SemanticEquivalenceAssessment.model_json_schema(mode="validation"),
             strict_schema=True,
-            system_prompt=_PROMPTS.get_prompt("semantic.verify"),
+            system_prompt=_PROMPTS.get_prompt(
+                "semantic.verify",
+                allowed_surface_change_rule=_ALLOWED_SURFACE_CHANGE_RULES[allowed_surface_change],
+            ),
             untrusted_payload=untrusted_payload,
         )
         try:
@@ -1029,10 +1257,14 @@ class SemanticModelDeconstructor:
             raw_assessment.update(
                 {
                     "schema_version": "1.0.0",
-                    "verifier_version": self.provider.equivalence_verifier_version,
+                    "verifier_version": _EQUIVALENCE_VERIFIER_VERSION,
                     "metadata": {
                         **self._generation_metadata(completion),
-                        "requested_model": self.settings.equivalence_model,
+                        "requested_model": role_config.model,
+                        "semantic_equivalence_policy": {
+                            "allowed_surface_change": allowed_surface_change
+                        },
+                        "semantic_reasoning": role_config.reasoning_metadata(),
                         "prompts": prompt_provenance("semantic.verify"),
                     },
                 }
@@ -1086,9 +1318,9 @@ class SemanticModelDeconstructor:
         return ProviderDiagnosticError(
             _provider_diagnostic(
                 error,
-                provider=self.provider.provider_id,
+                provider=self.llm_client.config.provider_id,
                 operation=operation,
-                endpoint_sha256=self.provider.endpoint_sha256,
+                endpoint_sha256=self.llm_client.config.endpoint_sha256,
             )
         )
 
@@ -1096,10 +1328,8 @@ class SemanticModelDeconstructor:
         self,
         *,
         operation: Literal["deconstruct", "render", "verify", "preflight"],
-        model: str,
-        reasoning: dict[str, JsonValue],
+        role: LLMRole,
         max_tokens: int,
-        temperature: float,
         seed: int,
         top_p: float | None,
         schema_name: str,
@@ -1109,13 +1339,12 @@ class SemanticModelDeconstructor:
         untrusted_payload: str,
         preflight_error_body_limit: int = 0,
     ) -> _SemanticCompletion:
-        api_key = self._require_live_access()
+        role_config = self.llm_client.config.role_config(role)
         cache_key = self._semantic_cache_key(
             operation=operation,
-            model=model,
-            reasoning=reasoning,
+            model=role_config.model,
             max_tokens=max_tokens,
-            temperature=temperature,
+            temperature=self.llm_client.config.temperature,
             seed=seed,
             top_p=top_p,
             schema_name=schema_name,
@@ -1135,21 +1364,29 @@ class SemanticModelDeconstructor:
             )
         self._semantic_actual_calls += 1
         try:
-            response = await self._request_completion(
-                api_key=api_key,
-                model=model,
-                reasoning=reasoning,
-                max_tokens=max_tokens,
-                temperature=temperature,
+            response = await self.llm_client.complete(
+                role=role,
                 seed=seed,
                 top_p=top_p,
                 schema_name=schema_name,
                 schema=schema,
                 strict_schema=strict_schema,
                 system_prompt=system_prompt,
-                untrusted_payload=untrusted_payload,
+                user_payload=untrusted_payload,
+                max_output_tokens=max_tokens,
                 preflight_error_body_limit=preflight_error_body_limit,
             )
+        except LLMProviderMismatchError as error:
+            if operation == "preflight":
+                raise
+            raise ProviderDiagnosticError(
+                _provider_diagnostic(
+                    error,
+                    provider=self.llm_client.config.provider_id,
+                    operation=operation,
+                    endpoint_sha256=self.llm_client.config.endpoint_sha256,
+                )
+            ) from None
         except (
             TimeoutError,
             ValidationError,
@@ -1159,9 +1396,9 @@ class SemanticModelDeconstructor:
             raise ProviderDiagnosticError(
                 _provider_diagnostic(
                     error,
-                    provider=self.provider.provider_id,
+                    provider=self.llm_client.config.provider_id,
                     operation=operation,
-                    endpoint_sha256=self.provider.endpoint_sha256,
+                    endpoint_sha256=self.llm_client.config.endpoint_sha256,
                 )
             ) from None
         if operation != "preflight":
@@ -1181,7 +1418,7 @@ class SemanticModelDeconstructor:
     def _cache_semantic_response(
         self,
         cache_key: str,
-        response: _ChatCompletionResponse,
+        response: LLMCompletion,
     ) -> None:
         response_size = len(response.model_dump_json().encode("utf-8"))
         replaced_entry = self._semantic_response_cache.pop(cache_key, None)
@@ -1203,7 +1440,6 @@ class SemanticModelDeconstructor:
         *,
         operation: Literal["deconstruct", "render", "verify", "preflight"],
         model: str,
-        reasoning: dict[str, JsonValue],
         max_tokens: int,
         temperature: float,
         seed: int,
@@ -1216,10 +1452,9 @@ class SemanticModelDeconstructor:
     ) -> str:
         identity = {
             "cache_version": _SEMANTIC_CACHE_VERSION,
-            "provider": self.provider.provider_id,
-            "endpoint_sha256": self.provider.endpoint_sha256,
-            "extractor_version": self.provider.extractor_version,
-            "equivalence_verifier_version": self.provider.equivalence_verifier_version,
+            "llm_client": self.llm_client.config.evidence_identity().model_dump(mode="json"),
+            "extractor_version": _EXTRACTOR_VERSION,
+            "equivalence_verifier_version": _EQUIVALENCE_VERIFIER_VERSION,
             "evaluator_preflight": (
                 self._preflight_result.model_dump(mode="json")
                 if self._preflight_result is not None
@@ -1227,7 +1462,6 @@ class SemanticModelDeconstructor:
             ),
             "operation": operation,
             "model": model,
-            "reasoning": reasoning,
             "max_tokens": max_tokens,
             "temperature": temperature,
             "seed": seed,
@@ -1241,122 +1475,9 @@ class SemanticModelDeconstructor:
         serialized = json.dumps(identity, sort_keys=True, separators=(",", ":"))
         return hashlib.sha256(serialized.encode()).hexdigest()
 
-    async def _request_completion(
-        self,
-        *,
-        api_key: str | None,
-        model: str,
-        reasoning: dict[str, JsonValue],
-        max_tokens: int,
-        temperature: float,
-        seed: int,
-        top_p: float | None,
-        schema_name: str,
-        schema: dict[str, Any],
-        strict_schema: bool,
-        system_prompt: str,
-        untrusted_payload: str,
-        preflight_error_body_limit: int = 0,
-    ) -> _ChatCompletionResponse:
-        async with asyncio.timeout(self.settings.timeout_seconds):
-            request_body: dict[str, Any] = {
-                "model": model,
-                "messages": [
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": untrusted_payload},
-                ],
-                "temperature": temperature,
-                "seed": seed,
-                "max_tokens": max_tokens,
-                "response_format": {
-                    "type": "json_schema",
-                    "json_schema": {
-                        "name": schema_name,
-                        "strict": strict_schema,
-                        "schema": schema,
-                    },
-                },
-                "stream": False,
-            }
-            self.provider.add_request_options(request_body, reasoning)
-            if top_p is not None:
-                request_body["top_p"] = top_p
-            endpoint = f"{self.provider.base_url}/chat/completions"
-            request_headers = {"Accept-Encoding": "identity"}
-            if api_key is not None:
-                request_headers["Authorization"] = f"Bearer {api_key}"
-            async with self._client.stream(
-                "POST",
-                endpoint,
-                headers=request_headers,
-                json=request_body,
-                timeout=self.settings.timeout_seconds,
-                follow_redirects=False,
-            ) as response:
-                if not _same_origin(response.url, httpx.URL(endpoint)):
-                    raise ValueError("semantic provider response changed request origin")
-                if 300 <= response.status_code < 400:
-                    raise ValueError("semantic provider redirects are not allowed")
-                if 400 <= response.status_code < 500 and preflight_error_body_limit:
-                    error_body = await _read_bounded_response(
-                        response,
-                        maximum_bytes=preflight_error_body_limit,
-                    )
-                    raise _EvaluatorPreflightHTTPError(
-                        _preflight_http_capability(response.status_code, error_body)
-                    )
-                response.raise_for_status()
-                content_encoding = response.headers.get("content-encoding", "identity")
-                if content_encoding.strip().lower() != "identity":
-                    raise ValueError("semantic provider response Content-Encoding is not allowed")
-                chunks: list[bytes] = []
-                response_size = 0
-                response_chunks = (
-                    _single_chunk(response.content)
-                    if response.is_stream_consumed
-                    else response.aiter_raw()
-                )
-                async for chunk in response_chunks:
-                    response_size += len(chunk)
-                    if response_size > self.settings.max_response_bytes:
-                        raise ValueError("semantic provider response exceeds max_response_bytes")
-                    chunks.append(chunk)
-        completion_response = _ChatCompletionResponse.model_validate_json(b"".join(chunks))
-        if _contains_secret(
-            completion_response.model_dump(mode="json"), self.settings.semantic_base_url
-        ):
-            raise ValueError("semantic provider response contains the configured endpoint URL")
-        if api_key is not None and _contains_secret(
-            completion_response.model_dump(mode="json"), api_key
-        ):
-            raise ValueError("semantic provider response contains the configured credential")
-        return completion_response
-
     @staticmethod
     def _render_seed(raw_input: str, instruction: str) -> int:
         return _render_seed(raw_input, instruction)
-
-    def _require_live_access(self) -> str | None:
-        if not self.settings.live_calls:
-            raise RuntimeError(
-                "semantic model calls require UL_LIVE=true (or UL_DATASET_LIVE_CALLS=true)"
-            )
-        if not self.settings.allow_external_data_processing:
-            raise RuntimeError(
-                "semantic model calls process raw inputs and outputs at the configured endpoint; "
-                "set "
-                "UL_LIVE=true (or UL_DATASET_ALLOW_EXTERNAL_DATA_PROCESSING=true) to allow this"
-            )
-        api_key = (
-            self.settings.api_key.get_secret_value().strip()
-            if self.settings.api_key is not None
-            else ""
-        )
-        if not api_key and self.provider.requires_api_key:
-            raise RuntimeError(
-                f"semantic model calls require {self.settings.api_key_environment_variable}"
-            )
-        return api_key or None
 
     def _bounded_json(self, payload: dict[str, JsonValue]) -> str:
         serialized = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
@@ -1391,54 +1512,87 @@ class SemanticModelDeconstructor:
             },
         )
 
-    @classmethod
-    def _expand_unambiguous_evidence_quotes(
-        cls,
-        interaction: InteractionRecord | UserInputRecord,
-        frame: SemanticFrame,
-    ) -> SemanticFrame:
-        observed_output = (
-            interaction.raw_observed_output if isinstance(interaction, InteractionRecord) else None
+    @staticmethod
+    def _normalize_self_correction_relation_kind(frame: SemanticFrame) -> SemanticFrame:
+        correction_acts = tuple(
+            act for act in frame.communication_acts if act.kind == "self_correction"
         )
-        evidence_payload: JsonValue = {
-            "raw_input": interaction.raw_input,
-            "raw_observed_output": observed_output,
-        }
-
-        def expand_element(element: Any) -> Any:
-            expanded_evidence: list[EvidenceReference] = []
-            for evidence in element.evidence:
-                resolved_value = cls._resolve_json_pointer(evidence_payload, evidence.json_pointer)
-                quote = evidence.text_quote
-                if (
-                    isinstance(resolved_value, str)
-                    and quote is not None
-                    and quote not in resolved_value
-                ):
-                    parts = re.split(r"\s*(?:\.\.\.|…)\s*", quote)
-                    if len(parts) == 2 and all(parts):
-                        prefix_start = resolved_value.find(parts[0])
-                        suffix_start = resolved_value.find(parts[1], prefix_start + len(parts[0]))
-                        if (
-                            prefix_start >= 0
-                            and suffix_start >= 0
-                            and prefix_start == resolved_value.rfind(parts[0])
-                            and suffix_start == resolved_value.rfind(parts[1])
-                        ):
-                            quote = resolved_value[prefix_start : suffix_start + len(parts[1])]
-                            evidence = evidence.model_copy(update={"text_quote": quote})
-                expanded_evidence.append(evidence)
-            return element.model_copy(update={"evidence": tuple(expanded_evidence)})
-
+        canonical_relations = tuple(
+            relation for relation in frame.relations if relation.kind == "superseded_by"
+        )
+        aliased_relations = tuple(
+            relation for relation in frame.relations if relation.kind == "self_correction"
+        )
+        if len(correction_acts) != 1 or canonical_relations or len(aliased_relations) > 1:
+            return frame
+        correction_act = correction_acts[0]
+        if correction_act.attributes:
+            return frame
+        provisional_factors = tuple(
+            factor
+            for factor in frame.factors
+            if factor.status == "superseded"
+            and not any(factor.id in request.factor_ids for request in frame.request_units)
+        )
+        if len(provisional_factors) != 1:
+            return frame
+        provisional_factor = provisional_factors[0]
+        final_factors = tuple(
+            factor
+            for factor in frame.factors
+            if factor.status != "superseded"
+            and (factor.kind, factor.role) == (provisional_factor.kind, provisional_factor.role)
+            and sum(factor.id in request.factor_ids for request in frame.request_units) == 1
+        )
+        if len(final_factors) != 1:
+            return frame
+        final_factor = final_factors[0]
+        expected_factor_ids = (provisional_factor.id, final_factor.id)
+        if correction_act.factor_ids not in ((), expected_factor_ids):
+            return frame
+        correction_relation = aliased_relations[0] if aliased_relations else None
+        if correction_relation is not None and (
+            correction_relation.source_ids != (provisional_factor.id,)
+            or correction_relation.target_ids != (final_factor.id,)
+        ):
+            return frame
+        if correction_relation is None:
+            relation_id = f"{correction_act.id}:superseded-by"
+            existing_ids = {
+                *(request.id for request in frame.request_units),
+                *(factor.id for factor in frame.factors),
+                *(relation.id for relation in frame.relations),
+                *(act.id for act in frame.communication_acts),
+                *(outcome.id for outcome in frame.outcomes),
+            }
+            if relation_id in existing_ids:
+                return frame
+            correction_relation = SemanticRelation(
+                id=relation_id,
+                evidence=correction_act.evidence,
+                confidence=correction_act.confidence,
+                status=correction_act.status,
+                kind="superseded_by",
+                source_ids=(provisional_factor.id,),
+                target_ids=(final_factor.id,),
+            )
+            normalized_relations = (*frame.relations, correction_relation)
+        else:
+            normalized_relations = tuple(
+                relation.model_copy(update={"kind": "superseded_by"})
+                if relation.id == correction_relation.id
+                else relation
+                for relation in frame.relations
+            )
         return frame.model_copy(
             update={
-                "request_units": tuple(expand_element(element) for element in frame.request_units),
-                "factors": tuple(expand_element(element) for element in frame.factors),
-                "relations": tuple(expand_element(element) for element in frame.relations),
+                "relations": normalized_relations,
                 "communication_acts": tuple(
-                    expand_element(element) for element in frame.communication_acts
+                    act.model_copy(update={"factor_ids": expected_factor_ids})
+                    if act.id == correction_act.id
+                    else act
+                    for act in frame.communication_acts
                 ),
-                "outcomes": tuple(expand_element(element) for element in frame.outcomes),
             }
         )
 
@@ -1542,75 +1696,106 @@ class SemanticModelDeconstructor:
             interaction.raw_observed_output if isinstance(interaction, InteractionRecord) else None
         )
         if observed_output is None and frame.outcomes:
-            raise ValueError("input-only frames must not contain outcomes")
+            raise SemanticGroundingError(
+                SemanticGroundingDiagnostic(
+                    collection="outcomes",
+                    element_index=0,
+                    reason="outcome_for_input_only_record",
+                )
+            )
         if observed_output is not None and not frame.outcomes:
-            raise ValueError("observed outputs must produce at least one grounded outcome")
-        if any(
-            not any(evidence.source == "output" for evidence in outcome.evidence)
-            for outcome in frame.outcomes
-        ):
-            raise ValueError("every observed outcome must include output evidence")
-        elements = (
-            *frame.request_units,
-            *frame.factors,
-            *frame.relations,
-            *frame.communication_acts,
-            *frame.outcomes,
+            raise SemanticGroundingError(
+                SemanticGroundingDiagnostic(
+                    collection="outcomes",
+                    reason="observed_outcome_missing",
+                )
+            )
+        for outcome_index, outcome in enumerate(frame.outcomes):
+            if not any(evidence.source == "output" for evidence in outcome.evidence):
+                raise SemanticGroundingError(
+                    SemanticGroundingDiagnostic(
+                        collection="outcomes",
+                        element_index=outcome_index,
+                        reason="output_evidence_missing",
+                    )
+                )
+        element_collections: tuple[tuple[SemanticElementCollection, tuple[Any, ...]], ...] = (
+            ("request_units", frame.request_units),
+            ("factors", frame.factors),
+            ("relations", frame.relations),
+            ("communication_acts", frame.communication_acts),
+            ("outcomes", frame.outcomes),
         )
         evidence_payload: JsonValue = {
             "raw_input": interaction.raw_input,
             "raw_observed_output": observed_output,
         }
-        for element in elements:
-            if not element.evidence:
-                raise ValueError(f"semantic element {element.id} requires source evidence")
-            for evidence in element.evidence:
-                if evidence.source == "output" and observed_output is None:
-                    raise ValueError("input-only frames must not contain output evidence")
-                expected_prefix = (
-                    "/raw_input" if evidence.source == "input" else "/raw_observed_output"
-                )
-                if (
-                    evidence.json_pointer != expected_prefix
-                    and not evidence.json_pointer.startswith(f"{expected_prefix}/")
-                ):
-                    raise ValueError("evidence json_pointer does not match its source")
-                resolved_value = cls._resolve_json_pointer(evidence_payload, evidence.json_pointer)
-                cls._validate_text_quote(resolved_value, evidence)
-                if isinstance(resolved_value, str) and evidence.text_quote is None:
-                    raise ValueError("evidence on text must include an exact quote")
+        for collection, elements in element_collections:
+            for element_index, element in enumerate(elements):
+                if not element.evidence:
+                    raise SemanticGroundingError(
+                        SemanticGroundingDiagnostic(
+                            collection=collection,
+                            element_index=element_index,
+                            reason="element_evidence_missing",
+                        )
+                    )
+                for evidence_index, evidence in enumerate(element.evidence):
+                    cls._validate_evidence_reference(
+                        evidence_payload,
+                        observed_output,
+                        evidence,
+                        collection=collection,
+                        element_index=element_index,
+                        evidence_index=evidence_index,
+                    )
+
+    @classmethod
+    def _validate_evidence_reference(
+        cls,
+        evidence_payload: JsonValue,
+        observed_output: JsonValue,
+        evidence: EvidenceReference,
+        *,
+        collection: SemanticElementCollection,
+        element_index: int,
+        evidence_index: int,
+    ) -> None:
+        def diagnostic(reason: SemanticGroundingReason) -> SemanticGroundingDiagnostic:
+            return SemanticGroundingDiagnostic(
+                collection=collection,
+                element_index=element_index,
+                evidence_index=evidence_index,
+                json_pointer=_safe_diagnostic_json_pointer(
+                    evidence.source,
+                    evidence.json_pointer,
+                ),
+                reason=reason,
+            )
+
+        if evidence.source == "output" and observed_output is None:
+            raise SemanticGroundingError(diagnostic("output_evidence_without_output"))
+        expected_prefix = "/raw_input" if evidence.source == "input" else "/raw_observed_output"
+        if evidence.json_pointer != expected_prefix and not evidence.json_pointer.startswith(
+            f"{expected_prefix}/"
+        ):
+            raise SemanticGroundingError(diagnostic("pointer_source_mismatch"))
+        try:
+            resolved_value = cls._resolve_json_pointer(evidence_payload, evidence.json_pointer)
+        except ValueError:
+            raise SemanticGroundingError(diagnostic("pointer_unresolved")) from None
+        quote = evidence.text_quote
+        if isinstance(resolved_value, str):
+            if quote is None:
+                raise SemanticGroundingError(diagnostic("quote_missing_for_string"))
+            if quote not in resolved_value:
+                raise SemanticGroundingError(diagnostic("quote_not_exact"))
+        elif quote is not None:
+            raise SemanticGroundingError(diagnostic("quote_for_non_string"))
 
     @staticmethod
     def _resolve_json_pointer(value: JsonValue, pointer: str) -> JsonValue:
-        if not pointer:
-            return value
-        current: object = value
-        for encoded_token in pointer[1:].split("/"):
-            token = encoded_token.replace("~1", "/").replace("~0", "~")
-            if isinstance(current, dict):
-                current_mapping = cast(dict[str, object], current)
-                if token in current_mapping:
-                    current = current_mapping[token]
-                    continue
-            valid_array_index = token == "0" or (token.isdecimal() and not token.startswith("0"))
-            if isinstance(current, list) and valid_array_index:
-                current_sequence = cast(list[object], current)
-                index = int(token)
-                if index < len(current_sequence):
-                    current = current_sequence[index]
-                    continue
-            raise ValueError("evidence json_pointer does not resolve")
-        return cast(JsonValue, current)
-
-    @staticmethod
-    def _validate_text_quote(
-        resolved_value: JsonValue,
-        evidence: EvidenceReference,
-    ) -> None:
-        if evidence.text_quote is None:
-            return
-        if not isinstance(resolved_value, str) or evidence.text_quote not in resolved_value:
-            raise ValueError("evidence text_quote does not occur inside the selected string")
+        return _resolve_json_pointer(value, pointer)
 
     @staticmethod
     def _decode_object(content: str) -> dict[str, Any]:
@@ -1623,7 +1808,7 @@ class SemanticModelDeconstructor:
         self,
         completion: _SemanticCompletion,
     ) -> dict[str, JsonValue]:
-        metadata = self.provider.generation_metadata(completion.response)
+        metadata = self.llm_client.generation_metadata(completion.response)
         if completion.cache_hit:
             metadata["semantic_cache_hit"] = True
             metadata["semantic_usage"] = {}
@@ -1638,23 +1823,41 @@ def create_semantic_model_deconstructor(
     settings: DatasetSemanticSettings,
     *,
     client: httpx.AsyncClient | None = None,
+    llm_client: LLMClient | None = None,
 ) -> SemanticModelDeconstructor:
-    provider = _semantic_completion_provider(settings)
-    return SemanticModelDeconstructor(settings, provider, client=client)
+    if client is not None and llm_client is not None:
+        raise ValueError("an HTTP client cannot replace the shared LLM client transport")
+    owns_llm_client = llm_client is None
+    configured_client = llm_client or LLMClient(
+        llm_client_config_from_dataset_settings(settings),
+        client=client,
+    )
+    return SemanticModelDeconstructor(
+        settings,
+        configured_client,
+        owns_llm_client=owns_llm_client,
+    )
+
+
+def semantic_deconstructor_identity(
+    settings: DatasetSemanticSettings,
+) -> SemanticDeconstructorIdentity:
+    return _semantic_deconstructor_identity(_EXTRACTOR_VERSION)
 
 
 def plan_evaluator_preflight_profiles(
     settings: DatasetSemanticSettings,
 ) -> tuple[EvaluatorPreflightProfilePlan, ...]:
-    provider = _semantic_completion_provider(settings)
+    llm_config = llm_client_config_from_dataset_settings(settings)
     return tuple(
         EvaluatorPreflightProfilePlan(
             roles=profile.roles,
             requested_model=profile.model,
+            reasoning_mode=profile.reasoning_mode,
             max_completion_tokens=profile.max_tokens,
             required_parameters=profile.required_parameters,
         )
-        for profile in _evaluator_preflight_profiles(settings, provider)
+        for profile in _evaluator_preflight_profiles(llm_config)
     )
 
 
@@ -1662,44 +1865,33 @@ def validate_evaluator_preflight(
     settings: DatasetSemanticSettings,
     result: EvaluatorModelPreflight,
 ) -> None:
-    provider = _semantic_completion_provider(settings)
+    llm_config = llm_client_config_from_dataset_settings(settings)
     _validate_evaluator_preflight(
-        provider,
-        _evaluator_preflight_profiles(settings, provider),
+        llm_config,
+        _evaluator_preflight_profiles(llm_config),
         result,
     )
 
 
-def _semantic_completion_provider(
-    settings: DatasetSemanticSettings,
-) -> SemanticCompletionProvider:
-    if isinstance(settings, OpenAICompatibleDatasetSettings):
-        return OpenAICompatibleSemanticProvider(
-            provider_id=settings.semantic_provider_id,
-            base_url=settings.semantic_base_url,
-            endpoint_sha256=settings.semantic_endpoint_sha256,
-        )
-    return OpenRouterSemanticProvider()
-
-
 def _evaluator_preflight_profiles(
-    settings: DatasetSemanticSettings,
-    provider: SemanticCompletionProvider,
+    llm_config: LLMClientConfig,
 ) -> tuple[_EvaluatorPreflightProfile, ...]:
     render_seed = _render_seed("UL evaluator preflight", "Check renderer compatibility.")
 
     def profile(
         *,
-        role: Literal["deconstruct", "render", "equivalence"],
-        model: str,
-        reasoning: dict[str, JsonValue],
+        role: Literal["deconstruct", "render", "equivalence", "materiality"],
         max_tokens: int,
-        temperature: float,
         seed: int,
         top_p: float | None,
     ) -> _EvaluatorPreflightProfile:
-        request_options: dict[str, Any] = {}
-        provider.add_request_options(request_options, reasoning)
+        role_config = llm_config.role_config(role)
+        request_options = llm_config.request_options(
+            role=role,
+            seed=seed,
+            top_p=top_p,
+            max_output_tokens=max_tokens,
+        )
         required_parameters = ["response_format", "seed", "temperature", "max_tokens"]
         if "reasoning" in request_options:
             required_parameters.append("reasoning")
@@ -1707,10 +1899,10 @@ def _evaluator_preflight_profiles(
             required_parameters.append("top_p")
         return _EvaluatorPreflightProfile(
             roles=(role,),
-            model=model,
-            reasoning=reasoning,
+            model=role_config.model,
+            reasoning_mode=role_config.reasoning_mode,
             max_tokens=max_tokens,
-            temperature=temperature,
+            temperature=llm_config.temperature,
             seed=seed,
             top_p=top_p,
             required_parameters=tuple(required_parameters),
@@ -1719,35 +1911,44 @@ def _evaluator_preflight_profiles(
     candidates = (
         profile(
             role="deconstruct",
-            model=settings.model,
-            reasoning={"effort": "minimal"},
-            max_tokens=min(settings.max_output_tokens, _PREFLIGHT_MAX_TOKENS),
-            temperature=0,
+            max_tokens=min(
+                llm_config.role_config("deconstruct").max_output_tokens,
+                _PREFLIGHT_MAX_TOKENS,
+            ),
             seed=0,
             top_p=None,
         ),
         profile(
             role="render",
-            model=settings.render_model,
-            reasoning={"effort": "none"},
-            max_tokens=min(settings.max_render_tokens, _PREFLIGHT_MAX_TOKENS),
-            temperature=0.7,
+            max_tokens=min(
+                llm_config.role_config("render").max_output_tokens,
+                _PREFLIGHT_MAX_TOKENS,
+            ),
             seed=render_seed,
-            top_p=0.95,
+            top_p=None,
         ),
         profile(
             role="equivalence",
-            model=settings.equivalence_model,
-            reasoning={"effort": "low"},
-            max_tokens=min(settings.max_output_tokens, _PREFLIGHT_MAX_TOKENS),
-            temperature=0,
+            max_tokens=min(
+                llm_config.role_config("equivalence").max_output_tokens,
+                _PREFLIGHT_MAX_TOKENS,
+            ),
+            seed=0,
+            top_p=None,
+        ),
+        profile(
+            role="materiality",
+            max_tokens=min(
+                llm_config.role_config("materiality").max_output_tokens,
+                _PREFLIGHT_MAX_TOKENS,
+            ),
             seed=0,
             top_p=None,
         ),
     )
     profiles_by_signature: dict[str, _EvaluatorPreflightProfile] = {}
     for candidate in candidates:
-        signature = _profile_request_options_sha256(provider, candidate)
+        signature = _profile_request_options_sha256(llm_config, candidate)
         existing = profiles_by_signature.get(signature)
         if existing is None:
             profiles_by_signature[signature] = candidate
@@ -1760,7 +1961,7 @@ def _evaluator_preflight_profiles(
 
 
 def _validate_evaluator_preflight(
-    provider: SemanticCompletionProvider,
+    llm_config: LLMClientConfig,
     expected_profiles: tuple[_EvaluatorPreflightProfile, ...],
     result: EvaluatorModelPreflight,
 ) -> None:
@@ -1768,8 +1969,10 @@ def _validate_evaluator_preflight(
         (
             profile.roles,
             profile.model,
+            llm_config.upstream_provider,
+            profile.reasoning_mode,
             profile.required_parameters,
-            _profile_request_options_sha256(provider, profile),
+            _profile_request_options_sha256(llm_config, profile),
         )
         for profile in expected_profiles
     )
@@ -1777,12 +1980,14 @@ def _validate_evaluator_preflight(
         (
             profile.roles,
             profile.requested_model,
+            profile.configured_upstream_provider,
+            profile.reasoning_mode,
             profile.required_parameters,
             profile.request_options_sha256,
         )
         for profile in result.profiles
     )
-    routing_enforced = provider.enforces_parameter_support
+    routing_enforced = llm_config.enforces_parameter_support
     expected_verified_capabilities = (
         ("routing", "structured_output", "required_parameters")
         if routing_enforced
@@ -1796,13 +2001,13 @@ def _validate_evaluator_preflight(
         )
     )
     if (
-        result.provider != provider.provider_id
-        or result.endpoint_sha256 != provider.endpoint_sha256
+        result.provider != llm_config.provider_id
+        or result.endpoint_sha256 != llm_config.endpoint_sha256
         or actual_profile_bindings != expected_profile_bindings
         or result.verified_capabilities != expected_verified_capabilities
         or result.ignored_or_unsupported_options
         or result.unverified_options != expected_unverified_options
-        or result.data_policy != provider.preflight_data_policy()
+        or result.data_policy != llm_config.data_policy()
         or any(
             profile.parameter_support
             != ("routing_enforced" if routing_enforced else "endpoint_accepted_unverified")
@@ -1815,57 +2020,20 @@ def _validate_evaluator_preflight(
 
 
 def _profile_request_options_sha256(
-    provider: SemanticCompletionProvider,
+    llm_config: LLMClientConfig,
     profile: _EvaluatorPreflightProfile,
 ) -> str:
     request_options: dict[str, Any] = {
-        "model": profile.model,
-        "max_tokens": profile.max_tokens,
-        "temperature": profile.temperature,
-        "seed": profile.seed,
+        "reasoning_mode": profile.reasoning_mode,
+        **llm_config.request_options(
+            role=profile.roles[0],
+            seed=profile.seed,
+            top_p=profile.top_p,
+            max_output_tokens=profile.max_tokens,
+        ),
     }
-    provider.add_request_options(request_options, profile.reasoning)
-    if profile.top_p is not None:
-        request_options["top_p"] = profile.top_p
     serialized_options = json.dumps(request_options, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(serialized_options.encode()).hexdigest()
-
-
-def _same_origin(left: httpx.URL, right: httpx.URL) -> bool:
-    return (left.scheme, left.host, left.port) == (right.scheme, right.host, right.port)
-
-
-async def _single_chunk(content: bytes) -> AsyncIterator[bytes]:
-    yield content
-
-
-def _contains_secret(value: object, secret: str) -> bool:
-    if isinstance(value, str):
-        return secret in value
-    if isinstance(value, dict):
-        mapping = cast(dict[object, object], value)
-        return any(_contains_secret(item, secret) for item in mapping.values())
-    if isinstance(value, list):
-        sequence = cast(list[object], value)
-        return any(_contains_secret(item, secret) for item in sequence)
-    return False
-
-
-async def _read_bounded_response(response: httpx.Response, *, maximum_bytes: int) -> bytes:
-    chunks: list[bytes] = []
-    remaining = maximum_bytes
-    response_chunks = (
-        _single_chunk(response.content) if response.is_stream_consumed else response.aiter_raw()
-    )
-    async for chunk in response_chunks:
-        if remaining <= 0:
-            break
-        retained = chunk[:remaining]
-        chunks.append(retained)
-        remaining -= len(retained)
-        if len(chunk) > len(retained):
-            break
-    return b"".join(chunks)
 
 
 def _preflight_http_capability(status_code: int, error_body: bytes) -> str:

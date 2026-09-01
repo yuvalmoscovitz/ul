@@ -23,10 +23,14 @@ from ul import (
     InteractionRecord,
     JsonHttpEnvironmentConfig,
     JsonHttpIsolatedResponseConfig,
+    MaterialVarianceAssessment,
+    MaterialVarianceEvidence,
     ObservedAgentOutput,
+    OpenAICompatibleJudgeConfig,
     RichInteractionCase,
     SemanticFrame,
     create_dataset_augmentation_projection,
+    material_variance_evaluator_version_from_config,
     project_rich_interaction_case,
 )
 from ul.augmentations.dataset import DatasetAugmentationCandidate
@@ -36,9 +40,24 @@ from ul.dataset_invariants import (
     DatasetInvariantRuleEvaluation,
 )
 from ul_cli.dataset.evidence import context as context_module
+from ul_cli.dataset_run_config import DatasetRunConfig, TargetExecutionConfig
 
 runner = CliRunner()
 _ANSI_ESCAPE_PATTERN = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+_TEST_MATERIALITY_EVALUATOR_VERSION_ID = material_variance_evaluator_version_from_config(
+    OpenAICompatibleJudgeConfig(
+        base_url="https://openrouter.ai/api/v1",
+        model="test/materiality",
+        api_key=SecretStr("test-key"),
+        allow_external_data_processing=True,
+        data_policy="openrouter_zdr",
+        upstream_provider="test-provider",
+        timeout_seconds=60.0,
+        max_output_tokens=512,
+        token_parameter="max_tokens",
+        max_response_bytes=1_000_000,
+    )
+).id
 
 
 def _trial_set(
@@ -84,6 +103,7 @@ def _evaluation_result(
     identifier: str,
     *,
     has_review_finding: bool = False,
+    material_variance_decision: str = "material_variance",
 ) -> DatasetEvaluationResult:
     source = InteractionRecord(
         id=identifier,
@@ -150,6 +170,28 @@ def _evaluation_result(
                     message="The variation changed observable behavior.",
                 ),
             ),
+            material_variance=MaterialVarianceAssessment(
+                decision=cast(Any, material_variance_decision),
+                reason_code=(
+                    "action_added"
+                    if material_variance_decision == "material_variance"
+                    else (
+                        "same_real_world_effect"
+                        if material_variance_decision == "operationally_equivalent"
+                        else "missing_comparison_evidence"
+                    )
+                ),
+                explanation="Automatic materiality test decision.",
+                evidence=(
+                    MaterialVarianceEvidence(
+                        json_pointer="/payload/answer/findings/0/baseline_effects/0"
+                    ),
+                    MaterialVarianceEvidence(
+                        json_pointer="/payload/answer/findings/0/variation_effects/0"
+                    ),
+                ),
+                evaluator_version_id=_TEST_MATERIALITY_EVALUATOR_VERSION_ID,
+            ),
         )
     else:
         evaluation_case = DatasetEvaluationCase(
@@ -208,9 +250,14 @@ def _settings(**overrides: object) -> SimpleNamespace:
         "live_calls": True,
         "allow_external_data_processing": True,
         "api_key": SecretStr("test-key"),
+        "upstream_provider": "test-provider",
         "model": "test/deconstructor",
         "render_model": "test/renderer",
         "equivalence_model": "test/equivalence",
+        "materiality_model": "test/materiality",
+        "deconstruct_reasoning": "required",
+        "render_reasoning": "required",
+        "equivalence_reasoning": "required",
         "max_input_chars": 50_000,
         "max_output_tokens": 4_096,
         "max_render_tokens": 512,
@@ -320,11 +367,12 @@ def _run_context(
     *,
     invariant_suite: object | None = None,
     target_config: object | None = None,
+    settings: object | None = None,
 ) -> object:
     return context_module.build_dataset_evidence_run_context(
         selected_records=records,
         selected_operator_ids=("input.surface.rephrase",),
-        repetitions=1,
+        run_config=_run_config(),
         invariant_suite=cast(Any, invariant_suite),
         target_config=cast(Any, target_config)
         if target_config is not None
@@ -361,7 +409,32 @@ def _run_context(
                 },
             }
         ),
-        settings=cast(Any, _settings()),
+        settings=cast(Any, settings if settings is not None else _settings()),
+    )
+
+
+def _run_config(
+    *,
+    repetitions: int = 1,
+    environment_api_calls_per_trial: int = 1,
+    planned_environment_api_calls: int | None = None,
+    max_environment_api_calls: int = 100,
+    trial_timeout_seconds: float = 30.0,
+) -> DatasetRunConfig:
+    planned_calls = planned_environment_api_calls or (
+        repetitions * 2 * environment_api_calls_per_trial
+    )
+    return DatasetRunConfig(
+        repetitions=repetitions,
+        target=TargetExecutionConfig(
+            trial_timeout_seconds=trial_timeout_seconds,
+            max_environment_api_calls=max_environment_api_calls,
+            environment_api_calls_per_trial=environment_api_calls_per_trial,
+            planned_environment_api_calls=planned_calls,
+            allow_network_egress=True,
+            test_environment_confirmed=True,
+            allow_insecure_http=False,
+        ),
     )
 
 
@@ -370,6 +443,8 @@ def _evaluator_preflight() -> EvaluatorModelPreflight:
         "require_parameters": True,
         "data_collection": "deny",
         "zdr": True,
+        "only": ["test-provider"],
+        "allow_fallbacks": False,
     }
 
     def request_options_sha256(
@@ -383,6 +458,7 @@ def _evaluator_preflight() -> EvaluatorModelPreflight:
     ) -> str:
         options: dict[str, object] = {
             "model": model,
+            "reasoning_mode": "required",
             "max_tokens": max_tokens,
             "temperature": temperature,
             "seed": seed,
@@ -401,6 +477,17 @@ def _evaluator_preflight() -> EvaluatorModelPreflight:
         )
         & 0x7FFF_FFFF
     )
+    materiality_options = {
+        "model": "test/materiality",
+        "reasoning_mode": "omitted",
+        "max_tokens": 512,
+        "temperature": 0,
+        "seed": 0,
+        "provider": provider_options,
+    }
+    materiality_options_sha256 = hashlib.sha256(
+        json.dumps(materiality_options, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
     return EvaluatorModelPreflight.model_validate(
         {
             "provider": "openrouter",
@@ -411,6 +498,8 @@ def _evaluator_preflight() -> EvaluatorModelPreflight:
                     "requested_model": "test/deconstructor",
                     "routed_model": "test/deconstructor",
                     "upstream_provider": "test-provider",
+                    "configured_upstream_provider": "test-provider",
+                    "reasoning_mode": "required",
                     "required_parameters": (
                         "response_format",
                         "seed",
@@ -429,21 +518,21 @@ def _evaluator_preflight() -> EvaluatorModelPreflight:
                     "requested_model": "test/renderer",
                     "routed_model": "test/renderer",
                     "upstream_provider": "test-provider",
+                    "configured_upstream_provider": "test-provider",
+                    "reasoning_mode": "required",
                     "required_parameters": (
                         "response_format",
                         "seed",
                         "temperature",
                         "max_tokens",
                         "reasoning",
-                        "top_p",
                     ),
                     "request_options_sha256": request_options_sha256(
                         "test/renderer",
                         "none",
-                        0.7,
+                        0,
                         render_seed,
                         max_tokens=512,
-                        top_p=0.95,
                     ),
                     "parameter_support": "routing_enforced",
                     "unverified_options": (),
@@ -453,6 +542,8 @@ def _evaluator_preflight() -> EvaluatorModelPreflight:
                     "requested_model": "test/equivalence",
                     "routed_model": "test/equivalence",
                     "upstream_provider": "test-provider",
+                    "configured_upstream_provider": "test-provider",
+                    "reasoning_mode": "required",
                     "required_parameters": (
                         "response_format",
                         "seed",
@@ -463,6 +554,23 @@ def _evaluator_preflight() -> EvaluatorModelPreflight:
                     "request_options_sha256": request_options_sha256(
                         "test/equivalence", "low", 0, 0
                     ),
+                    "parameter_support": "routing_enforced",
+                    "unverified_options": (),
+                },
+                {
+                    "roles": ("materiality",),
+                    "requested_model": "test/materiality",
+                    "routed_model": "test/materiality",
+                    "upstream_provider": "test-provider",
+                    "configured_upstream_provider": "test-provider",
+                    "reasoning_mode": "omitted",
+                    "required_parameters": (
+                        "response_format",
+                        "seed",
+                        "temperature",
+                        "max_tokens",
+                    ),
+                    "request_options_sha256": materiality_options_sha256,
                     "parameter_support": "routing_enforced",
                     "unverified_options": (),
                 },
@@ -479,6 +587,7 @@ def _evaluator_preflight() -> EvaluatorModelPreflight:
                 "provider_policy_declared": True,
                 "data_collection": "deny",
                 "zero_data_retention_required": True,
+                "upstream_provider": "test-provider",
                 "implication": (
                     "The configured route requires data collection to be denied and zero data "
                     "retention; the evaluator request is still processed externally."

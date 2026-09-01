@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from typing import Literal, cast
+from typing import Any, Literal, cast
 
 from pydantic import JsonValue
 from ul import (
@@ -10,13 +10,18 @@ from ul import (
     DatasetEvaluationFinding,
     DatasetEvaluationResult,
     DatasetEvaluationTrialSet,
+    DatasetSourcePreparationError,
     DatasetTargetLifecycleFailure,
+    InteractionRecord,
 )
-from ul.dataset_evaluation import compare_action_outcomes
+from ul.dataset_evaluation import compare_observed_outcomes
 from ul.dataset_invariants import DatasetInvariantEvaluation
 from ul_core.dataset import ObservedOutcome
 
-from ul_cli.dataset_review import DatasetEvidenceRunContext
+from ul_cli.dataset_review import (
+    DatasetEvidenceRunContext,
+    DatasetSourcePreparationFailureEvidence,
+)
 from ul_cli.report_contract import (
     CrossExaminationEvidenceAvailability,
     EvidenceAuthority,
@@ -37,6 +42,44 @@ _BEHAVIORAL_LIMITATIONS = (
 )
 
 
+def build_source_preparation_failure_evidence(
+    source: InteractionRecord,
+    error: DatasetSourcePreparationError,
+    *,
+    repetitions: int,
+    max_environment_api_calls: int,
+    planned_target_calls: int,
+    run_context: DatasetEvidenceRunContext,
+) -> DatasetSourcePreparationFailureEvidence:
+    augmentation_target = getattr(source, "augmentation_target", None)
+    evidence = DatasetSourcePreparationFailureEvidence(
+        interaction_id=source.id,
+        source_record_id=(
+            source.source_interaction_id if augmentation_target is not None else None
+        ),
+        reason_code=cast(
+            Literal[
+                "source_semantic_preparation_failed",
+                "source_outcome_projection_failed",
+                "source_comparison_surface_incompatible",
+            ],
+            error.code,
+        ),
+        summary=error.explanation,
+        remediation=error.remediation,
+        execution_plan=cast(
+            Any,
+            {
+                "repetitions": repetitions,
+                "max_target_calls": max_environment_api_calls,
+                "dataset_planned_target_calls": planned_target_calls,
+            },
+        ),
+        run_context=run_context,
+    )
+    return evidence
+
+
 def build_customer_evidence_record(
     result: DatasetEvaluationResult,
     *,
@@ -49,8 +92,17 @@ def build_customer_evidence_record(
     evaluation_mode = cast(Literal["variance"], getattr(result, "evaluation_mode", "variance"))
     augmentation_target = getattr(result.source, "augmentation_target", None)
     pattern_facets = _customer_pattern_facets(getattr(result.source, "metadata", {}))
+    evidence_schema_version = (
+        "1.15.0"
+        if all(
+            not case.findings or getattr(case, "material_variance", None) is not None
+            for case in result.cases
+        )
+        else "1.14.0"
+    )
     cases: list[JsonValue] = []
     for case in result.cases:
+        material_variance = getattr(case, "material_variance", None)
         cases.append(
             {
                 "operator_id": case.candidate.operator_id,
@@ -77,6 +129,18 @@ def build_customer_evidence_record(
                     operator_version=case.candidate.operator_version,
                     augmented_input=case.candidate.augmented_input,
                 ),
+                **(
+                    {
+                        "material_variance": cast(
+                            JsonValue,
+                            material_variance.model_dump(mode="json")
+                            if material_variance is not None
+                            else None,
+                        )
+                    }
+                    if evidence_schema_version == "1.15.0"
+                    else {}
+                ),
                 "cross_examination": _customer_cross_examination(result, case),
                 "inconclusive_reasons": list(case.inconclusive_reasons),
             }
@@ -89,7 +153,7 @@ def build_customer_evidence_record(
     if uses_extended_invariants and run_context is None:
         raise ValueError("extended invariant evidence requires a resumable run context")
     evidence: dict[str, JsonValue] = {
-        "schema_version": "1.13.0",
+        "schema_version": evidence_schema_version,
         "evaluation_mode": evaluation_mode,
         "interaction_id": result.source.id,
         **(
@@ -163,11 +227,12 @@ def _customer_cross_examination(
     else:
         historical_frame = source_frames[0]
         try:
-            baseline_deltas = compare_action_outcomes(
+            baseline_deltas = compare_observed_outcomes(
                 historical_frame,
                 current_baseline_frame,
                 result.source.raw_input,
                 grounding_frame=historical_frame,
+                comparison_surface=result.comparison_surface,
             )
         except ValueError:
             baseline_drift = "inconclusive"
@@ -504,8 +569,18 @@ def _finding_id(
             "augmented_input": augmented_input,
             "category": finding.category,
             "grounded_field_names": sorted(finding.grounded_field_names),
-            "reference_action_semantics": _normalized_action_semantics(finding.expected_effects),
-            "observed_action_semantics": _normalized_action_semantics(finding.observed_effects),
+            **(
+                {"comparison_surface": "response"}
+                if finding.category == "changed_response"
+                else {
+                    "reference_action_semantics": _normalized_outcome_semantics(
+                        finding.expected_effects
+                    ),
+                    "observed_action_semantics": _normalized_outcome_semantics(
+                        finding.observed_effects
+                    ),
+                }
+            ),
         },
     )
     if duplicate_ordinal is not None:
@@ -519,7 +594,7 @@ def _finding_id(
     return f"ulf_v1_{hashlib.sha256(canonical_json.encode('utf-8')).hexdigest()}"
 
 
-def _normalized_action_semantics(effects: tuple[ObservedOutcome, ...]) -> list[JsonValue]:
+def _normalized_outcome_semantics(effects: tuple[ObservedOutcome, ...]) -> list[JsonValue]:
     signatures = [
         cast(
             JsonValue,

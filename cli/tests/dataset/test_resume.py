@@ -12,6 +12,7 @@ import pytest
 from typer.testing import CliRunner
 from ul import (
     DatasetAugmentationResult,
+    DatasetSemanticPreparationError,
     EnvironmentLifecycleEvidence,
     EnvironmentTurnEvidence,
     EvaluatorModelPreflight,
@@ -39,6 +40,7 @@ from ._factories import (
     _evaluator_preflight,
     _invariant_evaluation,
     _rich_evaluation_result,
+    _run_config,
     _run_context,
     _settings,
 )
@@ -51,6 +53,31 @@ from ._files import (
 
 runner = CliRunner()
 _ANSI_ESCAPE_PATTERN = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+
+
+def test_evidence_run_context_binds_deconstructor_identity() -> None:
+    records = (_evaluation_result("interaction-1").source,)
+    current_context = cast(dataset_review.DatasetEvidenceRunContext, _run_context(records))
+    legacy_context = dataset_review.create_dataset_evidence_run_context(
+        selected_records=records,
+        operators=(("input.surface.rephrase", "1.0.0"),),
+        run_config=_run_config(),
+        invariant_suite_sha256=None,
+        target_config=current_context.target.config,
+        semantic_settings=current_context.semantic_settings.model_copy(
+            update={"deconstructor_identity": None}
+        ),
+    )
+
+    assert current_context.context_sha256 != legacy_context.context_sha256
+    assert current_context.semantic_settings.deconstructor_identity is not None
+    assert legacy_context.semantic_settings.deconstructor_identity is None
+    legacy_payload = legacy_context.model_dump(mode="json")
+    legacy_payload["semantic_settings"].pop("deconstructor_identity")
+    assert (
+        dataset_review.DatasetEvidenceRunContext.model_validate_json(json.dumps(legacy_payload))
+        == legacy_context
+    )
 
 
 def test_finding_reference_key_is_stable_across_resume(tmp_path: Path) -> None:
@@ -159,11 +186,11 @@ def test_resume_rejects_deleted_durable_sidecars_instead_of_replaying_as_legacy(
         run_context=_run_context((source,)),
         selected_records=(source,),
         selected_operator_ids=("input.surface.rephrase",),
-        repetitions=1,
-        max_environment_api_calls=10,
-        allow_environment_network=True,
-        confirm_test_environment=True,
-        allow_insecure_http=False,
+        run_config=_run_config(
+            environment_api_calls_per_trial=5,
+            planned_environment_api_calls=10,
+            max_environment_api_calls=10,
+        ),
         save_augmentations=True,
     )
     dataset_trial_journal.persist_dataset_run_manifest(
@@ -219,11 +246,11 @@ def test_resume_reuses_manifest_without_original_data_config_or_overrides(
         run_context=run_context,
         selected_records=(source,),
         selected_operator_ids=("input.surface.rephrase",),
-        repetitions=1,
-        max_environment_api_calls=10,
-        allow_environment_network=True,
-        confirm_test_environment=True,
-        allow_insecure_http=False,
+        run_config=_run_config(
+            environment_api_calls_per_trial=5,
+            planned_environment_api_calls=10,
+            max_environment_api_calls=10,
+        ),
         save_augmentations=True,
         invariant_suite_snapshot=invariant_suite,
         invariant_suite_source=str(invariant_path.resolve()),
@@ -280,11 +307,11 @@ def test_resume_fails_closed_when_completed_trials_have_no_durable_augmentation(
         run_context=run_context,
         selected_records=(evaluation.source,),
         selected_operator_ids=("input.surface.rephrase",),
-        repetitions=1,
-        max_environment_api_calls=10,
-        allow_environment_network=True,
-        confirm_test_environment=True,
-        allow_insecure_http=False,
+        run_config=_run_config(
+            environment_api_calls_per_trial=5,
+            planned_environment_api_calls=10,
+            max_environment_api_calls=10,
+        ),
         save_augmentations=False,
     )
     evidence.write_bytes(b"")
@@ -309,6 +336,65 @@ def test_resume_fails_closed_when_completed_trials_have_no_durable_augmentation(
     assert "resume_incompatible:augmentation_not_durable" in result.output
 
 
+def test_resume_accepts_completed_trials_with_durable_augmentation_input(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    evidence = tmp_path / "evidence.jsonl"
+    augmentations_input = tmp_path / "accepted.augmentations.jsonl"
+    evaluation = _evaluation_result("interaction-1")
+    settings = _settings()
+    generation_context = augmentation_ledger_module.create_dataset_augmentation_generation_context(
+        selected_records=(evaluation.source,),
+        operators=(("input.surface.rephrase", "1.0.0"),),
+        semantic_settings=(
+            augmentation_ledger_module.dataset_augmentation_ledger_semantic_settings(settings)
+        ),
+    )
+    with augmentation_ledger_module.create_private_augmentation_ledger(
+        augmentations_input,
+        generation_context=generation_context,
+        selected_records=(evaluation.source,),
+    ) as ledger:
+        ledger.append(source=evaluation.source, augmentation=evaluation.augmentation)
+    augmentation_sha256 = hashlib.sha256(augmentations_input.read_bytes()).hexdigest()
+    run_context = _run_context((evaluation.source,))
+    manifest = dataset_trial_journal.create_dataset_run_manifest(
+        run_context=run_context,
+        selected_records=(evaluation.source,),
+        selected_operator_ids=("input.surface.rephrase",),
+        run_config=_run_config(
+            environment_api_calls_per_trial=5,
+            planned_environment_api_calls=10,
+            max_environment_api_calls=10,
+        ),
+        save_augmentations=False,
+        augmentations_input_path=str(augmentations_input.resolve()),
+        augmentations_input_sha256=augmentation_sha256,
+    )
+    evidence.write_bytes(b"")
+    dataset_trial_journal.persist_dataset_run_manifest(
+        dataset_trial_journal.manifest_path(evidence), manifest
+    )
+    journal = dataset_trial_journal.create_dataset_trial_journal(
+        dataset_trial_journal.journal_path(evidence), manifest
+    )
+    journal.start(manifest.work_plan[0])
+    journal.finish(manifest.work_plan[0], evaluation.baseline.trial_set.trials[0])
+    journal.close()
+    persistence_module.persist_evaluator_preflight(evidence, _evaluator_preflight())
+    monkeypatch.setattr(command_module, "load_dataset_semantic_settings", lambda: settings)
+
+    result = runner.invoke(
+        root_app,
+        ["dataset", "evaluate", "--resume", str(evidence), "--dry-run"],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert f"Reusing accepted augmentations: {augmentations_input}" in " ".join(
+        _ANSI_ESCAPE_PATTERN.sub("", result.output).split()
+    )
+
+
 def test_quarantined_trial_requires_bound_operator_cleanup_attestation(
     tmp_path: Path,
 ) -> None:
@@ -318,11 +404,11 @@ def test_quarantined_trial_requires_bound_operator_cleanup_attestation(
         run_context=_run_context((source,)),
         selected_records=(source,),
         selected_operator_ids=("input.surface.rephrase",),
-        repetitions=1,
-        max_environment_api_calls=10,
-        allow_environment_network=True,
-        confirm_test_environment=True,
-        allow_insecure_http=False,
+        run_config=_run_config(
+            environment_api_calls_per_trial=5,
+            planned_environment_api_calls=10,
+            max_environment_api_calls=10,
+        ),
         save_augmentations=True,
     )
     evidence.write_bytes(b"")
@@ -387,17 +473,8 @@ def test_resume_skips_already_processed_interaction_ids(
     generation_context = augmentation_ledger_module.create_dataset_augmentation_generation_context(
         selected_records=selected_records,
         operators=(("input.surface.rephrase", "1.0.0"),),
-        semantic_settings=augmentation_ledger_module.DatasetAugmentationLedgerSemanticSettings(
-            provider="openrouter",
-            endpoint_sha256=_settings().semantic_endpoint_sha256,
-            model=_settings().model,
-            render_model=_settings().render_model,
-            equivalence_model=_settings().equivalence_model,
-            max_input_chars=_settings().max_input_chars,
-            max_output_tokens=_settings().max_output_tokens,
-            max_render_tokens=_settings().max_render_tokens,
-            max_response_bytes=_settings().max_response_bytes,
-            timeout_seconds=_settings().timeout_seconds,
+        semantic_settings=(
+            augmentation_ledger_module.dataset_augmentation_ledger_semantic_settings(_settings())
         ),
     )
     with augmentation_ledger_module.create_private_augmentation_ledger(
@@ -438,9 +515,7 @@ def test_resume_skips_already_processed_interaction_ids(
         target: object,
         output_stream: Any,
         *,
-        repetitions: int,
-        max_environment_api_calls: int,
-        planned_target_calls: int,
+        run_config: object,
         run_context: object,
         augmentation_ledger: object,
         saved_augmentations: object,
@@ -452,8 +527,6 @@ def test_resume_skips_already_processed_interaction_ids(
             operator_ids,
             settings,
             target,
-            max_environment_api_calls,
-            planned_target_calls,
             augmentation_ledger,
             progress_plan,
         )
@@ -463,7 +536,7 @@ def test_resume_skips_already_processed_interaction_ids(
         )
         assert redaction_engine is None
         assert evaluator_preflight == _evaluator_preflight()
-        assert repetitions == 1
+        assert cast(Any, run_config).repetitions == 1
         for record in records:
             evaluated_ids.append(record.id)
         output_stream.write(
@@ -607,17 +680,8 @@ def test_resume_dry_run_rejects_ledger_that_disagrees_with_completed_evidence(
     generation_context = augmentation_ledger_module.create_dataset_augmentation_generation_context(
         selected_records=selected_records,
         operators=(("input.surface.rephrase", "1.0.0"),),
-        semantic_settings=augmentation_ledger_module.DatasetAugmentationLedgerSemanticSettings(
-            provider="openrouter",
-            endpoint_sha256=_settings().semantic_endpoint_sha256,
-            model=_settings().model,
-            render_model=_settings().render_model,
-            equivalence_model=_settings().equivalence_model,
-            max_input_chars=_settings().max_input_chars,
-            max_output_tokens=_settings().max_output_tokens,
-            max_render_tokens=_settings().max_render_tokens,
-            max_response_bytes=_settings().max_response_bytes,
-            timeout_seconds=_settings().timeout_seconds,
+        semantic_settings=(
+            augmentation_ledger_module.dataset_augmentation_ledger_semantic_settings(_settings())
         ),
     )
     mismatched_candidate = evaluation_result.augmentation.candidates[0].model_copy(
@@ -703,6 +767,52 @@ def test_resume_exits_early_when_all_records_already_processed(
     assert "Estimated completion tokens: 0..0" in dry_run.output
     assert result.exit_code == 0, result.output
     assert "Nothing to do" in result.output
+
+
+def test_all_complete_resume_preserves_source_preparation_failure_exit_code(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    dataset = tmp_path / "interactions.jsonl"
+    evidence = tmp_path / "evidence.jsonl"
+    target_config = tmp_path / "target.json"
+    source = _evaluation_result("interaction-1").source
+    _write_dataset(dataset, [_record("interaction-1")])
+    _write_target_config(target_config)
+    run_context = _run_context((source,))
+    failure = customer_module.build_source_preparation_failure_evidence(
+        source,
+        DatasetSemanticPreparationError(),
+        repetitions=1,
+        max_environment_api_calls=2,
+        planned_target_calls=2,
+        run_context=cast(Any, run_context),
+    )
+    evidence.write_text(failure.model_dump_json(exclude_none=True) + "\n", encoding="utf-8")
+    monkeypatch.setattr(command_module, "load_dataset_semantic_settings", _settings)
+
+    result = runner.invoke(
+        root_app,
+        [
+            "dataset",
+            "evaluate",
+            str(dataset),
+            "--environment-config",
+            str(target_config),
+            "--allow-environment-network",
+            "--confirm-test-environment",
+            "--repetitions",
+            "1",
+            "--operator",
+            "input.surface.rephrase",
+            "--resume",
+            str(evidence),
+        ],
+    )
+
+    assert result.exit_code == 2, result.output
+    assert "Nothing to do" in result.output
+    assert "Source preparation failures: 1" in result.output
 
 
 def test_all_complete_resume_preserves_prior_review_finding_exit_code(
@@ -1247,7 +1357,7 @@ def test_resume_rejects_changed_evaluation_plan(tmp_path: Path) -> None:
             "--environment-config",
             str(target_config),
             "--operator",
-            "input.tone.frustrated",
+            "input.style.terse",
             "--repetitions",
             "1",
             "--resume",
@@ -1258,6 +1368,101 @@ def test_resume_rejects_changed_evaluation_plan(tmp_path: Path) -> None:
 
     assert result.exit_code != 0
     assert "incompatible with the current evaluation plan" in result.output
+
+
+def test_resume_rejects_changed_reasoning_mode(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    dataset = tmp_path / "interactions.jsonl"
+    evidence = tmp_path / "evidence.jsonl"
+    target_config = tmp_path / "target.json"
+    _write_dataset(dataset, [_record()])
+    _write_target_config(target_config)
+    evaluation_result = _evaluation_result("interaction-1")
+    run_context = _run_context(
+        (evaluation_result.source,),
+        settings=_settings(deconstruct_reasoning="omitted"),
+    )
+    required_context = _run_context((evaluation_result.source,))
+    assert (
+        command_module._manifest_incompatibility_reason(
+            cast(Any, run_context), cast(Any, required_context)
+        )
+        == "evaluator.llm_client"
+    )
+    evidence.write_text(
+        json.dumps(
+            customer_module.build_customer_evidence_record(
+                evaluation_result,
+                repetitions=1,
+                max_environment_api_calls=2,
+                planned_target_calls=2,
+                run_context=cast(Any, run_context),
+            )
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(command_module, "load_dataset_semantic_settings", _settings)
+
+    result = runner.invoke(
+        root_app,
+        [
+            "dataset",
+            "evaluate",
+            str(dataset),
+            "--environment-config",
+            str(target_config),
+            "--operator",
+            "input.surface.rephrase",
+            "--repetitions",
+            "1",
+            "--resume",
+            str(evidence),
+            "--dry-run",
+        ],
+    )
+
+    assert result.exit_code != 0
+    assert "incompatible with the current evaluation plan" in result.output
+
+
+def test_resume_rejects_pre_response_comparison_context() -> None:
+    evaluation_result = _evaluation_result("interaction-1")
+    current_context = _run_context((evaluation_result.source,))
+    record = cast(
+        dict[str, Any],
+        customer_module.build_customer_evidence_record(
+            evaluation_result,
+            repetitions=1,
+            max_environment_api_calls=2,
+            planned_target_calls=2,
+            run_context=cast(Any, current_context),
+        ),
+    )
+    record["schema_version"] = "1.13.0"
+    record["cases"][0].pop("material_variance")
+    legacy_context = cast(dict[str, Any], record["run_context"])
+    legacy_context["schema_version"] = "1.3.0"
+    legacy_context["pipeline_version"] = "1.4.0"
+    legacy_context_content = {
+        key: value
+        for key, value in legacy_context.items()
+        if key not in {"context_sha256", "redaction_policy_sha256", "redaction_coverage"}
+    }
+    legacy_context["context_sha256"] = dataset_review._canonical_json_sha256(legacy_context_content)
+
+    with pytest.raises(
+        ValueError,
+        match="resume evidence is incompatible with the current evaluation plan",
+    ):
+        dataset_review.validate_dataset_resume_evidence(
+            (json.dumps(record) + "\n").encode(),
+            expected_context=cast(Any, current_context),
+            selected_records=(evaluation_result.source,),
+            invariant_suite=None,
+            evidence_projector=customer_module.build_customer_evidence_record,
+        )
 
 
 def test_resume_rejects_evidence_without_terminal_newline(tmp_path: Path) -> None:

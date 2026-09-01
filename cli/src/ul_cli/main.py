@@ -16,7 +16,7 @@ app = typer.Typer(
     name="ul",
     help=(
         "Discover consequential failures in high-risk AI agents. "
-        "Start with 'ul demo' or probe observed interactions with 'ul probe'."
+        "Probe observed interactions with 'ul probe', or explore synthetic evidence with 'ul demo'."
     ),
     no_args_is_help=True,
 )

@@ -16,7 +16,9 @@ from ul_cli.dataset.evidence import context as context_module
 from ._factories import (
     _evaluation_result,
     _isolated_response_target_config,
+    _run_config,
     _run_context,
+    _settings,
 )
 
 runner = CliRunner()
@@ -26,12 +28,36 @@ _ANSI_ESCAPE_PATTERN = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 def test_run_context_uses_current_pipeline() -> None:
     record = _evaluation_result("interaction-1").source
     run_context = _run_context((record,))
-    assert run_context.schema_version == "1.3.0"
-    assert run_context.pipeline_version == "1.4.0"
+    assert run_context.schema_version == "1.5.0"
+    assert run_context.pipeline_version == "1.6.0"
     assert run_context.evaluation_mode == "variance"
     assert run_context.target.config.reset.reset_session is True
     assert run_context.target.config.reset.reset_env is True
     assert run_context.fixture.status == "missing"
+
+
+def test_run_context_binds_explicit_reasoning_omission() -> None:
+    record = _evaluation_result("interaction-1").source
+    required = cast(Any, _run_context((record,)))
+    omitted = cast(
+        Any,
+        _run_context(
+            (record,),
+            settings=_settings(
+                deconstruct_reasoning="omitted",
+                render_reasoning="omitted",
+            ),
+        ),
+    )
+
+    assert omitted.semantic_settings.llm_client.role_config("deconstruct").reasoning_mode == (
+        "omitted"
+    )
+    assert omitted.semantic_settings.llm_client.role_config("render").reasoning_mode == "omitted"
+    assert omitted.semantic_settings.llm_client.role_config("equivalence").reasoning_mode == (
+        "required"
+    )
+    assert omitted.context_sha256 != required.context_sha256
 
 
 def test_run_context_records_versioned_fixture_identity() -> None:
@@ -44,7 +70,7 @@ def test_run_context_records_versioned_fixture_identity() -> None:
         (record,), target_config=JsonHttpEnvironmentConfig.model_validate(raw_config)
     )
 
-    assert run_context.schema_version == "1.3.0"
+    assert run_context.schema_version == "1.5.0"
     assert run_context.fixture.model_dump(mode="json") == {
         "status": "configured",
         "id": "standard-account",
@@ -93,7 +119,7 @@ def test_run_context_records_canonical_provider_identity() -> None:
     custom_context = context_module.build_dataset_evidence_run_context(
         selected_records=(record,),
         selected_operator_ids=("input.surface.rephrase",),
-        repetitions=1,
+        run_config=_run_config(),
         invariant_suite=None,
         target_config=JsonHttpEnvironmentConfig.model_validate(
             {
@@ -125,7 +151,9 @@ def test_run_context_records_canonical_provider_identity() -> None:
         settings=custom_settings,
     )
 
-    assert custom_context.semantic_settings.provider == "customer-gateway"
-    assert len(custom_context.semantic_settings.endpoint_sha256) == 64
+    assert custom_context.semantic_settings.llm_client.provider_id == "customer-gateway"
+    assert custom_context.semantic_settings.llm_client.upstream_provider is None
+    assert openrouter_context.semantic_settings.llm_client.upstream_provider == "test-provider"
+    assert len(custom_context.semantic_settings.llm_client.endpoint_sha256) == 64
     assert "https://models.example.test/v1" not in custom_context.model_dump_json()
     assert custom_context.context_sha256 != openrouter_context.context_sha256

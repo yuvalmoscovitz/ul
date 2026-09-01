@@ -17,6 +17,7 @@ from ul.redaction import (
 from ul_core.dataset import (
     InteractionRecord,
     RenderedUserInput,
+    SemanticAllowedSurfaceChange,
     SemanticEquivalenceAssessment,
     SemanticFrame,
     UserInputRecord,
@@ -231,6 +232,7 @@ class _RecordingPipeline:
         self.rendered_inputs: list[str] = []
         self.rendered_instructions: list[str] = []
         self.verified_inputs: list[tuple[str, str]] = []
+        self.allowed_surface_changes: list[SemanticAllowedSurfaceChange] = []
         self.mutate_placeholder = False
         self.fail_with_secret = False
 
@@ -267,9 +269,14 @@ class _RecordingPipeline:
         return RenderedUserInput(text=f"Please {rendered}", metadata={})
 
     async def verify(
-        self, source_input: str, candidate_input: str
+        self,
+        source_input: str,
+        candidate_input: str,
+        *,
+        allowed_surface_change: SemanticAllowedSurfaceChange = "none",
     ) -> SemanticEquivalenceAssessment:
         self.verified_inputs.append((source_input, candidate_input))
+        self.allowed_surface_changes.append(allowed_surface_change)
         return SemanticEquivalenceAssessment(
             verdict="equivalent",
             explanation="same",
@@ -384,7 +391,11 @@ async def test_pipeline_is_one_boundary_and_environment_rehydrates(tmp_path: Pat
     rendered = await pipeline.render(
         protected_source.raw_input, f"rephrase without exposing {_SECRET}"
     )
-    assessment = await pipeline.verify(protected_source.raw_input, rendered.text)
+    assessment = await pipeline.verify(
+        protected_source.raw_input,
+        rendered.text,
+        allowed_surface_change="single_unprotected_punctuation_insertion",
+    )
     environment = _RecordingEnvironment()
     protected_evidence = await pipeline.wrap_environment(environment).execute(
         evaluation_case_from_inputs(
@@ -406,6 +417,7 @@ async def test_pipeline_is_one_boundary_and_environment_rehydrates(tmp_path: Pat
     assert _SECRET not in provider_payloads
     assert "secret-token" not in provider_payloads
     assert "private context" not in provider_payloads
+    assert provider.allowed_surface_changes == ["single_unprotected_punctuation_insertion"]
     assert environment.inputs == [f"Please Email {_SECRET}"]
     assert _SECRET not in protected_evidence.model_dump_json()
     assert "__UL_SECRET_email_" in protected_evidence.model_dump_json()
