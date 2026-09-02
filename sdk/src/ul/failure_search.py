@@ -15,7 +15,10 @@ class FailureSearchSettings(ULModel):
     candidates_per_round: int = Field(default=8, ge=1, le=100)
     maximum_rounds: int = Field(default=3, ge=1, le=100)
     maximum_candidate_executions: int = Field(default=24, ge=1, le=10_000)
+    meaning_concurrency: int = Field(default=4, ge=1, le=100)
     target_concurrency: int = Field(default=1, ge=1, le=100)
+    confirm_each_execution_isolated: bool = False
+    confirm_safe_test_target: bool = False
 
 
 class FailureSearchBusinessAssessment(ULModel):
@@ -163,11 +166,19 @@ class HiddenFailureSearch:
         self._target = target
         self._business_evaluator = business_evaluator
         self._settings = settings or FailureSearchSettings()
+        if not self._settings.confirm_each_execution_isolated:
+            raise ValueError(
+                "failure search requires confirmation that every target execution starts from "
+                "equivalent isolated state"
+            )
+        if not self._settings.confirm_safe_test_target:
+            raise ValueError("failure search requires confirmation that the target is safe to test")
 
     async def run(self, source_input: str) -> FailureSearchResult:
         if not source_input.strip():
             raise ValueError("source_input must not be empty")
         semaphore = asyncio.Semaphore(self._settings.target_concurrency)
+        meaning_semaphore = asyncio.Semaphore(self._settings.meaning_concurrency)
 
         async def execute(input: str) -> JsonValue:
             async with semaphore:
@@ -236,11 +247,14 @@ class HiddenFailureSearch:
                 generator_exhausted = True
                 break
 
+            async def verify_meaning(
+                candidate: RenderedUserInput,
+            ) -> SemanticEquivalenceAssessment:
+                async with meaning_semaphore:
+                    return await self._meaning_verifier.verify(source_input, candidate.text)
+
             meaning_assessments = await asyncio.gather(
-                *(
-                    self._meaning_verifier.verify(source_input, candidate.text)
-                    for candidate in novel_candidates
-                )
+                *(verify_meaning(candidate) for candidate in novel_candidates)
             )
 
             async def run_candidate(
@@ -271,15 +285,49 @@ class HiddenFailureSearch:
                     business_assessment=await assess(outcome),
                 )
 
-            round_results = tuple(
-                await asyncio.gather(
-                    *(
-                        run_candidate(position, candidate, meaning_assessment, round_number)
-                        for position, (candidate, meaning_assessment) in enumerate(
-                            zip(novel_candidates, meaning_assessments, strict=True), start=1
-                        )
+            pending_candidates = list(
+                enumerate(zip(novel_candidates, meaning_assessments, strict=True), start=1)
+            )
+            round_results_by_position: dict[int, FailureSearchCandidateResult] = {}
+            stop_scheduling = asyncio.Event()
+
+            async def execute_candidates(
+                candidate_queue: list[
+                    tuple[int, tuple[RenderedUserInput, SemanticEquivalenceAssessment]]
+                ],
+                stop_event: asyncio.Event,
+                results_by_position: dict[int, FailureSearchCandidateResult],
+                current_round_number: int,
+            ) -> None:
+                while candidate_queue and not stop_event.is_set():
+                    position, (candidate, meaning_assessment) = candidate_queue.pop(0)
+                    result = await run_candidate(
+                        position,
+                        candidate,
+                        meaning_assessment,
+                        current_round_number,
                     )
+                    results_by_position[position] = result
+                    if (
+                        result.business_assessment is not None
+                        and not result.business_assessment.passed
+                    ):
+                        stop_event.set()
+
+            await asyncio.gather(
+                *(
+                    execute_candidates(
+                        pending_candidates,
+                        stop_scheduling,
+                        round_results_by_position,
+                        round_number,
+                    )
+                    for _ in range(min(self._settings.target_concurrency, len(pending_candidates)))
                 )
+            )
+            round_results = tuple(
+                round_results_by_position[position]
+                for position in sorted(round_results_by_position)
             )
             rounds.append(FailureSearchRound(number=round_number, candidates=round_results))
             prior_results.extend(round_results)

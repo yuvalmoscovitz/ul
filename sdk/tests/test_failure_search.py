@@ -32,6 +32,10 @@ def _meaning(
 
 
 class MeaningVerifier:
+    def __init__(self) -> None:
+        self.active = 0
+        self.maximum_active = 0
+
     async def verify(
         self,
         source_input: str,
@@ -40,6 +44,10 @@ class MeaningVerifier:
         allowed_surface_change: SemanticAllowedSurfaceChange = "none",
     ) -> SemanticEquivalenceAssessment:
         assert allowed_surface_change == "none"
+        self.active += 1
+        self.maximum_active = max(self.maximum_active, self.active)
+        await asyncio.sleep(0.01)
+        self.active -= 1
         return _meaning("uncertain" if "different goal" in candidate_input else "equivalent")
 
 
@@ -83,6 +91,16 @@ class BusinessEvaluator:
         )
 
 
+async def test_search_requires_isolated_safe_test_target_confirmation() -> None:
+    with pytest.raises(ValueError, match="equivalent isolated state"):
+        HiddenFailureSearch(
+            AdaptiveGenerator((("candidate",),)),
+            MeaningVerifier(),
+            RecordingTarget(),
+            BusinessEvaluator(),
+        )
+
+
 async def test_search_uses_feedback_and_returns_first_valid_counterexample() -> None:
     generator = AdaptiveGenerator(
         (
@@ -101,7 +119,10 @@ async def test_search_uses_feedback_and_returns_first_valid_counterexample() -> 
             candidates_per_round=2,
             maximum_rounds=2,
             maximum_candidate_executions=4,
+            meaning_concurrency=2,
             target_concurrency=3,
+            confirm_each_execution_isolated=True,
+            confirm_safe_test_target=True,
         ),
     )
 
@@ -138,7 +159,11 @@ async def test_search_rejects_an_unstable_baseline_before_generation() -> None:
         MeaningVerifier(),
         target,
         UnstableBusinessEvaluator(),
-        settings=FailureSearchSettings(baseline_repetitions=5),
+        settings=FailureSearchSettings(
+            baseline_repetitions=5,
+            confirm_each_execution_isolated=True,
+            confirm_safe_test_target=True,
+        ),
     )
 
     result = await search.run("perform the task")
@@ -163,6 +188,8 @@ async def test_search_does_not_execute_meaning_changing_candidates() -> None:
             maximum_rounds=1,
             maximum_candidate_executions=2,
             target_concurrency=2,
+            confirm_each_execution_isolated=True,
+            confirm_safe_test_target=True,
         ),
     )
 
@@ -174,6 +201,59 @@ async def test_search_does_not_execute_meaning_changing_candidates() -> None:
     rejected_candidate = result.rounds[0].candidates[0]
     assert rejected_candidate.meaning_assessment.verdict == "uncertain"
     assert rejected_candidate.business_assessment is None
+
+
+async def test_search_stops_queued_target_calls_after_first_failure() -> None:
+    generator = AdaptiveGenerator(
+        (("break this while asking for the same task", "extra one", "extra two", "extra three"),)
+    )
+    target = RecordingTarget()
+    search = HiddenFailureSearch(
+        generator,
+        MeaningVerifier(),
+        target,
+        BusinessEvaluator(),
+        settings=FailureSearchSettings(
+            baseline_repetitions=1,
+            candidates_per_round=4,
+            maximum_rounds=1,
+            maximum_candidate_executions=4,
+            target_concurrency=1,
+            confirm_each_execution_isolated=True,
+            confirm_safe_test_target=True,
+        ),
+    )
+
+    result = await search.run("perform the task")
+
+    assert result.status == "counterexample_found"
+    assert result.candidate_executions == 1
+    assert target.inputs == ["perform the task", "break this while asking for the same task"]
+
+
+async def test_search_bounds_meaning_validation_concurrency() -> None:
+    generator = AdaptiveGenerator((("one", "two", "three", "four", "five"),))
+    meaning_verifier = MeaningVerifier()
+    search = HiddenFailureSearch(
+        generator,
+        meaning_verifier,
+        RecordingTarget(),
+        BusinessEvaluator(),
+        settings=FailureSearchSettings(
+            baseline_repetitions=1,
+            candidates_per_round=5,
+            maximum_rounds=1,
+            maximum_candidate_executions=5,
+            meaning_concurrency=2,
+            target_concurrency=5,
+            confirm_each_execution_isolated=True,
+            confirm_safe_test_target=True,
+        ),
+    )
+
+    await search.run("perform the task")
+
+    assert meaning_verifier.maximum_active == 2
 
 
 async def test_semantic_generator_returns_plain_rewrites_and_uses_feedback() -> None:
