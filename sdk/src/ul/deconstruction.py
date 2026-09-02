@@ -899,7 +899,10 @@ class _SemanticCompletion:
 class _RenderedInput(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    rendered_input: str = Field(min_length=1)
+    rendered_input: str = Field(
+        min_length=1,
+        description="The rewritten user input and nothing else.",
+    )
 
 
 class _EvaluatorPreflightSample(BaseModel):

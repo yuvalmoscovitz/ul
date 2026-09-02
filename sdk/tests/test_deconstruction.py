@@ -1139,6 +1139,7 @@ async def test_render_keeps_caller_instruction_out_of_the_system_prompt() -> Non
         )
         assert "real person" in body["messages"][0]["content"]
         assert "not polished benchmark text" in body["messages"][0]["content"]
+        assert '{"rendered_input":"<rewritten user input>"}' in body["messages"][0]["content"]
         assert "No temporary or alternate value may be introduced" in body["messages"][0]["content"]
         assert (
             "Trusted structured self-correction mode is enabled"
@@ -1146,6 +1147,12 @@ async def test_render_keeps_caller_instruction_out_of_the_system_prompt() -> Non
         )
         assert body["response_format"]["json_schema"]["name"] == "rendered_input"
         assert body["response_format"]["json_schema"]["strict"] is True
+        assert (
+            body["response_format"]["json_schema"]["schema"]["properties"]["rendered_input"][
+                "description"
+            ]
+            == "The rewritten user input and nothing else."
+        )
         assert "tools" not in body
         supplied = json.loads(body["messages"][1]["content"])
         assert supplied == {
