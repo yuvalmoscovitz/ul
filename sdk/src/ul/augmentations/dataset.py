@@ -435,6 +435,7 @@ class DatasetAugmentationEngine:
             for operator in selected_operators:
                 transformation_prompt_names: tuple[str, ...] = ()
                 self_correction_plan: _SelfCorrectionPlan | None = None
+                render_instruction: str | None = None
                 if (
                     operator.id == "input.surface.punctuation_noise"
                     and _punctuation_insertion(record.raw_input, expected_input_frame) is None
@@ -474,8 +475,12 @@ class DatasetAugmentationEngine:
                     )
                 else:
                     transformation_prompt_names = (_OPERATOR_PROMPT_NAMES[operator.id],)
+                    render_instruction = _meaning_guided_instruction(
+                        operator.instruction,
+                        expected_input_frame,
+                    )
                     rendered_input = await self._renderer.render(
-                        record.raw_input, operator.instruction
+                        record.raw_input, render_instruction
                     )
                 augmented_input = rendered_input.text
                 if operator.generation_mechanism == "llm":
@@ -487,9 +492,11 @@ class DatasetAugmentationEngine:
                 if augmented_input == record.raw_input:
                     retry_reasons = (*retry_reasons, "renderer did not change the source input")
                 if operator.generation_mechanism == "llm" and retry_reasons:
+                    if render_instruction is None:
+                        raise AssertionError("LLM generation requires meaning guidance")
                     rendered_input = await self._renderer.render(
                         record.raw_input,
-                        f"{operator.instruction}\n\n"
+                        f"{render_instruction}\n\n"
                         "Your previous attempt was invalid for these reasons: "
                         f"{'; '.join(retry_reasons)}. Return a corrected transformation that "
                         "satisfies the original instruction.",
@@ -770,6 +777,62 @@ def _has_input_evidence(element: Any) -> bool:
 
 def _input_evidence(element: Any) -> tuple[Any, ...]:
     return tuple(evidence for evidence in element.evidence if evidence.source == "input")
+
+
+def _meaning_guided_instruction(instruction: str, frame: SemanticFrame) -> str:
+    meaning_frame = _without_pure_communication_form(frame)
+    meaning_to_preserve = {
+        "requests": [
+            {
+                "id": request.id,
+                "mode": request.mode,
+                "predicate": request.predicate,
+                "factor_ids": list(request.factor_ids),
+            }
+            for request in meaning_frame.request_units
+        ],
+        "factors": [
+            {
+                "id": factor.id,
+                "kind": factor.kind,
+                "role": factor.role,
+                "value": factor.value,
+                "status": factor.status,
+            }
+            for factor in meaning_frame.factors
+        ],
+        "relations": [
+            {
+                "kind": relation.kind,
+                "source_ids": list(relation.source_ids),
+                "target_ids": list(relation.target_ids),
+            }
+            for relation in meaning_frame.relations
+        ],
+        "communication_acts": [
+            {
+                "kind": act.kind,
+                "factor_ids": list(act.factor_ids),
+                "attributes": act.attributes,
+            }
+            for act in meaning_frame.communication_acts
+        ],
+        "exact_text": list(
+            dict.fromkeys(
+                evidence.text_quote
+                for factor in meaning_frame.factors
+                for evidence in factor.evidence
+                if evidence.source == "input" and evidence.text_quote is not None
+            )
+        ),
+    }
+    serialized_meaning = json.dumps(
+        meaning_to_preserve,
+        ensure_ascii=False,
+        allow_nan=False,
+        separators=(",", ":"),
+    )
+    return f"{instruction}\nmeaning_to_preserve={serialized_meaning}"
 
 
 def _task_meaning_difference_reasons(

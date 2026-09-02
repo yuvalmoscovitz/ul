@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from collections.abc import Iterator
 from typing import Literal, cast
 
@@ -379,8 +380,103 @@ async def test_engine_rephrases_and_independently_validates_full_semantics() -> 
     assert candidate.expected_input_frame.outcomes == ()
     assert candidate.expected_input_frame.metadata == {}
     assert model.rendered_inputs == [record.raw_input]
+    transformation, serialized_meaning = model.rendered_instructions[0].rsplit(
+        "\nmeaning_to_preserve=", 1
+    )
+    assert transformation == builtin_dataset_augmentation_operators()[0].instruction
+    assert json.loads(serialized_meaning) == {
+        "requests": [
+            {
+                "id": "source:transfer",
+                "mode": "act",
+                "predicate": "transfer",
+                "factor_ids": ["source:amount", "source:recipient"],
+            },
+            {
+                "id": "source:balance",
+                "mode": "ask",
+                "predicate": "report_balance",
+                "factor_ids": [],
+            },
+        ],
+        "factors": [
+            {
+                "id": "source:amount",
+                "kind": "money",
+                "role": "amount",
+                "value": 100,
+                "status": "explicit",
+            },
+            {
+                "id": "source:recipient",
+                "kind": "entity",
+                "role": "recipient",
+                "value": "Alice",
+                "status": "explicit",
+            },
+        ],
+        "relations": [
+            {
+                "kind": "sequence",
+                "source_ids": ["source:transfer"],
+                "target_ids": ["source:balance"],
+            }
+        ],
+        "communication_acts": [
+            {
+                "kind": "compound_request",
+                "factor_ids": ["source:amount", "source:recipient"],
+                "attributes": {"connector": "then"},
+            }
+        ],
+        "exact_text": [],
+    }
     assert isinstance(model.deconstructed_records[1], UserInputRecord)
     assert not isinstance(model.deconstructed_records[1], InteractionRecord)
+
+
+async def test_meaning_guidance_excludes_changeable_style_and_keeps_exact_factor_text() -> None:
+    record = source_record()
+    original_frame = source_frame(record)
+    frame = original_frame.model_copy(
+        update={
+            "factors": (
+                original_frame.factors[0].model_copy(
+                    update={
+                        "evidence": (
+                            EvidenceReference(
+                                source="input",
+                                json_pointer="/raw_input",
+                                text_quote="100",
+                            ),
+                        )
+                    }
+                ),
+                original_frame.factors[1],
+            ),
+            "communication_acts": (
+                CommunicationAct(
+                    id="source:angry",
+                    evidence=evidence("input"),
+                    confidence=1,
+                    status="explicit",
+                    kind="angry",
+                ),
+            ),
+        }
+    )
+    candidate_frame = source_frame(record, identifier_prefix="candidate").model_copy(
+        update={"outcomes": ()}
+    )
+    model = DeterministicSemanticModel({record.id: frame}, candidate_frame)
+
+    await DatasetAugmentationEngine(model, model).augment((record,))
+
+    _, serialized_meaning = model.rendered_instructions[0].rsplit("\nmeaning_to_preserve=", 1)
+    meaning = json.loads(serialized_meaning)
+
+    assert meaning["communication_acts"] == []
+    assert meaning["exact_text"] == ["100"]
 
 
 async def test_engine_groups_multiple_records_by_requested_operator_order() -> None:
