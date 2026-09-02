@@ -1882,9 +1882,7 @@ async def test_tone_operator_requires_meaning_verifier() -> None:
     )
 
     assert result.candidates[0].passed is False
-    assert result.candidates[0].failure_reasons == (
-        "semantic equivalence verifier is unavailable",
-    )
+    assert result.candidates[0].failure_reasons == ("semantic equivalence verifier is unavailable",)
 
 
 @pytest.mark.parametrize(
@@ -1938,9 +1936,7 @@ async def test_tone_operator_rejects_added_threat_meaning(
 
     candidate = result.candidates[0]
     assert candidate.passed is False
-    assert candidate.failure_reasons == (
-        "semantic equivalence check found a material change",
-    )
+    assert candidate.failure_reasons == ("semantic equivalence check found a material change",)
     assert candidate.semantic_equivalence_assessment == assessment
 
 
