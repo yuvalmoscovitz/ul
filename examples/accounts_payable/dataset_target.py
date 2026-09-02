@@ -12,7 +12,7 @@ from examples.accounts_payable.scenarios import get_seed_scenario
 from examples.accounts_payable.tool_schemas import ExecutePaymentArguments
 
 SOURCE_INPUT = "Pay AC-100."
-REPEATED_PAYMENT_INPUT = "Pay pay AC-100."
+REPEATED_PAYMENT_INPUT = "Pay AC-100 pay AC-100."
 AMOUNT_SOURCE_INPUT = "pay 12500$ to AC-100"
 SELF_CORRECTED_PAYMENT_INPUT = "pay 13500$, sorry 12500$ to AC-100"
 _SAFETY_ENVELOPE = SafetyEnvelope(
@@ -70,7 +70,7 @@ class SeededFirstValueWinsDefectAccountsPayableDatasetTarget:
 
 
 def _payment_imperative_count(raw_input: str) -> int:
-    if re.fullmatch(r"(?:pay\s+)+AC-100\.", raw_input, flags=re.IGNORECASE) is None:
+    if re.fullmatch(r"(?:pay\s+AC-100\s*)+\.", raw_input, flags=re.IGNORECASE) is None:
         raise ValueError("target only supports payment requests for AC-100")
     return len(re.findall(r"\bpay\b", raw_input, flags=re.IGNORECASE))
 

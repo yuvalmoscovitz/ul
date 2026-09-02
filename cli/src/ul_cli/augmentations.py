@@ -635,7 +635,7 @@ def reset_augmentations() -> None:
         return DEFAULT_PROJECT_OPERATORS
 
     _update_operators(project_root, reset_operators)
-    typer.echo("Restored recommended defaults: input.surface.rephrase@1.0.0")
+    typer.echo("Restored recommended defaults: input.surface.rephrase@1.1.0")
     _print_selected_readiness(builtin_augmentation_catalog().get("input.surface.rephrase"))
 
 

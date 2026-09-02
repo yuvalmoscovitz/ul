@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from collections.abc import Iterator
 from typing import Literal, cast
 
@@ -320,6 +321,26 @@ class DeterministicSemanticModel:
         )
 
 
+class CorrectingSemanticModel(DeterministicSemanticModel):
+    async def render(
+        self,
+        raw_input: str,
+        instruction: str,
+        *,
+        allow_temporary_value: bool = False,
+    ) -> RenderedUserInput:
+        self.rendered_output = (
+            raw_input
+            if not self.rendered_inputs
+            else "Can you transfers 100 to Alice, then tell me the balance?"
+        )
+        return await super().render(
+            raw_input,
+            instruction,
+            allow_temporary_value=allow_temporary_value,
+        )
+
+
 class DeterministicEquivalenceVerifier:
     def __init__(self, assessment: SemanticEquivalenceAssessment | None) -> None:
         self.assessment = assessment
@@ -359,8 +380,131 @@ async def test_engine_rephrases_and_independently_validates_full_semantics() -> 
     assert candidate.expected_input_frame.outcomes == ()
     assert candidate.expected_input_frame.metadata == {}
     assert model.rendered_inputs == [record.raw_input]
+    transformation, serialized_meaning = model.rendered_instructions[0].rsplit(
+        "\nmeaning_to_preserve=", 1
+    )
+    assert transformation == builtin_dataset_augmentation_operators()[0].instruction
+    assert json.loads(serialized_meaning) == {
+        "requests": [
+            {
+                "id": "source:transfer",
+                "mode": "act",
+                "predicate": "transfer",
+                "factor_ids": ["source:amount", "source:recipient"],
+            },
+            {
+                "id": "source:balance",
+                "mode": "ask",
+                "predicate": "report_balance",
+                "factor_ids": [],
+            },
+        ],
+        "factors": [
+            {
+                "id": "source:amount",
+                "kind": "money",
+                "role": "amount",
+                "value": 100,
+                "status": "explicit",
+            },
+            {
+                "id": "source:recipient",
+                "kind": "entity",
+                "role": "recipient",
+                "value": "Alice",
+                "status": "explicit",
+            },
+        ],
+        "relations": [
+            {
+                "kind": "sequence",
+                "source_ids": ["source:transfer"],
+                "target_ids": ["source:balance"],
+            }
+        ],
+        "communication_acts": [
+            {
+                "kind": "compound_request",
+                "factor_ids": ["source:amount", "source:recipient"],
+                "attributes": {"connector": "then"},
+            }
+        ],
+        "exact_text": [],
+    }
     assert isinstance(model.deconstructed_records[1], UserInputRecord)
     assert not isinstance(model.deconstructed_records[1], InteractionRecord)
+
+
+async def test_meaning_guidance_excludes_changeable_style_and_keeps_exact_factor_text() -> None:
+    record = source_record()
+    original_frame = source_frame(record)
+    frame = original_frame.model_copy(
+        update={
+            "factors": (
+                original_frame.factors[0].model_copy(
+                    update={
+                        "evidence": (
+                            EvidenceReference(
+                                source="input",
+                                json_pointer="/raw_input",
+                                text_quote="100",
+                            ),
+                        )
+                    }
+                ),
+                original_frame.factors[1],
+            ),
+            "communication_acts": (
+                CommunicationAct(
+                    id="source:angry",
+                    evidence=evidence("input"),
+                    confidence=1,
+                    status="explicit",
+                    kind="angry",
+                ),
+            ),
+        }
+    )
+    candidate_frame = source_frame(record, identifier_prefix="candidate").model_copy(
+        update={"outcomes": ()}
+    )
+    model = DeterministicSemanticModel({record.id: frame}, candidate_frame)
+
+    await DatasetAugmentationEngine(model, model).augment((record,))
+
+    _, serialized_meaning = model.rendered_instructions[0].rsplit("\nmeaning_to_preserve=", 1)
+    meaning = json.loads(serialized_meaning)
+
+    assert meaning["communication_acts"] == []
+    assert meaning["exact_text"] == ["100"]
+
+
+async def test_engine_groups_multiple_records_by_requested_operator_order() -> None:
+    first_record = source_record("first")
+    second_record = source_record("second")
+    first_frame = source_frame(first_record)
+    second_frame = source_frame(second_record)
+    candidate_frame = source_frame(first_record, identifier_prefix="candidate").model_copy(
+        update={"outcomes": ()}
+    )
+    model = DeterministicSemanticModel(
+        {first_record.id: first_frame, second_record.id: second_frame},
+        candidate_frame,
+    )
+
+    result = await DatasetAugmentationEngine(model, model).augment(
+        (first_record, second_record),
+        operator_ids=("input.surface.typing_noise", "input.surface.punctuation_noise"),
+    )
+
+    assert [
+        (candidate.operator_id, candidate.source_interaction_id) for candidate in result.candidates
+    ] == [
+        ("input.surface.typing_noise", "first"),
+        ("input.surface.typing_noise", "second"),
+        ("input.surface.punctuation_noise", "first"),
+        ("input.surface.punctuation_noise", "second"),
+    ]
 
 
 async def test_engine_replaces_em_dashes_in_llm_generated_input() -> None:
@@ -629,11 +773,11 @@ def self_correction_candidate_frame(record: InteractionRecord) -> SemanticFrame:
 
 async def test_builtin_operator_library_is_fixed_versioned_and_reviewable() -> None:
     operators = builtin_dataset_augmentation_operators()
+    instructions = {operator.id: operator.instruction for operator in operators}
 
     assert tuple(operator.id for operator in operators) == (
         "input.surface.rephrase",
         "input.surface.typing_noise",
-        "input.surface.case_variation",
         "input.surface.punctuation_noise",
         "input.surface.grammar_error",
         "input.surface.fragmented_syntax",
@@ -647,13 +791,24 @@ async def test_builtin_operator_library_is_fixed_versioned_and_reviewable() -> N
     assert {operator.id: operator.version for operator in operators}[
         "input.intent.self_correction"
     ] == "1.1.0"
-    assert {
-        operator.version for operator in operators if operator.id != "input.intent.self_correction"
-    } == {"1.0.0"}
+    assert {operator.id: operator.version for operator in operators} == {
+        "input.surface.rephrase": "1.1.0",
+        "input.surface.typing_noise": "1.1.0",
+        "input.surface.punctuation_noise": "1.1.0",
+        "input.surface.grammar_error": "1.2.0",
+        "input.surface.fragmented_syntax": "1.2.0",
+        "input.surface.disfluency_repeat": "1.2.0",
+        "input.style.terse": "1.2.0",
+        "input.style.verbose": "1.2.0",
+        "input.tone.angry": "1.2.0",
+        "input.tone.argumentative": "1.2.0",
+        "input.intent.self_correction": "1.1.0",
+    }
     assert [operator.id for operator in operators if operator.generation_mechanism == "llm"] == [
         "input.surface.rephrase",
         "input.surface.grammar_error",
         "input.surface.fragmented_syntax",
+        "input.surface.disfluency_repeat",
         "input.style.terse",
         "input.style.verbose",
         "input.tone.angry",
@@ -663,18 +818,29 @@ async def test_builtin_operator_library_is_fixed_versioned_and_reviewable() -> N
         operator.id for operator in operators if operator.generation_mechanism == "deterministic"
     ] == [
         "input.surface.typing_noise",
-        "input.surface.case_variation",
         "input.surface.punctuation_noise",
-        "input.surface.disfluency_repeat",
         "input.intent.self_correction",
     ]
     assert [operator.id for operator in operators if operator.human_review_required] == [
         "input.intent.self_correction"
     ]
+    assert all(
+        len(operator.instruction.split()) <= 20
+        for operator in operators
+        if operator.generation_mechanism == "llm"
+    )
+    assert "very short human command" in instructions["input.style.terse"]
+    assert "natural grammar mistakes" in instructions["input.surface.grammar_error"]
+    assert "No duplicate words" in instructions["input.surface.grammar_error"]
+    assert "spoken restart" in instructions["input.surface.disfluency_repeat"]
+    assert "voice-note request to the agent" in instructions["input.style.verbose"]
+    assert "getting it wrong" in instructions["input.tone.argumentative"]
+    assert "profane" in instructions["input.tone.angry"]
+    assert "Insult the agent" in instructions["input.tone.angry"]
+    assert "urgency" in instructions["input.tone.angry"]
     assert [
         operator.id for operator in operators if operator.applicability_profile == "conditional"
     ] == [
-        "input.surface.case_variation",
         "input.surface.punctuation_noise",
         "input.intent.self_correction",
     ]
@@ -1720,8 +1886,8 @@ async def test_self_correction_skips_ineligible_sources(ineligible_reason: str) 
     [
         (
             "input.surface.grammar_error",
-            "fragmented_syntax",
-            "Transfer 100 to Alice, then tells me the balance.",
+            "grammar_error",
+            "transfr 100 to Alice then tells me balance",
             False,
         ),
         (
@@ -1734,19 +1900,21 @@ async def test_self_correction_skips_ineligible_sources(ineligible_reason: str) 
         (
             "input.style.verbose",
             "verbose",
-            "hey could you transfer 100 to alice and then please let me know the balance",
+            "hey can you please transfer 100 to alice and then once thats done just let me "
+            "know what the balance is",
             False,
         ),
         (
             "input.tone.angry",
             "angry",
-            "This is ridiculous—transfer 100 to Alice, then tell me the balance.",
+            "stupid fuck transfer 100 to Alice then tell me the balance!!!!!!1",
             False,
         ),
         (
             "input.tone.argumentative",
             "argumentative",
-            "There is no reason to debate this: transfer 100 to Alice, then tell me the balance.",
+            "for the last time transfer 100 to Alice then tell me the balance, can you do one "
+            "thing right? stop being wrong",
             False,
         ),
     ],
@@ -1782,7 +1950,7 @@ async def test_behavior_operators_allow_only_their_communication_change(
     candidate = result.candidates[0]
     assert candidate.passed
     assert candidate.operator_id == operator_id
-    assert candidate.operator_version == "1.0.0"
+    assert candidate.operator_version == "1.2.0"
     assert candidate.allowed_change == "declared_communication_form"
     assert candidate.human_review_required is review_required
     assert candidate.augmented_input == realistic_output.replace("—", " ")
@@ -1792,21 +1960,22 @@ async def test_behavior_operators_allow_only_their_communication_change(
         "transformation_prompts": prompt_provenance(f"augmentation.{operator_id}"),
     }
     if operator_id == "input.tone.angry":
-        assert "merely adding words" in model.rendered_instructions[0]
+        assert "insult the agent" in model.rendered_instructions[0].casefold()
+        assert "profane" in model.rendered_instructions[0].casefold()
     if operator_id == "input.tone.argumentative":
-        assert "merely making the request emphatic" in model.rendered_instructions[0]
+        assert "getting it wrong" in model.rendered_instructions[0]
     if verifier is not None:
-        assert verifier.allowed_surface_changes == [f"moderate_{target_kind}_tone"]
+        assert verifier.allowed_surface_changes == [f"hostile_{target_kind}_tone"]
 
 
-async def test_tone_operator_fails_closed_without_safety_verifier() -> None:
+async def test_tone_operator_requires_meaning_verifier() -> None:
     record = source_record()
     original_frame = source_frame(record)
     candidate_frame = behavior_candidate_frame(record, "angry")
     model = DeterministicSemanticModel(
         {record.id: original_frame},
         candidate_frame,
-        "This is ridiculous—transfer 100 to Alice, then tell me the balance.",
+        "stupid fuck transfer 100 to Alice then tell me the balance!!!!!!1",
     )
 
     result = await DatasetAugmentationEngine(model, model).augment(
@@ -1814,7 +1983,7 @@ async def test_tone_operator_fails_closed_without_safety_verifier() -> None:
     )
 
     assert result.candidates[0].passed is False
-    assert result.candidates[0].failure_reasons == ("tone safety verifier is unavailable",)
+    assert result.candidates[0].failure_reasons == ("semantic equivalence verifier is unavailable",)
 
 
 @pytest.mark.parametrize(
@@ -1823,24 +1992,19 @@ async def test_tone_operator_fails_closed_without_safety_verifier() -> None:
         (
             "input.tone.angry",
             "angry",
-            "You fucking idiot—transfer 100 to Alice, then tell me the balance.",
-            "fucking idiot",
-        ),
-        (
-            "input.tone.angry",
-            "angry",
-            "Transfer 100 to Alice or I will hurt you, then tell me the balance.",
+            "stupid fuck transfer 100 to Alice. I will hurt you. Then tell me the balance!!!",
             "I will hurt you",
         ),
         (
             "input.tone.argumentative",
             "argumentative",
-            "There is no debate, you moron: transfer 100 to Alice, then tell me the balance.",
-            "you moron",
+            "for the last time transfer 100 to Alice or I will destroy you, then tell me the "
+            "balance.",
+            "I will destroy you",
         ),
     ],
 )
-async def test_tone_operator_rejects_forbidden_hostility(
+async def test_tone_operator_rejects_added_threat_meaning(
     operator_id: str,
     target_kind: str,
     rendered_output: str,
@@ -1854,7 +2018,7 @@ async def test_tone_operator_rejects_forbidden_hostility(
     )
     assessment = SemanticEquivalenceAssessment(
         verdict="different",
-        explanation="The candidate exceeds the moderate tone boundary.",
+        explanation="The candidate adds a threat.",
         deltas=(
             SemanticDelta(
                 category="communication",
@@ -1873,9 +2037,7 @@ async def test_tone_operator_rejects_forbidden_hostility(
 
     candidate = result.candidates[0]
     assert candidate.passed is False
-    assert candidate.failure_reasons == (
-        "tone safety check found a forbidden communication change",
-    )
+    assert candidate.failure_reasons == ("semantic equivalence check found a material change",)
     assert candidate.semantic_equivalence_assessment == assessment
 
 
@@ -1905,7 +2067,8 @@ async def test_behavior_operator_rejects_relations_touching_its_marker() -> None
 
     assert not result.candidates[0].passed
     assert result.candidates[0].failure_reasons == (
-        "declared communication marker has unsupported relations",
+        "relations differ from the expected frame",
+        "communication acts differ from the expected frame",
     )
 
 
@@ -1936,14 +2099,13 @@ async def test_behavior_operator_rejects_semantics_hidden_in_its_marker() -> Non
 
     assert not result.candidates[0].passed
     assert result.candidates[0].failure_reasons == (
-        "declared communication marker contains unsupported semantics",
+        "communication acts differ from the expected frame",
     )
 
 
 @pytest.mark.parametrize(
     "drift",
     [
-        "missing_target_kind",
         "non_communication_relation",
         "existing_communication_act",
         "existing_communication_relation",
@@ -1953,11 +2115,7 @@ async def test_behavior_operator_rejects_changes_outside_its_contract(drift: str
     record = source_record()
     original_frame = source_frame(record)
     candidate_frame = behavior_candidate_frame(record, "terse")
-    if drift == "missing_target_kind":
-        candidate_frame = source_frame(record, identifier_prefix="candidate").model_copy(
-            update={"outcomes": ()}
-        )
-    elif drift == "non_communication_relation":
+    if drift == "non_communication_relation":
         candidate_frame = candidate_frame.model_copy(update={"relations": ()})
     elif drift == "existing_communication_act":
         changed_act = candidate_frame.communication_acts[0].model_copy(
@@ -1994,17 +2152,40 @@ async def test_behavior_operator_rejects_changes_outside_its_contract(drift: str
     assert result.candidates[0].failure_reasons
 
 
-async def test_rephrase_preserves_full_semantics() -> None:
+async def test_behavior_operator_validity_does_not_require_target_marker() -> None:
+    record = source_record()
+    original_frame = source_frame(record)
+    candidate_frame = source_frame(record, identifier_prefix="candidate").model_copy(
+        update={"outcomes": ()}
+    )
+    model = DeterministicSemanticModel({record.id: original_frame}, candidate_frame)
+
+    result = await DatasetAugmentationEngine(model, model).augment(
+        (record,), operator_ids=("input.style.terse",)
+    )
+
+    assert result.candidates[0].passed
+
+
+async def test_rephrase_ignores_pure_communication_form_changes() -> None:
     record = source_record()
     original_frame = source_frame(record)
     changed_communication = source_frame(record, identifier_prefix="candidate").model_copy(
         update={"outcomes": ()}
     )
-    changed_act = changed_communication.communication_acts[0].model_copy(
-        update={"kind": "paraphrase"}
-    )
     changed_communication = changed_communication.model_copy(
-        update={"communication_acts": (changed_act,)}
+        update={
+            "communication_acts": (
+                *changed_communication.communication_acts,
+                CommunicationAct(
+                    id="candidate:terse",
+                    evidence=evidence("input"),
+                    confidence=1,
+                    status="explicit",
+                    kind="terse",
+                ),
+            )
+        }
     )
     model = DeterministicSemanticModel({record.id: original_frame}, changed_communication)
 
@@ -2012,9 +2193,9 @@ async def test_rephrase_preserves_full_semantics() -> None:
         (record,), operator_ids=("input.surface.rephrase",)
     )
 
-    assert not result.candidates[0].passed
+    assert result.candidates[0].passed
     assert result.candidates[0].allowed_change == "surface_form_only"
-    assert "communication acts differ" in result.candidates[0].failure_reasons[0]
+    assert result.candidates[0].failure_reasons == ()
 
 
 async def test_engine_rejects_candidate_frame_for_another_input() -> None:
@@ -2045,7 +2226,9 @@ async def test_engine_rejects_candidate_frame_for_another_input() -> None:
 
 
 async def test_typing_noise_is_deterministic_protects_factors_and_needs_no_model_marker() -> None:
-    record = source_record()
+    record = source_record().model_copy(
+        update={"raw_input": f"{source_record().raw_input} Use DataStream Analytics."}
+    )
     original_frame = source_frame(record)
     reparsed_candidate = source_frame(record, identifier_prefix="candidate").model_copy(
         update={"outcomes": ()}
@@ -2060,183 +2243,56 @@ async def test_typing_noise_is_deterministic_protects_factors_and_needs_no_model
     assert candidate.passed
     assert candidate.augmented_input != record.raw_input
     assert "100" in candidate.augmented_input
-    assert "Alice" in candidate.augmented_input
+    assert "DataStream Analytics" in candidate.augmented_input
     assert model.rendered_inputs == []
     assert candidate.renderer_metadata["renderer"] == "deterministic"
-    assert candidate.renderer_metadata["algorithm"] == "protected_adjacent_transposition"
+    assert candidate.renderer_metadata["algorithm"] == "four_or_five_unprotected_typing_edits"
+    assert candidate.renderer_metadata["edit_count"] in {4, 5}
     assert candidate.renderer_metadata["transformation_prompts"] == []
 
 
-@pytest.mark.parametrize(
-    ("operator_id", "target_kind", "expected_input", "algorithm"),
-    (
-        (
-            "input.surface.case_variation",
-            "typing_noise",
-            "transfer 100 to Alice, then tell me the balance.",
-            "single_unicode_cased_letter_toggle",
-        ),
-        (
-            "input.surface.punctuation_noise",
-            "typing_noise",
-            "Transfer 100 to Alice,, then tell me the balance.",
-            "single_safe_punctuation_duplication",
-        ),
-    ),
-)
-async def test_broad_surface_operators_are_deterministic_and_preserve_source_text(
-    operator_id: str,
-    target_kind: str,
-    expected_input: str,
-    algorithm: str,
-) -> None:
+async def test_punctuation_noise_is_deterministic_and_preserves_source_text() -> None:
     record = source_record()
     original_frame = source_frame(record)
-    candidate_frame = behavior_candidate_frame(record, target_kind)
+    candidate_frame = behavior_candidate_frame(record, "typing_noise")
     model = DeterministicSemanticModel({record.id: original_frame}, candidate_frame)
 
     result = await DatasetAugmentationEngine(model, model).augment(
-        (record,), operator_ids=(operator_id,)
+        (record,), operator_ids=("input.surface.punctuation_noise",)
     )
 
     candidate = result.candidates[0]
     assert candidate.passed
-    assert candidate.augmented_input == expected_input
-    assert candidate.renderer_metadata["algorithm"] == algorithm
+    assert candidate.augmented_input != record.raw_input
+    assert candidate.renderer_metadata["algorithm"] == "seeded_mixed_punctuation_spacing_noise"
+    assert candidate.augmented_input.count("!") > record.raw_input.count("!")
+    assert candidate.augmented_input.count(".") > record.raw_input.count(".")
+    assert candidate.augmented_input.count("\n") > record.raw_input.count("\n")
+    assert candidate.augmented_input.count(" ") > record.raw_input.count(" ")
     assert candidate.renderer_metadata["transformation_prompts"] == []
     assert model.rendered_inputs == []
 
 
-@pytest.mark.parametrize(
-    ("raw_input", "expected_input"),
-    (
-        ("Émettre le rapport TEST-1.", "émettre le rapport TEST-1."),
-        ("Πλήρωσε το TEST-1.", "πλήρωσε το TEST-1."),
-        ("Оплати TEST-1.", "оплати TEST-1."),
-    ),
-)
-async def test_case_variation_supports_unicode_cased_letters(
-    raw_input: str, expected_input: str
-) -> None:
-    record = source_record().model_copy(update={"raw_input": raw_input})
-    original_frame = source_frame(record)
-    candidate_frame = behavior_candidate_frame(record, "typing_noise")
-    model = DeterministicSemanticModel({record.id: original_frame}, candidate_frame)
-
-    result = await DatasetAugmentationEngine(model, model).augment(
-        (record,), operator_ids=("input.surface.case_variation",)
-    )
-
-    assert result.skips == ()
-    assert result.candidates[0].passed
-    assert result.candidates[0].augmented_input == expected_input
-    assert result.candidates[0].renderer_metadata["algorithm"] == (
-        "single_unicode_cased_letter_toggle"
-    )
-
-
-@pytest.mark.parametrize("raw_input", ("支付测试订单。", "ادفع طلب الاختبار."))
-async def test_case_variation_skips_scripts_without_letter_case(raw_input: str) -> None:
-    record = source_record().model_copy(update={"raw_input": raw_input})
-    original_frame = source_frame(record)
-    model = DeterministicSemanticModel({record.id: original_frame})
-
-    result = await DatasetAugmentationEngine(model, model).augment(
-        (record,), operator_ids=("input.surface.case_variation",)
-    )
-
-    assert result.candidates == ()
-    assert len(result.skips) == 1
-    assert result.skips[0].operator_id == "input.surface.case_variation"
-    assert "unprotected Unicode letter" in result.skips[0].reason
-    assert len(model.deconstructed_records) == 1
-
-
-async def test_case_variation_avoids_protected_values_and_expanding_case_mappings() -> None:
-    record = source_record().model_copy(update={"raw_input": "TEST-ID ßauftrag ausführen."})
-    original_frame = source_frame(record)
-    protected_identifier = original_frame.factors[1].model_copy(
-        update={
-            "value": "TEST-ID",
-            "evidence": (
-                EvidenceReference(source="input", json_pointer="/raw_input", text_quote="TEST-ID"),
-            ),
-        }
-    )
-    original_frame = original_frame.model_copy(
-        update={"factors": (original_frame.factors[0], protected_identifier)}
-    )
-    candidate_frame = behavior_candidate_frame(record, "typing_noise")
-    candidate_identifier = candidate_frame.factors[1].model_copy(
-        update={"value": "TEST-ID", "evidence": protected_identifier.evidence}
-    )
-    candidate_frame = candidate_frame.model_copy(
-        update={"factors": (candidate_frame.factors[0], candidate_identifier)}
-    )
-    model = DeterministicSemanticModel({record.id: original_frame}, candidate_frame)
-
-    result = await DatasetAugmentationEngine(model, model).augment(
-        (record,), operator_ids=("input.surface.case_variation",)
-    )
-
-    assert result.candidates[0].passed
-    assert result.candidates[0].augmented_input == "TEST-ID ßAuftrag ausführen."
-
-
-@pytest.mark.parametrize(
-    ("operator_id", "allowed_surface_change", "frame_drift"),
-    [
-        (
-            "input.surface.case_variation",
-            "single_unprotected_case_change",
-            "reversed_relation",
-        ),
-        (
-            "input.surface.punctuation_noise",
-            "single_unprotected_punctuation_insertion",
-            "extra_style_label",
-        ),
-    ],
-)
-async def test_surface_operator_passes_trusted_change_policy_to_equivalence_fallback(
-    operator_id: str,
-    allowed_surface_change: SemanticAllowedSurfaceChange,
-    frame_drift: str,
-) -> None:
+async def test_pure_style_label_does_not_trigger_equivalence_fallback() -> None:
     record = source_record()
     original_frame = source_frame(record)
     candidate_frame = source_frame(record, identifier_prefix="candidate").model_copy(
         update={"outcomes": ()}
     )
-    if frame_drift == "reversed_relation":
-        relation = candidate_frame.relations[0]
-        candidate_frame = candidate_frame.model_copy(
-            update={
-                "relations": (
-                    relation.model_copy(
-                        update={
-                            "source_ids": relation.target_ids,
-                            "target_ids": relation.source_ids,
-                        }
-                    ),
-                )
-            }
-        )
-    else:
-        candidate_frame = candidate_frame.model_copy(
-            update={
-                "communication_acts": (
-                    *candidate_frame.communication_acts,
-                    CommunicationAct(
-                        id="candidate:verbose",
-                        evidence=evidence("input"),
-                        confidence=1,
-                        status="explicit",
-                        kind="verbose",
-                    ),
-                )
-            }
-        )
+    candidate_frame = candidate_frame.model_copy(
+        update={
+            "communication_acts": (
+                *candidate_frame.communication_acts,
+                CommunicationAct(
+                    id="candidate:verbose",
+                    evidence=evidence("input"),
+                    confidence=1,
+                    status="explicit",
+                    kind="verbose",
+                ),
+            )
+        }
+    )
     model = DeterministicSemanticModel({record.id: original_frame}, candidate_frame)
     assessment = SemanticEquivalenceAssessment(
         verdict="equivalent",
@@ -2247,13 +2303,13 @@ async def test_surface_operator_passes_trusted_change_policy_to_equivalence_fall
     verifier = DeterministicEquivalenceVerifier(assessment)
 
     result = await DatasetAugmentationEngine(model, model, verifier).augment(
-        (record,), operator_ids=(operator_id,)
+        (record,), operator_ids=("input.surface.punctuation_noise",)
     )
 
     candidate = result.candidates[0]
     assert candidate.passed
-    assert candidate.semantic_equivalence_assessment == assessment
-    assert verifier.allowed_surface_changes == [allowed_surface_change]
+    assert candidate.semantic_equivalence_assessment is None
+    assert verifier.allowed_surface_changes == []
 
 
 async def test_punctuation_noise_avoids_punctuation_inside_semantic_values() -> None:
@@ -2293,7 +2349,9 @@ async def test_punctuation_noise_avoids_punctuation_inside_semantic_values() -> 
     )
 
     assert result.candidates[0].passed
-    assert result.candidates[0].augmented_input == "P,ay $1,000 at 12:30"
+    assert result.candidates[0].augmented_input != record.raw_input
+    assert "$1,000" in result.candidates[0].augmented_input
+    assert "12:30" in result.candidates[0].augmented_input
 
 
 async def test_punctuation_noise_accepts_equivalent_list_factor_decomposition() -> None:
@@ -2325,10 +2383,10 @@ async def test_punctuation_noise_accepts_equivalent_list_factor_decomposition() 
         ),
         "verdict": "equivalent",
     }
-    assert candidate.augmented_input == (
-        "In the Status Report Google Sheet,, update API Gateway Upgrade to Completed "
-        "and Mobile App Redesign to In Progress."
-    )
+    assert candidate.augmented_input != record.raw_input
+    assert "Status Report Google Sheet" in candidate.augmented_input
+    assert "API Gateway Upgrade" in candidate.augmented_input
+    assert "Mobile App Redesign" in candidate.augmented_input
 
 
 @pytest.mark.parametrize(
@@ -2424,7 +2482,7 @@ async def test_relation_decomposition_fails_closed_before_oversized_expansion(
     monkeypatch.setattr(dataset_augmentations, "_expanded_relation_semantics", reject_expansion)
 
     assert (
-        dataset_augmentations._semantic_difference_reasons(
+        dataset_augmentations._task_meaning_difference_reasons(
             frame, frame.model_copy(update={"relations": tuple(reversed(frame.relations))})
         )
         == ()
@@ -2489,13 +2547,17 @@ async def test_punctuation_noise_skips_when_every_insertion_point_is_protected()
     assert "outside a protected semantic value" in result.skips[0].reason
 
 
-async def test_word_repetition_is_deterministic_and_protects_factors() -> None:
+async def test_phrase_repetition_uses_llm_and_preserves_protected_values() -> None:
     record = source_record()
     original_frame = source_frame(record)
     reparsed_candidate = source_frame(record, identifier_prefix="candidate").model_copy(
         update={"outcomes": ()}
     )
-    model = DeterministicSemanticModel({record.id: original_frame}, reparsed_candidate)
+    model = DeterministicSemanticModel(
+        {record.id: original_frame},
+        reparsed_candidate,
+        "Transfer 100 to Alice, then tell me then tell me the balance.",
+    )
 
     result = await DatasetAugmentationEngine(model, model).augment(
         (record,), operator_ids=("input.surface.disfluency_repeat",)
@@ -2505,86 +2567,11 @@ async def test_word_repetition_is_deterministic_and_protects_factors() -> None:
     assert candidate.passed
     assert "100" in candidate.augmented_input
     assert "Alice" in candidate.augmented_input
-    assert model.rendered_inputs == []
-    assert candidate.renderer_metadata["renderer"] == "deterministic"
-    assert candidate.renderer_metadata["algorithm"] == ("protected_immediate_word_repetition")
-    assert candidate.renderer_metadata["transformation_prompts"] == []
-
-
-async def test_factor_evidence_does_not_protect_unrelated_words_in_its_span() -> None:
-    record = InteractionRecord(
-        id="source",
-        raw_input="Pay AC-100.",
-        raw_observed_output={"action": "payment_committed"},
+    assert model.rendered_inputs == [record.raw_input]
+    assert candidate.renderer_metadata["model"] == "test/model"
+    assert candidate.renderer_metadata["transformation_prompts"] == prompt_provenance(
+        "augmentation.input.surface.disfluency_repeat"
     )
-    identifier = SemanticFactor(
-        id="identifier",
-        evidence=(
-            EvidenceReference(source="input", json_pointer="/raw_input", text_quote="AC-100"),
-        ),
-        confidence=1,
-        status="observed",
-        kind="identifier",
-        role="invoice_identifier",
-        value="AC-100",
-    )
-    inferred_object = SemanticFactor(
-        id="object",
-        evidence=(
-            EvidenceReference(
-                source="input",
-                json_pointer="/raw_input",
-                text_quote="Pay AC-100",
-            ),
-        ),
-        confidence=1,
-        status="observed",
-        kind="entity",
-        role="object",
-        value="invoice",
-    )
-    request = RequestUnit(
-        id="request",
-        evidence=(EvidenceReference(source="input", json_pointer="/raw_input", text_quote="Pay"),),
-        confidence=1,
-        status="observed",
-        mode="act",
-        predicate="pay",
-        factor_ids=(identifier.id, inferred_object.id),
-    )
-    original_frame = SemanticFrame(
-        interaction_id=record.id,
-        request_units=(request,),
-        factors=(identifier, inferred_object),
-        outcomes=(
-            ObservedOutcome(
-                id="outcome",
-                evidence=(
-                    EvidenceReference(
-                        source="output",
-                        json_pointer="/raw_observed_output/action",
-                        text_quote="payment_committed",
-                    ),
-                ),
-                confidence=1,
-                status="observed",
-                request_unit_ids=(request.id,),
-                position=0,
-                kind="action",
-                predicate="payment_committed",
-            ),
-        ),
-        extractor_version="test",
-    )
-    candidate_frame = original_frame.model_copy(update={"outcomes": ()})
-    model = DeterministicSemanticModel({record.id: original_frame}, candidate_frame)
-
-    result = await DatasetAugmentationEngine(model, model).augment(
-        (record,), operator_ids=("input.surface.disfluency_repeat",)
-    )
-
-    assert result.candidates[0].passed
-    assert result.candidates[0].augmented_input == "Pay pay AC-100."
 
 
 @pytest.mark.parametrize(
@@ -2593,11 +2580,12 @@ async def test_factor_evidence_does_not_protect_unrelated_words_in_its_span() ->
         ("input.style.terse", "transfer 100 alice then balance"),
         (
             "input.style.verbose",
-            "hey could you transfer 100 to alice and after that tell me what the balance is",
+            "hey so could you please transfer 100 to alice and then once thats done can you tell "
+            "me what the balance is",
         ),
         (
             "input.surface.disfluency_repeat",
-            "transfer transfer 100 to alice then tell me the balance",
+            "transfer 100 to alice then tell me then tell me the balance",
         ),
     ],
 )
@@ -2621,39 +2609,68 @@ async def test_measurable_behavior_does_not_depend_on_a_model_marker(
     assert result.candidates[0].passed
 
 
+async def test_llm_operator_retries_an_unchanged_generation_once() -> None:
+    record = source_record()
+    original_frame = source_frame(record)
+    candidate_frame = behavior_candidate_frame(record, "grammar_error")
+    model = CorrectingSemanticModel({record.id: original_frame}, candidate_frame)
+
+    result = await DatasetAugmentationEngine(model, model).augment(
+        (record,), operator_ids=("input.surface.grammar_error",)
+    )
+
+    candidate = result.candidates[0]
+    assert candidate.passed
+    assert candidate.augmented_input == "Can you transfers 100 to Alice, then tell me the balance?"
+    assert len(model.rendered_inputs) == 2
+    assert (
+        "renderer did not change the source input" in candidate.renderer_metadata["retry_reasons"]
+    )
+    grammar_instruction = next(
+        operator.instruction
+        for operator in builtin_dataset_augmentation_operators()
+        if operator.id == "input.surface.grammar_error"
+    )
+    assert grammar_instruction in model.rendered_instructions[1]
+    assert "previous attempt was invalid" in model.rendered_instructions[1]
+
+
 @pytest.mark.parametrize(
-    ("operator_id", "rendered_output", "failure"),
+    ("operator_id", "rendered_output", "retry_reason"),
     [
         (
             "input.surface.rephrase",
             "transfer 100 to Alice then tell me the balance",
-            "rendered input only changes case, spacing, or punctuation",
+            "rendered input does not change enough wording",
         ),
         (
             "input.surface.fragmented_syntax",
             "Please transfer 100 to Alice and then report the balance",
-            "reparsed frame does not contain required communication kind fragmented_syntax",
+            "rendered input must contain at least two natural fragments",
         ),
         (
             "input.style.verbose",
-            "please could you now transfer the amount of 100 to Alice and then when that is done "
-            "could you also please tell me exactly what the current balance is for the account",
-            "rendered input is not between 1.5 and 2 times the source length",
+            "please could you now transfer the amount of 100 to Alice and then when that is "
+            "done could you also please tell me exactly what the current balance is for the "
+            "account and please take all the time you need to carefully make sure the request "
+            "is handled "
+            "before sending a detailed confirmation back to me when everything is complete",
+            "rendered input is not between 2 and 3.5 times the source length",
         ),
         (
             "input.tone.angry",
             "Please transfer 100 to Alice and then report the balance",
-            "reparsed frame does not contain required communication kind angry",
+            "rendered input must sound unmistakably angry and hostile",
         ),
         (
             "input.tone.argumentative",
             "Please transfer 100 to Alice and then report the balance",
-            "reparsed frame does not contain required communication kind argumentative",
+            "rendered input must accuse or challenge an agent that keeps failing",
         ),
     ],
 )
-async def test_operator_footprints_reject_mislabeled_outputs(
-    operator_id: str, rendered_output: str, failure: str
+async def test_operator_footprints_guide_retry_without_deciding_validity(
+    operator_id: str, rendered_output: str, retry_reason: str
 ) -> None:
     record = source_record()
     original_frame = source_frame(record)
@@ -2663,12 +2680,51 @@ async def test_operator_footprints_reject_mislabeled_outputs(
     model = DeterministicSemanticModel(
         {record.id: original_frame}, candidate_frame, rendered_output
     )
+    verifier = (
+        DeterministicEquivalenceVerifier(
+            SemanticEquivalenceAssessment(
+                verdict="equivalent",
+                explanation="The task meaning is unchanged.",
+                verifier_version="test/1",
+            )
+        )
+        if operator_id in {"input.tone.angry", "input.tone.argumentative"}
+        else None
+    )
 
-    result = await DatasetAugmentationEngine(model, model).augment(
+    result = await DatasetAugmentationEngine(model, model, verifier).augment(
         (record,), operator_ids=(operator_id,)
     )
 
-    assert failure in result.candidates[0].failure_reasons
+    candidate = result.candidates[0]
+    assert candidate.passed
+    assert candidate.failure_reasons == ()
+    assert retry_reason in candidate.renderer_metadata["retry_reasons"]
+    assert len(model.rendered_inputs) == 2
+
+
+async def test_equivalence_verifier_can_accept_meaning_when_candidate_parse_fails() -> None:
+    record = source_record()
+    original_frame = source_frame(record)
+    model = DeterministicSemanticModel(
+        {record.id: original_frame},
+        invalid_candidate_operator_ids=frozenset({"input.surface.rephrase"}),
+    )
+    assessment = SemanticEquivalenceAssessment(
+        verdict="equivalent",
+        explanation="The task meaning is unchanged.",
+        verifier_version="test/1",
+    )
+    verifier = DeterministicEquivalenceVerifier(assessment)
+
+    result = await DatasetAugmentationEngine(model, model, verifier).augment(
+        (record,), operator_ids=("input.surface.rephrase",)
+    )
+
+    candidate = result.candidates[0]
+    assert candidate.passed
+    assert candidate.reparsed_input_frame is None
+    assert candidate.semantic_equivalence_assessment == assessment
 
 
 @pytest.mark.parametrize(
@@ -2698,7 +2754,7 @@ async def test_engine_selects_an_exact_versioned_operator_reference() -> None:
     model = DeterministicSemanticModel({})
 
     result = await DatasetAugmentationEngine(model, model).augment(
-        (), operator_ids=("input.surface.rephrase@1.0.0",)
+        (), operator_ids=("input.surface.rephrase@1.1.0",)
     )
 
     assert result.source_frames == ()
@@ -2795,13 +2851,14 @@ async def test_engine_retains_invalid_candidate_and_continues_to_later_operators
         "model": "test/model",
         "seed": 42,
         "transformation_prompts": prompt_provenance("augmentation.input.surface.rephrase"),
+        "retry_reasons": ["rendered input does not change enough wording"],
     }
     assert invalid_candidate.reparsed_input_frame is None
     assert invalid_candidate.failure_reasons == (
         "candidate semantic deconstruction failed validation",
     )
     assert result.candidates[1].reparsed_input_frame is not None
-    assert len(model.rendered_inputs) == 1
+    assert len(model.rendered_inputs) == 2
 
 
 async def test_engine_propagates_source_deconstruction_validation_failure() -> None:

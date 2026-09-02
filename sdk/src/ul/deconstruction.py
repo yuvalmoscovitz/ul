@@ -48,15 +48,14 @@ from ul.llm import (
 _PROMPTS = PromptManager.instance()
 _ALLOWED_SURFACE_CHANGE_RULES: dict[SemanticAllowedSurfaceChange, str] = {
     "none": "No caller-verified surface edit is declared.",
-    "single_unprotected_case_change": (
-        "The caller deterministically verified exactly one Unicode letter changed case outside "
-        "all evidence-grounded semantic value spans. You must treat that casing edit itself as "
-        "harmless."
-    ),
     "single_unprotected_punctuation_insertion": (
         "The caller deterministically verified exactly one punctuation character was inserted "
         "outside all evidence-grounded semantic value spans. Treat that insertion itself as "
         "harmless and do not report it as a delta."
+    ),
+    "unprotected_punctuation_noise": (
+        "The caller deterministically verified only disruptive punctuation or line breaks were "
+        "added outside evidence-grounded semantic value spans. Treat that noise as harmless."
     ),
     "moderate_angry_tone": (
         "The permitted communication change is moderate anger. Blunt wording, exclamation, "
@@ -72,6 +71,17 @@ _ALLOWED_SURFACE_CHANGE_RULES: dict[SemanticAllowedSurfaceChange, str] = {
         "different when the candidate contains a personal attack, threat, abuse, profanity, "
         "hateful or degrading language, intimidation, or a wish of harm, even when task meaning "
         "is unchanged."
+    ),
+    "hostile_angry_tone": (
+        "The permitted communication change is hostile anger toward the agent. Profanity, "
+        "insults, stretched words, and excessive punctuation are allowed. Return different only "
+        "for threats, hate, wishes of harm, changed task meaning, or new operational details."
+    ),
+    "hostile_argumentative_tone": (
+        "The permitted communication change is hostile argument with the agent. Accusations of "
+        "past failure, insults, profanity, rhetorical questions, and demands to stop being wrong "
+        "are allowed. Return different only for threats, hate, wishes of harm, changed task "
+        "meaning, or new operational details."
     ),
 }
 _SEMANTIC_CACHE_VERSION = "semantic-request-cache/1"
@@ -889,7 +899,10 @@ class _SemanticCompletion:
 class _RenderedInput(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    rendered_input: str = Field(min_length=1)
+    rendered_input: str = Field(
+        min_length=1,
+        description="The rewritten user input and nothing else.",
+    )
 
 
 class _EvaluatorPreflightSample(BaseModel):

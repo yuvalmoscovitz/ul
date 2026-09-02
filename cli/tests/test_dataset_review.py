@@ -113,7 +113,7 @@ def _evidence_record(*, finding_id: str = FINDING_ID) -> dict[str, Any]:
         "cases": [
             {
                 "operator_id": "input.surface.disfluency_repeat",
-                "operator_version": "1.0.0",
+                "operator_version": "1.2.0",
                 "augmented_input": "Pay pay AC-100.",
                 "status": "REPEATABLE DIFFERENCE — REVIEW",
                 "variation_accepted": True,
@@ -204,7 +204,7 @@ def _technical_details() -> dict[str, Any]:
     candidate = DatasetAugmentationCandidate(
         source_interaction_id="quickstart-payment",
         operator_id="input.surface.disfluency_repeat",
-        operator_version="1.0.0",
+        operator_version="1.2.0",
         projection=create_dataset_augmentation_projection(
             InteractionRecord(
                 id="quickstart-payment",
@@ -257,7 +257,7 @@ def _technical_details() -> dict[str, Any]:
             raw_observed_output={"final_amount": 100, "corrected_amount": 100},
         ),
         augmentation=DatasetAugmentationResult(
-            operator_references=({"id": candidate.operator_id, "version": "1.0.0"},),
+            operator_references=({"id": candidate.operator_id, "version": "1.2.0"},),
             source_records=(
                 InteractionRecord(
                     id="quickstart-payment",
@@ -455,7 +455,7 @@ def test_root_json_report_is_stable_and_omits_private_dataset_fields(tmp_path: P
                     "ulpf_v1_b5dd705fb4db534431680decfe8b221fbebfd049d7b7aba99c2b59af966a2ca3"
                 ),
                 "pattern_snapshot_id": (
-                    "ulps_v1_ebcde01bff883fa43fcfa740b674d2ad614afbd8d67a5147b701809a1b136ba6"
+                    "ulps_v1_b217a3d0440afd085ebd792459b89f19292ff91278b5a3a4d300dc74e2cf4e4b"
                 ),
                 "kind": "behavior_difference",
                 "category": "changed_grounded_effect_argument",
@@ -480,8 +480,8 @@ def test_root_json_report_is_stable_and_omits_private_dataset_fields(tmp_path: P
                 "operators": [
                     {
                         "operator_id": "input.surface.disfluency_repeat",
-                        "operator_version": "1.0.0",
-                        "summary": "Repeat a word as a natural disfluency.",
+                        "operator_version": "1.2.0",
+                        "summary": "Repeat a short phrase as a natural disfluency.",
                     }
                 ],
                 "needs_review_count": 1,
@@ -493,7 +493,7 @@ def test_root_json_report_is_stable_and_omits_private_dataset_fields(tmp_path: P
                     {
                         "finding_id": FINDING_ID,
                         "evidence_record_ref": (
-                            "ulpe_v1_717751ec28be57ec84779be550f7280d7e0c5a4377c2a092300cb3a13fe1aff5"
+                            "ulpe_v1_7ae0b6cddbfc65ca758b2bd46e9623b4c2a2ae7fe98856f2fd42e514dca78002"
                         ),
                         "membership_reasons": [
                             "same_action_shape",
@@ -516,7 +516,7 @@ def test_root_json_report_is_stable_and_omits_private_dataset_fields(tmp_path: P
                 "kind": "behavior_difference",
                 "category": "changed_grounded_effect_argument",
                 "operator_id": "input.surface.disfluency_repeat",
-                "operator_version": "1.0.0",
+                "operator_version": "1.2.0",
                 "rule_id": None,
                 "rule_version": None,
                 "declared_severity": None,
@@ -567,7 +567,7 @@ def test_root_human_report_explains_patterns_and_augmentation_names(tmp_path: Pa
     assert "Evidence limitation: semantic model output not independently verified" in report.output
     assert "Why grouped: same finding category and private action shape." in report.output
     assert "Affected: 1 finding(s) across 1 test question(s)" in report.output
-    assert "Repeat a word as a natural disfluency." in report.output
+    assert "Repeat a short phrase as a natural disfluency." in report.output
     assert "1 needs review; 0 confirmed" in report.output
     assert f"{FINDING_ID}: same action shape, same evidence authority" in report.output
     assert "review=needs_review/unrated" in report.output
@@ -1535,7 +1535,7 @@ def test_invariant_finding_rejects_changed_values_and_id_tracks_variation_identi
         "interaction_id": "quickstart-payment",
         "original_input": "Pay AC-100.",
         "operator_id": "input.surface.disfluency_repeat",
-        "operator_version": "1.0.0",
+        "operator_version": "1.2.0",
         "augmented_input": "Pay pay AC-100.",
         "suite_sha256": first["invariant_evaluation"]["suite_sha256"],
         "observation_authority": "committed_state_snapshot",

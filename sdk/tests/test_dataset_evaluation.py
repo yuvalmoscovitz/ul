@@ -49,8 +49,6 @@ from ul_core.dataset import (
     ObservedOutcome,
     RenderedUserInput,
     RequestUnit,
-    SemanticAllowedSurfaceChange,
-    SemanticEquivalenceAssessment,
     SemanticFactor,
     SemanticFrame,
     SemanticRelation,
@@ -444,7 +442,7 @@ class DeterministicSemanticPipeline:
     ) -> RenderedUserInput:
         del allow_temporary_value
         return RenderedUserInput(
-            text="Please transfer 100 to Alice.",
+            text="Send Alice the 100.",
             metadata={"model": "deterministic", "seed": 7},
         )
 
@@ -1021,7 +1019,7 @@ async def test_runner_executes_only_accepted_candidates_and_keeps_rejected_candi
     assert rejected.target_output is None
     assert rejected.observed_frame is None
     assert rejected.findings == ()
-    assert target.raw_inputs == ["Transfer 100 to Alice.", "Please transfer 100 to Alice."]
+    assert target.raw_inputs == ["Transfer 100 to Alice.", "Send Alice the 100."]
     last_reference = semantic_pipeline.references[-1]
     assert last_reference == result.baseline.observed_frame
     assert last_reference is not None
@@ -1083,84 +1081,11 @@ async def test_runner_executes_punctuation_candidate_with_equivalent_list_decomp
     assert case.candidate.semantic_normalization.verdict == "equivalent"
     assert case.target_output is not None
     assert case.verdict == "no_divergence"
-    assert environment.raw_inputs == [
-        source.raw_input,
-        (
-            "In the Status Report Google Sheet,, update the following: 1) Find the row for "
-            "'API Gateway Upgrade' and change Status to 'Completed'. 2) Find the row for "
-            "'Mobile App Redesign' and change Status to 'In Progress'. Use spreadsheet "
-            "ss_status, worksheet ws_report."
-        ),
-    ]
-
-
-async def test_runner_executes_case_variation_with_trusted_equivalence_policy() -> None:
-    source = _source()
-    source_frame = _frame(source.id, _source_outcomes())
-    candidate_frame = _frame(f"{source.id}:input.surface.case_variation", ()).model_copy(
-        update={
-            "relations": (
-                SemanticRelation(
-                    id="candidate_relation",
-                    evidence=_evidence("input"),
-                    confidence=1,
-                    status="explicit",
-                    kind="fulfills",
-                    source_ids=("amount", "recipient"),
-                    target_ids=("request",),
-                ),
-            )
-        }
-    )
-
-    class CaseVariationPipeline(DeterministicSemanticPipeline):
-        def __init__(self) -> None:
-            super().__init__(source_frame.outcomes)
-            self.source_frame = source_frame
-            self.allowed_surface_changes: list[SemanticAllowedSurfaceChange] = []
-
-        async def deconstruct(
-            self,
-            record: InteractionRecord | UserInputRecord,
-            reference_frame: SemanticFrame | None = None,
-        ) -> SemanticFrame:
-            if record.id == source.id:
-                return source_frame
-            if not isinstance(record, InteractionRecord):
-                return candidate_frame.model_copy(update={"interaction_id": record.id})
-            return await super().deconstruct(record, reference_frame)
-
-        async def verify(
-            self,
-            source_input: str,
-            candidate_input: str,
-            *,
-            allowed_surface_change: SemanticAllowedSurfaceChange = "none",
-        ) -> SemanticEquivalenceAssessment:
-            self.allowed_surface_changes.append(allowed_surface_change)
-            return SemanticEquivalenceAssessment(
-                verdict="equivalent",
-                explanation="Only caller-verified capitalization changed.",
-                verifier_version="test/1",
-                metadata={"model": "test/equivalence"},
-            )
-
-    pipeline = CaseVariationPipeline()
-    environment = DeterministicEnvironment()
-    runner = DatasetEvaluationRunner(
-        DatasetAugmentationEngine(pipeline, pipeline, pipeline), pipeline, environment
-    )
-
-    result = await runner.run(source, operator_ids=("input.surface.case_variation",))
-
-    case = result.cases[0]
-    assert case.candidate.passed
-    assert case.candidate.semantic_equivalence_assessment is not None
-    assert case.candidate.semantic_equivalence_assessment.metadata == {"model": "test/equivalence"}
-    assert case.target_output is not None
-    assert case.verdict == "no_divergence"
-    assert pipeline.allowed_surface_changes == ["single_unprotected_case_change"]
-    assert environment.raw_inputs == [source.raw_input, "transfer 100 to Alice."]
+    assert environment.raw_inputs == [source.raw_input, case.candidate.augmented_input]
+    assert case.candidate.augmented_input.count("!") > source.raw_input.count("!")
+    assert case.candidate.augmented_input.count(".") > source.raw_input.count(".")
+    assert case.candidate.augmented_input.count("\n") > source.raw_input.count("\n")
+    assert case.candidate.augmented_input.count(" ") > source.raw_input.count(" ")
 
 
 async def test_redacted_runner_evidence_never_persists_environment_secrets(tmp_path: Path) -> None:
@@ -2392,7 +2317,7 @@ async def test_repetitions_are_interleaved_and_group_equivalent_observations() -
         target.raw_inputs
         == [
             "Transfer 100 to Alice.",
-            "Please transfer 100 to Alice.",
+            "Send Alice the 100.",
         ]
         * 3
     )
@@ -2500,7 +2425,7 @@ async def test_numeric_identifier_representations_remain_distinct() -> None:
 
     result = await runner.run(
         source,
-        operator_ids=("input.surface.disfluency_repeat",),
+        operator_ids=("input.surface.rephrase",),
         repetitions=2,
     )
 
@@ -2604,10 +2529,10 @@ async def test_inconclusive_original_round_skips_only_its_paired_variation() -> 
 
     assert target.raw_inputs == [
         "Transfer 100 to Alice.",
-        "Please transfer 100 to Alice.",
+        "Send Alice the 100.",
         "Transfer 100 to Alice.",
         "Transfer 100 to Alice.",
-        "Please transfer 100 to Alice.",
+        "Send Alice the 100.",
     ]
     assert result.baseline.trial_set.stability == "inconclusive"
     case = result.cases[0]

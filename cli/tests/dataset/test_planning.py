@@ -69,7 +69,7 @@ def test_dry_run_validates_and_makes_no_external_calls(
     assert "Selected interactions: 1" in result.output
     assert "Evaluation mode: variance" in result.output
     assert "Repetitions: 3 per original and accepted variation" in result.output
-    assert "Potential semantic model calls: up to 14" in result.output
+    assert "Potential semantic model calls: up to 16" in result.output
     assert "Potential environment API calls: up to 30" in result.output
     assert "authorized maximum: 100" in result.output
     assert "Semantic models receive historical inputs and outputs" in result.output
@@ -169,12 +169,12 @@ def test_dry_run_json_exposes_per_example_campaign_and_exact_call_plan(
         "variation": 2,
         "repetitions": 2,
         "repetition_executions": 4,
-        "retries": 0,
+        "retries": 1,
         "preflight": 4,
         "evaluators": 7,
         "materiality": 1,
-        "variation_generation": 0,
-        "total_semantic_model": 12,
+        "variation_generation": 1,
+        "total_semantic_model": 14,
         "total_environment_api": 20,
     }
     assert payload["calls"]["preflight"] == len(payload["preflight_profiles"])
@@ -192,10 +192,11 @@ def test_dry_run_json_exposes_per_example_campaign_and_exact_call_plan(
         + payload["calls"]["evaluators"]
         + payload["calls"]["materiality"]
         + payload["calls"]["variation_generation"]
+        + payload["calls"]["retries"]
     )
     assert payload["timing"] == {
         "target_trial_timeout_seconds": 75.0,
-        "maximum_wall_time_seconds": 1020.0,
+        "maximum_wall_time_seconds": 1140.0,
     }
     planned_operator = next(
         operator
@@ -204,10 +205,10 @@ def test_dry_run_json_exposes_per_example_campaign_and_exact_call_plan(
     )
     assert planned_operator["status"] == "conditional"
     assert planned_operator["selected"] is True
-    assert "deterministic and free" in planned_operator["reasons"][1]
+    assert "candidate generation requires a semantic model call" in planned_operator["reasons"]
     assert payload["tokens"] == {
         "minimum": 0,
-        "maximum": 29_184,
+        "maximum": 30_208,
         "scope": "completion_tokens",
     }
     assert payload["money"] is None
@@ -342,6 +343,7 @@ def test_campaign_plan_counts_grammar_error_as_llm_generation() -> None:
         if operator.id == "input.surface.grammar_error"
     )
     assert plan.calls.variation_generation == 1
+    assert plan.calls.retries == 1
     assert "candidate generation requires a semantic model call" in grammar_operator.reasons
 
 
@@ -355,7 +357,8 @@ def test_campaign_plan_counts_tone_safety_validation() -> None:
 
     assert plan.calls.variation_generation == 1
     assert plan.calls.evaluators == 6
-    assert plan.calls.total_semantic_model == 12
+    assert plan.calls.retries == 1
+    assert plan.calls.total_semantic_model == 13
 
 
 @pytest.mark.parametrize("candidate_state", ["rejected", "missing"])
@@ -444,7 +447,7 @@ def test_human_dry_run_escapes_untrusted_ids_and_summarizes_unselected_catalog(
     assert "\\u001b" in result.output
     assert "[bold]spoof[/bold]" in result.output
     assert "Unselected catalog operators:" in result.output
-    assert "0 eligible, 11 conditional, 10 ineligible" in result.output
+    assert "0 eligible, 10 conditional, 10 ineligible" in result.output
     assert "use --json for full detail" in " ".join(result.output.split())
     assert "input.surface.rephrase@" not in result.output
 

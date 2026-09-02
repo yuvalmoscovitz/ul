@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import hashlib
 import json
+import random
 import re
+from collections import Counter
 from collections.abc import Collection, Iterable, Mapping
 from dataclasses import dataclass
 from decimal import Decimal
-from itertools import islice, pairwise
+from itertools import islice
 from typing import Any, Literal, Self, cast
 
 from pydantic import Field, JsonValue, model_validator
@@ -38,6 +40,17 @@ from ul_core.prompts import PromptManager, prompt_provenance
 _PROMPTS = PromptManager.instance()
 _MAX_DECOMPOSED_RELATION_ENDPOINTS = 10_000
 _TONE_SAFETY_KINDS = {"angry", "argumentative"}
+_COMMUNICATION_FORM_KINDS = {
+    "typing_noise",
+    "grammar_error",
+    "fragmented_syntax",
+    "repetition",
+    "terse",
+    "verbose",
+    "frustrated",
+    "angry",
+    "argumentative",
+}
 
 
 @dataclass(frozen=True)
@@ -55,7 +68,6 @@ def _is_none(value: object) -> bool:
 OperatorId = Literal[
     "input.surface.rephrase",
     "input.surface.typing_noise",
-    "input.surface.case_variation",
     "input.surface.punctuation_noise",
     "input.surface.grammar_error",
     "input.surface.fragmented_syntax",
@@ -77,7 +89,6 @@ OperatorGenerationMechanism = Literal["deterministic", "llm"]
 _OPERATOR_PROMPT_NAMES: dict[OperatorId, str] = {
     "input.surface.rephrase": "augmentation.input.surface.rephrase",
     "input.surface.typing_noise": "augmentation.input.surface.typing_noise",
-    "input.surface.case_variation": "augmentation.input.surface.case_variation",
     "input.surface.punctuation_noise": "augmentation.input.surface.punctuation_noise",
     "input.surface.grammar_error": "augmentation.input.surface.grammar_error",
     "input.surface.fragmented_syntax": "augmentation.input.surface.fragmented_syntax",
@@ -104,7 +115,6 @@ class DatasetAugmentationOperator(ULModel):
     generation_mechanism: OperatorGenerationMechanism
     allowed_change: AllowedChange
     target_communication_kind: str | None = Field(default=None, min_length=1)
-    target_marker_required: bool = False
     human_review_required: bool = False
 
     @model_validator(mode="after")
@@ -115,8 +125,6 @@ class DatasetAugmentationOperator(ULModel):
         }
         if requires_target != (self.target_communication_kind is not None):
             raise ValueError("target communication kind must match the allowed change")
-        if self.target_marker_required and self.target_communication_kind is None:
-            raise ValueError("required target marker needs a communication kind")
         return self
 
 
@@ -126,7 +134,6 @@ def _builtin_operator(
     generation_mechanism: OperatorGenerationMechanism,
     allowed_change: AllowedChange,
     target_communication_kind: str | None = None,
-    target_marker_required: bool = False,
 ) -> DatasetAugmentationOperator:
     definition = builtin_augmentation_catalog().get(operator_id)
     binding = next(item for item in definition.bindings if item.mode == "dataset_variation")
@@ -139,7 +146,6 @@ def _builtin_operator(
         generation_mechanism=generation_mechanism,
         allowed_change=allowed_change,
         target_communication_kind=target_communication_kind,
-        target_marker_required=target_marker_required,
         human_review_required=binding.requirements.human_review,
     )
 
@@ -157,12 +163,6 @@ _BUILTIN_OPERATORS = (
         target_communication_kind="typing_noise",
     ),
     _builtin_operator(
-        operator_id="input.surface.case_variation",
-        generation_mechanism="deterministic",
-        allowed_change="declared_communication_form",
-        target_communication_kind="typing_noise",
-    ),
-    _builtin_operator(
         operator_id="input.surface.punctuation_noise",
         generation_mechanism="deterministic",
         allowed_change="declared_communication_form",
@@ -172,18 +172,17 @@ _BUILTIN_OPERATORS = (
         operator_id="input.surface.grammar_error",
         generation_mechanism="llm",
         allowed_change="declared_communication_form",
-        target_communication_kind="fragmented_syntax",
+        target_communication_kind="grammar_error",
     ),
     _builtin_operator(
         operator_id="input.surface.fragmented_syntax",
         generation_mechanism="llm",
         allowed_change="declared_communication_form",
         target_communication_kind="fragmented_syntax",
-        target_marker_required=True,
     ),
     _builtin_operator(
         operator_id="input.surface.disfluency_repeat",
-        generation_mechanism="deterministic",
+        generation_mechanism="llm",
         allowed_change="declared_communication_form",
         target_communication_kind="repetition",
     ),
@@ -204,21 +203,18 @@ _BUILTIN_OPERATORS = (
         generation_mechanism="llm",
         allowed_change="declared_communication_form",
         target_communication_kind="angry",
-        target_marker_required=True,
     ),
     _builtin_operator(
         operator_id="input.tone.argumentative",
         generation_mechanism="llm",
         allowed_change="declared_communication_form",
         target_communication_kind="argumentative",
-        target_marker_required=True,
     ),
     _builtin_operator(
         operator_id="input.intent.self_correction",
         generation_mechanism="deterministic",
         allowed_change="structured_self_correction",
         target_communication_kind="self_correction",
-        target_marker_required=True,
     ),
 )
 _BUILTIN_OPERATORS_BY_REFERENCE = {
@@ -439,19 +435,7 @@ class DatasetAugmentationEngine:
             for operator in selected_operators:
                 transformation_prompt_names: tuple[str, ...] = ()
                 self_correction_plan: _SelfCorrectionPlan | None = None
-                if (
-                    operator.id == "input.surface.case_variation"
-                    and _first_cased_letter(record.raw_input, expected_input_frame) is None
-                ):
-                    skips.append(
-                        DatasetAugmentationSkip(
-                            source_interaction_id=record.id,
-                            operator_id=operator.id,
-                            operator_version=operator.version,
-                            reason=operator.applicability_rule,
-                        )
-                    )
-                    continue
+                render_instruction: str | None = None
                 if (
                     operator.id == "input.surface.punctuation_noise"
                     and _punctuation_insertion(record.raw_input, expected_input_frame) is None
@@ -479,12 +463,8 @@ class DatasetAugmentationEngine:
                         continue
                 if operator.id == "input.surface.typing_noise":
                     rendered_input = _add_typing_noise(record, expected_input_frame, operator)
-                elif operator.id == "input.surface.case_variation":
-                    rendered_input = _add_case_variation(record, expected_input_frame, operator)
                 elif operator.id == "input.surface.punctuation_noise":
                     rendered_input = _add_punctuation_noise(record, expected_input_frame, operator)
-                elif operator.id == "input.surface.disfluency_repeat":
-                    rendered_input = _add_word_repetition(record, expected_input_frame, operator)
                 elif operator.allowed_change == "structured_self_correction":
                     if self_correction_plan is None:
                         raise AssertionError("self-correction requires a selected factor")
@@ -495,21 +475,44 @@ class DatasetAugmentationEngine:
                     )
                 else:
                     transformation_prompt_names = (_OPERATOR_PROMPT_NAMES[operator.id],)
-                    rendered_input = await self._renderer.render(
-                        record.raw_input, operator.instruction
+                    render_instruction = _meaning_guided_instruction(
+                        operator.instruction,
+                        expected_input_frame,
                     )
-                renderer_metadata: dict[str, JsonValue] = {
-                    **rendered_input.metadata,
-                    "transformation_prompts": prompt_provenance(*transformation_prompt_names),
-                }
-                if self_correction_plan is not None:
-                    renderer_metadata["self_correction_grounding"] = self_correction_plan.grounding
+                    rendered_input = await self._renderer.render(
+                        record.raw_input, render_instruction
+                    )
                 augmented_input = rendered_input.text
                 if operator.generation_mechanism == "llm":
                     augmented_input = augmented_input.replace("—", " ")
                 surface_footprint_reasons = _surface_footprint_reasons(
                     operator.id, record.raw_input, augmented_input
                 )
+                retry_reasons = surface_footprint_reasons
+                if augmented_input == record.raw_input:
+                    retry_reasons = (*retry_reasons, "renderer did not change the source input")
+                if operator.generation_mechanism == "llm" and retry_reasons:
+                    if render_instruction is None:
+                        raise AssertionError("LLM generation requires meaning guidance")
+                    rendered_input = await self._renderer.render(
+                        record.raw_input,
+                        f"{render_instruction}\n\n"
+                        "Your previous attempt was invalid for these reasons: "
+                        f"{'; '.join(retry_reasons)}. Return a corrected transformation that "
+                        "satisfies the original instruction.",
+                    )
+                    augmented_input = rendered_input.text.replace("—", " ")
+                    surface_footprint_reasons = _surface_footprint_reasons(
+                        operator.id, record.raw_input, augmented_input
+                    )
+                renderer_metadata: dict[str, JsonValue] = {
+                    **rendered_input.metadata,
+                    "transformation_prompts": prompt_provenance(*transformation_prompt_names),
+                }
+                if operator.generation_mechanism == "llm" and retry_reasons:
+                    renderer_metadata["retry_reasons"] = list(retry_reasons)
+                if self_correction_plan is not None:
+                    renderer_metadata["self_correction_grounding"] = self_correction_plan.grounding
                 candidate_record = UserInputRecord(
                     id=f"{record.id}:{operator.id}",
                     raw_input=augmented_input,
@@ -528,7 +531,10 @@ class DatasetAugmentationEngine:
                         failure_reasons = ["reparsed frame must reference its candidate input"]
                     elif operator.allowed_change == "surface_form_only":
                         failure_reasons = list(
-                            _semantic_difference_reasons(expected_input_frame, reparsed_frame)
+                            _task_meaning_difference_reasons(
+                                expected_input_frame,
+                                reparsed_frame,
+                            )
                         )
                     elif operator.allowed_change == "structured_self_correction":
                         if self_correction_plan is None:
@@ -553,27 +559,27 @@ class DatasetAugmentationEngine:
                         )
                     else:
                         failure_reasons = list(
-                            _declared_communication_form_difference_reasons(
+                            _task_meaning_difference_reasons(
                                 expected_input_frame,
                                 reparsed_frame,
-                                operator.target_communication_kind,
-                                operator.target_marker_required,
                             )
                         )
                     if _has_unresolved_nodes(reparsed_frame):
                         failure_reasons.append(
                             "reparsed frame contains unresolved semantic elements"
                         )
-                    if (
-                        self._equivalence_verifier is not None
-                        and operator.allowed_change != "structured_self_correction"
-                        and not surface_footprint_reasons
-                        and failure_reasons
-                        and all(
-                            reason.endswith("differ from the expected frame")
-                            for reason in failure_reasons
-                        )
-                    ):
+                requires_equivalence_verification = (
+                    operator.allowed_change != "structured_self_correction"
+                    and (
+                        bool(failure_reasons)
+                        or operator.target_communication_kind in _TONE_SAFETY_KINDS
+                    )
+                )
+                if requires_equivalence_verification:
+                    if self._equivalence_verifier is None:
+                        if not failure_reasons:
+                            failure_reasons = ["semantic equivalence verifier is unavailable"]
+                    else:
                         try:
                             equivalence_assessment = await self._equivalence_verifier.verify(
                                 record.raw_input,
@@ -591,30 +597,6 @@ class DatasetAugmentationEngine:
                                 ]
                             else:
                                 failure_reasons = ["semantic equivalence check was uncertain"]
-                    if (
-                        operator.target_communication_kind in _TONE_SAFETY_KINDS
-                        and not surface_footprint_reasons
-                        and not failure_reasons
-                    ):
-                        if self._equivalence_verifier is None:
-                            failure_reasons = ["tone safety verifier is unavailable"]
-                        else:
-                            try:
-                                equivalence_assessment = await self._equivalence_verifier.verify(
-                                    record.raw_input,
-                                    augmented_input,
-                                    allowed_surface_change=_allowed_surface_change(operator.id),
-                                )
-                            except ValueError:
-                                failure_reasons = ["tone safety validation failed"]
-                            else:
-                                if equivalence_assessment.verdict == "different":
-                                    failure_reasons = [
-                                        "tone safety check found a forbidden communication change"
-                                    ]
-                                elif equivalence_assessment.verdict == "uncertain":
-                                    failure_reasons = ["tone safety check was uncertain"]
-                failure_reasons.extend(surface_footprint_reasons)
                 if augmented_input == record.raw_input:
                     failure_reasons.append("renderer did not change the source input")
                 generated_input_key = _text_key(augmented_input)
@@ -675,6 +657,23 @@ class DatasetAugmentationEngine:
                         failure_reasons=tuple(failure_reasons),
                     )
                 )
+        operator_positions = {
+            (operator.id, operator.version): position
+            for position, operator in enumerate(selected_operators)
+        }
+        source_positions = {record.id: position for position, record in enumerate(source_records)}
+        candidates.sort(
+            key=lambda candidate: (
+                operator_positions[(candidate.operator_id, candidate.operator_version)],
+                source_positions[candidate.source_interaction_id],
+            )
+        )
+        skips.sort(
+            key=lambda skip: (
+                operator_positions[(skip.operator_id, skip.operator_version)],
+                source_positions[skip.source_interaction_id],
+            )
+        )
         return DatasetAugmentationResult(
             operator_references=tuple(
                 DatasetAugmentationOperatorReference(id=operator.id, version=operator.version)
@@ -780,18 +779,99 @@ def _input_evidence(element: Any) -> tuple[Any, ...]:
     return tuple(evidence for evidence in element.evidence if evidence.source == "input")
 
 
-def _semantic_difference_reasons(
+def _meaning_guided_instruction(instruction: str, frame: SemanticFrame) -> str:
+    meaning_frame = _without_pure_communication_form(frame)
+    meaning_to_preserve = {
+        "requests": [
+            {
+                "id": request.id,
+                "mode": request.mode,
+                "predicate": request.predicate,
+                "factor_ids": list(request.factor_ids),
+            }
+            for request in meaning_frame.request_units
+        ],
+        "factors": [
+            {
+                "id": factor.id,
+                "kind": factor.kind,
+                "role": factor.role,
+                "value": factor.value,
+                "status": factor.status,
+            }
+            for factor in meaning_frame.factors
+        ],
+        "relations": [
+            {
+                "kind": relation.kind,
+                "source_ids": list(relation.source_ids),
+                "target_ids": list(relation.target_ids),
+            }
+            for relation in meaning_frame.relations
+        ],
+        "communication_acts": [
+            {
+                "kind": act.kind,
+                "factor_ids": list(act.factor_ids),
+                "attributes": act.attributes,
+            }
+            for act in meaning_frame.communication_acts
+        ],
+        "exact_text": list(
+            dict.fromkeys(
+                evidence.text_quote
+                for factor in meaning_frame.factors
+                for evidence in factor.evidence
+                if evidence.source == "input" and evidence.text_quote is not None
+            )
+        ),
+    }
+    serialized_meaning = json.dumps(
+        meaning_to_preserve,
+        ensure_ascii=False,
+        allow_nan=False,
+        separators=(",", ":"),
+    )
+    return f"{instruction}\nmeaning_to_preserve={serialized_meaning}"
+
+
+def _task_meaning_difference_reasons(
     expected: SemanticFrame, reparsed: SemanticFrame
 ) -> tuple[str, ...]:
-    expected_semantics = _canonical_semantics(expected)
-    reparsed_semantics = _canonical_semantics(reparsed)
+    expected_semantics = _canonical_semantics(_without_pure_communication_form(expected))
+    reparsed_semantics = _canonical_semantics(_without_pure_communication_form(reparsed))
     labels = ("factors", "request units", "relations", "communication acts")
     return tuple(
         f"{label} differ from the expected frame"
         for label, expected_part, reparsed_part in zip(
-            labels, expected_semantics, reparsed_semantics, strict=True
+            labels,
+            expected_semantics,
+            reparsed_semantics,
+            strict=True,
         )
         if expected_part != reparsed_part
+    )
+
+
+def _without_pure_communication_form(frame: SemanticFrame) -> SemanticFrame:
+    related_ids = {
+        element_id
+        for relation in frame.relations
+        for element_id in (*relation.source_ids, *relation.target_ids)
+    }
+    return frame.model_copy(
+        update={
+            "communication_acts": tuple(
+                act
+                for act in frame.communication_acts
+                if not (
+                    act.kind in _COMMUNICATION_FORM_KINDS
+                    and not act.factor_ids
+                    and not act.attributes
+                    and act.id not in related_ids
+                )
+            )
+        }
     )
 
 
@@ -816,54 +896,11 @@ def _semantic_normalization_assessment(
     return SemanticNormalizationAssessment(
         applied_rules=tuple(applied_rules),
         verdict=(
-            "equivalent" if not _semantic_difference_reasons(expected, reparsed) else "different"
+            "equivalent"
+            if not _task_meaning_difference_reasons(expected, reparsed)
+            else "different"
         ),
     )
-
-
-def _declared_communication_form_difference_reasons(
-    expected: SemanticFrame,
-    reparsed: SemanticFrame,
-    target_communication_kind: str | None,
-    target_marker_required: bool,
-) -> tuple[str, ...]:
-    target_acts = tuple(
-        act for act in reparsed.communication_acts if act.kind == target_communication_kind
-    )
-    if not target_acts:
-        if target_marker_required:
-            return (
-                f"reparsed frame does not contain required communication kind "
-                f"{target_communication_kind}",
-            )
-        return _semantic_difference_reasons(expected, reparsed)
-    candidate_differences: list[tuple[str, ...]] = []
-    for target_act in target_acts:
-        if target_act.factor_ids or target_act.attributes:
-            candidate_differences.append(
-                ("declared communication marker contains unsupported semantics",)
-            )
-            continue
-        if any(
-            target_act.id in (*relation.source_ids, *relation.target_ids)
-            for relation in reparsed.relations
-        ):
-            candidate_differences.append(
-                ("declared communication marker has unsupported relations",)
-            )
-            continue
-        filtered_frame = reparsed.model_copy(
-            update={
-                "communication_acts": tuple(
-                    act for act in reparsed.communication_acts if act.id != target_act.id
-                ),
-            }
-        )
-        differences = _semantic_difference_reasons(expected, filtered_frame)
-        if not differences:
-            return ()
-        candidate_differences.append(differences)
-    return min(candidate_differences, key=len)
 
 
 _SELF_CORRECTION_FACTOR_KINDS = ("money", "number", "date_time", "duration", "enum")
@@ -1753,47 +1790,70 @@ def _surface_footprint_reasons(
     source_word_count = len(re.findall(r"\w+", source_input, flags=re.UNICODE))
     augmented_words = re.findall(r"\w+", augmented_input, flags=re.UNICODE)
     augmented_word_count = len(augmented_words)
-    if operator_id == "input.surface.rephrase" and _word_key(source_input) == _word_key(
-        augmented_input
+    changed_word_count = _changed_word_count(source_input, augmented_input)
+    if operator_id == "input.surface.rephrase" and changed_word_count < max(
+        2, source_word_count // 4
     ):
-        return ("rendered input only changes case, spacing, or punctuation",)
-    if operator_id == "input.surface.case_variation" and not _is_single_case_change(
+        return ("rendered input does not change enough wording",)
+    if operator_id == "input.surface.grammar_error" and changed_word_count < 2:
+        return ("rendered input must contain at least two visible word errors",)
+    if (
+        operator_id == "input.surface.fragmented_syntax"
+        and len(tuple(part for part in re.split(r"[.;\n]+", augmented_input) if part.strip())) < 2
+    ):
+        return ("rendered input must contain at least two natural fragments",)
+    if operator_id == "input.surface.punctuation_noise" and not _is_disruptive_punctuation_noise(
         source_input, augmented_input
     ):
-        return ("rendered input must contain exactly one single-code-point case change",)
-    if operator_id == "input.surface.punctuation_noise" and not _is_single_punctuation_insertion(
-        source_input, augmented_input
-    ):
-        return ("rendered input must insert exactly one punctuation character",)
-    if operator_id == "input.style.terse" and augmented_word_count * 10 > source_word_count * 9:
+        return ("rendered input must add mixed exclamation, period, newline, and spacing noise",)
+    if operator_id == "input.style.terse" and augmented_word_count * 5 > source_word_count * 4:
         return ("rendered input is not visibly shorter than the source",)
     if operator_id == "input.style.verbose" and not (
-        source_word_count * 15 <= augmented_word_count * 10
-        and augmented_word_count <= source_word_count * 2
+        source_word_count * 2 <= augmented_word_count
+        and augmented_word_count * 2 <= source_word_count * 7
     ):
-        return ("rendered input is not between 1.5 and 2 times the source length",)
+        return ("rendered input is not between 2 and 3.5 times the source length",)
     if operator_id == "input.surface.disfluency_repeat":
-        source_repetition_count = sum(
-            first.casefold() == second.casefold()
-            for first, second in pairwise(re.findall(r"\w+", source_input, flags=re.UNICODE))
-        )
-        augmented_repetition_count = sum(
-            first.casefold() == second.casefold() for first, second in pairwise(augmented_words)
-        )
+        source_repetition_count = _immediate_phrase_repetition_count(source_input)
+        augmented_repetition_count = _immediate_phrase_repetition_count(augmented_input)
         if augmented_repetition_count != source_repetition_count + 1:
-            return ("rendered input must contain exactly one immediate word repetition",)
+            return ("rendered input must repeat exactly one short phrase immediately",)
+    if (
+        operator_id == "input.tone.angry"
+        and re.search(
+            r"(?i)\b(?:fuck\w*|shit\w*|stupid|idiot|moron|damn\w*|asshole|useless|dumb)\b",
+            augmented_input,
+        )
+        is None
+    ):
+        return ("rendered input must sound unmistakably angry and hostile",)
+    if (
+        operator_id == "input.tone.argumentative"
+        and re.search(
+            r"(?i)\b(?:last time|again|wrong|stop|ever|once in your life|get anything right|"
+            r"do one thing right|can(?:not|'t) you (?:get|do|ever))\b",
+            augmented_input,
+        )
+        is None
+    ):
+        return ("rendered input must accuse or challenge an agent that keeps failing",)
     return ()
 
 
+def _changed_word_count(source_input: str, augmented_input: str) -> int:
+    source_words = Counter(re.findall(r"\w+", source_input.casefold(), flags=re.UNICODE))
+    augmented_words = Counter(re.findall(r"\w+", augmented_input.casefold(), flags=re.UNICODE))
+    shared_word_count = sum((source_words & augmented_words).values())
+    return max(sum(source_words.values()), sum(augmented_words.values())) - shared_word_count
+
+
 def _allowed_surface_change(operator_id: OperatorId) -> SemanticAllowedSurfaceChange:
-    if operator_id == "input.surface.case_variation":
-        return "single_unprotected_case_change"
     if operator_id == "input.surface.punctuation_noise":
-        return "single_unprotected_punctuation_insertion"
+        return "unprotected_punctuation_noise"
     if operator_id == "input.tone.angry":
-        return "moderate_angry_tone"
+        return "hostile_angry_tone"
     if operator_id == "input.tone.argumentative":
-        return "moderate_argumentative_tone"
+        return "hostile_argumentative_tone"
     return "none"
 
 
@@ -1806,35 +1866,60 @@ def _add_typing_noise(
         hashlib.sha256(f"{record.id}\0{operator.id}\0{operator.version}".encode()).digest()[:4],
         "big",
     )
-    protected_words = _protected_factor_words(frame)
-    eligible_words: list[tuple[int, int, tuple[int, ...]]] = []
+    protected_spans = _protected_input_spans(record.raw_input, frame)
+    eligible_words: list[tuple[int, int, str]] = []
     for match in re.finditer(r"[A-Za-z]+", record.raw_input):
-        if len(match.group()) < 4 or match.group().casefold() in protected_words:
+        word = match.group()
+        if len(word) < 3 or any(
+            _position_is_protected(position, protected_spans)
+            for position in range(match.start(), match.end())
+        ):
             continue
-        swap_positions = tuple(
-            index
-            for index in range(1, len(match.group()) - 1)
-            if match.group()[index] != match.group()[index + 1]
-        )
-        if swap_positions:
-            eligible_words.append((match.start(), match.end(), swap_positions))
+        eligible_words.append((match.start(), match.end(), word))
     if not eligible_words:
         rendered_text = record.raw_input
+        edit_count = 0
     else:
-        start, end, swap_positions = eligible_words[seed % len(eligible_words)]
-        characters = list(record.raw_input[start:end])
-        swap_index = swap_positions[seed % len(swap_positions)]
-        characters[swap_index], characters[swap_index + 1] = (
-            characters[swap_index + 1],
-            characters[swap_index],
+        ranked_words = sorted(
+            eligible_words,
+            key=lambda item: hashlib.sha256(f"{seed}\0{item[0]}".encode()).digest(),
         )
-        rendered_text = f"{record.raw_input[:start]}{''.join(characters)}{record.raw_input[end:]}"
+        edit_count = 4 + seed % 2
+        mutations = {start: word for start, _end, word in ranked_words}
+        for edit_index in range(edit_count):
+            start, _end, _word = ranked_words[edit_index % len(ranked_words)]
+            word = mutations[start]
+            operation = (seed + edit_index) % 3
+            position = 1 + (seed + edit_index) % max(1, len(word) - 2)
+            if operation == 0 and len(word) >= 3:
+                swap_position = min(position, len(word) - 2)
+                characters = list(word)
+                characters[swap_position], characters[swap_position + 1] = (
+                    characters[swap_position + 1],
+                    characters[swap_position],
+                )
+                mutated = "".join(characters)
+                if mutated == word:
+                    mutated = f"{word[:swap_position]}{word[swap_position + 1 :]}"
+            elif operation == 1 and len(word) > 3:
+                mutated = f"{word[:position]}{word[position + 1 :]}"
+            else:
+                mutated = f"{word[:position]}{word[position]}{word[position:]}"
+            mutations[start] = mutated
+        pieces: list[str] = []
+        cursor = 0
+        for start, end, _word in eligible_words:
+            pieces.extend((record.raw_input[cursor:start], mutations[start]))
+            cursor = end
+        pieces.append(record.raw_input[cursor:])
+        rendered_text = "".join(pieces)
     return RenderedUserInput(
         text=rendered_text,
         metadata={
             "renderer": "deterministic",
-            "algorithm": "protected_adjacent_transposition",
+            "algorithm": "four_or_five_unprotected_typing_edits",
             "seed": seed,
+            "edit_count": edit_count,
         },
     )
 
@@ -1873,54 +1958,46 @@ def _add_self_correction(
     )
 
 
-def _add_case_variation(
-    record: InteractionRecord,
-    frame: SemanticFrame,
-    operator: DatasetAugmentationOperator,
-) -> RenderedUserInput:
-    cased_letter = _first_cased_letter(record.raw_input, frame)
-    if cased_letter is None:
-        raise AssertionError("case variation requires a Unicode cased letter")
-    index, letter = cased_letter
-    changed_letter = letter.lower() if letter.isupper() else letter.upper()
-    rendered_text = f"{record.raw_input[:index]}{changed_letter}{record.raw_input[index + 1 :]}"
-    return RenderedUserInput(
-        text=rendered_text,
-        metadata=_deterministic_renderer_metadata(
-            record, operator, "single_unicode_cased_letter_toggle"
-        ),
-    )
-
-
-def _first_cased_letter(text: str, frame: SemanticFrame) -> tuple[int, str] | None:
-    protected_spans = _protected_input_spans(text, frame)
-    return next(
-        (
-            (index, character)
-            for index, character in enumerate(text)
-            if character.isalpha()
-            and character.lower() != character.upper()
-            and len(character.lower()) == 1
-            and len(character.upper()) == 1
-            and not _position_is_protected(index, protected_spans)
-        ),
-        None,
-    )
-
-
 def _add_punctuation_noise(
     record: InteractionRecord,
     frame: SemanticFrame,
     operator: DatasetAugmentationOperator,
 ) -> RenderedUserInput:
-    insertion = _punctuation_insertion(record.raw_input, frame)
-    if insertion is None:
-        raise AssertionError("punctuation noise requires an unprotected insertion point")
-    position, punctuation, algorithm = insertion
-    rendered_text = f"{record.raw_input[:position]}{punctuation}{record.raw_input[position:]}"
+    seed = int.from_bytes(
+        hashlib.sha256(f"{record.id}\0{operator.id}\0{operator.version}".encode()).digest()[:4],
+        "big",
+    )
+    randomizer = random.Random(seed)
+    protected_spans = _protected_input_spans(record.raw_input, frame)
+    insertion_points = list(
+        index
+        for index, character in enumerate(record.raw_input)
+        if character.isspace()
+        and not _position_is_protected(index, protected_spans)
+        and not _space_splits_title_words(record.raw_input, index)
+    )
+    if not insertion_points:
+        fallback = _punctuation_insertion(record.raw_input, frame)
+        if fallback is None:
+            raise AssertionError("punctuation noise requires an unprotected insertion point")
+        insertion_points = [fallback[0]]
+    randomizer.shuffle(insertion_points)
+    noise = ["!", ".", "\n", " ", "!", ".", "\n", " ", "!", "."]
+    randomizer.shuffle(noise)
+    insertions: dict[int, list[str]] = {}
+    for index, character in enumerate(noise):
+        position = insertion_points[index % len(insertion_points)]
+        insertions.setdefault(position, []).append(character)
+    rendered_text = "".join(
+        f"{''.join(insertions.get(index, ()))}{character}"
+        for index, character in enumerate(record.raw_input)
+    )
+    rendered_text = f"{rendered_text}{''.join(insertions.get(len(record.raw_input), ()))}"
     return RenderedUserInput(
         text=rendered_text,
-        metadata=_deterministic_renderer_metadata(record, operator, algorithm),
+        metadata=_deterministic_renderer_metadata(
+            record, operator, "seeded_mixed_punctuation_spacing_noise"
+        ),
     )
 
 
@@ -1958,6 +2035,17 @@ def _punctuation_insertion(text: str, frame: SemanticFrame) -> tuple[int, str, s
     return word.start() + 1, ",", "single_unprotected_word_punctuation_insertion"
 
 
+def _space_splits_title_words(text: str, index: int) -> bool:
+    left_word = re.search(r"[^\W\d_]+$", text[:index], flags=re.UNICODE)
+    right_word = re.match(r"\s*([^\W\d_]+)", text[index + 1 :], flags=re.UNICODE)
+    return (
+        left_word is not None
+        and right_word is not None
+        and left_word.group()[0].isupper()
+        and right_word.group(1)[0].isupper()
+    )
+
+
 def _protected_input_spans(text: str, frame: SemanticFrame) -> tuple[tuple[int, int], ...]:
     spans: set[tuple[int, int]] = set()
     for factor in frame.factors:
@@ -1980,85 +2068,34 @@ def _insertion_is_protected(position: int, spans: tuple[tuple[int, int], ...]) -
     return any(start < position < end for start, end in spans)
 
 
-def _is_single_case_change(source_input: str, augmented_input: str) -> bool:
-    if len(source_input) != len(augmented_input):
-        return False
-    changed_positions = tuple(
-        index
-        for index, (source_character, augmented_character) in enumerate(
-            zip(source_input, augmented_input, strict=True)
-        )
-        if source_character != augmented_character
-    )
-    if len(changed_positions) != 1:
-        return False
-    position = changed_positions[0]
-    source_character = source_input[position]
-    augmented_character = augmented_input[position]
+def _is_disruptive_punctuation_noise(source_input: str, augmented_input: str) -> bool:
+    source_index = 0
+    inserted: list[str] = []
+    for character in augmented_input:
+        if source_index < len(source_input) and character == source_input[source_index]:
+            source_index += 1
+        elif character in {"!", "."} or character.isspace():
+            inserted.append(character)
+        else:
+            return False
     return (
-        source_character.lower() == augmented_character.lower()
-        and source_character.upper() == augmented_character.upper()
+        source_index == len(source_input)
+        and len(inserted) >= 10
+        and "!" in inserted
+        and "." in inserted
+        and "\n" in inserted
+        and " " in inserted
     )
 
 
-def _is_single_punctuation_insertion(source_input: str, augmented_input: str) -> bool:
-    if len(augmented_input) != len(source_input) + 1:
-        return False
-    return any(
-        augmented_input[index] in ",.!?;:"
-        and f"{augmented_input[:index]}{augmented_input[index + 1 :]}" == source_input
-        for index in range(len(augmented_input))
+def _immediate_phrase_repetition_count(text: str) -> int:
+    words = tuple(word.casefold() for word in re.findall(r"\w+", text, flags=re.UNICODE))
+    return sum(
+        words[index : index + phrase_length]
+        == words[index + phrase_length : index + (2 * phrase_length)]
+        for phrase_length in (2, 3)
+        for index in range(len(words) - (2 * phrase_length) + 1)
     )
-
-
-def _add_word_repetition(
-    record: InteractionRecord,
-    frame: SemanticFrame,
-    operator: DatasetAugmentationOperator,
-) -> RenderedUserInput:
-    seed = int.from_bytes(
-        hashlib.sha256(f"{record.id}\0{operator.id}\0{operator.version}".encode()).digest()[:4],
-        "big",
-    )
-    protected_words = _protected_factor_words(frame)
-    eligible_words = tuple(
-        match
-        for match in re.finditer(r"[A-Za-z]+", record.raw_input)
-        if len(match.group()) >= 3 and match.group().casefold() not in protected_words
-    )
-    if not eligible_words:
-        rendered_text = record.raw_input
-    else:
-        match = eligible_words[seed % len(eligible_words)]
-        repeated_word = match.group()
-        if repeated_word[:1].isupper() and repeated_word[1:].islower():
-            repeated_word = repeated_word.lower()
-        rendered_text = (
-            f"{record.raw_input[: match.end()]} {repeated_word}{record.raw_input[match.end() :]}"
-        )
-    return RenderedUserInput(
-        text=rendered_text,
-        metadata={
-            "renderer": "deterministic",
-            "algorithm": "protected_immediate_word_repetition",
-            "seed": seed,
-        },
-    )
-
-
-def _protected_factor_words(frame: SemanticFrame) -> set[str]:
-    protected_words: set[str] = set()
-    for factor in frame.factors:
-        if not isinstance(factor.value, str):
-            continue
-        value_words = {word.casefold() for word in re.findall(r"[A-Za-z]+", factor.value)}
-        for evidence in factor.evidence:
-            if evidence.source == "input" and evidence.text_quote is not None:
-                evidence_words = {
-                    word.casefold() for word in re.findall(r"[A-Za-z]+", evidence.text_quote)
-                }
-                protected_words.update(value_words & evidence_words)
-    return protected_words
 
 
 def _ambiguous_node_reason(frame: SemanticFrame) -> str | None:
@@ -2364,10 +2401,6 @@ def _version_tuple(version: str) -> tuple[int, int, int]:
 
 def _text_key(text: str) -> str:
     return " ".join(text.split()).casefold()
-
-
-def _word_key(text: str) -> tuple[str, ...]:
-    return tuple(word.casefold() for word in re.findall(r"\w+", text, flags=re.UNICODE))
 
 
 def _json_key(value: Any) -> str:

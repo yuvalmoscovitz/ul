@@ -321,7 +321,10 @@ class _DeterministicRepetitionPipeline:
         allow_temporary_value: bool = False,
     ) -> RenderedUserInput:
         del raw_input, instruction, allow_temporary_value
-        raise AssertionError("word repetition uses the deterministic renderer")
+        return RenderedUserInput(
+            text=REPEATED_PAYMENT_INPUT,
+            metadata={"model": "test/repetition-renderer"},
+        )
 
     async def deconstruct(
         self,

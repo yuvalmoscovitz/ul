@@ -86,7 +86,7 @@ def test_execution_reuses_complete_augmentation_input_without_regeneration(
     settings = _settings()
     generation_context = augmentation_ledger_module.create_dataset_augmentation_generation_context(
         selected_records=(evaluation_result.source,),
-        operators=(("input.surface.rephrase", "1.0.0"),),
+        operators=(("input.surface.rephrase", "1.1.0"),),
         semantic_settings=(
             augmentation_ledger_module.dataset_augmentation_ledger_semantic_settings(settings)
         ),
@@ -325,8 +325,10 @@ class _MaterialVarianceSemanticModel(_LocalEvaluationSemanticModel):
         *,
         allow_temporary_value: bool = False,
     ) -> RenderedUserInput:
-        del raw_input, instruction, allow_temporary_value
-        return RenderedUserInput(text="Please return status for ticket 42.")
+        del instruction, allow_temporary_value
+        if raw_input == "Create record 42.":
+            return RenderedUserInput(text="make record number 42")
+        return RenderedUserInput(text="check ticket 42 status")
 
     async def deconstruct(
         self,
@@ -783,7 +785,7 @@ def test_public_cli_persists_and_applies_automatic_materiality(
     )
     (tmp_path / "customer_agent.py").write_text(
         "def run(value):\n"
-        "    ticket = 43 if value.startswith('Please') else 42\n"
+        "    ticket = 43 if value.startswith('check') else 42\n"
         "    return {'action': 'lookup', 'ticket': ticket}\n",
         encoding="utf-8",
     )
@@ -875,7 +877,7 @@ def test_public_cli_does_not_let_judge_suppress_removed_committed_action(
     )
     (tmp_path / "customer_agent.py").write_text(
         "def run(value):\n"
-        "    actions = [] if value.startswith('Please') else "
+        "    actions = [] if value.startswith('make') else "
         "[{'action': 'CREATE_RECORD', 'id': 42}]\n"
         "    return {'answer': [], 'actions': actions}\n",
         encoding="utf-8",
@@ -2311,7 +2313,7 @@ def test_http_target_contract_runs_authenticated_loopback_and_resumes(
             "--confirm-target",
             resolved_target.confirmation_sha256,
             "--operator",
-            "input.surface.case_variation",
+            "input.surface.typing_noise",
             "--repetitions",
             "2",
             "--output",

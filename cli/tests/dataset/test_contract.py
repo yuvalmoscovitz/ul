@@ -77,17 +77,16 @@ def test_legacy_operator_list_delegates_to_catalog_and_counts_deterministic_corr
     )
     assert listed_operator_ids == (
         "input.intent.self_correction@1.1.0:",
-        "input.style.terse@1.0.0:",
-        "input.style.verbose@1.0.0:",
-        "input.surface.case_variation@1.0.0:",
-        "input.surface.disfluency_repeat@1.0.0:",
-        "input.surface.fragmented_syntax@1.0.0:",
-        "input.surface.grammar_error@1.0.0:",
-        "input.surface.punctuation_noise@1.0.0:",
-        "input.surface.rephrase@1.0.0:",
-        "input.surface.typing_noise@1.0.0:",
-        "input.tone.angry@1.0.0:",
-        "input.tone.argumentative@1.0.0:",
+        "input.style.terse@1.2.0:",
+        "input.style.verbose@1.2.0:",
+        "input.surface.disfluency_repeat@1.2.0:",
+        "input.surface.fragmented_syntax@1.2.0:",
+        "input.surface.grammar_error@1.2.0:",
+        "input.surface.punctuation_noise@1.1.0:",
+        "input.surface.rephrase@1.1.0:",
+        "input.surface.typing_noise@1.1.0:",
+        "input.tone.angry@1.2.0:",
+        "input.tone.argumentative@1.2.0:",
     )
 
     dataset = tmp_path / "interactions.jsonl"
@@ -117,13 +116,13 @@ def test_legacy_operator_list_delegates_to_catalog_and_counts_deterministic_corr
                 "evaluate",
                 str(dataset),
                 "--operator",
-                f"{tone_operator}@1.0.0",
+                f"{tone_operator}@1.2.0",
                 "--dry-run",
             ],
         )
         assert tone_dry_run.exit_code == 0, tone_dry_run.output
-        assert f"Operators: {tone_operator}@1.0.0" in tone_dry_run.output
-        assert "Potential semantic model calls: up to 16" in tone_dry_run.output
+        assert f"Operators: {tone_operator}@1.2.0" in tone_dry_run.output
+        assert "Potential semantic model calls: up to 17" in tone_dry_run.output
         assert "Potential environment API calls: up to 6" in tone_dry_run.output
 
     wrong_version = runner.invoke(

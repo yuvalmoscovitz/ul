@@ -1,6 +1,6 @@
 +++
 name = "augmentation.input.surface.punctuation_noise"
-description = "Introduces one harmless punctuation error."
+description = "Introduces disruptive punctuation or spacing noise."
 author = "UL"
 +++
-Add exactly one harmless punctuation error without changing any wording, case, values, identifiers, relationships, constraints, or request order.
+Add a long run of punctuation or many line breaks. Change no words, values, identifiers, or order.

@@ -34,14 +34,13 @@ from ul_core.prompts import prompt_provenance
 pytestmark = pytest.mark.asyncio
 _TEST_API_KEY = SecretStr("test-openrouter-key")
 _TEST_CUSTOMER_API_KEY = SecretStr("test-customer-key")
-_LEGACY_LLM_AUGMENTATIONS_WITHOUT_DEVELOPMENT_VALIDATION = {
+_EXPECTED_DEVELOPMENT_VALIDATED_LLM_AUGMENTATIONS = {
     "input.surface.rephrase",
+    "input.surface.grammar_error",
     "input.surface.fragmented_syntax",
+    "input.surface.disfluency_repeat",
     "input.style.terse",
     "input.style.verbose",
-}
-_EXPECTED_DEVELOPMENT_VALIDATED_LLM_AUGMENTATIONS = {
-    "input.surface.grammar_error",
     "input.tone.angry",
     "input.tone.argumentative",
 }
@@ -125,11 +124,8 @@ def synthetic_live_interaction() -> InteractionRecord:
         id="synthetic-live-check",
         raw_input="Could you please add 3 blue widgets with SKU TEST-42 to cart CART-7?",
         raw_observed_output={
-            "action": "cart_updated",
-            "sku": "TEST-42",
-            "quantity": 3,
-            "color": "blue",
-            "cart_id": "CART-7",
+            "updated": True,
+            "items_added": 3,
         },
     )
 
@@ -257,7 +253,7 @@ async def test_evaluator_preflight_proves_required_capabilities_and_records_poli
     ]
     assert [request.get("reasoning") for request in requests[:4]] == [
         {"effort": "minimal"},
-        {"effort": "none"},
+        {"effort": "minimal"},
         {"effort": "low"},
         None,
     ]
@@ -1129,7 +1125,7 @@ async def test_render_keeps_caller_instruction_out_of_the_system_prompt() -> Non
     def handler(request: httpx.Request) -> httpx.Response:
         body = json.loads(request.content)
         assert body["model"] == "test/default-model"
-        assert body["reasoning"] == {"effort": "none"}
+        assert body["reasoning"] == {"effort": "minimal"}
         assert body["max_tokens"] == 512
         assert body["temperature"] == 0
         assert "top_p" not in body
@@ -1143,6 +1139,7 @@ async def test_render_keeps_caller_instruction_out_of_the_system_prompt() -> Non
         )
         assert "real person" in body["messages"][0]["content"]
         assert "not polished benchmark text" in body["messages"][0]["content"]
+        assert '{"rendered_input":"<rewritten user input>"}' in body["messages"][0]["content"]
         assert "No temporary or alternate value may be introduced" in body["messages"][0]["content"]
         assert (
             "Trusted structured self-correction mode is enabled"
@@ -1150,6 +1147,12 @@ async def test_render_keeps_caller_instruction_out_of_the_system_prompt() -> Non
         )
         assert body["response_format"]["json_schema"]["name"] == "rendered_input"
         assert body["response_format"]["json_schema"]["strict"] is True
+        assert (
+            body["response_format"]["json_schema"]["schema"]["properties"]["rendered_input"][
+                "description"
+            ]
+            == "The rewritten user input and nothing else."
+        )
         assert "tools" not in body
         supplied = json.loads(body["messages"][1]["content"])
         assert supplied == {
@@ -1196,7 +1199,7 @@ async def test_render_keeps_caller_instruction_out_of_the_system_prompt() -> Non
             & 0x7FFF_FFFF,
             "max_tokens": 512,
         },
-        "semantic_reasoning": {"mode": "required", "effort": "none"},
+        "semantic_reasoning": {"mode": "required", "effort": "minimal"},
     }
     assert not client.is_closed
     await client.aclose()
@@ -1431,6 +1434,8 @@ async def test_verify_equivalence_compares_raw_inputs_with_the_configured_model(
         assert body["seed"] == 0
         assert body["response_format"]["json_schema"]["name"] == ("semantic_equivalence_assessment")
         assert "same complete task meaning" in body["messages"][0]["content"]
+        assert "Added urgency, timing, deadlines, reasons" in body["messages"][0]["content"]
+        assert "A trusted tone or verbosity edit never excuses it" in body["messages"][0]["content"]
         assert "No caller-verified surface edit is declared." in body["messages"][0]["content"]
         assert json.loads(body["messages"][1]["content"]) == {
             "source_input": "Pay invoice AC-100 for $125 USD.",
@@ -1459,37 +1464,6 @@ async def test_verify_equivalence_compares_raw_inputs_with_the_configured_model(
     assert assessment.verifier_version == "semantic-equivalence-verifier/2.0.0"
     assert assessment.metadata["semantic_generation_id"] == "generation-1"
     assert assessment.metadata["semantic_equivalence_policy"] == {"allowed_surface_change": "none"}
-    await client.aclose()
-
-
-async def test_verify_equivalence_receives_trusted_case_change_policy() -> None:
-    def handler(request: httpx.Request) -> httpx.Response:
-        body = json.loads(request.content)
-        system_prompt = body["messages"][0]["content"]
-        assert "exactly one Unicode letter changed case" in system_prompt
-        assert "outside all evidence-grounded semantic value spans" in system_prompt
-        return completion(
-            json.dumps(
-                {
-                    "verdict": "equivalent",
-                    "explanation": "Only caller-verified capitalization changed.",
-                    "deltas": [],
-                }
-            )
-        )
-
-    client = mock_client(handler)
-    async with create_semantic_model_deconstructor(settings(), client=client) as deconstructor:
-        assessment = await deconstructor.verify(
-            "Great news - mark opportunity 006001 Closed Won.",
-            "great news - mark opportunity 006001 Closed Won.",
-            allowed_surface_change="single_unprotected_case_change",
-        )
-
-    assert assessment.verdict == "equivalent"
-    assert assessment.metadata["semantic_equivalence_policy"] == {
-        "allowed_surface_change": "single_unprotected_case_change"
-    }
     await client.aclose()
 
 
@@ -2930,11 +2904,7 @@ async def test_llm_augmentation_development_validation_coverage_is_explicit() ->
         if operator.generation_mechanism == "llm"
     }
 
-    assert llm_operator_ids > _LEGACY_LLM_AUGMENTATIONS_WITHOUT_DEVELOPMENT_VALIDATION
-    assert (
-        llm_operator_ids - _LEGACY_LLM_AUGMENTATIONS_WITHOUT_DEVELOPMENT_VALIDATION
-        == _EXPECTED_DEVELOPMENT_VALIDATED_LLM_AUGMENTATIONS
-    )
+    assert llm_operator_ids == _EXPECTED_DEVELOPMENT_VALIDATED_LLM_AUGMENTATIONS
 
 
 async def test_required_live_llm_validation_fails_closed() -> None:
@@ -2961,24 +2931,24 @@ async def test_live_llm_augmentations_pass_existing_validity_check(
         operator
         for operator in builtin_dataset_augmentation_operators()
         if operator.generation_mechanism == "llm"
-        and operator.id not in _LEGACY_LLM_AUGMENTATIONS_WITHOUT_DEVELOPMENT_VALIDATION
     )
     assert {operator.id for operator in operators} == (
         _EXPECTED_DEVELOPMENT_VALIDATED_LLM_AUGMENTATIONS
     )
     candidates = []
+    interaction = synthetic_live_interaction()
     async with create_semantic_model_deconstructor(configured_settings) as semantic_model:
         engine = DatasetAugmentationEngine(semantic_model, semantic_model, semantic_model)
         for operator in operators:
             result = await engine.augment(
-                (synthetic_live_interaction(),),
+                (interaction,),
                 max_records=1,
                 operator_ids=(operator.id,),
             )
             assert result.skips == (), operator.id
             assert len(result.candidates) == 1, operator.id
             candidate = result.candidates[0]
-            assert candidate.augmented_input != synthetic_live_interaction().raw_input, operator.id
+            assert candidate.augmented_input != interaction.raw_input, operator.id
             communication_kinds = (
                 tuple(act.kind for act in candidate.reparsed_input_frame.communication_acts)
                 if candidate.reparsed_input_frame is not None

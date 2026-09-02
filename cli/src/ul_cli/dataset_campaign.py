@@ -153,6 +153,7 @@ def create_dataset_campaign_plan(
         for reference in selected_operator_ids
     )
     generation_calls = materialization_record_count * semantic_generation_operator_count
+    retry_calls = generation_calls
     tone_safety_calls = materialization_record_count * tone_safety_operator_count
     source_deconstruction_calls = materialization_record_count
     candidate_deconstruction_calls = materialization_record_count * operator_count
@@ -168,7 +169,9 @@ def create_dataset_campaign_plan(
     )
     preflight_profiles = plan_evaluator_preflight_profiles(settings) if requires_preflight else ()
     preflight_calls = len(preflight_profiles)
-    total_semantic_calls = evaluator_calls + materiality_calls + generation_calls + preflight_calls
+    total_semantic_calls = (
+        evaluator_calls + materiality_calls + generation_calls + retry_calls + preflight_calls
+    )
     maximum_wall_time_seconds = (
         max(1, execution_calls) * target_config.trial_timeout_seconds
         + total_semantic_calls * settings.timeout_seconds
@@ -181,6 +184,7 @@ def create_dataset_campaign_plan(
         sum(profile.max_completion_tokens for profile in preflight_profiles)
         + deconstruction_calls * settings.max_output_tokens
         + generation_calls * settings.max_render_tokens
+        + retry_calls * settings.max_render_tokens
         + equivalence_calls * min(settings.max_output_tokens, 1_024)
         + tone_safety_calls * min(settings.max_output_tokens, 1_024)
         + materiality_calls * 512
@@ -236,7 +240,7 @@ def create_dataset_campaign_plan(
             variation=variation_calls,
             repetitions=repetitions,
             repetition_executions=execution_calls,
-            retries=0,
+            retries=retry_calls,
             preflight=preflight_calls,
             evaluators=evaluator_calls,
             materiality=materiality_calls,

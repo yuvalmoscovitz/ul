@@ -506,10 +506,12 @@ class SemanticDelta(_StrictULModel):
 
 SemanticAllowedSurfaceChange = Literal[
     "none",
-    "single_unprotected_case_change",
     "single_unprotected_punctuation_insertion",
+    "unprotected_punctuation_noise",
     "moderate_angry_tone",
     "moderate_argumentative_tone",
+    "hostile_angry_tone",
+    "hostile_argumentative_tone",
 ]
 
 

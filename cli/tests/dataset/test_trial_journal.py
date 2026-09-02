@@ -264,13 +264,13 @@ def test_repeated_recovery_of_ten_by_ten_by_three_plan_never_duplicates_mutation
     operator_ids = (
         "input.surface.rephrase",
         "input.surface.typing_noise",
-        "input.surface.case_variation",
         "input.surface.punctuation_noise",
         "input.surface.grammar_error",
         "input.surface.disfluency_repeat",
         "input.surface.fragmented_syntax",
         "input.style.terse",
         "input.style.verbose",
+        "input.tone.angry",
         "input.intent.self_correction",
     )
     target_config = cast(DatasetEvidenceRunContext, _run_context((records[0],))).target.config

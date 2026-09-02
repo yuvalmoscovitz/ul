@@ -55,7 +55,7 @@ def _llm_client_identity(model: str) -> LLMClientIdentity:
                 model="test/render-model",
                 max_output_tokens=512,
                 reasoning_mode="required",
-                reasoning_effort="none",
+                reasoning_effort="minimal",
             ),
             LLMRoleConfig(
                 role="equivalence",
@@ -109,7 +109,7 @@ def _augmentation(source: InteractionRecord) -> DatasetAugmentationResult:
     candidate = DatasetAugmentationCandidate(
         source_interaction_id=source.id,
         operator_id="input.surface.rephrase",
-        operator_version="1.0.0",
+        operator_version="1.1.0",
         projection=create_dataset_augmentation_projection(source),
         changed_paths=(source.augmentation_path,),
         augmented_input="Please transfer 100 to Alice.",
@@ -121,7 +121,7 @@ def _augmentation(source: InteractionRecord) -> DatasetAugmentationResult:
         passed=True,
     )
     return DatasetAugmentationResult(
-        operator_references=({"id": "input.surface.rephrase", "version": "1.0.0"},),
+        operator_references=({"id": "input.surface.rephrase", "version": "1.1.0"},),
         source_records=(source,),
         source_frames=(source_frame,),
         candidates=(candidate,),
@@ -137,7 +137,7 @@ def _context(
 ):
     return create_dataset_augmentation_generation_context(
         selected_records=selected_records,
-        operators=(("input.surface.rephrase", "1.0.0"),),
+        operators=(("input.surface.rephrase", "1.1.0"),),
         semantic_settings=DatasetAugmentationLedgerSemanticSettings(
             llm_client=_llm_client_identity(model),
             max_input_chars=50_000,

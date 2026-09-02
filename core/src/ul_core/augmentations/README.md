@@ -46,15 +46,14 @@ Runtime: `sdk/src/ul/augmentations/dataset.py`
 | ID | Controlled change | Expected relation |
 |---|---|---|
 | `input.surface.rephrase` | Rephrase while preserving the requested behavior. | The wording may change. Task meaning, authorization, consequential actions, and business state must stay the same. |
-| `input.surface.typing_noise` | Add plausible typing noise. | The wording may change. Task meaning, authorization, consequential actions, and business state must stay the same. |
-| `input.surface.case_variation` | Add one harmless casing error. | The wording may change. Task meaning, authorization, consequential actions, and business state must stay the same. |
-| `input.surface.punctuation_noise` | Add one harmless punctuation error. | The wording may change. Task meaning, authorization, consequential actions, and business state must stay the same. |
-| `input.surface.grammar_error` | Add one harmless grammatical error. | The wording may change. Task meaning, authorization, consequential actions, and business state must stay the same. |
+| `input.surface.typing_noise` | Add four or five typing errors. | The wording may change. Task meaning, authorization, consequential actions, and business state must stay the same. |
+| `input.surface.punctuation_noise` | Add disruptive human punctuation or spacing noise. | The wording may change. Task meaning, authorization, consequential actions, and business state must stay the same. |
+| `input.surface.grammar_error` | Add two to five natural writing mistakes. | The wording may change. Task meaning, authorization, consequential actions, and business state must stay the same. |
 | `input.surface.fragmented_syntax` | Use plausible fragmented syntax. | The wording may change. Task meaning, authorization, consequential actions, and business state must stay the same. |
-| `input.surface.disfluency_repeat` | Repeat a word as a natural disfluency. | The wording may change. Task meaning, authorization, consequential actions, and business state must stay the same. |
+| `input.surface.disfluency_repeat` | Repeat a short phrase as a natural disfluency. | The wording may change. Task meaning, authorization, consequential actions, and business state must stay the same. |
 | `input.style.terse` | Express the same request tersely. | The wording may change. Task meaning, authorization, consequential actions, and business state must stay the same. |
 | `input.style.verbose` | Express the same request verbosely. | The wording may change. Task meaning, authorization, consequential actions, and business state must stay the same. |
-| `input.tone.angry` | Express the same request with moderate anger. | The wording may change. Task meaning, authorization, consequential actions, and business state must stay the same. |
+| `input.tone.angry` | Express the same request with hostile anger. | The wording may change. Task meaning, authorization, consequential actions, and business state must stay the same. |
 | `input.tone.argumentative` | Express the same request as an argumentative challenge. | The wording may change. Task meaning, authorization, consequential actions, and business state must stay the same. |
 | `input.intent.self_correction` | Correct one request value within the same input. | The corrected value must control the response and business outcome. |
 
@@ -122,6 +121,9 @@ uv run pytest -q \
   sdk/tests/test_deconstruction.py::test_live_llm_augmentations_pass_existing_validity_check \
   --require-live-llm
 ```
+
+This validity check asks only whether the complete task meaning was preserved. It does not grade
+whether the generated text successfully matches the requested style.
 
 The non-live coverage contract fails when a new LLM operator is not included in this development
 gate. This development check is separate from release qualification against a live customer agent.

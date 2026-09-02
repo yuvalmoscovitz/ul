@@ -200,7 +200,7 @@ def test_list_json_is_stable_sorted_and_complete() -> None:
     assert result.exit_code == 0
     payload = json.loads(result.output)
     assert payload["schema_version"] == "1.0.0"
-    assert len(payload["augmentations"]) == 22
+    assert len(payload["augmentations"]) == 21
     references = [(item["ref"]["id"], item["ref"]["version"]) for item in payload["augmentations"]]
     assert references == sorted(references)
     assert all(isinstance(item["cli_available"], bool) for item in payload["augmentations"])
@@ -226,8 +226,9 @@ def test_guide_and_surface_filter_make_the_library_navigable() -> None:
     assert "World and business state" in guide.output
     assert "Tool and execution" in guide.output
     assert "Trust, policy, and authorization" in guide.output
-    assert guide.output.count("@1.0.0 [implemented; not_qualified]") == 21
+    assert guide.output.count("@1.0.0 [implemented; not_qualified]") == 10
     assert "input.intent.self_correction@1.1.0 [implemented; not_qualified]" in guide.output
+    assert "input.surface.disfluency_repeat@1.2.0 [implemented; not_qualified]" in guide.output
 
     filtered = runner.invoke(
         app,
@@ -309,7 +310,7 @@ def test_show_reports_dataset_execution_requirements_without_requiring_invariant
     result = CliRunner().invoke(app, ["augmentations", "show", "input.style.terse"])
 
     assert result.exit_code == 0
-    assert "ul dataset evaluate --operator input.style.terse@1.0.0" in result.output
+    assert "ul dataset evaluate --operator input.style.terse@1.2.0" in result.output
     assert "test environment" in result.output
     assert "committed-state observation" in result.output
     assert "semantic model" in result.output
@@ -363,7 +364,7 @@ def test_show_json_and_unknown_reference_contract() -> None:
     assert payload["schema_version"] == "1.0.0"
     assert payload["augmentation"]["ref"] == {
         "id": "input.surface.rephrase",
-        "version": "1.0.0",
+        "version": "1.1.0",
     }
     assert payload["augmentation"]["bindings"][0]["projection"] == {
         "reads": ["structured_input", "conversation"],
@@ -397,13 +398,13 @@ def test_plan_json_is_stable_complete_and_project_aware(
     payload = json.loads(first.output)
     assert payload["schema_version"] == "1.0.0"
     assert payload["project"] == {"status": "ready", "reason": None}
-    assert payload["summary"] == {"ready": 11, "blocked": 3, "manual": 8}
+    assert payload["summary"] == {"ready": 10, "blocked": 3, "manual": 8}
     assert payload["inspection"] == {
         "model_calls": 0,
         "environment_calls": 0,
         "network_requests": 0,
     }
-    assert len(payload["augmentations"]) == 22
+    assert len(payload["augmentations"]) == 21
     references = [(item["ref"]["id"], item["ref"]["version"]) for item in payload["augmentations"]]
     assert references == sorted(references)
     assert {item["status"] for item in payload["augmentations"]} <= {
@@ -415,7 +416,7 @@ def test_plan_json_is_stable_complete_and_project_aware(
 
     rephrase = _planned_augmentation(payload, "input.surface.rephrase")
     assert rephrase["status"] == "ready"
-    assert rephrase["command"] == "ul run --operator input.surface.rephrase@1.0.0"
+    assert rephrase["command"] == "ul run --operator input.surface.rephrase@1.1.0"
     assert rephrase["projection"] == {
         "reads": ["structured_input", "conversation"],
         "writes": ["structured_input", "conversation"],
@@ -468,7 +469,7 @@ def test_plan_reads_declared_capabilities_without_constructing_external_clients(
 
     assert result.exit_code == 0, result.output
     payload = json.loads(result.output)
-    assert payload["summary"] == {"ready": 11, "blocked": 0, "manual": 11}
+    assert payload["summary"] == {"ready": 10, "blocked": 0, "manual": 11}
     timeout = _planned_augmentation(payload, "environment.tool.timeout_after_commit")
     assert timeout["status"] == "manual"
     assert timeout["command"] == (
@@ -531,8 +532,8 @@ def test_plan_without_a_project_still_classifies_every_catalog_item(
         "status": "missing",
         "reason": "No UL project found; run 'ul init' first.",
     }
-    assert payload["summary"] == {"ready": 0, "blocked": 15, "manual": 7}
-    assert len(payload["augmentations"]) == 22
+    assert payload["summary"] == {"ready": 0, "blocked": 14, "manual": 7}
+    assert len(payload["augmentations"]) == 21
     rephrase = _planned_augmentation(payload, "input.surface.rephrase")
     assert rephrase["status"] == "blocked"
     assert _reason_codes(rephrase) == {"project_not_configured"}
@@ -550,9 +551,9 @@ def test_plan_human_output_is_actionable_and_attests_zero_calls(
     result = runner.invoke(app, ["augmentations", "plan"], terminal_width=80)
 
     assert result.exit_code == 0, result.output
-    assert "Augmentation readiness: 11 ready, 3 blocked, 8 manual" in result.output
-    assert "READY input.surface.rephrase@1.0.0" in result.output
-    assert "Command: ul run --operator input.surface.rephrase@1.0.0" in result.output
+    assert "Augmentation readiness: 10 ready, 3 blocked, 8 manual" in result.output
+    assert "READY input.surface.rephrase@1.1.0" in result.output
+    assert "Command: ul run --operator input.surface.rephrase@1.1.0" in result.output
     assert "BLOCKED environment.tool.timeout_after_commit@1.0.0" in result.output
     assert (
         "Inspection only: 0 model calls, 0 environment calls, 0 network requests." in result.output
@@ -612,7 +613,7 @@ def test_project_augmentation_configuration_persists_and_drives_plans_and_dry_ru
         "input.surface.rephrase"
     ]
     assert added.exit_code == 0, added.output
-    assert "Enabled: input.surface.typing_noise@1.0.0" in added.output
+    assert "Enabled: input.surface.typing_noise@1.1.0" in added.output
     assert "Next steps:" in added.output
     assert "UL_LIVE=true" in added.output
     assert json.loads(config_path.read_text(encoding="utf-8"))["operators"] == [
@@ -627,7 +628,7 @@ def test_project_augmentation_configuration_persists_and_drives_plans_and_dry_ru
     reset = runner.invoke(app, ["augmentations", "reset"])
 
     assert removed.exit_code == 0, removed.output
-    assert "Disabled: input.surface.rephrase@1.0.0" in removed.output
+    assert "Disabled: input.surface.rephrase@1.1.0" in removed.output
     assert reset.exit_code == 0, reset.output
     assert "Restored recommended defaults" in reset.output
     assert json.loads(config_path.read_text(encoding="utf-8"))["operators"] == [

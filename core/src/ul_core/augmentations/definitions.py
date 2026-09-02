@@ -305,38 +305,44 @@ def _projection(
 
 
 _BUILTIN_AUGMENTATION_SPECS = (
-    _dataset_spec("input.surface.rephrase", "Rephrase while preserving the requested behavior."),
-    _dataset_spec("input.surface.typing_noise", "Add plausible typing noise."),
     _dataset_spec(
-        "input.surface.case_variation",
-        "Add one harmless casing error.",
-        applicability_profile="conditional",
-        applicability_rule=(
-            "Applies only when the input contains an unprotected Unicode letter with a "
-            "single-code-point uppercase or lowercase mapping."
-        ),
+        "input.surface.rephrase",
+        "Rephrase while preserving the requested behavior.",
+        version="1.1.0",
     ),
+    _dataset_spec("input.surface.typing_noise", "Add four or five typing errors.", version="1.1.0"),
     _dataset_spec(
         "input.surface.punctuation_noise",
-        "Add one harmless punctuation error.",
+        "Add disruptive human punctuation or spacing noise.",
+        version="1.1.0",
         applicability_profile="conditional",
         applicability_rule=(
             "Applies only when punctuation can be inserted outside a protected semantic value."
         ),
     ),
-    _dataset_spec("input.surface.grammar_error", "Add one harmless grammatical error."),
-    _dataset_spec("input.surface.fragmented_syntax", "Use plausible fragmented syntax."),
-    _dataset_spec("input.surface.disfluency_repeat", "Repeat a word as a natural disfluency."),
-    _dataset_spec("input.style.terse", "Express the same request tersely."),
-    _dataset_spec("input.style.verbose", "Express the same request verbosely."),
+    _dataset_spec(
+        "input.surface.grammar_error", "Add two to five natural writing mistakes.", version="1.2.0"
+    ),
+    _dataset_spec(
+        "input.surface.fragmented_syntax", "Use plausible fragmented syntax.", version="1.2.0"
+    ),
+    _dataset_spec(
+        "input.surface.disfluency_repeat",
+        "Repeat a short phrase as a natural disfluency.",
+        version="1.2.0",
+    ),
+    _dataset_spec("input.style.terse", "Express the same request tersely.", version="1.2.0"),
+    _dataset_spec("input.style.verbose", "Express the same request verbosely.", version="1.2.0"),
     _dataset_spec(
         "input.tone.angry",
-        "Express the same request with moderate anger.",
+        "Express the same request with hostile anger.",
+        version="1.2.0",
         state_observation=False,
     ),
     _dataset_spec(
         "input.tone.argumentative",
         "Express the same request as an argumentative challenge.",
+        version="1.2.0",
         state_observation=False,
     ),
     _dataset_spec(

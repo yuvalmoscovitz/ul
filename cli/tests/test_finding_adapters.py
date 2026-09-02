@@ -194,7 +194,7 @@ def _dataset_result() -> DatasetEvaluationResult:
     candidate = DatasetAugmentationCandidate(
         source_interaction_id=source.id,
         operator_id="input.surface.rephrase",
-        operator_version="1.0.0",
+        operator_version="1.1.0",
         projection=create_dataset_augmentation_projection(source),
         changed_paths=(source.augmentation_path,),
         augmented_input=f"Please pay account {_PRIVATE_SECRET}.",
@@ -259,7 +259,7 @@ def _dataset_result() -> DatasetEvaluationResult:
             operator_references=(
                 DatasetAugmentationOperatorReference(
                     id=candidate.operator_id,
-                    version="1.0.0",
+                    version="1.1.0",
                 ),
             ),
             source_records=(source,),

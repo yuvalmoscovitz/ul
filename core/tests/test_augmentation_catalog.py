@@ -17,7 +17,7 @@ def test_builtin_catalog_is_unique_sorted_and_immutable() -> None:
     catalog = builtin_augmentation_catalog()
     references = tuple((item.ref.id, item.ref.version) for item in catalog.list())
 
-    assert len(references) == 22
+    assert len(references) == 21
     assert references == tuple(sorted(references))
     assert len(references) == len(set(references))
     with pytest.raises(ValidationError, match="frozen"):
@@ -90,14 +90,11 @@ def test_tone_augmentations_require_only_response_observation() -> None:
 def test_dataset_applicability_contracts_are_discoverable_before_execution() -> None:
     catalog = builtin_augmentation_catalog()
     broad = catalog.get("input.surface.grammar_error")
-    case_variation = catalog.get("input.surface.case_variation")
     punctuation = catalog.get("input.surface.punctuation_noise")
     conditional = catalog.get("input.intent.self_correction")
 
     assert broad.applicability_profile == "broad"
     assert "nonempty user input" in broad.applicability_rule
-    assert case_variation.applicability_profile == "conditional"
-    assert "unprotected Unicode letter" in case_variation.applicability_rule
     assert punctuation.applicability_profile == "conditional"
     assert "protected semantic value" in punctuation.applicability_rule
     assert conditional.applicability_profile == "conditional"
@@ -174,7 +171,7 @@ def test_binding_rejects_owner_mode_mismatch_and_unsafe_environment_fault() -> N
 def test_catalog_resolves_latest_and_rejects_unknown_versions() -> None:
     catalog = builtin_augmentation_catalog()
 
-    assert catalog.get("input.surface.rephrase").ref.version == "1.0.0"
+    assert catalog.get("input.surface.rephrase").ref.version == "1.1.0"
     with pytest.raises(KeyError):
         catalog.get("input.surface.rephrase", "2.0.0")
 

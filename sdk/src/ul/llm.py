@@ -328,7 +328,7 @@ def llm_client_config_from_dataset_settings(settings: DatasetLLMSettings) -> LLM
                     settings.render_reasoning if supports_reasoning_options else "omitted"
                 ),
                 reasoning_effort=(
-                    "none"
+                    "minimal"
                     if supports_reasoning_options and settings.render_reasoning == "required"
                     else None
                 ),

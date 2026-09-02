@@ -134,6 +134,7 @@ def _evaluation_result(
     candidate = DatasetAugmentationCandidate(
         source_interaction_id=identifier,
         operator_id="input.surface.rephrase",
+        operator_version="1.1.0",
         projection=create_dataset_augmentation_projection(source),
         changed_paths=(source.augmentation_path,),
         augmented_input="Please transfer 100 to Alice.",
@@ -201,7 +202,9 @@ def _evaluation_result(
     return DatasetEvaluationResult(
         source=source,
         augmentation=DatasetAugmentationResult(
-            operator_references=({"id": candidate.operator_id, "version": "1.0.0"},),
+            operator_references=(
+                {"id": candidate.operator_id, "version": candidate.operator_version},
+            ),
             source_records=(source,),
             source_frames=(source_frame,),
             candidates=(candidate,),
@@ -529,7 +532,7 @@ def _evaluator_preflight() -> EvaluatorModelPreflight:
                     ),
                     "request_options_sha256": request_options_sha256(
                         "test/renderer",
-                        "none",
+                        "minimal",
                         0,
                         render_seed,
                         max_tokens=512,

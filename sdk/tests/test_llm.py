@@ -42,7 +42,7 @@ def _config() -> LLMClientConfig:
                 model="test/render",
                 max_output_tokens=101,
                 reasoning_mode="required",
-                reasoning_effort="none",
+                reasoning_effort="minimal",
             ),
             LLMRoleConfig(
                 role="equivalence",
@@ -102,7 +102,7 @@ async def test_one_client_applies_the_same_deterministic_route_to_every_semantic
     ]
     assert [request.get("reasoning") for request in requests] == [
         {"effort": "minimal"},
-        {"effort": "none"},
+        {"effort": "minimal"},
         {"effort": "low"},
         None,
     ]
