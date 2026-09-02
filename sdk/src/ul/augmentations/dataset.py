@@ -40,6 +40,17 @@ from ul_core.prompts import PromptManager, prompt_provenance
 _PROMPTS = PromptManager.instance()
 _MAX_DECOMPOSED_RELATION_ENDPOINTS = 10_000
 _TONE_SAFETY_KINDS = {"angry", "argumentative"}
+_COMMUNICATION_FORM_KINDS = {
+    "typing_noise",
+    "grammar_error",
+    "fragmented_syntax",
+    "repetition",
+    "terse",
+    "verbose",
+    "frustrated",
+    "angry",
+    "argumentative",
+}
 
 
 @dataclass(frozen=True)
@@ -104,7 +115,6 @@ class DatasetAugmentationOperator(ULModel):
     generation_mechanism: OperatorGenerationMechanism
     allowed_change: AllowedChange
     target_communication_kind: str | None = Field(default=None, min_length=1)
-    target_marker_required: bool = False
     human_review_required: bool = False
 
     @model_validator(mode="after")
@@ -115,8 +125,6 @@ class DatasetAugmentationOperator(ULModel):
         }
         if requires_target != (self.target_communication_kind is not None):
             raise ValueError("target communication kind must match the allowed change")
-        if self.target_marker_required and self.target_communication_kind is None:
-            raise ValueError("required target marker needs a communication kind")
         return self
 
 
@@ -126,7 +134,6 @@ def _builtin_operator(
     generation_mechanism: OperatorGenerationMechanism,
     allowed_change: AllowedChange,
     target_communication_kind: str | None = None,
-    target_marker_required: bool = False,
 ) -> DatasetAugmentationOperator:
     definition = builtin_augmentation_catalog().get(operator_id)
     binding = next(item for item in definition.bindings if item.mode == "dataset_variation")
@@ -139,7 +146,6 @@ def _builtin_operator(
         generation_mechanism=generation_mechanism,
         allowed_change=allowed_change,
         target_communication_kind=target_communication_kind,
-        target_marker_required=target_marker_required,
         human_review_required=binding.requirements.human_review,
     )
 
@@ -167,14 +173,12 @@ _BUILTIN_OPERATORS = (
         generation_mechanism="llm",
         allowed_change="declared_communication_form",
         target_communication_kind="grammar_error",
-        target_marker_required=True,
     ),
     _builtin_operator(
         operator_id="input.surface.fragmented_syntax",
         generation_mechanism="llm",
         allowed_change="declared_communication_form",
         target_communication_kind="fragmented_syntax",
-        target_marker_required=True,
     ),
     _builtin_operator(
         operator_id="input.surface.disfluency_repeat",
@@ -199,21 +203,18 @@ _BUILTIN_OPERATORS = (
         generation_mechanism="llm",
         allowed_change="declared_communication_form",
         target_communication_kind="angry",
-        target_marker_required=True,
     ),
     _builtin_operator(
         operator_id="input.tone.argumentative",
         generation_mechanism="llm",
         allowed_change="declared_communication_form",
         target_communication_kind="argumentative",
-        target_marker_required=True,
     ),
     _builtin_operator(
         operator_id="input.intent.self_correction",
         generation_mechanism="deterministic",
         allowed_change="structured_self_correction",
         target_communication_kind="self_correction",
-        target_marker_required=True,
     ),
 )
 _BUILTIN_OPERATORS_BY_REFERENCE = {
@@ -523,7 +524,10 @@ class DatasetAugmentationEngine:
                         failure_reasons = ["reparsed frame must reference its candidate input"]
                     elif operator.allowed_change == "surface_form_only":
                         failure_reasons = list(
-                            _semantic_difference_reasons(expected_input_frame, reparsed_frame)
+                            _task_meaning_difference_reasons(
+                                expected_input_frame,
+                                reparsed_frame,
+                            )
                         )
                     elif operator.allowed_change == "structured_self_correction":
                         if self_correction_plan is None:
@@ -548,27 +552,27 @@ class DatasetAugmentationEngine:
                         )
                     else:
                         failure_reasons = list(
-                            _declared_communication_form_difference_reasons(
+                            _task_meaning_difference_reasons(
                                 expected_input_frame,
                                 reparsed_frame,
-                                operator.target_communication_kind,
-                                operator.target_marker_required,
                             )
                         )
                     if _has_unresolved_nodes(reparsed_frame):
                         failure_reasons.append(
                             "reparsed frame contains unresolved semantic elements"
                         )
-                    if (
-                        self._equivalence_verifier is not None
-                        and operator.allowed_change != "structured_self_correction"
-                        and not surface_footprint_reasons
-                        and failure_reasons
-                        and all(
-                            reason.endswith("differ from the expected frame")
-                            for reason in failure_reasons
-                        )
-                    ):
+                requires_equivalence_verification = (
+                    operator.allowed_change != "structured_self_correction"
+                    and (
+                        bool(failure_reasons)
+                        or operator.target_communication_kind in _TONE_SAFETY_KINDS
+                    )
+                )
+                if requires_equivalence_verification:
+                    if self._equivalence_verifier is None:
+                        if not failure_reasons:
+                            failure_reasons = ["semantic equivalence verifier is unavailable"]
+                    else:
                         try:
                             equivalence_assessment = await self._equivalence_verifier.verify(
                                 record.raw_input,
@@ -586,30 +590,6 @@ class DatasetAugmentationEngine:
                                 ]
                             else:
                                 failure_reasons = ["semantic equivalence check was uncertain"]
-                    if (
-                        operator.target_communication_kind in _TONE_SAFETY_KINDS
-                        and not surface_footprint_reasons
-                        and not failure_reasons
-                    ):
-                        if self._equivalence_verifier is None:
-                            failure_reasons = ["tone safety verifier is unavailable"]
-                        else:
-                            try:
-                                equivalence_assessment = await self._equivalence_verifier.verify(
-                                    record.raw_input,
-                                    augmented_input,
-                                    allowed_surface_change=_allowed_surface_change(operator.id),
-                                )
-                            except ValueError:
-                                failure_reasons = ["tone safety validation failed"]
-                            else:
-                                if equivalence_assessment.verdict == "different":
-                                    failure_reasons = [
-                                        "tone safety check found a forbidden communication change"
-                                    ]
-                                elif equivalence_assessment.verdict == "uncertain":
-                                    failure_reasons = ["tone safety check was uncertain"]
-                failure_reasons.extend(surface_footprint_reasons)
                 if augmented_input == record.raw_input:
                     failure_reasons.append("renderer did not change the source input")
                 generated_input_key = _text_key(augmented_input)
@@ -792,18 +772,43 @@ def _input_evidence(element: Any) -> tuple[Any, ...]:
     return tuple(evidence for evidence in element.evidence if evidence.source == "input")
 
 
-def _semantic_difference_reasons(
+def _task_meaning_difference_reasons(
     expected: SemanticFrame, reparsed: SemanticFrame
 ) -> tuple[str, ...]:
-    expected_semantics = _canonical_semantics(expected)
-    reparsed_semantics = _canonical_semantics(reparsed)
+    expected_semantics = _canonical_semantics(_without_pure_communication_form(expected))
+    reparsed_semantics = _canonical_semantics(_without_pure_communication_form(reparsed))
     labels = ("factors", "request units", "relations", "communication acts")
     return tuple(
         f"{label} differ from the expected frame"
         for label, expected_part, reparsed_part in zip(
-            labels, expected_semantics, reparsed_semantics, strict=True
+            labels,
+            expected_semantics,
+            reparsed_semantics,
+            strict=True,
         )
         if expected_part != reparsed_part
+    )
+
+
+def _without_pure_communication_form(frame: SemanticFrame) -> SemanticFrame:
+    related_ids = {
+        element_id
+        for relation in frame.relations
+        for element_id in (*relation.source_ids, *relation.target_ids)
+    }
+    return frame.model_copy(
+        update={
+            "communication_acts": tuple(
+                act
+                for act in frame.communication_acts
+                if not (
+                    act.kind in _COMMUNICATION_FORM_KINDS
+                    and not act.factor_ids
+                    and not act.attributes
+                    and act.id not in related_ids
+                )
+            )
+        }
     )
 
 
@@ -828,54 +833,11 @@ def _semantic_normalization_assessment(
     return SemanticNormalizationAssessment(
         applied_rules=tuple(applied_rules),
         verdict=(
-            "equivalent" if not _semantic_difference_reasons(expected, reparsed) else "different"
+            "equivalent"
+            if not _task_meaning_difference_reasons(expected, reparsed)
+            else "different"
         ),
     )
-
-
-def _declared_communication_form_difference_reasons(
-    expected: SemanticFrame,
-    reparsed: SemanticFrame,
-    target_communication_kind: str | None,
-    target_marker_required: bool,
-) -> tuple[str, ...]:
-    target_acts = tuple(
-        act for act in reparsed.communication_acts if act.kind == target_communication_kind
-    )
-    if not target_acts:
-        if target_marker_required:
-            return (
-                f"reparsed frame does not contain required communication kind "
-                f"{target_communication_kind}",
-            )
-        return _semantic_difference_reasons(expected, reparsed)
-    candidate_differences: list[tuple[str, ...]] = []
-    for target_act in target_acts:
-        if target_act.factor_ids or target_act.attributes:
-            candidate_differences.append(
-                ("declared communication marker contains unsupported semantics",)
-            )
-            continue
-        if any(
-            target_act.id in (*relation.source_ids, *relation.target_ids)
-            for relation in reparsed.relations
-        ):
-            candidate_differences.append(
-                ("declared communication marker has unsupported relations",)
-            )
-            continue
-        filtered_frame = reparsed.model_copy(
-            update={
-                "communication_acts": tuple(
-                    act for act in reparsed.communication_acts if act.id != target_act.id
-                ),
-            }
-        )
-        differences = _semantic_difference_reasons(expected, filtered_frame)
-        if not differences:
-            return ()
-        candidate_differences.append(differences)
-    return min(candidate_differences, key=len)
 
 
 _SELF_CORRECTION_FACTOR_KINDS = ("money", "number", "date_time", "duration", "enum")

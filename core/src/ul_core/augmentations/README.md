@@ -122,5 +122,8 @@ uv run pytest -q \
   --require-live-llm
 ```
 
+This validity check asks only whether the complete task meaning was preserved. It does not grade
+whether the generated text successfully matches the requested style.
+
 The non-live coverage contract fails when a new LLM operator is not included in this development
 gate. This development check is separate from release qualification against a live customer agent.

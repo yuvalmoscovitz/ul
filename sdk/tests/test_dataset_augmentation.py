@@ -728,7 +728,13 @@ async def test_builtin_operator_library_is_fixed_versioned_and_reviewable() -> N
     assert [operator.id for operator in operators if operator.human_review_required] == [
         "input.intent.self_correction"
     ]
-    assert "shortest natural text-message command" in instructions["input.style.terse"]
+    assert all(
+        len(operator.instruction.split()) <= 20
+        for operator in operators
+        if operator.generation_mechanism == "llm"
+    )
+    assert "very short human command" in instructions["input.style.terse"]
+    assert "No typos" in instructions["input.surface.grammar_error"]
     assert "insulting" in instructions["input.tone.angry"]
     assert "profane" in instructions["input.tone.angry"]
     assert [
@@ -1856,12 +1862,12 @@ async def test_behavior_operators_allow_only_their_communication_change(
         assert "insulting" in model.rendered_instructions[0].casefold()
         assert "profane" in model.rendered_instructions[0].casefold()
     if operator_id == "input.tone.argumentative":
-        assert "previous requests kept failing" in model.rendered_instructions[0]
+        assert "generic challenge" in model.rendered_instructions[0]
     if verifier is not None:
         assert verifier.allowed_surface_changes == [f"hostile_{target_kind}_tone"]
 
 
-async def test_tone_operator_fails_closed_without_safety_verifier() -> None:
+async def test_tone_operator_requires_meaning_verifier() -> None:
     record = source_record()
     original_frame = source_frame(record)
     candidate_frame = behavior_candidate_frame(record, "angry")
@@ -1876,7 +1882,9 @@ async def test_tone_operator_fails_closed_without_safety_verifier() -> None:
     )
 
     assert result.candidates[0].passed is False
-    assert result.candidates[0].failure_reasons == ("tone safety verifier is unavailable",)
+    assert result.candidates[0].failure_reasons == (
+        "semantic equivalence verifier is unavailable",
+    )
 
 
 @pytest.mark.parametrize(
@@ -1897,7 +1905,7 @@ async def test_tone_operator_fails_closed_without_safety_verifier() -> None:
         ),
     ],
 )
-async def test_tone_operator_rejects_forbidden_hostility(
+async def test_tone_operator_rejects_added_threat_meaning(
     operator_id: str,
     target_kind: str,
     rendered_output: str,
@@ -1931,7 +1939,7 @@ async def test_tone_operator_rejects_forbidden_hostility(
     candidate = result.candidates[0]
     assert candidate.passed is False
     assert candidate.failure_reasons == (
-        "tone safety check found a forbidden communication change",
+        "semantic equivalence check found a material change",
     )
     assert candidate.semantic_equivalence_assessment == assessment
 
@@ -1962,7 +1970,8 @@ async def test_behavior_operator_rejects_relations_touching_its_marker() -> None
 
     assert not result.candidates[0].passed
     assert result.candidates[0].failure_reasons == (
-        "declared communication marker has unsupported relations",
+        "relations differ from the expected frame",
+        "communication acts differ from the expected frame",
     )
 
 
@@ -1993,14 +2002,13 @@ async def test_behavior_operator_rejects_semantics_hidden_in_its_marker() -> Non
 
     assert not result.candidates[0].passed
     assert result.candidates[0].failure_reasons == (
-        "declared communication marker contains unsupported semantics",
+        "communication acts differ from the expected frame",
     )
 
 
 @pytest.mark.parametrize(
     "drift",
     [
-        "missing_target_kind",
         "non_communication_relation",
         "existing_communication_act",
         "existing_communication_relation",
@@ -2010,11 +2018,7 @@ async def test_behavior_operator_rejects_changes_outside_its_contract(drift: str
     record = source_record()
     original_frame = source_frame(record)
     candidate_frame = behavior_candidate_frame(record, "terse")
-    if drift == "missing_target_kind":
-        candidate_frame = source_frame(record, identifier_prefix="candidate").model_copy(
-            update={"outcomes": ()}
-        )
-    elif drift == "non_communication_relation":
+    if drift == "non_communication_relation":
         candidate_frame = candidate_frame.model_copy(update={"relations": ()})
     elif drift == "existing_communication_act":
         changed_act = candidate_frame.communication_acts[0].model_copy(
@@ -2051,17 +2055,40 @@ async def test_behavior_operator_rejects_changes_outside_its_contract(drift: str
     assert result.candidates[0].failure_reasons
 
 
-async def test_rephrase_preserves_full_semantics() -> None:
+async def test_behavior_operator_validity_does_not_require_target_marker() -> None:
+    record = source_record()
+    original_frame = source_frame(record)
+    candidate_frame = source_frame(record, identifier_prefix="candidate").model_copy(
+        update={"outcomes": ()}
+    )
+    model = DeterministicSemanticModel({record.id: original_frame}, candidate_frame)
+
+    result = await DatasetAugmentationEngine(model, model).augment(
+        (record,), operator_ids=("input.style.terse",)
+    )
+
+    assert result.candidates[0].passed
+
+
+async def test_rephrase_ignores_pure_communication_form_changes() -> None:
     record = source_record()
     original_frame = source_frame(record)
     changed_communication = source_frame(record, identifier_prefix="candidate").model_copy(
         update={"outcomes": ()}
     )
-    changed_act = changed_communication.communication_acts[0].model_copy(
-        update={"kind": "paraphrase"}
-    )
     changed_communication = changed_communication.model_copy(
-        update={"communication_acts": (changed_act,)}
+        update={
+            "communication_acts": (
+                *changed_communication.communication_acts,
+                CommunicationAct(
+                    id="candidate:terse",
+                    evidence=evidence("input"),
+                    confidence=1,
+                    status="explicit",
+                    kind="terse",
+                ),
+            )
+        }
     )
     model = DeterministicSemanticModel({record.id: original_frame}, changed_communication)
 
@@ -2069,9 +2096,9 @@ async def test_rephrase_preserves_full_semantics() -> None:
         (record,), operator_ids=("input.surface.rephrase",)
     )
 
-    assert not result.candidates[0].passed
+    assert result.candidates[0].passed
     assert result.candidates[0].allowed_change == "surface_form_only"
-    assert "communication acts differ" in result.candidates[0].failure_reasons[0]
+    assert result.candidates[0].failure_reasons == ()
 
 
 async def test_engine_rejects_candidate_frame_for_another_input() -> None:
@@ -2149,55 +2176,26 @@ async def test_punctuation_noise_is_deterministic_and_preserves_source_text() ->
     assert model.rendered_inputs == []
 
 
-@pytest.mark.parametrize(
-    ("operator_id", "allowed_surface_change", "frame_drift"),
-    [
-        (
-            "input.surface.punctuation_noise",
-            "unprotected_punctuation_noise",
-            "extra_style_label",
-        ),
-    ],
-)
-async def test_surface_operator_passes_trusted_change_policy_to_equivalence_fallback(
-    operator_id: str,
-    allowed_surface_change: SemanticAllowedSurfaceChange,
-    frame_drift: str,
-) -> None:
+async def test_pure_style_label_does_not_trigger_equivalence_fallback() -> None:
     record = source_record()
     original_frame = source_frame(record)
     candidate_frame = source_frame(record, identifier_prefix="candidate").model_copy(
         update={"outcomes": ()}
     )
-    if frame_drift == "reversed_relation":
-        relation = candidate_frame.relations[0]
-        candidate_frame = candidate_frame.model_copy(
-            update={
-                "relations": (
-                    relation.model_copy(
-                        update={
-                            "source_ids": relation.target_ids,
-                            "target_ids": relation.source_ids,
-                        }
-                    ),
-                )
-            }
-        )
-    else:
-        candidate_frame = candidate_frame.model_copy(
-            update={
-                "communication_acts": (
-                    *candidate_frame.communication_acts,
-                    CommunicationAct(
-                        id="candidate:verbose",
-                        evidence=evidence("input"),
-                        confidence=1,
-                        status="explicit",
-                        kind="verbose",
-                    ),
-                )
-            }
-        )
+    candidate_frame = candidate_frame.model_copy(
+        update={
+            "communication_acts": (
+                *candidate_frame.communication_acts,
+                CommunicationAct(
+                    id="candidate:verbose",
+                    evidence=evidence("input"),
+                    confidence=1,
+                    status="explicit",
+                    kind="verbose",
+                ),
+            )
+        }
+    )
     model = DeterministicSemanticModel({record.id: original_frame}, candidate_frame)
     assessment = SemanticEquivalenceAssessment(
         verdict="equivalent",
@@ -2208,13 +2206,13 @@ async def test_surface_operator_passes_trusted_change_policy_to_equivalence_fall
     verifier = DeterministicEquivalenceVerifier(assessment)
 
     result = await DatasetAugmentationEngine(model, model, verifier).augment(
-        (record,), operator_ids=(operator_id,)
+        (record,), operator_ids=("input.surface.punctuation_noise",)
     )
 
     candidate = result.candidates[0]
     assert candidate.passed
-    assert candidate.semantic_equivalence_assessment == assessment
-    assert verifier.allowed_surface_changes == [allowed_surface_change]
+    assert candidate.semantic_equivalence_assessment is None
+    assert verifier.allowed_surface_changes == []
 
 
 async def test_punctuation_noise_avoids_punctuation_inside_semantic_values() -> None:
@@ -2387,7 +2385,7 @@ async def test_relation_decomposition_fails_closed_before_oversized_expansion(
     monkeypatch.setattr(dataset_augmentations, "_expanded_relation_semantics", reject_expansion)
 
     assert (
-        dataset_augmentations._semantic_difference_reasons(
+        dataset_augmentations._task_meaning_difference_reasons(
             frame, frame.model_copy(update={"relations": tuple(reversed(frame.relations))})
         )
         == ()
@@ -2541,17 +2539,12 @@ async def test_llm_operator_retries_an_unchanged_generation_once() -> None:
 
 
 @pytest.mark.parametrize(
-    ("operator_id", "rendered_output", "failure"),
+    ("operator_id", "rendered_output", "retry_reason"),
     [
         (
             "input.surface.rephrase",
             "transfer 100 to Alice then tell me the balance",
             "rendered input does not change enough wording",
-        ),
-        (
-            "input.surface.grammar_error",
-            "Please transfer 100 to Alice and then report the balance",
-            "reparsed frame does not contain required communication kind grammar_error",
         ),
         (
             "input.surface.fragmented_syntax",
@@ -2570,17 +2563,17 @@ async def test_llm_operator_retries_an_unchanged_generation_once() -> None:
         (
             "input.tone.angry",
             "Please transfer 100 to Alice and then report the balance",
-            "reparsed frame does not contain required communication kind angry",
+            "rendered input must sound unmistakably angry and hostile",
         ),
         (
             "input.tone.argumentative",
             "Please transfer 100 to Alice and then report the balance",
-            "reparsed frame does not contain required communication kind argumentative",
+            "rendered input must accuse or challenge an agent that keeps failing",
         ),
     ],
 )
-async def test_operator_footprints_reject_mislabeled_outputs(
-    operator_id: str, rendered_output: str, failure: str
+async def test_operator_footprints_guide_retry_without_deciding_validity(
+    operator_id: str, rendered_output: str, retry_reason: str
 ) -> None:
     record = source_record()
     original_frame = source_frame(record)
@@ -2590,12 +2583,51 @@ async def test_operator_footprints_reject_mislabeled_outputs(
     model = DeterministicSemanticModel(
         {record.id: original_frame}, candidate_frame, rendered_output
     )
+    verifier = (
+        DeterministicEquivalenceVerifier(
+            SemanticEquivalenceAssessment(
+                verdict="equivalent",
+                explanation="The task meaning is unchanged.",
+                verifier_version="test/1",
+            )
+        )
+        if operator_id in {"input.tone.angry", "input.tone.argumentative"}
+        else None
+    )
 
-    result = await DatasetAugmentationEngine(model, model).augment(
+    result = await DatasetAugmentationEngine(model, model, verifier).augment(
         (record,), operator_ids=(operator_id,)
     )
 
-    assert failure in result.candidates[0].failure_reasons
+    candidate = result.candidates[0]
+    assert candidate.passed
+    assert candidate.failure_reasons == ()
+    assert retry_reason in candidate.renderer_metadata["retry_reasons"]
+    assert len(model.rendered_inputs) == 2
+
+
+async def test_equivalence_verifier_can_accept_meaning_when_candidate_parse_fails() -> None:
+    record = source_record()
+    original_frame = source_frame(record)
+    model = DeterministicSemanticModel(
+        {record.id: original_frame},
+        invalid_candidate_operator_ids=frozenset({"input.surface.rephrase"}),
+    )
+    assessment = SemanticEquivalenceAssessment(
+        verdict="equivalent",
+        explanation="The task meaning is unchanged.",
+        verifier_version="test/1",
+    )
+    verifier = DeterministicEquivalenceVerifier(assessment)
+
+    result = await DatasetAugmentationEngine(model, model, verifier).augment(
+        (record,), operator_ids=("input.surface.rephrase",)
+    )
+
+    candidate = result.candidates[0]
+    assert candidate.passed
+    assert candidate.reparsed_input_frame is None
+    assert candidate.semantic_equivalence_assessment == assessment
 
 
 @pytest.mark.parametrize(
@@ -2727,7 +2759,6 @@ async def test_engine_retains_invalid_candidate_and_continues_to_later_operators
     assert invalid_candidate.reparsed_input_frame is None
     assert invalid_candidate.failure_reasons == (
         "candidate semantic deconstruction failed validation",
-        "rendered input does not change enough wording",
     )
     assert result.candidates[1].reparsed_input_frame is not None
     assert len(model.rendered_inputs) == 2
