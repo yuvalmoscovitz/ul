@@ -79,7 +79,6 @@ def test_legacy_operator_list_delegates_to_catalog_and_counts_deterministic_corr
         "input.intent.self_correction@1.1.0:",
         "input.style.terse@1.2.0:",
         "input.style.verbose@1.2.0:",
-        "input.surface.case_variation@1.0.0:",
         "input.surface.disfluency_repeat@1.2.0:",
         "input.surface.fragmented_syntax@1.2.0:",
         "input.surface.grammar_error@1.2.0:",

@@ -1458,37 +1458,6 @@ async def test_verify_equivalence_compares_raw_inputs_with_the_configured_model(
     await client.aclose()
 
 
-async def test_verify_equivalence_receives_trusted_case_change_policy() -> None:
-    def handler(request: httpx.Request) -> httpx.Response:
-        body = json.loads(request.content)
-        system_prompt = body["messages"][0]["content"]
-        assert "exactly one Unicode letter changed case" in system_prompt
-        assert "outside all evidence-grounded semantic value spans" in system_prompt
-        return completion(
-            json.dumps(
-                {
-                    "verdict": "equivalent",
-                    "explanation": "Only caller-verified capitalization changed.",
-                    "deltas": [],
-                }
-            )
-        )
-
-    client = mock_client(handler)
-    async with create_semantic_model_deconstructor(settings(), client=client) as deconstructor:
-        assessment = await deconstructor.verify(
-            "Great news - mark opportunity 006001 Closed Won.",
-            "great news - mark opportunity 006001 Closed Won.",
-            allowed_surface_change="single_unprotected_case_change",
-        )
-
-    assert assessment.verdict == "equivalent"
-    assert assessment.metadata["semantic_equivalence_policy"] == {
-        "allowed_surface_change": "single_unprotected_case_change"
-    }
-    await client.aclose()
-
-
 @pytest.mark.parametrize("source_quote", ("$999", " "))
 async def test_verify_equivalence_rejects_invalid_delta_quotes(source_quote: str) -> None:
     def handler(request: httpx.Request) -> httpx.Response:

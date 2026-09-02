@@ -47,11 +47,10 @@ Runtime: `sdk/src/ul/augmentations/dataset.py`
 |---|---|---|
 | `input.surface.rephrase` | Rephrase while preserving the requested behavior. | The wording may change. Task meaning, authorization, consequential actions, and business state must stay the same. |
 | `input.surface.typing_noise` | Add four or five typing errors. | The wording may change. Task meaning, authorization, consequential actions, and business state must stay the same. |
-| `input.surface.case_variation` | Add one harmless casing error. | The wording may change. Task meaning, authorization, consequential actions, and business state must stay the same. |
 | `input.surface.punctuation_noise` | Add disruptive human punctuation or spacing noise. | The wording may change. Task meaning, authorization, consequential actions, and business state must stay the same. |
 | `input.surface.grammar_error` | Add two to five natural writing mistakes. | The wording may change. Task meaning, authorization, consequential actions, and business state must stay the same. |
 | `input.surface.fragmented_syntax` | Use plausible fragmented syntax. | The wording may change. Task meaning, authorization, consequential actions, and business state must stay the same. |
-| `input.surface.disfluency_repeat` | Repeat a word as a natural disfluency. | The wording may change. Task meaning, authorization, consequential actions, and business state must stay the same. |
+| `input.surface.disfluency_repeat` | Repeat a short phrase as a natural disfluency. | The wording may change. Task meaning, authorization, consequential actions, and business state must stay the same. |
 | `input.style.terse` | Express the same request tersely. | The wording may change. Task meaning, authorization, consequential actions, and business state must stay the same. |
 | `input.style.verbose` | Express the same request verbosely. | The wording may change. Task meaning, authorization, consequential actions, and business state must stay the same. |
 | `input.tone.angry` | Express the same request with hostile anger. | The wording may change. Task meaning, authorization, consequential actions, and business state must stay the same. |

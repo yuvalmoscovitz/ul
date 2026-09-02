@@ -35,6 +35,6 @@ def test_every_runtime_augmentation_uses_one_canonical_namespace() -> None:
         augmentation_id.startswith(("input.", "conversation.", "environment."))
         for augmentation_id, _ in references
     )
-    assert len(set(references)) == 22
+    assert len(set(references)) == 21
     assert references.count(("conversation.correction_after_first_response", "1.0.0")) == 2
     assert references.count(("environment.tool.timeout_after_commit", "1.0.0")) == 2

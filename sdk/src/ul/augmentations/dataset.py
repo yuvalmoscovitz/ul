@@ -4,12 +4,13 @@ from __future__ import annotations
 
 import hashlib
 import json
+import random
 import re
 from collections import Counter
 from collections.abc import Collection, Iterable, Mapping
 from dataclasses import dataclass
 from decimal import Decimal
-from itertools import islice, pairwise
+from itertools import islice
 from typing import Any, Literal, Self, cast
 
 from pydantic import Field, JsonValue, model_validator
@@ -56,7 +57,6 @@ def _is_none(value: object) -> bool:
 OperatorId = Literal[
     "input.surface.rephrase",
     "input.surface.typing_noise",
-    "input.surface.case_variation",
     "input.surface.punctuation_noise",
     "input.surface.grammar_error",
     "input.surface.fragmented_syntax",
@@ -78,7 +78,6 @@ OperatorGenerationMechanism = Literal["deterministic", "llm"]
 _OPERATOR_PROMPT_NAMES: dict[OperatorId, str] = {
     "input.surface.rephrase": "augmentation.input.surface.rephrase",
     "input.surface.typing_noise": "augmentation.input.surface.typing_noise",
-    "input.surface.case_variation": "augmentation.input.surface.case_variation",
     "input.surface.punctuation_noise": "augmentation.input.surface.punctuation_noise",
     "input.surface.grammar_error": "augmentation.input.surface.grammar_error",
     "input.surface.fragmented_syntax": "augmentation.input.surface.fragmented_syntax",
@@ -153,12 +152,6 @@ _BUILTIN_OPERATORS = (
     ),
     _builtin_operator(
         operator_id="input.surface.typing_noise",
-        generation_mechanism="deterministic",
-        allowed_change="declared_communication_form",
-        target_communication_kind="typing_noise",
-    ),
-    _builtin_operator(
-        operator_id="input.surface.case_variation",
         generation_mechanism="deterministic",
         allowed_change="declared_communication_form",
         target_communication_kind="typing_noise",
@@ -442,19 +435,6 @@ class DatasetAugmentationEngine:
                 transformation_prompt_names: tuple[str, ...] = ()
                 self_correction_plan: _SelfCorrectionPlan | None = None
                 if (
-                    operator.id == "input.surface.case_variation"
-                    and _first_cased_letter(record.raw_input, expected_input_frame) is None
-                ):
-                    skips.append(
-                        DatasetAugmentationSkip(
-                            source_interaction_id=record.id,
-                            operator_id=operator.id,
-                            operator_version=operator.version,
-                            reason=operator.applicability_rule,
-                        )
-                    )
-                    continue
-                if (
                     operator.id == "input.surface.punctuation_noise"
                     and _punctuation_insertion(record.raw_input, expected_input_frame) is None
                 ):
@@ -481,8 +461,6 @@ class DatasetAugmentationEngine:
                         continue
                 if operator.id == "input.surface.typing_noise":
                     rendered_input = _add_typing_noise(record, expected_input_frame, operator)
-                elif operator.id == "input.surface.case_variation":
-                    rendered_input = _add_case_variation(record, expected_input_frame, operator)
                 elif operator.id == "input.surface.punctuation_noise":
                     rendered_input = _add_punctuation_noise(record, expected_input_frame, operator)
                 elif operator.allowed_change == "structured_self_correction":
@@ -1798,15 +1776,11 @@ def _surface_footprint_reasons(
         operator_id == "input.surface.fragmented_syntax"
         and len(tuple(part for part in re.split(r"[.;\n]+", augmented_input) if part.strip())) < 2
     ):
-        return ("rendered input must contain at least two clipped fragments",)
-    if operator_id == "input.surface.case_variation" and not _is_single_case_change(
-        source_input, augmented_input
-    ):
-        return ("rendered input must contain exactly one single-code-point case change",)
+        return ("rendered input must contain at least two natural fragments",)
     if operator_id == "input.surface.punctuation_noise" and not _is_disruptive_punctuation_noise(
         source_input, augmented_input
     ):
-        return ("rendered input must add a long punctuation run or many line breaks",)
+        return ("rendered input must add mixed exclamation, period, newline, and spacing noise",)
     if operator_id == "input.style.terse" and augmented_word_count * 5 > source_word_count * 4:
         return ("rendered input is not visibly shorter than the source",)
     if operator_id == "input.style.verbose" and not (
@@ -1815,15 +1789,10 @@ def _surface_footprint_reasons(
     ):
         return ("rendered input is not between 2 and 3.5 times the source length",)
     if operator_id == "input.surface.disfluency_repeat":
-        source_repetition_count = sum(
-            first.casefold() == second.casefold()
-            for first, second in pairwise(re.findall(r"\w+", source_input, flags=re.UNICODE))
-        )
-        augmented_repetition_count = sum(
-            first.casefold() == second.casefold() for first, second in pairwise(augmented_words)
-        )
+        source_repetition_count = _immediate_phrase_repetition_count(source_input)
+        augmented_repetition_count = _immediate_phrase_repetition_count(augmented_input)
         if augmented_repetition_count != source_repetition_count + 1:
-            return ("rendered input must contain exactly one immediate word repetition",)
+            return ("rendered input must repeat exactly one short phrase immediately",)
     if (
         operator_id == "input.tone.angry"
         and re.search(
@@ -1854,8 +1823,6 @@ def _changed_word_count(source_input: str, augmented_input: str) -> int:
 
 
 def _allowed_surface_change(operator_id: OperatorId) -> SemanticAllowedSurfaceChange:
-    if operator_id == "input.surface.case_variation":
-        return "single_unprotected_case_change"
     if operator_id == "input.surface.punctuation_noise":
         return "unprotected_punctuation_noise"
     if operator_id == "input.tone.angry":
@@ -1966,41 +1933,6 @@ def _add_self_correction(
     )
 
 
-def _add_case_variation(
-    record: InteractionRecord,
-    frame: SemanticFrame,
-    operator: DatasetAugmentationOperator,
-) -> RenderedUserInput:
-    cased_letter = _first_cased_letter(record.raw_input, frame)
-    if cased_letter is None:
-        raise AssertionError("case variation requires a Unicode cased letter")
-    index, letter = cased_letter
-    changed_letter = letter.lower() if letter.isupper() else letter.upper()
-    rendered_text = f"{record.raw_input[:index]}{changed_letter}{record.raw_input[index + 1 :]}"
-    return RenderedUserInput(
-        text=rendered_text,
-        metadata=_deterministic_renderer_metadata(
-            record, operator, "single_unicode_cased_letter_toggle"
-        ),
-    )
-
-
-def _first_cased_letter(text: str, frame: SemanticFrame) -> tuple[int, str] | None:
-    protected_spans = _protected_input_spans(text, frame)
-    return next(
-        (
-            (index, character)
-            for index, character in enumerate(text)
-            if character.isalpha()
-            and character.lower() != character.upper()
-            and len(character.lower()) == 1
-            and len(character.upper()) == 1
-            and not _position_is_protected(index, protected_spans)
-        ),
-        None,
-    )
-
-
 def _add_punctuation_noise(
     record: InteractionRecord,
     frame: SemanticFrame,
@@ -2010,37 +1942,37 @@ def _add_punctuation_noise(
         hashlib.sha256(f"{record.id}\0{operator.id}\0{operator.version}".encode()).digest()[:4],
         "big",
     )
+    randomizer = random.Random(seed)
     protected_spans = _protected_input_spans(record.raw_input, frame)
-    safe_spaces = tuple(
+    insertion_points = list(
         index
         for index, character in enumerate(record.raw_input)
-        if character.isspace() and not _position_is_protected(index, protected_spans)
+        if character.isspace()
+        and not _position_is_protected(index, protected_spans)
+        and not _space_splits_title_words(record.raw_input, index)
     )
-    mode = seed % 3
-    if mode == 0 and safe_spaces:
-        selected_spaces = set(safe_spaces[:10])
-        rendered_text = "".join(
-            "\n" if index in selected_spaces else character
-            for index, character in enumerate(record.raw_input)
-        )
-        missing_newlines = 10 - len(selected_spaces)
-        if missing_newlines:
-            insertion_point = min(selected_spaces)
-            extra_newlines = "\n" * missing_newlines
-            rendered_text = (
-                f"{rendered_text[:insertion_point]}{extra_newlines}"
-                f"{rendered_text[insertion_point:]}"
-            )
-        algorithm = "ten_scattered_line_breaks"
-    elif mode == 1:
-        rendered_text = f"{record.raw_input}!!!!!!!!!1"
-        algorithm = "long_exclamation_run"
-    else:
-        rendered_text = f"{record.raw_input}............"
-        algorithm = "long_period_run"
+    if not insertion_points:
+        fallback = _punctuation_insertion(record.raw_input, frame)
+        if fallback is None:
+            raise AssertionError("punctuation noise requires an unprotected insertion point")
+        insertion_points = [fallback[0]]
+    randomizer.shuffle(insertion_points)
+    noise = ["!", ".", "\n", " ", "!", ".", "\n", " ", "!", "."]
+    randomizer.shuffle(noise)
+    insertions: dict[int, list[str]] = {}
+    for index, character in enumerate(noise):
+        position = insertion_points[index % len(insertion_points)]
+        insertions.setdefault(position, []).append(character)
+    rendered_text = "".join(
+        f"{''.join(insertions.get(index, ()))}{character}"
+        for index, character in enumerate(record.raw_input)
+    )
+    rendered_text = f"{rendered_text}{''.join(insertions.get(len(record.raw_input), ()))}"
     return RenderedUserInput(
         text=rendered_text,
-        metadata=_deterministic_renderer_metadata(record, operator, algorithm),
+        metadata=_deterministic_renderer_metadata(
+            record, operator, "seeded_mixed_punctuation_spacing_noise"
+        ),
     )
 
 
@@ -2078,6 +2010,17 @@ def _punctuation_insertion(text: str, frame: SemanticFrame) -> tuple[int, str, s
     return word.start() + 1, ",", "single_unprotected_word_punctuation_insertion"
 
 
+def _space_splits_title_words(text: str, index: int) -> bool:
+    left_word = re.search(r"[^\W\d_]+$", text[:index], flags=re.UNICODE)
+    right_word = re.match(r"\s*([^\W\d_]+)", text[index + 1 :], flags=re.UNICODE)
+    return (
+        left_word is not None
+        and right_word is not None
+        and left_word.group()[0].isupper()
+        and right_word.group(1)[0].isupper()
+    )
+
+
 def _protected_input_spans(text: str, frame: SemanticFrame) -> tuple[tuple[int, int], ...]:
     spans: set[tuple[int, int]] = set()
     for factor in frame.factors:
@@ -2100,36 +2043,34 @@ def _insertion_is_protected(position: int, spans: tuple[tuple[int, int], ...]) -
     return any(start < position < end for start, end in spans)
 
 
-def _is_single_case_change(source_input: str, augmented_input: str) -> bool:
-    if len(source_input) != len(augmented_input):
-        return False
-    changed_positions = tuple(
-        index
-        for index, (source_character, augmented_character) in enumerate(
-            zip(source_input, augmented_input, strict=True)
-        )
-        if source_character != augmented_character
-    )
-    if len(changed_positions) != 1:
-        return False
-    position = changed_positions[0]
-    source_character = source_input[position]
-    augmented_character = augmented_input[position]
-    return (
-        source_character.lower() == augmented_character.lower()
-        and source_character.upper() == augmented_character.upper()
-    )
-
-
 def _is_disruptive_punctuation_noise(source_input: str, augmented_input: str) -> bool:
-    normalized_source = re.sub(r"\s+", " ", source_input).strip()
-    normalized_augmented = re.sub(r"\s+", " ", augmented_input).strip()
-    if normalized_source == normalized_augmented:
-        return augmented_input.count("\n") - source_input.count("\n") >= 10
-    if not augmented_input.startswith(source_input):
-        return False
-    suffix = augmented_input[len(source_input) :]
-    return re.fullmatch(r"!{4,}1?|\.{6,}", suffix) is not None
+    source_index = 0
+    inserted: list[str] = []
+    for character in augmented_input:
+        if source_index < len(source_input) and character == source_input[source_index]:
+            source_index += 1
+        elif character in {"!", "."} or character.isspace():
+            inserted.append(character)
+        else:
+            return False
+    return (
+        source_index == len(source_input)
+        and len(inserted) >= 10
+        and "!" in inserted
+        and "." in inserted
+        and "\n" in inserted
+        and " " in inserted
+    )
+
+
+def _immediate_phrase_repetition_count(text: str) -> int:
+    words = tuple(word.casefold() for word in re.findall(r"\w+", text, flags=re.UNICODE))
+    return sum(
+        words[index : index + phrase_length]
+        == words[index + phrase_length : index + (2 * phrase_length)]
+        for phrase_length in (2, 3)
+        for index in range(len(words) - (2 * phrase_length) + 1)
+    )
 
 
 def _ambiguous_node_reason(frame: SemanticFrame) -> str | None:

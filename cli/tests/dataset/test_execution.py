@@ -2313,7 +2313,7 @@ def test_http_target_contract_runs_authenticated_loopback_and_resumes(
             "--confirm-target",
             resolved_target.confirmation_sha256,
             "--operator",
-            "input.surface.case_variation",
+            "input.surface.typing_noise",
             "--repetitions",
             "2",
             "--output",

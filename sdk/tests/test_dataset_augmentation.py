@@ -398,7 +398,7 @@ async def test_engine_groups_multiple_records_by_requested_operator_order() -> N
 
     result = await DatasetAugmentationEngine(model, model).augment(
         (first_record, second_record),
-        operator_ids=("input.surface.typing_noise", "input.surface.case_variation"),
+        operator_ids=("input.surface.typing_noise", "input.surface.punctuation_noise"),
     )
 
     assert [
@@ -406,8 +406,8 @@ async def test_engine_groups_multiple_records_by_requested_operator_order() -> N
     ] == [
         ("input.surface.typing_noise", "first"),
         ("input.surface.typing_noise", "second"),
-        ("input.surface.case_variation", "first"),
-        ("input.surface.case_variation", "second"),
+        ("input.surface.punctuation_noise", "first"),
+        ("input.surface.punctuation_noise", "second"),
     ]
 
 
@@ -682,7 +682,6 @@ async def test_builtin_operator_library_is_fixed_versioned_and_reviewable() -> N
     assert tuple(operator.id for operator in operators) == (
         "input.surface.rephrase",
         "input.surface.typing_noise",
-        "input.surface.case_variation",
         "input.surface.punctuation_noise",
         "input.surface.grammar_error",
         "input.surface.fragmented_syntax",
@@ -699,7 +698,6 @@ async def test_builtin_operator_library_is_fixed_versioned_and_reviewable() -> N
     assert {operator.id: operator.version for operator in operators} == {
         "input.surface.rephrase": "1.1.0",
         "input.surface.typing_noise": "1.1.0",
-        "input.surface.case_variation": "1.0.0",
         "input.surface.punctuation_noise": "1.1.0",
         "input.surface.grammar_error": "1.2.0",
         "input.surface.fragmented_syntax": "1.2.0",
@@ -724,7 +722,6 @@ async def test_builtin_operator_library_is_fixed_versioned_and_reviewable() -> N
         operator.id for operator in operators if operator.generation_mechanism == "deterministic"
     ] == [
         "input.surface.typing_noise",
-        "input.surface.case_variation",
         "input.surface.punctuation_noise",
         "input.intent.self_correction",
     ]
@@ -732,11 +729,11 @@ async def test_builtin_operator_library_is_fixed_versioned_and_reviewable() -> N
         "input.intent.self_correction"
     ]
     assert "shortest natural text-message command" in instructions["input.style.terse"]
-    assert "insulting, profane" in instructions["input.tone.angry"]
+    assert "insulting" in instructions["input.tone.angry"]
+    assert "profane" in instructions["input.tone.angry"]
     assert [
         operator.id for operator in operators if operator.applicability_profile == "conditional"
     ] == [
-        "input.surface.case_variation",
         "input.surface.punctuation_noise",
         "input.intent.self_correction",
     ]
@@ -1856,9 +1853,10 @@ async def test_behavior_operators_allow_only_their_communication_change(
         "transformation_prompts": prompt_provenance(f"augmentation.{operator_id}"),
     }
     if operator_id == "input.tone.angry":
-        assert "insulting, profane" in model.rendered_instructions[0].casefold()
+        assert "insulting" in model.rendered_instructions[0].casefold()
+        assert "profane" in model.rendered_instructions[0].casefold()
     if operator_id == "input.tone.argumentative":
-        assert "keeps failing" in model.rendered_instructions[0]
+        assert "previous requests kept failing" in model.rendered_instructions[0]
     if verifier is not None:
         assert verifier.allowed_surface_changes == [f"hostile_{target_kind}_tone"]
 
@@ -2129,138 +2127,31 @@ async def test_typing_noise_is_deterministic_protects_factors_and_needs_no_model
     assert candidate.renderer_metadata["transformation_prompts"] == []
 
 
-@pytest.mark.parametrize(
-    ("operator_id", "target_kind", "expected_input", "algorithm"),
-    (
-        (
-            "input.surface.case_variation",
-            "typing_noise",
-            "transfer 100 to Alice, then tell me the balance.",
-            "single_unicode_cased_letter_toggle",
-        ),
-        (
-            "input.surface.punctuation_noise",
-            "typing_noise",
-            "",
-            "",
-        ),
-    ),
-)
-async def test_broad_surface_operators_are_deterministic_and_preserve_source_text(
-    operator_id: str,
-    target_kind: str,
-    expected_input: str,
-    algorithm: str,
-) -> None:
+async def test_punctuation_noise_is_deterministic_and_preserves_source_text() -> None:
     record = source_record()
     original_frame = source_frame(record)
-    candidate_frame = behavior_candidate_frame(record, target_kind)
+    candidate_frame = behavior_candidate_frame(record, "typing_noise")
     model = DeterministicSemanticModel({record.id: original_frame}, candidate_frame)
 
     result = await DatasetAugmentationEngine(model, model).augment(
-        (record,), operator_ids=(operator_id,)
+        (record,), operator_ids=("input.surface.punctuation_noise",)
     )
 
     candidate = result.candidates[0]
     assert candidate.passed
-    if operator_id == "input.surface.punctuation_noise":
-        assert candidate.augmented_input != record.raw_input
-        assert candidate.renderer_metadata["algorithm"] in {
-            "ten_scattered_line_breaks",
-            "long_exclamation_run",
-            "long_period_run",
-        }
-    else:
-        assert candidate.augmented_input == expected_input
-        assert candidate.renderer_metadata["algorithm"] == algorithm
+    assert candidate.augmented_input != record.raw_input
+    assert candidate.renderer_metadata["algorithm"] == "seeded_mixed_punctuation_spacing_noise"
+    assert candidate.augmented_input.count("!") > record.raw_input.count("!")
+    assert candidate.augmented_input.count(".") > record.raw_input.count(".")
+    assert candidate.augmented_input.count("\n") > record.raw_input.count("\n")
+    assert candidate.augmented_input.count(" ") > record.raw_input.count(" ")
     assert candidate.renderer_metadata["transformation_prompts"] == []
     assert model.rendered_inputs == []
 
 
 @pytest.mark.parametrize(
-    ("raw_input", "expected_input"),
-    (
-        ("Émettre le rapport TEST-1.", "émettre le rapport TEST-1."),
-        ("Πλήρωσε το TEST-1.", "πλήρωσε το TEST-1."),
-        ("Оплати TEST-1.", "оплати TEST-1."),
-    ),
-)
-async def test_case_variation_supports_unicode_cased_letters(
-    raw_input: str, expected_input: str
-) -> None:
-    record = source_record().model_copy(update={"raw_input": raw_input})
-    original_frame = source_frame(record)
-    candidate_frame = behavior_candidate_frame(record, "typing_noise")
-    model = DeterministicSemanticModel({record.id: original_frame}, candidate_frame)
-
-    result = await DatasetAugmentationEngine(model, model).augment(
-        (record,), operator_ids=("input.surface.case_variation",)
-    )
-
-    assert result.skips == ()
-    assert result.candidates[0].passed
-    assert result.candidates[0].augmented_input == expected_input
-    assert result.candidates[0].renderer_metadata["algorithm"] == (
-        "single_unicode_cased_letter_toggle"
-    )
-
-
-@pytest.mark.parametrize("raw_input", ("支付测试订单。", "ادفع طلب الاختبار."))
-async def test_case_variation_skips_scripts_without_letter_case(raw_input: str) -> None:
-    record = source_record().model_copy(update={"raw_input": raw_input})
-    original_frame = source_frame(record)
-    model = DeterministicSemanticModel({record.id: original_frame})
-
-    result = await DatasetAugmentationEngine(model, model).augment(
-        (record,), operator_ids=("input.surface.case_variation",)
-    )
-
-    assert result.candidates == ()
-    assert len(result.skips) == 1
-    assert result.skips[0].operator_id == "input.surface.case_variation"
-    assert "unprotected Unicode letter" in result.skips[0].reason
-    assert len(model.deconstructed_records) == 1
-
-
-async def test_case_variation_avoids_protected_values_and_expanding_case_mappings() -> None:
-    record = source_record().model_copy(update={"raw_input": "TEST-ID ßauftrag ausführen."})
-    original_frame = source_frame(record)
-    protected_identifier = original_frame.factors[1].model_copy(
-        update={
-            "value": "TEST-ID",
-            "evidence": (
-                EvidenceReference(source="input", json_pointer="/raw_input", text_quote="TEST-ID"),
-            ),
-        }
-    )
-    original_frame = original_frame.model_copy(
-        update={"factors": (original_frame.factors[0], protected_identifier)}
-    )
-    candidate_frame = behavior_candidate_frame(record, "typing_noise")
-    candidate_identifier = candidate_frame.factors[1].model_copy(
-        update={"value": "TEST-ID", "evidence": protected_identifier.evidence}
-    )
-    candidate_frame = candidate_frame.model_copy(
-        update={"factors": (candidate_frame.factors[0], candidate_identifier)}
-    )
-    model = DeterministicSemanticModel({record.id: original_frame}, candidate_frame)
-
-    result = await DatasetAugmentationEngine(model, model).augment(
-        (record,), operator_ids=("input.surface.case_variation",)
-    )
-
-    assert result.candidates[0].passed
-    assert result.candidates[0].augmented_input == "TEST-ID ßAuftrag ausführen."
-
-
-@pytest.mark.parametrize(
     ("operator_id", "allowed_surface_change", "frame_drift"),
     [
-        (
-            "input.surface.case_variation",
-            "single_unprotected_case_change",
-            "reversed_relation",
-        ),
         (
             "input.surface.punctuation_noise",
             "unprotected_punctuation_noise",
@@ -2561,7 +2452,7 @@ async def test_punctuation_noise_skips_when_every_insertion_point_is_protected()
     assert "outside a protected semantic value" in result.skips[0].reason
 
 
-async def test_word_repetition_uses_llm_and_preserves_protected_values() -> None:
+async def test_phrase_repetition_uses_llm_and_preserves_protected_values() -> None:
     record = source_record()
     original_frame = source_frame(record)
     reparsed_candidate = source_frame(record, identifier_prefix="candidate").model_copy(
@@ -2570,7 +2461,7 @@ async def test_word_repetition_uses_llm_and_preserves_protected_values() -> None
     model = DeterministicSemanticModel(
         {record.id: original_frame},
         reparsed_candidate,
-        "Transfer 100 to Alice, then then tell me the balance.",
+        "Transfer 100 to Alice, then tell me then tell me the balance.",
     )
 
     result = await DatasetAugmentationEngine(model, model).augment(
@@ -2599,7 +2490,7 @@ async def test_word_repetition_uses_llm_and_preserves_protected_values() -> None
         ),
         (
             "input.surface.disfluency_repeat",
-            "transfer transfer 100 to alice then tell me the balance",
+            "transfer 100 to alice then tell me then tell me the balance",
         ),
     ],
 )
@@ -2665,7 +2556,7 @@ async def test_llm_operator_retries_an_unchanged_generation_once() -> None:
         (
             "input.surface.fragmented_syntax",
             "Please transfer 100 to Alice and then report the balance",
-            "rendered input must contain at least two clipped fragments",
+            "rendered input must contain at least two natural fragments",
         ),
         (
             "input.style.verbose",

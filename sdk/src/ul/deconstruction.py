@@ -48,11 +48,6 @@ from ul.llm import (
 _PROMPTS = PromptManager.instance()
 _ALLOWED_SURFACE_CHANGE_RULES: dict[SemanticAllowedSurfaceChange, str] = {
     "none": "No caller-verified surface edit is declared.",
-    "single_unprotected_case_change": (
-        "The caller deterministically verified exactly one Unicode letter changed case outside "
-        "all evidence-grounded semantic value spans. You must treat that casing edit itself as "
-        "harmless."
-    ),
     "single_unprotected_punctuation_insertion": (
         "The caller deterministically verified exactly one punctuation character was inserted "
         "outside all evidence-grounded semantic value spans. Treat that insertion itself as "

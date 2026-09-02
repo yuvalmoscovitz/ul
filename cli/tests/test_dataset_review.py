@@ -455,7 +455,7 @@ def test_root_json_report_is_stable_and_omits_private_dataset_fields(tmp_path: P
                     "ulpf_v1_b5dd705fb4db534431680decfe8b221fbebfd049d7b7aba99c2b59af966a2ca3"
                 ),
                 "pattern_snapshot_id": (
-                    "ulps_v1_1fa48d52bd48e11e55b531b337c0fb5bc9168a426e73404e3716fa208ddd316c"
+                    "ulps_v1_b217a3d0440afd085ebd792459b89f19292ff91278b5a3a4d300dc74e2cf4e4b"
                 ),
                 "kind": "behavior_difference",
                 "category": "changed_grounded_effect_argument",
@@ -481,7 +481,7 @@ def test_root_json_report_is_stable_and_omits_private_dataset_fields(tmp_path: P
                     {
                         "operator_id": "input.surface.disfluency_repeat",
                         "operator_version": "1.2.0",
-                        "summary": "Repeat a word as a natural disfluency.",
+                        "summary": "Repeat a short phrase as a natural disfluency.",
                     }
                 ],
                 "needs_review_count": 1,
@@ -567,7 +567,7 @@ def test_root_human_report_explains_patterns_and_augmentation_names(tmp_path: Pa
     assert "Evidence limitation: semantic model output not independently verified" in report.output
     assert "Why grouped: same finding category and private action shape." in report.output
     assert "Affected: 1 finding(s) across 1 test question(s)" in report.output
-    assert "Repeat a word as a natural disfluency." in report.output
+    assert "Repeat a short phrase as a natural disfluency." in report.output
     assert "1 needs review; 0 confirmed" in report.output
     assert f"{FINDING_ID}: same action shape, same evidence authority" in report.output
     assert "review=needs_review/unrated" in report.output

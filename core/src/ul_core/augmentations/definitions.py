@@ -312,15 +312,6 @@ _BUILTIN_AUGMENTATION_SPECS = (
     ),
     _dataset_spec("input.surface.typing_noise", "Add four or five typing errors.", version="1.1.0"),
     _dataset_spec(
-        "input.surface.case_variation",
-        "Add one harmless casing error.",
-        applicability_profile="conditional",
-        applicability_rule=(
-            "Applies only when the input contains an unprotected Unicode letter with a "
-            "single-code-point uppercase or lowercase mapping."
-        ),
-    ),
-    _dataset_spec(
         "input.surface.punctuation_noise",
         "Add disruptive human punctuation or spacing noise.",
         version="1.1.0",
@@ -337,7 +328,7 @@ _BUILTIN_AUGMENTATION_SPECS = (
     ),
     _dataset_spec(
         "input.surface.disfluency_repeat",
-        "Repeat a word as a natural disfluency.",
+        "Repeat a short phrase as a natural disfluency.",
         version="1.2.0",
     ),
     _dataset_spec("input.style.terse", "Express the same request tersely.", version="1.2.0"),
