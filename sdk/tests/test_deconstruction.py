@@ -1434,6 +1434,8 @@ async def test_verify_equivalence_compares_raw_inputs_with_the_configured_model(
         assert body["seed"] == 0
         assert body["response_format"]["json_schema"]["name"] == ("semantic_equivalence_assessment")
         assert "same complete task meaning" in body["messages"][0]["content"]
+        assert "Added urgency, timing, deadlines, reasons" in body["messages"][0]["content"]
+        assert "A trusted tone or verbosity edit never excuses it" in body["messages"][0]["content"]
         assert "No caller-verified surface edit is declared." in body["messages"][0]["content"]
         assert json.loads(body["messages"][1]["content"]) == {
             "source_input": "Pay invoice AC-100 for $125 USD.",

@@ -3,4 +3,4 @@ name = "augmentation.input.surface.grammar_error"
 description = "Introduces natural grammar mistakes without adding typos."
 author = "UL"
 +++
-Make 2 to 5 grammar mistakes: missing words, bad tense, or bad agreement. No typos or repetition. Keep all details.
+Make 3 natural grammar mistakes: drop articles/prepositions and use wrong verb agreement. Keep understandable. No duplicate words or facts.

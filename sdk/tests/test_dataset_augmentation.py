@@ -830,9 +830,14 @@ async def test_builtin_operator_library_is_fixed_versioned_and_reviewable() -> N
         if operator.generation_mechanism == "llm"
     )
     assert "very short human command" in instructions["input.style.terse"]
-    assert "No typos" in instructions["input.surface.grammar_error"]
-    assert "insulting" in instructions["input.tone.angry"]
+    assert "natural grammar mistakes" in instructions["input.surface.grammar_error"]
+    assert "No duplicate words" in instructions["input.surface.grammar_error"]
+    assert "spoken restart" in instructions["input.surface.disfluency_repeat"]
+    assert "voice-note request to the agent" in instructions["input.style.verbose"]
+    assert "getting it wrong" in instructions["input.tone.argumentative"]
     assert "profane" in instructions["input.tone.angry"]
+    assert "Insult the agent" in instructions["input.tone.angry"]
+    assert "urgency" in instructions["input.tone.angry"]
     assert [
         operator.id for operator in operators if operator.applicability_profile == "conditional"
     ] == [
@@ -1955,10 +1960,10 @@ async def test_behavior_operators_allow_only_their_communication_change(
         "transformation_prompts": prompt_provenance(f"augmentation.{operator_id}"),
     }
     if operator_id == "input.tone.angry":
-        assert "insulting" in model.rendered_instructions[0].casefold()
+        assert "insult the agent" in model.rendered_instructions[0].casefold()
         assert "profane" in model.rendered_instructions[0].casefold()
     if operator_id == "input.tone.argumentative":
-        assert "generic challenge" in model.rendered_instructions[0]
+        assert "getting it wrong" in model.rendered_instructions[0]
     if verifier is not None:
         assert verifier.allowed_surface_changes == [f"hostile_{target_kind}_tone"]
 
