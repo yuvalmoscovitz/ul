@@ -2100,7 +2100,13 @@ def _immediate_phrase_repetition_count(text: str) -> int:
 
 def _ambiguous_node_reason(frame: SemanticFrame) -> str | None:
     factors_by_id = {
-        factor.id: (factor.kind, factor.role, _json_key(factor.value)) for factor in frame.factors
+        factor.id: (
+            factor.kind,
+            factor.role,
+            _json_key(factor.value),
+            _evidence_semantics(factor.evidence),
+        )
+        for factor in frame.factors
     }
     factor_semantics = tuple((factor.id, factors_by_id[factor.id]) for factor in frame.factors)
     request_semantics = tuple(
@@ -2110,6 +2116,7 @@ def _ambiguous_node_reason(frame: SemanticFrame) -> str | None:
                 request.mode,
                 request.predicate,
                 tuple(sorted(factors_by_id[factor_id] for factor_id in request.factor_ids)),
+                _evidence_semantics(request.evidence),
             ),
         )
         for request in frame.request_units
@@ -2121,6 +2128,7 @@ def _ambiguous_node_reason(frame: SemanticFrame) -> str | None:
                 act.kind,
                 tuple(sorted(factors_by_id[factor_id] for factor_id in act.factor_ids)),
                 _json_key(act.attributes),
+                _evidence_semantics(act.evidence),
             ),
         )
         for act in frame.communication_acts
@@ -2140,6 +2148,10 @@ def _ambiguous_node_reason(frame: SemanticFrame) -> str | None:
                 )
             ids_by_semantics[semantics] = element_id
     return None
+
+
+def _evidence_semantics(evidence: tuple[EvidenceReference, ...]) -> tuple[str, ...]:
+    return tuple(sorted(_json_key(reference.model_dump(mode="json")) for reference in evidence))
 
 
 def _has_unresolved_nodes(frame: SemanticFrame) -> bool:

@@ -661,6 +661,55 @@ async def test_engine_skips_semantically_ambiguous_nodes() -> None:
     assert model.rendered_inputs == []
 
 
+async def test_distinct_grounding_disambiguates_nodes_with_the_same_semantic_shape() -> None:
+    record = source_record()
+    frame = source_frame(record)
+    first_factor = frame.factors[0].model_copy(
+        update={
+            "kind": "entity",
+            "role": "object",
+            "value": None,
+            "evidence": (
+                EvidenceReference(
+                    source="input",
+                    json_pointer="/raw_input",
+                    text_quote="100",
+                ),
+            ),
+        }
+    )
+    second_factor = frame.factors[1].model_copy(
+        update={
+            "kind": "entity",
+            "role": "object",
+            "value": None,
+            "evidence": (
+                EvidenceReference(
+                    source="input",
+                    json_pointer="/raw_input",
+                    text_quote="Alice",
+                ),
+            ),
+        }
+    )
+    distinct_factors = frame.model_copy(update={"factors": (first_factor, second_factor)})
+    first_act = frame.communication_acts[0].model_copy(
+        update={
+            "id": "first-act",
+            "factor_ids": (),
+            "evidence": first_factor.evidence,
+        }
+    )
+    second_act = first_act.model_copy(
+        update={"id": "second-act", "evidence": second_factor.evidence}
+    )
+    distinctly_grounded = distinct_factors.model_copy(
+        update={"communication_acts": (first_act, second_act)}
+    )
+
+    assert dataset_augmentations._ambiguous_node_reason(distinctly_grounded) is None
+
+
 async def test_engine_skips_unresolved_source_and_rejects_unresolved_candidate() -> None:
     record = source_record()
     frame = source_frame(record)
