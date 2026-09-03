@@ -54,6 +54,7 @@ from ul_core.dataset import (
     RenderedUserInput,
     RequestUnit,
     SemanticEquivalenceAssessment,
+    SemanticFactor,
     SemanticFrame,
     UserInputRecord,
 )
@@ -315,6 +316,101 @@ class _WrappedActionFieldSemanticModel(_LocalEvaluationSemanticModel):
             for outcome in frame.outcomes
         )
         return frame.model_copy(update={"outcomes": wrapped_outcomes})
+
+
+class _DistinctlyGroundedMultiActionSemanticModel(_LocalEvaluationSemanticModel):
+    async def deconstruct(
+        self,
+        record: InteractionRecord | UserInputRecord,
+        reference_frame: SemanticFrame | None = None,
+    ) -> SemanticFrame:
+        if not isinstance(record, InteractionRecord):
+            if reference_frame is not None:
+                return reference_frame.model_copy(
+                    update={"interaction_id": record.id, "outcomes": ()}
+                )
+            reparsed = await self.deconstruct(
+                InteractionRecord(
+                    id=record.id,
+                    raw_input=record.raw_input,
+                    raw_observed_output={},
+                )
+            )
+            return reparsed.model_copy(update={"outcomes": ()})
+        factors = tuple(
+            SemanticFactor(
+                id=f"factor-{index}",
+                evidence=(
+                    EvidenceReference(
+                        source="input",
+                        json_pointer="/raw_input",
+                        text_quote=quote,
+                    ),
+                ),
+                confidence=1,
+                status="observed",
+                kind="entity",
+                role="object",
+                value=None,
+            )
+            for index, quote in enumerate(
+                ("vendor payments", "pending bills", "the vendor", "Status"),
+                start=1,
+            )
+        )
+        return SemanticFrame(
+            interaction_id=record.id,
+            request_units=(
+                RequestUnit(
+                    id="process-vendor-payments",
+                    evidence=(
+                        EvidenceReference(
+                            source="input",
+                            json_pointer="/raw_input",
+                            text_quote="vendor payments",
+                        ),
+                    ),
+                    confidence=1,
+                    status="observed",
+                    mode="act",
+                    predicate="process",
+                    factor_ids=tuple(factor.id for factor in factors),
+                ),
+            ),
+            factors=factors,
+            outcomes=(
+                ObservedOutcome(
+                    id="returned-response",
+                    evidence=(
+                        EvidenceReference(
+                            source="output",
+                            json_pointer="/raw_observed_output",
+                            text_quote=None,
+                        ),
+                    ),
+                    confidence=1,
+                    status="observed",
+                    request_unit_ids=("process-vendor-payments",),
+                    position=0,
+                    kind="answer",
+                    predicate="returned_response",
+                    fields={"value": record.raw_observed_output},
+                ),
+            ),
+            extractor_version="local-evaluation-test",
+        )
+
+    async def render(
+        self,
+        raw_input: str,
+        instruction: str,
+        *,
+        allow_temporary_value: bool = False,
+    ) -> RenderedUserInput:
+        del raw_input, instruction, allow_temporary_value
+        return RenderedUserInput(
+            text="vendor payments: review pending bills email the vendor update Status to Processing"
+        )
 
 
 class _MaterialVarianceSemanticModel(_LocalEvaluationSemanticModel):
@@ -713,6 +809,85 @@ def test_full_dataset_evaluation_runs_local_callable_through_worker_boundary(
             _ANSI_ESCAPE_PATTERN.sub("", incompatible_resume.output).split()
         )
         assert "incompatible with the current evaluation plan" in normalized_incompatible_error
+
+
+def test_public_cli_augments_multi_action_request_with_distinctly_grounded_objects(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    dataset = tmp_path / "interactions.jsonl"
+    output = tmp_path / "results.jsonl"
+    augmentations = tmp_path / "augmentations.jsonl"
+    recorded_output = {
+        "actions": [
+            {"operation": "send_email", "recipient": "billing@example.com"},
+            {"operation": "update_row", "status": "Processing"},
+        ]
+    }
+    dataset.write_text(
+        json.dumps(
+            {
+                "id": "vendor-payments",
+                "input": (
+                    "Process vendor payments. Review pending bills, email the vendor, and update "
+                    "the Status to Processing."
+                ),
+                "output": recorded_output,
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "customer_agent.py").write_text(
+        f"def run(value):\n    return {recorded_output!r}\n",
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("UL_LIVE", "true")
+    monkeypatch.setenv("OPEN_ROUTER_API_KEY", "test-key")
+    semantic_model = _DistinctlyGroundedMultiActionSemanticModel()
+
+    async def successful_preflight(_settings: object) -> object:
+        return _evaluator_preflight()
+
+    monkeypatch.setattr(command_module, "load_dataset_semantic_settings", _settings)
+    monkeypatch.setattr(command_module, "preflight_evaluator", successful_preflight)
+    monkeypatch.setattr(
+        runner_module,
+        "create_semantic_model_deconstructor",
+        lambda _settings: semantic_model,
+    )
+    target = resolve_local_target("customer_agent:run")
+
+    result = runner.invoke(
+        root_app,
+        [
+            "dataset",
+            "evaluate",
+            str(dataset),
+            "--operator",
+            "input.style.terse",
+            "--target",
+            "customer_agent:run",
+            "--confirm-target",
+            target.confirmation_sha256,
+            "--confirm-test-environment",
+            "--repetitions",
+            "1",
+            "--augmentations-output",
+            str(augmentations),
+            "--output",
+            str(output),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    augmentation = json.loads(augmentations.read_text(encoding="utf-8"))["augmentation"]
+    assert augmentation["skips"] == []
+    assert len(augmentation["candidates"]) == 1
+    assert augmentation["candidates"][0]["passed"] is True
+    evidence = json.loads(output.read_text(encoding="utf-8").splitlines()[1])
+    assert len(evidence["cases"]) == 1
 
 
 @pytest.mark.parametrize(

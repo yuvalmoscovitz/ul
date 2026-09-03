@@ -597,6 +597,8 @@ class DatasetAugmentationEngine:
                                 ]
                             else:
                                 failure_reasons = ["semantic equivalence check was uncertain"]
+                if reparsed_frame is not None and _ambiguous_node_reason(reparsed_frame):
+                    failure_reasons.append("reparsed frame contains ambiguous semantic elements")
                 if augmented_input == record.raw_input:
                     failure_reasons.append("renderer did not change the source input")
                 generated_input_key = _text_key(augmented_input)
@@ -2099,18 +2101,34 @@ def _immediate_phrase_repetition_count(text: str) -> int:
 
 
 def _ambiguous_node_reason(frame: SemanticFrame) -> str | None:
-    factors_by_id = {
-        factor.id: (factor.kind, factor.role, _json_key(factor.value)) for factor in frame.factors
+    factor_semantics_by_id = {
+        factor.id: (
+            factor.kind,
+            factor.role,
+            _json_key(factor.value),
+            _evidence_semantics(factor.evidence),
+        )
+        for factor in frame.factors
     }
-    factor_semantics = tuple((factor.id, factors_by_id[factor.id]) for factor in frame.factors)
+    factor_semantics = tuple(
+        (
+            factor.id,
+            (factor.kind, factor.role, _json_key(factor.value)),
+            _evidence_semantics(factor.evidence),
+        )
+        for factor in frame.factors
+    )
     request_semantics = tuple(
         (
             request.id,
             (
                 request.mode,
                 request.predicate,
-                tuple(sorted(factors_by_id[factor_id] for factor_id in request.factor_ids)),
+                tuple(
+                    sorted(factor_semantics_by_id[factor_id] for factor_id in request.factor_ids)
+                ),
             ),
+            _evidence_semantics(request.evidence),
         )
         for request in frame.request_units
     )
@@ -2119,9 +2137,10 @@ def _ambiguous_node_reason(frame: SemanticFrame) -> str | None:
             act.id,
             (
                 act.kind,
-                tuple(sorted(factors_by_id[factor_id] for factor_id in act.factor_ids)),
+                tuple(sorted(factor_semantics_by_id[factor_id] for factor_id in act.factor_ids)),
                 _json_key(act.attributes),
             ),
+            _evidence_semantics(act.evidence),
         )
         for act in frame.communication_acts
     )
@@ -2130,16 +2149,41 @@ def _ambiguous_node_reason(frame: SemanticFrame) -> str | None:
         ("request units", request_semantics),
         ("communication acts", communication_semantics),
     ):
-        ids_by_semantics: dict[object, str] = {}
-        for element_id, semantics in elements:
-            previous_id = ids_by_semantics.get(semantics)
-            if previous_id is not None:
-                return (
-                    f"Source {label} {previous_id!r} and {element_id!r} have indistinguishable "
-                    "semantics; clarify their evidence or roles."
-                )
-            ids_by_semantics[semantics] = element_id
+        elements_by_semantics: dict[
+            object, list[tuple[str, frozenset[tuple[str, str, str | None]]]]
+        ] = {}
+        for element_id, semantics, evidence in elements:
+            for previous_id, previous_evidence in elements_by_semantics.get(semantics, []):
+                if _evidence_semantics_overlap(previous_evidence, evidence):
+                    return (
+                        f"Source {label} {previous_id!r} and {element_id!r} have "
+                        "indistinguishable semantics; clarify their evidence or roles."
+                    )
+            elements_by_semantics.setdefault(semantics, []).append((element_id, evidence))
     return None
+
+
+def _evidence_semantics(
+    evidence: tuple[EvidenceReference, ...],
+) -> frozenset[tuple[str, str, str | None]]:
+    return frozenset(
+        (reference.source, reference.json_pointer, reference.text_quote) for reference in evidence
+    )
+
+
+def _evidence_semantics_overlap(
+    left: frozenset[tuple[str, str, str | None]],
+    right: frozenset[tuple[str, str, str | None]],
+) -> bool:
+    for left_source, left_pointer, left_quote in left:
+        for right_source, right_pointer, right_quote in right:
+            if (left_source, left_pointer) != (right_source, right_pointer):
+                continue
+            if left_quote is None or right_quote is None:
+                return True
+            if left_quote in right_quote or right_quote in left_quote:
+                return True
+    return False
 
 
 def _has_unresolved_nodes(frame: SemanticFrame) -> bool:

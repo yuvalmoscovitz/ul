@@ -130,6 +130,57 @@ def synthetic_live_interaction() -> InteractionRecord:
     )
 
 
+def multi_action_live_interaction() -> InteractionRecord:
+    return InteractionRecord(
+        id="multi-action-live-check",
+        raw_input=(
+            "Process this week's vendor payments. Review the pending bills in the Payment Queue "
+            "spreadsheet and follow our payment authorization procedure. For approved payments, "
+            "email the vendor confirming the payment is being processed and update the Status "
+            "column to 'Processing'."
+        ),
+        raw_observed_output={
+            "actions": [
+                {
+                    "operation": "send_email",
+                    "recipient": "billing@example.com",
+                    "status": "Processing",
+                },
+                {
+                    "operation": "update_row",
+                    "row_id": "payment-42",
+                    "status": "Processing",
+                },
+            ]
+        },
+    )
+
+
+def credit_card_multi_action_live_interaction() -> InteractionRecord:
+    return InteractionRecord(
+        id="credit-card-multi-action-live-check",
+        raw_input=(
+            "Reconcile last month's corporate card statements. Match each charge to the "
+            "statement, flag unmatched items, notify cardholders of missing receipts, and email "
+            "an exceptions-only summary to controller@company.example.com."
+        ),
+        raw_observed_output={
+            "actions": [
+                {
+                    "operation": "flag_charge",
+                    "charge_id": "charge-17",
+                    "reason": "missing receipt",
+                },
+                {
+                    "operation": "send_email",
+                    "recipient": "controller@company.example.com",
+                    "summary": "exceptions only",
+                },
+            ]
+        },
+    )
+
+
 def factor_payload() -> dict[str, object]:
     return {
         "id": "factor-1",
@@ -2969,6 +3020,42 @@ async def test_live_llm_augmentations_pass_existing_validity_check(
         candidate.operator_id for candidate in candidates if candidate.human_review_required
     }
     assert human_review_operators <= {"input.intent.self_correction"}
+
+
+@pytest.mark.live_llm
+async def test_live_llm_multi_action_interactions_reach_valid_augmentation(
+    pytestconfig: pytest.Config,
+) -> None:
+    required = bool(pytestconfig.getoption("--require-live-llm"))
+    configured_settings = openrouter_live_settings(required=required)
+    if not configured_settings.live_calls or configured_settings.api_key is None:
+        _live_llm_unavailable(
+            "requires explicit OpenRouter live opt-in and API key",
+            required=required,
+        )
+    configured_settings = configured_settings.model_copy(
+        update={"allow_external_data_processing": True}
+    )
+    interactions = (
+        multi_action_live_interaction(),
+        credit_card_multi_action_live_interaction(),
+    )
+
+    async with create_semantic_model_deconstructor(configured_settings) as semantic_model:
+        for interaction in interactions:
+            result = await DatasetAugmentationEngine(
+                semantic_model,
+                semantic_model,
+                semantic_model,
+            ).augment(
+                (interaction,),
+                max_records=1,
+                operator_ids=("input.style.terse",),
+            )
+
+            assert result.skips == (), interaction.id
+            assert len(result.candidates) == 1, interaction.id
+            assert result.candidates[0].passed, interaction.id
 
 
 async def test_live_equivalence_qualification_across_ten_domains() -> None:
