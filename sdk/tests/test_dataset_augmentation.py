@@ -710,6 +710,104 @@ async def test_distinct_grounding_disambiguates_nodes_with_the_same_semantic_sha
     assert dataset_augmentations._ambiguous_node_reason(distinctly_grounded) is None
 
 
+async def test_duplicate_or_overlapping_grounding_does_not_disambiguate_nodes() -> None:
+    record = source_record()
+    frame = source_frame(record)
+    original = frame.factors[0]
+    duplicate_reference = original.model_copy(
+        update={"id": "duplicate-reference", "evidence": (*original.evidence, *original.evidence)}
+    )
+    overlapping_quote = original.model_copy(
+        update={
+            "id": "overlapping-quote",
+            "evidence": (
+                EvidenceReference(
+                    source="input",
+                    json_pointer="/raw_input",
+                    text_quote="Trans",
+                ),
+            ),
+        }
+    )
+    grounded_original = original.model_copy(
+        update={
+            "evidence": (
+                EvidenceReference(
+                    source="input",
+                    json_pointer="/raw_input",
+                    text_quote="Transfer",
+                ),
+            ),
+        }
+    )
+
+    duplicate_reason = dataset_augmentations._ambiguous_node_reason(
+        frame.model_copy(update={"factors": (original, frame.factors[1], duplicate_reference)})
+    )
+    overlap_reason = dataset_augmentations._ambiguous_node_reason(
+        frame.model_copy(
+            update={"factors": (grounded_original, frame.factors[1], overlapping_quote)}
+        )
+    )
+
+    assert duplicate_reason is not None
+    assert overlap_reason is not None
+
+
+async def test_candidate_cannot_collapse_distinct_grounding_even_if_verifier_accepts() -> None:
+    record = source_record()
+    source = source_frame(record)
+    source_factors = tuple(
+        factor.model_copy(
+            update={
+                "kind": "entity",
+                "role": "object",
+                "value": None,
+                "evidence": (
+                    EvidenceReference(
+                        source="input",
+                        json_pointer="/raw_input",
+                        text_quote=quote,
+                    ),
+                ),
+            }
+        )
+        for factor, quote in zip(source.factors, ("100", "Alice"), strict=True)
+    )
+    source = source.model_copy(update={"factors": source_factors})
+    candidate = source_frame(record, identifier_prefix="candidate").model_copy(
+        update={"outcomes": ()}
+    )
+    collapsed_evidence = source_factors[0].evidence
+    candidate_factors = tuple(
+        factor.model_copy(
+            update={
+                "kind": "entity",
+                "role": "object",
+                "value": None,
+                "evidence": collapsed_evidence,
+            }
+        )
+        for factor in candidate.factors
+    )
+    candidate = candidate.model_copy(update={"factors": candidate_factors})
+    model = DeterministicSemanticModel({record.id: source}, candidate)
+    verifier = DeterministicEquivalenceVerifier(
+        SemanticEquivalenceAssessment(
+            verdict="equivalent",
+            explanation="The text appears equivalent.",
+            verifier_version="test/1",
+        )
+    )
+
+    result = await DatasetAugmentationEngine(model, model, verifier).augment((record,))
+
+    assert not result.candidates[0].passed
+    assert "reparsed frame contains ambiguous semantic elements" in (
+        result.candidates[0].failure_reasons
+    )
+
+
 async def test_engine_skips_unresolved_source_and_rejects_unresolved_candidate() -> None:
     record = source_record()
     frame = source_frame(record)

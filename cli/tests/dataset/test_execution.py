@@ -354,7 +354,7 @@ class _DistinctlyGroundedMultiActionSemanticModel(_LocalEvaluationSemanticModel)
                 value=None,
             )
             for index, quote in enumerate(
-                ("vendor payments", "pending bills", "vendor", "Status"),
+                ("vendor payments", "pending bills", "the vendor", "Status"),
                 start=1,
             )
         )
@@ -409,7 +409,7 @@ class _DistinctlyGroundedMultiActionSemanticModel(_LocalEvaluationSemanticModel)
     ) -> RenderedUserInput:
         del raw_input, instruction, allow_temporary_value
         return RenderedUserInput(
-            text="vendor payments: review pending bills email vendor update Status to Processing"
+            text="vendor payments: review pending bills email the vendor update Status to Processing"
         )
 
 
