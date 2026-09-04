@@ -2797,7 +2797,10 @@ async def test_runner_compares_answer_only_responses_without_action_authority() 
     assert result.cases[0].findings == (
         DatasetEvaluationFinding(
             category="changed_response",
-            message=("Needs review: the augmented input produced a different observed response."),
+            message=(
+                "Needs review: the augmented input produced a different observed response at "
+                "/answer."
+            ),
             expected_effects=expected_response,
             observed_effects=observed_response,
         ),

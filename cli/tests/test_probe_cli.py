@@ -2825,6 +2825,8 @@ def test_public_probe_runs_answer_only_callable_through_real_worker_and_reports_
     finding = evidence_lines[1]["cases"][0]["findings"][0]
     cross_examination = evidence_lines[1]["cases"][0]["cross_examination"]
     assert finding["category"] == "changed_response"
+    assert finding["summary"].endswith("at /recommendation.")
+    assert "PRIVATE_RESPONSE_CANARY" not in finding["summary"]
     assert cross_examination["response_evidence"]["conclusion"] == "observed"
     assert cross_examination["committed_state_evidence"]["conclusion"] == "unavailable"
     assert all(effect["kind"] == "answer" for effect in finding["reference_effects"])

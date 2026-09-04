@@ -743,6 +743,8 @@ def test_full_dataset_evaluation_runs_local_callable_through_worker_boundary(
     assert saved["technical_details"]["baseline"]["verdict"] == "no_divergence"
     expected_case_verdict = "no_divergence" if wrapped_action_fields else "divergence_needs_review"
     assert saved["technical_details"]["cases"][0]["verdict"] == expected_case_verdict
+    if not wrapped_action_fields:
+        assert saved["cases"][0]["findings"][0]["summary"].endswith("at /received.")
     observed_fields = saved["technical_details"]["baseline"]["trial_set"]["trials"][0][
         "observed_frame"
     ]["outcomes"][0]["fields"]

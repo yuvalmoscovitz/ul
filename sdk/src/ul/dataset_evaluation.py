@@ -1893,14 +1893,80 @@ def _compare_response_outcomes(
         map(_response_outcome_semantics, observed_responses)
     ):
         return ()
+    difference_paths, truncated = _response_difference_paths(
+        _response_comparison_value(expected_responses),
+        _response_comparison_value(observed_responses),
+    )
+    locations = ", ".join(difference_paths)
+    if truncated:
+        locations = f"{locations}, and more"
+    location_suffix = f" at {locations}" if locations else ""
     return (
         DatasetEvaluationFinding(
             category="changed_response",
-            message=f"Needs review: the {subject} produced a different observed response.",
+            message=(
+                f"Needs review: the {subject} produced a different observed response"
+                f"{location_suffix}."
+            ),
             expected_effects=expected_responses,
             observed_effects=observed_responses,
         ),
     )
+
+
+def _response_comparison_value(outcomes: tuple[ObservedOutcome, ...]) -> JsonValue:
+    if (
+        len(outcomes) == 1
+        and outcomes[0].predicate == "returned_response"
+        and set(outcomes[0].fields) == {"value"}
+    ):
+        return outcomes[0].fields["value"]
+    return [list(_response_outcome_semantics(outcome)) for outcome in outcomes]
+
+
+def _response_difference_paths(
+    before: JsonValue,
+    after: JsonValue,
+    *,
+    maximum_paths: int = 5,
+) -> tuple[tuple[str, ...], bool]:
+    paths: list[str] = []
+    truncated = False
+
+    def add(path: str) -> None:
+        nonlocal truncated
+        if len(paths) == maximum_paths:
+            truncated = True
+            return
+        paths.append(path or "/")
+
+    def visit(left: JsonValue, right: JsonValue, path: str) -> None:
+        if truncated:
+            return
+        if type(left) is not type(right):
+            add(path)
+            return
+        if isinstance(left, dict) and isinstance(right, dict):
+            for key in sorted(left.keys() | right.keys()):
+                child_path = f"{path}/{key.replace('~', '~0').replace('/', '~1')}"
+                if key not in left or key not in right:
+                    add(child_path)
+                else:
+                    visit(left[key], right[key], child_path)
+            return
+        if isinstance(left, list) and isinstance(right, list):
+            for index in range(max(len(left), len(right))):
+                child_path = f"{path}/{index}"
+                if index >= len(left) or index >= len(right):
+                    add(child_path)
+                else:
+                    visit(left[index], right[index], child_path)
+            return
+        if left != right:
+            add(path)
+
+    visit(before, after, "")
+    return tuple(paths), truncated
 
 
 def _response_outcome_semantics(outcome: ObservedOutcome) -> tuple[JsonValue, ...]:
