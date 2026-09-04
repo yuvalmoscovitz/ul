@@ -128,7 +128,7 @@ class DatasetComparisonCompatibilityError(DatasetSourcePreparationError):
         super().__init__(self.explanation)
 
 
-class ProjectedResponseSemanticDeconstructor:
+class ReturnedResponseSemanticDeconstructor:
     def __init__(self, deconstructor: SemanticDeconstructor) -> None:
         self._deconstructor = deconstructor
 

@@ -217,13 +217,21 @@ def _semantic_frame_response_schema(*, observed_output_present: bool) -> dict[st
         required = cast(list[str], schema.setdefault("required", []))
         if "outcomes" not in required:
             required.append("outcomes")
+    else:
+        properties = cast(dict[str, dict[str, Any]], schema["properties"])
+        properties["outcomes"]["maxItems"] = 0
     return schema
 
 
 def _semantic_deconstructor_identity(extractor_contract: str) -> SemanticDeconstructorIdentity:
     content = {
         "extractor_contract": extractor_contract,
-        "prompt_behavior_sha256": _PROMPTS.get_template_info("semantic.deconstruct").version,
+        "prompt_behavior_sha256": _canonical_json_sha256(
+            {
+                prompt_name: _PROMPTS.get_template_info(prompt_name).version
+                for prompt_name in ("semantic.deconstruct", "semantic.deconstruct_input")
+            }
+        ),
         "response_schema_sha256": _canonical_json_sha256(
             {
                 "input_only": _semantic_frame_response_schema(observed_output_present=False),
@@ -1135,6 +1143,9 @@ class SemanticModelDeconstructor:
             request_payload["reference_vocabulary"] = self._reference_vocabulary(reference_frame)
         untrusted_record = self._bounded_json(request_payload)
         role_config = self.llm_client.config.role_config("deconstruct")
+        prompt_name = (
+            "semantic.deconstruct" if observed_output is not None else "semantic.deconstruct_input"
+        )
         completion = await self._request(
             operation="deconstruct",
             role="deconstruct",
@@ -1146,7 +1157,7 @@ class SemanticModelDeconstructor:
                 observed_output_present=observed_output is not None
             ),
             strict_schema=True,
-            system_prompt=_PROMPTS.get_prompt("semantic.deconstruct"),
+            system_prompt=_PROMPTS.get_prompt(prompt_name),
             untrusted_payload=untrusted_record,
         )
         try:
@@ -1162,7 +1173,7 @@ class SemanticModelDeconstructor:
                             _EXTRACTOR_VERSION
                         ).model_dump(mode="json"),
                         "semantic_reasoning": role_config.reasoning_metadata(),
-                        "prompts": prompt_provenance("semantic.deconstruct"),
+                        "prompts": prompt_provenance(prompt_name),
                     },
                 }
             )

@@ -1591,10 +1591,15 @@ async def test_deconstruct_supports_input_only_candidate_validation() -> None:
 
     def handler(request: httpx.Request) -> httpx.Response:
         body = json.loads(request.content)
-        assert "leave outcomes empty" in body["messages"][0]["content"]
+        assert "smallest frame" in body["messages"][0]["content"]
+        assert "raw_observed_output is null" in body["messages"][0]["content"]
         assert (
-            "minItems"
-            not in body["response_format"]["json_schema"]["schema"]["properties"]["outcomes"]
+            "keep communication factor_ids and attributes empty" in body["messages"][0]["content"]
+        )
+        assert "Set status to explicit" in body["messages"][0]["content"]
+        assert (
+            body["response_format"]["json_schema"]["schema"]["properties"]["outcomes"]["maxItems"]
+            == 0
         )
         assert "outcomes" not in body["response_format"]["json_schema"]["schema"].get(
             "required", []
@@ -1642,6 +1647,7 @@ async def test_deconstruct_supports_input_only_candidate_validation() -> None:
         frame = await deconstructor.deconstruct(input_only_record, reference_frame)
 
     assert frame.outcomes == ()
+    assert frame.metadata["prompts"] == prompt_provenance("semantic.deconstruct_input")
     await client.aclose()
 
 
@@ -1930,7 +1936,12 @@ async def test_deconstructor_identity_binds_extractor_prompt_and_response_schema
     baseline = semantic_deconstructor_identity(settings())
     assert baseline.extractor_contract == "semantic-deconstructor/2.2.0"
     assert baseline.prompt_behavior_sha256 == (
-        deconstruction_module._PROMPTS.get_template_info("semantic.deconstruct").version
+        deconstruction_module._canonical_json_sha256(
+            {
+                prompt_name: deconstruction_module._PROMPTS.get_template_info(prompt_name).version
+                for prompt_name in ("semantic.deconstruct", "semantic.deconstruct_input")
+            }
+        )
     )
     assert (
         len(
@@ -1952,7 +1963,7 @@ async def test_deconstructor_identity_binds_extractor_prompt_and_response_schema
 
     def changed_template_info(name: str):
         template_info = original_template_info(name)
-        if name == "semantic.deconstruct":
+        if name == "semantic.deconstruct_input":
             return template_info.__class__(
                 name=template_info.name,
                 description=template_info.description,
@@ -1965,7 +1976,7 @@ async def test_deconstructor_identity_binds_extractor_prompt_and_response_schema
 
     monkeypatch.setattr(deconstruction_module._PROMPTS, "get_template_info", changed_template_info)
     changed_prompt = semantic_deconstructor_identity(settings())
-    assert changed_prompt.prompt_behavior_sha256 == "a" * 64
+    assert changed_prompt.prompt_behavior_sha256 != baseline.prompt_behavior_sha256
     assert changed_prompt.identity_sha256 != baseline.identity_sha256
     monkeypatch.undo()
 
