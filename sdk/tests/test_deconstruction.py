@@ -1768,6 +1768,8 @@ async def test_generated_schema_explains_exact_grounding_contract() -> None:
     assert "Use null" in evidence_properties["text_quote"]["description"]
     assert "primitive sibling values" in outcome_properties["fields"]["description"]
     assert "never wrap values" in outcome_properties["fields"]["description"]
+
+
 async def test_deconstruction_prompt_requires_case_sensitive_evidence_quotes() -> None:
     prompt = deconstruction_module._PROMPTS.get_prompt("semantic.deconstruct")
 
