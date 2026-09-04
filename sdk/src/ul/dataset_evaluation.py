@@ -228,8 +228,6 @@ class DatasetMaterialVarianceEvaluator(Protocol):
         self,
         comparison_surface: ComparisonSurface,
         findings: tuple[DatasetEvaluationFinding, ...],
-        *,
-        source_frame: SemanticFrame | None = None,
     ) -> MaterialVarianceAssessment: ...
 
 
@@ -738,11 +736,7 @@ class DatasetEvaluationRunner:
                 else _compare_response_outcomes(baseline_frame, observed_frame)
             )
             material_variance = (
-                await self._material_variance_evaluator.evaluate(
-                    comparison_surface,
-                    findings,
-                    source_frame=source_frame,
-                )
+                await self._material_variance_evaluator.evaluate(comparison_surface, findings)
                 if findings and self._material_variance_evaluator is not None
                 else None
             )

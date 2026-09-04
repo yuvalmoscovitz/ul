@@ -73,19 +73,15 @@ class RecordingMaterialVarianceEvaluator:
     def __init__(self) -> None:
         self.actual_calls = 0
         self.findings: tuple[DatasetEvaluationFinding, ...] = ()
-        self.source_frame: SemanticFrame | None = None
 
     async def evaluate(
         self,
         comparison_surface: Literal["action", "response"],
         findings: tuple[DatasetEvaluationFinding, ...],
-        *,
-        source_frame: SemanticFrame | None = None,
     ) -> MaterialVarianceAssessment:
         assert comparison_surface == "action"
         self.actual_calls += 1
         self.findings = findings
-        self.source_frame = source_frame
         return MaterialVarianceAssessment(
             decision="material_variance",
             reason_code="grounded_argument_changed",
@@ -1224,7 +1220,6 @@ async def test_flagged_candidate_receives_one_persisted_materiality_assessment()
 
     assert materiality.actual_calls == 1
     assert materiality.findings == result.cases[0].findings
-    assert materiality.source_frame == result.augmentation.source_frames[0]
     assert result.cases[0].material_variance is not None
     assert result.cases[0].material_variance.decision == "material_variance"
     assert result.semantic_calls.actual_calls == 1

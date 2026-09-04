@@ -7,7 +7,7 @@ from pydantic import JsonValue, SecretStr
 from ul.dataset_evaluation import DatasetEvaluationFinding
 from ul.evaluators import OpenAICompatibleEvaluatorJudge, OpenAICompatibleJudgeConfig
 from ul.material_variance import DatasetMaterialVarianceJudge
-from ul_core.dataset import ObservedOutcome, SemanticFrame
+from ul_core.dataset import ObservedOutcome
 
 
 def _email(identifier: str, recipient: str, subject: str, body: str) -> dict[str, JsonValue]:
@@ -55,24 +55,6 @@ def _finding(
     )
 
 
-def _source_frame(actions: list[JsonValue]) -> SemanticFrame:
-    return SemanticFrame(
-        interaction_id="source",
-        extractor_version="live-test",
-        outcomes=(
-            ObservedOutcome(
-                id="source-response",
-                kind="answer",
-                predicate="returned_response",
-                status="observed",
-                confidence=1,
-                position=0,
-                fields={"value": {"actions": actions}},
-            ),
-        ),
-    )
-
-
 @pytest.mark.asyncio
 @pytest.mark.live_llm
 @pytest.mark.skipif(
@@ -82,37 +64,24 @@ def _source_frame(actions: list[JsonValue]) -> SemanticFrame:
     or not os.environ.get("UL_DATASET_OPENROUTER_PROVIDER"),
     reason="requires explicit live-call opt-in, OpenRouter credentials, and model",
 )
-async def test_live_materiality_distinguishes_business_attributes_from_prose() -> None:
+async def test_live_materiality_distinguishes_business_target_from_prose() -> None:
     baseline = [
         _email("baseline-a", "a@example.com", "Payment $100", "Payment is processing."),
         _email("baseline-b", "b@example.com", "Payment $200", "Payment is processing."),
         _email(
             "baseline-c",
             "c@example.com",
-            "[PRIORITY] Payment $300",
+            "Payment $300",
             "Payment is processing urgently because it is more than 60 days overdue.",
         ),
         _status(2),
         _status(3),
         _status(5),
     ]
-    missing_priority = [
+    changed_recipient = [
         _email("terse-a", "a@example.com", "Payment $100", "Processing payment."),
         _email("terse-b", "b@example.com", "Payment $200", "Processing payment."),
-        _email("terse-c", "c@example.com", "Payment $300", "Processing payment."),
-        _status(2),
-        _status(3),
-        _status(5),
-    ]
-    recorded_source = [
-        _email("source-a", "a@example.com", "Payment confirmation $100", "Processing."),
-        _email("source-b", "b@example.com", "Payment confirmation $200", "Processing."),
-        _email(
-            "source-c",
-            "c@example.com",
-            "[PRIORITY] Payment confirmation $300",
-            "Prioritized because this payment is more than 60 days overdue.",
-        ),
+        _email("terse-c", "other@example.com", "Payment $300", "Processing payment."),
         _status(2),
         _status(3),
         _status(5),
@@ -133,7 +102,7 @@ async def test_live_materiality_distinguishes_business_attributes_from_prose() -
         _email(
             "grammar-c",
             "c@example.com",
-            "[PRIORITY] Payment $300",
+            "Payment $300",
             "Payment is processing urgently because it is more than 60 days overdue. Thank you.",
         ),
         _status(2),
@@ -152,17 +121,16 @@ async def test_live_materiality_distinguishes_business_attributes_from_prose() -
     )
     async with OpenAICompatibleEvaluatorJudge(config) as judge:
         evaluator = DatasetMaterialVarianceJudge(judge, max_input_chars=50_000)
-        priority_assessment = await evaluator.evaluate(
+        recipient_assessment = await evaluator.evaluate(
             "response",
-            (_finding(baseline, missing_priority),),
-            source_frame=_source_frame(recorded_source),
+            (_finding(baseline, changed_recipient),),
         )
         prose_assessment = await evaluator.evaluate(
             "response",
             (_finding(baseline, prose_only),),
-            source_frame=_source_frame(recorded_source),
         )
 
-    assert priority_assessment.decision == "material_variance"
+    assert recipient_assessment.decision == "material_variance"
+    assert recipient_assessment.reason_code == "action_target_changed"
     assert prose_assessment.decision == "operationally_equivalent"
-    assert evaluator.actual_calls == 1
+    assert evaluator.actual_calls == 2

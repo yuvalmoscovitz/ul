@@ -2,11 +2,10 @@ from __future__ import annotations
 
 import json
 import re
-from collections import Counter
 from typing import cast
 
 from pydantic import JsonValue
-from ul_core.dataset import ObservedOutcome, SemanticFrame
+from ul_core.dataset import ObservedOutcome
 from ul_core.evaluators import EvaluationSubject, EvaluatorVersion, RubricEvaluator
 from ul_core.prompts import PromptManager
 
@@ -33,8 +32,6 @@ _READ_ONLY_ACTION_TOKENS = frozenset(
     {"FETCH", "FIND", "GET", "LIST", "LOOKUP", "QUERY", "READ", "SEARCH"}
 )
 _RESPONSE_ENVELOPE_FIELDS = frozenset({"answer", "actions", "reward", "status", "steps", "task_id"})
-_PRIORITY_ROUTING_MARKER = re.compile(r"\[PRIORITY\]", re.IGNORECASE)
-_ACTION_TARGET_FIELDS = ("to", "cc", "bcc", "recipient", "recipients")
 _EVALUATOR = RubricEvaluator(
     id="dataset.material_variance.v2",
     rubric=_PROMPTS.get_prompt("evaluation.material_variance"),
@@ -131,8 +128,6 @@ class DatasetMaterialVarianceJudge:
         self,
         comparison_surface: ComparisonSurface,
         findings: tuple[DatasetEvaluationFinding, ...],
-        *,
-        source_frame: SemanticFrame | None = None,
     ) -> MaterialVarianceAssessment:
         answer = _comparison_payload(comparison_surface, findings)
         encoded_answer = json.dumps(answer, ensure_ascii=False, separators=(",", ":"))
@@ -144,7 +139,6 @@ class DatasetMaterialVarianceJudge:
             return self._insufficient("missing_comparison_evidence")
         deterministic_assessment = _deterministic_response_material_variance(
             answer,
-            source_frame=source_frame,
             evaluator_version_id=self.evaluator_version_id,
         )
         if deterministic_assessment is not None:
@@ -259,9 +253,7 @@ def _effect_payload(
 
 def _normalized_response_fields(fields: dict[str, JsonValue]) -> dict[str, JsonValue]:
     value = fields.get("value")
-    if not isinstance(value, dict) or not (
-        {"answer", "actions"} <= value.keys() or set(value) == {"actions"}
-    ):
+    if not isinstance(value, dict) or not {"answer", "actions"} <= value.keys():
         return fields
     answer = value.get("answer")
     actions = value.get("actions")
@@ -311,7 +303,6 @@ def _is_read_only_action(action: JsonValue) -> bool:
 def _deterministic_response_material_variance(
     answer: dict[str, JsonValue],
     *,
-    source_frame: SemanticFrame | None,
     evaluator_version_id: str,
 ) -> MaterialVarianceAssessment | None:
     findings = answer.get("findings")
@@ -347,60 +338,12 @@ def _deterministic_response_material_variance(
                 "response_meaning_changed",
                 evaluator_version_id=evaluator_version_id,
             )
-        if source_frame is not None and _stable_priority_marker_was_removed(
-            source_frame,
-            baseline_fields,
-            variation_fields,
-        ):
-            return _deterministic_material_assessment(
-                finding_index,
-                "grounded_argument_changed",
-                evaluator_version_id=evaluator_version_id,
-            )
         if baseline_fields == variation_fields:
             return _deterministic_equivalent_assessment(
                 finding_index,
                 evaluator_version_id=evaluator_version_id,
             )
     return None
-
-
-def _stable_priority_marker_was_removed(
-    source_frame: SemanticFrame,
-    baseline_fields: dict[str, JsonValue],
-    variation_fields: dict[str, JsonValue],
-) -> bool:
-    source_markers: Counter[tuple[str, str]] = Counter()
-    for outcome in source_frame.outcomes:
-        if outcome.kind == "answer":
-            source_markers.update(_subject_marker_occurrences(outcome.fields))
-    baseline_markers = _subject_marker_occurrences(baseline_fields)
-    variation_markers = _subject_marker_occurrences(variation_fields)
-    for (marker, encoded_target), reference_count in (source_markers & baseline_markers).items():
-        if reference_count > variation_markers[(marker, encoded_target)]:
-            return True
-    return False
-
-
-def _subject_marker_occurrences(value: JsonValue) -> Counter[tuple[str, str]]:
-    if isinstance(value, list):
-        markers: Counter[tuple[str, str]] = Counter()
-        for item in value:
-            markers.update(_subject_marker_occurrences(item))
-        return markers
-    if not isinstance(value, dict):
-        return Counter()
-    markers: Counter[tuple[str, str]] = Counter()
-    for item in value.values():
-        markers.update(_subject_marker_occurrences(item))
-    subject = value.get("subject")
-    if isinstance(subject, str):
-        target = {key: value[key] for key in _ACTION_TARGET_FIELDS if key in value}
-        encoded_target = json.dumps(target, ensure_ascii=False, sort_keys=True)
-        markers.update(
-            (marker.upper(), encoded_target) for marker in _PRIORITY_ROUTING_MARKER.findall(subject)
-        )
-    return markers
 
 
 def _response_safety_facts(
