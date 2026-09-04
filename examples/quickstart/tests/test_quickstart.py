@@ -650,7 +650,7 @@ def test_dry_run_is_a_real_subprocess_and_needs_no_api_key(tmp_path: Path) -> No
     assert "No model or target requests sent." in completed.stdout
     assert "Potential semantic model calls: up to 16" in completed.stdout
     assert "preflight=4" in completed.stdout
-    assert "Estimated completion tokens: 0..38400" in completed.stdout
+    assert "Estimated completion tokens: 0..71168" in completed.stdout
     assert "OPEN_ROUTER_API_KEY" not in environment
 
 

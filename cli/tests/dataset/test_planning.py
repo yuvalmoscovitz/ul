@@ -210,7 +210,7 @@ def test_dry_run_json_exposes_per_example_campaign_and_exact_call_plan(
     assert "candidate generation requires a semantic model call" in planned_operator["reasons"]
     assert payload["tokens"] == {
         "minimum": 0,
-        "maximum": 30_208,
+        "maximum": 54_784,
         "scope": "completion_tokens",
     }
     assert payload["money"] is None
