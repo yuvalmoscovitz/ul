@@ -27,7 +27,6 @@ from ul_core.dataset import (
     InteractionRecord,
     RenderedUserInput,
     RequestUnit,
-    SemanticAllowedSurfaceChange,
     SemanticEquivalenceAssessment,
     SemanticFactor,
     SemanticFrame,
@@ -35,22 +34,27 @@ from ul_core.dataset import (
     UserInputRecord,
 )
 from ul_core.models import ULModel
-from ul_core.prompts import PromptManager, prompt_provenance
+from ul_core.prompts import prompt_provenance
 
-_PROMPTS = PromptManager.instance()
+from ul.augmentations._dataset_operators import (
+    AllowedChange,
+    DatasetAugmentationOperator,
+    OperatorId,
+    dataset_operator_prompt_name,
+    dataset_operator_runtime,
+)
+from ul.augmentations._dataset_operators import (
+    builtin_dataset_augmentation_operators as builtin_dataset_augmentation_operators,
+)
+from ul.augmentations._dataset_operators import (
+    resolve_dataset_augmentation_operator as resolve_dataset_augmentation_operator,
+)
+from ul.augmentations._dataset_operators import (
+    select_dataset_augmentation_operators as _select_operators,
+)
+
 _MAX_DECOMPOSED_RELATION_ENDPOINTS = 10_000
 _TONE_SAFETY_KINDS = {"angry", "argumentative"}
-_COMMUNICATION_FORM_KINDS = {
-    "typing_noise",
-    "grammar_error",
-    "fragmented_syntax",
-    "repetition",
-    "terse",
-    "verbose",
-    "frustrated",
-    "angry",
-    "argumentative",
-}
 
 
 @dataclass(frozen=True)
@@ -63,182 +67,6 @@ class _SelfCorrectionPlan:
 
 def _is_none(value: object) -> bool:
     return value is None
-
-
-OperatorId = Literal[
-    "input.surface.rephrase",
-    "input.surface.typing_noise",
-    "input.surface.punctuation_noise",
-    "input.surface.grammar_error",
-    "input.surface.fragmented_syntax",
-    "input.surface.disfluency_repeat",
-    "input.style.terse",
-    "input.style.verbose",
-    "input.tone.angry",
-    "input.tone.argumentative",
-    "input.intent.self_correction",
-]
-AllowedChange = Literal[
-    "surface_form_only",
-    "declared_communication_form",
-    "structured_self_correction",
-]
-OperatorApplicabilityProfile = Literal["broad", "conditional"]
-OperatorGenerationMechanism = Literal["deterministic", "llm"]
-
-_OPERATOR_PROMPT_NAMES: dict[OperatorId, str] = {
-    "input.surface.rephrase": "augmentation.input.surface.rephrase",
-    "input.surface.typing_noise": "augmentation.input.surface.typing_noise",
-    "input.surface.punctuation_noise": "augmentation.input.surface.punctuation_noise",
-    "input.surface.grammar_error": "augmentation.input.surface.grammar_error",
-    "input.surface.fragmented_syntax": "augmentation.input.surface.fragmented_syntax",
-    "input.surface.disfluency_repeat": "augmentation.input.surface.disfluency_repeat",
-    "input.style.terse": "augmentation.input.style.terse",
-    "input.style.verbose": "augmentation.input.style.verbose",
-    "input.tone.angry": "augmentation.input.tone.angry",
-    "input.tone.argumentative": "augmentation.input.tone.argumentative",
-    "input.intent.self_correction": "augmentation.input.intent.self_correction",
-}
-
-
-class DatasetAugmentationOperator(ULModel):
-    id: OperatorId
-    version: str = Field(
-        default="1.0.0", pattern=r"^(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)$"
-    )
-    instruction: str = Field(min_length=1)
-    applicability_profile: OperatorApplicabilityProfile = "broad"
-    applicability_rule: str = Field(
-        default="Applies to any nonempty user input with recorded source semantics.",
-        min_length=1,
-    )
-    generation_mechanism: OperatorGenerationMechanism
-    allowed_change: AllowedChange
-    target_communication_kind: str | None = Field(default=None, min_length=1)
-    human_review_required: bool = False
-
-    @model_validator(mode="after")
-    def validate_change_contract(self) -> Self:
-        requires_target = self.allowed_change in {
-            "declared_communication_form",
-            "structured_self_correction",
-        }
-        if requires_target != (self.target_communication_kind is not None):
-            raise ValueError("target communication kind must match the allowed change")
-        return self
-
-
-def _builtin_operator(
-    operator_id: OperatorId,
-    *,
-    generation_mechanism: OperatorGenerationMechanism,
-    allowed_change: AllowedChange,
-    target_communication_kind: str | None = None,
-) -> DatasetAugmentationOperator:
-    definition = builtin_augmentation_catalog().get(operator_id)
-    binding = next(item for item in definition.bindings if item.mode == "dataset_variation")
-    return DatasetAugmentationOperator(
-        id=operator_id,
-        version=definition.ref.version,
-        instruction=_PROMPTS.get_prompt(_OPERATOR_PROMPT_NAMES[operator_id]),
-        applicability_profile=definition.applicability_profile,
-        applicability_rule=definition.applicability_rule,
-        generation_mechanism=generation_mechanism,
-        allowed_change=allowed_change,
-        target_communication_kind=target_communication_kind,
-        human_review_required=binding.requirements.human_review,
-    )
-
-
-_BUILTIN_OPERATORS = (
-    _builtin_operator(
-        operator_id="input.surface.rephrase",
-        generation_mechanism="llm",
-        allowed_change="surface_form_only",
-    ),
-    _builtin_operator(
-        operator_id="input.surface.typing_noise",
-        generation_mechanism="deterministic",
-        allowed_change="declared_communication_form",
-        target_communication_kind="typing_noise",
-    ),
-    _builtin_operator(
-        operator_id="input.surface.punctuation_noise",
-        generation_mechanism="deterministic",
-        allowed_change="declared_communication_form",
-        target_communication_kind="typing_noise",
-    ),
-    _builtin_operator(
-        operator_id="input.surface.grammar_error",
-        generation_mechanism="llm",
-        allowed_change="declared_communication_form",
-        target_communication_kind="grammar_error",
-    ),
-    _builtin_operator(
-        operator_id="input.surface.fragmented_syntax",
-        generation_mechanism="llm",
-        allowed_change="declared_communication_form",
-        target_communication_kind="fragmented_syntax",
-    ),
-    _builtin_operator(
-        operator_id="input.surface.disfluency_repeat",
-        generation_mechanism="llm",
-        allowed_change="declared_communication_form",
-        target_communication_kind="repetition",
-    ),
-    _builtin_operator(
-        operator_id="input.style.terse",
-        generation_mechanism="llm",
-        allowed_change="declared_communication_form",
-        target_communication_kind="terse",
-    ),
-    _builtin_operator(
-        operator_id="input.style.verbose",
-        generation_mechanism="llm",
-        allowed_change="declared_communication_form",
-        target_communication_kind="verbose",
-    ),
-    _builtin_operator(
-        operator_id="input.tone.angry",
-        generation_mechanism="llm",
-        allowed_change="declared_communication_form",
-        target_communication_kind="angry",
-    ),
-    _builtin_operator(
-        operator_id="input.tone.argumentative",
-        generation_mechanism="llm",
-        allowed_change="declared_communication_form",
-        target_communication_kind="argumentative",
-    ),
-    _builtin_operator(
-        operator_id="input.intent.self_correction",
-        generation_mechanism="deterministic",
-        allowed_change="structured_self_correction",
-        target_communication_kind="self_correction",
-    ),
-)
-_BUILTIN_OPERATORS_BY_REFERENCE = {
-    (operator.id, operator.version): operator for operator in _BUILTIN_OPERATORS
-}
-
-
-def builtin_dataset_augmentation_operators() -> tuple[DatasetAugmentationOperator, ...]:
-    return _BUILTIN_OPERATORS
-
-
-def resolve_dataset_augmentation_operator(reference: str) -> DatasetAugmentationOperator:
-    if not reference or len(reference) > 251 or reference.count("@") > 1:
-        raise ValueError("unknown dataset augmentation reference")
-    operator_id, separator, version = reference.partition("@")
-    if separator:
-        operator = _BUILTIN_OPERATORS_BY_REFERENCE.get((operator_id, version))
-        if operator is None:
-            raise ValueError("unknown dataset augmentation reference")
-        return operator
-    matching = tuple(operator for operator in _BUILTIN_OPERATORS if operator.id == operator_id)
-    if not matching:
-        raise ValueError("unknown dataset augmentation reference")
-    return max(matching, key=lambda operator: _version_tuple(operator.version))
 
 
 class SemanticNormalizationAssessment(ULModel):
@@ -474,10 +302,11 @@ class DatasetAugmentationEngine:
                         self_correction_plan,
                     )
                 else:
-                    transformation_prompt_names = (_OPERATOR_PROMPT_NAMES[operator.id],)
+                    transformation_prompt_names = (dataset_operator_prompt_name(operator),)
                     render_instruction = _meaning_guided_instruction(
                         operator.instruction,
                         expected_input_frame,
+                        target_communication_kind=operator.target_communication_kind,
                     )
                     rendered_input = await self._renderer.render(
                         record.raw_input, render_instruction
@@ -534,6 +363,7 @@ class DatasetAugmentationEngine:
                             _task_meaning_difference_reasons(
                                 expected_input_frame,
                                 reparsed_frame,
+                                target_communication_kind=operator.target_communication_kind,
                             )
                         )
                     elif operator.allowed_change == "structured_self_correction":
@@ -562,6 +392,7 @@ class DatasetAugmentationEngine:
                             _task_meaning_difference_reasons(
                                 expected_input_frame,
                                 reparsed_frame,
+                                target_communication_kind=operator.target_communication_kind,
                             )
                         )
                     if _has_unresolved_nodes(reparsed_frame):
@@ -584,7 +415,9 @@ class DatasetAugmentationEngine:
                             equivalence_assessment = await self._equivalence_verifier.verify(
                                 record.raw_input,
                                 augmented_input,
-                                allowed_surface_change=_allowed_surface_change(operator.id),
+                                allowed_surface_change=dataset_operator_runtime(
+                                    operator
+                                ).semantic_allowed_surface_change,
                             )
                         except ValueError:
                             failure_reasons = ["semantic equivalence validation failed"]
@@ -651,7 +484,11 @@ class DatasetAugmentationEngine:
                         reparsed_input_frame=reparsed_frame,
                         semantic_equivalence_assessment=equivalence_assessment,
                         semantic_normalization=(
-                            _semantic_normalization_assessment(expected_input_frame, reparsed_frame)
+                            _semantic_normalization_assessment(
+                                expected_input_frame,
+                                reparsed_frame,
+                                target_communication_kind=operator.target_communication_kind,
+                            )
                             if reparsed_frame is not None
                             else None
                         ),
@@ -781,8 +618,13 @@ def _input_evidence(element: Any) -> tuple[Any, ...]:
     return tuple(evidence for evidence in element.evidence if evidence.source == "input")
 
 
-def _meaning_guided_instruction(instruction: str, frame: SemanticFrame) -> str:
-    meaning_frame = _without_pure_communication_form(frame)
+def _meaning_guided_instruction(
+    instruction: str,
+    frame: SemanticFrame,
+    *,
+    target_communication_kind: str | None,
+) -> str:
+    meaning_frame = _without_target_communication_form(frame, target_communication_kind)
     meaning_to_preserve = {
         "requests": [
             {
@@ -838,10 +680,17 @@ def _meaning_guided_instruction(instruction: str, frame: SemanticFrame) -> str:
 
 
 def _task_meaning_difference_reasons(
-    expected: SemanticFrame, reparsed: SemanticFrame
+    expected: SemanticFrame,
+    reparsed: SemanticFrame,
+    *,
+    target_communication_kind: str | None,
 ) -> tuple[str, ...]:
-    expected_semantics = _canonical_semantics(_without_pure_communication_form(expected))
-    reparsed_semantics = _canonical_semantics(_without_pure_communication_form(reparsed))
+    expected_semantics = _canonical_semantics(
+        _without_target_communication_form(expected, target_communication_kind)
+    )
+    reparsed_semantics = _canonical_semantics(
+        _without_target_communication_form(reparsed, target_communication_kind)
+    )
     labels = ("factors", "request units", "relations", "communication acts")
     return tuple(
         f"{label} differ from the expected frame"
@@ -855,7 +704,10 @@ def _task_meaning_difference_reasons(
     )
 
 
-def _without_pure_communication_form(frame: SemanticFrame) -> SemanticFrame:
+def _without_target_communication_form(
+    frame: SemanticFrame,
+    target_communication_kind: str | None,
+) -> SemanticFrame:
     related_ids = {
         element_id
         for relation in frame.relations
@@ -867,7 +719,8 @@ def _without_pure_communication_form(frame: SemanticFrame) -> SemanticFrame:
                 act
                 for act in frame.communication_acts
                 if not (
-                    act.kind in _COMMUNICATION_FORM_KINDS
+                    target_communication_kind is not None
+                    and act.kind == target_communication_kind
                     and not act.factor_ids
                     and not act.attributes
                     and act.id not in related_ids
@@ -878,7 +731,10 @@ def _without_pure_communication_form(frame: SemanticFrame) -> SemanticFrame:
 
 
 def _semantic_normalization_assessment(
-    expected: SemanticFrame, reparsed: SemanticFrame
+    expected: SemanticFrame,
+    reparsed: SemanticFrame,
+    *,
+    target_communication_kind: str | None,
 ) -> SemanticNormalizationAssessment | None:
     applied_rules: list[
         Literal["ordered_list_factor_decomposition", "redundant_scalar_fulfills_elision"]
@@ -899,7 +755,11 @@ def _semantic_normalization_assessment(
         applied_rules=tuple(applied_rules),
         verdict=(
             "equivalent"
-            if not _task_meaning_difference_reasons(expected, reparsed)
+            if not _task_meaning_difference_reasons(
+                expected,
+                reparsed,
+                target_communication_kind=target_communication_kind,
+            )
             else "different"
         ),
     )
@@ -1849,16 +1709,6 @@ def _changed_word_count(source_input: str, augmented_input: str) -> int:
     return max(sum(source_words.values()), sum(augmented_words.values())) - shared_word_count
 
 
-def _allowed_surface_change(operator_id: OperatorId) -> SemanticAllowedSurfaceChange:
-    if operator_id == "input.surface.punctuation_noise":
-        return "unprotected_punctuation_noise"
-    if operator_id == "input.tone.angry":
-        return "hostile_angry_tone"
-    if operator_id == "input.tone.argumentative":
-        return "hostile_argumentative_tone"
-    return "none"
-
-
 def _add_typing_noise(
     record: InteractionRecord,
     frame: SemanticFrame,
@@ -2417,30 +2267,6 @@ def _relation_endpoint_group(
             )
         )
     )
-
-
-def _select_operators(
-    operator_ids: Iterable[str],
-) -> tuple[DatasetAugmentationOperator, ...]:
-    selected_references = tuple(islice(operator_ids, len(_BUILTIN_OPERATORS) + 1))
-    if not selected_references:
-        raise ValueError("operator_ids must contain at least one operator")
-    if any(not reference for reference in selected_references):
-        raise ValueError("operator identifiers must not be empty")
-    if len(selected_references) > len(_BUILTIN_OPERATORS):
-        raise ValueError("operator count exceeds the built-in library")
-    selected_operators = tuple(
-        resolve_dataset_augmentation_operator(reference) for reference in selected_references
-    )
-    resolved_references = tuple((operator.id, operator.version) for operator in selected_operators)
-    if len(resolved_references) != len(set(resolved_references)):
-        raise ValueError("operator identifiers must be unique")
-    return selected_operators
-
-
-def _version_tuple(version: str) -> tuple[int, int, int]:
-    major, minor, patch = version.split(".")
-    return int(major), int(minor), int(patch)
 
 
 def _text_key(text: str) -> str:

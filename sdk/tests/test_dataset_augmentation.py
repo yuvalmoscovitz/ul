@@ -435,7 +435,7 @@ async def test_engine_rephrases_and_independently_validates_full_semantics() -> 
     assert not isinstance(model.deconstructed_records[1], InteractionRecord)
 
 
-async def test_meaning_guidance_excludes_changeable_style_and_keeps_exact_factor_text() -> None:
+async def test_meaning_guidance_preserves_non_target_communication_and_exact_factor_text() -> None:
     record = source_record()
     original_frame = source_frame(record)
     frame = original_frame.model_copy(
@@ -475,8 +475,41 @@ async def test_meaning_guidance_excludes_changeable_style_and_keeps_exact_factor
     _, serialized_meaning = model.rendered_instructions[0].rsplit("\nmeaning_to_preserve=", 1)
     meaning = json.loads(serialized_meaning)
 
-    assert meaning["communication_acts"] == []
+    assert meaning["communication_acts"] == [{"kind": "angry", "factor_ids": [], "attributes": {}}]
     assert meaning["exact_text"] == ["100"]
+
+
+async def test_semantic_validation_uses_declared_communication_kind_without_allowlist() -> None:
+    record = source_record()
+    expected = source_frame(record)
+    reparsed = expected.model_copy(
+        update={
+            "communication_acts": (
+                *expected.communication_acts,
+                CommunicationAct(
+                    id="candidate:customer-form",
+                    evidence=evidence("input"),
+                    confidence=1,
+                    status="explicit",
+                    kind="customer_specific_form",
+                ),
+            )
+        }
+    )
+
+    assert (
+        dataset_augmentations._task_meaning_difference_reasons(
+            expected,
+            reparsed,
+            target_communication_kind="customer_specific_form",
+        )
+        == ()
+    )
+    assert dataset_augmentations._task_meaning_difference_reasons(
+        expected,
+        reparsed,
+        target_communication_kind=None,
+    ) == ("communication acts differ from the expected frame",)
 
 
 async def test_engine_groups_multiple_records_by_requested_operator_order() -> None:
@@ -2314,7 +2347,7 @@ async def test_behavior_operator_validity_does_not_require_target_marker() -> No
     assert result.candidates[0].passed
 
 
-async def test_rephrase_ignores_pure_communication_form_changes() -> None:
+async def test_rephrase_rejects_non_target_communication_form_changes() -> None:
     record = source_record()
     original_frame = source_frame(record)
     changed_communication = source_frame(record, identifier_prefix="candidate").model_copy(
@@ -2340,9 +2373,11 @@ async def test_rephrase_ignores_pure_communication_form_changes() -> None:
         (record,), operator_ids=("input.surface.rephrase",)
     )
 
-    assert result.candidates[0].passed
+    assert not result.candidates[0].passed
+    assert result.candidates[0].failure_reasons == (
+        "communication acts differ from the expected frame",
+    )
     assert result.candidates[0].allowed_change == "surface_form_only"
-    assert result.candidates[0].failure_reasons == ()
 
 
 async def test_engine_rejects_candidate_frame_for_another_input() -> None:
@@ -2420,7 +2455,7 @@ async def test_punctuation_noise_is_deterministic_and_preserves_source_text() ->
     assert model.rendered_inputs == []
 
 
-async def test_pure_style_label_does_not_trigger_equivalence_fallback() -> None:
+async def test_non_target_style_label_triggers_equivalence_fallback() -> None:
     record = source_record()
     original_frame = source_frame(record)
     candidate_frame = source_frame(record, identifier_prefix="candidate").model_copy(
@@ -2455,8 +2490,8 @@ async def test_pure_style_label_does_not_trigger_equivalence_fallback() -> None:
 
     candidate = result.candidates[0]
     assert candidate.passed
-    assert candidate.semantic_equivalence_assessment is None
-    assert verifier.allowed_surface_changes == []
+    assert candidate.semantic_equivalence_assessment == assessment
+    assert verifier.allowed_surface_changes == ["unprotected_punctuation_noise"]
 
 
 async def test_punctuation_noise_avoids_punctuation_inside_semantic_values() -> None:
@@ -2630,7 +2665,9 @@ async def test_relation_decomposition_fails_closed_before_oversized_expansion(
 
     assert (
         dataset_augmentations._task_meaning_difference_reasons(
-            frame, frame.model_copy(update={"relations": tuple(reversed(frame.relations))})
+            frame,
+            frame.model_copy(update={"relations": tuple(reversed(frame.relations))}),
+            target_communication_kind=None,
         )
         == ()
     )

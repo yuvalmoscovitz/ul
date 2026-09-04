@@ -44,6 +44,9 @@ from ul_core.augmentations.definitions import (
     AugmentationRequirements,
     BuiltinAugmentationCatalog,
     BuiltinAugmentationSpec,
+    DatasetAllowedChange,
+    DatasetGenerationMechanism,
+    DatasetVariationRuntime,
     builtin_augmentation_catalog,
 )
 from ul_core.augmentations.projections import (
@@ -86,6 +89,9 @@ __all__ = [
     "BundleSourceCase",
     "ConversationModifierBinding",
     "ConversationModifierRuntime",
+    "DatasetAllowedChange",
+    "DatasetGenerationMechanism",
+    "DatasetVariationRuntime",
     "DeterministicTransformBinding",
     "DeterministicTransformRuntime",
     "EnvironmentScheduleBinding",
