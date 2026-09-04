@@ -609,29 +609,46 @@ class DatasetEvaluationRunner:
             subject: Literal["current baseline", "variation"],
             variation_id: str,
         ) -> DatasetEvaluationTrial:
-            async with target_request_semaphore:
+            target_delivery_started = False
+
+            def record_trial_started() -> None:
+                nonlocal target_delivery_started
+                target_delivery_started = True
                 if trial_started_callback is not None:
                     trial_started_callback(unit)
-                try:
-                    trial = await self._execute_trial(
-                        repetition=unit.repetition,
-                        interaction_id=interaction_id,
-                        raw_input=raw_input,
-                        reference_frame=reference_frame,
-                        source=source,
-                        subject=subject,
-                        variation_id=variation_id,
-                        comparison_surface=comparison_surface,
-                    )
-                    if trial_terminal_callback is not None:
-                        trial_terminal_callback(unit, trial)
-                    return trial
-                except asyncio.CancelledError:
-                    self._target_state_uncertain = True
+
+            try:
+                trial = await self._execute_trial(
+                    repetition=unit.repetition,
+                    interaction_id=interaction_id,
+                    raw_input=raw_input,
+                    reference_frame=reference_frame,
+                    source=source,
+                    subject=subject,
+                    variation_id=variation_id,
+                    comparison_surface=comparison_surface,
+                    target_request_semaphore=target_request_semaphore,
+                    trial_started_callback=record_trial_started,
+                )
+                if trial_terminal_callback is not None:
+                    trial_terminal_callback(unit, trial)
+                if (
+                    self._max_concurrent_target_requests > 1
+                    and trial.lifecycle_failure is not None
+                    and trial.lifecycle_failure.environment_state_may_remain
+                ):
                     raise DatasetTargetDeliveryUncertain(
-                        "target delivery is uncertain; environment quarantined and trial not "
-                        "retried"
-                    ) from None
+                        "target state is uncertain; terminal evidence was recorded and in-flight "
+                        "trials were stopped"
+                    )
+                return trial
+            except asyncio.CancelledError:
+                if not target_delivery_started:
+                    raise
+                self._target_state_uncertain = True
+                raise DatasetTargetDeliveryUncertain(
+                    "target delivery is uncertain; environment quarantined and trial not retried"
+                ) from None
 
         async def execute_repetition(repetition: int) -> None:
             baseline_unit = DatasetTrialUnit(
@@ -705,10 +722,20 @@ class DatasetEvaluationRunner:
         else:
             delivery_uncertain = False
             unexpected_error: BaseException | None = None
+            repetition_iterator = iter(range(1, repetitions + 1))
+
+            async def execute_repetitions() -> None:
+                for repetition in repetition_iterator:
+                    await execute_repetition(repetition)
+
             try:
                 async with asyncio.TaskGroup() as repetition_tasks:
-                    for repetition in range(1, repetitions + 1):
-                        repetition_tasks.create_task(execute_repetition(repetition))
+                    worker_count = min(
+                        repetitions,
+                        self._max_concurrent_target_requests * 2,
+                    )
+                    for _ in range(worker_count):
+                        repetition_tasks.create_task(execute_repetitions())
             except* DatasetTargetDeliveryUncertain:
                 delivery_uncertain = True
             except* BaseException as error:
@@ -874,8 +901,14 @@ class DatasetEvaluationRunner:
         subject: Literal["current baseline", "variation"],
         variation_id: str,
         comparison_surface: ComparisonSurface,
+        target_request_semaphore: asyncio.Semaphore,
+        trial_started_callback: Callable[[], None],
     ) -> DatasetEvaluationTrial:
         if self._target_state_uncertain:
+            if self._max_concurrent_target_requests > 1:
+                raise DatasetTargetDeliveryUncertain(
+                    "target state is uncertain; queued trials were stopped"
+                )
             return DatasetEvaluationTrial(
                 repetition=repetition,
                 inconclusive_reasons=(
@@ -883,97 +916,134 @@ class DatasetEvaluationRunner:
                     "environment state may remain",
                 ),
             )
+        target_delivery_started = False
         try:
-            async with asyncio.timeout(self._target_timeout_seconds):
-                evaluation_case = EvaluationCase(
-                    id=source.id,
-                    turns=(
-                        ConversationTurn(
-                            id=f"turn-{secrets.token_hex(12)}",
-                            role=ConversationRole.USER,
-                            content=raw_input,
+            async with target_request_semaphore:
+                if self._target_state_uncertain:
+                    if self._max_concurrent_target_requests > 1:
+                        raise DatasetTargetDeliveryUncertain(
+                            "target state is uncertain; queued trials were stopped"
+                        )
+                    return DatasetEvaluationTrial(
+                        repetition=repetition,
+                        inconclusive_reasons=(
+                            f"{subject} not executed because target state is uncertain; "
+                            "environment state may remain",
                         ),
-                    ),
-                    max_environment_api_calls=1,
-                    timeout_seconds=self._target_timeout_seconds,
-                    probe_context={
-                        **source.probe_context(raw_input),
-                        "ul.variation.id": variation_id,
-                        "ul.repetition": repetition,
-                    },
-                )
-                environment_api_calls = self._environment.api_calls_for_case(evaluation_case)
-                if type(environment_api_calls) is not int or environment_api_calls < 1:
-                    raise RuntimeError("environment returned an invalid API call count")
-                evaluation_case = evaluation_case.model_copy(
-                    update={"max_environment_api_calls": environment_api_calls}
-                )
-                execution_evidence = await self._environment.execute(evaluation_case)
-        except OutcomeProjectionExecutionError as error:
-            return self._outcome_projection_failure_trial(
-                repetition=repetition,
-                subject=subject,
-                error=error,
-                completed_phases=error.completed_phases,
-                cleanup_reset_failed=error.cleanup_reset_failed,
-                target_safe_to_reuse=error.target_safe_to_reuse,
-            )
+                    )
+                trial_started_callback()
+                target_delivery_started = True
+                try:
+                    async with asyncio.timeout(self._target_timeout_seconds):
+                        evaluation_case = EvaluationCase(
+                            id=source.id,
+                            turns=(
+                                ConversationTurn(
+                                    id=f"turn-{secrets.token_hex(12)}",
+                                    role=ConversationRole.USER,
+                                    content=raw_input,
+                                ),
+                            ),
+                            max_environment_api_calls=1,
+                            timeout_seconds=self._target_timeout_seconds,
+                            probe_context={
+                                **source.probe_context(raw_input),
+                                "ul.variation.id": variation_id,
+                                "ul.repetition": repetition,
+                            },
+                        )
+                        environment_api_calls = self._environment.api_calls_for_case(
+                            evaluation_case
+                        )
+                        if type(environment_api_calls) is not int or environment_api_calls < 1:
+                            raise RuntimeError("environment returned an invalid API call count")
+                        evaluation_case = evaluation_case.model_copy(
+                            update={"max_environment_api_calls": environment_api_calls}
+                        )
+                        execution_evidence = await self._environment.execute(evaluation_case)
+                except OutcomeProjectionExecutionError as error:
+                    return self._outcome_projection_failure_trial(
+                        repetition=repetition,
+                        subject=subject,
+                        error=error,
+                        completed_phases=error.completed_phases,
+                        cleanup_reset_failed=error.cleanup_reset_failed,
+                        target_safe_to_reuse=error.target_safe_to_reuse,
+                    )
+                except TimeoutError:
+                    if environment_timeout_requires_quarantine(self._environment.capabilities):
+                        self._target_state_uncertain = True
+                    return DatasetEvaluationTrial(
+                        repetition=repetition,
+                        inconclusive_reasons=(f"{subject} execution timed out",),
+                    )
+                except asyncio.CancelledError:
+                    self._target_state_uncertain = True
+                    raise DatasetTargetDeliveryUncertain(
+                        "target delivery is uncertain; environment quarantined and trial not "
+                        "retried"
+                    ) from None
+                try:
+                    validate_execution_evidence(
+                        evaluation_case,
+                        self._environment,
+                        execution_evidence,
+                    )
+                except OutcomeProjectionError as error:
+                    target_safe_to_reuse = (
+                        execution_evidence.evidence_scope == "response_and_state"
+                        and not execution_evidence_requires_quarantine(execution_evidence)
+                    )
+                    return self._outcome_projection_failure_trial(
+                        repetition=repetition,
+                        subject=subject,
+                        error=error,
+                        completed_phases=execution_evidence.lifecycle.completed_phases,
+                        cleanup_reset_failed=execution_evidence.lifecycle.cleanup == "failed",
+                        target_safe_to_reuse=target_safe_to_reuse,
+                    )
+                lifecycle = execution_evidence.lifecycle
+                if lifecycle.terminal_status != "succeeded":
+                    environment_state_may_remain = execution_evidence_requires_quarantine(
+                        execution_evidence
+                    )
+                    if environment_state_may_remain:
+                        self._target_state_uncertain = True
+                    cleanup_reason = (
+                        "; cleanup reset also failed; environment state may remain"
+                        if lifecycle.cleanup == "failed"
+                        and lifecycle.failed_phase != "cleanup_reset"
+                        else (
+                            "; environment state may remain" if environment_state_may_remain else ""
+                        )
+                    )
+                    return DatasetEvaluationTrial(
+                        repetition=repetition,
+                        inconclusive_reasons=(
+                            f"{subject} lifecycle failed during {lifecycle.failed_phase}"
+                            f"{cleanup_reason}",
+                        ),
+                        lifecycle_failure=DatasetTargetLifecycleFailure(
+                            failed_phase=lifecycle.failed_phase or "unknown",
+                            completed_phases=lifecycle.completed_phases,
+                            cleanup_reset_failed=lifecycle.cleanup == "failed",
+                            environment_state_may_remain=environment_state_may_remain,
+                        ),
+                        execution_evidence=execution_evidence,
+                    )
         except asyncio.CancelledError:
+            if not target_delivery_started:
+                raise
             self._target_state_uncertain = True
             raise DatasetTargetDeliveryUncertain(
                 "target delivery is uncertain; environment quarantined and trial not retried"
             ) from None
-        except TimeoutError:
-            if environment_timeout_requires_quarantine(self._environment.capabilities):
-                self._target_state_uncertain = True
-            return DatasetEvaluationTrial(
-                repetition=repetition,
-                inconclusive_reasons=(f"{subject} execution timed out",),
-            )
+        except DatasetTargetDeliveryUncertain:
+            raise
         except RuntimeError:
             return DatasetEvaluationTrial(
                 repetition=repetition,
                 inconclusive_reasons=(f"{subject} execution failed",),
-            )
-        try:
-            validate_execution_evidence(evaluation_case, self._environment, execution_evidence)
-        except OutcomeProjectionError as error:
-            target_safe_to_reuse = (
-                execution_evidence.evidence_scope == "response_and_state"
-                and not execution_evidence_requires_quarantine(execution_evidence)
-            )
-            return self._outcome_projection_failure_trial(
-                repetition=repetition,
-                subject=subject,
-                error=error,
-                completed_phases=execution_evidence.lifecycle.completed_phases,
-                cleanup_reset_failed=execution_evidence.lifecycle.cleanup == "failed",
-                target_safe_to_reuse=target_safe_to_reuse,
-            )
-        lifecycle = execution_evidence.lifecycle
-        if lifecycle.terminal_status != "succeeded":
-            environment_state_may_remain = execution_evidence_requires_quarantine(
-                execution_evidence
-            )
-            if environment_state_may_remain:
-                self._target_state_uncertain = True
-            cleanup_reason = (
-                "; cleanup reset also failed; environment state may remain"
-                if lifecycle.cleanup == "failed" and lifecycle.failed_phase != "cleanup_reset"
-                else ("; environment state may remain" if environment_state_may_remain else "")
-            )
-            return DatasetEvaluationTrial(
-                repetition=repetition,
-                inconclusive_reasons=(
-                    f"{subject} lifecycle failed during {lifecycle.failed_phase}{cleanup_reason}",
-                ),
-                lifecycle_failure=DatasetTargetLifecycleFailure(
-                    failed_phase=lifecycle.failed_phase or "unknown",
-                    completed_phases=lifecycle.completed_phases,
-                    cleanup_reset_failed=lifecycle.cleanup == "failed",
-                    environment_state_may_remain=environment_state_may_remain,
-                ),
-                execution_evidence=execution_evidence,
             )
         if len(execution_evidence.turns) != 1:
             raise RuntimeError("environment returned invalid single-turn evidence")

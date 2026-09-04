@@ -234,6 +234,7 @@ class ComposedEnvironmentExecutor:
         self._lock = asyncio.Lock()
         self._parallel_response_execution = (
             invoker.capabilities.request_isolation == "per_request_attested"
+            and inspect.iscoroutinefunction(invoker.invoke)
             and state_environment is None
             and observation_source is None
             and worker_trace_flusher is None

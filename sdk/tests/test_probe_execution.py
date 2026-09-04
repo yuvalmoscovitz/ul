@@ -875,6 +875,47 @@ async def test_sync_invoker_does_not_depend_on_global_executor_capacity() -> Non
 
 
 @pytest.mark.asyncio
+async def test_attested_sync_invoker_serializes_overlapping_public_execute_calls() -> None:
+    first_invocation_started = threading.Event()
+    release_first_invocation = threading.Event()
+
+    class _AttestedSyncInvoker(_Invoker):
+        capabilities = ProbeInvokerCapabilities(
+            invoker_id="attested-sync-invoker",
+            response_size_limit_bytes=1_000,
+            supports_conversations=True,
+            request_isolation="per_request_attested",
+        )
+
+        def invoke(self, request: ProbeRequest) -> ProbeResult:
+            if request.turn.input == "first":
+                first_invocation_started.set()
+                release_first_invocation.wait()
+            return super().invoke(request)
+
+    executor = ComposedEnvironmentExecutor(
+        _AttestedSyncInvoker(),
+        config_sha256=_CONFIG_SHA256,
+    )
+    first_task = asyncio.create_task(executor.execute(_case("first")))
+    while not first_invocation_started.is_set():
+        await asyncio.sleep(0)
+    second_task = asyncio.create_task(executor.execute(_case("second")))
+    await asyncio.sleep(0)
+
+    try:
+        release_first_invocation.set()
+        first_evidence, second_evidence = await asyncio.gather(first_task, second_task)
+    finally:
+        release_first_invocation.set()
+
+    assert first_evidence.lifecycle.terminal_status == "succeeded"
+    assert second_evidence.lifecycle.terminal_status == "succeeded"
+    assert first_evidence.final_response == {"echo": "first"}
+    assert second_evidence.final_response == {"echo": "second"}
+
+
+@pytest.mark.asyncio
 async def test_timed_out_sync_invocation_is_not_retried_while_still_running() -> None:
     release_invocation = threading.Event()
 
