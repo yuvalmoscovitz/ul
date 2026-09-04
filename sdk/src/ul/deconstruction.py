@@ -1343,16 +1343,22 @@ class SemanticModelDeconstructor:
         finish_reason: str | None,
     ) -> ProviderDiagnosticError:
         if finish_reason == "length":
+            suggested_actions = {
+                "deconstruct": (
+                    "raise UL_DATASET_MAX_OUTPUT_TOKENS for this evaluator, then start a new run."
+                ),
+                "render": (
+                    "raise UL_DATASET_MAX_RENDER_TOKENS for this evaluator, then start a new run."
+                ),
+                "verify": "choose a more concise evaluator model, then start a new run.",
+            }
             return ProviderDiagnosticError(
                 ProviderDiagnostic(
                     provider=self.llm_client.config.provider_id,
                     operation=operation,
                     category="output_limit",
                     retryable=False,
-                    suggested_action=(
-                        "raise UL_DATASET_MAX_OUTPUT_TOKENS for this evaluator, then start a new "
-                        "run."
-                    ),
+                    suggested_action=suggested_actions[operation],
                     endpoint_sha256=self.llm_client.config.endpoint_sha256,
                 )
             )

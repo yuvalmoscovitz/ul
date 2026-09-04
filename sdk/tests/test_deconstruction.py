@@ -1734,6 +1734,30 @@ async def test_deconstruct_reports_provider_output_limit() -> None:
     await client.aclose()
 
 
+async def test_render_reports_its_provider_output_limit_setting() -> None:
+    client = mock_client(lambda request: completion("{", finish_reason="length"))
+
+    async with create_semantic_model_deconstructor(settings(), client=client) as deconstructor:
+        with pytest.raises(ProviderDiagnosticError) as provider_error:
+            await deconstructor.render("send the invoice", "make it terse")
+
+    assert provider_error.value.diagnostic.category == "output_limit"
+    assert "UL_DATASET_MAX_RENDER_TOKENS" in str(provider_error.value)
+    await client.aclose()
+
+
+async def test_verify_reports_actionable_provider_output_limit() -> None:
+    client = mock_client(lambda request: completion("{", finish_reason="length"))
+
+    async with create_semantic_model_deconstructor(settings(), client=client) as deconstructor:
+        with pytest.raises(ProviderDiagnosticError) as provider_error:
+            await deconstructor.verify("send the invoice", "send invoice")
+
+    assert provider_error.value.diagnostic.category == "output_limit"
+    assert "concise evaluator model" in str(provider_error.value)
+    await client.aclose()
+
+
 async def test_generated_schema_explains_exact_grounding_contract() -> None:
     schema = SemanticFrame.model_json_schema(mode="validation")
     evidence_properties = schema["$defs"]["EvidenceReference"]["properties"]
