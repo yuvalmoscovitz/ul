@@ -226,8 +226,7 @@ class _RegressionSemanticModel(_CleanRoomSemanticModel):
         reference_frame: SemanticFrame | None = None,
     ) -> SemanticFrame:
         if not isinstance(record, InteractionRecord):
-            assert reference_frame is not None
-            return reference_frame.model_copy(update={"interaction_id": record.id})
+            return await super().deconstruct(record, reference_frame)
         output = cast(dict[str, Any], record.raw_observed_output)
         return SemanticFrame(
             interaction_id=record.id,
@@ -290,8 +289,7 @@ class _ResponseOnlySemanticModel(_CleanRoomSemanticModel):
         reference_frame: SemanticFrame | None = None,
     ) -> SemanticFrame:
         if not isinstance(record, InteractionRecord):
-            assert reference_frame is not None
-            return reference_frame.model_copy(update={"interaction_id": record.id})
+            return await super().deconstruct(record, reference_frame)
         output = record.raw_observed_output
         if isinstance(output, str):
             recommendation = output
@@ -357,8 +355,7 @@ class _UnknownOutcomeSemanticModel(_ResponseOnlySemanticModel):
         reference_frame: SemanticFrame | None = None,
     ) -> SemanticFrame:
         if not isinstance(record, InteractionRecord):
-            assert reference_frame is not None
-            return reference_frame.model_copy(update={"interaction_id": record.id})
+            return await super().deconstruct(record, reference_frame)
         return SemanticFrame(
             interaction_id=record.id,
             outcomes=(
@@ -2828,6 +2825,8 @@ def test_public_probe_runs_answer_only_callable_through_real_worker_and_reports_
     finding = evidence_lines[1]["cases"][0]["findings"][0]
     cross_examination = evidence_lines[1]["cases"][0]["cross_examination"]
     assert finding["category"] == "changed_response"
+    assert finding["summary"].endswith("at /recommendation.")
+    assert "PRIVATE_RESPONSE_CANARY" not in finding["summary"]
     assert cross_examination["response_evidence"]["conclusion"] == "observed"
     assert cross_examination["committed_state_evidence"]["conclusion"] == "unavailable"
     assert all(effect["kind"] == "answer" for effect in finding["reference_effects"])
@@ -2895,7 +2894,7 @@ def test_public_probe_runs_raw_text_callable_through_real_worker_without_leaking
     assert evidence["cases"][0]["findings"][0]["category"] == "changed_response"
 
 
-def test_public_probe_maps_source_compatibility_before_campaign_target_invocation(
+def test_public_probe_accepts_arbitrary_recorded_responses_without_custom_mapping(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2933,12 +2932,9 @@ def test_public_probe_maps_source_compatibility_before_campaign_target_invocatio
         input="y\ny\n",
     )
 
-    assert result.exit_code == 2, result.output
-    assert "PROBE_SOURCE_COMPARISON_INCOMPATIBLE" in result.output
-    assert "no coherent action or grounded response" in result.output
-    assert "Record the agent's returned text or JSON response" in result.output
-    assert "Target safe to reuse: yes" in result.output
-    assert (tmp_path / "target-invocations").read_text().splitlines() == ["called"]
+    assert result.exit_code == 0, result.output
+    assert "PROBE_SOURCE_COMPARISON_INCOMPATIBLE" not in result.output
+    assert (tmp_path / "target-invocations").read_text().splitlines() == ["called"] * 2
 
 
 def test_public_probe_maps_invalid_recorded_projection_before_campaign_target_invocation(

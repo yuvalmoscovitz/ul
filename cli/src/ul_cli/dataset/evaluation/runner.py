@@ -20,9 +20,9 @@ from ul import (
     EvaluatorModelPreflight,
     InteractionRecord,
     OpenAICompatibleEvaluatorJudge,
-    ProjectedResponseSemanticDeconstructor,
     RedactedSemanticPipeline,
     RedactionEngine,
+    ReturnedResponseSemanticDeconstructor,
     create_semantic_model_deconstructor,
 )
 from ul.dataset_invariants import (
@@ -154,11 +154,7 @@ async def evaluate_interaction_records(
                 else target
             )
             source_outcome_projection = getattr(target, "outcome_projection", None)
-            evaluation_deconstructor = (
-                ProjectedResponseSemanticDeconstructor(semantic_pipeline)
-                if source_outcome_projection is not None
-                else semantic_pipeline
-            )
+            evaluation_deconstructor = ReturnedResponseSemanticDeconstructor(semantic_pipeline)
             runner = DatasetEvaluationRunner(
                 DatasetAugmentationEngine(
                     evaluation_deconstructor,

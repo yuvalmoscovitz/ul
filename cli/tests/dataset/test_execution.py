@@ -177,6 +177,7 @@ class _LocalEvaluationSemanticModel:
         self.llm_client = LLMClient(
             llm_client_config_from_dataset_settings(semantic_settings or _settings())
         )
+        self.deconstructed_records: list[InteractionRecord | UserInputRecord] = []
 
     async def __aenter__(self) -> _LocalEvaluationSemanticModel:
         return self
@@ -192,6 +193,7 @@ class _LocalEvaluationSemanticModel:
         record: InteractionRecord | UserInputRecord,
         reference_frame: SemanticFrame | None = None,
     ) -> SemanticFrame:
+        self.deconstructed_records.append(record)
         if not isinstance(record, InteractionRecord):
             if reference_frame is not None:
                 return reference_frame.model_copy(update={"interaction_id": record.id})
@@ -729,7 +731,7 @@ def test_full_dataset_evaluation_runs_local_callable_through_worker_boundary(
         ],
     )
 
-    assert result.exit_code == 0, result.output
+    assert result.exit_code == (0 if wrapped_action_fields else 2), result.output
     saved = json.loads(output.read_text(encoding="utf-8").splitlines()[1])
     assert saved["run_context"]["target"]["kind"] == "probe_target"
     assert saved["run_context"]["fixture"]["status"] == "not_required"
@@ -739,26 +741,28 @@ def test_full_dataset_evaluation_runs_local_callable_through_worker_boundary(
     assert manifest.effective_command.run_config.target.trial_timeout_seconds == 90.0
     assert len(saved["technical_details"]["baseline"]["trial_set"]["trials"]) == 2
     assert saved["technical_details"]["baseline"]["verdict"] == "no_divergence"
-    assert saved["technical_details"]["cases"][0]["verdict"] == "no_divergence"
+    expected_case_verdict = "no_divergence" if wrapped_action_fields else "divergence_needs_review"
+    assert saved["technical_details"]["cases"][0]["verdict"] == expected_case_verdict
+    if not wrapped_action_fields:
+        assert saved["cases"][0]["findings"][0]["summary"].endswith("at /received.")
     observed_fields = saved["technical_details"]["baseline"]["trial_set"]["trials"][0][
         "observed_frame"
     ]["outcomes"][0]["fields"]
-    assert observed_fields["ticket"] == 42
-    if wrapped_action_fields:
-        assert observed_fields == {
-            "ticket": 42,
-            "body.intent": "order",
-            "body.note.text": "Return status for ticket 42.",
-            "authoredOn": {
-                "value": "stale-reference-only-value",
-                "evidence": [
-                    {
-                        "source": "output",
-                        "json_pointer": "/raw_observed_output/actions/0/authoredOn",
-                    }
-                ],
-            },
-        }
+    assert observed_fields == {
+        "value": (
+            {"actions": [canonical_action]}
+            if wrapped_action_fields
+            else {
+                "action": "lookup",
+                "ticket": 42,
+                "received": "Return status for ticket 42.",
+            }
+        )
+    }
+    assert semantic_model.deconstructed_records
+    assert all(
+        isinstance(record, UserInputRecord) for record in semantic_model.deconstructed_records
+    )
     final_response = saved["technical_details"]["baseline"]["trial_set"]["trials"][0][
         "execution_evidence"
     ]["final_response"]
@@ -1420,7 +1424,7 @@ def test_local_target_pause_action_preserves_binding_and_resumes(
     )
     resumed = runner.invoke(root_app, receipt["argv"][1:])
 
-    assert resumed.exit_code == 0, resumed.output
+    assert resumed.exit_code == 2, resumed.output
     saved = json.loads(output.read_text(encoding="utf-8").splitlines()[1])
     assert (
         saved["run_context"]["target"]["receipt"]["confirmation_sha256"]
