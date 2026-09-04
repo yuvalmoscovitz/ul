@@ -27,10 +27,12 @@ class CampaignPersistence:
     finding_reference_context: FindingReferenceContext
 
     def close(self) -> None:
-        if not self.output_stream.closed:
-            self.output_stream.close()
-        if self.augmentation_ledger is not None:
-            self.augmentation_ledger.close()
+        try:
+            if not self.output_stream.closed:
+                self.output_stream.close()
+        finally:
+            if self.augmentation_ledger is not None:
+                self.augmentation_ledger.close()
 
     def __enter__(self) -> CampaignPersistence:
         return self
