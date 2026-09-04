@@ -9,9 +9,9 @@ from ul import (
     DatasetSourceOutcomeProjectionError,
     DatasetTrialUnit,
 )
-from ul_cli.dataset.evaluation.command import (
-    _attempted_target_calls,
+from ul_cli.dataset.evaluation.durable_run import (
     _reconcile_source_preparation_failures,
+    attempted_target_calls,
 )
 from ul_cli.dataset.evidence.context import build_dataset_evidence_run_context
 from ul_cli.dataset.evidence.customer import build_source_preparation_failure_evidence
@@ -142,7 +142,7 @@ def test_resume_reconciles_an_interrupted_source_failure_without_target_calls(
     snapshot = resumed.snapshot
     assert snapshot.terminal_states == {unit.id: "errored" for unit in manifest.work_plan}
     assert set(snapshot.terminal_reason_codes.values()) == {failure.reason_code}
-    assert _attempted_target_calls(snapshot) == 0
+    assert attempted_target_calls(snapshot) == 0
     resumed.close()
 
 

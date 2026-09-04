@@ -29,6 +29,7 @@ from ul_cli import dataset_augmentation_ledger as augmentation_ledger_module
 from ul_cli import dataset_review, dataset_trial_journal
 from ul_cli import finding_reference as finding_reference_module
 from ul_cli.dataset.evaluation import command as command_module
+from ul_cli.dataset.evaluation import resume_compatibility
 from ul_cli.dataset.evaluation import runner as runner_module
 from ul_cli.dataset.evidence import customer as customer_module
 from ul_cli.dataset.evidence import persistence as persistence_module
@@ -295,6 +296,41 @@ def test_resume_reuses_manifest_without_original_data_config_or_overrides(
     assert "Selected interactions: 1" in result.output
     assert "input.surface.rephrase" in result.output
     assert str(custom_augmentations) in result.output
+
+
+def test_resume_preflight_failure_releases_durable_journal_lock(tmp_path: Path) -> None:
+    evidence = tmp_path / "evidence.jsonl"
+    source = _evaluation_result("interaction-1").source
+    manifest = dataset_trial_journal.create_dataset_run_manifest(
+        run_context=_run_context((source,)),
+        selected_records=(source,),
+        selected_operator_ids=("input.surface.rephrase",),
+        run_config=_run_config(
+            environment_api_calls_per_trial=5,
+            planned_environment_api_calls=10,
+            max_environment_api_calls=10,
+        ),
+        save_augmentations=True,
+    )
+    evidence.write_bytes(b"")
+    dataset_trial_journal.persist_dataset_run_manifest(
+        dataset_trial_journal.manifest_path(evidence), manifest
+    )
+    dataset_trial_journal.create_dataset_trial_journal(
+        dataset_trial_journal.journal_path(evidence), manifest
+    ).close()
+
+    result = runner.invoke(
+        root_app,
+        ["dataset", "evaluate", "--resume", str(evidence), "--dry-run"],
+    )
+
+    assert result.exit_code == 2
+    assert "required receipt evidence.jsonl.preflight.json is missing" in result.output
+    reopened = dataset_trial_journal.open_dataset_trial_journal(
+        dataset_trial_journal.journal_path(evidence), manifest
+    )
+    reopened.close()
 
 
 def test_resume_fails_closed_when_completed_trials_have_no_durable_augmentation(
@@ -1385,7 +1421,7 @@ def test_resume_rejects_changed_reasoning_mode(
     )
     required_context = _run_context((evaluation_result.source,))
     assert (
-        command_module._manifest_incompatibility_reason(
+        resume_compatibility.manifest_incompatibility_reason(
             cast(Any, run_context), cast(Any, required_context)
         )
         == "evaluator.llm_client"
