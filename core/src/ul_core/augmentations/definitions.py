@@ -10,6 +10,7 @@ from ul_core.augmentations.projections import (
     AugmentationTargetSurface,
     ProjectionContract,
 )
+from ul_core.dataset import SemanticAllowedSurfaceChange
 from ul_core.models import ULModel
 
 AugmentationScope = Literal["input", "conversation", "environment"]
@@ -32,6 +33,12 @@ AugmentationExecutionOwner = Literal["dataset_cli", "augmentation_registry", "st
 AugmentationApplicabilityProfile = Literal["broad", "conditional"]
 AugmentationImplementationStatus = Literal["implemented"]
 AugmentationQualificationStatus = Literal["not_qualified"]
+DatasetGenerationMechanism = Literal["deterministic", "llm"]
+DatasetAllowedChange = Literal[
+    "surface_form_only",
+    "declared_communication_form",
+    "structured_self_correction",
+]
 
 _AUGMENTATION_ID_PATTERN = r"^[a-z][a-z0-9_]*(?:\.[a-z][a-z0-9_]*)+$"
 _VERSION_PATTERN = r"^(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)$"
@@ -69,6 +76,24 @@ class AugmentationRequirements(_CatalogModel):
         return self
 
 
+class DatasetVariationRuntime(_CatalogModel):
+    order: int = Field(ge=0)
+    generation_mechanism: DatasetGenerationMechanism
+    allowed_change: DatasetAllowedChange
+    target_communication_kind: str | None = Field(default=None, min_length=1)
+    semantic_allowed_surface_change: SemanticAllowedSurfaceChange = "none"
+
+    @model_validator(mode="after")
+    def validate_change_contract(self) -> Self:
+        requires_target = self.allowed_change in {
+            "declared_communication_form",
+            "structured_self_correction",
+        }
+        if requires_target != (self.target_communication_kind is not None):
+            raise ValueError("target communication kind must match the allowed change")
+        return self
+
+
 class AugmentationBinding(_CatalogModel):
     mode: AugmentationMode
     stages: tuple[AugmentationStage, ...] = Field(min_length=1)
@@ -77,6 +102,7 @@ class AugmentationBinding(_CatalogModel):
     command: str | None = Field(default=None, min_length=1, max_length=200)
     requirements: AugmentationRequirements = AugmentationRequirements()
     projection: ProjectionContract
+    dataset_runtime: DatasetVariationRuntime | None = None
 
     @model_validator(mode="after")
     def validate_binding(self) -> Self:
@@ -98,6 +124,8 @@ class AugmentationBinding(_CatalogModel):
             not self.requirements.environment or not self.requirements.environment_capabilities
         ):
             raise ValueError("environment fault bindings require an environment capability")
+        if (self.mode == "dataset_variation") != (self.dataset_runtime is not None):
+            raise ValueError("dataset variation bindings require dataset runtime metadata")
         return self
 
     @property
@@ -146,6 +174,14 @@ class BuiltinAugmentationCatalog(_CatalogModel):
         references = tuple((item.ref.id, item.ref.version) for item in self.augmentations)
         if len(references) != len(set(references)):
             raise ValueError("augmentation catalog contains a duplicate ID and version")
+        dataset_runtime_orders = tuple(
+            binding.dataset_runtime.order
+            for item in self.augmentations
+            for binding in item.bindings
+            if binding.dataset_runtime is not None
+        )
+        if len(dataset_runtime_orders) != len(set(dataset_runtime_orders)):
+            raise ValueError("dataset variation runtime order must be unique")
         return self
 
     def list(
@@ -203,6 +239,7 @@ def _binding(
     execution_owner: AugmentationExecutionOwner = "augmentation_registry",
     command: str | None = None,
     requirements: AugmentationRequirements | None = None,
+    dataset_runtime: DatasetVariationRuntime | None = None,
 ) -> AugmentationBinding:
     return AugmentationBinding(
         mode=mode,
@@ -212,6 +249,7 @@ def _binding(
         command=command,
         requirements=requirements or AugmentationRequirements(),
         projection=projection,
+        dataset_runtime=dataset_runtime,
     )
 
 
@@ -228,6 +266,11 @@ def _dataset_spec(
     state_observation: bool = True,
     applicability_profile: AugmentationApplicabilityProfile = "broad",
     applicability_rule: str = "Applies to any nonempty user input with recorded source semantics.",
+    order: int,
+    generation_mechanism: DatasetGenerationMechanism,
+    allowed_change: DatasetAllowedChange,
+    target_communication_kind: str | None = None,
+    semantic_allowed_surface_change: SemanticAllowedSurfaceChange = "none",
 ) -> BuiltinAugmentationSpec:
     return BuiltinAugmentationSpec(
         ref=AugmentationRef(id=augmentation_id, version=version),
@@ -254,6 +297,13 @@ def _dataset_spec(
                     environment=True,
                     state_observation=state_observation,
                     human_review=human_review,
+                ),
+                dataset_runtime=DatasetVariationRuntime(
+                    order=order,
+                    generation_mechanism=generation_mechanism,
+                    allowed_change=allowed_change,
+                    target_communication_kind=target_communication_kind,
+                    semantic_allowed_surface_change=semantic_allowed_surface_change,
                 ),
             ),
         ),
@@ -309,46 +359,108 @@ _BUILTIN_AUGMENTATION_SPECS = (
         "input.surface.rephrase",
         "Rephrase while preserving the requested behavior.",
         version="1.1.0",
+        order=0,
+        generation_mechanism="llm",
+        allowed_change="surface_form_only",
     ),
-    _dataset_spec("input.surface.typing_noise", "Add four or five typing errors.", version="1.1.0"),
+    _dataset_spec(
+        "input.surface.typing_noise",
+        "Add four or five typing errors.",
+        version="1.1.0",
+        order=1,
+        generation_mechanism="deterministic",
+        allowed_change="declared_communication_form",
+        target_communication_kind="typing_noise",
+    ),
     _dataset_spec(
         "input.surface.punctuation_noise",
         "Add disruptive human punctuation or spacing noise.",
         version="1.1.0",
+        order=2,
+        generation_mechanism="deterministic",
+        allowed_change="declared_communication_form",
+        target_communication_kind="typing_noise",
+        semantic_allowed_surface_change="unprotected_punctuation_noise",
         applicability_profile="conditional",
         applicability_rule=(
             "Applies only when punctuation can be inserted outside a protected semantic value."
         ),
     ),
     _dataset_spec(
-        "input.surface.grammar_error", "Add two to five natural writing mistakes.", version="1.2.0"
+        "input.surface.grammar_error",
+        "Add two to five natural writing mistakes.",
+        version="1.2.0",
+        order=3,
+        generation_mechanism="llm",
+        allowed_change="declared_communication_form",
+        target_communication_kind="grammar_error",
     ),
     _dataset_spec(
-        "input.surface.fragmented_syntax", "Use plausible fragmented syntax.", version="1.2.0"
+        "input.surface.fragmented_syntax",
+        "Use plausible fragmented syntax.",
+        version="1.2.0",
+        order=4,
+        generation_mechanism="llm",
+        allowed_change="declared_communication_form",
+        target_communication_kind="fragmented_syntax",
     ),
     _dataset_spec(
         "input.surface.disfluency_repeat",
         "Repeat a short phrase as a natural disfluency.",
         version="1.2.0",
+        order=5,
+        generation_mechanism="llm",
+        allowed_change="declared_communication_form",
+        target_communication_kind="repetition",
     ),
-    _dataset_spec("input.style.terse", "Express the same request tersely.", version="1.2.0"),
-    _dataset_spec("input.style.verbose", "Express the same request verbosely.", version="1.2.0"),
+    _dataset_spec(
+        "input.style.terse",
+        "Express the same request tersely.",
+        version="1.2.0",
+        order=6,
+        generation_mechanism="llm",
+        allowed_change="declared_communication_form",
+        target_communication_kind="terse",
+    ),
+    _dataset_spec(
+        "input.style.verbose",
+        "Express the same request verbosely.",
+        version="1.2.0",
+        order=7,
+        generation_mechanism="llm",
+        allowed_change="declared_communication_form",
+        target_communication_kind="verbose",
+    ),
     _dataset_spec(
         "input.tone.angry",
         "Express the same request with hostile anger.",
         version="1.2.0",
+        order=8,
+        generation_mechanism="llm",
+        allowed_change="declared_communication_form",
+        target_communication_kind="angry",
+        semantic_allowed_surface_change="hostile_angry_tone",
         state_observation=False,
     ),
     _dataset_spec(
         "input.tone.argumentative",
         "Express the same request as an argumentative challenge.",
         version="1.2.0",
+        order=9,
+        generation_mechanism="llm",
+        allowed_change="declared_communication_form",
+        target_communication_kind="argumentative",
+        semantic_allowed_surface_change="hostile_argumentative_tone",
         state_observation=False,
     ),
     _dataset_spec(
         "input.intent.self_correction",
         "Correct one request value within the same input.",
         version="1.1.0",
+        order=10,
+        generation_mechanism="deterministic",
+        allowed_change="structured_self_correction",
+        target_communication_kind="self_correction",
         expected_relation="The corrected value must control the response and business outcome.",
         human_review=True,
         applicability_profile="conditional",

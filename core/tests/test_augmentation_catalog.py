@@ -6,6 +6,7 @@ from ul_core.augmentations.definitions import (
     AugmentationRequirements,
     BuiltinAugmentationCatalog,
     BuiltinAugmentationSpec,
+    DatasetVariationRuntime,
     builtin_augmentation_catalog,
 )
 from ul_core.augmentations.projections import ProjectionContract
@@ -203,6 +204,11 @@ def test_latest_version_is_selected_before_cli_and_mode_filters() -> None:
                 runtime="example.module:resolve",
                 command="ul dataset evaluate --operator input.example",
                 projection=_PROJECTION,
+                dataset_runtime=DatasetVariationRuntime(
+                    order=0,
+                    generation_mechanism="llm",
+                    allowed_change="surface_form_only",
+                ),
             ),
         ),
     )
