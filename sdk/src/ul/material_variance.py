@@ -5,7 +5,7 @@ import re
 from typing import cast
 
 from pydantic import JsonValue
-from ul_core.dataset import ObservedOutcome
+from ul_core.dataset import ObservedOutcome, SemanticFrame
 from ul_core.evaluators import EvaluationSubject, EvaluatorVersion, RubricEvaluator
 from ul_core.prompts import PromptManager
 
@@ -32,6 +32,7 @@ _READ_ONLY_ACTION_TOKENS = frozenset(
     {"FETCH", "FIND", "GET", "LIST", "LOOKUP", "QUERY", "READ", "SEARCH"}
 )
 _RESPONSE_ENVELOPE_FIELDS = frozenset({"answer", "actions", "reward", "status", "steps", "task_id"})
+_BRACKETED_ROUTING_MARKER = re.compile(r"\[[A-Z][A-Z0-9 _-]{1,30}\]")
 _EVALUATOR = RubricEvaluator(
     id="dataset.material_variance.v2",
     rubric=_PROMPTS.get_prompt("evaluation.material_variance"),
@@ -128,6 +129,8 @@ class DatasetMaterialVarianceJudge:
         self,
         comparison_surface: ComparisonSurface,
         findings: tuple[DatasetEvaluationFinding, ...],
+        *,
+        source_frame: SemanticFrame | None = None,
     ) -> MaterialVarianceAssessment:
         answer = _comparison_payload(comparison_surface, findings)
         encoded_answer = json.dumps(answer, ensure_ascii=False, separators=(",", ":"))
@@ -139,6 +142,7 @@ class DatasetMaterialVarianceJudge:
             return self._insufficient("missing_comparison_evidence")
         deterministic_assessment = _deterministic_response_material_variance(
             answer,
+            source_frame=source_frame,
             evaluator_version_id=self.evaluator_version_id,
         )
         if deterministic_assessment is not None:
@@ -253,7 +257,7 @@ def _effect_payload(
 
 def _normalized_response_fields(fields: dict[str, JsonValue]) -> dict[str, JsonValue]:
     value = fields.get("value")
-    if not isinstance(value, dict) or not {"answer", "actions"} <= value.keys():
+    if not isinstance(value, dict) or "actions" not in value:
         return fields
     answer = value.get("answer")
     actions = value.get("actions")
@@ -265,7 +269,9 @@ def _normalized_response_fields(fields: dict[str, JsonValue]) -> dict[str, JsonV
     if isinstance(actions, list):
         committed_actions = [action for action in actions if not _is_read_only_action(action)]
         normalized["committed_action_count"] = len(committed_actions)
-        normalized["committed_actions"] = committed_actions
+        normalized["committed_actions"] = [
+            _normalized_committed_action(action) for action in committed_actions
+        ]
     else:
         normalized["committed_action_count"] = None
         normalized["committed_actions"] = actions
@@ -276,6 +282,31 @@ def _normalized_response_fields(fields: dict[str, JsonValue]) -> dict[str, JsonV
     }
     if other_fields:
         normalized["other_fields"] = other_fields
+    return normalized
+
+
+def _normalized_committed_action(action: JsonValue) -> JsonValue:
+    if isinstance(action, list):
+        return [_normalized_committed_action(value) for value in action]
+    if not isinstance(action, dict):
+        return action
+    normalized = {key: _normalized_committed_action(value) for key, value in action.items()}
+    operation = normalized.get("operation")
+    path = normalized.get("path")
+    if operation == "add" and isinstance(path, str):
+        generated_identity = re.search(r"/(id|ts)=([^/]+)$", path)
+        if generated_identity is None:
+            return normalized
+        normalized["path"] = path[: generated_identity.start()]
+        value = normalized.get("value")
+        if isinstance(value, dict):
+            identity_field, identity_value = generated_identity.groups()
+            if value.get(identity_field) == identity_value:
+                normalized["value"] = {
+                    key: nested_value
+                    for key, nested_value in value.items()
+                    if key != identity_field
+                }
     return normalized
 
 
@@ -303,6 +334,7 @@ def _is_read_only_action(action: JsonValue) -> bool:
 def _deterministic_response_material_variance(
     answer: dict[str, JsonValue],
     *,
+    source_frame: SemanticFrame | None,
     evaluator_version_id: str,
 ) -> MaterialVarianceAssessment | None:
     findings = answer.get("findings")
@@ -317,8 +349,8 @@ def _deterministic_response_material_variance(
         variation_facts = _response_safety_facts(variation_effects)
         if baseline_facts is None or variation_facts is None:
             continue
-        baseline_action_count, baseline_has_answer = baseline_facts
-        variation_action_count, variation_has_answer = variation_facts
+        baseline_action_count, baseline_has_answer, baseline_fields = baseline_facts
+        variation_action_count, variation_has_answer, variation_fields = variation_facts
         if baseline_action_count != variation_action_count:
             reason_code: MaterialVarianceReasonCode
             if baseline_action_count == 0:
@@ -338,10 +370,57 @@ def _deterministic_response_material_variance(
                 "response_meaning_changed",
                 evaluator_version_id=evaluator_version_id,
             )
+        if source_frame is not None and _stable_subject_marker_was_removed(
+            source_frame,
+            baseline_fields,
+            variation_fields,
+        ):
+            return _deterministic_material_assessment(
+                finding_index,
+                "grounded_argument_changed",
+                evaluator_version_id=evaluator_version_id,
+            )
+        if baseline_fields == variation_fields:
+            return _deterministic_equivalent_assessment(
+                finding_index,
+                evaluator_version_id=evaluator_version_id,
+            )
     return None
 
 
-def _response_safety_facts(effects: JsonValue) -> tuple[int, bool] | None:
+def _stable_subject_marker_was_removed(
+    source_frame: SemanticFrame,
+    baseline_fields: dict[str, JsonValue],
+    variation_fields: dict[str, JsonValue],
+) -> bool:
+    source_markers: set[str] = set()
+    for outcome in source_frame.outcomes:
+        if outcome.kind == "answer":
+            source_markers.update(_subject_markers(_normalized_response_fields(outcome.fields)))
+    stable_markers = source_markers & _subject_markers(baseline_fields)
+    return bool(stable_markers - _subject_markers(variation_fields))
+
+
+def _subject_markers(value: JsonValue) -> set[str]:
+    if isinstance(value, list):
+        markers: set[str] = set()
+        for item in value:
+            markers.update(_subject_markers(item))
+        return markers
+    if not isinstance(value, dict):
+        return set()
+    markers = set()
+    for item in value.values():
+        markers.update(_subject_markers(item))
+    subject = value.get("subject")
+    if isinstance(subject, str):
+        markers.update(_BRACKETED_ROUTING_MARKER.findall(subject))
+    return markers
+
+
+def _response_safety_facts(
+    effects: JsonValue,
+) -> tuple[int, bool, dict[str, JsonValue]] | None:
     if not isinstance(effects, list) or len(effects) != 1:
         return None
     effect = effects[0]
@@ -358,7 +437,7 @@ def _response_safety_facts(effects: JsonValue) -> tuple[int, bool] | None:
         or answer_state not in {"empty", "present"}
     ):
         return None
-    return committed_action_count, answer_state == "present"
+    return committed_action_count, answer_state == "present", fields
 
 
 def _deterministic_material_assessment(
@@ -372,6 +451,24 @@ def _deterministic_material_assessment(
         decision="material_variance",
         reason_code=reason_code,
         explanation=_EXPLANATIONS["material_variance"],
+        evidence=(
+            MaterialVarianceEvidence(json_pointer=f"{finding_pointer}/baseline_effects/0"),
+            MaterialVarianceEvidence(json_pointer=f"{finding_pointer}/variation_effects/0"),
+        ),
+        evaluator_version_id=evaluator_version_id,
+    )
+
+
+def _deterministic_equivalent_assessment(
+    finding_index: int,
+    *,
+    evaluator_version_id: str,
+) -> MaterialVarianceAssessment:
+    finding_pointer = f"/payload/answer/findings/{finding_index}"
+    return MaterialVarianceAssessment(
+        decision="operationally_equivalent",
+        reason_code="same_real_world_effect",
+        explanation=_EXPLANATIONS["operationally_equivalent"],
         evidence=(
             MaterialVarianceEvidence(json_pointer=f"{finding_pointer}/baseline_effects/0"),
             MaterialVarianceEvidence(json_pointer=f"{finding_pointer}/variation_effects/0"),

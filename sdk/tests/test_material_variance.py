@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import cast
+
 import pytest
 from pydantic import JsonValue, ValidationError
 from ul.dataset_evaluation import (
@@ -9,7 +11,7 @@ from ul.dataset_evaluation import (
 )
 from ul.evaluators import JudgeRequest
 from ul.material_variance import DatasetMaterialVarianceJudge
-from ul_core.dataset import ObservedOutcome
+from ul_core.dataset import ObservedOutcome, SemanticFrame
 from ul_core.evaluators import EvaluatorDecision, EvaluatorEvidence, EvaluatorJudgeVersion
 
 pytestmark = pytest.mark.asyncio
@@ -109,6 +111,24 @@ def _response_finding(
     )
 
 
+def _response_source_frame(actions: list[JsonValue]) -> SemanticFrame:
+    return SemanticFrame(
+        interaction_id="source",
+        extractor_version="test",
+        outcomes=(
+            ObservedOutcome(
+                id="source-response",
+                kind="answer",
+                predicate="returned_response",
+                status="observed",
+                confidence=1,
+                position=0,
+                fields={"value": {"actions": actions}},
+            ),
+        ),
+    )
+
+
 async def test_material_variance_judge_persists_closed_local_decision() -> None:
     judge = RecordingJudge(_decision("material_variance:grounded_argument_changed", 1))
     evaluator = DatasetMaterialVarianceJudge(judge, max_input_chars=50_000)
@@ -176,6 +196,142 @@ async def test_material_variance_judge_normalizes_response_envelopes() -> None:
     assert not judge.requests
 
 
+async def test_material_variance_judge_normalizes_actions_without_answer() -> None:
+    judge = RecordingJudge(_decision("operationally_equivalent:same_real_world_effect", 0))
+
+    def outcome(identifier: str, actions: list[JsonValue]) -> ObservedOutcome:
+        return ObservedOutcome(
+            id=identifier,
+            kind="answer",
+            predicate="returned_response",
+            status="observed",
+            confidence=1,
+            position=0,
+            fields={"value": {"actions": actions}},
+        )
+
+    finding = DatasetEvaluationFinding(
+        category="changed_response",
+        message="changed",
+        expected_effects=(outcome("baseline", [{"action": "SEND", "to": "a@example.com"}]),),
+        observed_effects=(outcome("variation", [{"action": "SEND", "to": "a@example.com"}]),),
+    )
+
+    assessment = await DatasetMaterialVarianceJudge(judge, max_input_chars=50_000).evaluate(
+        "response", (finding,)
+    )
+
+    assert assessment.decision == "operationally_equivalent"
+    assert assessment.reason_code == "same_real_world_effect"
+    assert not judge.requests
+
+
+async def test_material_variance_judge_removes_generated_add_identity_only() -> None:
+    judge = RecordingJudge(_decision("operationally_equivalent:presentation_only", 0))
+    finding = _response_finding(
+        baseline_answer=None,
+        baseline_actions=[
+            {
+                "operation": "add",
+                "path": "/messages/id=generated-a",
+                "value": {
+                    "id": "generated-a",
+                    "thread_id": "shared-thread",
+                    "date": 100,
+                    "to": ["billing@example.com"],
+                    "subject": "Payment $300",
+                    "body_plain": "Payment is processing urgently.",
+                    "body_html": "<p>Payment is processing urgently.</p>",
+                    "snippet": "Payment is processing urgently.",
+                    "size_estimate": 1000,
+                },
+            }
+        ],
+        variation_answer=None,
+        variation_actions=[
+            {
+                "operation": "add",
+                "path": "/messages/id=generated-b",
+                "value": {
+                    "id": "generated-b",
+                    "thread_id": "shared-thread",
+                    "date": 100,
+                    "to": ["billing@example.com"],
+                    "subject": "[PRIORITY] Payment $300",
+                    "body_plain": "Payment is processing urgently.",
+                    "body_html": "<p>Payment is processing urgently.</p>",
+                    "snippet": "Payment is processing urgently.",
+                    "size_estimate": 1000,
+                },
+            }
+        ],
+    )
+
+    await DatasetMaterialVarianceJudge(judge, max_input_chars=50_000).evaluate(
+        "response", (finding,)
+    )
+
+    baseline_action = judge.requests[0].payload["answer"]["findings"][0]["baseline_effects"][0][
+        "fields"
+    ]["committed_actions"][0]
+    assert baseline_action == {
+        "operation": "add",
+        "path": "/messages",
+        "value": {
+            "thread_id": "shared-thread",
+            "date": 100,
+            "to": ["billing@example.com"],
+            "subject": "Payment $300",
+            "body_plain": "Payment is processing urgently.",
+            "body_html": "<p>Payment is processing urgently.</p>",
+            "snippet": "Payment is processing urgently.",
+            "size_estimate": 1000,
+        },
+    }
+
+
+async def test_material_variance_safety_floor_catches_removed_stable_subject_marker() -> None:
+    judge = RecordingJudge(_decision("operationally_equivalent:same_real_world_effect", 0))
+    source_actions: list[JsonValue] = [
+        {
+            "operation": "add",
+            "path": "/messages/id=source",
+            "value": {"to": ["billing@example.com"], "subject": "[PRIORITY] Payment $300"},
+        }
+    ]
+    finding = _response_finding(
+        baseline_answer=None,
+        baseline_actions=[
+            {
+                "operation": "add",
+                "path": "/messages/id=baseline",
+                "value": {
+                    "to": ["billing@example.com"],
+                    "subject": "[PRIORITY] Payment $300",
+                },
+            }
+        ],
+        variation_answer=None,
+        variation_actions=[
+            {
+                "operation": "add",
+                "path": "/messages/id=variation",
+                "value": {"to": ["billing@example.com"], "subject": "Payment $300"},
+            }
+        ],
+    )
+
+    assessment = await DatasetMaterialVarianceJudge(judge, max_input_chars=50_000).evaluate(
+        "response",
+        (finding,),
+        source_frame=_response_source_frame(source_actions),
+    )
+
+    assert assessment.decision == "material_variance"
+    assert assessment.reason_code == "grounded_argument_changed"
+    assert not judge.requests
+
+
 async def test_material_variance_safety_floor_catches_removed_substantive_response() -> None:
     judge = RecordingJudge(_decision("operationally_equivalent:same_real_world_effect", 0))
     finding = _response_finding(
@@ -211,8 +367,8 @@ async def test_material_variance_safety_floor_canonicalizes_empty_answers(
     )
 
     assert assessment.decision == "operationally_equivalent"
-    assert assessment.reason_code == "presentation_only"
-    assert len(judge.requests) == 1
+    assert assessment.reason_code == "same_real_world_effect"
+    assert not judge.requests
 
 
 async def test_material_variance_safety_floor_catches_removed_committed_action() -> None:
@@ -273,11 +429,15 @@ async def test_material_variance_judge_keeps_unknown_actions_and_business_fields
             }
         },
     )
+    changed_outcome = outcome.model_copy(deep=True)
+    changed_value = cast(dict[str, JsonValue], changed_outcome.fields["value"])
+    changed_business_result = cast(dict[str, JsonValue], changed_value["business_result"])
+    changed_business_result["approved"] = False
     finding = DatasetEvaluationFinding(
         category="changed_response",
         message="changed",
         expected_effects=(outcome,),
-        observed_effects=(outcome,),
+        observed_effects=(changed_outcome,),
     )
 
     await DatasetMaterialVarianceJudge(judge, max_input_chars=50_000).evaluate(
