@@ -90,7 +90,7 @@ async def test_live_materiality_distinguishes_business_attributes_from_prose() -
             "baseline-c",
             "c@example.com",
             "[PRIORITY] Payment $300",
-            "Payment is processing urgently.",
+            "Payment is processing urgently because it is more than 60 days overdue.",
         ),
         _status(2),
         _status(3),
@@ -100,6 +100,19 @@ async def test_live_materiality_distinguishes_business_attributes_from_prose() -
         _email("terse-a", "a@example.com", "Payment $100", "Processing payment."),
         _email("terse-b", "b@example.com", "Payment $200", "Processing payment."),
         _email("terse-c", "c@example.com", "Payment $300", "Processing payment."),
+        _status(2),
+        _status(3),
+        _status(5),
+    ]
+    recorded_source = [
+        _email("source-a", "a@example.com", "Payment confirmation $100", "Processing."),
+        _email("source-b", "b@example.com", "Payment confirmation $200", "Processing."),
+        _email(
+            "source-c",
+            "c@example.com",
+            "[PRIORITY] Payment confirmation $300",
+            "Prioritized because this payment is more than 60 days overdue.",
+        ),
         _status(2),
         _status(3),
         _status(5),
@@ -121,7 +134,7 @@ async def test_live_materiality_distinguishes_business_attributes_from_prose() -
             "grammar-c",
             "c@example.com",
             "[PRIORITY] Payment $300",
-            "Payment is processing urgently. Thank you.",
+            "Payment is processing urgently because it is more than 60 days overdue. Thank you.",
         ),
         _status(2),
         _status(3),
@@ -142,12 +155,12 @@ async def test_live_materiality_distinguishes_business_attributes_from_prose() -
         priority_assessment = await evaluator.evaluate(
             "response",
             (_finding(baseline, missing_priority),),
-            source_frame=_source_frame(baseline),
+            source_frame=_source_frame(recorded_source),
         )
         prose_assessment = await evaluator.evaluate(
             "response",
             (_finding(baseline, prose_only),),
-            source_frame=_source_frame(baseline),
+            source_frame=_source_frame(recorded_source),
         )
 
     assert priority_assessment.decision == "material_variance"

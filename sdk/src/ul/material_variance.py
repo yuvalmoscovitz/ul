@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+from collections import Counter
 from typing import cast
 
 from pydantic import JsonValue
@@ -32,7 +33,8 @@ _READ_ONLY_ACTION_TOKENS = frozenset(
     {"FETCH", "FIND", "GET", "LIST", "LOOKUP", "QUERY", "READ", "SEARCH"}
 )
 _RESPONSE_ENVELOPE_FIELDS = frozenset({"answer", "actions", "reward", "status", "steps", "task_id"})
-_BRACKETED_ROUTING_MARKER = re.compile(r"\[[A-Z][A-Z0-9 _-]{1,30}\]")
+_PRIORITY_ROUTING_MARKER = re.compile(r"\[PRIORITY\]", re.IGNORECASE)
+_ACTION_TARGET_FIELDS = ("to", "cc", "bcc", "recipient", "recipients")
 _EVALUATOR = RubricEvaluator(
     id="dataset.material_variance.v2",
     rubric=_PROMPTS.get_prompt("evaluation.material_variance"),
@@ -257,7 +259,9 @@ def _effect_payload(
 
 def _normalized_response_fields(fields: dict[str, JsonValue]) -> dict[str, JsonValue]:
     value = fields.get("value")
-    if not isinstance(value, dict) or "actions" not in value:
+    if not isinstance(value, dict) or not (
+        {"answer", "actions"} <= value.keys() or set(value) == {"actions"}
+    ):
         return fields
     answer = value.get("answer")
     actions = value.get("actions")
@@ -269,9 +273,7 @@ def _normalized_response_fields(fields: dict[str, JsonValue]) -> dict[str, JsonV
     if isinstance(actions, list):
         committed_actions = [action for action in actions if not _is_read_only_action(action)]
         normalized["committed_action_count"] = len(committed_actions)
-        normalized["committed_actions"] = [
-            _normalized_committed_action(action) for action in committed_actions
-        ]
+        normalized["committed_actions"] = committed_actions
     else:
         normalized["committed_action_count"] = None
         normalized["committed_actions"] = actions
@@ -282,31 +284,6 @@ def _normalized_response_fields(fields: dict[str, JsonValue]) -> dict[str, JsonV
     }
     if other_fields:
         normalized["other_fields"] = other_fields
-    return normalized
-
-
-def _normalized_committed_action(action: JsonValue) -> JsonValue:
-    if isinstance(action, list):
-        return [_normalized_committed_action(value) for value in action]
-    if not isinstance(action, dict):
-        return action
-    normalized = {key: _normalized_committed_action(value) for key, value in action.items()}
-    operation = normalized.get("operation")
-    path = normalized.get("path")
-    if operation == "add" and isinstance(path, str):
-        generated_identity = re.search(r"/(id|ts)=([^/]+)$", path)
-        if generated_identity is None:
-            return normalized
-        normalized["path"] = path[: generated_identity.start()]
-        value = normalized.get("value")
-        if isinstance(value, dict):
-            identity_field, identity_value = generated_identity.groups()
-            if value.get(identity_field) == identity_value:
-                normalized["value"] = {
-                    key: nested_value
-                    for key, nested_value in value.items()
-                    if key != identity_field
-                }
     return normalized
 
 
@@ -370,7 +347,7 @@ def _deterministic_response_material_variance(
                 "response_meaning_changed",
                 evaluator_version_id=evaluator_version_id,
             )
-        if source_frame is not None and _stable_subject_marker_was_removed(
+        if source_frame is not None and _stable_priority_marker_was_removed(
             source_frame,
             baseline_fields,
             variation_fields,
@@ -388,33 +365,41 @@ def _deterministic_response_material_variance(
     return None
 
 
-def _stable_subject_marker_was_removed(
+def _stable_priority_marker_was_removed(
     source_frame: SemanticFrame,
     baseline_fields: dict[str, JsonValue],
     variation_fields: dict[str, JsonValue],
 ) -> bool:
-    source_markers: set[str] = set()
+    source_markers: Counter[tuple[str, str]] = Counter()
     for outcome in source_frame.outcomes:
         if outcome.kind == "answer":
-            source_markers.update(_subject_markers(_normalized_response_fields(outcome.fields)))
-    stable_markers = source_markers & _subject_markers(baseline_fields)
-    return bool(stable_markers - _subject_markers(variation_fields))
+            source_markers.update(_subject_marker_occurrences(outcome.fields))
+    baseline_markers = _subject_marker_occurrences(baseline_fields)
+    variation_markers = _subject_marker_occurrences(variation_fields)
+    for (marker, encoded_target), reference_count in (source_markers & baseline_markers).items():
+        if reference_count > variation_markers[(marker, encoded_target)]:
+            return True
+    return False
 
 
-def _subject_markers(value: JsonValue) -> set[str]:
+def _subject_marker_occurrences(value: JsonValue) -> Counter[tuple[str, str]]:
     if isinstance(value, list):
-        markers: set[str] = set()
+        markers: Counter[tuple[str, str]] = Counter()
         for item in value:
-            markers.update(_subject_markers(item))
+            markers.update(_subject_marker_occurrences(item))
         return markers
     if not isinstance(value, dict):
-        return set()
-    markers = set()
+        return Counter()
+    markers: Counter[tuple[str, str]] = Counter()
     for item in value.values():
-        markers.update(_subject_markers(item))
+        markers.update(_subject_marker_occurrences(item))
     subject = value.get("subject")
     if isinstance(subject, str):
-        markers.update(_BRACKETED_ROUTING_MARKER.findall(subject))
+        target = {key: value[key] for key in _ACTION_TARGET_FIELDS if key in value}
+        encoded_target = json.dumps(target, ensure_ascii=False, sort_keys=True)
+        markers.update(
+            (marker.upper(), encoded_target) for marker in _PRIORITY_ROUTING_MARKER.findall(subject)
+        )
     return markers
 
 
