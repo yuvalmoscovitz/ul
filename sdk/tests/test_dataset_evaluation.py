@@ -1062,6 +1062,7 @@ async def test_repetition_benchmark_reduces_semantic_calls_without_changing_find
             for position, action in raw_actions.items()
         )
         frame_payload = _frame("untrusted", outcomes).model_dump(mode="json")
+        frame_payload["communication_acts"] = []
         raw_input = cast(str, request_payload["raw_input"])
         for collection_name in ("request_units", "factors", "communication_acts"):
             collection = cast(list[dict[str, object]], frame_payload[collection_name])

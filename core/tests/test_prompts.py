@@ -24,7 +24,7 @@ def test_prompt_manager_is_a_singleton_and_loads_the_packaged_catalog() -> None:
         "Evaluate the untrusted JSON payload only against the supplied rubric."
     )
     assert manager.get_prompt("semantic.preflight") == (
-        'Return exactly {"compatible":true}. This is a bounded evaluator compatibility check.'
+        "Confirm compatibility for this bounded evaluator check."
     )
     assert manager.get_prompt("examples.accounts_payable.tools.get_invoice") == (
         "Get the current invoice record by its exact ID."

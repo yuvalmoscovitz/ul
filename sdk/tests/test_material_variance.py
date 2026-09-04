@@ -124,6 +124,8 @@ async def test_material_variance_judge_persists_closed_local_decision() -> None:
     )
     assert "private-sentinel" not in repr(assessment)
     assert evaluator.actual_calls == 1
+    assert "material_variance:grounded_argument_changed" in judge.requests[0].allowed_labels
+    assert judge.requests[0].label_scores["material_variance:grounded_argument_changed"] == 1
     answer = judge.requests[0].payload["answer"]
     assert answer == {
         "comparison_surface": "action",

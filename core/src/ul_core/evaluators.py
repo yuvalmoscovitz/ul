@@ -135,10 +135,24 @@ class RubricEvaluator(_EvaluatorSpecModel):
     type: Literal["rubric"] = "rubric"
     rubric: str = Field(min_length=1, max_length=20_000)
     minimum_score: float = Field(default=1, ge=0, le=1)
+    allowed_labels: tuple[Annotated[str, Field(min_length=1, max_length=500)], ...] = ()
+    label_scores: dict[str, float] = Field(default_factory=dict)
     include_sources: tuple[
         Literal["answer", "tool_calls", "initial_state", "final_state", "http_result"], ...
     ] = ("answer",)
     allow_private_data: bool = False
+
+    @model_validator(mode="after")
+    def validate_label_contract(self) -> Self:
+        if len(self.allowed_labels) != len(set(self.allowed_labels)):
+            raise ValueError("rubric allowed_labels must be unique")
+        if self.label_scores and set(self.label_scores) != set(self.allowed_labels):
+            raise ValueError("rubric label_scores must cover exactly allowed_labels")
+        if any(
+            not math.isfinite(score) or not 0 <= score <= 1 for score in self.label_scores.values()
+        ):
+            raise ValueError("rubric label_scores must be finite values from 0 to 1")
+        return self
 
 
 class PairwiseEvaluator(_EvaluatorSpecModel):

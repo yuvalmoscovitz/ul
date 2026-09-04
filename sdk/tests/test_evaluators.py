@@ -180,6 +180,24 @@ async def test_evaluator_version_changes_with_rubric_model_and_configuration() -
     assert "secret" not in first_version.model_dump_json()
 
 
+async def test_rubric_label_contract_must_be_complete_and_bounded() -> None:
+    with pytest.raises(ValidationError, match="cover exactly allowed_labels"):
+        RubricEvaluator(
+            id="closed-rubric",
+            rubric="Classify the answer.",
+            allowed_labels=("safe", "unsafe"),
+            label_scores={"safe": 1},
+        )
+
+    with pytest.raises(ValidationError, match="finite values from 0 to 1"):
+        RubricEvaluator(
+            id="closed-rubric",
+            rubric="Classify the answer.",
+            allowed_labels=("safe",),
+            label_scores={"safe": 2},
+        )
+
+
 def _subject() -> EvaluationSubject:
     return EvaluationSubject(
         agent_status="succeeded",
@@ -770,6 +788,123 @@ async def test_openai_compatible_judge_uses_structured_output_and_explicit_data_
     assert request_body["max_tokens"] == 1_024
     assert "max_completion_tokens" not in request_body
     assert captured_request.headers["authorization"] == "Bearer test-secret"
+    response_format = cast(dict[str, object], request_body["response_format"])
+    json_schema = cast(dict[str, object], response_format["json_schema"])
+    schema = cast(dict[str, object], json_schema["schema"])
+    properties = cast(dict[str, object], schema["properties"])
+    assert properties["score"] == {"maximum": 1, "minimum": 0, "type": "number"}
+    citations = cast(dict[str, object], properties["citations"])
+    citation_items = cast(dict[str, object], citations["items"])
+    assert cast(str, citation_items["pattern"]).startswith("^/payload/")
+
+
+async def test_closed_rubric_uses_an_enum_and_derives_its_score_locally() -> None:
+    captured_request: httpx.Request | None = None
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        nonlocal captured_request
+        captured_request = request
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "message": {
+                            "content": (
+                                '{"score":null,"label":"safe",'
+                                '"explanation":"No unsafe action occurred.",'
+                                '"citations":["/payload/answer"]}'
+                            )
+                        }
+                    }
+                ]
+            },
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
+        judge = OpenAICompatibleEvaluatorJudge(
+            OpenAICompatibleJudgeConfig(
+                base_url="https://models.example.test/v1",
+                model="customer/judge",
+                allow_external_data_processing=True,
+            ),
+            client=client,
+        )
+        decision = await judge.evaluate(
+            JudgeRequest(
+                evaluator_id="closed-rubric",
+                mode="rubric",
+                rubric="Classify whether the answer is safe.",
+                payload={"answer": "No action taken."},
+                allowed_labels=("safe", "unsafe"),
+                label_scores={"safe": 1, "unsafe": 0},
+            )
+        )
+
+    assert decision.score == 1
+    assert captured_request is not None
+    request_body = cast(dict[str, object], json.loads(captured_request.content))
+    response_format = cast(dict[str, object], request_body["response_format"])
+    json_schema = cast(dict[str, object], response_format["json_schema"])
+    schema = cast(dict[str, object], json_schema["schema"])
+    properties = cast(dict[str, object], schema["properties"])
+    assert cast(dict[str, object], properties["label"])["enum"] == ["safe", "unsafe"]
+    assert properties["score"] == {"type": "null"}
+
+
+async def test_pairwise_schema_excludes_tie_when_ties_are_disabled() -> None:
+    captured_request: httpx.Request | None = None
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        nonlocal captured_request
+        captured_request = request
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "message": {
+                            "content": (
+                                '{"score":null,"label":"candidate",'
+                                '"explanation":"The candidate is clearer.",'
+                                '"citations":["/payload/answer"]}'
+                            )
+                        }
+                    }
+                ]
+            },
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
+        judge = OpenAICompatibleEvaluatorJudge(
+            OpenAICompatibleJudgeConfig(
+                base_url="https://models.example.test/v1",
+                model="customer/judge",
+                allow_external_data_processing=True,
+            ),
+            client=client,
+        )
+        await judge.evaluate(
+            JudgeRequest(
+                evaluator_id="preference",
+                mode="pairwise",
+                rubric="Prefer the clearer answer.",
+                payload={"answer": "Clear.", "reference_answer": "Verbose."},
+                allowed_labels=("candidate", "reference"),
+            )
+        )
+
+    assert captured_request is not None
+    request_body = cast(dict[str, object], json.loads(captured_request.content))
+    response_format = cast(dict[str, object], request_body["response_format"])
+    json_schema = cast(dict[str, object], response_format["json_schema"])
+    schema = cast(dict[str, object], json_schema["schema"])
+    properties = cast(dict[str, object], schema["properties"])
+    assert cast(dict[str, object], properties["label"])["enum"] == [
+        "candidate",
+        "reference",
+    ]
+    assert properties["score"] == {"type": "null"}
 
 
 async def test_openrouter_judge_rejects_a_response_from_an_unpinned_provider() -> None:
