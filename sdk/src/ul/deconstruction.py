@@ -365,6 +365,7 @@ class ProviderDiagnostic(BaseModel):
         "bad_request",
         "connection",
         "invalid_response",
+        "output_limit",
         "provider_unavailable",
         "rate_limit",
         "timeout",
@@ -522,7 +523,7 @@ class OpenRouterDatasetSettings(BaseSettings):
         validation_alias="UL_DATASET_MAX_INPUT_CHARS",
     )
     max_output_tokens: int = Field(
-        default=4_096,
+        default=8_192,
         ge=1,
         le=32_768,
         validation_alias="UL_DATASET_MAX_OUTPUT_TOKENS",
@@ -643,7 +644,7 @@ class OpenAICompatibleDatasetSettings(BaseSettings):
         validation_alias="UL_DATASET_MAX_INPUT_CHARS",
     )
     max_output_tokens: int = Field(
-        default=4_096,
+        default=8_192,
         ge=1,
         le=32_768,
         validation_alias="UL_DATASET_MAX_OUTPUT_TOKENS",
@@ -1169,7 +1170,11 @@ class SemanticModelDeconstructor:
             frame = SemanticFrame.model_validate_json(json.dumps(raw_frame))
         except (ValidationError, ValueError) as error:
             self._discard_cached_completion(completion)
-            raise self._invalid_response(error, operation="deconstruct") from None
+            raise self._invalid_response(
+                error,
+                operation="deconstruct",
+                finish_reason=completion.response.choices[0].finish_reason,
+            ) from None
         try:
             frame = self._normalize_self_correction_relation_kind(frame)
             frame = self._ground_self_correction_evidence(record, frame)
@@ -1220,7 +1225,11 @@ class SemanticModelDeconstructor:
             ).rendered_input
         except (ValidationError, ValueError) as error:
             self._discard_cached_completion(completion)
-            raise self._invalid_response(error, operation="render") from None
+            raise self._invalid_response(
+                error,
+                operation="render",
+                finish_reason=completion.response.choices[0].finish_reason,
+            ) from None
         if len(rendered) > self.settings.max_input_chars:
             self._discard_cached_completion(completion)
             raise ValueError("rendered input exceeds max_input_chars")
@@ -1287,7 +1296,11 @@ class SemanticModelDeconstructor:
             )
         except (ValidationError, ValueError) as error:
             self._discard_cached_completion(completion)
-            raise self._invalid_response(error, operation="verify") from None
+            raise self._invalid_response(
+                error,
+                operation="verify",
+                finish_reason=completion.response.choices[0].finish_reason,
+            ) from None
         assessment = assessment.model_copy(
             update={
                 "deltas": tuple(
@@ -1327,7 +1340,22 @@ class SemanticModelDeconstructor:
         error: BaseException,
         *,
         operation: Literal["deconstruct", "render", "verify"],
+        finish_reason: str | None,
     ) -> ProviderDiagnosticError:
+        if finish_reason == "length":
+            return ProviderDiagnosticError(
+                ProviderDiagnostic(
+                    provider=self.llm_client.config.provider_id,
+                    operation=operation,
+                    category="output_limit",
+                    retryable=False,
+                    suggested_action=(
+                        "raise UL_DATASET_MAX_OUTPUT_TOKENS for this evaluator, then start a new "
+                        "run."
+                    ),
+                    endpoint_sha256=self.llm_client.config.endpoint_sha256,
+                )
+            )
         return ProviderDiagnosticError(
             _provider_diagnostic(
                 error,

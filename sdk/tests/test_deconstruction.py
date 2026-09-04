@@ -248,14 +248,19 @@ def frame_payload() -> dict[str, object]:
     }
 
 
-def completion(content: str) -> httpx.Response:
+def completion(content: str, *, finish_reason: str | None = None) -> httpx.Response:
     return httpx.Response(
         200,
         json={
             "id": "generation-1",
             "model": "provider/resolved-model",
             "provider": "provider-name",
-            "choices": [{"message": {"role": "assistant", "content": content}}],
+            "choices": [
+                {
+                    "message": {"role": "assistant", "content": content},
+                    "finish_reason": finish_reason,
+                }
+            ],
             "usage": {
                 "prompt_tokens": 100,
                 "completion_tokens": 25,
@@ -1717,6 +1722,18 @@ async def test_deconstruct_rejects_text_quote_not_found_in_source() -> None:
     await client.aclose()
 
 
+async def test_deconstruct_reports_provider_output_limit() -> None:
+    client = mock_client(lambda request: completion("{", finish_reason="length"))
+
+    async with create_semantic_model_deconstructor(settings(), client=client) as deconstructor:
+        with pytest.raises(ProviderDiagnosticError) as provider_error:
+            await deconstructor.deconstruct(interaction())
+
+    assert provider_error.value.diagnostic.category == "output_limit"
+    assert "UL_DATASET_MAX_OUTPUT_TOKENS" in str(provider_error.value)
+    await client.aclose()
+
+
 async def test_generated_schema_explains_exact_grounding_contract() -> None:
     schema = SemanticFrame.model_json_schema(mode="validation")
     evidence_properties = schema["$defs"]["EvidenceReference"]["properties"]
@@ -1727,6 +1744,16 @@ async def test_generated_schema_explains_exact_grounding_contract() -> None:
     assert "Use null" in evidence_properties["text_quote"]["description"]
     assert "primitive sibling values" in outcome_properties["fields"]["description"]
     assert "never wrap values" in outcome_properties["fields"]["description"]
+    assert schema["$defs"]["RequestUnit"]["properties"]["factor_ids"]["maxItems"] == 20
+
+
+async def test_deconstruction_prompt_requires_case_sensitive_evidence_quotes() -> None:
+    prompt = deconstruction_module._PROMPTS.get_prompt("semantic.deconstruct")
+
+    assert "case-sensitive, exact" in prompt
+    assert "Never change capitalization" in prompt
+    assert "Represent each semantic fact once" in prompt
+    assert "Every referenced ID must name an element actually returned" in prompt
 
 
 @pytest.mark.parametrize(

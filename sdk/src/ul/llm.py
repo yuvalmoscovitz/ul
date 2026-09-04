@@ -368,6 +368,7 @@ class _LLMResponseChoice(BaseModel):
     model_config = ConfigDict(extra="ignore", hide_input_in_errors=True)
 
     message: _LLMResponseMessage
+    finish_reason: str | None = Field(default=None, max_length=100)
 
 
 class LLMUsage(BaseModel):
