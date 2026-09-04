@@ -10,7 +10,7 @@ from typer.testing import CliRunner
 from ul import (
     JsonHttpEnvironmentConfig,
 )
-from ul_cli.dataset.evaluation import command as command_module
+from ul_cli.dataset.evaluation import preparation as preparation_module
 from ul_cli.dataset.evaluation import runner as runner_module
 from ul_cli.dataset.evaluation.records import load_interaction_records
 from ul_cli.http_target_resolution import resolve_http_target
@@ -342,7 +342,7 @@ def test_preflight_reports_safe_line_numbered_errors_without_external_calls(
     def unexpected_settings() -> None:
         raise AssertionError("invalid data reached model setup")
 
-    monkeypatch.setattr(command_module, "load_dataset_semantic_settings", unexpected_settings)
+    monkeypatch.setattr(preparation_module, "load_dataset_semantic_settings", unexpected_settings)
     result = runner.invoke(root_app, ["dataset", "evaluate", str(dataset)])
 
     assert result.exit_code != 0
@@ -360,7 +360,7 @@ def test_preflight_rejects_duplicate_ids_before_external_calls(
     def unexpected_settings() -> None:
         raise AssertionError("duplicate data reached model setup")
 
-    monkeypatch.setattr(command_module, "load_dataset_semantic_settings", unexpected_settings)
+    monkeypatch.setattr(preparation_module, "load_dataset_semantic_settings", unexpected_settings)
     result = runner.invoke(root_app, ["dataset", "evaluate", str(dataset)])
 
     assert result.exit_code != 0
@@ -388,7 +388,7 @@ def test_preflight_rejects_selected_model_input_over_limit(
     dataset = tmp_path / "interactions.jsonl"
     _write_dataset(dataset, [_record(), _record("interaction-2")])
     monkeypatch.setattr(
-        command_module,
+        preparation_module,
         "load_dataset_semantic_settings",
         lambda: _settings(max_input_chars=50),
     )
@@ -408,7 +408,7 @@ def test_preflight_enforces_record_and_target_call_bounds(
     def unexpected_settings() -> None:
         raise AssertionError("oversized data reached model setup")
 
-    monkeypatch.setattr(command_module, "load_dataset_semantic_settings", unexpected_settings)
+    monkeypatch.setattr(preparation_module, "load_dataset_semantic_settings", unexpected_settings)
     too_many_records = runner.invoke(
         root_app,
         ["dataset", "evaluate", str(dataset), "--dry-run"],
@@ -418,7 +418,7 @@ def test_preflight_enforces_record_and_target_call_bounds(
     assert "line 101: dataset exceeds 100 records" in too_many_records.output
 
     monkeypatch.setattr(
-        command_module,
+        preparation_module,
         "load_dataset_semantic_settings",
         lambda: _settings(),
     )
@@ -470,7 +470,7 @@ def test_repetition_budget_is_explicit_and_checked_before_external_setup(
     def unexpected_settings() -> None:
         raise AssertionError("over-budget repetition plan reached model setup")
 
-    monkeypatch.setattr(command_module, "load_dataset_semantic_settings", unexpected_settings)
+    monkeypatch.setattr(preparation_module, "load_dataset_semantic_settings", unexpected_settings)
     huge_plan = runner.invoke(
         root_app,
         [
@@ -488,7 +488,7 @@ def test_repetition_budget_is_explicit_and_checked_before_external_setup(
     assert "repetitions cannot exceed 100" in normalized_output
 
     monkeypatch.setattr(
-        command_module,
+        preparation_module,
         "load_dataset_semantic_settings",
         lambda: _settings(),
     )

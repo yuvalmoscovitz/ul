@@ -29,6 +29,7 @@ from ul_cli import dataset_augmentation_ledger as augmentation_ledger_module
 from ul_cli import dataset_review, dataset_trial_journal
 from ul_cli import finding_reference as finding_reference_module
 from ul_cli.dataset.evaluation import command as command_module
+from ul_cli.dataset.evaluation import preparation as preparation_module
 from ul_cli.dataset.evaluation import resume_compatibility
 from ul_cli.dataset.evaluation import runner as runner_module
 from ul_cli.dataset.evidence import customer as customer_module
@@ -240,7 +241,7 @@ def test_resume_reuses_manifest_without_original_data_config_or_overrides(
     custom_augmentations = tmp_path / "private" / "custom-augmentations.jsonl"
     custom_augmentations.parent.mkdir()
     _write_invariant_suite(invariant_path)
-    invariant_suite = command_module.load_dataset_invariant_suite(invariant_path)
+    invariant_suite = preparation_module.load_dataset_invariant_suite(invariant_path)
     source = _evaluation_result("interaction-1").source
     run_context = _run_context((source,), invariant_suite=invariant_suite)
     manifest = dataset_trial_journal.create_dataset_run_manifest(
@@ -285,7 +286,11 @@ def test_resume_reuses_manifest_without_original_data_config_or_overrides(
     def unexpected_settings_load() -> object:
         raise AssertionError("durable resume must restore safe evaluator settings")
 
-    monkeypatch.setattr(command_module, "load_dataset_semantic_settings", unexpected_settings_load)
+    monkeypatch.setattr(
+        preparation_module,
+        "load_dataset_semantic_settings",
+        unexpected_settings_load,
+    )
 
     result = runner.invoke(
         root_app,
@@ -361,7 +366,7 @@ def test_resume_fails_closed_when_completed_trials_have_no_durable_augmentation(
     journal.finish(manifest.work_plan[0], evaluation.baseline.trial_set.trials[0])
     journal.close()
     persistence_module.persist_evaluator_preflight(evidence, _evaluator_preflight())
-    monkeypatch.setattr(command_module, "load_dataset_semantic_settings", _settings)
+    monkeypatch.setattr(preparation_module, "load_dataset_semantic_settings", _settings)
 
     result = runner.invoke(
         root_app,
@@ -418,7 +423,7 @@ def test_resume_accepts_completed_trials_with_durable_augmentation_input(
     journal.finish(manifest.work_plan[0], evaluation.baseline.trial_set.trials[0])
     journal.close()
     persistence_module.persist_evaluator_preflight(evidence, _evaluator_preflight())
-    monkeypatch.setattr(command_module, "load_dataset_semantic_settings", lambda: settings)
+    monkeypatch.setattr(preparation_module, "load_dataset_semantic_settings", lambda: settings)
 
     result = runner.invoke(
         root_app,
@@ -591,7 +596,7 @@ def test_resume_skips_already_processed_interaction_ids(
         return ()
 
     monkeypatch.setattr(
-        command_module,
+        preparation_module,
         "load_dataset_semantic_settings",
         _settings,
     )
@@ -732,7 +737,7 @@ def test_resume_dry_run_rejects_ledger_that_disagrees_with_completed_evidence(
         selected_records=selected_records,
     ) as ledger:
         ledger.append(source=evaluation_result.source, augmentation=mismatched_augmentation)
-    monkeypatch.setattr(command_module, "load_dataset_semantic_settings", _settings)
+    monkeypatch.setattr(preparation_module, "load_dataset_semantic_settings", _settings)
 
     result = runner.invoke(
         root_app,
@@ -777,7 +782,7 @@ def test_resume_exits_early_when_all_records_already_processed(
         + "\n",
         encoding="utf-8",
     )
-    monkeypatch.setattr(command_module, "load_dataset_semantic_settings", _settings)
+    monkeypatch.setattr(preparation_module, "load_dataset_semantic_settings", _settings)
 
     command = [
         "dataset",
@@ -825,7 +830,7 @@ def test_all_complete_resume_preserves_source_preparation_failure_exit_code(
         run_context=cast(Any, run_context),
     )
     evidence.write_text(failure.model_dump_json(exclude_none=True) + "\n", encoding="utf-8")
-    monkeypatch.setattr(command_module, "load_dataset_semantic_settings", _settings)
+    monkeypatch.setattr(preparation_module, "load_dataset_semantic_settings", _settings)
 
     result = runner.invoke(
         root_app,
@@ -925,7 +930,7 @@ def test_all_complete_resume_preserves_prior_review_finding_exit_code(
     original_reference_context = finding_reference_module.create_finding_reference_context(
         finding_output
     )
-    monkeypatch.setattr(command_module, "load_dataset_semantic_settings", _settings)
+    monkeypatch.setattr(preparation_module, "load_dataset_semantic_settings", _settings)
 
     result = runner.invoke(
         root_app,
@@ -974,7 +979,7 @@ def test_all_complete_resume_preserves_prior_invariant_exit_code(
     _write_dataset(dataset, [_record()])
     _write_target_config(target_config)
     _write_invariant_suite(invariant_path)
-    invariant_suite = command_module.load_dataset_invariant_suite(invariant_path)
+    invariant_suite = preparation_module.load_dataset_invariant_suite(invariant_path)
     evaluation_result = _evaluation_result("interaction-1")
     baseline_output = (
         {"final_amount": 200, "corrected_amount": 100}
@@ -1030,7 +1035,7 @@ def test_all_complete_resume_preserves_prior_invariant_exit_code(
         + "\n",
         encoding="utf-8",
     )
-    monkeypatch.setattr(command_module, "load_dataset_semantic_settings", _settings)
+    monkeypatch.setattr(preparation_module, "load_dataset_semantic_settings", _settings)
 
     result = runner.invoke(
         root_app,
@@ -1063,7 +1068,7 @@ def test_resume_rejects_forged_invariant_outcome(tmp_path: Path) -> None:
     _write_dataset(dataset, [_record()])
     _write_target_config(target_config)
     _write_invariant_suite(invariant_path)
-    invariant_suite = command_module.load_dataset_invariant_suite(invariant_path)
+    invariant_suite = preparation_module.load_dataset_invariant_suite(invariant_path)
     evaluation_result = _evaluation_result("interaction-1")
     run_context = _run_context(
         (evaluation_result.source,),
@@ -1439,7 +1444,7 @@ def test_resume_rejects_changed_reasoning_mode(
         + "\n",
         encoding="utf-8",
     )
-    monkeypatch.setattr(command_module, "load_dataset_semantic_settings", _settings)
+    monkeypatch.setattr(preparation_module, "load_dataset_semantic_settings", _settings)
 
     result = runner.invoke(
         root_app,
@@ -1568,7 +1573,7 @@ def test_resume_dry_run_accepts_read_only_evidence(
         encoding="utf-8",
     )
     evidence.chmod(0o400)
-    monkeypatch.setattr(command_module, "load_dataset_semantic_settings", _settings)
+    monkeypatch.setattr(preparation_module, "load_dataset_semantic_settings", _settings)
 
     result = runner.invoke(
         root_app,

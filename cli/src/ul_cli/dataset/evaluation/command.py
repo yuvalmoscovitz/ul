@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
-import math
 import os
 import shlex
 import sys
@@ -14,30 +13,20 @@ from typing import Annotated, Any, Literal, TextIO, cast
 
 import httpx
 import typer
-from pydantic import JsonValue, ValidationError
+from pydantic import ValidationError
 from ul import (
     DatasetEvaluationMode,
     DatasetEvaluationResult,
     EvaluatorModelCompatibilityError,
     EvaluatorModelPreflight,
     ProviderDiagnosticError,
-    load_dataset_semantic_settings,
 )
-from ul.dataset_invariants import (
-    DatasetInvariantEvaluation,
-    DatasetInvariantRule,
-    load_dataset_invariant_suite,
-)
+from ul.dataset_invariants import DatasetInvariantEvaluation, DatasetInvariantRule
 from ul.http_environment import (
     JsonHttpEnvironmentConnection,
     JsonHttpTargetConfig,
-    json_http_environment_calls_per_execution,
     json_http_environment_capabilities,
-    json_http_environment_config_sha256,
     json_http_environment_config_urls,
-    json_http_environment_origin,
-    load_json_http_environment_config,
-    validate_json_http_environment_configuration,
 )
 
 from ul_cli.dataset.progress import (
@@ -48,22 +37,15 @@ from ul_cli.dataset.progress import (
 from ul_cli.dataset.source_preparation import DatasetSourcePreparationFailureEvent
 from ul_cli.dataset_augmentation_ledger import (
     DatasetAugmentationLedger,
-    create_dataset_augmentation_generation_context,
     create_private_augmentation_ledger,
-    dataset_augmentation_ledger_semantic_settings,
     open_augmentation_ledger_for_resume,
 )
 from ul_cli.dataset_campaign import create_dataset_campaign_plan
-from ul_cli.dataset_run_config import DatasetRunConfig, TargetExecutionConfig
 from ul_cli.dataset_trial_journal import (
     DatasetRunManifest,
     DatasetTrialJournal,
     create_dataset_run_manifest,
-    journal_anchor_path,
-    journal_path,
-    manifest_path,
     private_file_sha256,
-    read_dataset_run_manifest,
 )
 from ul_cli.environment import TEST_ENVIRONMENT_CONFIRMATION_MESSAGE
 from ul_cli.finding_adapters import FindingAdapterContext, adapt_dataset_finding_packages
@@ -75,20 +57,12 @@ from ul_cli.finding_reference import (
 from ul_cli.http_target_resolution import (
     HttpTargetConfirmation,
     ResolvedHttpTarget,
-    http_target_evidence_receipt,
-    resolve_http_target,
-    resolve_http_target_config,
 )
 from ul_cli.local_target_resolution import (
     ResolvedLocalTarget,
-    local_target_evidence_receipt,
-    resolve_local_target,
 )
 
-from ..evidence.context import build_dataset_evidence_run_context
 from ..evidence.persistence import (
-    default_augmentations_output,
-    durable_evidence_marker_manifest_sha256,
     load_evaluator_preflight,
     open_resume_output,
     persist_evaluator_preflight,
@@ -114,104 +88,13 @@ from .durable_run import (
 from .durable_run import (
     attempted_target_calls as _attempted_target_calls,
 )
-from .durable_run import (
-    restore_recorded_augmentation_input as _restore_recorded_augmentation_input,
-)
-from .operators import dataset_operator_identity, validate_operator_ids
-from .records import DatasetInputError, load_interaction_records, validate_model_input_bounds
-from .redaction import (
-    calculate_redaction_coverage,
-    load_redaction_engine,
-    protect_interaction_records,
-)
-from .resume_compatibility import (
-    restore_recorded_semantic_settings as _restore_recorded_semantic_settings,
-)
+from .preparation import prepare_dataset_evaluation
+from .request import DatasetEvaluationRequest, DatasetRequestError
 from .runner import evaluate_interaction_records, preflight_evaluator
 
 _MAXIMUM_DATASET_RECORDS = 100
-_MAXIMUM_REPETITIONS = 100
-_DEFAULT_MAXIMUM_ENVIRONMENT_API_CALLS = 100
-_DEFAULT_TARGET_TIMEOUT_SECONDS = 30.0
 _MAXIMUM_TARGET_TIMEOUT_SECONDS = 3_600.0
 _MAXIMUM_FINDING_SNAPSHOT_BYTES = 128_000_000
-
-
-def _resolve_target_timeout_seconds(
-    requested: float | None,
-    recorded_manifest: DatasetRunManifest | None,
-) -> float:
-    recorded = (
-        recorded_manifest.effective_command.run_config.target.trial_timeout_seconds
-        if recorded_manifest is not None
-        else _DEFAULT_TARGET_TIMEOUT_SECONDS
-    )
-    resolved = recorded if requested is None else requested
-    if not math.isfinite(resolved) or resolved <= 0:
-        raise typer.BadParameter(
-            "target timeout must be positive and finite",
-            param_hint="--target-timeout-seconds",
-        )
-    return resolved
-
-
-def _validate_target_concurrency(
-    concurrency: int,
-    *,
-    request_isolation: str | None,
-    local_target: bool,
-) -> None:
-    if concurrency == 1:
-        return
-    if local_target:
-        raise typer.BadParameter(
-            "--concurrency above 1 requires an isolated-response HTTP target; local targets "
-            "remain sequential",
-            param_hint="--concurrency",
-        )
-    if request_isolation != "per_request_attested":
-        raise typer.BadParameter(
-            "--concurrency above 1 requires an isolated-response target and "
-            "--confirm-request-isolation; stateful lifecycle targets remain sequential",
-            param_hint="--concurrency",
-        )
-
-
-def _source_outcome_projection_sha256(
-    target_config: JsonHttpTargetConfig | None,
-    local_target: ResolvedLocalTarget | None,
-) -> str | None:
-    projection = local_target.config.outcome if local_target is not None else None
-    if projection is None and target_config is not None:
-        projection = target_config.outcome
-    return projection.digest if projection is not None else None
-
-
-def _resolve_augmentation_output(
-    *,
-    augmentations_input: Path | None,
-    augmentations_output: Path | None,
-    no_save_augmentations: bool,
-    evidence_output: Path | None,
-) -> Path | None:
-    if augmentations_output is not None and no_save_augmentations:
-        raise typer.BadParameter(
-            "--augmentations-output cannot be used with --no-save-augmentations",
-            param_hint="--augmentations-output",
-        )
-    if augmentations_input is not None and augmentations_output is not None:
-        raise typer.BadParameter(
-            "--augmentations-input cannot be combined with --augmentations-output",
-            param_hint="--augmentations-input",
-        )
-    if (
-        augmentations_output is not None
-        or no_save_augmentations
-        or augmentations_input is not None
-        or evidence_output is None
-    ):
-        return augmentations_output
-    return default_augmentations_output(evidence_output)
 
 
 def _write_finding_package_snapshot(
@@ -603,460 +486,89 @@ def evaluate_dataset(
     Augmentation reuse: --augmentations-input PATH
     Augmentation retention: --augmentations-output PATH or --no-save-augmentations
     """
-    augmentations_input_was_explicit = augmentations_input is not None
-    augmentations_output_was_explicit = augmentations_output is not None
-    redaction_state_was_explicit = redaction_state is not None
-    recorded_manifest_for_resume = None
-    durable_path_presence = (False, False, False)
-    durable_evidence_manifest_sha256 = None
-    if resume is not None:
-        durable_paths = (
-            manifest_path(resume),
-            journal_path(resume),
-            journal_anchor_path(resume),
-        )
-        durable_path_presence = tuple(os.path.lexists(path) for path in durable_paths)
-        try:
-            durable_evidence_manifest_sha256 = durable_evidence_marker_manifest_sha256(resume)
-        except (OSError, ValueError) as error:
-            message = str(error) if isinstance(error, ValueError) else error.__class__.__name__
-            raise typer.BadParameter(
-                f"cannot safely inspect resume evidence ({message})",
-                param_hint="--resume",
-            ) from None
-        if durable_evidence_manifest_sha256 is not None and not all(durable_path_presence):
-            raise typer.BadParameter(
-                "durable evidence requires its manifest, journal, and anchor sidecars; restore "
-                "all three together because legacy replay is unsafe",
-                param_hint="--resume",
-            )
-        if any(durable_path_presence) and not all(durable_path_presence):
-            raise typer.BadParameter(
-                "durable resume sidecars are incomplete; restore the manifest, journal, and "
-                "anchor together",
-                param_hint="--resume",
-            )
-    if resume is not None and all(durable_path_presence):
-        try:
-            recorded_manifest_for_resume = read_dataset_run_manifest(manifest_path(resume))
-        except (OSError, ValueError) as error:
-            message = str(error) if isinstance(error, ValueError) else error.__class__.__name__
-            raise typer.BadParameter(
-                f"cannot safely read recorded run manifest ({message})",
-                param_hint="--resume",
-            ) from None
-        if (
-            durable_evidence_manifest_sha256 is not None
-            and durable_evidence_manifest_sha256 != recorded_manifest_for_resume.manifest_sha256
-        ):
-            raise typer.BadParameter(
-                "primary evidence marker does not match its durable manifest",
-                param_hint="--resume",
-            )
-        recorded_command = recorded_manifest_for_resume.effective_command
-        recorded_run_config = recorded_command.run_config
-        repetitions = repetitions or recorded_run_config.repetitions
-        concurrency = concurrency or recorded_run_config.concurrency
-        max_environment_api_calls = (
-            max_environment_api_calls or recorded_run_config.target.max_environment_api_calls
-        )
-        allow_environment_network = (
-            allow_environment_network or recorded_run_config.target.allow_network_egress
-        )
-        confirm_test_environment = (
-            confirm_test_environment or recorded_run_config.target.test_environment_confirmed
-        )
-        allow_insecure_http = allow_insecure_http or recorded_run_config.target.allow_insecure_http
-        if operator is None:
-            operator = list(recorded_manifest_for_resume.selected_operator_ids)
-        if data is None:
-            limit = len(recorded_manifest_for_resume.selected_records)
-        no_save_augmentations = not recorded_command.save_augmentations
-        if augmentations_output is None and recorded_command.augmentations_output_path is not None:
-            augmentations_output = Path(recorded_command.augmentations_output_path)
-        if redaction_state is None and recorded_command.redaction_state_path is not None:
-            redaction_state = Path(recorded_command.redaction_state_path)
-    repetitions = repetitions or 3
-    concurrency = concurrency or 1
-    target_timeout_seconds = _resolve_target_timeout_seconds(
-        target_timeout_seconds,
-        recorded_manifest_for_resume,
-    )
-    direct_http_options_used = (
-        http_preset is not None
-        or request_json_template is not None
-        or response_json_pointer is not None
-        or agent_model is not None
-        or bool(header_from_env)
-    )
-    if environment_config is not None and target is not None:
-        raise typer.BadParameter(
-            "--target cannot be combined with --environment-config",
-            param_hint="--target",
-        )
-    if target_artifact and target is None:
-        raise typer.BadParameter(
-            "--target-artifact requires --target", param_hint="--target-artifact"
-        )
-    if direct_http_options_used and target is None:
-        raise typer.BadParameter(
-            "direct HTTP mapping options require --target with an HTTP URL",
-            param_hint="--target",
-        )
-    if confirm_target is not None and target is None:
-        raise typer.BadParameter(
-            "--confirm-target requires --target", param_hint="--confirm-target"
-        )
-    if repetitions > _MAXIMUM_REPETITIONS:
-        raise typer.BadParameter(
-            f"repetitions cannot exceed {_MAXIMUM_REPETITIONS}",
-            param_hint="--repetitions",
-        )
-    max_environment_api_calls = max_environment_api_calls or _DEFAULT_MAXIMUM_ENVIRONMENT_API_CALLS
-    limit = limit or 10
-    if data is None and recorded_manifest_for_resume is None:
-        raise typer.BadParameter(
-            "DATA is required unless --resume has a durable run manifest",
-            param_hint="DATA",
-        )
-    if (json_output or show_sensitive_values) and not dry_run:
-        option = "--show-sensitive-values" if show_sensitive_values else "--json"
-        raise typer.BadParameter(f"{option} requires --dry-run", param_hint=option)
-    if evaluation_mode != "variance":
-        raise typer.BadParameter(
-            f"evaluation mode '{evaluation_mode}' is not implemented; use 'variance'. "
-            "Historical dataset output is grounding evidence, not an expected answer.",
-            param_hint="--evaluation-mode",
-        )
-    augmentations_input = _restore_recorded_augmentation_input(
-        augmentations_input, recorded_manifest_for_resume
-    )
-    if resume is not None:
-        if output is not None and output.resolve() != resume.resolve():
-            raise typer.BadParameter(
-                "--output must point to the same file as --resume, or be omitted",
-                param_hint="--output",
-            )
-        if output is None:
-            output = resume
-    augmentations_output = _resolve_augmentation_output(
+    raw_request = DatasetEvaluationRequest(
+        data=data,
+        environment_config=environment_config,
+        target=target,
+        target_artifacts=tuple(target_artifact or ()),
+        http_preset=http_preset,
+        request_json_template=request_json_template,
+        response_json_pointer=response_json_pointer,
+        agent_model=agent_model,
+        headers_from_env=tuple(header_from_env or ()),
+        confirm_target=confirm_target,
+        output=output,
         augmentations_input=augmentations_input,
         augmentations_output=augmentations_output,
         no_save_augmentations=no_save_augmentations,
-        evidence_output=output,
+        invariants=invariants,
+        evaluation_mode=evaluation_mode,
+        operators=tuple(operator) if operator is not None else None,
+        limit=limit,
+        repetitions=repetitions,
+        concurrency=concurrency,
+        target_timeout_seconds=target_timeout_seconds,
+        max_environment_api_calls=max_environment_api_calls,
+        allow_environment_network=allow_environment_network,
+        confirm_test_environment=confirm_test_environment,
+        confirm_request_isolation=confirm_request_isolation,
+        confirm_safe_test_target=confirm_safe_test_target,
+        allow_insecure_http=allow_insecure_http,
+        dry_run=dry_run,
+        json_output=json_output,
+        progress_json=progress_json,
+        show_sensitive_values=show_sensitive_values,
+        resume=resume,
+        resolve_quarantine_after=resolve_quarantine_after,
+        redaction_policy=redaction_policy,
+        redaction_state=redaction_state,
+        expected_environment_origin=expected_environment_origin,
+        expected_environment_config_sha256=expected_environment_config_sha256,
+        expected_redaction_policy_sha256=expected_redaction_policy_sha256,
+        show_report_guidance=show_report_guidance,
     )
-    if (
-        output is not None
-        and augmentations_output is not None
-        and output.resolve() == augmentations_output.resolve()
-    ):
-        raise typer.BadParameter(
-            "--augmentations-output must differ from --output",
-            param_hint="--augmentations-output",
-        )
     try:
-        if data is None:
-            assert recorded_manifest_for_resume is not None
-            records = recorded_manifest_for_resume.selected_records
-        else:
-            records = load_interaction_records(data)
-        selected_operators = validate_operator_ids(operator)
-        invariant_suite = (
-            load_dataset_invariant_suite(invariants)
-            if invariants is not None
-            else (
-                recorded_manifest_for_resume.effective_command.invariant_suite_snapshot
-                if recorded_manifest_for_resume is not None
-                else None
-            )
-        )
-        selected_records = records[:limit]
-        redaction_engine = load_redaction_engine(
-            redaction_policy,
-            redaction_state,
-            state_required=not dry_run or resume is not None,
-            policy_snapshot=(
-                recorded_manifest_for_resume.effective_command.redaction_policy_snapshot
-                if redaction_policy is None and recorded_manifest_for_resume is not None
-                else None
-            ),
-        )
-        if expected_redaction_policy_sha256 is not None and (
-            redaction_engine is None
-            or redaction_engine.policy.digest != expected_redaction_policy_sha256
-        ):
-            raise ValueError(
-                "redaction policy changed since 'ul init'; reinitialize the project before "
-                "sending data to the semantic provider"
-            )
-        redaction_coverage = (
-            recorded_manifest_for_resume.run_context.redaction_coverage
-            if data is None and recorded_manifest_for_resume is not None
-            else calculate_redaction_coverage(selected_records, redaction_engine)
-        )
-        if (
-            data is not None
-            and redaction_engine is not None
-            and (not dry_run or resume is not None)
-        ):
-            selected_records = protect_interaction_records(selected_records, redaction_engine)
-        all_selected_records = selected_records
-        if not dry_run and resume is None:
-            if environment_config is None and target is None:
-                raise typer.BadParameter(
-                    "execution requires --target or --environment-config",
-                    param_hint="--target",
-                )
-            if environment_config is not None and not allow_environment_network:
-                raise typer.BadParameter(
-                    "execution requires --allow-environment-network",
-                    param_hint="--allow-environment-network",
-                )
-            if not confirm_test_environment:
-                raise typer.BadParameter(
-                    TEST_ENVIRONMENT_CONFIRMATION_MESSAGE,
-                    param_hint="--confirm-test-environment",
-                )
-        loaded_local_target: ResolvedLocalTarget | None = None
-        resolved_http_target: ResolvedHttpTarget | None = None
-        if target is not None:
-            direct_http_target = target.casefold().startswith(("https://", "http://"))
-            if direct_http_target and not confirm_request_isolation:
-                raise typer.BadParameter(
-                    "direct HTTP targets require --confirm-request-isolation",
-                    param_hint="--confirm-request-isolation",
-                )
-            if direct_http_target and not confirm_safe_test_target:
-                raise typer.BadParameter(
-                    "direct HTTP targets require --confirm-safe-test-target",
-                    param_hint="--confirm-safe-test-target",
-                )
-            try:
-                resolved_http_target = resolve_http_target(
-                    target,
-                    allow_insecure_http=allow_insecure_http,
-                    http_preset=http_preset,
-                    request_json_template=request_json_template,
-                    response_json_pointer=response_json_pointer,
-                    agent_model=agent_model,
-                    header_from_env=header_from_env,
-                    request_isolation_attested=confirm_request_isolation,
-                    safe_test_target_attested=confirm_safe_test_target,
-                )
-            except (OSError, ValidationError, ValueError):
-                if (
-                    target.casefold().startswith(("https://", "http://"))
-                    or direct_http_options_used
-                ):
-                    raise
-                loaded_local_target = resolve_local_target(
-                    target,
-                    explicit_artifacts=tuple(target_artifact or ()),
-                )
-            if resolved_http_target is not None and target_artifact:
-                raise ValueError("--target-artifact applies only to local targets")
-        loaded_target_config = (
-            resolved_http_target.config
-            if resolved_http_target is not None
-            else (
-                load_json_http_environment_config(environment_config)
-                if environment_config is not None
-                else _recorded_http_target_config(recorded_manifest_for_resume)
-            )
-        )
-        recorded_http_confirmation = (
-            recorded_manifest_for_resume.effective_command.http_target_confirmation
-            if recorded_manifest_for_resume is not None
-            else None
-        )
-        if (
-            recorded_http_confirmation is not None
-            and resolved_http_target is None
-            and loaded_target_config is not None
-        ):
-            current_http_confirmation = resolve_http_target_config(
-                recorded_http_confirmation.reference,
-                loaded_target_config,
-                allow_insecure_http=allow_insecure_http,
-            ).confirmation
-            if current_http_confirmation != recorded_http_confirmation:
-                raise ValueError(
-                    "HTTP target credential identity changed since this run was confirmed; "
-                    "start a new evaluation and confirm the new target digest"
-                )
-        if (
-            resume is not None
-            and recorded_manifest_for_resume is not None
-            and recorded_manifest_for_resume.run_context.target.kind == "probe_target"
-            and recorded_manifest_for_resume.effective_command.http_target_config is None
-            and loaded_local_target is None
-        ):
-            raise ValueError("local target resume requires the same explicit --target")
-        if expected_environment_origin is not None:
-            if loaded_target_config is None:
-                raise ValueError("saved environment origin requires --environment-config")
-            if json_http_environment_origin(loaded_target_config) != expected_environment_origin:
-                raise ValueError(
-                    "environment origin changed since 'ul init'; reinitialize the project and "
-                    "repeat the environment safety acknowledgements"
-                )
-        if expected_environment_config_sha256 is not None:
-            if loaded_target_config is None:
-                raise ValueError("saved environment configuration requires --environment-config")
-            if json_http_environment_config_sha256(loaded_target_config) != (
-                expected_environment_config_sha256
-            ):
-                raise ValueError(
-                    "environment configuration changed since 'ul init'; reinitialize the project "
-                    "and repeat the environment safety acknowledgements"
-                )
-        target_request_isolation: str | None = None
-        if loaded_target_config is not None:
-            validate_json_http_environment_configuration(
-                loaded_target_config,
-                test_environment_confirmed=confirm_test_environment
-                or dry_run
-                or resume is not None,
-                allow_insecure_http=allow_insecure_http,
-            )
-            target_capabilities = json_http_environment_capabilities(loaded_target_config)
-            target_request_isolation = target_capabilities.request_isolation
-            if (
-                invariant_suite is not None
-                and invariant_suite.observation_authority == "committed_state_snapshot"
-                and not target_capabilities.supports_state_observation
-            ):
-                raise ValueError(
-                    "committed-state invariants require the stateful-lifecycle adapter tier; "
-                    "isolated-response targets provide response evidence only"
-                )
-        if (
-            resolved_http_target is not None
-            and not dry_run
-            and resume is None
-            and not allow_environment_network
-        ):
-            raise ValueError("HTTP target execution requires --allow-environment-network")
-        if (
-            resolved_http_target is not None
-            and not dry_run
-            and resume is None
-            and confirm_target != resolved_http_target.confirmation_sha256
-        ):
-            raise ValueError(
-                "HTTP execution requires --confirm-target with the exact displayed digest"
-            )
-        if (
-            loaded_local_target is not None
-            and invariant_suite is not None
-            and invariant_suite.observation_authority == "committed_state_snapshot"
-        ):
-            raise ValueError(
-                "committed-state invariants require the stateful-lifecycle adapter tier; "
-                "local targets provide response evidence only"
-            )
-        _validate_target_concurrency(
-            concurrency,
-            request_isolation=target_request_isolation,
-            local_target=loaded_local_target is not None,
-        )
-        normalized_target_config = loaded_target_config
-        if resume is not None and normalized_target_config is None and loaded_local_target is None:
-            raise ValueError("--resume requires a recorded or explicit environment configuration")
-        target_calls_per_execution = (
-            json_http_environment_calls_per_execution(normalized_target_config)
-            if normalized_target_config is not None
-            else 1
-        )
-        initial_target_calls = (
-            len(selected_records)
-            * repetitions
-            * (1 + len(selected_operators))
-            * target_calls_per_execution
-        )
-        if resume is None and initial_target_calls > max_environment_api_calls:
-            raise ValueError(
-                f"selection would make up to {initial_target_calls} environment API calls, "
-                f"exceeding --max-environment-api-calls {max_environment_api_calls}; reduce "
-                "--limit, --operator, or --repetitions, or explicitly raise the call budget"
-            )
-        run_config = DatasetRunConfig(
-            evaluation_mode=evaluation_mode,
-            repetitions=repetitions,
-            concurrency=concurrency,
-            target=TargetExecutionConfig(
-                trial_timeout_seconds=target_timeout_seconds,
-                max_environment_api_calls=max_environment_api_calls,
-                environment_api_calls_per_trial=target_calls_per_execution,
-                planned_environment_api_calls=initial_target_calls,
-                allow_network_egress=(allow_environment_network or loaded_local_target is not None),
-                test_environment_confirmed=confirm_test_environment,
-                allow_insecure_http=allow_insecure_http,
-            ),
-        )
-        if not dry_run and resume is None:
-            if output is None:
-                raise typer.BadParameter("execution requires --output", param_hint="--output")
-            if output.exists():
-                raise typer.BadParameter(
-                    "output already exists; UL will not overwrite it",
-                    param_hint="--output",
-                )
-            if augmentations_output is not None and augmentations_output.exists():
-                raise typer.BadParameter(
-                    "augmentations output already exists; UL will not overwrite it",
-                    param_hint="--augmentations-output",
-                )
-        settings = (
-            _restore_recorded_semantic_settings(recorded_manifest_for_resume)
-            if recorded_manifest_for_resume is not None
-            else load_dataset_semantic_settings()
-        )
-        validate_model_input_bounds(selected_records, settings.max_input_chars)
-        direct_http_target_receipt = _direct_http_target_receipt(
-            resolved_http_target, recorded_manifest_for_resume
-        )
-        run_context = (
-            build_dataset_evidence_run_context(
-                selected_records=selected_records,
-                selected_operator_ids=selected_operators,
-                run_config=run_config,
-                invariant_suite=invariant_suite,
-                target_config=(
-                    None if direct_http_target_receipt is not None else normalized_target_config
-                ),
-                target_receipt=(
-                    local_target_evidence_receipt(loaded_local_target)
-                    if loaded_local_target is not None
-                    else direct_http_target_receipt
-                ),
-                settings=settings,
-                redaction_policy_sha256=(
-                    redaction_engine.policy.digest if redaction_engine is not None else None
-                ),
-                redaction_coverage=redaction_coverage,
-            )
-            if normalized_target_config is not None or loaded_local_target is not None
-            else None
-        )
-        augmentation_generation_context = create_dataset_augmentation_generation_context(
-            selected_records=all_selected_records,
-            operators=tuple(
-                dataset_operator_identity(operator_reference)
-                for operator_reference in selected_operators
-            ),
-            semantic_settings=dataset_augmentation_ledger_semantic_settings(settings),
-            redaction_policy_sha256=(
-                redaction_engine.policy.digest if redaction_engine is not None else None
-            ),
-            source_outcome_projection_sha256=_source_outcome_projection_sha256(
-                normalized_target_config,
-                loaded_local_target,
-            ),
-        )
-    except (DatasetInputError, ValidationError, ValueError, RuntimeError) as error:
+        prepared_evaluation = prepare_dataset_evaluation(raw_request)
+    except DatasetRequestError as error:
+        raise typer.BadParameter(str(error), param_hint=error.parameter) from None
+    except (ValidationError, ValueError, RuntimeError) as error:
         raise typer.BadParameter(str(error)) from None
 
+    normalized_request = prepared_evaluation.request
+    requested = normalized_request.requested
+    recorded_manifest_for_resume = normalized_request.recorded_manifest
+    output = normalized_request.output
+    augmentations_input = normalized_request.augmentations_input
+    augmentations_output = normalized_request.augmentations_output
+    redaction_state = normalized_request.redaction_state
+    progress_json = requested.progress_json
+    resolve_quarantine_after = requested.resolve_quarantine_after
+    show_report_guidance = requested.show_report_guidance
+    evaluation_mode = normalized_request.evaluation_mode
+    repetitions = normalized_request.repetitions
+    concurrency = normalized_request.concurrency
+    target_timeout_seconds = normalized_request.target_timeout_seconds
+    max_environment_api_calls = normalized_request.max_environment_api_calls
+    allow_environment_network = normalized_request.allow_environment_network
+    confirm_test_environment = normalized_request.confirm_test_environment
+    allow_insecure_http = normalized_request.allow_insecure_http
+    augmentations_input_was_explicit = normalized_request.augmentations_input_was_explicit
+    augmentations_output_was_explicit = normalized_request.augmentations_output_was_explicit
+    redaction_state_was_explicit = normalized_request.redaction_state_was_explicit
+    records = prepared_evaluation.records
+    selected_records = prepared_evaluation.selected_records
+    all_selected_records = selected_records
+    selected_operators = prepared_evaluation.selected_operator_ids
+    invariant_suite = prepared_evaluation.invariant_suite
+    redaction_engine = prepared_evaluation.redaction_engine
+    redaction_coverage = prepared_evaluation.redaction_coverage
+    loaded_local_target = prepared_evaluation.local_target
+    resolved_http_target = prepared_evaluation.http_target
+    loaded_target_config = prepared_evaluation.target_config
+    run_config = prepared_evaluation.run_config
+    settings = prepared_evaluation.settings
+    run_context = prepared_evaluation.run_context
+    augmentation_generation_context = prepared_evaluation.augmentation_generation_context
     prepared_durable_run: PreparedDurableRun | None = None
     trial_journal: DatasetTrialJournal | None = None
     expected_manifest: DatasetRunManifest | None = None
@@ -1808,33 +1320,6 @@ def evaluate_dataset(
         raise typer.Exit(code=2)
     if all_source_preparation_failures:
         raise typer.Exit(code=2)
-
-
-def _recorded_http_target_config(
-    recorded_manifest: DatasetRunManifest | None,
-) -> JsonHttpTargetConfig | None:
-    if recorded_manifest is None:
-        return None
-    direct_http_config = recorded_manifest.effective_command.http_target_config
-    if direct_http_config is not None:
-        return direct_http_config
-    if recorded_manifest.run_context.target.kind == "environment_http":
-        return recorded_manifest.run_context.target.config
-    return None
-
-
-def _direct_http_target_receipt(
-    resolved_target: ResolvedHttpTarget | None,
-    recorded_manifest: DatasetRunManifest | None,
-) -> dict[str, JsonValue] | None:
-    if resolved_target is not None:
-        return http_target_evidence_receipt(resolved_target)
-    if (
-        recorded_manifest is not None
-        and recorded_manifest.effective_command.http_target_config is not None
-    ):
-        return recorded_manifest.run_context.target.receipt
-    return None
 
 
 def _recorded_or_resolved_http_confirmation(

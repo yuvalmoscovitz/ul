@@ -242,16 +242,6 @@ def _load_complete_augmentation_input(
     )
 
 
-def restore_recorded_augmentation_input(
-    requested: Path | None,
-    recorded_manifest: DatasetRunManifest | None,
-) -> Path | None:
-    if requested is not None or recorded_manifest is None:
-        return requested
-    recorded_path = recorded_manifest.effective_command.augmentations_input_path
-    return Path(recorded_path) if recorded_path is not None else None
-
-
 def _close_trial_journal(trial_journal: DatasetTrialJournal | None) -> None:
     if trial_journal is not None:
         trial_journal.close()

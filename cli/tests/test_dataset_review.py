@@ -34,6 +34,7 @@ from ul.dataset_invariants import DatasetInvariantSuite, JsonValuesEqualInvarian
 from ul_cli import dataset_review
 from ul_cli import report as report_module
 from ul_cli.dataset.evaluation import command as dataset_command
+from ul_cli.dataset.evaluation import preparation as preparation_module
 from ul_cli.dataset.evaluation import runner as dataset_runner
 from ul_cli.main import app
 from ul_cli.pattern_identity import pattern_mechanism_pseudonym
@@ -2139,7 +2140,7 @@ def test_report_and_review_make_no_model_or_network_calls(
     def unexpected_call(*args: object, **kwargs: object) -> None:
         raise AssertionError("report/review attempted an external call")
 
-    monkeypatch.setattr(dataset_command, "load_dataset_semantic_settings", unexpected_call)
+    monkeypatch.setattr(preparation_module, "load_dataset_semantic_settings", unexpected_call)
     monkeypatch.setattr(dataset_runner, "create_semantic_model_deconstructor", unexpected_call)
     monkeypatch.setattr(dataset_command, "JsonHttpEnvironmentConnection", unexpected_call)
 

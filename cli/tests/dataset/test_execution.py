@@ -32,6 +32,7 @@ from ul.llm import LLMClient, llm_client_config_from_dataset_settings
 from ul_cli import dataset_augmentation_ledger as augmentation_ledger_module
 from ul_cli import progress_action as progress_action_module
 from ul_cli.dataset.evaluation import command as command_module
+from ul_cli.dataset.evaluation import preparation as preparation_module
 from ul_cli.dataset.evaluation import runner as runner_module
 from ul_cli.dataset.evidence import persistence as persistence_module
 from ul_cli.dataset.source_preparation import build_source_preparation_failure_event
@@ -126,7 +127,7 @@ def test_execution_reuses_complete_augmentation_input_without_regeneration(
         output_stream.flush()
         return ()
 
-    monkeypatch.setattr(command_module, "load_dataset_semantic_settings", lambda: settings)
+    monkeypatch.setattr(preparation_module, "load_dataset_semantic_settings", lambda: settings)
     monkeypatch.setattr(command_module, "JsonHttpEnvironmentConnection", FakeTarget)
     monkeypatch.setattr(command_module, "evaluate_interaction_records", fake_evaluate)
 
@@ -560,7 +561,7 @@ def test_safe_boundary_pause_flushes_a_resumable_campaign(
         runtime.control.request_pause()
         return runtime
 
-    monkeypatch.setattr(command_module, "load_dataset_semantic_settings", _settings)
+    monkeypatch.setattr(preparation_module, "load_dataset_semantic_settings", _settings)
     monkeypatch.setattr(command_module, "JsonHttpEnvironmentConnection", FakeTarget)
     monkeypatch.setattr(command_module, "preflight_evaluator", successful_preflight)
     monkeypatch.setattr(
@@ -692,7 +693,7 @@ def test_full_dataset_evaluation_runs_local_callable_through_worker_boundary(
     async def successful_preflight(_settings: object) -> object:
         return _evaluator_preflight()
 
-    monkeypatch.setattr(command_module, "load_dataset_semantic_settings", _settings)
+    monkeypatch.setattr(preparation_module, "load_dataset_semantic_settings", _settings)
     monkeypatch.setattr(command_module, "preflight_evaluator", successful_preflight)
     monkeypatch.setattr(
         runner_module,
@@ -850,7 +851,7 @@ def test_public_cli_augments_multi_action_request_with_distinctly_grounded_objec
     async def successful_preflight(_settings: object) -> object:
         return _evaluator_preflight()
 
-    monkeypatch.setattr(command_module, "load_dataset_semantic_settings", _settings)
+    monkeypatch.setattr(preparation_module, "load_dataset_semantic_settings", _settings)
     monkeypatch.setattr(command_module, "preflight_evaluator", successful_preflight)
     monkeypatch.setattr(
         runner_module,
@@ -972,7 +973,7 @@ def test_public_cli_persists_and_applies_automatic_materiality(
         return _evaluator_preflight()
 
     monkeypatch.setattr(
-        command_module,
+        preparation_module,
         "load_dataset_semantic_settings",
         lambda: _settings(**settings_overrides),
     )
@@ -1064,7 +1065,7 @@ def test_public_cli_does_not_let_judge_suppress_removed_committed_action(
     async def successful_preflight(_settings: object) -> object:
         return _evaluator_preflight()
 
-    monkeypatch.setattr(command_module, "load_dataset_semantic_settings", _settings)
+    monkeypatch.setattr(preparation_module, "load_dataset_semantic_settings", _settings)
     monkeypatch.setattr(command_module, "preflight_evaluator", successful_preflight)
     monkeypatch.setattr(
         runner_module,
@@ -1167,7 +1168,7 @@ def test_dataset_evaluation_allows_http_target_response_after_thirty_seconds(
 
     monkeypatch.setenv("UL_LIVE", "true")
     monkeypatch.setenv("OPEN_ROUTER_API_KEY", "test-key")
-    monkeypatch.setattr(command_module, "load_dataset_semantic_settings", _settings)
+    monkeypatch.setattr(preparation_module, "load_dataset_semantic_settings", _settings)
     monkeypatch.setattr(command_module, "preflight_evaluator", successful_preflight)
     monkeypatch.setattr(
         runner_module,
@@ -1278,7 +1279,7 @@ def test_declared_projection_compares_raw_recorded_tool_calls_through_public_cli
     async def successful_preflight(_settings: object) -> object:
         return _evaluator_preflight()
 
-    monkeypatch.setattr(command_module, "load_dataset_semantic_settings", _settings)
+    monkeypatch.setattr(preparation_module, "load_dataset_semantic_settings", _settings)
     monkeypatch.setattr(command_module, "preflight_evaluator", successful_preflight)
     monkeypatch.setattr(
         runner_module,
@@ -1341,7 +1342,7 @@ def test_local_target_pause_action_preserves_binding_and_resumes(
     async def successful_preflight(_settings: object) -> object:
         return _evaluator_preflight()
 
-    monkeypatch.setattr(command_module, "load_dataset_semantic_settings", _settings)
+    monkeypatch.setattr(preparation_module, "load_dataset_semantic_settings", _settings)
     monkeypatch.setattr(command_module, "preflight_evaluator", successful_preflight)
     monkeypatch.setattr(
         runner_module,
@@ -1479,7 +1480,7 @@ done
     async def successful_preflight(_settings: object) -> object:
         return _evaluator_preflight()
 
-    monkeypatch.setattr(command_module, "load_dataset_semantic_settings", _settings)
+    monkeypatch.setattr(preparation_module, "load_dataset_semantic_settings", _settings)
     monkeypatch.setattr(command_module, "preflight_evaluator", successful_preflight)
     monkeypatch.setattr(
         runner_module,
@@ -1528,7 +1529,7 @@ def test_execution_refuses_to_overwrite_output_before_model_setup(
     def unexpected_settings() -> None:
         raise AssertionError("output collision reached model setup")
 
-    monkeypatch.setattr(command_module, "load_dataset_semantic_settings", unexpected_settings)
+    monkeypatch.setattr(preparation_module, "load_dataset_semantic_settings", unexpected_settings)
     result = runner.invoke(
         root_app,
         [
@@ -1563,7 +1564,7 @@ def test_execution_refuses_default_augmentations_collision_before_model_setup(
     def unexpected_settings() -> None:
         raise AssertionError("augmentations collision reached model setup")
 
-    monkeypatch.setattr(command_module, "load_dataset_semantic_settings", unexpected_settings)
+    monkeypatch.setattr(preparation_module, "load_dataset_semantic_settings", unexpected_settings)
     result = runner.invoke(
         root_app,
         [
@@ -1605,7 +1606,7 @@ def test_invalid_custom_augmentations_path_does_not_strand_evidence(
         async def aclose(self) -> None:
             return None
 
-    monkeypatch.setattr(command_module, "load_dataset_semantic_settings", _settings)
+    monkeypatch.setattr(preparation_module, "load_dataset_semantic_settings", _settings)
     monkeypatch.setattr(command_module, "JsonHttpEnvironmentConnection", FakeTarget)
 
     result = runner.invoke(
@@ -1648,7 +1649,7 @@ def test_execution_rejects_missing_header_secret_before_model_or_output(
     )
     monkeypatch.delenv("UL_ENVIRONMENT_MISSING_TOKEN", raising=False)
     monkeypatch.setattr(
-        command_module,
+        preparation_module,
         "load_dataset_semantic_settings",
         _settings,
     )
@@ -1749,7 +1750,7 @@ def test_public_cli_records_one_source_failure_and_completes_another(
     async def successful_preflight(_settings: object) -> object:
         return _evaluator_preflight()
 
-    monkeypatch.setattr(command_module, "load_dataset_semantic_settings", _settings)
+    monkeypatch.setattr(preparation_module, "load_dataset_semantic_settings", _settings)
     monkeypatch.setattr(command_module, "preflight_evaluator", successful_preflight)
     monkeypatch.setattr(command_module, "JsonHttpEnvironmentConnection", FakeTarget)
     monkeypatch.setattr(
@@ -1867,7 +1868,7 @@ def test_execution_creates_private_explicit_output(
         return ()
 
     monkeypatch.setattr(
-        command_module,
+        preparation_module,
         "load_dataset_semantic_settings",
         _settings,
     )
@@ -1976,7 +1977,7 @@ def test_provider_failure_has_concise_output_and_private_sanitized_diagnostics(
         error.add_note(secret)
         raise error
 
-    monkeypatch.setattr(command_module, "load_dataset_semantic_settings", _settings)
+    monkeypatch.setattr(preparation_module, "load_dataset_semantic_settings", _settings)
     monkeypatch.setattr(command_module, "JsonHttpEnvironmentConnection", FakeTarget)
     monkeypatch.setattr(command_module, "evaluate_interaction_records", fail_evaluation)
 
@@ -2165,7 +2166,7 @@ def test_execution_wires_redaction_into_records_pipeline_and_run_context(
         output_stream.write(serialized_context + "\n")
         return ()
 
-    monkeypatch.setattr(command_module, "load_dataset_semantic_settings", _settings)
+    monkeypatch.setattr(preparation_module, "load_dataset_semantic_settings", _settings)
     monkeypatch.setattr(command_module, "JsonHttpEnvironmentConnection", FakeTarget)
     monkeypatch.setattr(command_module, "evaluate_interaction_records", fake_evaluate)
 
@@ -2326,7 +2327,7 @@ def test_target_config_runs_nested_request_and_response_against_loopback(
             return ()
 
         monkeypatch.setattr(
-            command_module,
+            preparation_module,
             "load_dataset_semantic_settings",
             _settings,
         )
@@ -2475,7 +2476,7 @@ def test_http_target_contract_runs_authenticated_loopback_and_resumes(
             output_stream.write('{"saved":true}\n')
             return ()
 
-        monkeypatch.setattr(command_module, "load_dataset_semantic_settings", _settings)
+        monkeypatch.setattr(preparation_module, "load_dataset_semantic_settings", _settings)
         monkeypatch.setattr(command_module, "evaluate_interaction_records", evaluate_once)
         arguments = [
             "dataset",
