@@ -32,12 +32,6 @@ _READ_ONLY_ACTION_TOKENS = frozenset(
     {"FETCH", "FIND", "GET", "LIST", "LOOKUP", "QUERY", "READ", "SEARCH"}
 )
 _RESPONSE_ENVELOPE_FIELDS = frozenset({"answer", "actions", "reward", "status", "steps", "task_id"})
-_EVALUATOR = RubricEvaluator(
-    id="dataset.material_variance.v2",
-    rubric=_PROMPTS.get_prompt("evaluation.material_variance"),
-    minimum_score=0,
-    include_sources=("answer",),
-)
 _LABELS: dict[str, tuple[MaterialVarianceDecision, MaterialVarianceReasonCode, float]] = {
     "material_variance:action_added": ("material_variance", "action_added", 1),
     "material_variance:action_removed": ("material_variance", "action_removed", 1),
@@ -92,6 +86,14 @@ _LABELS: dict[str, tuple[MaterialVarianceDecision, MaterialVarianceReasonCode, f
         0.5,
     ),
 }
+_EVALUATOR = RubricEvaluator(
+    id="dataset.material_variance.v2",
+    rubric=_PROMPTS.get_prompt("evaluation.material_variance"),
+    minimum_score=0,
+    allowed_labels=tuple(_LABELS),
+    label_scores={label: contract[2] for label, contract in _LABELS.items()},
+    include_sources=("answer",),
+)
 _EXPLANATIONS = {
     "material_variance": "The variation changed the observed real-world action or outcome.",
     "operationally_equivalent": (

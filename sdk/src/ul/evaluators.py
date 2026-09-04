@@ -9,7 +9,7 @@ import math
 from collections.abc import Awaitable, Callable, Mapping
 from copy import deepcopy
 from types import TracebackType
-from typing import Literal, Protocol, Self, cast
+from typing import Annotated, Any, Literal, Protocol, Self, cast
 from urllib.parse import urlsplit, urlunsplit
 
 import httpx
@@ -69,6 +69,31 @@ class JudgeRequest(ULModel):
     rubric: str
     payload: dict[str, JsonValue]
     allow_tie: bool = False
+    allowed_labels: tuple[Annotated[str, Field(min_length=1, max_length=500)], ...] = Field(
+        default=(), max_length=100
+    )
+    label_scores: dict[Annotated[str, Field(min_length=1, max_length=500)], float] = Field(
+        default_factory=dict, max_length=100
+    )
+
+    @model_validator(mode="after")
+    def validate_label_contract(self) -> Self:
+        if len(self.allowed_labels) != len(set(self.allowed_labels)):
+            raise ValueError("judge allowed_labels must be unique")
+        if self.label_scores and set(self.label_scores) != set(self.allowed_labels):
+            raise ValueError("judge label_scores must cover exactly allowed_labels")
+        if any(
+            not math.isfinite(score) or not 0 <= score <= 1 for score in self.label_scores.values()
+        ):
+            raise ValueError("judge label_scores must be finite values from 0 to 1")
+        if self.mode == "pairwise":
+            if self.allowed_labels != ("candidate", "reference", "tie"):
+                raise ValueError("pairwise judge labels must be candidate, reference, and tie")
+            if self.label_scores:
+                raise ValueError("pairwise judge does not accept label_scores")
+        elif self.allow_tie:
+            raise ValueError("allow_tie is only valid for pairwise judges")
+        return self
 
 
 class EvaluatorJudge(Protocol):
@@ -197,7 +222,16 @@ class _JudgeOutput(BaseModel):
     score: float | None = Field(ge=0, le=1)
     label: str | None = Field(min_length=1, max_length=500)
     explanation: str = Field(min_length=1, max_length=5_000)
-    citations: tuple[str, ...] = Field(min_length=1, max_length=20)
+    citations: tuple[
+        Annotated[
+            str,
+            Field(
+                max_length=4_096,
+                pattern=r"^/payload/(?:[^~/]|~[01])*(?:/(?:[^~/]|~[01])*)*$",
+            ),
+        ],
+        ...,
+    ] = Field(min_length=1, max_length=20)
 
 
 class OpenAICompatibleEvaluatorJudge:
@@ -242,23 +276,64 @@ class OpenAICompatibleEvaluatorJudge:
             await self.llm_client.aclose()
 
     async def evaluate(self, request: JudgeRequest) -> EvaluatorDecision:
+        output_schema = _judge_output_schema(request)
+        allowed_labels = _allowed_judge_labels(request)
         completion = await self.llm_client.complete(
             role="materiality",
             seed=0,
             top_p=None,
             schema_name="ul_evaluator_decision",
-            schema=_JudgeOutput.model_json_schema(mode="validation"),
+            schema=output_schema,
             strict_schema=True,
             system_prompt=_PROMPTS.get_prompt("evaluation.judge"),
             user_payload=json.dumps(request.model_dump(mode="json"), sort_keys=True),
         )
         output = _JudgeOutput.model_validate_json(completion.choices[0].message.content)
+        if allowed_labels and output.label not in allowed_labels:
+            raise ValueError("judge label is outside the structured output contract")
+        if request.mode == "pairwise" and output.label is None:
+            raise ValueError("pairwise judge must choose a label")
+        if request.mode == "pairwise" and output.score is not None:
+            raise ValueError("pairwise judge must not return a score")
+        if request.label_scores and output.score is not None:
+            raise ValueError("label-scored rubric judge must not return a score")
+        if request.mode == "rubric" and not request.label_scores and output.score is None:
+            raise ValueError("rubric judge must return a score")
         return EvaluatorDecision(
             score=output.score,
             label=output.label,
             explanation=output.explanation,
             evidence=_judge_evidence(request, output.citations),
         )
+
+
+def _judge_output_schema(request: JudgeRequest) -> dict[str, Any]:
+    schema = _JudgeOutput.model_json_schema(mode="validation")
+    properties = cast(dict[str, dict[str, object]], schema["properties"])
+    if request.mode == "pairwise":
+        properties["label"] = {
+            "enum": list(_allowed_judge_labels(request)),
+            "type": "string",
+        }
+        properties["score"] = {"type": "null"}
+    elif request.allowed_labels:
+        properties["label"] = {
+            "enum": list(request.allowed_labels),
+            "type": "string",
+        }
+        if request.label_scores:
+            properties["score"] = {"type": "null"}
+        else:
+            properties["score"] = {"maximum": 1, "minimum": 0, "type": "number"}
+    else:
+        properties["score"] = {"maximum": 1, "minimum": 0, "type": "number"}
+    return schema
+
+
+def _allowed_judge_labels(request: JudgeRequest) -> tuple[str, ...]:
+    if request.mode == "pairwise":
+        return ("candidate", "reference", "tie")
+    return request.allowed_labels
 
 
 def evaluator_judge_version_from_llm_config(
@@ -810,6 +885,12 @@ async def _evaluate_one(
     decision = await judge.evaluate(request)
     _validate_judge_evidence(request, decision.evidence)
     if isinstance(evaluator, RubricEvaluator):
+        if evaluator.allowed_labels and decision.label not in evaluator.allowed_labels:
+            raise ValueError("rubric judge label is outside the evaluator contract")
+        if evaluator.label_scores:
+            decision = decision.model_copy(
+                update={"score": evaluator.label_scores[cast(str, decision.label)]}
+            )
         if decision.score is None:
             raise ValueError("rubric judges must return a score")
         passed = decision.score >= evaluator.minimum_score
@@ -859,6 +940,12 @@ def _judge_request(
         rubric=evaluator.rubric,
         payload=payload,
         allow_tie=isinstance(evaluator, PairwiseEvaluator) and evaluator.allow_tie,
+        allowed_labels=(
+            ("candidate", "reference", "tie")
+            if isinstance(evaluator, PairwiseEvaluator)
+            else evaluator.allowed_labels
+        ),
+        label_scores=(evaluator.label_scores if isinstance(evaluator, RubricEvaluator) else {}),
     )
 
 
