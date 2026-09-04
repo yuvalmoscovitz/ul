@@ -1,5 +1,9 @@
 import pytest
-from ul.augmentations._dataset_operators import dataset_operator_runtime
+from ul.augmentations._dataset_operators import (
+    _operators_from_specifications,
+    dataset_operator_prompt_name,
+    dataset_operator_runtime,
+)
 from ul.augmentations.dataset import (
     builtin_dataset_augmentation_operators,
     resolve_dataset_augmentation_operator,
@@ -15,7 +19,7 @@ from ul_core.prompts import PromptManager
 def _dataset_catalog_entries() -> tuple[tuple[BuiltinAugmentationSpec, AugmentationBinding], ...]:
     entries = tuple(
         (specification, binding)
-        for specification in builtin_augmentation_catalog().list(latest_only=False)
+        for specification in builtin_augmentation_catalog().list(mode="dataset_variation")
         for binding in specification.bindings
         if binding.mode == "dataset_variation"
     )
@@ -56,9 +60,60 @@ def test_every_dataset_operator_uses_its_catalog_named_prompt() -> None:
     prompts = PromptManager.instance()
 
     for operator in builtin_dataset_augmentation_operators():
-        prompt_name = f"augmentation.{operator.id}"
+        prompt_name = dataset_operator_prompt_name(operator)
         assert prompts.get_template_info(prompt_name).name == prompt_name
         assert operator.instruction == prompts.get_prompt(prompt_name)
+
+
+def _versioned_rephrase_specification(
+    version: str, prompt_name: str | None
+) -> BuiltinAugmentationSpec:
+    specification = builtin_augmentation_catalog().get("input.surface.rephrase")
+    binding = next(
+        binding for binding in specification.bindings if binding.mode == "dataset_variation"
+    )
+    assert binding.dataset_runtime is not None
+    versioned_binding = binding.model_copy(
+        update={
+            "dataset_runtime": binding.dataset_runtime.model_copy(
+                update={"prompt_name": prompt_name}
+            )
+        }
+    )
+    return specification.model_copy(
+        update={
+            "ref": specification.ref.model_copy(update={"version": version}),
+            "bindings": (versioned_binding,),
+        }
+    )
+
+
+def test_default_operators_select_only_latest_version_with_its_prompt() -> None:
+    version_one = _versioned_rephrase_specification("1.0.0", "augmentation.input.surface.rephrase")
+    version_two = _versioned_rephrase_specification("2.0.0", "augmentation.input.style.terse")
+
+    default_operators = _operators_from_specifications((version_one, version_two), latest_only=True)
+    historical_operators = _operators_from_specifications(
+        (version_one, version_two), latest_only=False
+    )
+
+    assert tuple(operator.version for operator in default_operators) == ("2.0.0",)
+    assert tuple(operator.version for operator in historical_operators) == ("1.0.0", "2.0.0")
+    assert default_operators[0].instruction == PromptManager.instance().get_prompt(
+        "augmentation.input.style.terse"
+    )
+    assert historical_operators[0].instruction != historical_operators[1].instruction
+
+
+def test_versioned_operators_require_explicit_prompt_identities() -> None:
+    version_one = _versioned_rephrase_specification("1.0.0", None)
+    version_two = _versioned_rephrase_specification("2.0.0", None)
+
+    with pytest.raises(
+        ValueError,
+        match=r"^versioned dataset augmentations require explicit prompt identities$",
+    ):
+        _operators_from_specifications((version_one, version_two), latest_only=True)
 
 
 @pytest.mark.parametrize(

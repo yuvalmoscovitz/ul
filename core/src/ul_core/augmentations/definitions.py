@@ -82,6 +82,7 @@ class DatasetVariationRuntime(_CatalogModel):
     allowed_change: DatasetAllowedChange
     target_communication_kind: str | None = Field(default=None, min_length=1)
     semantic_allowed_surface_change: SemanticAllowedSurfaceChange = "none"
+    prompt_name: str | None = Field(default=None, min_length=1, max_length=500)
 
     @model_validator(mode="after")
     def validate_change_contract(self) -> Self:
@@ -271,6 +272,7 @@ def _dataset_spec(
     allowed_change: DatasetAllowedChange,
     target_communication_kind: str | None = None,
     semantic_allowed_surface_change: SemanticAllowedSurfaceChange = "none",
+    prompt_name: str | None = None,
 ) -> BuiltinAugmentationSpec:
     return BuiltinAugmentationSpec(
         ref=AugmentationRef(id=augmentation_id, version=version),
@@ -304,6 +306,7 @@ def _dataset_spec(
                     allowed_change=allowed_change,
                     target_communication_kind=target_communication_kind,
                     semantic_allowed_surface_change=semantic_allowed_surface_change,
+                    prompt_name=prompt_name,
                 ),
             ),
         ),

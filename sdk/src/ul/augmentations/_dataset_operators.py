@@ -52,6 +52,11 @@ def _validate_operator_id(operator_id: str) -> str:
     return operator_id
 
 
+def _version_tuple(version: str) -> tuple[int, int, int]:
+    major, minor, patch = version.split(".")
+    return int(major), int(minor), int(patch)
+
+
 OperatorId = Annotated[
     str,
     AfterValidator(_validate_operator_id),
@@ -89,8 +94,8 @@ class DatasetAugmentationOperator(ULModel):
         return self
 
 
-def dataset_operator_prompt_name(operator_id: str) -> str:
-    return f"augmentation.{operator_id}"
+def _specification_prompt_name(specification: BuiltinAugmentationSpec) -> str:
+    return _dataset_runtime(specification).prompt_name or f"augmentation.{specification.ref.id}"
 
 
 def _builtin_operator(specification: BuiltinAugmentationSpec) -> DatasetAugmentationOperator:
@@ -99,9 +104,7 @@ def _builtin_operator(specification: BuiltinAugmentationSpec) -> DatasetAugmenta
     return DatasetAugmentationOperator(
         id=specification.ref.id,
         version=specification.ref.version,
-        instruction=PromptManager.instance().get_prompt(
-            dataset_operator_prompt_name(specification.ref.id)
-        ),
+        instruction=PromptManager.instance().get_prompt(_specification_prompt_name(specification)),
         applicability_profile=specification.applicability_profile,
         applicability_rule=specification.applicability_rule,
         generation_mechanism=runtime.generation_mechanism,
@@ -111,11 +114,64 @@ def _builtin_operator(specification: BuiltinAugmentationSpec) -> DatasetAugmenta
     )
 
 
-_BUILTIN_OPERATORS = tuple(
-    _builtin_operator(specification) for specification in _DATASET_SPECIFICATIONS
+def _validate_versioned_prompt_identities(
+    specifications: tuple[BuiltinAugmentationSpec, ...],
+) -> None:
+    specifications_by_id: dict[str, list[BuiltinAugmentationSpec]] = {}
+    for specification in specifications:
+        specifications_by_id.setdefault(specification.ref.id, []).append(specification)
+    for versioned_specifications in specifications_by_id.values():
+        if len(versioned_specifications) > 1 and any(
+            _dataset_runtime(specification).prompt_name is None
+            for specification in versioned_specifications
+        ):
+            raise ValueError("versioned dataset augmentations require explicit prompt identities")
+
+
+def _latest_specifications(
+    specifications: tuple[BuiltinAugmentationSpec, ...],
+) -> tuple[BuiltinAugmentationSpec, ...]:
+    latest_by_id: dict[str, BuiltinAugmentationSpec] = {}
+    for specification in specifications:
+        previous = latest_by_id.get(specification.ref.id)
+        if previous is None or _version_tuple(specification.ref.version) > _version_tuple(
+            previous.ref.version
+        ):
+            latest_by_id[specification.ref.id] = specification
+    return tuple(
+        sorted(
+            latest_by_id.values(),
+            key=lambda specification: (
+                _dataset_runtime(specification).order,
+                specification.ref.id,
+                specification.ref.version,
+            ),
+        )
+    )
+
+
+def _operators_from_specifications(
+    specifications: tuple[BuiltinAugmentationSpec, ...],
+    *,
+    latest_only: bool,
+) -> tuple[DatasetAugmentationOperator, ...]:
+    _validate_versioned_prompt_identities(specifications)
+    selected_specifications = (
+        _latest_specifications(specifications) if latest_only else specifications
+    )
+    return tuple(_builtin_operator(specification) for specification in selected_specifications)
+
+
+_ALL_BUILTIN_OPERATORS = _operators_from_specifications(
+    _DATASET_SPECIFICATIONS,
+    latest_only=False,
+)
+_BUILTIN_OPERATORS = _operators_from_specifications(
+    _DATASET_SPECIFICATIONS,
+    latest_only=True,
 )
 _BUILTIN_OPERATORS_BY_REFERENCE = {
-    (operator.id, operator.version): operator for operator in _BUILTIN_OPERATORS
+    (operator.id, operator.version): operator for operator in _ALL_BUILTIN_OPERATORS
 }
 _DATASET_RUNTIMES_BY_REFERENCE = {
     (specification.ref.id, specification.ref.version): _dataset_runtime(specification)
@@ -136,7 +192,7 @@ def resolve_dataset_augmentation_operator(reference: str) -> DatasetAugmentation
         if operator is None:
             raise ValueError("unknown dataset augmentation reference")
         return operator
-    matching = tuple(operator for operator in _BUILTIN_OPERATORS if operator.id == operator_id)
+    matching = tuple(operator for operator in _ALL_BUILTIN_OPERATORS if operator.id == operator_id)
     if not matching:
         raise ValueError("unknown dataset augmentation reference")
     return max(matching, key=lambda operator: _version_tuple(operator.version))
@@ -144,6 +200,11 @@ def resolve_dataset_augmentation_operator(reference: str) -> DatasetAugmentation
 
 def dataset_operator_runtime(operator: DatasetAugmentationOperator) -> DatasetVariationRuntime:
     return _DATASET_RUNTIMES_BY_REFERENCE[(operator.id, operator.version)]
+
+
+def dataset_operator_prompt_name(operator: DatasetAugmentationOperator) -> str:
+    runtime = dataset_operator_runtime(operator)
+    return runtime.prompt_name or f"augmentation.{operator.id}"
 
 
 def select_dataset_augmentation_operators(
@@ -163,8 +224,3 @@ def select_dataset_augmentation_operators(
     if len(resolved_references) != len(set(resolved_references)):
         raise ValueError("operator identifiers must be unique")
     return selected_operators
-
-
-def _version_tuple(version: str) -> tuple[int, int, int]:
-    major, minor, patch = version.split(".")
-    return int(major), int(minor), int(patch)

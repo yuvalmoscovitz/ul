@@ -55,17 +55,6 @@ from ul.augmentations._dataset_operators import (
 
 _MAX_DECOMPOSED_RELATION_ENDPOINTS = 10_000
 _TONE_SAFETY_KINDS = {"angry", "argumentative"}
-_COMMUNICATION_FORM_KINDS = {
-    "typing_noise",
-    "grammar_error",
-    "fragmented_syntax",
-    "repetition",
-    "terse",
-    "verbose",
-    "frustrated",
-    "angry",
-    "argumentative",
-}
 
 
 @dataclass(frozen=True)
@@ -313,10 +302,11 @@ class DatasetAugmentationEngine:
                         self_correction_plan,
                     )
                 else:
-                    transformation_prompt_names = (dataset_operator_prompt_name(operator.id),)
+                    transformation_prompt_names = (dataset_operator_prompt_name(operator),)
                     render_instruction = _meaning_guided_instruction(
                         operator.instruction,
                         expected_input_frame,
+                        target_communication_kind=operator.target_communication_kind,
                     )
                     rendered_input = await self._renderer.render(
                         record.raw_input, render_instruction
@@ -373,6 +363,7 @@ class DatasetAugmentationEngine:
                             _task_meaning_difference_reasons(
                                 expected_input_frame,
                                 reparsed_frame,
+                                target_communication_kind=operator.target_communication_kind,
                             )
                         )
                     elif operator.allowed_change == "structured_self_correction":
@@ -401,6 +392,7 @@ class DatasetAugmentationEngine:
                             _task_meaning_difference_reasons(
                                 expected_input_frame,
                                 reparsed_frame,
+                                target_communication_kind=operator.target_communication_kind,
                             )
                         )
                     if _has_unresolved_nodes(reparsed_frame):
@@ -492,7 +484,11 @@ class DatasetAugmentationEngine:
                         reparsed_input_frame=reparsed_frame,
                         semantic_equivalence_assessment=equivalence_assessment,
                         semantic_normalization=(
-                            _semantic_normalization_assessment(expected_input_frame, reparsed_frame)
+                            _semantic_normalization_assessment(
+                                expected_input_frame,
+                                reparsed_frame,
+                                target_communication_kind=operator.target_communication_kind,
+                            )
                             if reparsed_frame is not None
                             else None
                         ),
@@ -622,8 +618,13 @@ def _input_evidence(element: Any) -> tuple[Any, ...]:
     return tuple(evidence for evidence in element.evidence if evidence.source == "input")
 
 
-def _meaning_guided_instruction(instruction: str, frame: SemanticFrame) -> str:
-    meaning_frame = _without_pure_communication_form(frame)
+def _meaning_guided_instruction(
+    instruction: str,
+    frame: SemanticFrame,
+    *,
+    target_communication_kind: str | None,
+) -> str:
+    meaning_frame = _without_target_communication_form(frame, target_communication_kind)
     meaning_to_preserve = {
         "requests": [
             {
@@ -679,10 +680,17 @@ def _meaning_guided_instruction(instruction: str, frame: SemanticFrame) -> str:
 
 
 def _task_meaning_difference_reasons(
-    expected: SemanticFrame, reparsed: SemanticFrame
+    expected: SemanticFrame,
+    reparsed: SemanticFrame,
+    *,
+    target_communication_kind: str | None,
 ) -> tuple[str, ...]:
-    expected_semantics = _canonical_semantics(_without_pure_communication_form(expected))
-    reparsed_semantics = _canonical_semantics(_without_pure_communication_form(reparsed))
+    expected_semantics = _canonical_semantics(
+        _without_target_communication_form(expected, target_communication_kind)
+    )
+    reparsed_semantics = _canonical_semantics(
+        _without_target_communication_form(reparsed, target_communication_kind)
+    )
     labels = ("factors", "request units", "relations", "communication acts")
     return tuple(
         f"{label} differ from the expected frame"
@@ -696,7 +704,10 @@ def _task_meaning_difference_reasons(
     )
 
 
-def _without_pure_communication_form(frame: SemanticFrame) -> SemanticFrame:
+def _without_target_communication_form(
+    frame: SemanticFrame,
+    target_communication_kind: str | None,
+) -> SemanticFrame:
     related_ids = {
         element_id
         for relation in frame.relations
@@ -708,7 +719,8 @@ def _without_pure_communication_form(frame: SemanticFrame) -> SemanticFrame:
                 act
                 for act in frame.communication_acts
                 if not (
-                    act.kind in _COMMUNICATION_FORM_KINDS
+                    target_communication_kind is not None
+                    and act.kind == target_communication_kind
                     and not act.factor_ids
                     and not act.attributes
                     and act.id not in related_ids
@@ -719,7 +731,10 @@ def _without_pure_communication_form(frame: SemanticFrame) -> SemanticFrame:
 
 
 def _semantic_normalization_assessment(
-    expected: SemanticFrame, reparsed: SemanticFrame
+    expected: SemanticFrame,
+    reparsed: SemanticFrame,
+    *,
+    target_communication_kind: str | None,
 ) -> SemanticNormalizationAssessment | None:
     applied_rules: list[
         Literal["ordered_list_factor_decomposition", "redundant_scalar_fulfills_elision"]
@@ -740,7 +755,11 @@ def _semantic_normalization_assessment(
         applied_rules=tuple(applied_rules),
         verdict=(
             "equivalent"
-            if not _task_meaning_difference_reasons(expected, reparsed)
+            if not _task_meaning_difference_reasons(
+                expected,
+                reparsed,
+                target_communication_kind=target_communication_kind,
+            )
             else "different"
         ),
     )
