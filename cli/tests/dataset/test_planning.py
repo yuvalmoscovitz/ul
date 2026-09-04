@@ -157,7 +157,7 @@ def test_dry_run_json_exposes_per_example_campaign_and_exact_call_plan(
 
     assert result.exit_code == 0, result.output
     payload = json.loads(result.output)
-    assert payload["schema_version"] == "1.3.0"
+    assert payload["schema_version"] == "1.4.0"
     assert payload["evaluation_mode"] == "variance"
     assert payload["fixture"] == {"status": "missing", "id": None, "version": None}
     assert any("no fixture identity" in warning.casefold() for warning in payload["warnings"])
@@ -196,6 +196,7 @@ def test_dry_run_json_exposes_per_example_campaign_and_exact_call_plan(
     )
     assert payload["timing"] == {
         "target_trial_timeout_seconds": 75.0,
+        "target_request_concurrency": 1,
         "maximum_wall_time_seconds": 1140.0,
     }
     planned_operator = next(

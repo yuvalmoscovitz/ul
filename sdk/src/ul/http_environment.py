@@ -727,13 +727,14 @@ class JsonHttpEnvironmentConnection:
         required_calls = self.api_calls_for_case(case)
         if required_calls > case.max_environment_api_calls:
             raise ValueError("evaluation case exceeds its environment API call budget")
+        if isinstance(self._config, JsonHttpIsolatedResponseConfig):
+            async with asyncio.timeout(case.timeout_seconds):
+                if self._composed_executor.state_uncertain:
+                    return await self._composed_executor.execute(case)
+                self._reserve_environment_api_calls(len(case.turns))
+                return await self._composed_executor.execute(case)
         async with self._lifecycle_lock:
             async with asyncio.timeout(case.timeout_seconds):
-                if isinstance(self._config, JsonHttpIsolatedResponseConfig):
-                    if self._composed_executor.state_uncertain:
-                        return await self._composed_executor.execute(case)
-                    self._reserve_environment_api_calls(len(case.turns))
-                    return await self._composed_executor.execute(case)
                 if case.timeout_after_commit_event is None:
                     if self._composed_executor.state_uncertain:
                         return await self._composed_executor.execute(case)

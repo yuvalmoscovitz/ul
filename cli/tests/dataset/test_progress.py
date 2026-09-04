@@ -269,6 +269,51 @@ def test_signal_cancels_inflight_target_call_for_uncertainty_handling() -> None:
     asyncio.run(run())
 
 
+def test_signal_cancels_every_inflight_target_call() -> None:
+    async def run() -> None:
+        control = CampaignControl()
+        signal_control = CampaignSignalControl(control)
+        target_tasks = [asyncio.create_task(_wait_for_cancellation()) for _ in range(3)]
+        for target_task in target_tasks:
+            signal_control.target_call_started(target_task)
+
+        signal_control.interrupt()
+        results = await asyncio.gather(*target_tasks, return_exceptions=True)
+
+        assert all(isinstance(result, asyncio.CancelledError) for result in results)
+        assert control.requested_action() is None
+
+    asyncio.run(run())
+
+
+def test_progress_counts_multiple_running_trials() -> None:
+    clock_values = iter((1.0, 2.0, 3.0, 4.0, 5.0))
+    events = []
+    tracker = _tracker(events.append, lambda: next(clock_values))
+    first = DatasetTrialUnit(
+        interaction_id="first",
+        operator_id="current_baseline",
+        arm="original",
+        repetition=1,
+    )
+    second = DatasetTrialUnit(
+        interaction_id="second",
+        operator_id="current_baseline",
+        arm="original",
+        repetition=1,
+    )
+
+    tracker.trial_started(case_number=1, unit=first)
+    tracker.trial_started(case_number=2, unit=second)
+    skipped = second.model_copy(update={"interaction_id": "skipped"})
+    tracker.trial_skipped(case_number=3, unit=skipped)
+    tracker.trial_delivery_uncertain(case_number=1, unit=first)
+
+    assert events[1].work.running == 2
+    assert events[2].work.running == 2
+    assert events[3].work.running == 1
+
+
 def test_uncertain_delivery_is_terminal_and_quarantined() -> None:
     clock_values = iter((20.0, 21.0, 22.0))
     events = []

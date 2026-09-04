@@ -230,20 +230,24 @@ class CampaignControlRequested(RuntimeError):
 class CampaignSignalControl:
     def __init__(self, control: CampaignControl) -> None:
         self._control = control
-        self._target_task: asyncio.Task[object] | None = None
+        self._target_tasks: set[asyncio.Task[object]] = set()
 
     def target_call_started(self, task: asyncio.Task[object]) -> None:
-        self._target_task = task
+        self._target_tasks.add(task)
 
-    def target_call_finished(self) -> None:
-        self._target_task = None
+    def target_call_finished(self, task: asyncio.Task[object] | None = None) -> None:
+        if task is None:
+            self._target_tasks.clear()
+            return
+        self._target_tasks.discard(task)
 
     def interrupt(self) -> None:
-        target_task = self._target_task
-        if target_task is None or target_task.done():
+        target_tasks = tuple(task for task in self._target_tasks if not task.done())
+        if not target_tasks:
             self._control.request_pause_or_cancel()
             return
-        target_task.get_loop().call_soon_threadsafe(target_task.cancel)
+        for target_task in target_tasks:
+            target_task.get_loop().call_soon_threadsafe(target_task.cancel)
 
     @contextmanager
     def installed(self) -> Generator[None]:
@@ -328,7 +332,7 @@ class CampaignProgressTracker:
         )
 
     def trial_started(self, *, case_number: int, unit: DatasetTrialUnit) -> None:
-        self._running = 1
+        self._running += 1
         self.emit(
             status="running",
             stage=unit.arm,
@@ -347,7 +351,7 @@ class CampaignProgressTracker:
         unit: DatasetTrialUnit,
         trial: DatasetEvaluationTrial,
     ) -> None:
-        self._running = 0
+        self._running = max(0, self._running - 1)
         skipped = trial.execution_evidence is None and any(
             "not executed" in reason for reason in trial.inconclusive_reasons
         )
@@ -405,7 +409,7 @@ class CampaignProgressTracker:
         )
 
     def trial_delivery_uncertain(self, *, case_number: int, unit: DatasetTrialUnit) -> None:
-        self._running = 0
+        self._running = max(0, self._running - 1)
         self._failed += 1
         self.emit(
             status="failed",

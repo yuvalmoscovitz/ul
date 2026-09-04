@@ -168,6 +168,28 @@ def _resolve_target_timeout_seconds(
     return resolved
 
 
+def _validate_target_concurrency(
+    concurrency: int,
+    *,
+    request_isolation: str | None,
+    local_target: bool,
+) -> None:
+    if concurrency == 1:
+        return
+    if local_target:
+        raise typer.BadParameter(
+            "--concurrency above 1 requires an isolated-response HTTP target; local targets "
+            "remain sequential",
+            param_hint="--concurrency",
+        )
+    if request_isolation != "per_request_attested":
+        raise typer.BadParameter(
+            "--concurrency above 1 requires an isolated-response target and "
+            "--confirm-request-isolation; stateful lifecycle targets remain sequential",
+            param_hint="--concurrency",
+        )
+
+
 def _source_outcome_projection_sha256(
     target_config: JsonHttpTargetConfig | None,
     local_target: ResolvedLocalTarget | None,
@@ -541,6 +563,15 @@ def evaluate_dataset(
             help="Fresh-state environment executions per original input and accepted variation.",
         ),
     ] = None,
+    concurrency: Annotated[
+        int | None,
+        typer.Option(
+            "--concurrency",
+            min=1,
+            max=100,
+            help="Maximum isolated target requests in flight. Defaults to 1.",
+        ),
+    ] = None,
     target_timeout_seconds: Annotated[
         float | None,
         typer.Option(
@@ -736,6 +767,7 @@ def evaluate_dataset(
         recorded_command = recorded_manifest_for_resume.effective_command
         recorded_run_config = recorded_command.run_config
         repetitions = repetitions or recorded_run_config.repetitions
+        concurrency = concurrency or recorded_run_config.concurrency
         max_environment_api_calls = (
             max_environment_api_calls or recorded_run_config.target.max_environment_api_calls
         )
@@ -756,6 +788,7 @@ def evaluate_dataset(
         if redaction_state is None and recorded_command.redaction_state_path is not None:
             redaction_state = Path(recorded_command.redaction_state_path)
     repetitions = repetitions or 3
+    concurrency = concurrency or 1
     target_timeout_seconds = _resolve_target_timeout_seconds(
         target_timeout_seconds,
         recorded_manifest_for_resume,
@@ -988,6 +1021,7 @@ def evaluate_dataset(
                     "environment configuration changed since 'ul init'; reinitialize the project "
                     "and repeat the environment safety acknowledgements"
                 )
+        target_request_isolation: str | None = None
         if loaded_target_config is not None:
             validate_json_http_environment_configuration(
                 loaded_target_config,
@@ -997,6 +1031,7 @@ def evaluate_dataset(
                 allow_insecure_http=allow_insecure_http,
             )
             target_capabilities = json_http_environment_capabilities(loaded_target_config)
+            target_request_isolation = target_capabilities.request_isolation
             if (
                 invariant_suite is not None
                 and invariant_suite.observation_authority == "committed_state_snapshot"
@@ -1031,6 +1066,11 @@ def evaluate_dataset(
                 "committed-state invariants require the stateful-lifecycle adapter tier; "
                 "local targets provide response evidence only"
             )
+        _validate_target_concurrency(
+            concurrency,
+            request_isolation=target_request_isolation,
+            local_target=loaded_local_target is not None,
+        )
         normalized_target_config = loaded_target_config
         if resume is not None and normalized_target_config is None and loaded_local_target is None:
             raise ValueError("--resume requires a recorded or explicit environment configuration")
@@ -1054,6 +1094,7 @@ def evaluate_dataset(
         run_config = DatasetRunConfig(
             evaluation_mode=evaluation_mode,
             repetitions=repetitions,
+            concurrency=concurrency,
             target=TargetExecutionConfig(
                 trial_timeout_seconds=target_timeout_seconds,
                 max_environment_api_calls=max_environment_api_calls,

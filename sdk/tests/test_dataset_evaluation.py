@@ -661,6 +661,179 @@ class IsolatedTimeoutThenSuccessEnvironment:
         )
 
 
+class ConcurrentIsolatedEnvironment:
+    environment_id = "concurrent-isolated-test-environment"
+    config_sha256 = "3" * 64
+    capabilities = EnvironmentCapabilities(
+        request_isolation="per_request_attested",
+        supports_conversations=False,
+        supports_state_observation=False,
+        cancellation_guarantee="none",
+    )
+
+    def __init__(self, *, complete_baseline_immediately: bool = False) -> None:
+        self.complete_baseline_immediately = complete_baseline_immediately
+        self.active_requests = 0
+        self.maximum_active_requests = 0
+        self.execution_count = 0
+        self.overlap_observed = asyncio.Event()
+        self.release_requests = asyncio.Event()
+
+    def api_calls_for_case(self, case: EvaluationCase) -> int:
+        return 1
+
+    async def execute(self, case: EvaluationCase) -> ExecutionEvidence:
+        self.execution_count += 1
+        self.active_requests += 1
+        self.maximum_active_requests = max(
+            self.maximum_active_requests,
+            self.active_requests,
+        )
+        if self.active_requests == 2:
+            self.overlap_observed.set()
+        try:
+            if not (
+                self.complete_baseline_immediately
+                and case.probe_context["ul.variation.id"] == "current_baseline"
+            ):
+                await self.release_requests.wait()
+            response = _raw_output_for_actions((_source_outcomes()[0],))
+            return ExecutionEvidence(
+                evidence_scope="response_only",
+                case_id=case.id,
+                environment_id=self.environment_id,
+                environment_config_sha256=self.config_sha256,
+                turns=(
+                    EnvironmentTurnEvidence(
+                        turn_id=case.turns[0].id,
+                        response=response,
+                    ),
+                ),
+                final_response=response,
+                lifecycle=EnvironmentLifecycleEvidence(
+                    terminal_status="succeeded",
+                    completed_phases=("execute_turn",),
+                    delivery="certain",
+                    cleanup="not_attempted",
+                    environment_state_uncertain=False,
+                ),
+            )
+        finally:
+            self.active_requests -= 1
+
+
+class ConcurrentUnsafeLifecycleEnvironment(DeterministicEnvironment):
+    def __init__(self) -> None:
+        super().__init__(cancellation_guarantee="none")
+        self.capabilities = self.capabilities.model_copy(
+            update={"request_isolation": "per_request_attested"}
+        )
+        self.execution_count = 0
+        self.cancelled_requests = 0
+        self.two_requests_started = asyncio.Event()
+
+    def api_calls_for_case(self, case: EvaluationCase) -> int:
+        return 1
+
+    async def execute(self, case: EvaluationCase) -> ExecutionEvidence:
+        self.execution_count += 1
+        execution_number = self.execution_count
+        if execution_number == 2:
+            self.two_requests_started.set()
+        await self.two_requests_started.wait()
+        if execution_number == 1:
+            return ExecutionEvidence(
+                evidence_scope="response_and_state",
+                case_id=case.id,
+                environment_id=self.environment_id,
+                environment_config_sha256=self.config_sha256,
+                lifecycle=EnvironmentLifecycleEvidence(
+                    initial_reset=EnvironmentResetEvidence(
+                        reset_session_requested=True,
+                        reset_session_acknowledged=True,
+                        reset_env_requested=True,
+                        reset_env_acknowledged=True,
+                    ),
+                    cleanup_reset=EnvironmentResetEvidence(
+                        reset_session_requested=True,
+                        reset_session_acknowledged=True,
+                        reset_env_requested=True,
+                        reset_env_acknowledged=False,
+                    ),
+                    terminal_status="failed",
+                    completed_phases=("reset", "execute_turn"),
+                    failed_phase="cleanup_reset",
+                    failure_code="environment_lifecycle_error",
+                    failure_reason="environment lifecycle failed",
+                    delivery="certain",
+                    cleanup="failed",
+                    cleanup_failure_code="reset_not_clean",
+                    cleanup_failure_reason="environment state may remain",
+                    environment_state_uncertain=True,
+                ),
+            )
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            self.cancelled_requests += 1
+            raise
+        raise AssertionError("blocked target request returned")
+
+
+class WindowedSemanticPipeline(DeterministicSemanticPipeline):
+    def __init__(self, expected_concurrent_calls: int) -> None:
+        super().__init__((_source_outcomes()[0],))
+        self.expected_concurrent_calls = expected_concurrent_calls
+        self.active_observed_calls = 0
+        self.maximum_active_observed_calls = 0
+        self.expected_calls_started = asyncio.Event()
+        self.release_observed_calls = asyncio.Event()
+
+    async def deconstruct(
+        self,
+        record: InteractionRecord | UserInputRecord,
+        reference_frame: SemanticFrame | None = None,
+    ) -> SemanticFrame:
+        if not isinstance(record, InteractionRecord) or record.id == "source":
+            return await super().deconstruct(record, reference_frame)
+        self.active_observed_calls += 1
+        self.maximum_active_observed_calls = max(
+            self.maximum_active_observed_calls,
+            self.active_observed_calls,
+        )
+        if self.active_observed_calls == self.expected_concurrent_calls:
+            self.expected_calls_started.set()
+        try:
+            await self.release_observed_calls.wait()
+            return await super().deconstruct(record, reference_frame)
+        finally:
+            self.active_observed_calls -= 1
+
+
+class BlockingObservedSemanticPipeline(DeterministicSemanticPipeline):
+    def __init__(self, *, fail_first: bool = False) -> None:
+        super().__init__((_source_outcomes()[0],))
+        self.fail_first = fail_first
+        self.started_count = 0
+        self.all_started = asyncio.Event()
+
+    async def deconstruct(
+        self,
+        record: InteractionRecord | UserInputRecord,
+        reference_frame: SemanticFrame | None = None,
+    ) -> SemanticFrame:
+        if not isinstance(record, InteractionRecord) or record.id == "source":
+            return await super().deconstruct(record, reference_frame)
+        self.started_count += 1
+        if self.started_count == 2:
+            self.all_started.set()
+        await self.all_started.wait()
+        if self.fail_first and ":round-1" in record.id:
+            raise AssertionError("independent semantic failure")
+        await asyncio.Event().wait()
+        raise AssertionError("blocked semantic request returned")
+
+
 class FailingEnvironment(DeterministicEnvironment):
     def __init__(self, fail_on_execution: int) -> None:
         super().__init__()
@@ -3225,6 +3398,211 @@ async def test_runner_requires_remote_environment_network_opt_in() -> None:
         environment,
         allow_network_egress=True,
     )
+
+
+@pytest.mark.parametrize("maximum", [0, 101, True])
+async def test_runner_rejects_invalid_target_request_concurrency(maximum: int) -> None:
+    semantic_pipeline = DeterministicSemanticPipeline((_source_outcomes()[0],))
+
+    with pytest.raises(ValueError, match="between 1 and 100"):
+        _DatasetEvaluationRunner(
+            DatasetAugmentationEngine(semantic_pipeline, semantic_pipeline),
+            semantic_pipeline,
+            ConcurrentIsolatedEnvironment(),
+            allow_network_egress=True,
+            max_concurrent_target_requests=maximum,
+        )
+
+
+async def test_runner_requires_request_isolation_for_concurrency() -> None:
+    semantic_pipeline = DeterministicSemanticPipeline((_source_outcomes()[0],))
+
+    with pytest.raises(ValueError, match="attested per-request isolation"):
+        _DatasetEvaluationRunner(
+            DatasetAugmentationEngine(semantic_pipeline, semantic_pipeline),
+            semantic_pipeline,
+            DeterministicEnvironment(),
+            allow_network_egress=True,
+            max_concurrent_target_requests=2,
+        )
+
+
+async def test_runner_bounds_and_overlaps_isolated_target_requests() -> None:
+    semantic_pipeline = DeterministicSemanticPipeline((_source_outcomes()[0],))
+    environment = ConcurrentIsolatedEnvironment()
+    runner = _DatasetEvaluationRunner(
+        DatasetAugmentationEngine(semantic_pipeline, semantic_pipeline),
+        semantic_pipeline,
+        environment,
+        allow_network_egress=True,
+        max_concurrent_target_requests=2,
+    )
+
+    evaluation = asyncio.create_task(runner.run(_source(), repetitions=3))
+    await asyncio.wait_for(environment.overlap_observed.wait(), timeout=1)
+
+    assert environment.active_requests == 2
+    assert environment.maximum_active_requests == 2
+
+    environment.release_requests.set()
+    result = await evaluation
+
+    assert result.baseline.trial_set.requested_repetitions == 3
+    assert environment.maximum_active_requests == 2
+
+
+async def test_one_repetition_overlaps_multiple_candidate_requests() -> None:
+    semantic_pipeline = DeterministicSemanticPipeline((_source_outcomes()[0],))
+    environment = ConcurrentIsolatedEnvironment(complete_baseline_immediately=True)
+    runner = _DatasetEvaluationRunner(
+        DatasetAugmentationEngine(semantic_pipeline, semantic_pipeline),
+        semantic_pipeline,
+        environment,
+        allow_network_egress=True,
+        max_concurrent_target_requests=2,
+    )
+
+    evaluation = asyncio.create_task(
+        runner.run(
+            _source(),
+            repetitions=1,
+            operator_ids=("input.surface.rephrase", "input.surface.typing_noise"),
+        )
+    )
+    await asyncio.wait_for(environment.overlap_observed.wait(), timeout=1)
+
+    assert environment.active_requests == 2
+    assert environment.maximum_active_requests == 2
+
+    environment.release_requests.set()
+    result = await evaluation
+    assert len(result.cases) == 2
+
+
+async def test_runner_uses_a_bounded_worker_window_for_many_repetitions() -> None:
+    semantic_pipeline = DeterministicSemanticPipeline((_source_outcomes()[0],))
+    environment = ConcurrentIsolatedEnvironment()
+    runner = _DatasetEvaluationRunner(
+        DatasetAugmentationEngine(semantic_pipeline, semantic_pipeline),
+        semantic_pipeline,
+        environment,
+        allow_network_egress=True,
+        max_concurrent_target_requests=2,
+    )
+
+    existing_tasks = asyncio.all_tasks()
+    evaluation = asyncio.create_task(runner.run(_source(), repetitions=25))
+    await asyncio.wait_for(environment.overlap_observed.wait(), timeout=1)
+
+    scheduler_tasks = asyncio.all_tasks() - existing_tasks
+    assert len(scheduler_tasks) <= 5
+
+    environment.release_requests.set()
+    result = await evaluation
+
+    assert result.baseline.trial_set.requested_repetitions == 25
+    assert environment.execution_count == 50
+
+
+async def test_target_limit_does_not_hold_semantic_deconstruction_slots() -> None:
+    semantic_pipeline = WindowedSemanticPipeline(expected_concurrent_calls=4)
+    environment = ConcurrentIsolatedEnvironment()
+    runner = _DatasetEvaluationRunner(
+        DatasetAugmentationEngine(semantic_pipeline, semantic_pipeline),
+        semantic_pipeline,
+        environment,
+        allow_network_egress=True,
+        max_concurrent_target_requests=2,
+    )
+
+    evaluation = asyncio.create_task(runner.run(_source(), repetitions=4))
+    await asyncio.wait_for(environment.overlap_observed.wait(), timeout=1)
+    environment.release_requests.set()
+    await asyncio.wait_for(semantic_pipeline.expected_calls_started.wait(), timeout=1)
+
+    assert environment.maximum_active_requests == 2
+    assert semantic_pipeline.maximum_active_observed_calls == 4
+
+    semantic_pipeline.release_observed_calls.set()
+    result = await evaluation
+    assert result.baseline.trial_set.requested_repetitions == 4
+
+
+async def test_unsafe_terminal_evidence_cancels_siblings_before_queued_starts() -> None:
+    semantic_pipeline = DeterministicSemanticPipeline((_source_outcomes()[0],))
+    environment = ConcurrentUnsafeLifecycleEnvironment()
+    started_units: list[DatasetTrialUnit] = []
+    terminal_trials: list[tuple[DatasetTrialUnit, DatasetEvaluationTrial]] = []
+    runner = _DatasetEvaluationRunner(
+        DatasetAugmentationEngine(semantic_pipeline, semantic_pipeline),
+        semantic_pipeline,
+        environment,
+        allow_network_egress=True,
+        max_concurrent_target_requests=2,
+    )
+
+    with pytest.raises(DatasetTargetDeliveryUncertain):
+        await runner.run(
+            _source(),
+            repetitions=20,
+            trial_started_callback=started_units.append,
+            trial_terminal_callback=lambda unit, trial: terminal_trials.append((unit, trial)),
+        )
+
+    assert len(started_units) == 2
+    assert environment.execution_count == 2
+    assert environment.cancelled_requests == 1
+    assert len(terminal_trials) == 1
+    terminal_unit, terminal_trial = terminal_trials[0]
+    assert terminal_unit.repetition == 1
+    assert terminal_trial.lifecycle_failure is not None
+    assert terminal_trial.lifecycle_failure.environment_state_may_remain is True
+    assert terminal_trial.execution_evidence is not None
+
+
+async def test_cancellation_after_target_response_still_quarantines_started_trial() -> None:
+    semantic_pipeline = BlockingObservedSemanticPipeline()
+    environment = ConcurrentIsolatedEnvironment()
+    environment.release_requests.set()
+    started_tasks: list[asyncio.Task[object]] = []
+    runner = _DatasetEvaluationRunner(
+        DatasetAugmentationEngine(semantic_pipeline, semantic_pipeline),
+        semantic_pipeline,
+        environment,
+        allow_network_egress=True,
+        max_concurrent_target_requests=2,
+    )
+
+    evaluation = asyncio.create_task(
+        runner.run(
+            _source(),
+            repetitions=2,
+            trial_started_callback=lambda unit: started_tasks.append(
+                cast(asyncio.Task[object], asyncio.current_task())
+            ),
+        )
+    )
+    await asyncio.wait_for(semantic_pipeline.all_started.wait(), timeout=1)
+    started_tasks[0].cancel()
+
+    with pytest.raises(DatasetTargetDeliveryUncertain):
+        await evaluation
+
+
+async def test_delivery_uncertainty_wins_over_mixed_parallel_failure() -> None:
+    semantic_pipeline = BlockingObservedSemanticPipeline(fail_first=True)
+    environment = ConcurrentIsolatedEnvironment()
+    environment.release_requests.set()
+    runner = _DatasetEvaluationRunner(
+        DatasetAugmentationEngine(semantic_pipeline, semantic_pipeline),
+        semantic_pipeline,
+        environment,
+        allow_network_egress=True,
+        max_concurrent_target_requests=2,
+    )
+
+    with pytest.raises(DatasetTargetDeliveryUncertain):
+        await runner.run(_source(), repetitions=2)
 
 
 @pytest.mark.parametrize("evaluation_mode", ["correctness", "preference"])

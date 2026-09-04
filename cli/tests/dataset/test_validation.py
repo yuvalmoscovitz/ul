@@ -548,6 +548,58 @@ def test_default_limit_and_repetitions_fit_the_default_call_budget(tmp_path: Pat
     assert "Potential environment API calls: up to 60" in result.output
 
 
+def test_isolated_http_target_exposes_customer_selected_concurrency(tmp_path: Path) -> None:
+    dataset = tmp_path / "interactions.jsonl"
+    _write_dataset(dataset, [_record()])
+
+    result = runner.invoke(
+        root_app,
+        [
+            "dataset",
+            "evaluate",
+            str(dataset),
+            "--target",
+            "https://agent.example.test/invoke",
+            "--confirm-request-isolation",
+            "--confirm-safe-test-target",
+            "--concurrency",
+            "4",
+            "--dry-run",
+            "--json",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output[result.output.index("{") :])
+    assert payload["timing"]["target_request_concurrency"] == 4
+
+
+def test_stateful_target_rejects_parallel_requests(tmp_path: Path) -> None:
+    dataset = tmp_path / "interactions.jsonl"
+    target_config = tmp_path / "target.json"
+    _write_dataset(dataset, [_record()])
+    _write_target_config(target_config)
+
+    result = runner.invoke(
+        root_app,
+        [
+            "dataset",
+            "evaluate",
+            str(dataset),
+            "--environment-config",
+            str(target_config),
+            "--concurrency",
+            "2",
+            "--dry-run",
+        ],
+    )
+
+    assert result.exit_code != 0
+    assert "stateful lifecycle targets remain sequential" in " ".join(
+        _ANSI_ESCAPE_PATTERN.sub("", result.output).replace("│", "").split()
+    )
+
+
 def test_direct_http_target_requires_tls_or_explicit_loopback_exception(tmp_path: Path) -> None:
     dataset = tmp_path / "interactions.jsonl"
     _write_dataset(dataset, [_record()])

@@ -113,7 +113,7 @@ async def evaluate_interaction_records(
     signal_control = progress_runtime.signal_control
     initial_target_calls, _, initial_environment_calls, _ = progress_tracker.actual_usage
     actual_target_calls = 0
-    active_trial: tuple[int, DatasetTrialUnit] | None = None
+    active_trials: dict[asyncio.Task[object], tuple[int, DatasetTrialUnit]] = {}
     recorded_source_preparation_events = (
         source_preparation_events if source_preparation_events is not None else []
     )
@@ -172,6 +172,7 @@ async def evaluate_interaction_records(
                 evaluation_mode=run_config.evaluation_mode,
                 source_outcome_projection=source_outcome_projection,
                 material_variance_evaluator=material_variance_evaluator,
+                max_concurrent_target_requests=run_config.concurrency,
             )
             for case_number, record in enumerate(records, start=1):
                 plan_outcome_terminal_ids: set[str] = set()
@@ -231,15 +232,16 @@ async def evaluate_interaction_records(
                     unit: DatasetTrialUnit,
                     case_position: int = case_number,
                 ) -> None:
-                    nonlocal active_trial, actual_target_calls
-                    stop_at_requested_boundary()
+                    nonlocal actual_target_calls
+                    if run_config.concurrency == 1:
+                        stop_at_requested_boundary()
                     if trial_journal is not None:
                         trial_journal.start(unit)
                     progress_tracker.trial_started(case_number=case_position, unit=unit)
                     actual_target_calls += 1
-                    active_trial = (case_position, unit)
                     task = asyncio.current_task()
                     if task is not None:
+                        active_trials[task] = (case_position, unit)
                         signal_control.target_call_started(task)
 
                 def trial_terminal(
@@ -247,18 +249,28 @@ async def evaluate_interaction_records(
                     trial: DatasetEvaluationTrial,
                     case_position: int = case_number,
                 ) -> None:
-                    nonlocal active_trial
-                    signal_control.target_call_finished()
-                    active_trial = None
+                    task = asyncio.current_task()
+                    trial_was_started = task is not None and task in active_trials
+                    if task is not None:
+                        signal_control.target_call_finished(task)
+                        active_trials.pop(task, None)
                     if trial_journal is not None:
                         trial_journal.finish(unit, trial)
-                    progress_tracker.trial_terminal(
-                        case_number=case_position,
-                        unit=unit,
-                        trial=trial,
-                    )
-                    stop_at_requested_boundary()
+                    if trial_was_started:
+                        progress_tracker.trial_terminal(
+                            case_number=case_position,
+                            unit=unit,
+                            trial=trial,
+                        )
+                    else:
+                        progress_tracker.trial_skipped(
+                            case_number=case_position,
+                            unit=unit,
+                        )
+                    if run_config.concurrency == 1:
+                        stop_at_requested_boundary()
 
+                stop_at_requested_boundary()
                 try:
                     result = await runner.run(
                         record,
@@ -277,7 +289,7 @@ async def evaluate_interaction_records(
                 except DatasetSourcePreparationError as error:
                     if not isolate_source_preparation_failures:
                         raise
-                    if active_trial is not None:
+                    if active_trials:
                         raise AssertionError(
                             "source preparation failures must precede target delivery"
                         ) from error
@@ -345,24 +357,26 @@ async def evaluate_interaction_records(
                     continue
                 except (DatasetTargetDeliveryUncertain, asyncio.CancelledError):
                     signal_control.target_call_finished()
-                    assert active_trial is not None
-                    active_case_number, active_unit = active_trial
-                    if trial_journal is not None and not trial_journal.is_terminal(active_unit):
-                        trial_journal.terminal(
-                            active_unit,
-                            "quarantined",
-                            "target_delivery_or_cleanup_uncertain",
+                    assert active_trials
+                    for active_case_number, active_unit in active_trials.values():
+                        if trial_journal is not None and not trial_journal.is_terminal(active_unit):
+                            trial_journal.terminal(
+                                active_unit,
+                                "quarantined",
+                                "target_delivery_or_cleanup_uncertain",
+                            )
+                        progress_tracker.trial_delivery_uncertain(
+                            case_number=active_case_number,
+                            unit=active_unit,
                         )
                     durable_flush()
-                    progress_tracker.trial_delivery_uncertain(
-                        case_number=active_case_number,
-                        unit=active_unit,
-                    )
-                    active_trial = None
+                    active_trials.clear()
                     raise DatasetTargetDeliveryUncertain(
                         "target delivery is uncertain; environment quarantined and trial not "
                         "retried"
                     ) from None
+                if run_config.concurrency > 1:
+                    stop_at_requested_boundary()
                 invariant_evaluation = (
                     evaluate_dataset_invariants(result, invariant_suite)
                     if invariant_suite is not None
