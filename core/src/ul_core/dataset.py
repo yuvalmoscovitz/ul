@@ -374,7 +374,7 @@ class _SemanticElement(_StrictULModel):
 class RequestUnit(_SemanticElement):
     mode: str = Field(min_length=1)
     predicate: str = Field(min_length=1)
-    factor_ids: tuple[str, ...] = Field(default=(), max_length=20)
+    factor_ids: tuple[str, ...] = ()
 
 
 class SemanticFactor(_SemanticElement):

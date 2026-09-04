@@ -380,6 +380,8 @@ def test_runner_uses_configured_models_safe_argv_and_private_artifacts(
     monkeypatch.setenv("UL_DATASET_OPENROUTER_PROVIDER", "test-provider")
     monkeypatch.setenv("UL_DATASET_RENDER_MODEL", "untrusted/render-override")
     monkeypatch.setenv("UL_DATASET_EQUIVALENCE_MODEL", "untrusted/checker-override")
+    monkeypatch.setenv("UL_DATASET_MAX_OUTPUT_TOKENS", "16384")
+    monkeypatch.setenv("UL_DATASET_MAX_RENDER_TOKENS", "1024")
     monkeypatch.setenv("UNRELATED_SECRET", "must-not-be-forwarded")
     observed_endpoint = ""
     evidence_path: Path | None = None
@@ -406,6 +408,8 @@ def test_runner_uses_configured_models_safe_argv_and_private_artifacts(
             "UL_DATASET_RENDER_MODEL": "untrusted/render-override",
             "UL_DATASET_EQUIVALENCE_MODEL": "untrusted/checker-override",
             "UL_DATASET_MATERIALITY_MODEL": "untrusted/model-override",
+            "UL_DATASET_MAX_OUTPUT_TOKENS": "16384",
+            "UL_DATASET_MAX_RENDER_TOKENS": "1024",
             "UL_DATASET_OPENROUTER_PROVIDER": "test-provider",
         }
         target_config_path = Path(command[command.index("--environment-config") + 1])
@@ -509,6 +513,8 @@ def test_live_environment_supports_keyless_loopback_openai_provider(
         "UL_DATASET_RENDER_MODEL": "local-model",
         "UL_DATASET_EQUIVALENCE_MODEL": "local-model",
         "UL_DATASET_MATERIALITY_MODEL": "local-model",
+        "UL_DATASET_MAX_OUTPUT_TOKENS": "8192",
+        "UL_DATASET_MAX_RENDER_TOKENS": "512",
         "UL_DATASET_LIVE_CALLS": "true",
         "UL_DATASET_ALLOW_EXTERNAL_DATA_PROCESSING": "true",
     }
