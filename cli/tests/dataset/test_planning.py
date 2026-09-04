@@ -8,7 +8,8 @@ from typing import Any, cast
 import pytest
 from typer.testing import CliRunner
 from ul_cli import dataset_campaign as campaign_module
-from ul_cli.dataset.evaluation import command as command_module
+from ul_cli.dataset.evaluation import execution as execution_module
+from ul_cli.dataset.evaluation import preparation as preparation_module
 from ul_cli.dataset.evaluation import runner as runner_module
 from ul_cli.main import app as root_app
 
@@ -46,7 +47,7 @@ def test_dry_run_validates_and_makes_no_external_calls(
         runner_module, "create_semantic_model_deconstructor", unexpected_deconstructor
     )
     monkeypatch.setattr(
-        command_module.JsonHttpEnvironmentConnection, "from_config", unexpected_target
+        execution_module.JsonHttpEnvironmentConnection, "from_config", unexpected_target
     )
     result = runner.invoke(
         root_app,
@@ -134,7 +135,7 @@ def test_dry_run_json_exposes_per_example_campaign_and_exact_call_plan(
         runner_module, "create_semantic_model_deconstructor", unexpected_deconstructor
     )
     monkeypatch.setattr(
-        command_module.JsonHttpEnvironmentConnection, "from_config", unexpected_target
+        execution_module.JsonHttpEnvironmentConnection, "from_config", unexpected_target
     )
     result = runner.invoke(
         root_app,
@@ -271,7 +272,7 @@ def test_campaign_plan_exposes_precomputed_candidate_without_new_generation() ->
         records=(evaluation_result.source,),
         selected_operator_ids=("input.surface.rephrase",),
         run_config=_run_config(),
-        settings=command_module.load_dataset_semantic_settings(),
+        settings=preparation_module.load_dataset_semantic_settings(),
         saved_augmentations={evaluation_result.source.id: evaluation_result.augmentation},
     )
 
@@ -290,7 +291,7 @@ def test_campaign_plan_exposes_precomputed_candidate_without_new_generation() ->
         records=(evaluation_result.source,),
         selected_operator_ids=("input.surface.rephrase",),
         run_config=_run_config(),
-        settings=command_module.load_dataset_semantic_settings(),
+        settings=preparation_module.load_dataset_semantic_settings(),
         saved_augmentations={evaluation_result.source.id: evaluation_result.augmentation},
         show_sensitive_values=True,
     )
@@ -319,7 +320,7 @@ def test_campaign_plan_derives_execution_totals_and_timeout_from_run_config() ->
         records=(_evaluation_result("interaction-1").source,),
         selected_operator_ids=("input.surface.rephrase",),
         run_config=run_config,
-        settings=command_module.load_dataset_semantic_settings(),
+        settings=preparation_module.load_dataset_semantic_settings(),
     )
 
     assert plan.calls.baseline == 2
@@ -335,7 +336,7 @@ def test_campaign_plan_counts_grammar_error_as_llm_generation() -> None:
         records=(_evaluation_result("interaction-1").source,),
         selected_operator_ids=("input.surface.grammar_error",),
         run_config=_run_config(),
-        settings=command_module.load_dataset_semantic_settings(),
+        settings=preparation_module.load_dataset_semantic_settings(),
     )
 
     grammar_operator = next(
@@ -353,7 +354,7 @@ def test_campaign_plan_counts_tone_safety_validation() -> None:
         records=(_evaluation_result("interaction-1").source,),
         selected_operator_ids=("input.tone.angry",),
         run_config=_run_config(),
-        settings=command_module.load_dataset_semantic_settings(),
+        settings=preparation_module.load_dataset_semantic_settings(),
     )
 
     assert plan.calls.variation_generation == 1
@@ -379,7 +380,7 @@ def test_campaign_plan_does_not_count_known_non_executable_variations(
             environment_api_calls_per_trial=5,
             planned_environment_api_calls=30,
         ),
-        settings=command_module.load_dataset_semantic_settings(),
+        settings=preparation_module.load_dataset_semantic_settings(),
         saved_augmentations={evaluation_result.source.id: saved_augmentation},
     )
 
@@ -399,7 +400,7 @@ def test_campaign_plan_keeps_unattempted_operators_conditional() -> None:
         records=(evaluation_result.source,),
         selected_operator_ids=("input.surface.rephrase",),
         run_config=_run_config(),
-        settings=command_module.load_dataset_semantic_settings(),
+        settings=preparation_module.load_dataset_semantic_settings(),
         saved_augmentations={evaluation_result.source.id: saved_augmentation},
     )
 
@@ -512,7 +513,7 @@ def test_unimplemented_evaluation_mode_fails_before_calls_or_persistence(
     def unexpected_settings() -> None:
         raise AssertionError("unsupported evaluation mode reached semantic settings")
 
-    monkeypatch.setattr(command_module, "load_dataset_semantic_settings", unexpected_settings)
+    monkeypatch.setattr(preparation_module, "load_dataset_semantic_settings", unexpected_settings)
 
     result = runner.invoke(
         root_app,

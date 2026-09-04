@@ -28,7 +28,10 @@ from ul.dataset_invariants import (
 from ul_cli import dataset_augmentation_ledger as augmentation_ledger_module
 from ul_cli import dataset_review, dataset_trial_journal
 from ul_cli import finding_reference as finding_reference_module
-from ul_cli.dataset.evaluation import command as command_module
+from ul_cli.dataset.evaluation import execution as execution_module
+from ul_cli.dataset.evaluation import preparation as preparation_module
+from ul_cli.dataset.evaluation import reporting as reporting_module
+from ul_cli.dataset.evaluation import resume_compatibility
 from ul_cli.dataset.evaluation import runner as runner_module
 from ul_cli.dataset.evidence import customer as customer_module
 from ul_cli.dataset.evidence import persistence as persistence_module
@@ -138,10 +141,10 @@ def test_atomic_finding_snapshot_failure_preserves_published_file(
         del descriptor, value
         raise OSError("simulated disk full")
 
-    monkeypatch.setattr(command_module.os, "write", failed_write)
+    monkeypatch.setattr(reporting_module.os, "write", failed_write)
 
     with pytest.raises(OSError, match="simulated disk full"):
-        command_module._replace_finding_package_snapshot(finding_output, b"new snapshot\n")
+        reporting_module.replace_finding_package_snapshot(finding_output, b"new snapshot\n")
     assert finding_output.read_bytes() == b"prior snapshot\n"
 
 
@@ -152,7 +155,7 @@ def test_atomic_finding_snapshot_keeps_open_reader_on_complete_old_version(
     finding_output.write_bytes(b"prior snapshot\n")
 
     with finding_output.open("rb") as old_reader:
-        command_module._replace_finding_package_snapshot(finding_output, b"new snapshot\n")
+        reporting_module.replace_finding_package_snapshot(finding_output, b"new snapshot\n")
         assert old_reader.read() == b"prior snapshot\n"
     assert finding_output.read_bytes() == b"new snapshot\n"
 
@@ -239,7 +242,7 @@ def test_resume_reuses_manifest_without_original_data_config_or_overrides(
     custom_augmentations = tmp_path / "private" / "custom-augmentations.jsonl"
     custom_augmentations.parent.mkdir()
     _write_invariant_suite(invariant_path)
-    invariant_suite = command_module.load_dataset_invariant_suite(invariant_path)
+    invariant_suite = preparation_module.load_dataset_invariant_suite(invariant_path)
     source = _evaluation_result("interaction-1").source
     run_context = _run_context((source,), invariant_suite=invariant_suite)
     manifest = dataset_trial_journal.create_dataset_run_manifest(
@@ -284,7 +287,11 @@ def test_resume_reuses_manifest_without_original_data_config_or_overrides(
     def unexpected_settings_load() -> object:
         raise AssertionError("durable resume must restore safe evaluator settings")
 
-    monkeypatch.setattr(command_module, "load_dataset_semantic_settings", unexpected_settings_load)
+    monkeypatch.setattr(
+        preparation_module,
+        "load_dataset_semantic_settings",
+        unexpected_settings_load,
+    )
 
     result = runner.invoke(
         root_app,
@@ -295,6 +302,41 @@ def test_resume_reuses_manifest_without_original_data_config_or_overrides(
     assert "Selected interactions: 1" in result.output
     assert "input.surface.rephrase" in result.output
     assert str(custom_augmentations) in result.output
+
+
+def test_resume_preflight_failure_releases_durable_journal_lock(tmp_path: Path) -> None:
+    evidence = tmp_path / "evidence.jsonl"
+    source = _evaluation_result("interaction-1").source
+    manifest = dataset_trial_journal.create_dataset_run_manifest(
+        run_context=_run_context((source,)),
+        selected_records=(source,),
+        selected_operator_ids=("input.surface.rephrase",),
+        run_config=_run_config(
+            environment_api_calls_per_trial=5,
+            planned_environment_api_calls=10,
+            max_environment_api_calls=10,
+        ),
+        save_augmentations=True,
+    )
+    evidence.write_bytes(b"")
+    dataset_trial_journal.persist_dataset_run_manifest(
+        dataset_trial_journal.manifest_path(evidence), manifest
+    )
+    dataset_trial_journal.create_dataset_trial_journal(
+        dataset_trial_journal.journal_path(evidence), manifest
+    ).close()
+
+    result = runner.invoke(
+        root_app,
+        ["dataset", "evaluate", "--resume", str(evidence), "--dry-run"],
+    )
+
+    assert result.exit_code == 2
+    assert "required receipt evidence.jsonl.preflight.json is missing" in result.output
+    reopened = dataset_trial_journal.open_dataset_trial_journal(
+        dataset_trial_journal.journal_path(evidence), manifest
+    )
+    reopened.close()
 
 
 def test_resume_fails_closed_when_completed_trials_have_no_durable_augmentation(
@@ -325,7 +367,7 @@ def test_resume_fails_closed_when_completed_trials_have_no_durable_augmentation(
     journal.finish(manifest.work_plan[0], evaluation.baseline.trial_set.trials[0])
     journal.close()
     persistence_module.persist_evaluator_preflight(evidence, _evaluator_preflight())
-    monkeypatch.setattr(command_module, "load_dataset_semantic_settings", _settings)
+    monkeypatch.setattr(preparation_module, "load_dataset_semantic_settings", _settings)
 
     result = runner.invoke(
         root_app,
@@ -382,7 +424,7 @@ def test_resume_accepts_completed_trials_with_durable_augmentation_input(
     journal.finish(manifest.work_plan[0], evaluation.baseline.trial_set.trials[0])
     journal.close()
     persistence_module.persist_evaluator_preflight(evidence, _evaluator_preflight())
-    monkeypatch.setattr(command_module, "load_dataset_semantic_settings", lambda: settings)
+    monkeypatch.setattr(preparation_module, "load_dataset_semantic_settings", lambda: settings)
 
     result = runner.invoke(
         root_app,
@@ -508,6 +550,9 @@ def test_resume_skips_already_processed_interaction_ids(
         def from_config(cls, config: JsonHttpEnvironmentConfig, **options: object) -> FakeTarget:
             return cls()
 
+        async def aclose(self) -> None:
+            pass
+
     async def fake_evaluate(
         records: tuple[Any, ...],
         operator_ids: tuple[str, ...],
@@ -555,12 +600,12 @@ def test_resume_skips_already_processed_interaction_ids(
         return ()
 
     monkeypatch.setattr(
-        command_module,
+        preparation_module,
         "load_dataset_semantic_settings",
         _settings,
     )
-    monkeypatch.setattr(command_module, "JsonHttpEnvironmentConnection", FakeTarget)
-    monkeypatch.setattr(command_module, "evaluate_interaction_records", fake_evaluate)
+    monkeypatch.setattr(execution_module, "JsonHttpEnvironmentConnection", FakeTarget)
+    monkeypatch.setattr(execution_module, "evaluate_interaction_records", fake_evaluate)
 
     async def unexpected_paid_preflight(settings: object) -> EvaluatorModelPreflight:
         nonlocal preflight_calls
@@ -568,7 +613,7 @@ def test_resume_skips_already_processed_interaction_ids(
         preflight_calls += 1
         raise AssertionError("partial resume must reuse its preflight receipt")
 
-    monkeypatch.setattr(command_module, "preflight_evaluator", unexpected_paid_preflight)
+    monkeypatch.setattr(execution_module, "preflight_evaluator", unexpected_paid_preflight)
     command = [
         "dataset",
         "evaluate",
@@ -696,7 +741,7 @@ def test_resume_dry_run_rejects_ledger_that_disagrees_with_completed_evidence(
         selected_records=selected_records,
     ) as ledger:
         ledger.append(source=evaluation_result.source, augmentation=mismatched_augmentation)
-    monkeypatch.setattr(command_module, "load_dataset_semantic_settings", _settings)
+    monkeypatch.setattr(preparation_module, "load_dataset_semantic_settings", _settings)
 
     result = runner.invoke(
         root_app,
@@ -741,7 +786,7 @@ def test_resume_exits_early_when_all_records_already_processed(
         + "\n",
         encoding="utf-8",
     )
-    monkeypatch.setattr(command_module, "load_dataset_semantic_settings", _settings)
+    monkeypatch.setattr(preparation_module, "load_dataset_semantic_settings", _settings)
 
     command = [
         "dataset",
@@ -789,7 +834,7 @@ def test_all_complete_resume_preserves_source_preparation_failure_exit_code(
         run_context=cast(Any, run_context),
     )
     evidence.write_text(failure.model_dump_json(exclude_none=True) + "\n", encoding="utf-8")
-    monkeypatch.setattr(command_module, "load_dataset_semantic_settings", _settings)
+    monkeypatch.setattr(preparation_module, "load_dataset_semantic_settings", _settings)
 
     result = runner.invoke(
         root_app,
@@ -889,7 +934,7 @@ def test_all_complete_resume_preserves_prior_review_finding_exit_code(
     original_reference_context = finding_reference_module.create_finding_reference_context(
         finding_output
     )
-    monkeypatch.setattr(command_module, "load_dataset_semantic_settings", _settings)
+    monkeypatch.setattr(preparation_module, "load_dataset_semantic_settings", _settings)
 
     result = runner.invoke(
         root_app,
@@ -938,7 +983,7 @@ def test_all_complete_resume_preserves_prior_invariant_exit_code(
     _write_dataset(dataset, [_record()])
     _write_target_config(target_config)
     _write_invariant_suite(invariant_path)
-    invariant_suite = command_module.load_dataset_invariant_suite(invariant_path)
+    invariant_suite = preparation_module.load_dataset_invariant_suite(invariant_path)
     evaluation_result = _evaluation_result("interaction-1")
     baseline_output = (
         {"final_amount": 200, "corrected_amount": 100}
@@ -994,7 +1039,7 @@ def test_all_complete_resume_preserves_prior_invariant_exit_code(
         + "\n",
         encoding="utf-8",
     )
-    monkeypatch.setattr(command_module, "load_dataset_semantic_settings", _settings)
+    monkeypatch.setattr(preparation_module, "load_dataset_semantic_settings", _settings)
 
     result = runner.invoke(
         root_app,
@@ -1027,7 +1072,7 @@ def test_resume_rejects_forged_invariant_outcome(tmp_path: Path) -> None:
     _write_dataset(dataset, [_record()])
     _write_target_config(target_config)
     _write_invariant_suite(invariant_path)
-    invariant_suite = command_module.load_dataset_invariant_suite(invariant_path)
+    invariant_suite = preparation_module.load_dataset_invariant_suite(invariant_path)
     evaluation_result = _evaluation_result("interaction-1")
     run_context = _run_context(
         (evaluation_result.source,),
@@ -1385,7 +1430,7 @@ def test_resume_rejects_changed_reasoning_mode(
     )
     required_context = _run_context((evaluation_result.source,))
     assert (
-        command_module._manifest_incompatibility_reason(
+        resume_compatibility.manifest_incompatibility_reason(
             cast(Any, run_context), cast(Any, required_context)
         )
         == "evaluator.llm_client"
@@ -1403,7 +1448,7 @@ def test_resume_rejects_changed_reasoning_mode(
         + "\n",
         encoding="utf-8",
     )
-    monkeypatch.setattr(command_module, "load_dataset_semantic_settings", _settings)
+    monkeypatch.setattr(preparation_module, "load_dataset_semantic_settings", _settings)
 
     result = runner.invoke(
         root_app,
@@ -1532,7 +1577,7 @@ def test_resume_dry_run_accepts_read_only_evidence(
         encoding="utf-8",
     )
     evidence.chmod(0o400)
-    monkeypatch.setattr(command_module, "load_dataset_semantic_settings", _settings)
+    monkeypatch.setattr(preparation_module, "load_dataset_semantic_settings", _settings)
 
     result = runner.invoke(
         root_app,

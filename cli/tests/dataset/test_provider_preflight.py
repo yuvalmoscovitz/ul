@@ -10,7 +10,7 @@ from ul import (
     EvaluatorModelCompatibilityError,
     EvaluatorModelPreflight,
 )
-from ul_cli.dataset.evaluation import command as command_module
+from ul_cli.dataset.evaluation import execution as execution_module
 from ul_cli.dataset.evaluation import runner as runner_module
 from ul_cli.dataset.evidence.persistence import durable_evidence_marker_manifest_sha256
 from ul_cli.main import app as root_app
@@ -106,8 +106,8 @@ def test_openai_compatible_execution_allows_an_unauthenticated_endpoint(
     async def fake_evaluate(*args: object, **kwargs: object) -> tuple[object, ...]:
         return ()
 
-    monkeypatch.setattr(command_module, "JsonHttpEnvironmentConnection", FakeTarget)
-    monkeypatch.setattr(command_module, "evaluate_interaction_records", fake_evaluate)
+    monkeypatch.setattr(execution_module, "JsonHttpEnvironmentConnection", FakeTarget)
+    monkeypatch.setattr(execution_module, "evaluate_interaction_records", fake_evaluate)
 
     result = runner.invoke(
         root_app,
@@ -154,8 +154,8 @@ def test_evaluator_preflight_failure_surfaces_capability_and_safe_action(
             "choose another configured evaluator model or verify the configured route and retry"
         )
 
-    monkeypatch.setattr(command_module, "preflight_evaluator", fail_preflight)
-    monkeypatch.setattr(command_module, "JsonHttpEnvironmentConnection", FakeTarget)
+    monkeypatch.setattr(execution_module, "preflight_evaluator", fail_preflight)
+    monkeypatch.setattr(execution_module, "JsonHttpEnvironmentConnection", FakeTarget)
 
     result = runner.invoke(
         root_app,
@@ -203,7 +203,7 @@ def test_local_environment_gate_fails_before_evaluator_preflight(
         preflight_calls += 1
         raise AssertionError("local validation must run before evaluator preflight")
 
-    monkeypatch.setattr(command_module, "preflight_evaluator", unexpected_preflight)
+    monkeypatch.setattr(execution_module, "preflight_evaluator", unexpected_preflight)
 
     result = runner.invoke(
         root_app,
@@ -259,9 +259,9 @@ def test_evaluator_preflight_receipt_survives_later_semantic_failure(
         assert kwargs["evaluator_preflight"] is expected_preflight
         raise ValueError("later semantic failure")
 
-    monkeypatch.setattr(command_module, "preflight_evaluator", successful_preflight)
-    monkeypatch.setattr(command_module, "JsonHttpEnvironmentConnection", FakeTarget)
-    monkeypatch.setattr(command_module, "evaluate_interaction_records", fail_after_preflight)
+    monkeypatch.setattr(execution_module, "preflight_evaluator", successful_preflight)
+    monkeypatch.setattr(execution_module, "JsonHttpEnvironmentConnection", FakeTarget)
+    monkeypatch.setattr(execution_module, "evaluate_interaction_records", fail_after_preflight)
 
     result = runner.invoke(
         root_app,

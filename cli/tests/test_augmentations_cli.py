@@ -7,7 +7,7 @@ from threading import Barrier
 import pytest
 from typer.testing import CliRunner
 from ul_cli import augmentations
-from ul_cli.dataset.evaluation import command as dataset_command
+from ul_cli.dataset.evaluation import execution as dataset_execution
 from ul_cli.dataset.evaluation import runner as dataset_runner
 from ul_cli.main import app
 
@@ -460,7 +460,7 @@ def test_plan_reads_declared_capabilities_without_constructing_external_clients(
         unexpected_external_client,
     )
     monkeypatch.setattr(
-        dataset_command.JsonHttpEnvironmentConnection,
+        dataset_execution.JsonHttpEnvironmentConnection,
         "from_config",
         unexpected_external_client,
     )

@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 from typer.testing import CliRunner
-from ul_cli.dataset.evaluation import command as command_module
+from ul_cli.dataset.evaluation import preparation as preparation_module
 from ul_cli.main import app as root_app
 
 from ._files import (
@@ -158,7 +158,7 @@ def test_cli_rejects_duplicate_or_unknown_self_correction_operator_before_calls(
     def unexpected_settings() -> None:
         raise AssertionError("invalid operator selection reached model setup")
 
-    monkeypatch.setattr(command_module, "load_dataset_semantic_settings", unexpected_settings)
+    monkeypatch.setattr(preparation_module, "load_dataset_semantic_settings", unexpected_settings)
     arguments = ["dataset", "evaluate", str(dataset)]
     for operator_id in operators:
         arguments.extend(("--operator", operator_id))

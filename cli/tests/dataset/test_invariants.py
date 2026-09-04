@@ -23,7 +23,7 @@ from ul.dataset_invariants import (
 )
 from ul.llm import LLMClient, llm_client_config_from_dataset_settings
 from ul_cli import dataset_review
-from ul_cli.dataset.evaluation import command as command_module
+from ul_cli.dataset.evaluation import preparation as preparation_module
 from ul_cli.dataset.evaluation import runner as runner_module
 from ul_cli.dataset.evidence import customer as customer_module
 from ul_cli.dataset.presentation import evaluation as presentation_module
@@ -320,7 +320,7 @@ def test_invalid_invariant_config_stops_before_settings_network_or_output(
     def unexpected_settings() -> None:
         raise AssertionError("invalid invariants reached settings")
 
-    monkeypatch.setattr(command_module, "load_dataset_semantic_settings", unexpected_settings)
+    monkeypatch.setattr(preparation_module, "load_dataset_semantic_settings", unexpected_settings)
     result = runner.invoke(
         root_app,
         [
@@ -344,7 +344,7 @@ def test_invariant_evaluation_reuses_results_without_extra_runner_calls(
 ) -> None:
     invariant_path = tmp_path / "invariants.json"
     _write_invariant_suite(invariant_path)
-    suite = command_module.load_dataset_invariant_suite(invariant_path)
+    suite = preparation_module.load_dataset_invariant_suite(invariant_path)
     runner_calls = 0
     invariant_calls = 0
     stored_evaluations: list[DatasetInvariantEvaluation] = []

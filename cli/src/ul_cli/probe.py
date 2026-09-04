@@ -52,7 +52,6 @@ from ul.outcome_projection import OutcomeProjection, OutcomeProjectionError
 from ul.probe_execution import OutcomeProjectionExecutionError
 from ul_core.models import ConversationRole, ConversationTurn
 
-from ul_cli.dataset.evaluation.command import preflight_evaluator
 from ul_cli.dataset.evaluation.operators import (
     DEFAULT_DATASET_OPERATOR,
     dataset_operator_identity,
@@ -63,7 +62,7 @@ from ul_cli.dataset.evaluation.records import (
     load_interaction_records,
     validate_model_input_bounds,
 )
-from ul_cli.dataset.evaluation.runner import evaluate_interaction_records
+from ul_cli.dataset.evaluation.runner import evaluate_interaction_records, preflight_evaluator
 from ul_cli.dataset.evidence.context import dataset_evidence_semantic_settings
 from ul_cli.dataset.evidence.persistence import (
     create_durable_evidence_output,
