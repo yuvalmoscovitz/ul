@@ -155,9 +155,7 @@ def prepare_dataset_evaluation(
             selected_operator_ids=selected_operator_ids,
             run_config=prepared_target.run_config,
             invariant_suite=invariant_suite,
-            target_config=(
-                None if direct_http_receipt is not None else prepared_target.config
-            ),
+            target_config=(None if direct_http_receipt is not None else prepared_target.config),
             target_receipt=(
                 local_target_evidence_receipt(prepared_target.local_target)
                 if prepared_target.local_target is not None

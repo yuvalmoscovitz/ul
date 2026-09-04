@@ -8,7 +8,7 @@ from typing import Any, cast
 import pytest
 from typer.testing import CliRunner
 from ul_cli import dataset_campaign as campaign_module
-from ul_cli.dataset.evaluation import command as command_module
+from ul_cli.dataset.evaluation import execution as execution_module
 from ul_cli.dataset.evaluation import preparation as preparation_module
 from ul_cli.dataset.evaluation import runner as runner_module
 from ul_cli.main import app as root_app
@@ -47,7 +47,7 @@ def test_dry_run_validates_and_makes_no_external_calls(
         runner_module, "create_semantic_model_deconstructor", unexpected_deconstructor
     )
     monkeypatch.setattr(
-        command_module.JsonHttpEnvironmentConnection, "from_config", unexpected_target
+        execution_module.JsonHttpEnvironmentConnection, "from_config", unexpected_target
     )
     result = runner.invoke(
         root_app,
@@ -135,7 +135,7 @@ def test_dry_run_json_exposes_per_example_campaign_and_exact_call_plan(
         runner_module, "create_semantic_model_deconstructor", unexpected_deconstructor
     )
     monkeypatch.setattr(
-        command_module.JsonHttpEnvironmentConnection, "from_config", unexpected_target
+        execution_module.JsonHttpEnvironmentConnection, "from_config", unexpected_target
     )
     result = runner.invoke(
         root_app,

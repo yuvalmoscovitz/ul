@@ -28,8 +28,9 @@ from ul.dataset_invariants import (
 from ul_cli import dataset_augmentation_ledger as augmentation_ledger_module
 from ul_cli import dataset_review, dataset_trial_journal
 from ul_cli import finding_reference as finding_reference_module
-from ul_cli.dataset.evaluation import command as command_module
+from ul_cli.dataset.evaluation import execution as execution_module
 from ul_cli.dataset.evaluation import preparation as preparation_module
+from ul_cli.dataset.evaluation import reporting as reporting_module
 from ul_cli.dataset.evaluation import resume_compatibility
 from ul_cli.dataset.evaluation import runner as runner_module
 from ul_cli.dataset.evidence import customer as customer_module
@@ -140,10 +141,10 @@ def test_atomic_finding_snapshot_failure_preserves_published_file(
         del descriptor, value
         raise OSError("simulated disk full")
 
-    monkeypatch.setattr(command_module.os, "write", failed_write)
+    monkeypatch.setattr(reporting_module.os, "write", failed_write)
 
     with pytest.raises(OSError, match="simulated disk full"):
-        command_module._replace_finding_package_snapshot(finding_output, b"new snapshot\n")
+        reporting_module.replace_finding_package_snapshot(finding_output, b"new snapshot\n")
     assert finding_output.read_bytes() == b"prior snapshot\n"
 
 
@@ -154,7 +155,7 @@ def test_atomic_finding_snapshot_keeps_open_reader_on_complete_old_version(
     finding_output.write_bytes(b"prior snapshot\n")
 
     with finding_output.open("rb") as old_reader:
-        command_module._replace_finding_package_snapshot(finding_output, b"new snapshot\n")
+        reporting_module.replace_finding_package_snapshot(finding_output, b"new snapshot\n")
         assert old_reader.read() == b"prior snapshot\n"
     assert finding_output.read_bytes() == b"new snapshot\n"
 
@@ -549,6 +550,9 @@ def test_resume_skips_already_processed_interaction_ids(
         def from_config(cls, config: JsonHttpEnvironmentConfig, **options: object) -> FakeTarget:
             return cls()
 
+        async def aclose(self) -> None:
+            pass
+
     async def fake_evaluate(
         records: tuple[Any, ...],
         operator_ids: tuple[str, ...],
@@ -600,8 +604,8 @@ def test_resume_skips_already_processed_interaction_ids(
         "load_dataset_semantic_settings",
         _settings,
     )
-    monkeypatch.setattr(command_module, "JsonHttpEnvironmentConnection", FakeTarget)
-    monkeypatch.setattr(command_module, "evaluate_interaction_records", fake_evaluate)
+    monkeypatch.setattr(execution_module, "JsonHttpEnvironmentConnection", FakeTarget)
+    monkeypatch.setattr(execution_module, "evaluate_interaction_records", fake_evaluate)
 
     async def unexpected_paid_preflight(settings: object) -> EvaluatorModelPreflight:
         nonlocal preflight_calls
@@ -609,7 +613,7 @@ def test_resume_skips_already_processed_interaction_ids(
         preflight_calls += 1
         raise AssertionError("partial resume must reuse its preflight receipt")
 
-    monkeypatch.setattr(command_module, "preflight_evaluator", unexpected_paid_preflight)
+    monkeypatch.setattr(execution_module, "preflight_evaluator", unexpected_paid_preflight)
     command = [
         "dataset",
         "evaluate",

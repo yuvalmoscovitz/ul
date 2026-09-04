@@ -147,9 +147,7 @@ def normalize_dataset_evaluation_request(
     target_timeout_seconds = _resolve_target_timeout_seconds(
         request.target_timeout_seconds, recorded_manifest
     )
-    max_environment_api_calls = (
-        max_environment_api_calls or _DEFAULT_MAXIMUM_ENVIRONMENT_API_CALLS
-    )
+    max_environment_api_calls = max_environment_api_calls or _DEFAULT_MAXIMUM_ENVIRONMENT_API_CALLS
     limit = limit or 10
     _validate_request_options(
         request,

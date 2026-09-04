@@ -25,6 +25,7 @@ from ul_cli.http_target_resolution import (
 )
 from ul_cli.local_target_resolution import ResolvedLocalTarget, resolve_local_target
 
+from ..presentation.runtime import print_dataset_plain
 from .request import DatasetRequestError, NormalizedDatasetEvaluationRequest
 
 
@@ -170,9 +171,7 @@ def prepare_evaluation_target(
         raise ValueError("--resume requires a recorded or explicit environment configuration")
 
     calls_per_execution = (
-        json_http_environment_calls_per_execution(target_config)
-        if target_config is not None
-        else 1
+        json_http_environment_calls_per_execution(target_config) if target_config is not None else 1
     )
     initial_target_calls = (
         len(selected_records)
@@ -180,10 +179,7 @@ def prepare_evaluation_target(
         * (1 + len(selected_operator_ids))
         * calls_per_execution
     )
-    if (
-        requested.resume is None
-        and initial_target_calls > request.max_environment_api_calls
-    ):
+    if requested.resume is None and initial_target_calls > request.max_environment_api_calls:
         raise ValueError(
             f"selection would make up to {initial_target_calls} environment API calls, "
             f"exceeding --max-environment-api-calls {request.max_environment_api_calls}; reduce "
@@ -301,3 +297,32 @@ def _validate_target_concurrency(
             "--confirm-request-isolation; stateful lifecycle targets remain sequential",
             parameter="--concurrency",
         )
+
+
+def print_local_target_identity(target: ResolvedLocalTarget) -> None:
+    confirmation = target.confirmation
+    print_dataset_plain("UL active-probe target")
+    print_dataset_plain(f"  Kind: {target.kind}")
+    print_dataset_plain(f"  Config sha256: {target.config_sha256}")
+    print_dataset_plain(f"  Confirmation sha256: {target.confirmation_sha256}")
+    print_dataset_plain(f"  Selected executable: {confirmation.selected_executable}")
+    print_dataset_plain(
+        f"  Executable identity: {confirmation.executable.path} ({confirmation.executable.sha256})"
+    )
+    for artifact in confirmation.artifacts:
+        print_dataset_plain(f"  Artifact: {artifact.path} ({artifact.sha256})")
+    for environment in confirmation.environment:
+        print_dataset_plain(
+            f"  Environment: {environment.name} value sha256 {environment.value_sha256}"
+        )
+    if confirmation.callable is not None:
+        print_dataset_plain(f"  Callable: {confirmation.callable}")
+    print_dataset_plain("Use only a dedicated test target that cannot cause real-world effects.")
+
+
+def print_http_target_identity(target: ResolvedHttpTarget) -> None:
+    print_dataset_plain("UL active-probe target")
+    print_dataset_plain("  Kind: http")
+    print_dataset_plain(f"  Config sha256: {target.config_sha256}")
+    print_dataset_plain(f"  Confirmation sha256: {target.confirmation_sha256}")
+    print_dataset_plain("Use only a dedicated test target that cannot cause real-world effects.")
