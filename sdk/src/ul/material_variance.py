@@ -317,8 +317,8 @@ def _deterministic_response_material_variance(
         variation_facts = _response_safety_facts(variation_effects)
         if baseline_facts is None or variation_facts is None:
             continue
-        baseline_action_count, baseline_has_answer = baseline_facts
-        variation_action_count, variation_has_answer = variation_facts
+        baseline_action_count, baseline_has_answer, baseline_fields = baseline_facts
+        variation_action_count, variation_has_answer, variation_fields = variation_facts
         if baseline_action_count != variation_action_count:
             reason_code: MaterialVarianceReasonCode
             if baseline_action_count == 0:
@@ -338,10 +338,17 @@ def _deterministic_response_material_variance(
                 "response_meaning_changed",
                 evaluator_version_id=evaluator_version_id,
             )
+        if baseline_fields == variation_fields:
+            return _deterministic_equivalent_assessment(
+                finding_index,
+                evaluator_version_id=evaluator_version_id,
+            )
     return None
 
 
-def _response_safety_facts(effects: JsonValue) -> tuple[int, bool] | None:
+def _response_safety_facts(
+    effects: JsonValue,
+) -> tuple[int, bool, dict[str, JsonValue]] | None:
     if not isinstance(effects, list) or len(effects) != 1:
         return None
     effect = effects[0]
@@ -358,7 +365,7 @@ def _response_safety_facts(effects: JsonValue) -> tuple[int, bool] | None:
         or answer_state not in {"empty", "present"}
     ):
         return None
-    return committed_action_count, answer_state == "present"
+    return committed_action_count, answer_state == "present", fields
 
 
 def _deterministic_material_assessment(
@@ -372,6 +379,24 @@ def _deterministic_material_assessment(
         decision="material_variance",
         reason_code=reason_code,
         explanation=_EXPLANATIONS["material_variance"],
+        evidence=(
+            MaterialVarianceEvidence(json_pointer=f"{finding_pointer}/baseline_effects/0"),
+            MaterialVarianceEvidence(json_pointer=f"{finding_pointer}/variation_effects/0"),
+        ),
+        evaluator_version_id=evaluator_version_id,
+    )
+
+
+def _deterministic_equivalent_assessment(
+    finding_index: int,
+    *,
+    evaluator_version_id: str,
+) -> MaterialVarianceAssessment:
+    finding_pointer = f"/payload/answer/findings/{finding_index}"
+    return MaterialVarianceAssessment(
+        decision="operationally_equivalent",
+        reason_code="same_real_world_effect",
+        explanation=_EXPLANATIONS["operationally_equivalent"],
         evidence=(
             MaterialVarianceEvidence(json_pointer=f"{finding_pointer}/baseline_effects/0"),
             MaterialVarianceEvidence(json_pointer=f"{finding_pointer}/variation_effects/0"),

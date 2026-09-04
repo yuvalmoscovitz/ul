@@ -45,7 +45,7 @@ The success claim is still a substantive returned answer. If one side says an op
 
 For action findings, compare predicates and only the submitted grounded fields. Do not treat opaque record identifiers, server-generated identifiers, timestamps, ordering, transport envelopes, URLs, display names, abbreviations, or alternate code representations as material unless the submitted evidence establishes that they select a different real-world target or value.
 
-For response findings, ignore wording and formatting but treat a changed factual assertion, recommendation, refusal, or requested next step as material.
+For response findings, ignore wording, formatting, and added non-conflicting explanation, signatures, or apologies. Treat a changed factual assertion, recommendation, refusal, requested next step, recipient, or other substantive instruction as material.
 
 If the structured findings do not establish both sides well enough to make the distinction, return `insufficient_evidence:missing_comparison_evidence`. Never infer missing facts from domain knowledge.
 
