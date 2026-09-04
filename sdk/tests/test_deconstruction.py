@@ -808,6 +808,7 @@ async def test_deconstruct_sends_one_bounded_strict_structured_request() -> None
         assert "Do not classify alternatives or choices" in body["messages"][0]["content"]
         assert "An action is a visible executed action or effect" in body["messages"][0]["content"]
         assert "an answer is returned information" in body["messages"][0]["content"]
+        assert "Mark a visible outcome observed" in body["messages"][0]["content"]
         assert "sensitive or high risk" in body["messages"][0]["content"]
         assert "A field is also grounded" in body["messages"][0]["content"]
         assert "complete action object is also valid" in body["messages"][0]["content"]

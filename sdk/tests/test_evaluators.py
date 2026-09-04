@@ -198,6 +198,35 @@ async def test_rubric_label_contract_must_be_complete_and_bounded() -> None:
         )
 
 
+async def test_judge_request_rejects_invalid_label_contracts_before_a_call() -> None:
+    with pytest.raises(ValidationError, match="cover exactly allowed_labels"):
+        JudgeRequest(
+            evaluator_id="closed-rubric",
+            mode="rubric",
+            rubric="Classify the answer.",
+            payload={"answer": "done"},
+            label_scores={"safe": 1},
+        )
+
+    with pytest.raises(ValidationError, match="pairwise judge labels"):
+        JudgeRequest(
+            evaluator_id="preference",
+            mode="pairwise",
+            rubric="Prefer the clearer answer.",
+            payload={"answer": "done"},
+            allowed_labels=("candidate", "reference"),
+        )
+
+    with pytest.raises(ValidationError, match="at most 100 items"):
+        JudgeRequest(
+            evaluator_id="oversized",
+            mode="rubric",
+            rubric="Classify the answer.",
+            payload={"answer": "done"},
+            allowed_labels=tuple(f"label-{index}" for index in range(101)),
+        )
+
+
 def _subject() -> EvaluationSubject:
     return EvaluationSubject(
         agent_status="succeeded",
@@ -704,6 +733,93 @@ async def test_pairwise_and_human_review_are_first_class_evaluators() -> None:
     assert results.results[1].status == "needs_review"
 
 
+async def test_disallowed_pairwise_tie_is_truthful_and_fails() -> None:
+    judge = RecordingJudge(
+        (
+            EvaluatorDecision(
+                label="tie",
+                explanation="The answers are equivalent.",
+                evidence=(
+                    EvaluatorEvidence(
+                        source="judge_payload",
+                        json_pointer="/payload/answer/message",
+                        description="Candidate answer.",
+                    ),
+                ),
+            ),
+        )
+    )
+
+    results = await evaluate(
+        _subject(),
+        (
+            PairwiseEvaluator(
+                id="preference",
+                rubric="Prefer the clearer answer.",
+                allow_tie=False,
+            ),
+        ),
+        judge=judge,
+    )
+
+    assert results.results[0].status == "failed"
+    assert results.results[0].label == "tie"
+    assert judge.requests[0].allowed_labels == ("candidate", "reference", "tie")
+
+
+async def test_closed_rubric_contract_applies_to_customer_judges() -> None:
+    evaluator = RubricEvaluator(
+        id="safety",
+        rubric="Classify the answer.",
+        minimum_score=0.9,
+        allowed_labels=("safe", "unsafe"),
+        label_scores={"safe": 1, "unsafe": 0},
+    )
+    valid_judge = RecordingJudge(
+        (
+            EvaluatorDecision(
+                score=0.2,
+                label="safe",
+                explanation="The answer is safe.",
+                evidence=(
+                    EvaluatorEvidence(
+                        source="judge_payload",
+                        json_pointer="/payload/answer/message",
+                        description="Candidate answer.",
+                    ),
+                ),
+            ),
+        )
+    )
+
+    valid_results = await evaluate(_subject(), (evaluator,), judge=valid_judge)
+
+    assert valid_results.results[0].status == "passed"
+    assert valid_results.results[0].score == 1
+
+    invalid_results = await evaluate(
+        _subject(),
+        (evaluator,),
+        judge=RecordingJudge(
+            (
+                EvaluatorDecision(
+                    score=1,
+                    label="maybe",
+                    explanation="Unsupported label.",
+                    evidence=(
+                        EvaluatorEvidence(
+                            source="judge_payload",
+                            json_pointer="/payload/answer/message",
+                            description="Candidate answer.",
+                        ),
+                    ),
+                ),
+            )
+        ),
+    )
+    assert invalid_results.results[0].status == "evaluator_error"
+
+
 async def test_agent_failure_is_distinct_from_evaluator_failure_and_does_not_call_judge() -> None:
     judge = RecordingJudge(())
     failed_subject = EvaluationSubject(
@@ -830,18 +946,20 @@ async def test_closed_rubric_uses_an_enum_and_derives_its_score_locally() -> Non
             ),
             client=client,
         )
-        decision = await judge.evaluate(
-            JudgeRequest(
-                evaluator_id="closed-rubric",
-                mode="rubric",
-                rubric="Classify whether the answer is safe.",
-                payload={"answer": "No action taken."},
-                allowed_labels=("safe", "unsafe"),
-                label_scores={"safe": 1, "unsafe": 0},
-            )
+        results = await evaluate(
+            _subject(),
+            (
+                RubricEvaluator(
+                    id="closed-rubric",
+                    rubric="Classify whether the answer is safe.",
+                    allowed_labels=("safe", "unsafe"),
+                    label_scores={"safe": 1, "unsafe": 0},
+                ),
+            ),
+            judge=judge,
         )
 
-    assert decision.score == 1
+    assert results.results[0].score == 1
     assert captured_request is not None
     request_body = cast(dict[str, object], json.loads(captured_request.content))
     response_format = cast(dict[str, object], request_body["response_format"])
@@ -852,7 +970,7 @@ async def test_closed_rubric_uses_an_enum_and_derives_its_score_locally() -> Non
     assert properties["score"] == {"type": "null"}
 
 
-async def test_pairwise_schema_excludes_tie_when_ties_are_disabled() -> None:
+async def test_pairwise_schema_always_allows_a_truthful_tie() -> None:
     captured_request: httpx.Request | None = None
 
     def respond(request: httpx.Request) -> httpx.Response:
@@ -890,7 +1008,7 @@ async def test_pairwise_schema_excludes_tie_when_ties_are_disabled() -> None:
                 mode="pairwise",
                 rubric="Prefer the clearer answer.",
                 payload={"answer": "Clear.", "reference_answer": "Verbose."},
-                allowed_labels=("candidate", "reference"),
+                allowed_labels=("candidate", "reference", "tie"),
             )
         )
 
@@ -903,6 +1021,7 @@ async def test_pairwise_schema_excludes_tie_when_ties_are_disabled() -> None:
     assert cast(dict[str, object], properties["label"])["enum"] == [
         "candidate",
         "reference",
+        "tie",
     ]
     assert properties["score"] == {"type": "null"}
 

@@ -69,8 +69,31 @@ class JudgeRequest(ULModel):
     rubric: str
     payload: dict[str, JsonValue]
     allow_tie: bool = False
-    allowed_labels: tuple[str, ...] = ()
-    label_scores: dict[str, float] = Field(default_factory=dict)
+    allowed_labels: tuple[Annotated[str, Field(min_length=1, max_length=500)], ...] = Field(
+        default=(), max_length=100
+    )
+    label_scores: dict[Annotated[str, Field(min_length=1, max_length=500)], float] = Field(
+        default_factory=dict, max_length=100
+    )
+
+    @model_validator(mode="after")
+    def validate_label_contract(self) -> Self:
+        if len(self.allowed_labels) != len(set(self.allowed_labels)):
+            raise ValueError("judge allowed_labels must be unique")
+        if self.label_scores and set(self.label_scores) != set(self.allowed_labels):
+            raise ValueError("judge label_scores must cover exactly allowed_labels")
+        if any(
+            not math.isfinite(score) or not 0 <= score <= 1 for score in self.label_scores.values()
+        ):
+            raise ValueError("judge label_scores must be finite values from 0 to 1")
+        if self.mode == "pairwise":
+            if self.allowed_labels != ("candidate", "reference", "tie"):
+                raise ValueError("pairwise judge labels must be candidate, reference, and tie")
+            if self.label_scores:
+                raise ValueError("pairwise judge does not accept label_scores")
+        elif self.allow_tie:
+            raise ValueError("allow_tie is only valid for pairwise judges")
+        return self
 
 
 class EvaluatorJudge(Protocol):
@@ -276,13 +299,8 @@ class OpenAICompatibleEvaluatorJudge:
             raise ValueError("label-scored rubric judge must not return a score")
         if request.mode == "rubric" and not request.label_scores and output.score is None:
             raise ValueError("rubric judge must return a score")
-        score = (
-            request.label_scores[output.label]
-            if output.label is not None and request.label_scores
-            else output.score
-        )
         return EvaluatorDecision(
-            score=score,
+            score=output.score,
             label=output.label,
             explanation=output.explanation,
             evidence=_judge_evidence(request, output.citations),
@@ -314,9 +332,7 @@ def _judge_output_schema(request: JudgeRequest) -> dict[str, Any]:
 
 def _allowed_judge_labels(request: JudgeRequest) -> tuple[str, ...]:
     if request.mode == "pairwise":
-        return (
-            ("candidate", "reference", "tie") if request.allow_tie else ("candidate", "reference")
-        )
+        return ("candidate", "reference", "tie")
     return request.allowed_labels
 
 
@@ -869,6 +885,12 @@ async def _evaluate_one(
     decision = await judge.evaluate(request)
     _validate_judge_evidence(request, decision.evidence)
     if isinstance(evaluator, RubricEvaluator):
+        if evaluator.allowed_labels and decision.label not in evaluator.allowed_labels:
+            raise ValueError("rubric judge label is outside the evaluator contract")
+        if evaluator.label_scores:
+            decision = decision.model_copy(
+                update={"score": evaluator.label_scores[cast(str, decision.label)]}
+            )
         if decision.score is None:
             raise ValueError("rubric judges must return a score")
         passed = decision.score >= evaluator.minimum_score
@@ -919,11 +941,7 @@ def _judge_request(
         payload=payload,
         allow_tie=isinstance(evaluator, PairwiseEvaluator) and evaluator.allow_tie,
         allowed_labels=(
-            (
-                ("candidate", "reference", "tie")
-                if evaluator.allow_tie
-                else ("candidate", "reference")
-            )
+            ("candidate", "reference", "tie")
             if isinstance(evaluator, PairwiseEvaluator)
             else evaluator.allowed_labels
         ),

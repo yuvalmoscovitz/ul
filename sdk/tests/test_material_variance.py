@@ -441,11 +441,11 @@ async def test_material_variance_judge_keeps_unknown_actions_and_business_fields
 
 
 async def test_material_variance_judge_fails_closed_on_invalid_or_failed_judgment() -> None:
-    invalid_score = RecordingJudge(_decision("operationally_equivalent:same_real_world_effect", 1))
+    invalid_label = RecordingJudge(_decision("unsupported", 1))
     failed = RecordingJudge(RuntimeError("private-provider-body"))
 
     invalid_assessment = await DatasetMaterialVarianceJudge(
-        invalid_score, max_input_chars=50_000
+        invalid_label, max_input_chars=50_000
     ).evaluate("action", (_finding(),))
     failed_assessment = await DatasetMaterialVarianceJudge(failed, max_input_chars=50_000).evaluate(
         "action", (_finding(),)
