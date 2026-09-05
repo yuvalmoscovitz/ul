@@ -102,24 +102,11 @@ def test_every_catalog_binding_points_to_an_importable_runtime() -> None:
                 )
 
 
-def test_every_catalog_entry_is_documented_with_authoritative_fields() -> None:
+def test_readme_points_to_the_authoritative_catalog_and_public_cli() -> None:
     readme = (Path(__file__).parents[2] / "core/src/ul_core/augmentations/README.md").read_text()
-    section_by_surface = {
-        "human_behavior": "Human behavior",
-        "task_semantics": "Task semantics",
-        "conversation_workflow": "Conversation and workflow",
-        "world_business_state": "World and business state",
-        "tool_execution": "Tool and execution",
-        "trust_policy_authorization": "Trust, policy, and authorization",
-    }
 
-    for specification in builtin_augmentation_catalog().list(latest_only=False):
-        expected_row = (
-            f"| `{specification.ref.id}` | {specification.summary} | "
-            f"{specification.expected_relation} |"
-        )
-        assert readme.count(expected_row) == 1
-        section_start = readme.index(f"### {section_by_surface[specification.surface]}")
-        next_section = readme.find("\n### ", section_start + 1)
-        section = readme[section_start : next_section if next_section >= 0 else len(readme)]
-        assert expected_row in section
+    assert "`definitions.py` is the single source of truth" in readme
+    assert "ul augmentations list" in readme
+    assert "ul augmentations show ID[@VERSION]" in readme
+    assert "ul augmentations list --json" in readme
+    assert "| ID | Controlled change | Expected relation |" not in readme

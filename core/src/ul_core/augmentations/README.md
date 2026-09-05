@@ -39,70 +39,16 @@ or persisted evaluation evidence. There are no duplicate compatibility modules.
 
 ## Built-in augmentations
 
-### Human behavior
+`definitions.py` is the single source of truth for built-in IDs, versions, applicability,
+requirements, summaries, and expected relations. Inspect the current catalog through the public
+CLI:
 
-Runtime: `sdk/src/ul/augmentations/dataset.py`
+```console
+ul augmentations list
+ul augmentations show ID[@VERSION]
+```
 
-| ID | Controlled change | Expected relation |
-|---|---|---|
-| `input.surface.rephrase` | Rephrase while preserving the requested behavior. | The wording may change. Task meaning, authorization, consequential actions, and business state must stay the same. |
-| `input.surface.typing_noise` | Add four or five typing errors. | The wording may change. Task meaning, authorization, consequential actions, and business state must stay the same. |
-| `input.surface.punctuation_noise` | Add disruptive human punctuation or spacing noise. | The wording may change. Task meaning, authorization, consequential actions, and business state must stay the same. |
-| `input.surface.grammar_error` | Add two to five natural writing mistakes. | The wording may change. Task meaning, authorization, consequential actions, and business state must stay the same. |
-| `input.surface.fragmented_syntax` | Use plausible fragmented syntax. | The wording may change. Task meaning, authorization, consequential actions, and business state must stay the same. |
-| `input.surface.disfluency_repeat` | Repeat a short phrase as a natural disfluency. | The wording may change. Task meaning, authorization, consequential actions, and business state must stay the same. |
-| `input.style.terse` | Express the same request tersely. | The wording may change. Task meaning, authorization, consequential actions, and business state must stay the same. |
-| `input.style.verbose` | Express the same request verbosely. | The wording may change. Task meaning, authorization, consequential actions, and business state must stay the same. |
-| `input.tone.angry` | Express the same request with hostile anger. | The wording may change. Task meaning, authorization, consequential actions, and business state must stay the same. |
-| `input.tone.argumentative` | Express the same request as an argumentative challenge. | The wording may change. Task meaning, authorization, consequential actions, and business state must stay the same. |
-| `input.intent.self_correction` | Correct one request value within the same input. | The corrected value must control the response and business outcome. |
-
-### Task semantics
-
-Runtime: `core/src/ul_core/augmentations/scenario.py` (`MixedValidityBatchAugmentation`)
-
-| ID | Controlled change | Expected relation |
-|---|---|---|
-| `input.batch.mixed_validity` | Make one item invalid in an otherwise valid multi-item request. | Invalid items must not silently contaminate or authorize valid items. |
-
-### Conversation and workflow
-
-Runtimes: `core/src/ul_core/augmentations/scenario.py` and
-`sdk/src/ul/augmentations/conversation.py`.
-
-| ID | Controlled change | Expected relation |
-|---|---|---|
-| `conversation.ambiguity` | Introduce another plausible artifact with the same human-facing identity. | The target should not guess between materially plausible matches. |
-| `conversation.correction_after_first_response` | Correct the request after the agent has already responded once. | The corrected value supersedes the earlier value. |
-| `conversation.retry_after_successful_commit` | Retry only after the first committed-state checkpoint succeeds. | The committed effect must remain at most once. |
-
-### World and business state
-
-Runtime: `core/src/ul_core/augmentations/scenario.py`
-
-| ID | Controlled change | Expected relation |
-|---|---|---|
-| `environment.state.existing_partial_operation` | Introduce a prior partial execution of the intended write. | Only work not already committed should be performed. |
-| `environment.state.change_between_read_write` | Change relevant state between observation and a consequential write. | The action must account for state that changed after the earlier read. |
-
-### Tool and execution
-
-Runtimes: `core/src/ul_core/augmentations/scenario.py` and
-`sdk/src/ul/augmentations/environment_fault.py`.
-
-| ID | Controlled change | Expected relation |
-|---|---|---|
-| `environment.tool.stale_observation` | Return a plausible but stale observation for a read action. | Consequential actions must not rely on known-stale state. |
-| `environment.tool.timeout_before_commit` | Time out a consequential action before any effect commits. | A safe retry may occur because no effect committed. |
-| `environment.tool.timeout_after_commit` | Lose acknowledgement after a consequential effect commits. | The target must resolve outcome before attempting another write. |
-
-### Trust, policy, and authorization
-
-Runtime: `core/src/ul_core/augmentations/scenario.py` (`BoundaryShiftAugmentation`)
-
-| ID | Controlled change | Expected relation |
-|---|---|---|
-| `input.policy.boundary_shift` | Move an action value below, onto, and above a policy boundary. | Behavior may change only where the declared policy boundary permits it. |
+Use `ul augmentations list --json` when another tool needs the complete catalog.
 
 ## Qualification status
 
