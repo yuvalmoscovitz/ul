@@ -126,8 +126,9 @@ def test_dataset_report_explains_array_count_change_without_disclosing_values(
     original_value = {
         "answer": "",
         "actions": [
-            {"action": "POST private-operation-one-canary"},
-            {"action": "PUT private-operation-two-canary"},
+            {"action": "POST remove-message-canary"},
+            {"action": "DELETE remove-record-canary"},
+            {"action": "PUT update-record-canary", "body": {"amount": 1}},
         ],
         "private-diagnostics-canary": list(range(100)),
     }
@@ -135,7 +136,8 @@ def test_dataset_report_explains_array_count_change_without_disclosing_values(
         "answer": "",
         "actions": [
             {"action": "GET private-read-only-operation-canary"},
-            {"action": "PUT private-variation-operation-canary"},
+            {"action": "PUT update-record-canary", "body": {"amount": 2}},
+            {"action": "PATCH add-record-canary"},
         ],
         "private-diagnostics-canary": [],
     }
@@ -231,18 +233,121 @@ def test_dataset_report_explains_array_count_change_without_disclosing_values(
     assert report.exit_code == 0, report.output
     normalized_report = " ".join(_ANSI_ESCAPE_PATTERN.sub("", report.output).split())
     assert (
-        "What changed: The agent made 2 committed actions for the original response and 1 after "
+        "What changed: The agent made 3 committed actions for the original response and 2 after "
         "the test variation (1 fewer)."
     ) in normalized_report
     for private_canary in (
         "private-input-canary",
         "private-diagnostics-canary",
-        "private-operation-one-canary",
-        "private-operation-two-canary",
+        "remove-message-canary",
+        "remove-record-canary",
         "private-read-only-operation-canary",
-        "private-variation-operation-canary",
+        "update-record-canary",
+        "add-record-canary",
     ):
         assert private_canary not in normalized_report
+
+    finding_id = cast(dict[str, Any], cast(list[Any], record["cases"])[0])["findings"][0][
+        "finding_id"
+    ]
+    private_report = runner.invoke(
+        root_app,
+        [
+            "dataset",
+            "report",
+            str(evidence_path),
+            "--finding",
+            finding_id,
+            "--show-sensitive-values",
+        ],
+    )
+
+    assert private_report.exit_code == 0, private_report.output
+    assert (
+        "Changed committed action: PUT update-record-canary; /body/amount: 1 -> 2"
+        in private_report.output
+    )
+    assert "Removed committed action: DELETE remove-record-canary" in private_report.output
+    assert "Removed committed action: POST remove-message-canary" in private_report.output
+    assert "Added committed action: PATCH add-record-canary" in private_report.output
+    assert "private-read-only-operation-canary" not in private_report.output
+    assert "private-diagnostics-canary" not in private_report.output
+
+
+def _response_action_finding(
+    original_actions: list[dict[str, Any]],
+    variation_actions: list[dict[str, Any]],
+) -> Any:
+    def effect(identifier: str, actions: list[dict[str, Any]]) -> dict[str, Any]:
+        return {
+            "id": identifier,
+            "evidence": [],
+            "confidence": 1,
+            "status": "observed",
+            "request_unit_ids": [],
+            "position": 0,
+            "kind": "answer",
+            "predicate": "returned_response",
+            "fields": {"value": {"answer": "", "actions": actions}},
+            "propositions": [],
+        }
+
+    return dataset_review._Finding.model_validate(
+        {
+            "finding_id": "ulf_v1_" + "0" * 64,
+            "category": "changed_response",
+            "grounded_field_names": [],
+            "severity": "unrated",
+            "review_status": "needs_review",
+            "summary": "The response changed.",
+            "reference_effects": [effect("original", original_actions)],
+            "observed_effects": [effect("variation", variation_actions)],
+        }
+    )
+
+
+@pytest.mark.parametrize(
+    ("original_actions", "variation_actions", "expected_count_summary", "expected_diff"),
+    (
+        (
+            [{"action": "POST remove-canary"}],
+            [],
+            "1 committed actions for the original response and 0 after the test variation",
+            "Removed committed action: POST remove-canary",
+        ),
+        (
+            [],
+            [{"action": "POST add-canary"}],
+            "0 committed actions for the original response and 1 after the test variation",
+            "Added committed action: POST add-canary",
+        ),
+    ),
+)
+def test_response_action_summary_covers_complete_addition_and_removal(
+    original_actions: list[dict[str, Any]],
+    variation_actions: list[dict[str, Any]],
+    expected_count_summary: str,
+    expected_diff: str,
+) -> None:
+    finding = _response_action_finding(original_actions, variation_actions)
+
+    assert expected_count_summary in dataset_review._response_action_count_summary(finding)
+    assert expected_diff in dataset_review._sensitive_response_action_difference_lines(finding)
+
+
+def test_response_action_diff_is_bounded_with_an_omission_summary() -> None:
+    finding = _response_action_finding(
+        [{"action": f"POST remove-{index}"} for index in range(51)],
+        [],
+    )
+
+    lines = dataset_review._sensitive_response_action_difference_lines(finding)
+
+    assert len(lines) == 21
+    assert lines[-1] == (
+        "Additional committed action differences omitted: 31; "
+        "inspect the complete technical evidence."
+    )
 
 
 @pytest.mark.parametrize(

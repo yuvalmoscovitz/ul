@@ -10,6 +10,7 @@ import stat
 import sys
 import tempfile
 import unicodedata
+from collections import Counter
 from collections.abc import Callable, Generator, Iterable
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass
@@ -58,7 +59,11 @@ from ul.dataset_regression import dataset_regression_target_config_sha256
 from ul.environment import validate_outcome_projection_evidence
 from ul.http_environment import JsonHttpIsolatedResponseConfig, JsonHttpTargetConfig
 from ul.llm import LLMClientIdentity
-from ul.material_variance import response_materiality_action_count
+from ul.material_variance import (
+    response_materiality_action_count,
+    response_materiality_action_name,
+    response_materiality_committed_actions,
+)
 from ul.outcome_projection import OutcomeProjection
 from ul_core.augmentations.definitions import builtin_augmentation_catalog
 
@@ -110,6 +115,11 @@ _MAXIMUM_REVIEWS_BYTES = 10_000_000
 _MAXIMUM_REVIEW_RECORDS = 10_000
 _MAXIMUM_SENSITIVE_DISCLOSURE_BYTES = 32_768
 _MAXIMUM_SENSITIVE_DISCLOSURE_LINES = 50
+_MAXIMUM_SENSITIVE_ACTIONS_TO_COMPARE = 100
+_MAXIMUM_SENSITIVE_ACTION_DIFFERENCE_LINES = 20
+_MAXIMUM_SENSITIVE_ACTION_FIELD_DIFFERENCES = 5
+_MAXIMUM_SENSITIVE_ACTION_VALUE_CHARACTERS = 200
+_ACTION_COUNT_REASON_CODES = frozenset({"action_added", "action_removed", "action_count_changed"})
 _SHA256_PATTERN = r"^[0-9a-f]{64}$"
 _FINDING_ID_PATTERN = r"^ulf_v1_[0-9a-f]{64}$"
 _REVIEW_ID_PATTERN = r"^ulr_[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
@@ -219,6 +229,120 @@ def _response_action_count_summary(finding: _Finding) -> str | None:
         f"{variation_item_count} after the test variation "
         f"({abs(item_count_delta)} {direction})."
     )
+
+
+def _sensitive_response_action_difference_lines(finding: _Finding) -> tuple[str, ...]:
+    if len(finding.reference_effects) != 1 or len(finding.observed_effects) != 1:
+        return ()
+    original_actions = response_materiality_committed_actions(finding.reference_effects[0].fields)
+    variation_actions = response_materiality_committed_actions(finding.observed_effects[0].fields)
+    if original_actions is None or variation_actions is None:
+        return ()
+    action_count = len(original_actions) + len(variation_actions)
+    if action_count > _MAXIMUM_SENSITIVE_ACTIONS_TO_COMPARE:
+        return (
+            "Readable committed action diff omitted: "
+            f"{action_count} actions exceed the {_MAXIMUM_SENSITIVE_ACTIONS_TO_COMPARE}-action "
+            "comparison limit; inspect the complete technical evidence.",
+        )
+
+    unmatched_variation = list(variation_actions)
+    unmatched_original: list[JsonValue] = []
+    for original_action in original_actions:
+        try:
+            matching_index = unmatched_variation.index(original_action)
+        except ValueError:
+            unmatched_original.append(original_action)
+        else:
+            unmatched_variation.pop(matching_index)
+
+    changed_actions: list[tuple[str, JsonValue, JsonValue]] = []
+    removed_actions: list[JsonValue] = []
+    for original_action in unmatched_original:
+        action_name = response_materiality_action_name(original_action)
+        matching_index = next(
+            (
+                index
+                for index, variation_action in enumerate(unmatched_variation)
+                if action_name is not None
+                and response_materiality_action_name(variation_action) == action_name
+            ),
+            None,
+        )
+        if matching_index is None or action_name is None:
+            removed_actions.append(original_action)
+            continue
+        changed_actions.append(
+            (action_name, original_action, unmatched_variation.pop(matching_index))
+        )
+
+    removed_names = Counter(response_materiality_action_name(action) for action in removed_actions)
+    added_names = Counter(
+        response_materiality_action_name(action) for action in unmatched_variation
+    )
+    lines: list[str] = []
+    for action_name, original_action, variation_action in changed_actions:
+        differences = _sensitive_action_field_differences(original_action, variation_action)
+        difference_suffix = "; " + "; ".join(differences) if differences else ""
+        lines.append(f"Changed committed action: {action_name}{difference_suffix}")
+    for change, names in (("removed", removed_names), ("added", added_names)):
+        for name, count in sorted(names.items(), key=lambda item: (item[0] is None, item[0] or "")):
+            count_suffix = f" ({count} occurrences)" if count > 1 else ""
+            lines.append(
+                f"{change.capitalize()} committed action{count_suffix}: "
+                f"{name or '(unnamed action)'}"
+            )
+    if len(lines) <= _MAXIMUM_SENSITIVE_ACTION_DIFFERENCE_LINES:
+        return tuple(lines)
+    shown_lines = lines[:_MAXIMUM_SENSITIVE_ACTION_DIFFERENCE_LINES]
+    shown_lines.append(
+        f"Additional committed action differences omitted: "
+        f"{len(lines) - _MAXIMUM_SENSITIVE_ACTION_DIFFERENCE_LINES}; "
+        "inspect the complete technical evidence."
+    )
+    return tuple(shown_lines)
+
+
+def _sensitive_action_field_differences(
+    original_action: JsonValue,
+    variation_action: JsonValue,
+) -> tuple[str, ...]:
+    differences: list[str] = []
+    truncated = False
+    missing = object()
+
+    def render(value: Any) -> str:
+        if value is missing:
+            return "(missing)"
+        encoded = json.dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+        if len(encoded) <= _MAXIMUM_SENSITIVE_ACTION_VALUE_CHARACTERS:
+            return encoded
+        return encoded[:_MAXIMUM_SENSITIVE_ACTION_VALUE_CHARACTERS] + "..."
+
+    def visit(left: JsonValue | object, right: JsonValue | object, path: str) -> None:
+        nonlocal truncated
+        if left == right:
+            return
+        if len(differences) == _MAXIMUM_SENSITIVE_ACTION_FIELD_DIFFERENCES:
+            truncated = True
+            return
+        if isinstance(left, dict) and isinstance(right, dict):
+            left_mapping = cast(dict[str, JsonValue], left)
+            right_mapping = cast(dict[str, JsonValue], right)
+            for key in sorted(left_mapping.keys() | right_mapping.keys()):
+                escaped_key = key.replace("~", "~0").replace("/", "~1")
+                visit(
+                    left_mapping.get(key, missing),
+                    right_mapping.get(key, missing),
+                    f"{path}/{escaped_key}",
+                )
+            return
+        differences.append(f"{path or '/'}: {render(left)} -> {render(right)}")
+
+    visit(original_action, variation_action, "")
+    if truncated:
+        differences.append("additional fields differ")
+    return tuple(differences)
 
 
 class _OutcomeGroup(_StrictModel):
@@ -2161,7 +2285,7 @@ def report_dataset_evidence(
                 _print_plain("Reason: " + case.material_variance.reason_code.replace("_", " "))
                 if (
                     finding.category == "changed_response"
-                    and case.material_variance.reason_code == "action_count_changed"
+                    and case.material_variance.reason_code in _ACTION_COUNT_REASON_CODES
                 ):
                     difference_summary = _response_action_count_summary(finding)
                     if difference_summary is not None:
@@ -3487,6 +3611,12 @@ def _bounded_sensitive_semantic_lines(
     finding = indexed_finding.semantic_finding
     if finding is None:
         raise AssertionError("semantic disclosure requires a semantic finding")
+    action_difference_lines = (
+        _sensitive_response_action_difference_lines(finding)
+        if indexed_finding.case.material_variance is not None
+        and indexed_finding.case.material_variance.reason_code in _ACTION_COUNT_REASON_CODES
+        else ()
+    )
     return _bounded_sensitive_lines(
         (
             _sensitive_json_line(
@@ -3496,13 +3626,29 @@ def _bounded_sensitive_semantic_lines(
             _sensitive_json_line(
                 "Variation input", {"value": indexed_finding.case.augmented_input}
             ),
-            _sensitive_json_line(
-                "Reference effects",
-                {"value": [effect.model_dump(mode="json") for effect in finding.reference_effects]},
-            ),
-            _sensitive_json_line(
-                "Observed effects",
-                {"value": [effect.model_dump(mode="json") for effect in finding.observed_effects]},
+            *(
+                action_difference_lines
+                if action_difference_lines
+                else (
+                    _sensitive_json_line(
+                        "Reference effects",
+                        {
+                            "value": [
+                                effect.model_dump(mode="json")
+                                for effect in finding.reference_effects
+                            ]
+                        },
+                    ),
+                    _sensitive_json_line(
+                        "Observed effects",
+                        {
+                            "value": [
+                                effect.model_dump(mode="json")
+                                for effect in finding.observed_effects
+                            ]
+                        },
+                    ),
+                )
             ),
         )
     )
