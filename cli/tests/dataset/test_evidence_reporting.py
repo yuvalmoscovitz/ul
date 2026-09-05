@@ -124,14 +124,20 @@ def test_dataset_report_explains_array_count_change_without_disclosing_values(
     tmp_path: Path,
 ) -> None:
     original_value = {
-        "private-list-name-canary": [
-            {"operation": "private-operation-one-canary"},
-            {"operation": "private-operation-two-canary"},
-            {"operation": "private-operation-three-canary"},
-        ]
+        "answer": "",
+        "actions": [
+            {"action": "POST private-operation-one-canary"},
+            {"action": "PUT private-operation-two-canary"},
+        ],
+        "private-diagnostics-canary": list(range(100)),
     }
     variation_value = {
-        "private-list-name-canary": [{"operation": "private-variation-operation-canary"}]
+        "answer": "",
+        "actions": [
+            {"action": "GET private-read-only-operation-canary"},
+            {"action": "PUT private-variation-operation-canary"},
+        ],
+        "private-diagnostics-canary": [],
     }
 
     def response_effect(identifier: str, value: dict[str, Any]) -> ObservedOutcome:
@@ -185,9 +191,7 @@ def test_dataset_report_explains_array_count_change_without_disclosing_values(
     )
     finding = DatasetEvaluationFinding(
         category="changed_response",
-        message=(
-            "The variation changed the observed response at /private-list-name-canary/0/operation."
-        ),
+        message=("The variation changed the observed response at /private-diagnostics-canary/0."),
         expected_effects=(original_effect,),
         observed_effects=(variation_effect,),
     )
@@ -227,15 +231,15 @@ def test_dataset_report_explains_array_count_change_without_disclosing_values(
     assert report.exit_code == 0, report.output
     normalized_report = " ".join(_ANSI_ESCAPE_PATTERN.sub("", report.output).split())
     assert (
-        "What changed: A response list contained 3 items in the original response and 1 after "
-        "the test variation (2 fewer)."
+        "What changed: The agent made 2 committed actions for the original response and 1 after "
+        "the test variation (1 fewer)."
     ) in normalized_report
     for private_canary in (
         "private-input-canary",
-        "private-list-name-canary",
+        "private-diagnostics-canary",
         "private-operation-one-canary",
         "private-operation-two-canary",
-        "private-operation-three-canary",
+        "private-read-only-operation-canary",
         "private-variation-operation-canary",
     ):
         assert private_canary not in normalized_report

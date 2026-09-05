@@ -58,6 +58,7 @@ from ul.dataset_regression import dataset_regression_target_config_sha256
 from ul.environment import validate_outcome_projection_evidence
 from ul.http_environment import JsonHttpIsolatedResponseConfig, JsonHttpTargetConfig
 from ul.llm import LLMClientIdentity
+from ul.material_variance import response_materiality_action_count
 from ul.outcome_projection import OutcomeProjection
 from ul_core.augmentations.definitions import builtin_augmentation_catalog
 
@@ -196,51 +197,25 @@ class _Finding(_StrictModel):
     observed_effects: list[_Effect]
 
 
-def _safe_response_list_counts(finding: _Finding) -> tuple[int, int] | None:
-    def returned_response_value(effects: list[_Effect]) -> JsonValue | None:
-        if (
-            len(effects) == 1
-            and effects[0].predicate == "returned_response"
-            and set(effects[0].fields) == {"value"}
-        ):
-            return effects[0].fields["value"]
+def _response_materiality_action_counts(finding: _Finding) -> tuple[int, int] | None:
+    if len(finding.reference_effects) != 1 or len(finding.observed_effects) != 1:
         return None
-
-    original = returned_response_value(finding.reference_effects)
-    variation = returned_response_value(finding.observed_effects)
-    candidates: list[tuple[int, tuple[str, ...], int, int]] = []
-
-    def visit(left: JsonValue, right: JsonValue, path: tuple[str, ...]) -> None:
-        if len(path) >= 100:
-            return
-        if isinstance(left, list) and isinstance(right, list):
-            if len(left) != len(right):
-                candidates.append((len(path), path, len(left), len(right)))
-            for index, (left_item, right_item) in enumerate(zip(left, right, strict=False)):
-                visit(left_item, right_item, (*path, str(index)))
-            return
-        if isinstance(left, dict) and isinstance(right, dict):
-            for key in sorted(left.keys() & right.keys()):
-                visit(left[key], right[key], (*path, key))
-
-    if original is not None and variation is not None:
-        visit(original, variation, ())
-    if not candidates:
+    original_item_count = response_materiality_action_count(finding.reference_effects[0].fields)
+    variation_item_count = response_materiality_action_count(finding.observed_effects[0].fields)
+    if original_item_count is None or variation_item_count is None:
         return None
-    _, _, original_item_count, variation_item_count = min(candidates)
     return original_item_count, variation_item_count
 
 
-def _safe_response_list_difference_summary(finding: _Finding) -> str | None:
-    counts = _safe_response_list_counts(finding)
+def _response_action_count_summary(finding: _Finding) -> str | None:
+    counts = _response_materiality_action_counts(finding)
     if counts is None:
         return None
     original_item_count, variation_item_count = counts
     item_count_delta = variation_item_count - original_item_count
     direction = "more" if item_count_delta > 0 else "fewer"
     return (
-        "A response list contained "
-        f"{original_item_count} items in the original response and "
+        f"The agent made {original_item_count} committed actions for the original response and "
         f"{variation_item_count} after the test variation "
         f"({abs(item_count_delta)} {direction})."
     )
@@ -2188,7 +2163,7 @@ def report_dataset_evidence(
                     finding.category == "changed_response"
                     and case.material_variance.reason_code == "action_count_changed"
                 ):
-                    difference_summary = _safe_response_list_difference_summary(finding)
+                    difference_summary = _response_action_count_summary(finding)
                     if difference_summary is not None:
                         _print_plain("What changed: " + difference_summary)
         else:

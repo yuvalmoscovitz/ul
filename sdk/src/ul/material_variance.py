@@ -281,6 +281,13 @@ def _normalized_response_fields(fields: dict[str, JsonValue]) -> dict[str, JsonV
     return normalized
 
 
+def response_materiality_action_count(fields: dict[str, JsonValue]) -> int | None:
+    committed_action_count = _normalized_response_fields(fields).get("committed_action_count")
+    if type(committed_action_count) is not int or committed_action_count < 0:
+        return None
+    return committed_action_count
+
+
 def _is_empty_answer(answer: JsonValue) -> bool:
     if answer is None:
         return True
