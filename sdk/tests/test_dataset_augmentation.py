@@ -1025,6 +1025,9 @@ async def test_builtin_operator_library_is_fixed_versioned_and_reviewable() -> N
     assert "profane" in instructions["input.tone.angry"]
     assert "Insult the agent" in instructions["input.tone.angry"]
     assert "urgency" in instructions["input.tone.angry"]
+    assert instructions["input.behavior.indirect_request"] == (
+        "Express one direct imperative as a conventional indirect request."
+    )
     assert [
         operator.id for operator in operators if operator.applicability_profile == "conditional"
     ] == [
@@ -1093,6 +1096,7 @@ async def test_indirect_request_wraps_one_proven_direct_imperative() -> None:
         ("Create record 42 and email me.\n", "act", "create_record"),
         ("Create record 42!", "act", "create_record"),
         ("Create record 42. Then email me.", "act", "create_record"),
+        ("Do not create record 42.", "act", "do_not_create"),
     ],
 )
 async def test_indirect_request_skips_when_direct_form_is_not_proven(

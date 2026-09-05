@@ -1786,6 +1786,8 @@ def _indirect_request_transformation(
     request = frame.request_units[0]
     if request.mode != "act":
         return None
+    if source_input.casefold().startswith(("do not ", "don't ")):
+        return None
     direct_input = source_input.removesuffix(".")
     match = re.fullmatch(r"([A-Z][a-z]+)(\s.+)", direct_input)
     if match is None:

@@ -60,6 +60,10 @@ def test_every_dataset_operator_uses_its_catalog_named_prompt() -> None:
     prompts = PromptManager.instance()
 
     for operator in builtin_dataset_augmentation_operators():
+        runtime = dataset_operator_runtime(operator)
+        if runtime.instruction is not None:
+            assert operator.instruction == runtime.instruction
+            continue
         prompt_name = dataset_operator_prompt_name(operator)
         assert prompts.get_template_info(prompt_name).name == prompt_name
         assert operator.instruction == prompts.get_prompt(prompt_name)

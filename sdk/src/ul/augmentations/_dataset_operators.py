@@ -104,7 +104,10 @@ def _builtin_operator(specification: BuiltinAugmentationSpec) -> DatasetAugmenta
     return DatasetAugmentationOperator(
         id=specification.ref.id,
         version=specification.ref.version,
-        instruction=PromptManager.instance().get_prompt(_specification_prompt_name(specification)),
+        instruction=(
+            runtime.instruction
+            or PromptManager.instance().get_prompt(_specification_prompt_name(specification))
+        ),
         applicability_profile=specification.applicability_profile,
         applicability_rule=specification.applicability_rule,
         generation_mechanism=runtime.generation_mechanism,
