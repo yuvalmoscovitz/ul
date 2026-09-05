@@ -58,6 +58,7 @@ from ul.dataset_regression import dataset_regression_target_config_sha256
 from ul.environment import validate_outcome_projection_evidence
 from ul.http_environment import JsonHttpIsolatedResponseConfig, JsonHttpTargetConfig
 from ul.llm import LLMClientIdentity
+from ul.material_variance import response_materiality_action_count
 from ul.outcome_projection import OutcomeProjection
 from ul_core.augmentations.definitions import builtin_augmentation_catalog
 
@@ -194,6 +195,30 @@ class _Finding(_StrictModel):
     summary: str
     reference_effects: list[_Effect]
     observed_effects: list[_Effect]
+
+
+def _response_materiality_action_counts(finding: _Finding) -> tuple[int, int] | None:
+    if len(finding.reference_effects) != 1 or len(finding.observed_effects) != 1:
+        return None
+    original_item_count = response_materiality_action_count(finding.reference_effects[0].fields)
+    variation_item_count = response_materiality_action_count(finding.observed_effects[0].fields)
+    if original_item_count is None or variation_item_count is None:
+        return None
+    return original_item_count, variation_item_count
+
+
+def _response_action_count_summary(finding: _Finding) -> str | None:
+    counts = _response_materiality_action_counts(finding)
+    if counts is None:
+        return None
+    original_item_count, variation_item_count = counts
+    item_count_delta = variation_item_count - original_item_count
+    direction = "more" if item_count_delta > 0 else "fewer"
+    return (
+        f"The agent made {original_item_count} committed actions for the original response and "
+        f"{variation_item_count} after the test variation "
+        f"({abs(item_count_delta)} {direction})."
+    )
 
 
 class _OutcomeGroup(_StrictModel):
@@ -2125,10 +2150,22 @@ def report_dataset_evidence(
         _print_plain("")
         if indexed_finding.semantic_finding is not None:
             finding = indexed_finding.semantic_finding
-            _print_plain(f"{section_item_number}. {finding.summary}")
+            safe_summary = (
+                _BEHAVIOR_FINDING_SUMMARIES["changed_response"]
+                if finding.category == "changed_response"
+                else finding.summary
+            )
+            _print_plain(f"{section_item_number}. {safe_summary}")
             _print_plain(f"Category: {finding.category}")
             if case.material_variance is not None:
                 _print_plain("Reason: " + case.material_variance.reason_code.replace("_", " "))
+                if (
+                    finding.category == "changed_response"
+                    and case.material_variance.reason_code == "action_count_changed"
+                ):
+                    difference_summary = _response_action_count_summary(finding)
+                    if difference_summary is not None:
+                        _print_plain("What changed: " + difference_summary)
         else:
             baseline_rule = indexed_finding.baseline_rule
             variation_rule = indexed_finding.variation_rule
