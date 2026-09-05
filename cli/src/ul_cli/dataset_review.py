@@ -115,6 +115,11 @@ _MAXIMUM_REVIEWS_BYTES = 10_000_000
 _MAXIMUM_REVIEW_RECORDS = 10_000
 _MAXIMUM_SENSITIVE_DISCLOSURE_BYTES = 32_768
 _MAXIMUM_SENSITIVE_DISCLOSURE_LINES = 50
+_MAXIMUM_SENSITIVE_ACTIONS_TO_COMPARE = 100
+_MAXIMUM_SENSITIVE_ACTION_DIFFERENCE_LINES = 20
+_MAXIMUM_SENSITIVE_ACTION_FIELD_DIFFERENCES = 5
+_MAXIMUM_SENSITIVE_ACTION_VALUE_CHARACTERS = 200
+_ACTION_COUNT_REASON_CODES = frozenset({"action_added", "action_removed", "action_count_changed"})
 _SHA256_PATTERN = r"^[0-9a-f]{64}$"
 _FINDING_ID_PATTERN = r"^ulf_v1_[0-9a-f]{64}$"
 _REVIEW_ID_PATTERN = r"^ulr_[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
@@ -233,45 +238,111 @@ def _sensitive_response_action_difference_lines(finding: _Finding) -> tuple[str,
     variation_actions = response_materiality_committed_actions(finding.observed_effects[0].fields)
     if original_actions is None or variation_actions is None:
         return ()
+    action_count = len(original_actions) + len(variation_actions)
+    if action_count > _MAXIMUM_SENSITIVE_ACTIONS_TO_COMPARE:
+        return (
+            "Readable committed action diff omitted: "
+            f"{action_count} actions exceed the {_MAXIMUM_SENSITIVE_ACTIONS_TO_COMPARE}-action "
+            "comparison limit; inspect the complete technical evidence.",
+        )
 
-    def action_key(action: JsonValue) -> str:
-        return json.dumps(action, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+    unmatched_variation = list(variation_actions)
+    unmatched_original: list[JsonValue] = []
+    for original_action in original_actions:
+        try:
+            matching_index = unmatched_variation.index(original_action)
+        except ValueError:
+            unmatched_original.append(original_action)
+        else:
+            unmatched_variation.pop(matching_index)
 
-    original_keys = Counter(action_key(action) for action in original_actions)
-    variation_keys = Counter(action_key(action) for action in variation_actions)
-    unchanged = original_keys & variation_keys
-    original_keys -= unchanged
-    variation_keys -= unchanged
-    action_names = {
-        action_key(action): response_materiality_action_name(action)
-        for action in (*original_actions, *variation_actions)
-    }
+    changed_actions: list[tuple[str, JsonValue, JsonValue]] = []
+    removed_actions: list[JsonValue] = []
+    for original_action in unmatched_original:
+        action_name = response_materiality_action_name(original_action)
+        matching_index = next(
+            (
+                index
+                for index, variation_action in enumerate(unmatched_variation)
+                if action_name is not None
+                and response_materiality_action_name(variation_action) == action_name
+            ),
+            None,
+        )
+        if matching_index is None or action_name is None:
+            removed_actions.append(original_action)
+            continue
+        changed_actions.append(
+            (action_name, original_action, unmatched_variation.pop(matching_index))
+        )
 
-    def count_names(action_keys: Counter[str]) -> Counter[str | None]:
-        counts: Counter[str | None] = Counter()
-        for key, count in action_keys.items():
-            counts[action_names[key]] += count
-        return counts
-
-    original_names = count_names(original_keys)
-    variation_names = count_names(variation_keys)
-    changed_names = original_names & variation_names
-    changed_names.pop(None, None)
-    original_names -= changed_names
-    variation_names -= changed_names
+    removed_names = Counter(response_materiality_action_name(action) for action in removed_actions)
+    added_names = Counter(
+        response_materiality_action_name(action) for action in unmatched_variation
+    )
     lines: list[str] = []
-    for change, names in (
-        ("changed", changed_names),
-        ("removed", original_names),
-        ("added", variation_names),
-    ):
+    for action_name, original_action, variation_action in changed_actions:
+        differences = _sensitive_action_field_differences(original_action, variation_action)
+        difference_suffix = "; " + "; ".join(differences) if differences else ""
+        lines.append(f"Changed committed action: {action_name}{difference_suffix}")
+    for change, names in (("removed", removed_names), ("added", added_names)):
         for name, count in sorted(names.items(), key=lambda item: (item[0] is None, item[0] or "")):
             count_suffix = f" ({count} occurrences)" if count > 1 else ""
             lines.append(
                 f"{change.capitalize()} committed action{count_suffix}: "
                 f"{name or '(unnamed action)'}"
             )
-    return tuple(lines)
+    if len(lines) <= _MAXIMUM_SENSITIVE_ACTION_DIFFERENCE_LINES:
+        return tuple(lines)
+    shown_lines = lines[:_MAXIMUM_SENSITIVE_ACTION_DIFFERENCE_LINES]
+    shown_lines.append(
+        f"Additional committed action differences omitted: "
+        f"{len(lines) - _MAXIMUM_SENSITIVE_ACTION_DIFFERENCE_LINES}; "
+        "inspect the complete technical evidence."
+    )
+    return tuple(shown_lines)
+
+
+def _sensitive_action_field_differences(
+    original_action: JsonValue,
+    variation_action: JsonValue,
+) -> tuple[str, ...]:
+    differences: list[str] = []
+    truncated = False
+    missing = object()
+
+    def render(value: Any) -> str:
+        if value is missing:
+            return "(missing)"
+        encoded = json.dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+        if len(encoded) <= _MAXIMUM_SENSITIVE_ACTION_VALUE_CHARACTERS:
+            return encoded
+        return encoded[:_MAXIMUM_SENSITIVE_ACTION_VALUE_CHARACTERS] + "..."
+
+    def visit(left: JsonValue | object, right: JsonValue | object, path: str) -> None:
+        nonlocal truncated
+        if left == right:
+            return
+        if len(differences) == _MAXIMUM_SENSITIVE_ACTION_FIELD_DIFFERENCES:
+            truncated = True
+            return
+        if isinstance(left, dict) and isinstance(right, dict):
+            left_mapping = cast(dict[str, JsonValue], left)
+            right_mapping = cast(dict[str, JsonValue], right)
+            for key in sorted(left_mapping.keys() | right_mapping.keys()):
+                escaped_key = key.replace("~", "~0").replace("/", "~1")
+                visit(
+                    left_mapping.get(key, missing),
+                    right_mapping.get(key, missing),
+                    f"{path}/{escaped_key}",
+                )
+            return
+        differences.append(f"{path or '/'}: {render(left)} -> {render(right)}")
+
+    visit(original_action, variation_action, "")
+    if truncated:
+        differences.append("additional fields differ")
+    return tuple(differences)
 
 
 class _OutcomeGroup(_StrictModel):
@@ -2214,7 +2285,7 @@ def report_dataset_evidence(
                 _print_plain("Reason: " + case.material_variance.reason_code.replace("_", " "))
                 if (
                     finding.category == "changed_response"
-                    and case.material_variance.reason_code == "action_count_changed"
+                    and case.material_variance.reason_code in _ACTION_COUNT_REASON_CODES
                 ):
                     difference_summary = _response_action_count_summary(finding)
                     if difference_summary is not None:
@@ -3543,7 +3614,7 @@ def _bounded_sensitive_semantic_lines(
     action_difference_lines = (
         _sensitive_response_action_difference_lines(finding)
         if indexed_finding.case.material_variance is not None
-        and indexed_finding.case.material_variance.reason_code == "action_count_changed"
+        and indexed_finding.case.material_variance.reason_code in _ACTION_COUNT_REASON_CODES
         else ()
     )
     return _bounded_sensitive_lines(
