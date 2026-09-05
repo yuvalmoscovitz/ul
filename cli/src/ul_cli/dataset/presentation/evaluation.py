@@ -7,7 +7,7 @@ from typing import Literal
 
 import typer
 from rich.table import Table
-from ul import DatasetEvaluationResult, EvaluatorModelPreflight
+from ul import DatasetEvaluationCase, DatasetEvaluationResult, EvaluatorModelPreflight
 from ul.dataset_invariants import (
     DatasetInvariantArrayUniqueTrialEvaluation,
     DatasetInvariantEvaluation,
@@ -328,7 +328,12 @@ def print_dataset_results(
             )
     console.print(table)
     compared_variation_count = sum(
-        case.trial_set is not None for result in results for case in result.cases
+        case_has_completed_comparison(case) for result in results for case in result.cases
+    )
+    inconclusive_variation_count = sum(
+        case.trial_set is not None and not case_has_completed_comparison(case)
+        for result in results
+        for case in result.cases
     )
     rejected_variation_count = sum(
         case.verdict == "augmentation_rejected" for result in results for case in result.cases
@@ -336,11 +341,12 @@ def print_dataset_results(
     skipped_variation_count = sum(
         len(getattr(getattr(result, "augmentation", None), "skips", ())) for result in results
     )
-    console.print(
+    print_dataset_plain(
         f"Coverage: {compared_variation_count} "
         f"{'variation' if compared_variation_count == 1 else 'variations'} compared across "
         f"{len(results)} {'interaction' if len(results) == 1 else 'interactions'}; "
-        f"{rejected_variation_count} rejected; {skipped_variation_count} skipped."
+        f"{inconclusive_variation_count} inconclusive; {rejected_variation_count} rejected; "
+        f"{skipped_variation_count} skipped."
     )
     selected_interactions_by_operator = Counter(
         reference.id
@@ -359,7 +365,7 @@ def print_dataset_results(
     )
     for (operator_id, _reason_code, reason, next_action), count in sorted(skip_groups.items()):
         selected_count = selected_interactions_by_operator[operator_id]
-        console.print(
+        print_dataset_plain(
             f"Warning: {operator_id} skipped for {count} of {selected_count} interactions: "
             f"{reason} Next: {next_action}"
         )
@@ -397,6 +403,13 @@ def result_needs_review(result: DatasetEvaluationResult) -> bool:
     return dataset_result_exit_code(result) == 1
 
 
+def case_has_completed_comparison(case: DatasetEvaluationCase) -> bool:
+    trial_set = case.trial_set
+    return trial_set is not None and any(
+        not trial.inconclusive_reasons for trial in trial_set.trials
+    )
+
+
 def dataset_result_exit_code(result: DatasetEvaluationResult) -> int:
     has_inconclusive_materiality = False
     for case in result.cases:
@@ -409,7 +422,7 @@ def dataset_result_exit_code(result: DatasetEvaluationResult) -> int:
             has_inconclusive_materiality = True
     if has_inconclusive_materiality:
         return 2
-    if not any(case.trial_set is not None for case in result.cases):
+    if not any(case_has_completed_comparison(case) for case in result.cases):
         return 2
     return 0
 
@@ -418,7 +431,9 @@ def dataset_results_exit_code(results: tuple[DatasetEvaluationResult, ...]) -> i
     if not results:
         return 0
     compared_results = tuple(
-        result for result in results if any(case.trial_set is not None for case in result.cases)
+        result
+        for result in results
+        if any(case_has_completed_comparison(case) for case in result.cases)
     )
     if not compared_results:
         return 2

@@ -818,7 +818,7 @@ def test_resume_exits_early_when_all_records_already_processed(
     assert "Potential semantic model calls: up to 0" in dry_run.output
     assert "preflight=0" in dry_run.output
     assert "Estimated completion tokens: 0..0" in dry_run.output
-    assert result.exit_code == 0, result.output
+    assert result.exit_code == 2, result.output
     assert "Nothing to do" in result.output
 
 

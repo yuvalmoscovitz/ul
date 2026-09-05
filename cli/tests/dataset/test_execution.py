@@ -1130,6 +1130,24 @@ def test_public_cli_reports_mixed_augmentation_coverage_to_the_customer(
     assert "Augmentation coverage: selected=1, compared=0, rejected=0, skipped=1" in (
         normalized_skipped_report
     )
+    resumed_skipped_run = runner.invoke(
+        root_app,
+        [
+            "dataset",
+            "evaluate",
+            "--resume",
+            str(skipped_output),
+            "--operator",
+            "input.surface.punctuation_noise",
+            "--target",
+            "customer_agent:run",
+            "--confirm-target",
+            target.confirmation_sha256,
+        ],
+    )
+    assert resumed_skipped_run.exit_code == 2, resumed_skipped_run.output
+    assert "Nothing to do" in " ".join(resumed_skipped_run.output.split())
+
     project_directory = tmp_path / ".ul"
     project_directory.mkdir(mode=0o700)
     ensure_project_pattern_identity_key(project_directory)

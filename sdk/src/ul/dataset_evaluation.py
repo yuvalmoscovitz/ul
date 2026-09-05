@@ -596,13 +596,17 @@ class DatasetEvaluationRunner:
         augmentation = augmentation.model_copy(update={"source_frames": (source_frame,)})
         if precomputed_augmentation is None and augmentation_checkpoint_callback is not None:
             augmentation_checkpoint_callback(augmentation)
-        comparison_surface = _source_comparison_surface(projected_source, source_frame)
-        if comparison_surface == "response":
-            source_frame = _response_frame(source_frame, projected_source.raw_observed_output)
-            augmentation = augmentation.model_copy(update={"source_frames": (source_frame,)})
         accepted_candidates = tuple(
             candidate for candidate in augmentation.candidates if candidate.passed
         )
+        comparison_surface = (
+            _source_comparison_surface(projected_source, source_frame)
+            if accepted_candidates
+            else "response"
+        )
+        if comparison_surface == "response":
+            source_frame = _response_frame(source_frame, projected_source.raw_observed_output)
+            augmentation = augmentation.model_copy(update={"source_frames": (source_frame,)})
         baseline_trials_by_repetition: dict[int, DatasetEvaluationTrial] = {}
         candidate_trials_by_repetition: dict[str, dict[int, DatasetEvaluationTrial]] = {
             candidate.operator_id: {} for candidate in accepted_candidates
@@ -670,15 +674,17 @@ class DatasetEvaluationRunner:
                 repetition=repetition,
             )
             if not accepted_candidates:
-                skipped_baseline = DatasetEvaluationTrial(
-                    repetition=repetition,
-                    inconclusive_reasons=(
-                        "no usable variation was produced; original replay not executed",
-                    ),
-                )
+                skipped_baseline = recovered_trials.get(baseline_unit.id)
+                if skipped_baseline is None:
+                    skipped_baseline = DatasetEvaluationTrial(
+                        repetition=repetition,
+                        inconclusive_reasons=(
+                            "no usable variation was produced; original replay not executed",
+                        ),
+                    )
+                    if trial_terminal_callback is not None:
+                        trial_terminal_callback(baseline_unit, skipped_baseline)
                 baseline_trials_by_repetition[repetition] = skipped_baseline
-                if trial_terminal_callback is not None:
-                    trial_terminal_callback(baseline_unit, skipped_baseline)
                 return
             baseline_trial = recovered_trials.get(baseline_unit.id)
             if baseline_trial is None:

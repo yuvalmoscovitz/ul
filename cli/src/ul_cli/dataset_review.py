@@ -986,7 +986,7 @@ def validate_dataset_resume_evidence(
             raise ValueError("resume evidence original input does not match its technical details")
         if evidence.execution_plan.repetitions != expected_context.repetitions:
             raise ValueError("resume evidence repetitions do not match the current evaluation plan")
-        technical_operators = tuple(
+        technical_candidate_operators = tuple(
             (case.candidate.operator_id, case.candidate.operator_version)
             for case in technical_result.cases
         )
@@ -996,7 +996,14 @@ def validate_dataset_resume_evidence(
         expected_operators = tuple(
             (operator.id, operator.version) for operator in expected_context.operators
         )
-        if technical_operators != expected_operators or public_operators != expected_operators:
+        technical_selected_operators = tuple(
+            (operator.id, operator.version)
+            for operator in technical_result.augmentation.operator_references
+        )
+        if (
+            technical_selected_operators != expected_operators
+            or public_operators != technical_candidate_operators
+        ):
             raise ValueError("resume evidence operators do not match the current evaluation plan")
         if (
             technical_result.baseline.trial_set.requested_repetitions
@@ -2001,6 +2008,14 @@ def _dataset_case_report_bucket(
     return "no_difference"
 
 
+def _dataset_case_completed(case: _Case) -> bool:
+    return (
+        case.variation_accepted
+        and case.observations is not None
+        and case.observations.observed_repetitions > 0
+    )
+
+
 def report_dataset_evidence(
     evidence: Annotated[
         Path,
@@ -2077,22 +2092,23 @@ def report_dataset_evidence(
     }
 
     cases = [case for loaded_record in evidence_records for case in loaded_record.evidence.cases]
-    technical_results = tuple(
-        DatasetEvaluationResult.model_validate_json(
-            json.dumps(loaded_record.evidence.technical_details, ensure_ascii=False)
-        )
-        for loaded_record in evidence_records
-    )
-    selected_interactions_by_operator = Counter(
-        reference.id
-        for result in technical_results
-        for reference in result.augmentation.operator_references
-    )
-    skip_groups = Counter(
-        (skip.operator_id, skip.reason_code, skip.reason, skip.next_action)
-        for result in technical_results
-        for skip in result.augmentation.skips
-    )
+    selected_interactions_by_operator: Counter[str] = Counter()
+    skip_groups: Counter[tuple[str, str, str, str]] = Counter()
+    try:
+        for loaded_record in evidence_records:
+            technical_result = DatasetEvaluationResult.model_validate(
+                loaded_record.evidence.technical_details,
+                strict=False,
+            )
+            selected_interactions_by_operator.update(
+                reference.id for reference in technical_result.augmentation.operator_references
+            )
+            skip_groups.update(
+                (skip.operator_id, skip.reason_code, skip.reason, skip.next_action)
+                for skip in technical_result.augmentation.skips
+            )
+    except (ValidationError, ValueError):
+        raise typer.BadParameter("evidence contains invalid technical details") from None
     skipped_variation_count = sum(skip_groups.values())
     comparison_counts = {
         bucket: sum(_dataset_case_report_bucket(case) == bucket for case in cases)
@@ -2148,7 +2164,7 @@ def report_dataset_evidence(
     _print_plain(
         "Augmentation coverage: "
         f"selected={sum(selected_interactions_by_operator.values())}, "
-        f"compared={len(cases) - comparison_counts['not_evaluated']}, "
+        f"compared={sum(_dataset_case_completed(case) for case in cases)}, "
         f"rejected={comparison_counts['not_evaluated']}, "
         f"skipped={skipped_variation_count}"
     )
@@ -2160,7 +2176,7 @@ def report_dataset_evidence(
         )
     _print_plain(
         f"Semantic comparisons: total={len(cases)}, completed="
-        f"{len(cases) - comparison_counts['not_evaluated']}, "
+        f"{sum(_dataset_case_completed(case) for case in cases)}, "
         f"no_observed_difference={comparison_counts['no_difference']}"
     )
     _print_plain(

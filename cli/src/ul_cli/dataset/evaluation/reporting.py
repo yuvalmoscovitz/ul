@@ -179,6 +179,8 @@ def report_completed_resume(
         raise typer.Exit(code=1)
     if resume_evidence.has_inconclusive_materiality or failure_count:
         raise typer.Exit(code=2)
+    if dataset_results_exit_code(resume_evidence.technical_results):
+        raise typer.Exit(code=2)
     raise typer.Exit(code=0)
 
 

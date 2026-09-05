@@ -12,7 +12,6 @@ from pydantic import JsonValue, SecretStr, ValidationError
 from ul.augmentations.dataset import (
     DatasetAugmentationEngine,
     DatasetAugmentationResult,
-    DatasetAugmentationSkip,
 )
 from ul.dataset_evaluation import (
     DatasetComparisonCompatibilityError,
@@ -1214,35 +1213,36 @@ async def test_runner_executes_only_accepted_candidates_and_keeps_rejected_candi
 
 async def test_runner_does_not_call_target_when_no_variation_is_usable() -> None:
     source = _source()
-    runner, semantic_pipeline, target = _runner((_source_outcomes()[0],))
-    generated = await DatasetAugmentationEngine(semantic_pipeline, semantic_pipeline).augment(
-        (source,)
-    )
-    reference = generated.operator_references[0]
-    skipped = generated.model_copy(
-        update={
-            "candidates": (),
-            "skips": (
-                DatasetAugmentationSkip(
-                    source_interaction_id=source.id,
-                    operator_id=reference.id,
-                    operator_version=reference.version,
-                    reason_code="operator_not_applicable",
-                    reason="The augmentation does not apply to this datapoint.",
-                    next_action="Choose another augmentation.",
-                ),
-            ),
-        }
-    )
+    runner, semantic_pipeline, target = _runner(())
+    semantic_pipeline.source_frame = _frame("source", ())
 
-    result = await runner.run(source, precomputed_augmentation=skipped)
+    recovered_trials: dict[str, DatasetEvaluationTrial] = {}
+    result = await runner.run(
+        source,
+        trial_terminal_callback=lambda unit, trial: recovered_trials.__setitem__(unit.id, trial),
+    )
 
     assert target.raw_inputs == []
+    assert result.augmentation.skips[0].reason_code == "no_observed_outcome"
     assert result.cases == ()
     assert result.baseline.verdict == "inconclusive"
     assert result.baseline.trial_set.trials[0].inconclusive_reasons == (
         "no usable variation was produced; original replay not executed",
     )
+    terminal_callback_count = len(recovered_trials)
+
+    resumed = await runner.run(
+        source,
+        precomputed_augmentation=result.augmentation,
+        prior_trials=recovered_trials,
+        trial_terminal_callback=lambda unit, trial: pytest.fail(
+            f"recovered terminal trial was recorded again: {unit.id}"
+        ),
+    )
+
+    assert len(recovered_trials) == terminal_callback_count
+    assert resumed.baseline == result.baseline
+    assert target.raw_inputs == []
 
 
 async def test_runner_executes_punctuation_candidate_with_equivalent_list_decomposition() -> None:
@@ -3012,14 +3012,6 @@ async def test_runner_does_not_promote_unknown_outcome_kinds_to_response_semanti
     "source_answer",
     (
         _outcome(
-            "unresolved-answer",
-            0,
-            kind="answer",
-            predicate="recommendation",
-            fields={"text": "Retry."},
-            status="unresolved",
-        ),
-        _outcome(
             "ungrounded-answer",
             0,
             kind="answer",
@@ -3091,7 +3083,6 @@ async def test_runner_marks_missing_trial_answer_inconclusive_without_action_fal
 @pytest.mark.parametrize(
     "source_outcome",
     [
-        _outcome("unresolved", 0, status="unresolved"),
         _outcome("ambiguous", 0, status="ambiguous"),
         _outcome("unknown", 0, status="unknown"),
         _outcome("low_confidence", 0, confidence=0.9),
@@ -3121,6 +3112,34 @@ async def test_runner_rejects_inconclusive_source_actions_before_execution(
     ):
         await runner.run(_source())
 
+    assert target.raw_inputs == []
+
+
+@pytest.mark.parametrize(
+    "source_outcome",
+    (
+        _outcome("unresolved-action", 0, status="unresolved"),
+        _outcome(
+            "unresolved-answer",
+            0,
+            kind="answer",
+            predicate="recommendation",
+            fields={"text": "Retry."},
+            status="unresolved",
+        ),
+    ),
+)
+async def test_runner_skips_unresolved_source_semantics_without_target_calls(
+    source_outcome: ObservedOutcome,
+) -> None:
+    runner, semantic_pipeline, target = _runner((source_outcome,))
+    semantic_pipeline.source_frame = _frame("source", (source_outcome,))
+
+    result = await runner.run(_source())
+
+    assert result.augmentation.skips[0].reason_code == "unresolved_source_semantics"
+    assert result.baseline.verdict == "inconclusive"
+    assert result.cases == ()
     assert target.raw_inputs == []
 
 
