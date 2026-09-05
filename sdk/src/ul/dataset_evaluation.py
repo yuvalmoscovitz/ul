@@ -154,7 +154,17 @@ class ReturnedResponseSemanticDeconstructor:
         )
         if input_frame.interaction_id != record.id:
             raise ValueError("deconstructed frame must reference its source interaction")
-        return _response_frame(input_frame, record.raw_observed_output)
+        return self.frame_returned_response(record, input_frame)
+
+    def frame_returned_response(
+        self,
+        record: InteractionRecord,
+        input_frame: SemanticFrame,
+    ) -> SemanticFrame:
+        return _response_frame(
+            input_frame.model_copy(update={"interaction_id": record.id, "outcomes": ()}),
+            record.raw_observed_output,
+        )
 
 
 class DatasetEvaluationFinding(_StrictULModel):
@@ -606,6 +616,7 @@ class DatasetEvaluationRunner:
             interaction_id: str,
             raw_input: str,
             reference_frame: SemanticFrame,
+            prepared_input_frame: SemanticFrame,
             subject: Literal["current baseline", "variation"],
             variation_id: str,
         ) -> DatasetEvaluationTrial:
@@ -623,6 +634,7 @@ class DatasetEvaluationRunner:
                     interaction_id=interaction_id,
                     raw_input=raw_input,
                     reference_frame=reference_frame,
+                    prepared_input_frame=prepared_input_frame,
                     source=source,
                     subject=subject,
                     variation_id=variation_id,
@@ -664,6 +676,7 @@ class DatasetEvaluationRunner:
                     interaction_id=f"{source.id}:current_baseline:round-{repetition}",
                     raw_input=source.raw_input,
                     reference_frame=source_frame,
+                    prepared_input_frame=source_frame,
                     subject="current baseline",
                     variation_id="current_baseline",
                 )
@@ -698,11 +711,15 @@ class DatasetEvaluationRunner:
                 reference_frame = baseline_trial.observed_frame
                 if reference_frame is None:
                     raise AssertionError("conclusive baseline trial requires an observed frame")
+                candidate_input_frame = candidate.reparsed_input_frame
+                if candidate_input_frame is None:
+                    raise AssertionError("accepted candidates require a reparsed input frame")
                 candidate_trial = await execute_trial(
                     candidate_unit,
                     interaction_id=(f"{source.id}:{candidate.operator_id}:round-{repetition}"),
                     raw_input=candidate.augmented_input,
                     reference_frame=reference_frame,
+                    prepared_input_frame=candidate_input_frame,
                     subject="variation",
                     variation_id=candidate.operator_id,
                 )
@@ -897,6 +914,7 @@ class DatasetEvaluationRunner:
         interaction_id: str,
         raw_input: str,
         reference_frame: SemanticFrame,
+        prepared_input_frame: SemanticFrame,
         source: InteractionRecord,
         subject: Literal["current baseline", "variation"],
         variation_id: str,
@@ -1053,26 +1071,37 @@ class DatasetEvaluationRunner:
             raw_input=raw_input,
             raw_observed_output=target_output.raw_output,
         )
-        try:
-            observed_frame = await self._deconstructor.deconstruct(record, reference_frame)
-        except ValueError:
-            return DatasetEvaluationTrial(
-                repetition=repetition,
-                execution_evidence=execution_evidence,
-                target_output=target_output,
-                inconclusive_reasons=(f"{subject} output could not be semantically deconstructed",),
+        if comparison_surface == "response" and isinstance(
+            self._deconstructor, ReturnedResponseSemanticDeconstructor
+        ):
+            observed_frame = self._deconstructor.frame_returned_response(
+                record, prepared_input_frame
             )
-        if observed_frame.interaction_id != record.id:
-            raise ValueError(f"observed frame must reference its {subject} interaction")
-        observed_frame = canonicalize_evidenced_action_fields(record, observed_frame)
-        if comparison_surface == "response":
-            if not _frame_supports_response_projection(record, observed_frame):
+        else:
+            try:
+                observed_frame = await self._deconstructor.deconstruct(record, reference_frame)
+            except ValueError:
                 return DatasetEvaluationTrial(
                     repetition=repetition,
                     execution_evidence=execution_evidence,
                     target_output=target_output,
-                    inconclusive_reasons=(f"{subject} produced no grounded response outcome",),
+                    inconclusive_reasons=(
+                        f"{subject} output could not be semantically deconstructed",
+                    ),
                 )
+        if observed_frame.interaction_id != record.id:
+            raise ValueError(f"observed frame must reference its {subject} interaction")
+        observed_frame = canonicalize_evidenced_action_fields(record, observed_frame)
+        if comparison_surface == "response" and not _frame_supports_response_projection(
+            record, observed_frame
+        ):
+            return DatasetEvaluationTrial(
+                repetition=repetition,
+                execution_evidence=execution_evidence,
+                target_output=target_output,
+                inconclusive_reasons=(f"{subject} produced no grounded response outcome",),
+            )
+        if comparison_surface == "response":
             observed_frame = _response_frame(observed_frame, target_output.raw_output)
         inconclusive_reasons = (
             _action_outcome_reliability_issues(
@@ -1190,6 +1219,8 @@ def _validate_precomputed_augmentation(
             and candidate.reparsed_input_frame.interaction_id != expected_reparsed_interaction_id
         ):
             raise ValueError("precomputed augmentation candidate has invalid reparsed lineage")
+        if candidate.passed and candidate.reparsed_input_frame is None:
+            raise ValueError("accepted precomputed candidate requires a reparsed input frame")
         candidate_references.append(candidate_reference)
     if len(candidate_references) != len(set(candidate_references)):
         raise ValueError("precomputed augmentation contains duplicate operator references")
