@@ -2116,6 +2116,8 @@ def report_dataset_evidence(
         )
     elif unresolved_count:
         result_summary = f"INCONCLUSIVE — {unresolved_count} item(s) need attention"
+    elif cases and comparison_counts["not_evaluated"] == len(cases):
+        result_summary = "INCONCLUSIVE — no valid variations were evaluated"
     else:
         result_summary = "CLEAR — no consequential behavior changes found"
 
