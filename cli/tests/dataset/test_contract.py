@@ -76,6 +76,7 @@ def test_legacy_operator_list_delegates_to_catalog_and_counts_deterministic_corr
         if line.startswith("- ")
     )
     assert listed_operator_ids == (
+        "input.behavior.indirect_request@1.0.0:",
         "input.intent.self_correction@1.1.0:",
         "input.style.terse@1.2.0:",
         "input.style.verbose@1.2.0:",

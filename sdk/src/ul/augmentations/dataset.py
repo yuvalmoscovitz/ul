@@ -277,6 +277,7 @@ class DatasetAugmentationEngine:
             for operator in selected_operators:
                 transformation_prompt_names: tuple[str, ...] = ()
                 self_correction_plan: _SelfCorrectionPlan | None = None
+                indirect_request_input: str | None = None
                 render_instruction: str | None = None
                 if (
                     operator.id == "input.surface.punctuation_noise"
@@ -296,6 +297,25 @@ class DatasetAugmentationEngine:
                         )
                     )
                     continue
+                if operator.id == "input.behavior.indirect_request":
+                    indirect_request_input = _indirect_request_transformation(
+                        record.raw_input, expected_input_frame
+                    )
+                    if indirect_request_input is None:
+                        skips.append(
+                            DatasetAugmentationSkip(
+                                source_interaction_id=record.id,
+                                operator_id=operator.id,
+                                operator_version=operator.version,
+                                reason_code="operator_not_applicable",
+                                reason=operator.applicability_rule,
+                                next_action=(
+                                    "Choose another augmentation or use a datapoint that matches "
+                                    "this augmentation."
+                                ),
+                            )
+                        )
+                        continue
                 if operator.allowed_change == "structured_self_correction":
                     self_correction_plan = _self_correction_plan(record, source_frame)
                     if self_correction_plan is None:
@@ -313,7 +333,16 @@ class DatasetAugmentationEngine:
                             )
                         )
                         continue
-                if operator.id == "input.surface.typing_noise":
+                if indirect_request_input is not None:
+                    rendered_input = RenderedUserInput(
+                        text=indirect_request_input,
+                        metadata=_deterministic_renderer_metadata(
+                            record,
+                            operator,
+                            "direct_imperative_to_conventional_indirect_request",
+                        ),
+                    )
+                elif operator.id == "input.surface.typing_noise":
                     rendered_input = _add_typing_noise(record, expected_input_frame, operator)
                 elif operator.id == "input.surface.punctuation_noise":
                     rendered_input = _add_punctuation_noise(record, expected_input_frame, operator)
@@ -1740,6 +1769,35 @@ def _surface_footprint_reasons(
     ):
         return ("rendered input must accuse or challenge an agent that keeps failing",)
     return ()
+
+
+def _indirect_request_transformation(
+    source_input: str,
+    frame: SemanticFrame,
+) -> str | None:
+    if "\n" in source_input or source_input != source_input.strip():
+        return None
+    if source_input.endswith(("?", "!")) or any(
+        punctuation in source_input.removesuffix(".") for punctuation in ".?!"
+    ):
+        return None
+    if len(frame.request_units) != 1:
+        return None
+    request = frame.request_units[0]
+    if request.mode != "act":
+        return None
+    if source_input.casefold().startswith(("do not ", "don't ")):
+        return None
+    direct_input = source_input.removesuffix(".")
+    match = re.fullmatch(r"([A-Z][a-z]+)(\s.+)", direct_input)
+    if match is None:
+        return None
+    opening_verb, remainder = match.groups()
+    predicate_verb = re.split(r"[_\s]+", request.predicate.casefold(), maxsplit=1)[0]
+    if opening_verb.casefold() != predicate_verb:
+        return None
+    direct_request = f"{opening_verb[:1].casefold()}{opening_verb[1:]}{remainder}"
+    return f"Could you please {direct_request}?"
 
 
 def _changed_word_count(source_input: str, augmented_input: str) -> int:

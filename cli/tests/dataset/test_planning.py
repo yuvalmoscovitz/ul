@@ -449,7 +449,7 @@ def test_human_dry_run_escapes_untrusted_ids_and_summarizes_unselected_catalog(
     assert "\\u001b" in result.output
     assert "[bold]spoof[/bold]" in result.output
     assert "Unselected catalog operators:" in result.output
-    assert "0 eligible, 10 conditional, 10 ineligible" in result.output
+    assert "0 eligible, 11 conditional, 10 ineligible" in result.output
     assert "use --json for full detail" in " ".join(result.output.split())
     assert "input.surface.rephrase@" not in result.output
 

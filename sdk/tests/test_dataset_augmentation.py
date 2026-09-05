@@ -970,6 +970,7 @@ async def test_builtin_operator_library_is_fixed_versioned_and_reviewable() -> N
         "input.tone.angry",
         "input.tone.argumentative",
         "input.intent.self_correction",
+        "input.behavior.indirect_request",
     )
     assert {operator.id: operator.version for operator in operators}[
         "input.intent.self_correction"
@@ -986,6 +987,7 @@ async def test_builtin_operator_library_is_fixed_versioned_and_reviewable() -> N
         "input.tone.angry": "1.2.0",
         "input.tone.argumentative": "1.2.0",
         "input.intent.self_correction": "1.1.0",
+        "input.behavior.indirect_request": "1.0.0",
     }
     assert [operator.id for operator in operators if operator.generation_mechanism == "llm"] == [
         "input.surface.rephrase",
@@ -1003,9 +1005,11 @@ async def test_builtin_operator_library_is_fixed_versioned_and_reviewable() -> N
         "input.surface.typing_noise",
         "input.surface.punctuation_noise",
         "input.intent.self_correction",
+        "input.behavior.indirect_request",
     ]
     assert [operator.id for operator in operators if operator.human_review_required] == [
-        "input.intent.self_correction"
+        "input.intent.self_correction",
+        "input.behavior.indirect_request",
     ]
     assert all(
         len(operator.instruction.split()) <= 20
@@ -1021,12 +1025,126 @@ async def test_builtin_operator_library_is_fixed_versioned_and_reviewable() -> N
     assert "profane" in instructions["input.tone.angry"]
     assert "Insult the agent" in instructions["input.tone.angry"]
     assert "urgency" in instructions["input.tone.angry"]
+    assert instructions["input.behavior.indirect_request"] == (
+        "Express one direct imperative as a conventional indirect request."
+    )
     assert [
         operator.id for operator in operators if operator.applicability_profile == "conditional"
     ] == [
         "input.surface.punctuation_noise",
         "input.intent.self_correction",
+        "input.behavior.indirect_request",
     ]
+
+
+async def test_indirect_request_wraps_one_proven_direct_imperative() -> None:
+    record = InteractionRecord(
+        id="create-record",
+        raw_input="Create record 42.",
+        raw_observed_output={"action": "CREATE_RECORD", "id": 42},
+    )
+    original_frame = SemanticFrame(
+        interaction_id=record.id,
+        request_units=(
+            RequestUnit(
+                id="create-request",
+                evidence=evidence("input"),
+                confidence=1,
+                status="explicit",
+                mode="act",
+                predicate="create_record",
+            ),
+        ),
+        outcomes=(
+            ObservedOutcome(
+                id="create-outcome",
+                evidence=evidence("output"),
+                confidence=1,
+                status="observed",
+                request_unit_ids=("create-request",),
+                position=0,
+                kind="action",
+                predicate="create_record",
+                fields={"id": 42},
+            ),
+        ),
+        extractor_version="test",
+    )
+    candidate_frame = original_frame.model_copy(
+        update={"interaction_id": "candidate", "outcomes": ()}
+    )
+    model = DeterministicSemanticModel({record.id: original_frame}, candidate_frame)
+
+    result = await DatasetAugmentationEngine(model, model).augment(
+        (record,), operator_ids=("input.behavior.indirect_request",)
+    )
+
+    assert result.skips == ()
+    assert result.candidates[0].passed
+    assert result.candidates[0].augmented_input == "Could you please create record 42?"
+    assert result.candidates[0].renderer_metadata["algorithm"] == (
+        "direct_imperative_to_conventional_indirect_request"
+    )
+    assert model.rendered_inputs == []
+
+
+@pytest.mark.parametrize(
+    ("raw_input", "mode", "predicate"),
+    [
+        ("Can you create record 42?", "ask", "create_record"),
+        ("Please create record 42.", "act", "create_record"),
+        ("Create record 42 and email me.\n", "act", "create_record"),
+        ("Create record 42!", "act", "create_record"),
+        ("Create record 42. Then email me.", "act", "create_record"),
+        ("Do not create record 42.", "act", "do_not_create"),
+    ],
+)
+async def test_indirect_request_skips_when_direct_form_is_not_proven(
+    raw_input: str,
+    mode: str,
+    predicate: str,
+) -> None:
+    record = InteractionRecord(
+        id="not-direct",
+        raw_input=raw_input,
+        raw_observed_output={"status": "ok"},
+    )
+    source = SemanticFrame(
+        interaction_id=record.id,
+        request_units=(
+            RequestUnit(
+                id="request",
+                evidence=evidence("input"),
+                confidence=1,
+                status="explicit",
+                mode=mode,
+                predicate=predicate,
+            ),
+        ),
+        outcomes=(
+            ObservedOutcome(
+                id="outcome",
+                evidence=evidence("output"),
+                confidence=1,
+                status="observed",
+                request_unit_ids=("request",),
+                position=0,
+                kind="answer",
+                predicate="respond",
+            ),
+        ),
+        extractor_version="test",
+    )
+    model = DeterministicSemanticModel({record.id: source})
+
+    result = await DatasetAugmentationEngine(model, model).augment(
+        (record,), operator_ids=("input.behavior.indirect_request",)
+    )
+
+    assert result.candidates == ()
+    assert result.skips[0].reason_code == "operator_not_applicable"
+    assert "single direct imperative" in result.skips[0].reason
+    assert model.rendered_inputs == []
 
 
 async def test_operator_change_contract_rejects_impossible_target_states() -> None:

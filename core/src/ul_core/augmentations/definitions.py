@@ -80,6 +80,7 @@ class DatasetVariationRuntime(_CatalogModel):
     order: int = Field(ge=0)
     generation_mechanism: DatasetGenerationMechanism
     allowed_change: DatasetAllowedChange
+    instruction: str | None = Field(default=None, min_length=1, max_length=500)
     target_communication_kind: str | None = Field(default=None, min_length=1)
     semantic_allowed_surface_change: SemanticAllowedSurfaceChange = "none"
     prompt_name: str | None = Field(default=None, min_length=1, max_length=500)
@@ -92,6 +93,10 @@ class DatasetVariationRuntime(_CatalogModel):
         }
         if requires_target != (self.target_communication_kind is not None):
             raise ValueError("target communication kind must match the allowed change")
+        if self.instruction is not None and self.generation_mechanism != "deterministic":
+            raise ValueError("inline instructions are only valid for deterministic generation")
+        if self.instruction is not None and self.prompt_name is not None:
+            raise ValueError("dataset runtime cannot declare both an instruction and prompt")
         return self
 
 
@@ -273,6 +278,7 @@ def _dataset_spec(
     target_communication_kind: str | None = None,
     semantic_allowed_surface_change: SemanticAllowedSurfaceChange = "none",
     prompt_name: str | None = None,
+    instruction: str | None = None,
 ) -> BuiltinAugmentationSpec:
     return BuiltinAugmentationSpec(
         ref=AugmentationRef(id=augmentation_id, version=version),
@@ -307,6 +313,7 @@ def _dataset_spec(
                     target_communication_kind=target_communication_kind,
                     semantic_allowed_surface_change=semantic_allowed_surface_change,
                     prompt_name=prompt_name,
+                    instruction=instruction,
                 ),
             ),
         ),
@@ -471,6 +478,20 @@ _BUILTIN_AUGMENTATION_SPECS = (
             "Applies only when one explicit numeric, monetary, date, or duration value can be "
             "temporarily misstated, or one enum value has one exact prior observed value for "
             "the same field and object and both values appear exactly once in the input."
+        ),
+    ),
+    _dataset_spec(
+        "input.behavior.indirect_request",
+        "Express one direct imperative as a conventional indirect request.",
+        order=11,
+        generation_mechanism="deterministic",
+        allowed_change="surface_form_only",
+        instruction="Express one direct imperative as a conventional indirect request.",
+        human_review=True,
+        applicability_profile="conditional",
+        applicability_rule=(
+            "Applies only when the source is a single direct imperative whose opening verb "
+            "matches the recorded request predicate."
         ),
     ),
     _scenario_spec(

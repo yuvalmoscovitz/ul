@@ -581,6 +581,37 @@ class _ResponseMaterialVarianceSemanticModel(_MaterialVarianceSemanticModel):
         )
 
 
+class _IndirectRequestSemanticModel(_ResponseMaterialVarianceSemanticModel):
+    async def deconstruct(
+        self,
+        record: InteractionRecord | UserInputRecord,
+        reference_frame: SemanticFrame | None = None,
+    ) -> SemanticFrame:
+        frame = await super().deconstruct(record, reference_frame)
+        if isinstance(record, InteractionRecord) or reference_frame is not None:
+            return frame
+        return frame.model_copy(
+            update={
+                "request_units": (
+                    RequestUnit(
+                        id="create-request",
+                        evidence=(
+                            EvidenceReference(
+                                source="input",
+                                json_pointer="/raw_input",
+                                text_quote="Create record 42",
+                            ),
+                        ),
+                        confidence=1,
+                        status="explicit",
+                        mode="act",
+                        predicate="create_record",
+                    ),
+                )
+            }
+        )
+
+
 class _MaterialVarianceJudge:
     label = "material_variance:grounded_argument_changed"
     score = 1
@@ -1372,6 +1403,77 @@ def test_public_cli_does_not_let_judge_suppress_removed_committed_action(
     assert comparison["material_variance"]["decision"] == "material_variance"
     assert comparison["material_variance"]["reason_code"] == "action_removed"
     assert saved["technical_details"]["semantic_calls"]["actual_calls"] == 0
+
+    report = runner.invoke(root_app, ["dataset", "report", str(output)])
+
+    assert report.exit_code == 0, report.output
+    assert "ACTION REQUIRED" in report.output
+    assert "consequential=1" in report.output
+
+
+def test_public_cli_discovers_agent_failure_on_indirect_request(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    dataset = tmp_path / "interactions.jsonl"
+    output = tmp_path / "results.jsonl"
+    dataset.write_text(
+        '{"id":"case-1","input":"Create record 42.",'
+        '"output":{"answer":[],"actions":[{"action":"CREATE_RECORD","id":42}]} }\n',
+        encoding="utf-8",
+    )
+    (tmp_path / "customer_agent.py").write_text(
+        "def run(value):\n"
+        "    actions = ([{'action': 'CREATE_RECORD', 'id': 42}] "
+        "if value == 'Create record 42.' else [])\n"
+        "    return {'answer': [], 'actions': actions}\n",
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("UL_LIVE", "true")
+    monkeypatch.setenv("OPEN_ROUTER_API_KEY", "test-key")
+
+    async def successful_preflight(_settings: object) -> object:
+        return _evaluator_preflight()
+
+    semantic_model = _IndirectRequestSemanticModel()
+    monkeypatch.setattr(preparation_module, "load_dataset_semantic_settings", _settings)
+    monkeypatch.setattr(execution_module, "preflight_evaluator", successful_preflight)
+    monkeypatch.setattr(
+        runner_module,
+        "create_semantic_model_deconstructor",
+        lambda _settings: semantic_model,
+    )
+    target = resolve_local_target("customer_agent:run")
+
+    evaluated = runner.invoke(
+        root_app,
+        [
+            "dataset",
+            "evaluate",
+            str(dataset),
+            "--operator",
+            "input.behavior.indirect_request",
+            "--target",
+            "customer_agent:run",
+            "--confirm-target",
+            target.confirmation_sha256,
+            "--confirm-test-environment",
+            "--repetitions",
+            "1",
+            "--output",
+            str(output),
+        ],
+    )
+
+    assert evaluated.exit_code == 1, evaluated.output
+    saved = json.loads(output.read_text(encoding="utf-8").splitlines()[1])
+    comparison = saved["cases"][0]
+    assert comparison["augmented_input"] == "Could you please create record 42?"
+    assert comparison["material_variance"]["decision"] == "material_variance"
+    assert comparison["material_variance"]["reason_code"] == "action_removed"
+    assert semantic_model.deconstructed_records
+    assert semantic_model.deconstructed_records[0].raw_input == "Create record 42."
 
     report = runner.invoke(root_app, ["dataset", "report", str(output)])
 
