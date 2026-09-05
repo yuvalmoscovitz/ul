@@ -101,6 +101,25 @@ type SemanticElementCollection = Literal[
     "communication_acts",
     "outcomes",
 ]
+_REQUEST_UNIT_STATUSES = ("explicit", "unresolved")
+_SEMANTIC_FACTOR_STATUSES = ("explicit", "superseded", "unresolved")
+_SEMANTIC_RELATION_STATUSES = ("explicit", "unresolved")
+_COMMUNICATION_ACT_STATUSES = ("explicit", "unresolved")
+_OBSERVED_OUTCOME_STATUSES = ("observed", "unresolved")
+_REQUEST_MODES = ("act", "ask", "inform")
+_COMMUNICATION_ACT_KINDS = (
+    "typing_noise",
+    "grammar_error",
+    "fragmented_syntax",
+    "repetition",
+    "terse",
+    "verbose",
+    "frustrated",
+    "angry",
+    "argumentative",
+    "self_correction",
+)
+_OBSERVED_OUTCOME_KINDS = ("action", "answer")
 type SemanticGroundingReason = Literal[
     "outcome_for_input_only_record",
     "observed_outcome_missing",
@@ -211,19 +230,77 @@ def _semantic_frame_response_schema(*, observed_output_present: bool) -> dict[st
         required = cast(list[str], definition["required"])
         if "evidence" not in required:
             required.append("evidence")
+    closed_fields = {
+        "RequestUnit": {
+            "status": _REQUEST_UNIT_STATUSES,
+            "mode": _REQUEST_MODES,
+        },
+        "SemanticFactor": {"status": _SEMANTIC_FACTOR_STATUSES},
+        "SemanticRelation": {"status": _SEMANTIC_RELATION_STATUSES},
+        "CommunicationAct": {
+            "status": _COMMUNICATION_ACT_STATUSES,
+            "kind": _COMMUNICATION_ACT_KINDS,
+        },
+        "ObservedOutcome": {
+            "status": _OBSERVED_OUTCOME_STATUSES,
+            "kind": _OBSERVED_OUTCOME_KINDS,
+        },
+    }
+    for definition_name, fields in closed_fields.items():
+        properties = cast(dict[str, dict[str, Any]], definitions[definition_name]["properties"])
+        for field_name, choices in fields.items():
+            properties[field_name]["enum"] = list(choices)
     if observed_output_present:
         properties = cast(dict[str, dict[str, Any]], schema["properties"])
         properties["outcomes"]["minItems"] = 1
         required = cast(list[str], schema.setdefault("required", []))
         if "outcomes" not in required:
             required.append("outcomes")
+    else:
+        properties = cast(dict[str, dict[str, Any]], schema["properties"])
+        properties["outcomes"]["maxItems"] = 0
     return schema
+
+
+def _validate_semantic_frame_vocabulary(frame: SemanticFrame) -> None:
+    collections = (
+        (
+            "request_units",
+            frame.request_units,
+            {"status": _REQUEST_UNIT_STATUSES, "mode": _REQUEST_MODES},
+        ),
+        ("factors", frame.factors, {"status": _SEMANTIC_FACTOR_STATUSES}),
+        ("relations", frame.relations, {"status": _SEMANTIC_RELATION_STATUSES}),
+        (
+            "communication_acts",
+            frame.communication_acts,
+            {"status": _COMMUNICATION_ACT_STATUSES, "kind": _COMMUNICATION_ACT_KINDS},
+        ),
+        (
+            "outcomes",
+            frame.outcomes,
+            {"status": _OBSERVED_OUTCOME_STATUSES, "kind": _OBSERVED_OUTCOME_KINDS},
+        ),
+    )
+    for collection_name, elements, fields in collections:
+        for index, element in enumerate(elements):
+            for field_name, choices in fields.items():
+                if getattr(element, field_name) not in choices:
+                    raise ValueError(
+                        f"{collection_name}[{index}].{field_name} is outside "
+                        "the semantic output contract"
+                    )
 
 
 def _semantic_deconstructor_identity(extractor_contract: str) -> SemanticDeconstructorIdentity:
     content = {
         "extractor_contract": extractor_contract,
-        "prompt_behavior_sha256": _PROMPTS.get_template_info("semantic.deconstruct").version,
+        "prompt_behavior_sha256": _canonical_json_sha256(
+            {
+                prompt_name: _PROMPTS.get_template_info(prompt_name).version
+                for prompt_name in ("semantic.deconstruct", "semantic.deconstruct_input")
+            }
+        ),
         "response_schema_sha256": _canonical_json_sha256(
             {
                 "input_only": _semantic_frame_response_schema(observed_output_present=False),
@@ -1136,6 +1213,9 @@ class SemanticModelDeconstructor:
             request_payload["reference_vocabulary"] = self._reference_vocabulary(reference_frame)
         untrusted_record = self._bounded_json(request_payload)
         role_config = self.llm_client.config.role_config("deconstruct")
+        prompt_name = (
+            "semantic.deconstruct" if observed_output is not None else "semantic.deconstruct_input"
+        )
         completion = await self._request(
             operation="deconstruct",
             role="deconstruct",
@@ -1147,7 +1227,7 @@ class SemanticModelDeconstructor:
                 observed_output_present=observed_output is not None
             ),
             strict_schema=True,
-            system_prompt=_PROMPTS.get_prompt("semantic.deconstruct"),
+            system_prompt=_PROMPTS.get_prompt(prompt_name),
             untrusted_payload=untrusted_record,
         )
         try:
@@ -1163,11 +1243,12 @@ class SemanticModelDeconstructor:
                             _EXTRACTOR_VERSION
                         ).model_dump(mode="json"),
                         "semantic_reasoning": role_config.reasoning_metadata(),
-                        "prompts": prompt_provenance("semantic.deconstruct"),
+                        "prompts": prompt_provenance(prompt_name),
                     },
                 }
             )
             frame = SemanticFrame.model_validate_json(json.dumps(raw_frame))
+            _validate_semantic_frame_vocabulary(frame)
         except (ValidationError, ValueError) as error:
             self._discard_cached_completion(completion)
             raise self._invalid_response(

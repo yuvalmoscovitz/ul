@@ -240,7 +240,7 @@ from ul.dataset_evaluation import (
     MaterialVarianceDecision,
     MaterialVarianceEvidence,
     MaterialVarianceReasonCode,
-    ProjectedResponseSemanticDeconstructor,
+    ReturnedResponseSemanticDeconstructor,
 )
 from ul.dataset_invariants import (
     DatasetInvariantArmEvaluation,
@@ -648,7 +648,6 @@ __all__ = [
     "ProductionObservation",
     "ProductionSource",
     "ProductionSourcePage",
-    "ProjectedResponseSemanticDeconstructor",
     "ProjectionContract",
     "ProjectionTarget",
     "ProjectionTargetOperation",
@@ -671,6 +670,7 @@ __all__ = [
     "RetryAfterSuccessfulCommitCase",
     "RetryAfterSuccessfulCommitStressPlan",
     "RetryAfterSuccessfulCommitStressResult",
+    "ReturnedResponseSemanticDeconstructor",
     "RichInteractionCase",
     "RubricEvaluator",
     "SafeFindingAnnotation",

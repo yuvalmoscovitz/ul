@@ -26,7 +26,7 @@ from ul.dataset_evaluation import (
     DatasetTrialUnit,
     MaterialVarianceAssessment,
     MaterialVarianceEvidence,
-    ProjectedResponseSemanticDeconstructor,
+    ReturnedResponseSemanticDeconstructor,
 )
 from ul.dataset_evaluation import DatasetEvaluationRunner as _DatasetEvaluationRunner
 from ul.deconstruction import OpenRouterDatasetSettings, create_semantic_model_deconstructor
@@ -1062,6 +1062,7 @@ async def test_repetition_benchmark_reduces_semantic_calls_without_changing_find
             for position, action in raw_actions.items()
         )
         frame_payload = _frame("untrusted", outcomes).model_dump(mode="json")
+        frame_payload["communication_acts"] = []
         raw_input = cast(str, request_payload["raw_input"])
         for collection_name in ("request_units", "factors", "communication_acts"):
             collection = cast(list[dict[str, object]], frame_payload[collection_name])
@@ -1995,7 +1996,7 @@ async def test_declared_projection_compares_recorded_and_fresh_responses() -> No
         }
     )
     semantic_pipeline = DeterministicSemanticPipeline(())
-    projected_deconstructor = ProjectedResponseSemanticDeconstructor(semantic_pipeline)
+    projected_deconstructor = ReturnedResponseSemanticDeconstructor(semantic_pipeline)
     target = DeterministicEnvironment(
         raw_output={"action": "record_observation", "patient": "123"},
         baseline_raw_output={"action": "record_observation", "patient": "123"},
@@ -2042,7 +2043,7 @@ async def test_declared_projection_accepts_bounded_action_arrays_from_source_and
     projected_response = {"actions": actions}
     source = _source().model_copy(update={"raw_observed_output": projected_response})
     semantic_pipeline = DeterministicSemanticPipeline(())
-    projected_deconstructor = ProjectedResponseSemanticDeconstructor(semantic_pipeline)
+    projected_deconstructor = ReturnedResponseSemanticDeconstructor(semantic_pipeline)
     target = DeterministicEnvironment(
         raw_output=projected_response,
         baseline_raw_output=projected_response,
@@ -2073,7 +2074,7 @@ async def test_declared_projection_accepts_bounded_action_arrays_from_source_and
 async def test_invalid_recorded_projection_fails_before_target_delivery() -> None:
     projection = OutcomeProjection(complete_result="/missing")
     semantic_pipeline = DeterministicSemanticPipeline(())
-    projected_deconstructor = ProjectedResponseSemanticDeconstructor(semantic_pipeline)
+    projected_deconstructor = ReturnedResponseSemanticDeconstructor(semantic_pipeline)
     target = DeterministicEnvironment()
     runner = DatasetEvaluationRunner(
         DatasetAugmentationEngine(projected_deconstructor, semantic_pipeline),
@@ -2797,7 +2798,10 @@ async def test_runner_compares_answer_only_responses_without_action_authority() 
     assert result.cases[0].findings == (
         DatasetEvaluationFinding(
             category="changed_response",
-            message=("Needs review: the augmented input produced a different observed response."),
+            message=(
+                "Needs review: the augmented input produced a different observed response at "
+                "/answer."
+            ),
             expected_effects=expected_response,
             observed_effects=observed_response,
         ),

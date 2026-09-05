@@ -124,6 +124,8 @@ async def test_material_variance_judge_persists_closed_local_decision() -> None:
     )
     assert "private-sentinel" not in repr(assessment)
     assert evaluator.actual_calls == 1
+    assert "material_variance:grounded_argument_changed" in judge.requests[0].allowed_labels
+    assert judge.requests[0].label_scores["material_variance:grounded_argument_changed"] == 1
     answer = judge.requests[0].payload["answer"]
     assert answer == {
         "comparison_surface": "action",
@@ -439,11 +441,11 @@ async def test_material_variance_judge_keeps_unknown_actions_and_business_fields
 
 
 async def test_material_variance_judge_fails_closed_on_invalid_or_failed_judgment() -> None:
-    invalid_score = RecordingJudge(_decision("operationally_equivalent:same_real_world_effect", 1))
+    invalid_label = RecordingJudge(_decision("unsupported", 1))
     failed = RecordingJudge(RuntimeError("private-provider-body"))
 
     invalid_assessment = await DatasetMaterialVarianceJudge(
-        invalid_score, max_input_chars=50_000
+        invalid_label, max_input_chars=50_000
     ).evaluate("action", (_finding(),))
     failed_assessment = await DatasetMaterialVarianceJudge(failed, max_input_chars=50_000).evaluate(
         "action", (_finding(),)

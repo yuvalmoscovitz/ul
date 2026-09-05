@@ -234,7 +234,7 @@ def frame_payload() -> dict[str, object]:
                     }
                 ],
                 "confidence": 1,
-                "status": "explicit",
+                "status": "observed",
                 "request_unit_ids": ["request-1"],
                 "position": 0,
                 "kind": "action",
@@ -756,6 +756,49 @@ async def test_deconstruct_sends_one_bounded_strict_structured_request() -> None
             definition = body["response_format"]["json_schema"]["schema"]["$defs"][definition_name]
             assert "evidence" in definition["required"]
             assert definition["properties"]["evidence"]["minItems"] == 1
+        definitions = body["response_format"]["json_schema"]["schema"]["$defs"]
+        assert definitions["RequestUnit"]["properties"]["mode"]["enum"] == [
+            "act",
+            "ask",
+            "inform",
+        ]
+        assert definitions["RequestUnit"]["properties"]["status"]["enum"] == [
+            "explicit",
+            "unresolved",
+        ]
+        assert definitions["SemanticFactor"]["properties"]["status"]["enum"] == [
+            "explicit",
+            "superseded",
+            "unresolved",
+        ]
+        assert definitions["SemanticRelation"]["properties"]["status"]["enum"] == [
+            "explicit",
+            "unresolved",
+        ]
+        assert definitions["CommunicationAct"]["properties"]["kind"]["enum"] == [
+            "typing_noise",
+            "grammar_error",
+            "fragmented_syntax",
+            "repetition",
+            "terse",
+            "verbose",
+            "frustrated",
+            "angry",
+            "argumentative",
+            "self_correction",
+        ]
+        assert definitions["CommunicationAct"]["properties"]["status"]["enum"] == [
+            "explicit",
+            "unresolved",
+        ]
+        assert definitions["ObservedOutcome"]["properties"]["kind"]["enum"] == [
+            "action",
+            "answer",
+        ]
+        assert definitions["ObservedOutcome"]["properties"]["status"]["enum"] == [
+            "observed",
+            "unresolved",
+        ]
         assert [message["role"] for message in body["messages"]] == ["system", "user"]
         assert "fragmented_syntax" in body["messages"][0]["content"]
         assert "frustrated" in body["messages"][0]["content"]
@@ -768,10 +811,9 @@ async def test_deconstruct_sends_one_bounded_strict_structured_request() -> None
         assert "provisional-then-repaired order" in body["messages"][0]["content"]
         assert "exact surface mention" in body["messages"][0]["content"]
         assert "Do not classify alternatives or choices" in body["messages"][0]["content"]
-        assert "action for a visible executed action or effect" in body["messages"][0]["content"]
-        assert "answer for a textual answer" in body["messages"][0]["content"]
-        assert "set its status to observed" in body["messages"][0]["content"]
-        assert "empty outcome list is invalid" in body["messages"][0]["content"]
+        assert "An action is a visible executed action or effect" in body["messages"][0]["content"]
+        assert "an answer is returned information" in body["messages"][0]["content"]
+        assert "Mark a visible outcome observed" in body["messages"][0]["content"]
         assert "sensitive or high risk" in body["messages"][0]["content"]
         assert "A field is also grounded" in body["messages"][0]["content"]
         assert "complete action object is also valid" in body["messages"][0]["content"]
@@ -1065,6 +1107,21 @@ async def test_provider_cannot_persist_a_reflected_endpoint_url() -> None:
     await client.aclose()
 
 
+async def test_deconstruct_rejects_a_closed_value_outside_the_response_schema() -> None:
+    invalid_frame = frame_payload()
+    request_unit = cast(list[dict[str, object]], invalid_frame["request_units"])[0]
+    request_unit["mode"] = "execute"
+    client = mock_client(lambda request: completion(json.dumps(invalid_frame)))
+
+    async with create_semantic_model_deconstructor(settings(), client=client) as deconstructor:
+        with pytest.raises(ProviderDiagnosticError) as error:
+            await deconstructor.deconstruct(interaction())
+
+    assert error.value.diagnostic.category == "invalid_response"
+    assert "execute" not in str(error.value)
+    await client.aclose()
+
+
 @pytest.mark.parametrize(
     ("field_name", "field_value"),
     [
@@ -1195,7 +1252,7 @@ async def test_render_keeps_caller_instruction_out_of_the_system_prompt() -> Non
         )
         assert "real person" in body["messages"][0]["content"]
         assert "not polished benchmark text" in body["messages"][0]["content"]
-        assert '{"rendered_input":"<rewritten user input>"}' in body["messages"][0]["content"]
+        assert '{"rendered_input"' not in body["messages"][0]["content"]
         assert "No temporary or alternate value may be introduced" in body["messages"][0]["content"]
         assert (
             "Trusted structured self-correction mode is enabled"
@@ -1596,14 +1653,17 @@ async def test_deconstruct_supports_input_only_candidate_validation() -> None:
 
     def handler(request: httpx.Request) -> httpx.Response:
         body = json.loads(request.content)
-        assert "leave outcomes empty" in body["messages"][0]["content"]
+        assert "smallest frame" in body["messages"][0]["content"]
         assert (
-            "minItems"
-            not in body["response_format"]["json_schema"]["schema"]["properties"]["outcomes"]
+            "keep communication factor_ids and attributes empty" in body["messages"][0]["content"]
         )
-        assert "outcomes" not in body["response_format"]["json_schema"]["schema"].get(
-            "required", []
-        )
+        schema = body["response_format"]["json_schema"]["schema"]
+        assert schema["properties"]["outcomes"]["maxItems"] == 0
+        assert "outcomes" not in schema.get("required", [])
+        assert schema["$defs"]["RequestUnit"]["properties"]["status"]["enum"] == [
+            "explicit",
+            "unresolved",
+        ]
         supplied_record = json.loads(body["messages"][1]["content"])
         assert supplied_record["raw_observed_output"] is None
         assert supplied_record["reference_vocabulary"] == {
@@ -1647,6 +1707,7 @@ async def test_deconstruct_supports_input_only_candidate_validation() -> None:
         frame = await deconstructor.deconstruct(input_only_record, reference_frame)
 
     assert frame.outcomes == ()
+    assert frame.metadata["prompts"] == prompt_provenance("semantic.deconstruct_input")
     await client.aclose()
 
 
@@ -1980,7 +2041,12 @@ async def test_deconstructor_identity_binds_extractor_prompt_and_response_schema
     baseline = semantic_deconstructor_identity(settings())
     assert baseline.extractor_contract == "semantic-deconstructor/2.2.0"
     assert baseline.prompt_behavior_sha256 == (
-        deconstruction_module._PROMPTS.get_template_info("semantic.deconstruct").version
+        deconstruction_module._canonical_json_sha256(
+            {
+                prompt_name: deconstruction_module._PROMPTS.get_template_info(prompt_name).version
+                for prompt_name in ("semantic.deconstruct", "semantic.deconstruct_input")
+            }
+        )
     )
     assert (
         len(
@@ -2002,7 +2068,7 @@ async def test_deconstructor_identity_binds_extractor_prompt_and_response_schema
 
     def changed_template_info(name: str):
         template_info = original_template_info(name)
-        if name == "semantic.deconstruct":
+        if name == "semantic.deconstruct_input":
             return template_info.__class__(
                 name=template_info.name,
                 description=template_info.description,
@@ -2015,7 +2081,7 @@ async def test_deconstructor_identity_binds_extractor_prompt_and_response_schema
 
     monkeypatch.setattr(deconstruction_module._PROMPTS, "get_template_info", changed_template_info)
     changed_prompt = semantic_deconstructor_identity(settings())
-    assert changed_prompt.prompt_behavior_sha256 == "a" * 64
+    assert changed_prompt.prompt_behavior_sha256 != baseline.prompt_behavior_sha256
     assert changed_prompt.identity_sha256 != baseline.identity_sha256
     monkeypatch.undo()
 
@@ -2029,7 +2095,12 @@ async def test_deconstructor_identity_binds_extractor_prompt_and_response_schema
                 "properties": {"outcomes": {"type": "array"}},
                 "$defs": {
                     name: {
-                        "properties": {"evidence": {"type": "array"}},
+                        "properties": {
+                            "evidence": {"type": "array"},
+                            "status": {"type": "string"},
+                            "mode": {"type": "string"},
+                            "kind": {"type": "string"},
+                        },
                         "required": [],
                     }
                     for name in (
