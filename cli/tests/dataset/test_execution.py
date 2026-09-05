@@ -1275,6 +1275,27 @@ def test_declared_projection_compares_raw_recorded_tool_calls_through_public_cli
     monkeypatch.setenv("OPEN_ROUTER_API_KEY", "test-key")
 
     class ProjectedResponseSemanticModel(_LocalEvaluationSemanticModel):
+        async def deconstruct(
+            self,
+            record: InteractionRecord | UserInputRecord,
+            reference_frame: SemanticFrame | None = None,
+        ) -> SemanticFrame:
+            frame = await super().deconstruct(record, reference_frame)
+            if isinstance(record, InteractionRecord) or record.id == "case-1":
+                return frame
+            request_unit = frame.request_units[0].model_copy(
+                update={
+                    "evidence": (
+                        EvidenceReference(
+                            source="input",
+                            json_pointer="/raw_input",
+                            text_quote=record.raw_input,
+                        ),
+                    )
+                }
+            )
+            return frame.model_copy(update={"request_units": (request_unit,)})
+
         async def render(
             self,
             raw_input: str,
@@ -1327,6 +1348,15 @@ def test_declared_projection_compares_raw_recorded_tool_calls_through_public_cli
         "action": "lookup",
         "ticket": 42,
     }
+    assert [record.id for record in semantic_model.deconstructed_records] == [
+        "case-1",
+        "case-1:input.surface.typing_noise",
+    ]
+    variation = details["cases"][0]
+    variation_request = variation["trial_set"]["trials"][0]["observed_frame"]["request_units"][0]
+    augmented_record = semantic_model.deconstructed_records[1]
+    assert isinstance(augmented_record, UserInputRecord)
+    assert variation_request["evidence"][0]["text_quote"] == augmented_record.raw_input
 
 
 def test_local_target_pause_action_preserves_binding_and_resumes(
