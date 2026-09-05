@@ -10,6 +10,7 @@ import stat
 import sys
 import tempfile
 import unicodedata
+from collections import Counter
 from collections.abc import Callable, Generator, Iterable
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass
@@ -58,7 +59,11 @@ from ul.dataset_regression import dataset_regression_target_config_sha256
 from ul.environment import validate_outcome_projection_evidence
 from ul.http_environment import JsonHttpIsolatedResponseConfig, JsonHttpTargetConfig
 from ul.llm import LLMClientIdentity
-from ul.material_variance import response_materiality_action_count
+from ul.material_variance import (
+    response_materiality_action_count,
+    response_materiality_action_name,
+    response_materiality_committed_actions,
+)
 from ul.outcome_projection import OutcomeProjection
 from ul_core.augmentations.definitions import builtin_augmentation_catalog
 
@@ -219,6 +224,54 @@ def _response_action_count_summary(finding: _Finding) -> str | None:
         f"{variation_item_count} after the test variation "
         f"({abs(item_count_delta)} {direction})."
     )
+
+
+def _sensitive_response_action_difference_lines(finding: _Finding) -> tuple[str, ...]:
+    if len(finding.reference_effects) != 1 or len(finding.observed_effects) != 1:
+        return ()
+    original_actions = response_materiality_committed_actions(finding.reference_effects[0].fields)
+    variation_actions = response_materiality_committed_actions(finding.observed_effects[0].fields)
+    if original_actions is None or variation_actions is None:
+        return ()
+
+    def action_key(action: JsonValue) -> str:
+        return json.dumps(action, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+
+    original_keys = Counter(action_key(action) for action in original_actions)
+    variation_keys = Counter(action_key(action) for action in variation_actions)
+    unchanged = original_keys & variation_keys
+    original_keys -= unchanged
+    variation_keys -= unchanged
+    action_names = {
+        action_key(action): response_materiality_action_name(action)
+        for action in (*original_actions, *variation_actions)
+    }
+
+    def count_names(action_keys: Counter[str]) -> Counter[str | None]:
+        counts: Counter[str | None] = Counter()
+        for key, count in action_keys.items():
+            counts[action_names[key]] += count
+        return counts
+
+    original_names = count_names(original_keys)
+    variation_names = count_names(variation_keys)
+    changed_names = original_names & variation_names
+    changed_names.pop(None, None)
+    original_names -= changed_names
+    variation_names -= changed_names
+    lines: list[str] = []
+    for change, names in (
+        ("changed", changed_names),
+        ("removed", original_names),
+        ("added", variation_names),
+    ):
+        for name, count in sorted(names.items(), key=lambda item: (item[0] is None, item[0] or "")):
+            count_suffix = f" ({count} occurrences)" if count > 1 else ""
+            lines.append(
+                f"{change.capitalize()} committed action{count_suffix}: "
+                f"{name or '(unnamed action)'}"
+            )
+    return tuple(lines)
 
 
 class _OutcomeGroup(_StrictModel):
@@ -3487,6 +3540,12 @@ def _bounded_sensitive_semantic_lines(
     finding = indexed_finding.semantic_finding
     if finding is None:
         raise AssertionError("semantic disclosure requires a semantic finding")
+    action_difference_lines = (
+        _sensitive_response_action_difference_lines(finding)
+        if indexed_finding.case.material_variance is not None
+        and indexed_finding.case.material_variance.reason_code == "action_count_changed"
+        else ()
+    )
     return _bounded_sensitive_lines(
         (
             _sensitive_json_line(
@@ -3496,13 +3555,29 @@ def _bounded_sensitive_semantic_lines(
             _sensitive_json_line(
                 "Variation input", {"value": indexed_finding.case.augmented_input}
             ),
-            _sensitive_json_line(
-                "Reference effects",
-                {"value": [effect.model_dump(mode="json") for effect in finding.reference_effects]},
-            ),
-            _sensitive_json_line(
-                "Observed effects",
-                {"value": [effect.model_dump(mode="json") for effect in finding.observed_effects]},
+            *(
+                action_difference_lines
+                if action_difference_lines
+                else (
+                    _sensitive_json_line(
+                        "Reference effects",
+                        {
+                            "value": [
+                                effect.model_dump(mode="json")
+                                for effect in finding.reference_effects
+                            ]
+                        },
+                    ),
+                    _sensitive_json_line(
+                        "Observed effects",
+                        {
+                            "value": [
+                                effect.model_dump(mode="json")
+                                for effect in finding.observed_effects
+                            ]
+                        },
+                    ),
+                )
             ),
         )
     )

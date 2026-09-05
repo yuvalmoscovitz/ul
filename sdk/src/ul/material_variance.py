@@ -282,10 +282,26 @@ def _normalized_response_fields(fields: dict[str, JsonValue]) -> dict[str, JsonV
 
 
 def response_materiality_action_count(fields: dict[str, JsonValue]) -> int | None:
-    committed_action_count = _normalized_response_fields(fields).get("committed_action_count")
-    if type(committed_action_count) is not int or committed_action_count < 0:
+    committed_actions = response_materiality_committed_actions(fields)
+    if committed_actions is None:
         return None
-    return committed_action_count
+    return len(committed_actions)
+
+
+def response_materiality_committed_actions(
+    fields: dict[str, JsonValue],
+) -> tuple[JsonValue, ...] | None:
+    committed_actions = _normalized_response_fields(fields).get("committed_actions")
+    if not isinstance(committed_actions, list):
+        return None
+    return tuple(committed_actions)
+
+
+def response_materiality_action_name(action: JsonValue) -> str | None:
+    if not isinstance(action, dict):
+        return None
+    action_name = action.get("action", action.get("name"))
+    return action_name if isinstance(action_name, str) and action_name else None
 
 
 def _is_empty_answer(answer: JsonValue) -> bool:
@@ -299,10 +315,8 @@ def _is_empty_answer(answer: JsonValue) -> bool:
 
 
 def _is_read_only_action(action: JsonValue) -> bool:
-    if not isinstance(action, dict):
-        return False
-    action_name = action.get("action", action.get("name"))
-    if not isinstance(action_name, str):
+    action_name = response_materiality_action_name(action)
+    if action_name is None:
         return False
     separated_name = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", action_name)
     tokens = set(re.findall(r"[A-Za-z]+", separated_name.upper()))

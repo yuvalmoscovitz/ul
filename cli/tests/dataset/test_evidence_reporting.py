@@ -126,8 +126,9 @@ def test_dataset_report_explains_array_count_change_without_disclosing_values(
     original_value = {
         "answer": "",
         "actions": [
-            {"action": "POST private-operation-one-canary"},
-            {"action": "PUT private-operation-two-canary"},
+            {"action": "POST remove-message-canary"},
+            {"action": "DELETE remove-record-canary"},
+            {"action": "PUT update-record-canary", "body": {"amount": 1}},
         ],
         "private-diagnostics-canary": list(range(100)),
     }
@@ -135,7 +136,8 @@ def test_dataset_report_explains_array_count_change_without_disclosing_values(
         "answer": "",
         "actions": [
             {"action": "GET private-read-only-operation-canary"},
-            {"action": "PUT private-variation-operation-canary"},
+            {"action": "PUT update-record-canary", "body": {"amount": 2}},
+            {"action": "PATCH add-record-canary"},
         ],
         "private-diagnostics-canary": [],
     }
@@ -231,18 +233,42 @@ def test_dataset_report_explains_array_count_change_without_disclosing_values(
     assert report.exit_code == 0, report.output
     normalized_report = " ".join(_ANSI_ESCAPE_PATTERN.sub("", report.output).split())
     assert (
-        "What changed: The agent made 2 committed actions for the original response and 1 after "
+        "What changed: The agent made 3 committed actions for the original response and 2 after "
         "the test variation (1 fewer)."
     ) in normalized_report
     for private_canary in (
         "private-input-canary",
         "private-diagnostics-canary",
-        "private-operation-one-canary",
-        "private-operation-two-canary",
+        "remove-message-canary",
+        "remove-record-canary",
         "private-read-only-operation-canary",
-        "private-variation-operation-canary",
+        "update-record-canary",
+        "add-record-canary",
     ):
         assert private_canary not in normalized_report
+
+    finding_id = cast(dict[str, Any], cast(list[Any], record["cases"])[0])["findings"][0][
+        "finding_id"
+    ]
+    private_report = runner.invoke(
+        root_app,
+        [
+            "dataset",
+            "report",
+            str(evidence_path),
+            "--finding",
+            finding_id,
+            "--show-sensitive-values",
+        ],
+    )
+
+    assert private_report.exit_code == 0, private_report.output
+    assert "Changed committed action: PUT update-record-canary" in private_report.output
+    assert "Removed committed action: DELETE remove-record-canary" in private_report.output
+    assert "Removed committed action: POST remove-message-canary" in private_report.output
+    assert "Added committed action: PATCH add-record-canary" in private_report.output
+    assert "private-read-only-operation-canary" not in private_report.output
+    assert "private-diagnostics-canary" not in private_report.output
 
 
 @pytest.mark.parametrize(
