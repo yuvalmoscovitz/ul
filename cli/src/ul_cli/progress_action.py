@@ -109,13 +109,14 @@ def _validate_action_argv(
             raise ValueError("progress action path is invalid")
         if action_kind == "dataset_diagnose" and argv[-1] != "--dry-run":
             raise ValueError("dataset diagnosis must be a dry run")
-        if action_kind == "dataset_resume":
+        if action_kind in {"dataset_resume", "dataset_diagnose"}:
             value_options = {"--target", "--confirm-target", "--target-artifact"}
             seen_bound_options: set[str] = set()
             index = len(prefix) + 1
-            while index < len(argv):
+            options_end = len(argv) - (action_kind == "dataset_diagnose")
+            while index < options_end:
                 option = argv[index]
-                if option not in value_options or index + 1 >= len(argv):
+                if option not in value_options or index + 1 >= options_end:
                     raise ValueError("dataset resume contains an unsupported option")
                 if argv[index + 1].startswith("--"):
                     raise ValueError("dataset resume option is missing its value")

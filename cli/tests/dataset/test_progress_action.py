@@ -57,14 +57,7 @@ def test_dataset_terminal_actions_are_opaque_private_and_executable(
         ),
         "cancelled": (
             "diagnose",
-            (
-                "ul",
-                "dataset",
-                "evaluate",
-                "--resume",
-                str(evidence_path.resolve()),
-                "--dry-run",
-            ),
+            (*local_resume_argv, "--dry-run"),
         ),
         "completed": (
             "inspect_findings",
