@@ -605,14 +605,7 @@ def create_campaign_next_commands(
             action="diagnose",
             argv=create_progress_action(
                 "dataset_diagnose",
-                (
-                    "ul",
-                    "dataset",
-                    "evaluate",
-                    "--resume",
-                    str(resolved_evidence_path),
-                    "--dry-run",
-                ),
+                (*effective_resume_argv, "--dry-run"),
             ),
         ),
     )
