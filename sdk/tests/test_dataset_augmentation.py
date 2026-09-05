@@ -687,6 +687,8 @@ async def test_engine_skips_semantically_ambiguous_nodes() -> None:
     result = await DatasetAugmentationEngine(model, model).augment((record,))
 
     assert result.candidates == ()
+    assert result.skips[0].reason_code == "ambiguous_source_semantics"
+    assert result.skips[0].next_action == "Review the datapoint's ambiguous semantic evidence."
     assert result.skips[0].reason == (
         "Source factors 'source:amount' and 'duplicate-amount' have indistinguishable semantics; "
         "clarify their evidence or roles."
@@ -853,6 +855,7 @@ async def test_engine_skips_unresolved_source_and_rejects_unresolved_candidate()
     skipped = await DatasetAugmentationEngine(source_model, source_model).augment((record,))
 
     assert skipped.candidates == ()
+    assert skipped.skips[0].reason_code == "unresolved_source_semantics"
     assert skipped.skips[0].reason == (
         "Source factor 'source:amount' is unresolved; clarify its evidence or improve semantic "
         "extraction."
@@ -2728,6 +2731,8 @@ async def test_punctuation_noise_skips_when_every_insertion_point_is_protected()
 
     assert result.candidates == ()
     assert len(result.skips) == 1
+    assert result.skips[0].reason_code == "operator_not_applicable"
+    assert result.skips[0].next_action.startswith("Choose another augmentation")
     assert "outside a protected semantic value" in result.skips[0].reason
 
 

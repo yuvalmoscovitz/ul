@@ -19,7 +19,7 @@ from ul_cli.finding_reference import FindingReferenceContext, resolve_finding_re
 
 from ..presentation.evaluation import (
     dataset_invariant_exit_code,
-    dataset_result_exit_code,
+    dataset_results_exit_code,
     print_dataset_results,
     result_needs_review,
 )
@@ -179,6 +179,8 @@ def report_completed_resume(
         raise typer.Exit(code=1)
     if resume_evidence.has_inconclusive_materiality or failure_count:
         raise typer.Exit(code=2)
+    if dataset_results_exit_code(resume_evidence.technical_results):
+        raise typer.Exit(code=2)
     raise typer.Exit(code=0)
 
 
@@ -222,11 +224,7 @@ def report_campaign_results(
     if invariant_exit_code:
         raise typer.Exit(code=invariant_exit_code)
     all_results = (*(prior.technical_results if prior is not None else ()), *results)
-    semantic_exit_code = max(
-        (dataset_result_exit_code(result) for result in all_results),
-        default=0,
-        key=lambda code: {0: 0, 2: 1, 1: 2}[code],
-    )
+    semantic_exit_code = dataset_results_exit_code(all_results)
     if semantic_exit_code:
         raise typer.Exit(code=semantic_exit_code)
     if all_failures:

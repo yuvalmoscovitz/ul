@@ -50,6 +50,7 @@ from ul_cli.http_target_resolution import (
 )
 from ul_cli.local_target_resolution import resolve_local_target
 from ul_cli.main import app as root_app
+from ul_cli.pattern_identity import ensure_project_pattern_identity_key
 from ul_core.dataset import (
     EvidenceReference,
     ObservedOutcome,
@@ -420,6 +421,97 @@ class _DistinctlyGroundedMultiActionSemanticModel(_LocalEvaluationSemanticModel)
         del raw_input, instruction, allow_temporary_value
         return RenderedUserInput(
             text="vendor payments: review pending bills email the vendor update Status to Processing"
+        )
+
+
+class _MixedApplicabilitySemanticModel(_LocalEvaluationSemanticModel):
+    async def deconstruct(
+        self,
+        record: InteractionRecord | UserInputRecord,
+        reference_frame: SemanticFrame | None = None,
+    ) -> SemanticFrame:
+        if not isinstance(record, InteractionRecord) and reference_frame is not None:
+            return reference_frame.model_copy(update={"interaction_id": record.id, "outcomes": ()})
+        is_transfer = record.id.startswith("transfer-funds")
+        factors = (
+            (
+                SemanticFactor(
+                    id="amount",
+                    evidence=(
+                        EvidenceReference(
+                            source="input",
+                            json_pointer="/raw_input",
+                            text_quote="100",
+                        ),
+                    ),
+                    confidence=1,
+                    status="explicit",
+                    kind="numeric",
+                    role="amount",
+                    value=100,
+                ),
+            )
+            if is_transfer
+            else (
+                SemanticFactor(
+                    id="recipient",
+                    evidence=(
+                        EvidenceReference(
+                            source="input",
+                            json_pointer="/raw_input",
+                            text_quote="Alice",
+                        ),
+                    ),
+                    confidence=1,
+                    status="explicit",
+                    kind="entity",
+                    role="recipient",
+                    value="Alice",
+                ),
+            )
+        )
+        return SemanticFrame(
+            interaction_id=record.id,
+            request_units=(
+                RequestUnit(
+                    id="customer-request",
+                    evidence=(
+                        EvidenceReference(
+                            source="input",
+                            json_pointer="/raw_input",
+                            text_quote=None,
+                        ),
+                    ),
+                    confidence=1,
+                    status="explicit",
+                    mode="act",
+                    predicate="transfer" if is_transfer else "notify",
+                    factor_ids=tuple(factor.id for factor in factors),
+                ),
+            ),
+            factors=factors,
+            outcomes=(
+                ObservedOutcome(
+                    id="observed-action",
+                    evidence=(
+                        EvidenceReference(
+                            source="output",
+                            json_pointer="/raw_observed_output",
+                            text_quote=None,
+                        ),
+                    ),
+                    confidence=1,
+                    status="observed",
+                    request_unit_ids=("customer-request",),
+                    position=0,
+                    kind="action",
+                    predicate="transfer" if is_transfer else "notify",
+                    fields={"amount": 100} if is_transfer else {"recipient": "Alice"},
+                ),
+            )
+            if isinstance(record, InteractionRecord)
+            else (),
+            extractor_version="mixed-applicability-customer-experiment",
         )
 
 
@@ -900,6 +992,168 @@ def test_public_cli_augments_multi_action_request_with_distinctly_grounded_objec
     assert augmentation["candidates"][0]["passed"] is True
     evidence = json.loads(output.read_text(encoding="utf-8").splitlines()[1])
     assert len(evidence["cases"]) == 1
+
+
+def test_public_cli_reports_mixed_augmentation_coverage_to_the_customer(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    dataset = tmp_path / "interactions.jsonl"
+    output = tmp_path / "results.jsonl"
+    augmentations = tmp_path / "augmentations.jsonl"
+    records = (
+        {
+            "id": "transfer-funds",
+            "input": "Transfer 100 to Alice.",
+            "output": {"action": "transfer", "amount": 100, "recipient": "Alice"},
+        },
+        {
+            "id": "notify-recipient",
+            "input": "Alice",
+            "output": {"action": "notify", "recipient": "Alice"},
+        },
+    )
+    dataset.write_text(
+        "".join(f"{json.dumps(record)}\n" for record in records),
+        encoding="utf-8",
+    )
+    (tmp_path / "customer_agent.py").write_text(
+        "def run(value):\n"
+        "    if '100' in value:\n"
+        "        return {'action': 'transfer', 'amount': 100, 'recipient': 'Alice'}\n"
+        "    return {'action': 'notify', 'recipient': 'Alice'}\n",
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("UL_LIVE", "true")
+    monkeypatch.setenv("OPEN_ROUTER_API_KEY", "test-key")
+    semantic_model = _MixedApplicabilitySemanticModel()
+
+    async def successful_preflight(_settings: object) -> object:
+        return _evaluator_preflight()
+
+    monkeypatch.setattr(preparation_module, "load_dataset_semantic_settings", _settings)
+    monkeypatch.setattr(execution_module, "preflight_evaluator", successful_preflight)
+    monkeypatch.setattr(
+        runner_module,
+        "create_semantic_model_deconstructor",
+        lambda _settings: semantic_model,
+    )
+    target = resolve_local_target("customer_agent:run")
+
+    result = runner.invoke(
+        root_app,
+        [
+            "dataset",
+            "evaluate",
+            str(dataset),
+            "--operator",
+            "input.surface.punctuation_noise",
+            "--target",
+            "customer_agent:run",
+            "--confirm-target",
+            target.confirmation_sha256,
+            "--confirm-test-environment",
+            "--repetitions",
+            "1",
+            "--augmentations-output",
+            str(augmentations),
+            "--output",
+            str(output),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    normalized_output = " ".join(_ANSI_ESCAPE_PATTERN.sub("", result.output).split())
+    assert (
+        "Warning: input.surface.punctuation_noise skipped for 1 of 2 interactions"
+        in normalized_output
+    )
+    assert "1 variation compared across 2 interactions" in normalized_output
+    assert "binding" not in normalized_output.casefold()
+    saved_augmentations = tuple(
+        json.loads(line)["augmentation"]
+        for line in augmentations.read_text(encoding="utf-8").splitlines()
+    )
+    assert sum(len(item["candidates"]) for item in saved_augmentations) == 1
+    assert sum(len(item["skips"]) for item in saved_augmentations) == 1
+    assert saved_augmentations[1]["skips"][0]["reason_code"] == "operator_not_applicable"
+    assert len(output.read_text(encoding="utf-8").splitlines()) == 3
+
+    offline_report = runner.invoke(root_app, ["dataset", "report", str(output)])
+    assert offline_report.exit_code == 0, offline_report.output
+    normalized_report = " ".join(_ANSI_ESCAPE_PATTERN.sub("", offline_report.output).split())
+    assert "Augmentation coverage: selected=2, compared=1, rejected=0, skipped=1" in (
+        normalized_report
+    )
+    assert (
+        "Warning: input.surface.punctuation_noise skipped for 1 of 2 interactions"
+        in normalized_report
+    )
+
+    skipped_dataset = tmp_path / "skipped-interactions.jsonl"
+    skipped_output = tmp_path / "skipped-results.jsonl"
+    skipped_augmentations = tmp_path / "skipped-augmentations.jsonl"
+    skipped_dataset.write_text(f"{json.dumps(records[1])}\n", encoding="utf-8")
+    skipped_run = runner.invoke(
+        root_app,
+        [
+            "dataset",
+            "evaluate",
+            str(skipped_dataset),
+            "--operator",
+            "input.surface.punctuation_noise",
+            "--target",
+            "customer_agent:run",
+            "--confirm-target",
+            target.confirmation_sha256,
+            "--confirm-test-environment",
+            "--repetitions",
+            "1",
+            "--augmentations-output",
+            str(skipped_augmentations),
+            "--output",
+            str(skipped_output),
+        ],
+    )
+    assert skipped_run.exit_code == 2, skipped_run.output
+    normalized_skipped_run = " ".join(_ANSI_ESCAPE_PATTERN.sub("", skipped_run.output).split())
+    assert "0 variations compared across 1 interaction" in normalized_skipped_run
+    assert "skipped for 1 of 1 interactions" in normalized_skipped_run
+
+    skipped_report = runner.invoke(root_app, ["dataset", "report", str(skipped_output)])
+    assert skipped_report.exit_code == 0, skipped_report.output
+    normalized_skipped_report = " ".join(
+        _ANSI_ESCAPE_PATTERN.sub("", skipped_report.output).split()
+    )
+    assert "INCONCLUSIVE — no valid variations were evaluated" in normalized_skipped_report
+    assert "Augmentation coverage: selected=1, compared=0, rejected=0, skipped=1" in (
+        normalized_skipped_report
+    )
+    resumed_skipped_run = runner.invoke(
+        root_app,
+        [
+            "dataset",
+            "evaluate",
+            "--resume",
+            str(skipped_output),
+            "--operator",
+            "input.surface.punctuation_noise",
+            "--target",
+            "customer_agent:run",
+            "--confirm-target",
+            target.confirmation_sha256,
+        ],
+    )
+    assert resumed_skipped_run.exit_code == 2, resumed_skipped_run.output
+    assert "Nothing to do" in " ".join(resumed_skipped_run.output.split())
+
+    project_directory = tmp_path / ".ul"
+    project_directory.mkdir(mode=0o700)
+    ensure_project_pattern_identity_key(project_directory)
+    unified_skipped_report = runner.invoke(root_app, ["report", str(skipped_output), "--json"])
+    assert unified_skipped_report.exit_code == 2, unified_skipped_report.output
+    assert json.loads(unified_skipped_report.output)["review_status"] == "inconclusive"
 
 
 @pytest.mark.parametrize(

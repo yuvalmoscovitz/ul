@@ -76,8 +76,9 @@ def test_rich_evidence_builds_parses_and_reports_end_to_end(tmp_path: Path) -> N
     assert record["schema_version"] == "1.15.0"
     assert dataset_review.is_reportable_dataset_evidence(evidence_path) is True
     report = runner.invoke(root_app, ["report", str(evidence_path), "--json"])
-    assert report.exit_code == 0, report.output
+    assert report.exit_code == 2, report.output
     parsed_report = json.loads(report.output)
+    assert parsed_report["review_status"] == "inconclusive"
     assert parsed_report["evidence_schema_versions"] == ["1.15.0"]
     assert parsed_report["evaluation_mode"] == "variance"
 
@@ -371,6 +372,13 @@ def test_automatic_materiality_drives_evaluation_exit_code(
 
     assert presentation_module.dataset_result_exit_code(result) == expected_exit_code
     assert presentation_module.result_needs_review(result) is needs_review
+
+
+def test_rejected_only_augmentation_result_is_inconclusive() -> None:
+    result = _evaluation_result("rejected-only")
+
+    assert presentation_module.dataset_result_exit_code(result) == 2
+    assert presentation_module.dataset_results_exit_code((result,)) == 2
 
 
 def test_dataset_report_leads_with_actionable_summary_and_hides_private_values(
@@ -989,8 +997,10 @@ def test_pre_response_schema_action_and_answer_evidence_still_reports(tmp_path: 
 
     report = runner.invoke(root_app, ["report", str(evidence_path), "--json"])
 
-    assert report.exit_code == 0, report.output
-    assert json.loads(report.output)["evidence_schema_versions"] == ["1.13.0"]
+    assert report.exit_code == 2, report.output
+    parsed_report = json.loads(report.output)
+    assert parsed_report["review_status"] == "inconclusive"
+    assert parsed_report["evidence_schema_versions"] == ["1.13.0"]
     assert "private legacy answer" not in report.output
 
 
@@ -1401,8 +1411,9 @@ def test_unified_report_surfaces_response_only_scope_and_limitations(tmp_path: P
     json_report = runner.invoke(root_app, ["report", str(evidence), "--json"])
     human_report = runner.invoke(root_app, ["report", str(evidence)])
 
-    assert json_report.exit_code == 0, json_report.output
+    assert json_report.exit_code == 2, json_report.output
     parsed_report = json.loads(json_report.output)
+    assert parsed_report["review_status"] == "inconclusive"
     assert parsed_report["evaluation_mode"] == "variance"
     assert parsed_report["response_state_evidence_scope"] == "response_only"
     assert parsed_report["capability_limitations"] == [
@@ -1410,7 +1421,7 @@ def test_unified_report_surfaces_response_only_scope_and_limitations(tmp_path: P
         "conversation_replay",
         "state_observation",
     ]
-    assert human_report.exit_code == 0, human_report.output
+    assert human_report.exit_code == 2, human_report.output
     assert "Evaluation mode: variance" in human_report.output
     assert "Response/state evidence scope: response only" in human_report.output
     assert "Not verified: committed state, cleanup, or multi-turn conversations." in (
