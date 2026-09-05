@@ -497,6 +497,27 @@ def test_dataset_report_leads_with_actionable_summary_and_hides_private_values(
     assert "Sensitive value disclosure:" in private_drilldown.output
 
 
+def test_dataset_report_is_inconclusive_when_no_valid_variation_was_evaluated(
+    tmp_path: Path,
+) -> None:
+    result = _evaluation_result("report-discarded")
+    record = customer_module.build_customer_evidence_record(
+        result,
+        repetitions=1,
+        max_environment_api_calls=2,
+        planned_target_calls=1,
+    )
+    evidence_path = tmp_path / "discarded-report.jsonl"
+    evidence_path.write_text(json.dumps(record) + "\n", encoding="utf-8")
+
+    report = runner.invoke(root_app, ["dataset", "report", str(evidence_path)])
+
+    assert report.exit_code == 0, report.output
+    assert "Result: INCONCLUSIVE — no valid variations were evaluated" in report.output
+    assert "Semantic comparisons: total=1, completed=0" in report.output
+    assert "Result: CLEAR" not in report.output
+
+
 def test_equivalent_semantic_difference_does_not_suppress_invariant_violation(
     tmp_path: Path,
 ) -> None:
