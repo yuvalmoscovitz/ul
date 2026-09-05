@@ -18,7 +18,7 @@ def test_builtin_catalog_is_unique_sorted_and_immutable() -> None:
     catalog = builtin_augmentation_catalog()
     references = tuple((item.ref.id, item.ref.version) for item in catalog.list())
 
-    assert len(references) == 21
+    assert len(references) == 22
     assert references == tuple(sorted(references))
     assert len(references) == len(set(references))
     with pytest.raises(ValidationError, match="frozen"):
@@ -93,6 +93,7 @@ def test_dataset_applicability_contracts_are_discoverable_before_execution() -> 
     broad = catalog.get("input.surface.grammar_error")
     punctuation = catalog.get("input.surface.punctuation_noise")
     conditional = catalog.get("input.intent.self_correction")
+    indirect_request = catalog.get("input.behavior.indirect_request")
 
     assert broad.applicability_profile == "broad"
     assert "nonempty user input" in broad.applicability_rule
@@ -100,6 +101,8 @@ def test_dataset_applicability_contracts_are_discoverable_before_execution() -> 
     assert "protected semantic value" in punctuation.applicability_rule
     assert conditional.applicability_profile == "conditional"
     assert "numeric, monetary, date, or duration" in conditional.applicability_rule
+    assert indirect_request.applicability_profile == "conditional"
+    assert "single direct imperative" in indirect_request.applicability_rule
 
 
 def test_catalog_rejects_duplicate_references() -> None:

@@ -473,6 +473,20 @@ _BUILTIN_AUGMENTATION_SPECS = (
             "the same field and object and both values appear exactly once in the input."
         ),
     ),
+    _dataset_spec(
+        "input.behavior.indirect_request",
+        "Express one direct imperative as a conventional indirect request.",
+        order=11,
+        generation_mechanism="deterministic",
+        allowed_change="surface_form_only",
+        prompt_name="augmentation.input.surface.rephrase",
+        human_review=True,
+        applicability_profile="conditional",
+        applicability_rule=(
+            "Applies only when the source is a single direct imperative whose opening verb "
+            "matches the recorded request predicate."
+        ),
+    ),
     _scenario_spec(
         "conversation.ambiguity",
         "conversation_workflow",
