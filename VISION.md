@@ -7,6 +7,8 @@ UL's first promise is to discover consequential failures in high-risk AI agents 
 1. Make insights excellent: discover as many meaningful failures as possible, explain why they matter, and expose recurring patterns across them.
 2. Then make UL quick and easy to integrate and run.
 
+Every product improvement must start with a real experiment using UL as a mock customer. Run the product, observe the actual failure or missed opportunity, make the smallest useful change, and rerun the same customer journey to prove that it improved. Do not add or fix product behavior based only on theory, internal APIs, or isolated helper tests.
+
 The core customer flow is deliberately small:
 
 ```text
