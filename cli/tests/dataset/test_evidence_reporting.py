@@ -120,6 +120,127 @@ def test_automatic_materiality_drives_unified_report_actionability(
     assert report["exit_code"] == expected_exit_code
 
 
+def test_dataset_report_explains_array_count_change_without_disclosing_values(
+    tmp_path: Path,
+) -> None:
+    original_value = {
+        "private-list-name-canary": [
+            {"operation": "private-operation-one-canary"},
+            {"operation": "private-operation-two-canary"},
+            {"operation": "private-operation-three-canary"},
+        ]
+    }
+    variation_value = {
+        "private-list-name-canary": [{"operation": "private-variation-operation-canary"}]
+    }
+
+    def response_effect(identifier: str, value: dict[str, Any]) -> ObservedOutcome:
+        return ObservedOutcome(
+            id=identifier,
+            confidence=1,
+            status="observed",
+            position=0,
+            kind="answer",
+            predicate="returned_response",
+            fields={"value": cast(Any, value)},
+        )
+
+    original_effect = response_effect("original-response", original_value)
+    variation_effect = response_effect("variation-response", variation_value)
+    result = _evaluation_result("private-input-canary", has_review_finding=True)
+    baseline_trial = result.baseline.trial_set.trials[0]
+    variation_trial_set = result.cases[0].trial_set
+    assert variation_trial_set is not None
+    variation_trial = variation_trial_set.trials[0]
+    baseline_frame = baseline_trial.observed_frame
+    variation_frame = variation_trial.observed_frame
+    assert baseline_frame is not None
+    assert variation_frame is not None
+    source_frame = result.augmentation.source_frames[0].model_copy(
+        update={"outcomes": (original_effect,)}
+    )
+    baseline_frame = baseline_frame.model_copy(update={"outcomes": (original_effect,)})
+    variation_frame = variation_frame.model_copy(update={"outcomes": (variation_effect,)})
+    baseline_trial_set = result.baseline.trial_set.model_copy(
+        update={
+            "comparison_surface": "response",
+            "trials": (baseline_trial.model_copy(update={"observed_frame": baseline_frame}),),
+            "outcome_groups": (
+                DatasetEvaluationOutcomeGroup(
+                    repetitions=(1,), representative_effects=(original_effect,)
+                ),
+            ),
+        }
+    )
+    variation_trial_set = variation_trial_set.model_copy(
+        update={
+            "comparison_surface": "response",
+            "trials": (variation_trial.model_copy(update={"observed_frame": variation_frame}),),
+            "outcome_groups": (
+                DatasetEvaluationOutcomeGroup(
+                    repetitions=(1,), representative_effects=(variation_effect,)
+                ),
+            ),
+        }
+    )
+    finding = DatasetEvaluationFinding(
+        category="changed_response",
+        message=(
+            "The variation changed the observed response at /private-list-name-canary/0/operation."
+        ),
+        expected_effects=(original_effect,),
+        observed_effects=(variation_effect,),
+    )
+    material_variance = result.cases[0].material_variance
+    assert material_variance is not None
+    result = result.model_copy(
+        update={
+            "comparison_surface": "response",
+            "augmentation": result.augmentation.model_copy(
+                update={"source_frames": (source_frame,)}
+            ),
+            "baseline": result.baseline.model_copy(update={"trial_set": baseline_trial_set}),
+            "cases": (
+                result.cases[0].model_copy(
+                    update={
+                        "trial_set": variation_trial_set,
+                        "findings": (finding,),
+                        "material_variance": material_variance.model_copy(
+                            update={"reason_code": "action_count_changed"}
+                        ),
+                    }
+                ),
+            ),
+        }
+    )
+    record = customer_module.build_customer_evidence_record(
+        result,
+        repetitions=1,
+        max_environment_api_calls=2,
+        planned_target_calls=2,
+    )
+    evidence_path = tmp_path / "structural-difference.jsonl"
+    evidence_path.write_text(json.dumps(record) + "\n", encoding="utf-8")
+
+    report = runner.invoke(root_app, ["dataset", "report", str(evidence_path)])
+
+    assert report.exit_code == 0, report.output
+    normalized_report = " ".join(_ANSI_ESCAPE_PATTERN.sub("", report.output).split())
+    assert (
+        "What changed: A response list contained 3 items in the original response and 1 after "
+        "the test variation (2 fewer)."
+    ) in normalized_report
+    for private_canary in (
+        "private-input-canary",
+        "private-list-name-canary",
+        "private-operation-one-canary",
+        "private-operation-two-canary",
+        "private-operation-three-canary",
+        "private-variation-operation-canary",
+    ):
+        assert private_canary not in normalized_report
+
+
 @pytest.mark.parametrize(
     ("decision", "expected_exit_code", "needs_review"),
     (

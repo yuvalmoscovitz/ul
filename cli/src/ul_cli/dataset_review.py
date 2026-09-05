@@ -196,6 +196,56 @@ class _Finding(_StrictModel):
     observed_effects: list[_Effect]
 
 
+def _safe_response_list_counts(finding: _Finding) -> tuple[int, int] | None:
+    def returned_response_value(effects: list[_Effect]) -> JsonValue | None:
+        if (
+            len(effects) == 1
+            and effects[0].predicate == "returned_response"
+            and set(effects[0].fields) == {"value"}
+        ):
+            return effects[0].fields["value"]
+        return None
+
+    original = returned_response_value(finding.reference_effects)
+    variation = returned_response_value(finding.observed_effects)
+    candidates: list[tuple[int, tuple[str, ...], int, int]] = []
+
+    def visit(left: JsonValue, right: JsonValue, path: tuple[str, ...]) -> None:
+        if len(path) >= 100:
+            return
+        if isinstance(left, list) and isinstance(right, list):
+            if len(left) != len(right):
+                candidates.append((len(path), path, len(left), len(right)))
+            for index, (left_item, right_item) in enumerate(zip(left, right, strict=False)):
+                visit(left_item, right_item, (*path, str(index)))
+            return
+        if isinstance(left, dict) and isinstance(right, dict):
+            for key in sorted(left.keys() & right.keys()):
+                visit(left[key], right[key], (*path, key))
+
+    if original is not None and variation is not None:
+        visit(original, variation, ())
+    if not candidates:
+        return None
+    _, _, original_item_count, variation_item_count = min(candidates)
+    return original_item_count, variation_item_count
+
+
+def _safe_response_list_difference_summary(finding: _Finding) -> str | None:
+    counts = _safe_response_list_counts(finding)
+    if counts is None:
+        return None
+    original_item_count, variation_item_count = counts
+    item_count_delta = variation_item_count - original_item_count
+    direction = "more" if item_count_delta > 0 else "fewer"
+    return (
+        "A response list contained "
+        f"{original_item_count} items in the original response and "
+        f"{variation_item_count} after the test variation "
+        f"({abs(item_count_delta)} {direction})."
+    )
+
+
 class _OutcomeGroup(_StrictModel):
     repetitions: list[int]
     count: int = Field(ge=1)
@@ -2125,10 +2175,22 @@ def report_dataset_evidence(
         _print_plain("")
         if indexed_finding.semantic_finding is not None:
             finding = indexed_finding.semantic_finding
-            _print_plain(f"{section_item_number}. {finding.summary}")
+            safe_summary = (
+                _BEHAVIOR_FINDING_SUMMARIES["changed_response"]
+                if finding.category == "changed_response"
+                else finding.summary
+            )
+            _print_plain(f"{section_item_number}. {safe_summary}")
             _print_plain(f"Category: {finding.category}")
             if case.material_variance is not None:
                 _print_plain("Reason: " + case.material_variance.reason_code.replace("_", " "))
+                if (
+                    finding.category == "changed_response"
+                    and case.material_variance.reason_code == "action_count_changed"
+                ):
+                    difference_summary = _safe_response_list_difference_summary(finding)
+                    if difference_summary is not None:
+                        _print_plain("What changed: " + difference_summary)
         else:
             baseline_rule = indexed_finding.baseline_rule
             variation_rule = indexed_finding.variation_rule
