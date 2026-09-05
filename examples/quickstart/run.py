@@ -54,6 +54,8 @@ def _subprocess_environment(*, dry_run: bool) -> dict[str, str]:
         "UL_DATASET_RENDER_MODEL": settings.render_model,
         "UL_DATASET_EQUIVALENCE_MODEL": settings.equivalence_model,
         "UL_DATASET_MATERIALITY_MODEL": settings.materiality_model,
+        "UL_DATASET_MAX_OUTPUT_TOKENS": str(settings.max_output_tokens),
+        "UL_DATASET_MAX_RENDER_TOKENS": str(settings.max_render_tokens),
     }
     if isinstance(settings, OpenRouterDatasetSettings):
         environment["UL_DATASET_OPENROUTER_PROVIDER"] = settings.upstream_provider
