@@ -1954,6 +1954,7 @@ def _build_failure_patterns(
 
 
 def _dataset_evidence_is_inconclusive(records: list[_LoadedEvidenceRecord]) -> bool:
+    has_completed_comparison = False
     for loaded_record in records:
         evidence = loaded_record.evidence
         if (
@@ -1967,7 +1968,9 @@ def _dataset_evidence_is_inconclusive(records: list[_LoadedEvidenceRecord]) -> b
                 and (case.observations is None or case.observations.inconclusive_repetitions > 0)
             ):
                 return True
-    return False
+            if case.variation_accepted and case.observations is not None:
+                has_completed_comparison = True
+    return not has_completed_comparison
 
 
 def _dataset_case_report_bucket(
@@ -2074,6 +2077,23 @@ def report_dataset_evidence(
     }
 
     cases = [case for loaded_record in evidence_records for case in loaded_record.evidence.cases]
+    technical_results = tuple(
+        DatasetEvaluationResult.model_validate_json(
+            json.dumps(loaded_record.evidence.technical_details, ensure_ascii=False)
+        )
+        for loaded_record in evidence_records
+    )
+    selected_interactions_by_operator = Counter(
+        reference.id
+        for result in technical_results
+        for reference in result.augmentation.operator_references
+    )
+    skip_groups = Counter(
+        (skip.operator_id, skip.reason_code, skip.reason, skip.next_action)
+        for result in technical_results
+        for skip in result.augmentation.skips
+    )
+    skipped_variation_count = sum(skip_groups.values())
     comparison_counts = {
         bucket: sum(_dataset_case_report_bucket(case) == bucket for case in cases)
         for bucket in (
@@ -2116,13 +2136,28 @@ def report_dataset_evidence(
         )
     elif unresolved_count:
         result_summary = f"INCONCLUSIVE — {unresolved_count} item(s) need attention"
-    elif cases and comparison_counts["not_evaluated"] == len(cases):
+    elif (cases and comparison_counts["not_evaluated"] == len(cases)) or (
+        not cases and skipped_variation_count
+    ):
         result_summary = "INCONCLUSIVE — no valid variations were evaluated"
     else:
         result_summary = "CLEAR — no consequential behavior changes found"
 
     _print_plain("UL dataset report")
     _print_plain(f"Result: {result_summary}")
+    _print_plain(
+        "Augmentation coverage: "
+        f"selected={sum(selected_interactions_by_operator.values())}, "
+        f"compared={len(cases) - comparison_counts['not_evaluated']}, "
+        f"rejected={comparison_counts['not_evaluated']}, "
+        f"skipped={skipped_variation_count}"
+    )
+    for (operator_id, _reason_code, reason, next_action), count in sorted(skip_groups.items()):
+        selected_count = selected_interactions_by_operator[operator_id]
+        _print_plain(
+            f"Warning: {operator_id} skipped for {count} of {selected_count} interactions: "
+            f"{reason} Next: {next_action}"
+        )
     _print_plain(
         f"Semantic comparisons: total={len(cases)}, completed="
         f"{len(cases) - comparison_counts['not_evaluated']}, "

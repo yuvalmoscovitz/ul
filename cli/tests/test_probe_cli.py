@@ -219,6 +219,18 @@ class _CleanRoomSemanticModel:
         )
 
 
+class _AcceptedCleanRoomSemanticModel(_CleanRoomSemanticModel):
+    async def render(
+        self,
+        raw_input: str,
+        instruction: str,
+        *,
+        allow_temporary_value: bool = False,
+    ) -> RenderedUserInput:
+        del instruction, allow_temporary_value
+        return RenderedUserInput(text=f"Please {raw_input.casefold()}")
+
+
 class _RegressionSemanticModel(_CleanRoomSemanticModel):
     async def deconstruct(
         self,
@@ -2256,7 +2268,7 @@ def test_paused_probe_action_resumes_after_terminal_trial_without_replay(
     monkeypatch.setattr(
         campaign_runner_module,
         "create_semantic_model_deconstructor",
-        lambda semantic_settings: _CleanRoomSemanticModel(semantic_settings),
+        lambda semantic_settings: _AcceptedCleanRoomSemanticModel(semantic_settings),
     )
     result = runner.invoke(
         app,
@@ -2313,7 +2325,7 @@ def test_paused_probe_action_resumes_after_terminal_trial_without_replay(
     assert "Operators: input.surface.rephrase" in nested_results[0].output
     assert "Repetitions: 2" in nested_results[0].output
     assert preflight_calls == 1
-    assert len(invocations.read_text().splitlines()) == 3
+    assert len(invocations.read_text().splitlines()) == 5
     evidence_lines = [json.loads(line) for line in output.read_text().splitlines()]
     assert len(evidence_lines) == 2
     assert evidence_lines[0]["record_type"] == "dataset_durable_run"
@@ -2325,7 +2337,7 @@ def test_paused_probe_action_resumes_after_terminal_trial_without_replay(
     completed_units = {
         record["unit"]["arm"] for record in journal_records if record["state"] == "completed"
     }
-    assert completed_units == {"original"}
+    assert completed_units == {"original", "probe"}
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="symlink creation requires privileges")
@@ -2585,7 +2597,7 @@ def test_public_documentation_flow_runs_real_callable_campaign_and_report(
         target="agent:run",
     )
     output = tmp_path / ".ul" / "runs" / "probe-evidence.jsonl"
-    semantic_model = _CleanRoomSemanticModel()
+    semantic_model = _AcceptedCleanRoomSemanticModel()
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("UL_LIVE", "true")
     monkeypatch.setenv("OPEN_ROUTER_API_KEY", "test-key")
@@ -2654,8 +2666,8 @@ def test_public_documentation_flow_runs_real_callable_campaign_and_report(
     )
     assert action_match is not None
     assert str(output) not in result.output.split("next_action=", 1)[1]
-    assert "target_calls=3" in result.output
-    assert "environment_calls=3" in result.output
+    assert "target_calls=5" in result.output
+    assert "environment_calls=5" in result.output
     assert "semantic_calls=unknown" in result.output
     assert "tokens=unknown" in result.output
     evidence_lines = [json.loads(line) for line in output.read_text().splitlines()]
@@ -2932,9 +2944,11 @@ def test_public_probe_accepts_arbitrary_recorded_responses_without_custom_mappin
         input="y\ny\n",
     )
 
-    assert result.exit_code == 0, result.output
+    assert result.exit_code == 2, result.output
     assert "PROBE_SOURCE_COMPARISON_INCOMPATIBLE" not in result.output
-    assert (tmp_path / "target-invocations").read_text().splitlines() == ["called"] * 2
+    assert (tmp_path / "target-invocations").read_text().splitlines() == ["called"]
+    assert "0 variations compared across 1 interaction" in result.output
+    assert "1 rejected; 0 skipped" in result.output
 
 
 def test_public_probe_maps_invalid_recorded_projection_before_campaign_target_invocation(

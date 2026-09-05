@@ -669,6 +669,17 @@ class DatasetEvaluationRunner:
                 arm="original",
                 repetition=repetition,
             )
+            if not accepted_candidates:
+                skipped_baseline = DatasetEvaluationTrial(
+                    repetition=repetition,
+                    inconclusive_reasons=(
+                        "no usable variation was produced; original replay not executed",
+                    ),
+                )
+                baseline_trials_by_repetition[repetition] = skipped_baseline
+                if trial_terminal_callback is not None:
+                    trial_terminal_callback(baseline_unit, skipped_baseline)
+                return
             baseline_trial = recovered_trials.get(baseline_unit.id)
             if baseline_trial is None:
                 baseline_trial = await execute_trial(

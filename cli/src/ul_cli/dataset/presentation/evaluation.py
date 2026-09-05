@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from collections import Counter
 from pathlib import Path
 from typing import Literal
 
@@ -326,6 +327,42 @@ def print_dataset_results(
                 ", ".join(finding_labels) or "—",
             )
     console.print(table)
+    compared_variation_count = sum(
+        case.trial_set is not None for result in results for case in result.cases
+    )
+    rejected_variation_count = sum(
+        case.verdict == "augmentation_rejected" for result in results for case in result.cases
+    )
+    skipped_variation_count = sum(
+        len(getattr(getattr(result, "augmentation", None), "skips", ())) for result in results
+    )
+    console.print(
+        f"Coverage: {compared_variation_count} "
+        f"{'variation' if compared_variation_count == 1 else 'variations'} compared across "
+        f"{len(results)} {'interaction' if len(results) == 1 else 'interactions'}; "
+        f"{rejected_variation_count} rejected; {skipped_variation_count} skipped."
+    )
+    selected_interactions_by_operator = Counter(
+        reference.id
+        for result in results
+        for reference in getattr(getattr(result, "augmentation", None), "operator_references", ())
+    )
+    skip_groups = Counter(
+        (
+            skip.operator_id,
+            skip.reason_code,
+            skip.reason,
+            skip.next_action,
+        )
+        for result in results
+        for skip in getattr(getattr(result, "augmentation", None), "skips", ())
+    )
+    for (operator_id, _reason_code, reason, next_action), count in sorted(skip_groups.items()):
+        selected_count = selected_interactions_by_operator[operator_id]
+        console.print(
+            f"Warning: {operator_id} skipped for {count} of {selected_count} interactions: "
+            f"{reason} Next: {next_action}"
+        )
     actual_semantic_calls = sum(
         getattr(getattr(result, "semantic_calls", None), "actual_calls", 0) for result in results
     )
@@ -370,7 +407,25 @@ def dataset_result_exit_code(result: DatasetEvaluationResult) -> int:
             return 1
         if material_variance.decision == "insufficient_evidence":
             has_inconclusive_materiality = True
-    return 2 if has_inconclusive_materiality else 0
+    if has_inconclusive_materiality:
+        return 2
+    if not any(case.trial_set is not None for case in result.cases):
+        return 2
+    return 0
+
+
+def dataset_results_exit_code(results: tuple[DatasetEvaluationResult, ...]) -> int:
+    if not results:
+        return 0
+    compared_results = tuple(
+        result for result in results if any(case.trial_set is not None for case in result.cases)
+    )
+    if not compared_results:
+        return 2
+    return max(
+        (dataset_result_exit_code(result) for result in compared_results),
+        key=lambda code: {0: 0, 2: 1, 1: 2}[code],
+    )
 
 
 def dataset_invariant_exit_code(

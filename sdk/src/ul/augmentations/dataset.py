@@ -113,6 +113,15 @@ class DatasetAugmentationOperatorReference(ULModel):
     )
 
 
+DatasetAugmentationSkipReasonCode = Literal[
+    "no_actionable_request",
+    "no_observed_outcome",
+    "unresolved_source_semantics",
+    "ambiguous_source_semantics",
+    "operator_not_applicable",
+]
+
+
 class DatasetAugmentationSkip(ULModel):
     source_interaction_id: str = Field(min_length=1)
     operator_id: OperatorId
@@ -120,7 +129,9 @@ class DatasetAugmentationSkip(ULModel):
         default="1.0.0",
         pattern=r"^(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)$",
     )
+    reason_code: DatasetAugmentationSkipReasonCode
     reason: str = Field(min_length=1)
+    next_action: str = Field(min_length=1)
 
 
 class DatasetAugmentationResult(ULModel):
@@ -247,14 +258,17 @@ class DatasetAugmentationEngine:
                 raise ValueError("deconstructed frame must reference its source interaction")
             source_frames.append(source_frame)
             expected_input_frame = _input_only_frame(source_frame)
-            source_skip_reason = _source_skip_reason(source_frame, expected_input_frame)
-            if source_skip_reason is not None:
+            source_skip = _source_skip(source_frame, expected_input_frame)
+            if source_skip is not None:
+                reason_code, reason, next_action = source_skip
                 skips.extend(
                     DatasetAugmentationSkip(
                         source_interaction_id=record.id,
                         operator_id=operator.id,
                         operator_version=operator.version,
-                        reason=source_skip_reason,
+                        reason_code=reason_code,
+                        reason=reason,
+                        next_action=next_action,
                     )
                     for operator in selected_operators
                 )
@@ -273,7 +287,12 @@ class DatasetAugmentationEngine:
                             source_interaction_id=record.id,
                             operator_id=operator.id,
                             operator_version=operator.version,
+                            reason_code="operator_not_applicable",
                             reason=operator.applicability_rule,
+                            next_action=(
+                                "Choose another augmentation or use a datapoint that matches "
+                                "this augmentation."
+                            ),
                         )
                     )
                     continue
@@ -285,7 +304,12 @@ class DatasetAugmentationEngine:
                                 source_interaction_id=record.id,
                                 operator_id=operator.id,
                                 operator_version=operator.version,
+                                reason_code="operator_not_applicable",
                                 reason=operator.applicability_rule,
+                                next_action=(
+                                    "Choose another augmentation or use a datapoint that matches "
+                                    "this augmentation."
+                                ),
                             )
                         )
                         continue
@@ -552,19 +576,35 @@ def create_dataset_augmentation_projection(
     )
 
 
-def _source_skip_reason(
+def _source_skip(
     source_frame: SemanticFrame, expected_input_frame: SemanticFrame
-) -> str | None:
+) -> tuple[DatasetAugmentationSkipReasonCode, str, str] | None:
     if not expected_input_frame.request_units:
-        return "Source semantics contain no actionable request units."
+        return (
+            "no_actionable_request",
+            "Source semantics contain no actionable request units.",
+            "Use a datapoint that contains an actionable request.",
+        )
     if not source_frame.outcomes:
-        return "Source interaction contains no observed outcome to preserve."
+        return (
+            "no_observed_outcome",
+            "Source interaction contains no observed outcome to preserve.",
+            "Include the observed agent outcome for this datapoint.",
+        )
     unresolved_reason = _unresolved_node_reason(source_frame)
     if unresolved_reason is not None:
-        return unresolved_reason
+        return (
+            "unresolved_source_semantics",
+            unresolved_reason,
+            "Review the datapoint's unresolved semantic evidence.",
+        )
     ambiguous_reason = _ambiguous_node_reason(expected_input_frame)
     if ambiguous_reason is not None:
-        return ambiguous_reason
+        return (
+            "ambiguous_source_semantics",
+            ambiguous_reason,
+            "Review the datapoint's ambiguous semantic evidence.",
+        )
     return None
 
 

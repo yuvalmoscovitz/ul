@@ -9,7 +9,11 @@ from typing import Literal, cast
 import httpx
 import pytest
 from pydantic import JsonValue, SecretStr, ValidationError
-from ul.augmentations.dataset import DatasetAugmentationEngine, DatasetAugmentationResult
+from ul.augmentations.dataset import (
+    DatasetAugmentationEngine,
+    DatasetAugmentationResult,
+    DatasetAugmentationSkip,
+)
 from ul.dataset_evaluation import (
     DatasetComparisonCompatibilityError,
     DatasetEvaluationBaseline,
@@ -1206,6 +1210,39 @@ async def test_runner_executes_only_accepted_candidates_and_keeps_rejected_candi
         == accepted.target_output.raw_output
     )
     assert DatasetEvaluationResult.model_validate_json(result.model_dump_json()) == result
+
+
+async def test_runner_does_not_call_target_when_no_variation_is_usable() -> None:
+    source = _source()
+    runner, semantic_pipeline, target = _runner((_source_outcomes()[0],))
+    generated = await DatasetAugmentationEngine(semantic_pipeline, semantic_pipeline).augment(
+        (source,)
+    )
+    reference = generated.operator_references[0]
+    skipped = generated.model_copy(
+        update={
+            "candidates": (),
+            "skips": (
+                DatasetAugmentationSkip(
+                    source_interaction_id=source.id,
+                    operator_id=reference.id,
+                    operator_version=reference.version,
+                    reason_code="operator_not_applicable",
+                    reason="The augmentation does not apply to this datapoint.",
+                    next_action="Choose another augmentation.",
+                ),
+            ),
+        }
+    )
+
+    result = await runner.run(source, precomputed_augmentation=skipped)
+
+    assert target.raw_inputs == []
+    assert result.cases == ()
+    assert result.baseline.verdict == "inconclusive"
+    assert result.baseline.trial_set.trials[0].inconclusive_reasons == (
+        "no usable variation was produced; original replay not executed",
+    )
 
 
 async def test_runner_executes_punctuation_candidate_with_equivalent_list_decomposition() -> None:

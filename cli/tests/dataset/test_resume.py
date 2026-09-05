@@ -507,8 +507,16 @@ def test_resume_skips_already_processed_interaction_ids(
     _write_dataset(dataset, [_record("interaction-1"), _record("interaction-2")])
     _write_target_config(target_config)
     evaluation_results = (
-        _evaluation_result("interaction-1"),
-        _evaluation_result("interaction-2"),
+        _evaluation_result(
+            "interaction-1",
+            has_review_finding=True,
+            material_variance_decision="operationally_equivalent",
+        ),
+        _evaluation_result(
+            "interaction-2",
+            has_review_finding=True,
+            material_variance_decision="operationally_equivalent",
+        ),
     )
     selected_records = tuple(result.source for result in evaluation_results)
     run_context = _run_context(selected_records)
