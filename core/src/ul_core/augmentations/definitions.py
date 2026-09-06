@@ -42,6 +42,7 @@ DatasetAllowedChange = Literal[
 
 _AUGMENTATION_ID_PATTERN = r"^[a-z][a-z0-9_]*(?:\.[a-z][a-z0-9_]*)+$"
 _VERSION_PATTERN = r"^(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)$"
+_INDIRECT_REQUEST_INSTRUCTION = "Express one direct imperative as a conventional indirect request."
 
 
 class _CatalogModel(ULModel):
@@ -486,7 +487,7 @@ _BUILTIN_AUGMENTATION_SPECS = (
         order=11,
         generation_mechanism="deterministic",
         allowed_change="surface_form_only",
-        instruction="Express one direct imperative as a conventional indirect request.",
+        instruction=_INDIRECT_REQUEST_INSTRUCTION,
         human_review=True,
         applicability_profile="conditional",
         applicability_rule=(
