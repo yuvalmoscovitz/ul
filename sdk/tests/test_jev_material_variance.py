@@ -232,3 +232,57 @@ async def test_missing_grounded_action_field_cannot_be_called_equivalent(transpo
     result = await JevMaterialVarianceJudge(client).evaluate("action", (comparison,))
     assert result.decision == "insufficient_evidence"
     assert not requests
+
+
+@pytest.mark.parametrize(
+    "label, expected",
+    [
+        ("material_variance", "material_variance"),
+        ("operationally_equivalent", "insufficient_evidence"),
+    ],
+)
+async def test_incomplete_finding_does_not_hide_supported_change(
+    transport: Any, label: str, expected: str
+) -> None:
+    client, requests, options = transport
+    options["labels"] = [label]
+    incomplete = finding("A", "B").model_copy(update={"observed_effects": ()})
+    result = await JevMaterialVarianceJudge(client).evaluate(
+        "response",
+        (incomplete, finding("Refund completed", "Refund scheduled")),
+    )
+    assert result.decision == expected
+    assert list(requests[0]["questions"]) == ["1"]
+    if result.evidence:
+        assert all("/findings/1/" in item.json_pointer for item in result.evidence)
+
+
+async def test_incomplete_finding_does_not_hide_exact_change(transport: Any) -> None:
+    client, requests, _ = transport
+    complete = finding("A", "B")
+    complete = complete.model_copy(
+        update={
+            "expected_effects": (
+                complete.expected_effects[0].model_copy(
+                    update={
+                        "fields": {"value": {"answer": "Done", "actions": []}},
+                    }
+                ),
+            ),
+            "observed_effects": (
+                complete.observed_effects[0].model_copy(
+                    update={
+                        "fields": {
+                            "value": {"answer": "Done", "actions": [{"action": "SEND_PAYMENT"}]}
+                        },
+                    }
+                ),
+            ),
+        }
+    )
+    incomplete = finding("A", "B").model_copy(update={"observed_effects": ()})
+    result = await JevMaterialVarianceJudge(client).evaluate("response", (incomplete, complete))
+    assert result.decision == "material_variance"
+    assert result.reason_code == "action_added"
+    assert all("/findings/1/" in item.json_pointer for item in result.evidence)
+    assert not requests

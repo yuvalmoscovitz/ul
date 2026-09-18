@@ -492,7 +492,7 @@ class JevMaterialVarianceJudge:
                     "client": client.settings.version,
                     "max_input_chars": max_input_chars,
                     "minimum_confidence": minimum_confidence,
-                    "adapter_version": "jev-material-variance/1",
+                    "adapter_version": "jev-material-variance/2",
                 }
             ),
         )
@@ -511,23 +511,7 @@ class JevMaterialVarianceJudge:
         comparison_surface: ComparisonSurface,
         findings: tuple[DatasetEvaluationFinding, ...],
     ) -> MaterialVarianceAssessment:
-        if not 1 <= len(findings) <= 10 or any(
-            not finding.expected_effects
-            or not finding.observed_effects
-            or any(
-                effect.status != "observed"
-                or not effect.fields
-                or (
-                    effect.kind == "action"
-                    and (
-                        not finding.grounded_field_names
-                        or any(name not in effect.fields for name in finding.grounded_field_names)
-                    )
-                )
-                for effect in (*finding.expected_effects, *finding.observed_effects)
-            )
-            for finding in findings
-        ):
+        if not 1 <= len(findings) <= 10:
             return self._assessment("insufficient_evidence", "missing_comparison_evidence")
         state = _comparison_payload(comparison_surface, findings)
         encoded_state = json.dumps(state, ensure_ascii=False)
@@ -537,7 +521,28 @@ class JevMaterialVarianceJudge:
         ):
             return self._assessment("insufficient_evidence", "missing_comparison_evidence")
         questions: dict[str, ChoiceQuestion] = {}
+        uncertain = False
         for index, finding in enumerate(findings):
+            if (
+                not finding.expected_effects
+                or not finding.observed_effects
+                or any(
+                    effect.status != "observed"
+                    or not effect.fields
+                    or (
+                        effect.kind == "action"
+                        and (
+                            not finding.grounded_field_names
+                            or any(
+                                name not in effect.fields for name in finding.grounded_field_names
+                            )
+                        )
+                    )
+                    for effect in (*finding.expected_effects, *finding.observed_effects)
+                )
+            ):
+                uncertain = True
+                continue
             deterministic = _deterministic_response_material_variance(
                 _comparison_payload(comparison_surface, (finding,)),
                 evaluator_version_id=self.evaluator_version_id,
@@ -557,7 +562,6 @@ class JevMaterialVarianceJudge:
                 response = await self._client.decide(state, dict(questions))
             except DecisionError:
                 return self._assessment("insufficient_evidence", "judge_error")
-            uncertain = False
             for key in questions:
                 answer = response.answers[key]
                 assert isinstance(answer, ChoiceAnswer)
@@ -574,8 +578,8 @@ class JevMaterialVarianceJudge:
                         _JEV_REASON_CODES[findings[int(key)].category],
                         (int(key),),
                     )
-            if uncertain:
-                return self._assessment("insufficient_evidence", "missing_comparison_evidence")
+        if uncertain:
+            return self._assessment("insufficient_evidence", "missing_comparison_evidence")
         return self._assessment(
             "operationally_equivalent", "same_real_world_effect", tuple(range(len(findings)))
         )

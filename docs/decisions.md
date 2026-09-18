@@ -152,7 +152,8 @@ policy, not a guarantee of accuracy or calibration for your data. Missing confid
 or an uncertain answer produces `insufficient_evidence`. Provider failures produce the same decision
 with reason `judge_error`. There are no retries or automatic calls to another model.
 
-Both sides must contain observed outcomes with fields. Action comparisons additionally require
+Each finding needs observed outcomes with fields on both sides. An incomplete finding cannot
+block a material change established by another finding, but it prevents an equivalent conclusion. Action comparisons additionally require
 available grounded fields. Missing sides, unobserved outcomes, empty evidence, more than ten findings,
 or oversized input remain inconclusive without a model call. In particular, an empty action list
 on one side of a finding does not by itself prove absence; use complete response envelopes containing
