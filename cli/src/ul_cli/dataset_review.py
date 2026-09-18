@@ -389,6 +389,9 @@ class DatasetEvidenceOperator(_StrictModel):
 
 class DatasetEvidenceSemanticSettings(_StrictModel):
     llm_client: LLMClientIdentity
+    decision_model: str | None = Field(
+        default=None, min_length=1, max_length=200, exclude_if=_is_none
+    )
     max_input_chars: int = Field(ge=1)
     deconstructor_identity: SemanticDeconstructorIdentity | None = None
     materiality_evaluator_version_id: str | None = Field(

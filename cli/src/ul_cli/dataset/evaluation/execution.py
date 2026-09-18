@@ -24,6 +24,7 @@ from ul_cli.dataset.progress import (
     create_campaign_progress_runtime,
 )
 from ul_cli.dataset.source_preparation import DatasetSourcePreparationFailureEvent
+from ul_cli.dataset_materiality import dataset_decision_settings
 from ul_cli.environment import TEST_ENVIRONMENT_CONFIRMATION_MESSAGE
 
 from ..evidence.persistence import (
@@ -87,6 +88,12 @@ def execute_campaign(campaign: PreparedCampaign) -> CampaignExecutionOutcome:
         raise typer.BadParameter(
             f"set {evaluation.settings.api_key_environment_variable} to run an evaluation"
         )
+    if evaluation.run_config.materiality_judge == "jev":
+        credential = dataset_decision_settings(evaluation.settings).api_key
+        if credential is None or not credential.get_secret_value().strip():
+            raise typer.BadParameter(
+                "set OPEN_ROUTER_API_KEY for the configured outcome comparison provider"
+            )
     try:
         if evaluation.local_target is not None:
             print_local_target_identity(evaluation.local_target)

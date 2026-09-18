@@ -24,7 +24,13 @@ from ul.dataset_evaluation import (
     MaterialVarianceEvidence,
     MaterialVarianceReasonCode,
 )
-from ul.decisions import ChoiceAnswer, ChoiceQuestion, DecisionError, OpenRouterDecisionClient
+from ul.decisions import (
+    ChoiceAnswer,
+    ChoiceQuestion,
+    DecisionError,
+    OpenRouterDecisionClient,
+    OpenRouterDecisionSettings,
+)
 from ul.evaluators import (
     EvaluatorJudge,
     OpenAICompatibleJudgeConfig,
@@ -482,21 +488,9 @@ class JevMaterialVarianceJudge:
         self._max_input_chars = max_input_chars
         self._minimum_confidence = minimum_confidence
         self._actual_calls = 0
-        version = EvaluatorJudgeVersion(
-            prompt_version=_jev_fingerprint(
-                {"instructions": _JEV_INSTRUCTIONS, "criteria": _JEV_CRITERIA}
-            ),
-            model=client.settings.model,
-            configuration_sha256=_jev_fingerprint(
-                {
-                    "client": client.settings.version,
-                    "max_input_chars": max_input_chars,
-                    "minimum_confidence": minimum_confidence,
-                    "adapter_version": "jev-material-variance/2",
-                }
-            ),
-        )
-        self._evaluator_version_id = create_evaluator_version(_EVALUATOR, judge_version=version).id
+        self._evaluator_version_id = jev_material_variance_evaluator_version(
+            client.settings, max_input_chars=max_input_chars, minimum_confidence=minimum_confidence
+        ).id
 
     @property
     def evaluator_version_id(self) -> str:
@@ -607,3 +601,26 @@ class JevMaterialVarianceJudge:
 
 def _jev_fingerprint(value: dict[str, object]) -> str:
     return hashlib.sha256(json.dumps(value, sort_keys=True).encode()).hexdigest()
+
+
+def jev_material_variance_evaluator_version(
+    settings: OpenRouterDecisionSettings,
+    *,
+    max_input_chars: int = 50_000,
+    minimum_confidence: float = 0.88,
+) -> EvaluatorVersion:
+    version = EvaluatorJudgeVersion(
+        prompt_version=_jev_fingerprint(
+            {"instructions": _JEV_INSTRUCTIONS, "criteria": _JEV_CRITERIA}
+        ),
+        model=settings.model,
+        configuration_sha256=_jev_fingerprint(
+            {
+                "client": settings.version,
+                "max_input_chars": max_input_chars,
+                "minimum_confidence": minimum_confidence,
+                "adapter_version": "jev-material-variance/2",
+            }
+        ),
+    )
+    return create_evaluator_version(_EVALUATOR, judge_version=version)

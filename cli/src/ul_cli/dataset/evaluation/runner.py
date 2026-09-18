@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+from contextlib import AsyncExitStack
 from pathlib import Path
 from typing import TextIO
 
@@ -19,12 +20,15 @@ from ul import (
     DatasetTrialUnit,
     EvaluatorModelPreflight,
     InteractionRecord,
+    JevMaterialVarianceJudge,
     OpenAICompatibleEvaluatorJudge,
+    OpenRouterDecisionClient,
     RedactedSemanticPipeline,
     RedactionEngine,
     ReturnedResponseSemanticDeconstructor,
     create_semantic_model_deconstructor,
 )
+from ul.dataset_evaluation import DatasetMaterialVarianceEvaluator
 from ul.dataset_invariants import (
     DatasetInvariantEvaluation,
     DatasetInvariantSuite,
@@ -40,6 +44,7 @@ from ul_cli.dataset.source_preparation import (
 )
 from ul_cli.dataset_augmentation_ledger import DatasetAugmentationLedger
 from ul_cli.dataset_campaign import DatasetCampaignPlan
+from ul_cli.dataset_materiality import dataset_decision_settings
 from ul_cli.dataset_review import DatasetEvidenceRunContext
 from ul_cli.dataset_run_config import DatasetRunConfig
 from ul_cli.dataset_trial_journal import DatasetTrialJournal
@@ -136,13 +141,27 @@ async def evaluate_interaction_records(
     deconstructor.reuse_preflight(evaluator_preflight)
     if not settings.allow_external_data_processing:
         raise ValueError("material variance judging requires external data processing approval")
-    materiality_judge = OpenAICompatibleEvaluatorJudge(llm_client=deconstructor.llm_client)
-    material_variance_evaluator = DatasetMaterialVarianceJudge(
-        materiality_judge,
-        max_input_chars=settings.max_input_chars,
-    )
     with signal_control.installed():
-        async with deconstructor, materiality_judge, target:
+        async with AsyncExitStack() as stack:
+            await stack.enter_async_context(deconstructor)
+            material_variance_evaluator: DatasetMaterialVarianceEvaluator
+            if run_config.materiality_judge == "jev":
+                decision_client = await stack.enter_async_context(
+                    OpenRouterDecisionClient(dataset_decision_settings(settings))
+                )
+                material_variance_evaluator = JevMaterialVarianceJudge(
+                    decision_client,
+                    max_input_chars=settings.max_input_chars,
+                )
+            else:
+                materiality_judge = await stack.enter_async_context(
+                    OpenAICompatibleEvaluatorJudge(llm_client=deconstructor.llm_client)
+                )
+                material_variance_evaluator = DatasetMaterialVarianceJudge(
+                    materiality_judge,
+                    max_input_chars=settings.max_input_chars,
+                )
+            await stack.enter_async_context(target)
             semantic_pipeline = (
                 RedactedSemanticPipeline(deconstructor, redaction_engine)
                 if redaction_engine is not None

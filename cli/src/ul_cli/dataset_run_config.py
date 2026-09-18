@@ -27,6 +27,9 @@ class TargetExecutionConfig(_StrictModel):
 
 class DatasetRunConfig(_StrictModel):
     evaluation_mode: Literal["variance"] = "variance"
+    materiality_judge: Literal["llm", "jev"] = Field(
+        default="llm", exclude_if=lambda value: value == "llm"
+    )
     repetitions: int = Field(ge=1, le=100)
     concurrency: int = Field(default=1, ge=1, le=100)
     target: TargetExecutionConfig
