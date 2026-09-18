@@ -81,13 +81,89 @@ question shapes raise Pydantic validation errors before the network request.
 An injected `httpx.AsyncClient` remains owned by the caller. The SDK closes clients it creates itself.
 The SDK does not log raw requests or responses.
 
-## Relationship to UL evaluators
+## Compare baseline and augmented outcomes
 
-This is the transport and typed decision foundation. Existing augmentation verification and evaluator
-judges are unchanged. A decision is not a complete UL finding: integrations must retain source
-evidence and apply their task-specific completeness and calibration requirements. A missing
-observation is not evidence that an action did not happen. Code should enforce known structural
-requirements before asking the model to make a semantic decision.
+`JevMaterialVarianceJudge` plugs into `DatasetEvaluationRunner` through its existing
+`material_variance_evaluator` argument. It checks whether the meaning or real-world effect changed;
+it does not decide which answer is better or whether either answer is correct. The CLI and existing
+LLM judges keep their current defaults.
+
+This runnable SDK example compares a completed refund with a scheduled refund:
+
+```python
+import asyncio
+
+from ul import JevMaterialVarianceJudge, OpenRouterDecisionClient, OpenRouterDecisionSettings
+from ul.dataset_evaluation import DatasetEvaluationFinding
+from ul_core.dataset import ObservedOutcome
+
+
+def outcome(identifier, text):
+    return ObservedOutcome(
+        id=identifier,
+        kind="answer",
+        predicate="returned_response",
+        status="observed",
+        confidence=1,
+        position=0,
+        fields={"value": text},
+    )
+
+
+async def main():
+    settings = OpenRouterDecisionSettings(
+        live_calls=True,
+        allow_external_data_processing=True,
+    )
+    async with OpenRouterDecisionClient(settings) as client:
+        judge = JevMaterialVarianceJudge(client)
+        assessment = await judge.evaluate(
+            "response",
+            (
+                DatasetEvaluationFinding(
+                    category="changed_response",
+                    message="Compare the returned answers.",
+                    expected_effects=(outcome("baseline", "The $50 refund was completed."),),
+                    observed_effects=(outcome("augmented", "The $50 refund is scheduled."),),
+                ),
+            ),
+        )
+        print(assessment.model_dump_json(indent=2))
+
+
+asyncio.run(main())
+```
+
+For a full dataset run, construct the judge inside the client's context and pass
+`material_variance_evaluator=judge` to your `DatasetEvaluationRunner`. Keep the client open until
+`await runner.run(source)` finishes. The runner persists the assessment, evidence references, and
+version alongside its findings and includes decision requests in its semantic call count. Its
+existing divergence verdict and human review workflow remain unchanged.
+
+Ordinary code checks evidence presence and applies the existing exact response-envelope checks
+before calling Jev. Remaining findings share one request, with one independent three-choice question
+per finding. Any confident material change establishes divergence. Equivalence requires every
+finding to be equivalent. Code assigns the reason from the finding category and attaches references
+to both compared evidence lists; these are the inputs to the decision, not model-generated citations
+or reasoning. No raw model prose is saved.
+
+The default confidence threshold is `0.88`, configurable with `minimum_confidence`. This is a routing
+policy, not a guarantee of accuracy or calibration for your data. Missing confidence, low confidence,
+or an uncertain answer produces `insufficient_evidence`. Provider failures produce the same decision
+with reason `judge_error`. There are no retries or automatic calls to another model.
+
+Both sides must contain observed outcomes with fields. Action comparisons additionally require
+available grounded fields. Missing sides, unobserved outcomes, empty evidence, more than ten findings,
+or oversized input remain inconclusive without a model call. In particular, an empty action list
+on one side of a finding does not by itself prove absence; use complete response envelopes containing
+observed action lists where available. Ten findings fit the assessment's twenty-reference limit.
+The default state limit is 50,000 characters, plus the existing byte limits. Nothing is truncated.
+`actual_calls` counts attempted decision requests; local exact checks do not increment it.
+
+The credential-independent evaluator version includes the questions, model settings, threshold,
+input limit, and adapter version. The caller owns the decision client's lifecycle and must supply
+appropriately redacted evidence. Augmentation-input verification and general rubric/pairwise judges
+are not changed by this integration.
 
 See the [TypeSafe API](https://docs.typesafe.ai/api),
 [Jev limitations](https://docs.typesafe.ai/model-jaggedness/jev-1.13), and

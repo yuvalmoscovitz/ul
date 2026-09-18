@@ -382,6 +382,7 @@ from ul.local_target import (
 )
 from ul.material_variance import (
     DatasetMaterialVarianceJudge,
+    JevMaterialVarianceJudge,
     material_variance_evaluator_version,
     material_variance_evaluator_version_from_config,
 )
@@ -609,6 +610,7 @@ __all__ = [
     "HumanReviewEvaluator",
     "InstalledRuntimeBinding",
     "InteractionRecord",
+    "JevMaterialVarianceJudge",
     "JsonArrayItemsUniqueByInvariant",
     "JsonHttpEnvironmentConfig",
     "JsonHttpEnvironmentConnection",

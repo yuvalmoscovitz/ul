@@ -32,7 +32,9 @@ from ul.dataset_evaluation import (
     ReturnedResponseSemanticDeconstructor,
 )
 from ul.dataset_evaluation import DatasetEvaluationRunner as _DatasetEvaluationRunner
+from ul.decisions import OpenRouterDecisionClient, OpenRouterDecisionSettings
 from ul.deconstruction import OpenRouterDatasetSettings, create_semantic_model_deconstructor
+from ul.material_variance import JevMaterialVarianceJudge
 from ul.outcome_projection import OutcomeProjection, OutcomeProjectionError
 from ul.probe_execution import OutcomeProjectionExecutionError
 from ul.redaction import (
@@ -3847,3 +3849,56 @@ async def test_cancellation_during_target_call_quarantines_without_retry() -> No
     assert terminal_units == []
     assert started_units[0].arm == "original"
     assert "Transfer 100 to Alice." not in str(task.exception())
+
+
+async def test_dataset_runner_persists_jev_comparison_and_call_count() -> None:
+    baseline = _outcome("baseline", 0, fields={"amount": 120, "recipient": "Alice"})
+    candidate = _outcome("candidate", 0, fields={"amount": 130, "recipient": "Alice"})
+    pipeline = DeterministicSemanticPipeline((candidate,), baseline_outcomes=(baseline,))
+    requests: list[httpx.Request] = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(
+            200,
+            json={
+                "id": "test",
+                "provider": "TypeSafe",
+                "model": "typesafe/jev-1.13",
+                "usage": {"input_tokens": 100, "output_tokens": 10},
+                "answers": {
+                    "0": {"type": "choice", "choice": "material_variance", "confidence": 0.99}
+                },
+            },
+        )
+
+    async with (
+        httpx.AsyncClient(transport=httpx.MockTransport(respond)) as http,
+        OpenRouterDecisionClient(
+            OpenRouterDecisionSettings(
+                api_key=SecretStr("test-key"),
+                live_calls=True,
+                allow_external_data_processing=True,
+            ),
+            client=http,
+        ) as client,
+    ):
+        materiality = JevMaterialVarianceJudge(client)
+        runner = DatasetEvaluationRunner(
+            DatasetAugmentationEngine(pipeline, pipeline),
+            pipeline,
+            DeterministicEnvironment(
+                raw_output=_raw_output_for_actions((candidate,)),
+                baseline_raw_output=_raw_output_for_actions((baseline,)),
+            ),
+            material_variance_evaluator=materiality,
+        )
+        result = await runner.run(_source())
+    assessment = result.cases[0].material_variance
+    assert assessment is not None
+    assert assessment.decision == "material_variance"
+    assert assessment.reason_code == "grounded_argument_changed"
+    assert assessment.evaluator_version_id == materiality.evaluator_version_id
+    assert len(assessment.evidence) == 2
+    assert result.semantic_calls.actual_calls == len(requests) == 1
+    assert result.cases[0].verdict == "divergence_needs_review"
