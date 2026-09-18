@@ -187,6 +187,7 @@ def prepare_evaluation_target(
         )
     run_config = DatasetRunConfig(
         evaluation_mode=request.evaluation_mode,
+        materiality_judge=request.materiality_judge,
         repetitions=request.repetitions,
         concurrency=request.concurrency,
         target=TargetExecutionConfig(

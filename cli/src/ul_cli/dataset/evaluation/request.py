@@ -73,6 +73,7 @@ class DatasetEvaluationRequest:
     expected_environment_config_sha256: str | None
     expected_redaction_policy_sha256: str | None
     show_report_guidance: bool
+    materiality_judge: Literal["llm", "jev"] | None = None
 
 
 @dataclass(frozen=True)
@@ -84,6 +85,7 @@ class NormalizedDatasetEvaluationRequest:
     augmentations_output: Path | None
     redaction_state: Path | None
     evaluation_mode: Literal["variance"]
+    materiality_judge: Literal["llm", "jev"]
     repetitions: int
     concurrency: int
     target_timeout_seconds: float
@@ -106,6 +108,7 @@ def normalize_dataset_evaluation_request(
     redaction_state_was_explicit = request.redaction_state is not None
     recorded_manifest = _load_recorded_manifest(request.resume)
 
+    materiality_judge = request.materiality_judge
     repetitions = request.repetitions
     concurrency = request.concurrency
     max_environment_api_calls = request.max_environment_api_calls
@@ -120,6 +123,7 @@ def normalize_dataset_evaluation_request(
     if recorded_manifest is not None:
         recorded_command = recorded_manifest.effective_command
         recorded_run_config = recorded_command.run_config
+        materiality_judge = materiality_judge or recorded_run_config.materiality_judge
         repetitions = repetitions or recorded_run_config.repetitions
         concurrency = concurrency or recorded_run_config.concurrency
         max_environment_api_calls = (
@@ -190,6 +194,7 @@ def normalize_dataset_evaluation_request(
         augmentations_output=augmentations_output,
         redaction_state=redaction_state,
         evaluation_mode="variance",
+        materiality_judge=materiality_judge or "llm",
         repetitions=repetitions,
         concurrency=concurrency,
         target_timeout_seconds=target_timeout_seconds,

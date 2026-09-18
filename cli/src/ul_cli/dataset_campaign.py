@@ -16,6 +16,7 @@ from ul_core.augmentations.definitions import (
     builtin_augmentation_catalog,
 )
 
+from ul_cli.dataset_materiality import dataset_decision_settings
 from ul_cli.dataset_run_config import DatasetRunConfig
 
 
@@ -82,6 +83,8 @@ class CampaignTimingPlan(_StrictModel):
 class DatasetCampaignPlan(_StrictModel):
     schema_version: Literal["1.4.0"] = "1.4.0"
     evaluation_mode: Literal["variance"] = "variance"
+    materiality_judge: Literal["llm", "jev"] = "llm"
+    materiality_model: str | None = None
     fixture: CampaignFixturePlan | None = None
     examples: tuple[CampaignExamplePlan, ...]
     calls: CampaignCallCounts
@@ -188,9 +191,11 @@ def create_dataset_campaign_plan(
         + retry_calls * settings.max_render_tokens
         + equivalence_calls * min(settings.max_output_tokens, 1_024)
         + tone_safety_calls * min(settings.max_output_tokens, 1_024)
-        + materiality_calls * 512
+        + (materiality_calls * 512 if run_config.materiality_judge == "llm" else 0)
     )
     warnings = list(_model_parameter_warnings(settings))
+    if run_config.materiality_judge == "jev":
+        warnings.append("Jev decision tokens are excluded from the completion-token estimate.")
     candidate_inputs_available = any(
         operator.candidate_input_available for example in examples for operator in example.operators
     )
@@ -226,6 +231,12 @@ def create_dataset_campaign_plan(
         )
     return DatasetCampaignPlan(
         evaluation_mode=run_config.evaluation_mode,
+        materiality_judge=run_config.materiality_judge,
+        materiality_model=(
+            dataset_decision_settings(settings).model
+            if run_config.materiality_judge == "jev"
+            else settings.materiality_model
+        ),
         fixture=(
             CampaignFixturePlan(
                 status=fixture_status,

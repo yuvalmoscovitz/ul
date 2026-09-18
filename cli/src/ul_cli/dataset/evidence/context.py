@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import Literal
+
 from pydantic import JsonValue
 from ul import (
     DatasetSemanticSettings,
@@ -9,8 +11,12 @@ from ul import (
 from ul.dataset_invariants import DatasetInvariantSuite
 from ul.http_environment import JsonHttpTargetConfig
 from ul.llm import llm_client_config_from_dataset_settings
-from ul.material_variance import material_variance_evaluator_version_from_llm_config
+from ul.material_variance import (
+    jev_material_variance_evaluator_version,
+    material_variance_evaluator_version_from_llm_config,
+)
 
+from ul_cli.dataset_materiality import dataset_decision_settings
 from ul_cli.dataset_review import (
     DatasetEvidenceRedactionCoverage,
     DatasetEvidenceRunContext,
@@ -34,7 +40,9 @@ def build_dataset_evidence_run_context(
     redaction_policy_sha256: str | None = None,
     redaction_coverage: tuple[DatasetEvidenceRedactionCoverage, ...] = (),
 ) -> DatasetEvidenceRunContext:
-    semantic_settings = dataset_evidence_semantic_settings(settings)
+    semantic_settings = dataset_evidence_semantic_settings(
+        settings, materiality_judge=run_config.materiality_judge
+    )
     return create_dataset_evidence_run_context(
         selected_records=selected_records,
         operators=tuple(
@@ -52,13 +60,23 @@ def build_dataset_evidence_run_context(
 
 def dataset_evidence_semantic_settings(
     settings: DatasetSemanticSettings,
+    *,
+    materiality_judge: Literal["llm", "jev"] = "llm",
 ) -> DatasetEvidenceSemanticSettings:
     llm_config = llm_client_config_from_dataset_settings(settings)
     return DatasetEvidenceSemanticSettings(
         llm_client=llm_config.evidence_identity(),
+        decision_model=(
+            dataset_decision_settings(settings).model if materiality_judge == "jev" else None
+        ),
         max_input_chars=settings.max_input_chars,
         deconstructor_identity=semantic_deconstructor_identity(settings),
         materiality_evaluator_version_id=(
-            material_variance_evaluator_version_from_llm_config(llm_config).id
+            jev_material_variance_evaluator_version(
+                dataset_decision_settings(settings),
+                max_input_chars=settings.max_input_chars,
+            ).id
+            if materiality_judge == "jev"
+            else material_variance_evaluator_version_from_llm_config(llm_config).id
         ),
     )

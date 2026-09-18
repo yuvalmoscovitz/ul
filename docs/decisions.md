@@ -85,8 +85,7 @@ The SDK does not log raw requests or responses.
 
 `JevMaterialVarianceJudge` plugs into `DatasetEvaluationRunner` through its existing
 `material_variance_evaluator` argument. It checks whether the meaning or real-world effect changed;
-it does not decide which answer is better or whether either answer is correct. The CLI and existing
-LLM judges keep their current defaults.
+it does not decide which answer is better or whether either answer is correct. The existing LLM judge remains the default.
 
 This runnable SDK example compares a completed refund with a scheduled refund:
 
@@ -169,3 +168,39 @@ are not changed by this integration.
 See the [TypeSafe API](https://docs.typesafe.ai/api),
 [Jev limitations](https://docs.typesafe.ai/model-jaggedness/jev-1.13), and
 [OpenRouter schema](https://openrouter.ai/openapi.json).
+
+
+## Select Jev in the CLI
+
+Add `--materiality-judge jev` to a dataset evaluation:
+
+```bash
+uv run ul dataset evaluate interactions.jsonl \
+  --target customer_agent:run \
+  --materiality-judge jev \
+  --dry-run
+```
+
+The dry run shows the selected judge, model, and OpenRouter/TypeSafe destination without making
+external calls. To execute, use the displayed target confirmation with `--confirm-target`,
+`--confirm-test-environment`, and a new `--output` path, as for other local targets. HTTP targets
+use their existing environment confirmation options. Set `OPEN_ROUTER_API_KEY` and `UL_LIVE=true`
+(or the separate dataset live-call and external-processing controls). The CLI loads `.env` and uses
+these dataset opt-ins for Jev too; it does not require separate `UL_DECISION_LIVE_CALLS` opt-in.
+
+`--materiality-judge llm` retains the existing judge. Generation and augmentation verification still
+use the configured dataset LLM in both modes. Existing LLM preflight checks still run; they do not
+preflight Jev. A missing Jev credential stops execution before the target runs, and provider errors
+during comparison remain inconclusive. If the semantic LLM uses a customer endpoint, its API key is
+not forwarded to OpenRouter: Jev uses `OPEN_ROUTER_API_KEY` separately.
+
+Jev defaults to `typesafe/jev-1.13`; set `UL_DECISION_MODEL` to select another numeric version. The
+CLI uses the dataset timeout and input limit, with the SDK's default confidence threshold of 0.88.
+Other decision request/response bounds retain their `UL_DECISION_` settings. Jev requests count as
+materiality calls in campaign planning; their decision tokens are excluded from the LLM completion
+token estimate. No monetary estimate is implied.
+
+Saved evidence records the decision model and evaluator identity. Resume restores the selected
+judge when the option is omitted and rejects an explicit switch. Keep the same `UL_DECISION_`
+settings when resuming: model or limit changes produce an incompatible evaluator identity and
+require a new output file. Credentials can rotate without changing that identity.

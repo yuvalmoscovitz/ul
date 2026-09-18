@@ -121,6 +121,11 @@ def print_dataset_plan(
         f"Semantic provider: {semantic_provider_id} "
         f"(endpoint sha256: {semantic_endpoint_sha256[:12]})"
     )
+    print_dataset_plain(
+        f"Outcome comparison judge: {campaign_plan.materiality_judge} "
+        f"({campaign_plan.materiality_model})"
+        + (" via OpenRouter/TypeSafe" if campaign_plan.materiality_judge == "jev" else "")
+    )
     if redaction_policy_sha256 is not None:
         console.print(f"Redaction policy sha256: {redaction_policy_sha256}")
         for coverage in redaction_coverage:
