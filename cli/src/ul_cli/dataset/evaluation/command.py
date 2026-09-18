@@ -139,12 +139,6 @@ def evaluate_dataset(
             ),
         ),
     ] = "variance",
-    materiality_judge: Annotated[
-        Literal["llm", "jev"] | None,
-        typer.Option(
-            help="Outcome comparison judge: llm (default) or Jev via OpenRouter/TypeSafe."
-        ),
-    ] = None,
     operator: Annotated[
         list[str] | None,
         typer.Option(
@@ -334,7 +328,6 @@ def evaluate_dataset(
         no_save_augmentations=no_save_augmentations,
         invariants=invariants,
         evaluation_mode=evaluation_mode,
-        materiality_judge=materiality_judge,
         operators=tuple(operator) if operator is not None else None,
         limit=limit,
         repetitions=repetitions,

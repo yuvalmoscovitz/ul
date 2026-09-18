@@ -25,6 +25,7 @@ def test_jev_dry_run_discloses_provider_without_constructing_client(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setenv("UL_DATASET_MATERIALITY_JUDGE", "jev")
     dataset = tmp_path / "data.jsonl"
     target = tmp_path / "target.json"
     _write_dataset(dataset, [_record()])
@@ -41,8 +42,6 @@ def test_jev_dry_run_discloses_provider_without_constructing_client(
         str(dataset),
         "--environment-config",
         str(target),
-        "--materiality-judge",
-        "jev",
         "--dry-run",
     ]
     human = runner.invoke(app, args)
@@ -60,6 +59,7 @@ def test_jev_cli_evidence_report_and_resume_bind_selected_judge(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("UL_DATASET_MATERIALITY_JUDGE", "jev")
     dataset = tmp_path / "data.jsonl"
     output = tmp_path / "results.jsonl"
     dataset.write_text(
@@ -115,8 +115,6 @@ def test_jev_cli_evidence_report_and_resume_bind_selected_judge(
                 "1",
                 "--operator",
                 "input.surface.rephrase",
-                "--materiality-judge",
-                "jev",
                 "--output",
                 str(output),
             ],
@@ -136,12 +134,15 @@ def test_jev_cli_evidence_report_and_resume_bind_selected_judge(
         assert report.exit_code == 0, report.output
         assert "consequential=1" in report.output
         resume = ["dataset", "evaluate", "--resume", str(output), *binding, "--dry-run"]
+        monkeypatch.delenv("UL_DATASET_MATERIALITY_JUDGE")
         compatible = runner.invoke(app, resume)
         assert compatible.exit_code == 0, compatible.output
-        assert "Outcome comparison judge: jev" in compatible.output
-        incompatible = runner.invoke(app, [*resume, "--materiality-judge", "llm"])
+        assert "Outcome comparison provider: OpenRouter/TypeSafe" in compatible.output
+        monkeypatch.setenv("UL_DATASET_MATERIALITY_JUDGE", "llm")
+        incompatible = runner.invoke(app, resume)
         assert incompatible.exit_code == 2
         assert "incompatible" in incompatible.output
+        monkeypatch.delenv("UL_DATASET_MATERIALITY_JUDGE")
         monkeypatch.setenv("UL_DECISION_MODEL", "typesafe/jev-1.14")
         changed_model = runner.invoke(app, resume)
         assert changed_model.exit_code == 2
@@ -158,6 +159,7 @@ def test_jev_requires_its_own_key_before_target_execution(
 ) -> None:
     monkeypatch.chdir(tmp_path)
     monkeypatch.delenv("OPEN_ROUTER_API_KEY", raising=False)
+    monkeypatch.setenv("UL_DATASET_MATERIALITY_JUDGE", "jev")
     dataset = tmp_path / "data.jsonl"
     target = tmp_path / "target.json"
     _write_dataset(dataset, [_record()])
@@ -188,8 +190,6 @@ def test_jev_requires_its_own_key_before_target_execution(
             str(target),
             "--allow-environment-network",
             "--confirm-test-environment",
-            "--materiality-judge",
-            "jev",
             "--output",
             str(tmp_path / "result.jsonl"),
         ],
@@ -197,3 +197,22 @@ def test_jev_requires_its_own_key_before_target_execution(
     assert result.exit_code == 2
     assert "OPEN_ROUTER_API_KEY" in result.output
     assert "test-key" not in result.output
+
+
+def test_normal_cli_does_not_expose_judge_selection() -> None:
+    result = runner.invoke(app, ["dataset", "evaluate", "--help"])
+    assert result.exit_code == 0
+    assert "materiality-judge" not in result.output
+    assert "Jev" not in result.output
+
+
+def test_advanced_comparison_configuration_loads_dotenv(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from ul_cli.dataset_materiality import DatasetOutcomeComparisonSettings
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("UL_DATASET_MATERIALITY_JUDGE", raising=False)
+    assert DatasetOutcomeComparisonSettings().materiality_judge is None
+    (tmp_path / ".env").write_text("UL_DATASET_MATERIALITY_JUDGE=jev\n")
+    assert DatasetOutcomeComparisonSettings().materiality_judge == "jev"

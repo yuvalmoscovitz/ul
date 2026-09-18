@@ -1,7 +1,15 @@
 from __future__ import annotations
 
-from pydantic_settings import SettingsConfigDict
+from typing import Literal
+
+from pydantic_settings import BaseSettings, SettingsConfigDict
 from ul import DatasetSemanticSettings, OpenRouterDecisionSettings
+
+
+class DatasetOutcomeComparisonSettings(BaseSettings):
+    model_config = SettingsConfigDict(env_prefix="UL_DATASET_", env_file=".env", extra="ignore")
+
+    materiality_judge: Literal["llm", "jev"] | None = None
 
 
 class _DatasetDecisionSettings(OpenRouterDecisionSettings):

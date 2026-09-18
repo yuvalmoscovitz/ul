@@ -170,37 +170,33 @@ See the [TypeSafe API](https://docs.typesafe.ai/api),
 [OpenRouter schema](https://openrouter.ai/openapi.json).
 
 
-## Select Jev in the CLI
+## Outcome comparison in the CLI
 
-Add `--materiality-judge jev` to a dataset evaluation:
+Run `ul dataset evaluate` normally. UL handles outcome comparison internally; there is no
+judge-selection CLI option. Generation and augmentation verification use the configured dataset
+LLM. The existing comparison judge remains the default while full live workflow validation is
+pending.
 
-```bash
-uv run ul dataset evaluate interactions.jsonl \
-  --target customer_agent:run \
-  --materiality-judge jev \
-  --dry-run
-```
+### Advanced rollout configuration
 
-The dry run shows the selected judge, model, and OpenRouter/TypeSafe destination without making
-external calls. To execute, use the displayed target confirmation with `--confirm-target`,
-`--confirm-test-environment`, and a new `--output` path, as for other local targets. HTTP targets
-use their existing environment confirmation options. Set `OPEN_ROUTER_API_KEY` and `UL_LIVE=true`
-(or the separate dataset live-call and external-processing controls). The CLI loads `.env` and uses
-these dataset opt-ins for Jev too; it does not require separate `UL_DECISION_LIVE_CALLS` opt-in.
+For testing and deployment configuration, set `UL_DATASET_MATERIALITY_JUDGE=jev` in the environment
+or `.env`. Use `llm` to explicitly select the existing implementation. This override is not needed
+for normal use. Merely configuring an OpenRouter credential does not select Jev or route comparison
+evidence to a different provider.
 
-`--materiality-judge llm` retains the existing judge. Generation and augmentation verification still
-use the configured dataset LLM in both modes. Existing LLM preflight checks still run; they do not
-preflight Jev. A missing Jev credential stops execution before the target runs, and provider errors
-during comparison remain inconclusive. If the semantic LLM uses a customer endpoint, its API key is
-not forwarded to OpenRouter: Jev uses `OPEN_ROUTER_API_KEY` separately.
+The dry run discloses the OpenRouter/TypeSafe destination without making external calls. Set
+`OPEN_ROUTER_API_KEY` and `UL_LIVE=true` (or the separate dataset live-call and external-processing
+controls) to execute. The CLI uses these dataset opt-ins for Jev too. When the semantic LLM uses a
+customer endpoint, its API key is never forwarded to OpenRouter; Jev requires its own credential.
+A missing credential stops execution before the target runs. Existing LLM preflight checks still
+run; they do not preflight Jev. Comparison provider errors remain inconclusive.
 
-Jev defaults to `typesafe/jev-1.13`; set `UL_DECISION_MODEL` to select another numeric version. The
-CLI uses the dataset timeout and input limit, with the SDK's default confidence threshold of 0.88.
-Other decision request/response bounds retain their `UL_DECISION_` settings. Jev requests count as
-materiality calls in campaign planning; their decision tokens are excluded from the LLM completion
-token estimate. No monetary estimate is implied.
+Jev defaults to `typesafe/jev-1.13`; `UL_DECISION_MODEL` accepts another numeric version. The CLI uses
+the dataset timeout and input limit, with the SDK's default confidence threshold of 0.88. Other
+request/response bounds retain their `UL_DECISION_` settings. Decision tokens are excluded from the
+LLM completion-token estimate. No monetary estimate is implied.
 
-Saved evidence records the decision model and evaluator identity. Resume restores the selected
-judge when the option is omitted and rejects an explicit switch. Keep the same `UL_DECISION_`
-settings when resuming: model or limit changes produce an incompatible evaluator identity and
-require a new output file. Credentials can rotate without changing that identity.
+Detailed JSON plans and saved evidence record the judge, model, and evaluator identity for auditing.
+Resume restores the recorded judge when no override is configured and rejects a configured switch.
+Keep the same `UL_DECISION_` settings when resuming: model or limit changes require a new output file.
+Credentials can rotate without changing that identity.

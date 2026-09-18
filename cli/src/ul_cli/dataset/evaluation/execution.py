@@ -91,7 +91,9 @@ def execute_campaign(campaign: PreparedCampaign) -> CampaignExecutionOutcome:
     if evaluation.run_config.materiality_judge == "jev":
         credential = dataset_decision_settings(evaluation.settings).api_key
         if credential is None or not credential.get_secret_value().strip():
-            raise typer.BadParameter("set OPEN_ROUTER_API_KEY to use --materiality-judge jev")
+            raise typer.BadParameter(
+                "set OPEN_ROUTER_API_KEY for the configured outcome comparison provider"
+            )
     try:
         if evaluation.local_target is not None:
             print_local_target_identity(evaluation.local_target)

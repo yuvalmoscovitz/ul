@@ -8,6 +8,7 @@ from typing import Literal
 
 from ul import DatasetEvaluationMode
 
+from ul_cli.dataset_materiality import DatasetOutcomeComparisonSettings
 from ul_cli.dataset_trial_journal import (
     DatasetRunManifest,
     journal_anchor_path,
@@ -73,7 +74,6 @@ class DatasetEvaluationRequest:
     expected_environment_config_sha256: str | None
     expected_redaction_policy_sha256: str | None
     show_report_guidance: bool
-    materiality_judge: Literal["llm", "jev"] | None = None
 
 
 @dataclass(frozen=True)
@@ -108,7 +108,7 @@ def normalize_dataset_evaluation_request(
     redaction_state_was_explicit = request.redaction_state is not None
     recorded_manifest = _load_recorded_manifest(request.resume)
 
-    materiality_judge = request.materiality_judge
+    materiality_judge = DatasetOutcomeComparisonSettings().materiality_judge
     repetitions = request.repetitions
     concurrency = request.concurrency
     max_environment_api_calls = request.max_environment_api_calls
