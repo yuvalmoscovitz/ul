@@ -85,8 +85,8 @@ _ALLOWED_SURFACE_CHANGE_RULES: dict[SemanticAllowedSurfaceChange, str] = {
     ),
 }
 _SEMANTIC_CACHE_VERSION = "semantic-request-cache/1"
-_EXTRACTOR_VERSION = "semantic-deconstructor/2.2.0"
-_EQUIVALENCE_VERIFIER_VERSION = "semantic-equivalence-verifier/2.0.0"
+_EXTRACTOR_VERSION = "semantic-deconstructor/2.3.0"
+_EQUIVALENCE_VERIFIER_VERSION = "semantic-equivalence-verifier/2.1.0"
 _MAXIMUM_SEMANTIC_CACHE_ENTRIES = 256
 _MAXIMUM_SEMANTIC_CACHE_BYTES = 16 * 1024 * 1024
 _GROUNDING_REMEDIATION = (
@@ -214,6 +214,50 @@ def _safe_diagnostic_json_pointer(
     return f"{trusted_root}/<pointer-sha256:{_sha256_text(json_pointer)[:12]}>"
 
 
+def _require_all_object_fields(schema: dict[str, Any]) -> None:
+    if schema.get("type") == "object":
+        schema["required"] = list(schema.get("properties", {}))
+    for value in schema.values():
+        if isinstance(value, dict):
+            _require_all_object_fields(cast(dict[str, Any], value))
+        elif isinstance(value, list):
+            for item in cast(list[Any], value):
+                if isinstance(item, dict):
+                    _require_all_object_fields(cast(dict[str, Any], item))
+
+
+def _remove_generated_metadata(schema: dict[str, Any], names: tuple[str, ...]) -> None:
+    for name in names:
+        schema["properties"].pop(name)
+    schema.get("$defs", {}).pop("JsonValue", None)
+
+
+def _semantic_equivalence_response_schema() -> dict[str, Any]:
+    schema = SemanticEquivalenceAssessment.model_json_schema(mode="validation")
+    _remove_generated_metadata(schema, ("schema_version", "verifier_version", "metadata"))
+    _require_all_object_fields(schema)
+    return schema
+
+
+def _decode_semantic_json_fields(frame: dict[str, Any]) -> None:
+    for collection, field in (
+        ("factors", "value"),
+        ("communication_acts", "attributes"),
+        ("outcomes", "fields"),
+    ):
+        elements = frame.get(collection, [])
+        if not isinstance(elements, list):
+            continue
+        for element in cast(list[Any], elements):
+            if not isinstance(element, dict):
+                continue
+            element = cast(dict[str, Any], element)
+            encoded = element.pop(f"{field}_json", None)
+            if field in element or not isinstance(encoded, str):
+                raise ValueError(f"{collection} requires JSON-encoded {field}_json")
+            element[field] = json.loads(encoded)
+
+
 def _semantic_frame_response_schema(*, observed_output_present: bool) -> dict[str, Any]:
     schema = SemanticFrame.model_json_schema(mode="validation")
     definitions = cast(dict[str, dict[str, Any]], schema["$defs"])
@@ -227,9 +271,6 @@ def _semantic_frame_response_schema(*, observed_output_present: bool) -> dict[st
         definition = definitions[definition_name]
         properties = cast(dict[str, dict[str, Any]], definition["properties"])
         properties["evidence"]["minItems"] = 1
-        required = cast(list[str], definition["required"])
-        if "evidence" not in required:
-            required.append("evidence")
     closed_fields = {
         "RequestUnit": {
             "status": _REQUEST_UNIT_STATUSES,
@@ -253,12 +294,32 @@ def _semantic_frame_response_schema(*, observed_output_present: bool) -> dict[st
     if observed_output_present:
         properties = cast(dict[str, dict[str, Any]], schema["properties"])
         properties["outcomes"]["minItems"] = 1
-        required = cast(list[str], schema.setdefault("required", []))
-        if "outcomes" not in required:
-            required.append("outcomes")
     else:
         properties = cast(dict[str, dict[str, Any]], schema["properties"])
         properties["outcomes"]["maxItems"] = 0
+    for definition_name, field_name in (
+        ("SemanticFactor", "value"),
+        ("CommunicationAct", "attributes"),
+        ("ObservedOutcome", "fields"),
+    ):
+        properties = definitions[definition_name]["properties"]
+        original = properties.pop(field_name)
+        properties[f"{field_name}_json"] = {
+            "type": "string",
+            "description": (
+                original.get("description", "")
+                + f" Return {field_name} encoded as JSON text, preserving its JSON type. "
+                + (
+                    "Encode a JSON object."
+                    if field_name != "value"
+                    else "For a string use JSON quotes, for example '\"INV-104\"'."
+                )
+            ).strip(),
+        }
+    _remove_generated_metadata(
+        schema, ("schema_version", "interaction_id", "extractor_version", "metadata")
+    )
+    _require_all_object_fields(schema)
     return schema
 
 
@@ -1232,6 +1293,7 @@ class SemanticModelDeconstructor:
         )
         try:
             raw_frame = self._decode_object(completion.response.choices[0].message.content)
+            _decode_semantic_json_fields(raw_frame)
             raw_frame.update(
                 {
                     "schema_version": "1.0.0",
@@ -1347,7 +1409,7 @@ class SemanticModelDeconstructor:
             seed=0,
             top_p=None,
             schema_name="semantic_equivalence_assessment",
-            schema=SemanticEquivalenceAssessment.model_json_schema(mode="validation"),
+            schema=_semantic_equivalence_response_schema(),
             strict_schema=True,
             system_prompt=_PROMPTS.get_prompt(
                 "semantic.verify",
