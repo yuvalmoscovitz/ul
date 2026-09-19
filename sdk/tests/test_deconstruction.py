@@ -248,6 +248,23 @@ def frame_payload() -> dict[str, object]:
     }
 
 
+def wire_frame_content(content: str) -> str:
+    try:
+        frame = json.loads(content)
+    except ValueError:
+        return content
+    if not isinstance(frame, dict) or "request_units" not in frame:
+        return content
+    for collection, field in (
+        ("factors", "value"),
+        ("communication_acts", "attributes"),
+        ("outcomes", "fields"),
+    ):
+        for element in frame.get(collection, []):
+            element[f"{field}_json"] = json.dumps(element.pop(field, {}))
+    return json.dumps(frame)
+
+
 def completion(content: str, *, finish_reason: str | None = None) -> httpx.Response:
     return httpx.Response(
         200,
@@ -257,7 +274,7 @@ def completion(content: str, *, finish_reason: str | None = None) -> httpx.Respo
             "provider": "provider-name",
             "choices": [
                 {
-                    "message": {"role": "assistant", "content": content},
+                    "message": {"role": "assistant", "content": wire_frame_content(content)},
                     "finish_reason": finish_reason,
                 }
             ],
@@ -841,7 +858,7 @@ async def test_deconstruct_sends_one_bounded_strict_structured_request() -> None
     assert not client.is_closed
     assert frame.interaction_id == "interaction-1"
     assert frame.schema_version == "1.0.0"
-    assert frame.extractor_version == "semantic-deconstructor/2.2.0"
+    assert frame.extractor_version == "semantic-deconstructor/2.3.0"
     assert frame.metadata == {
         "semantic_provider": "openrouter",
         "semantic_protocol": "openai-chat-completions",
@@ -996,7 +1013,7 @@ async def test_openai_compatible_deconstruction_uses_generic_chat_contract() -> 
     ) as deconstructor:
         frame = await deconstructor.deconstruct(interaction())
 
-    assert frame.extractor_version == "semantic-deconstructor/2.2.0"
+    assert frame.extractor_version == "semantic-deconstructor/2.3.0"
     assert frame.metadata["semantic_provider"] == "customer-model-gateway"
     assert frame.metadata["semantic_protocol"] == "openai-chat-completions"
     assert frame.metadata["semantic_endpoint_sha256"] == (
@@ -1019,7 +1036,7 @@ async def test_provider_provenance_is_bounded_and_usage_is_allowlisted() -> None
                 "choices": [
                     {
                         "message": {
-                            "content": json.dumps(frame_payload()),
+                            "content": wire_frame_content(json.dumps(frame_payload())),
                         }
                     }
                 ],
@@ -1054,7 +1071,7 @@ async def test_provider_accepts_null_usage() -> None:
     response_body = {
         "id": "generation-1",
         "model": "resolved-model",
-        "choices": [{"message": {"content": json.dumps(frame_payload())}}],
+        "choices": [{"message": {"content": wire_frame_content(json.dumps(frame_payload()))}}],
         "usage": None,
     }
     client = mock_client(lambda request: httpx.Response(200, json=response_body))
@@ -1093,7 +1110,7 @@ async def test_provider_cannot_persist_a_reflected_endpoint_url() -> None:
         "id": "generation-1",
         "model": "resolved-model",
         "provider": endpoint_url,
-        "choices": [{"message": {"content": json.dumps(frame_payload())}}],
+        "choices": [{"message": {"content": wire_frame_content(json.dumps(frame_payload()))}}],
     }
     client = mock_client(lambda request: httpx.Response(200, json=response_body))
 
@@ -1138,7 +1155,7 @@ async def test_provider_provenance_strings_are_bounded(
         "id": "generation-1",
         "model": "resolved-model",
         "provider": "customer-runtime",
-        "choices": [{"message": {"content": json.dumps(frame_payload())}}],
+        "choices": [{"message": {"content": wire_frame_content(json.dumps(frame_payload()))}}],
     }
     response_body[field_name] = field_value
     client = mock_client(lambda request: httpx.Response(200, json=response_body))
@@ -1172,7 +1189,9 @@ async def test_provider_usage_values_are_size_and_type_bounded(
             json={
                 "id": "generation-1",
                 "model": "resolved-model",
-                "choices": [{"message": {"content": json.dumps(frame_payload())}}],
+                "choices": [
+                    {"message": {"content": wire_frame_content(json.dumps(frame_payload()))}}
+                ],
                 "usage": usage,
             },
         )
@@ -1194,7 +1213,7 @@ async def test_provider_cannot_persist_a_reflected_api_key(reflected_field: str)
         "id": "generation-1",
         "model": "resolved-model",
         "provider": "customer-runtime",
-        "choices": [{"message": {"content": json.dumps(frame_payload())}}],
+        "choices": [{"message": {"content": wire_frame_content(json.dumps(frame_payload()))}}],
     }
     if reflected_field == "content":
         response_body["choices"] = [{"message": {"content": secret}}]
@@ -1574,7 +1593,7 @@ async def test_verify_equivalence_compares_raw_inputs_with_the_configured_model(
         )
 
     assert assessment.verdict == "equivalent"
-    assert assessment.verifier_version == "semantic-equivalence-verifier/2.0.0"
+    assert assessment.verifier_version == "semantic-equivalence-verifier/2.1.0"
     assert assessment.metadata["semantic_generation_id"] == "generation-1"
     assert assessment.metadata["semantic_equivalence_policy"] == {"allowed_surface_change": "none"}
     await client.aclose()
@@ -1659,7 +1678,7 @@ async def test_deconstruct_supports_input_only_candidate_validation() -> None:
         )
         schema = body["response_format"]["json_schema"]["schema"]
         assert schema["properties"]["outcomes"]["maxItems"] == 0
-        assert "outcomes" not in schema.get("required", [])
+        assert "outcomes" in schema["required"]
         assert schema["$defs"]["RequestUnit"]["properties"]["status"]["enum"] == [
             "explicit",
             "unresolved",
@@ -2039,7 +2058,7 @@ async def test_deconstructor_identity_binds_extractor_prompt_and_response_schema
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     baseline = semantic_deconstructor_identity(settings())
-    assert baseline.extractor_contract == "semantic-deconstructor/2.2.0"
+    assert baseline.extractor_contract == "semantic-deconstructor/2.3.0"
     assert baseline.prompt_behavior_sha256 == (
         deconstruction_module._canonical_json_sha256(
             {
@@ -2085,34 +2104,11 @@ async def test_deconstructor_identity_binds_extractor_prompt_and_response_schema
     assert changed_prompt.identity_sha256 != baseline.identity_sha256
     monkeypatch.undo()
 
+    original_schema = SemanticFrame.model_json_schema
     monkeypatch.setattr(
         SemanticFrame,
         "model_json_schema",
-        classmethod(
-            lambda cls, **kwargs: {
-                "type": "object",
-                "title": "ChangedFrame",
-                "properties": {"outcomes": {"type": "array"}},
-                "$defs": {
-                    name: {
-                        "properties": {
-                            "evidence": {"type": "array"},
-                            "status": {"type": "string"},
-                            "mode": {"type": "string"},
-                            "kind": {"type": "string"},
-                        },
-                        "required": [],
-                    }
-                    for name in (
-                        "RequestUnit",
-                        "SemanticFactor",
-                        "SemanticRelation",
-                        "CommunicationAct",
-                        "ObservedOutcome",
-                    )
-                },
-            }
-        ),
+        classmethod(lambda cls, **kwargs: {**original_schema(**kwargs), "title": "ChangedFrame"}),
     )
     changed_schema = semantic_deconstructor_identity(settings())
     assert changed_schema.response_schema_sha256 != baseline.response_schema_sha256

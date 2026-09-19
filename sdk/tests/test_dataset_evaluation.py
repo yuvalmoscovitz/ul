@@ -1084,6 +1084,9 @@ async def test_repetition_benchmark_reduces_semantic_calls_without_changing_find
                 resolved_value = raw_actions[position][field_name]
                 if isinstance(resolved_value, str):
                     evidence_item["text_quote"] = resolved_value
+        for collection_name, field_name in (("factors", "value"), ("outcomes", "fields")):
+            for element in frame_payload[collection_name]:
+                element[f"{field_name}_json"] = json.dumps(element.pop(field_name))
         return httpx.Response(
             200,
             json={
